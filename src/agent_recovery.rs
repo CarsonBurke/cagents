@@ -2415,20 +2415,28 @@ mod tests {
         ]
         .into();
         recipe.unset_environment.insert("ANTHROPIC_API_KEY".into());
-        let mut child = std::process::Command::new("/bin/sleep")
+        #[cfg(target_os = "linux")]
+        let sleep = Path::new("/bin/sleep");
+        #[cfg(target_os = "macos")]
+        let temporary = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let sleep = locally_signed_fixture(temporary.path(), "sleep", "/bin/sleep");
+        let mut child = std::process::Command::new(sleep)
             .arg("10")
             .env_clear()
             .envs(&recipe.environment)
             .spawn()
             .unwrap();
         let pid = child.id() as i32;
-        // `spawn` returns as soon as the child stops sharing this process's
-        // memory. Until its exec completes, `/proc` shows it with this image
-        // and environment, then with the new image and no environment yet.
-        let own = fs::read_link("/proc/self/exe").unwrap();
+        let view = ProcessView::native(pid);
+        let own = crate::process::current_executable().unwrap();
         let executed = || {
-            fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| image != own)
-                && fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| !environ.is_empty())
+            view.identity()
+                .and_then(|(_, start)| view.executable(start))
+                .is_some_and(|image| image != own)
+                && view
+                    .environment()
+                    .is_some_and(|environ| !environ.is_empty())
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !executed() {
@@ -2436,11 +2444,9 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "the fixture never finished exec"
             );
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let start = process_identity(&fs::read(format!("/proc/{pid}/stat")).unwrap())
-            .unwrap()
-            .1;
+        let start = view.identity().unwrap().1;
         let process = AgentProcess {
             pid,
             start,
@@ -2953,7 +2959,10 @@ mod tests {
             .environment
             .insert("HOME".into(), directory.path().to_str().unwrap().into());
         symlink(
-            dotfiles.join(format!("sessions/2026/09/23/rollout-2026-09-23-{id}.jsonl")),
+            dotfiles
+                .canonicalize()
+                .unwrap()
+                .join(format!("sessions/2026/09/23/rollout-2026-09-23-{id}.jsonl")),
             root.join("fd/3"),
         )
         .unwrap();
@@ -3550,6 +3559,20 @@ mod tests {
         assert!(bind_session(&launch("muse", &["--unknown"]), id).is_none());
     }
 
+    #[cfg(all(feature = "host", target_os = "macos"))]
+    fn locally_signed_fixture(directory: &Path, name: &str, original: &str) -> std::path::PathBuf {
+        // Darwin can withhold the environment of restricted system binaries.
+        let executable = directory.join(name);
+        fs::copy(original, &executable).unwrap();
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        executable
+    }
+
     #[cfg(feature = "host")]
     #[test]
     fn foreground_launcher_recovers_the_native_childs_exact_identity() {
@@ -3579,15 +3602,7 @@ mod tests {
         std::os::unix::fs::symlink("/bin/cat", &native).unwrap();
         #[cfg(target_os = "macos")]
         {
-            // A restricted system binary can hide its launch environment.
-            // Make this fixture a locally signed, inspectable executable.
-            fs::copy("/bin/cat", &native).unwrap();
-            let output = Command::new("/usr/bin/codesign")
-                .args(["--force", "--sign", "-"])
-                .arg(&native)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
+            locally_signed_fixture(directory.path(), "codex", "/bin/cat");
         }
         let home = directory.path().join("codex-home");
         let sessions = home.join("sessions");
