@@ -133,16 +133,24 @@ struct Invocation {
 }
 
 fn read_invocation(record: &[u8], evidence: &SurvivorEvidence) -> Option<Invocation> {
-    let arguments = inspect::parse_arguments(record)?;
-    if arguments.arguments.first().is_none_or(Vec::is_empty) {
-        return None;
-    }
+    // The ordinary parser ends the environment at the first empty entry.
+    // Search the returned bytes for exact markers even when argv is empty.
+    let marked = evidence.carries_marker(record.get(4..)?.split(|byte| *byte == 0));
+    let Some(arguments) = inspect::parse_arguments(record).filter(|arguments| {
+        arguments
+            .arguments
+            .first()
+            .is_some_and(|arg| !arg.is_empty())
+    }) else {
+        return marked.then_some(Invocation {
+            conversation: false,
+            marked,
+            environment_visible: false,
+        });
+    };
     Some(Invocation {
         conversation: evidence.names_conversation(arguments.arguments.iter().map(Vec::as_slice)),
-        // The ordinary parser ends the environment at the first empty
-        // entry. Compare exact marker tokens throughout the returned bytes;
-        // an empty entry, or an empty argv[0], cannot hide a positive marker.
-        marked: evidence.carries_marker(record[4..].split(|byte| *byte == 0)),
+        marked,
         environment_visible: !arguments.environment.is_empty(),
     })
 }
@@ -347,6 +355,12 @@ mod tests {
         let invocation = read_invocation(&record, &evidence).unwrap();
         assert!(invocation.environment_visible);
         assert!(invocation.marked);
+
+        let mut record = 0_i32.to_ne_bytes().to_vec();
+        record.extend_from_slice(b"/bin/cat\0\0");
+        record.extend_from_slice(evidence.markers[0].as_bytes());
+        record.push(0);
+        assert!(read_invocation(&record, &evidence).unwrap().marked);
     }
 
     #[test]
