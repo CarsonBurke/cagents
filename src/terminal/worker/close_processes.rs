@@ -571,13 +571,46 @@ fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
 /// After the pinned root exits, a numeric session can only refuse cleanup;
 /// it never grants authority to signal a process discovered after that exit.
 pub(super) fn session_is_empty(session: libc::pid_t, deadline: Instant) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
     let processes = census(deadline)?;
+    #[cfg(target_os = "macos")]
+    let processes = session_members(session, deadline)?;
     let daemon = daemon_subtree(this_daemon(), &processes);
     Ok(processes.iter().all(|process| {
         process.session != session
             || matches!(process.state, b'Z' | b'X')
             || daemon.contains(&process.pid)
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn session_members(session: libc::pid_t, deadline: Instant) -> Result<Vec<CloseProcess>, String> {
+    let mut members = Vec::new();
+    // getsid observes active session membership even across UIDs. Unrelated
+    // processes do not need the destructive census's stronger identity reads.
+    for pid in crate::process::table::list_all().map_err(|error| error.to_string())? {
+        check_deadline(deadline)?;
+        let pid = pid as libc::pid_t;
+        // SAFETY: getsid takes a positive PID from the process table.
+        let observed = unsafe { libc::getsid(pid) };
+        if observed < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(error.to_string());
+        }
+        if observed != session {
+            continue;
+        }
+        match read_process(pid) {
+            Ok(process) => members.push(process),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    check_deadline(deadline)?;
+    Ok(members)
 }
 
 fn this_daemon() -> libc::pid_t {

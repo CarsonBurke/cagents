@@ -3853,9 +3853,10 @@ impl Worker {
                 let cleanup = if self.checked_shutdown {
                     Ok(())
                 } else {
+                    let wait_for_pty = !cfg!(target_os = "macos") || !self.pty_eof;
                     confirm_exited_family(
                         &self.child,
-                        &self.master,
+                        wait_for_pty.then_some(&self.master),
                         Instant::now() + budget.deadline,
                         budget.census_reserve,
                     )
@@ -6266,7 +6267,7 @@ fn shutdown_child_exit(
                 }
             }
         }
-        confirm_exited_family(child, master, deadline, budget.census_reserve)?;
+        confirm_exited_family(child, Some(master), deadline, budget.census_reserve)?;
     }
     if let Some(report) = report {
         return report;
@@ -6284,7 +6285,7 @@ fn shutdown_child_exit(
 
 fn confirm_exited_family(
     child: &holder::HeldChild,
-    master: &holder::PtyMaster,
+    master: Option<&holder::PtyMaster>,
     deadline: Instant,
     census_reserve: Duration,
 ) -> Result<(), String> {
@@ -6305,28 +6306,31 @@ fn confirm_exited_family(
     // A job can fork between thaw and HUP, outside the tracked set. Give the
     // session's last members the bounded budget to finish, ending early once
     // nothing holds the PTY, and keep the final census its own time.
-    let master = master.duplicate().map_err(|error| error.to_string())?;
-    let mut target = libc::pollfd {
-        fd: master.as_raw_fd(),
-        events: 0,
-        revents: 0,
-    };
-    loop {
-        let remaining = drained.saturating_duration_since(Instant::now());
-        // SAFETY: one live, owned descriptor; this only observes readiness.
-        match unsafe {
-            libc::poll(
-                &mut target,
-                1,
-                remaining
-                    .as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(i32::MAX as u128) as libc::c_int,
-            )
-        } {
-            -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
-            -1 => return Err(std::io::Error::last_os_error().to_string()),
-            _ => break,
+    if let Some(master) = master {
+        let master = master.duplicate().map_err(|error| error.to_string())?;
+        let mut target = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        loop {
+            let remaining = drained.saturating_duration_since(Instant::now());
+            // SAFETY: one live, owned descriptor; this only observes readiness.
+            match unsafe {
+                libc::poll(
+                    &mut target,
+                    1,
+                    remaining
+                        .as_nanos()
+                        .div_ceil(1_000_000)
+                        .min(i32::MAX as u128) as libc::c_int,
+                )
+            } {
+                -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+                }
+                -1 => return Err(std::io::Error::last_os_error().to_string()),
+                _ => break,
+            }
         }
     }
     // A final census that cannot finish, for instance one a loaded host's
