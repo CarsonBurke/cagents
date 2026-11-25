@@ -115,9 +115,9 @@ in a session before starting the chat; it takes no arguments:
 scripts/native-evidence env python3 "$PWD/tests/fixtures/conversation-work.py"
 ```
 
-It adds three worktrees of the fixture project under `.worktrees/`, gives the
+It adds four worktrees of the fixture project under `.worktrees/`, gives the
 project the remote `https://github.com/octo-org/fixture-app`, turns the
-[forge](#an-offline-github) on with five seeded pull requests, and writes
+[forge](#an-offline-github) on with six seeded pull requests, and writes
 [`conversation-work/frames.jsonl`](../tests/fixtures/conversation-work/frames.jsonl)
 as the provider's `fixture-frames.jsonl`, with this fixture's paths. Its turn
 replays Claude Code `Edit` and `Bash` calls and their output, in the shape
@@ -127,6 +127,7 @@ Claude Code records them:
 | --- | --- | --- |
 | #41 Key the response cache by locale, **Created**, worktree `fix/cache-key` | edited it, committed, pushed and ran `gh pr create`, then left a test uncommitted | open; checks build passed, lint failed, test running |
 | #38 Bound the retry budget, **Pushed**, worktree `feat/retry-budget` | edited it, committed and pushed its branch | open, approved, every check passed |
+| #44 Count cache misses per locale, **Pushed**, worktree `feat/cache-metrics` | edited it, committed and pushed its branch | merged after `main` was merged into it on GitHub, so its head there is not the worktree's commit; the worktree is shown on its row |
 | #35 Drop the legacy cache flag, **Updated** | `gh pr merge 35` | merged |
 | `docs/locale-notes`, a worktree with no pull request | edited `docs/locales.md`, uncommitted | |
 | #12 and #29, **Mentioned** | named by URL and by `#29` in prose | merged; closed |
