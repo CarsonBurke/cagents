@@ -458,19 +458,29 @@ fn invalid(message: impl Into<String>) -> UpdateError {
 /// macOS cannot hand a running daemon's sessions to another version yet, so
 /// an installation there updates only through its installer, which a person
 /// runs once the daemon has stopped. The app finds a newer release and says
-/// so; it never stops the daemon or installs a release itself.
-fn installer_updates() -> String {
+/// so; it never stops the daemon or installs a release itself. The command
+/// ends the text, so it can be copied whole: for a verified release it runs
+/// that release's own installer for that version.
+fn installer_updates(version: Option<&str>) -> String {
+    let command = match version {
+        Some(version) => format!(
+            "curl -fsSL {}/download/v{version}/install-macos.sh | sh -s -- --version {version}",
+            feed::PUBLIC_FEED
+        ),
+        None => format!(
+            "curl -fsSL {}/latest/download/install-macos.sh | sh",
+            feed::PUBLIC_FEED
+        ),
+    };
     format!(
-        "On macOS, update cagents by running its installer again from a system terminal: \
-         curl -fsSL {}/latest/download/install-macos.sh | sh. \
-         It says how to stop the running daemon first.",
-        feed::PUBLIC_FEED
+        "On macOS, update cagents by running its installer again from a system terminal. \
+         It says how to stop the running daemon first. Run:\n\n{command}"
     )
 }
 
-fn installer_updates_only() -> Result<(), UpdateError> {
+fn installer_updates_only(version: Option<&str>) -> Result<(), UpdateError> {
     if cfg!(target_os = "macos") {
-        return Err(invalid(installer_updates()));
+        return Err(invalid(installer_updates(version)));
     }
     Ok(())
 }
@@ -540,7 +550,7 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
             reason: format!(
                 "cagents {} is available. {}",
                 release.version,
-                installer_updates()
+                installer_updates(Some(&release.version))
             ),
         },
         Some(release) => UpdateState::Available {
@@ -614,7 +624,7 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
             "a native evidence session never installs a release",
         ));
     }
-    installer_updates_only()?;
+    installer_updates_only(Some(&release.version))?;
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
@@ -634,7 +644,7 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
 }
 
 fn apply_installed_from(window_candidate: Option<&Path>) -> Result<UpdateJob, UpdateError> {
-    installer_updates_only()?;
+    installer_updates_only(None)?;
     recovery::inspect_pending_current()?;
     let mut installation = running_installation()?;
     let layout = locate(&crate::process::current_executable()?)?;
@@ -762,9 +772,27 @@ pub fn upgrade_release(
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
-    installer_updates_only()?;
+    if cfg!(target_os = "macos") {
+        // Offer the installer command for the release, once it is verified.
+        let selected = selected_upgrade(&Installation::detect()?, version)?;
+        return Err(invalid(installer_updates(Some(&selected.version))));
+    }
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
+    let selected = selected_upgrade(&installation, version)?;
+    if cancellation::requested() {
+        return Err(UpdateError::Cancelled);
+    }
+    let initial = start_job(
+        &installation,
+        &selected.version,
+        &UpdateRequest::ReleaseFromTerminal(selected.clone()),
+    )?;
+    drive_terminal_review(initial, yes, interrupt)
+}
+
+/// The verified release `version`, when it is newer than `installation`.
+fn selected_upgrade(installation: &Installation, version: &str) -> Result<Release, UpdateError> {
     let parsed = stable_version(version)?;
     let selected = feed::Feed::configured()
         .map_err(invalid)?
@@ -776,15 +804,7 @@ pub fn upgrade_release(
             "selected release is not newer than the running installation",
         ));
     }
-    if cancellation::requested() {
-        return Err(UpdateError::Cancelled);
-    }
-    let initial = start_job(
-        &installation,
-        &selected.version,
-        &UpdateRequest::ReleaseFromTerminal(selected.clone()),
-    )?;
-    drive_terminal_review(initial, yes, interrupt)
+    Ok(selected)
 }
 
 /// Inspect retained preparation before constructing a new update census.
@@ -3731,9 +3751,9 @@ fn bounded_command(
             }
             thread::sleep(Duration::from_millis(20));
         }
-        seal_file(&file)?;
+        let mut file = seal_file(file)?;
         file.seek(SeekFrom::Start(0))?;
-        Ok(())
+        Ok(file)
     })();
     // Keep the original leader unreaped through failed status and sealing/seek
     // errors, since each still needs original-group cleanup. Success preserves
@@ -3745,8 +3765,8 @@ fn bounded_command(
             cleanup,
         }),
         (Err(operation), Ok(())) => Err(operation),
-        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
-        (Ok(()), Ok(())) => Ok(file),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+        (Ok(file), Ok(())) => Ok(file),
     }
 }
 
@@ -3902,22 +3922,24 @@ fn anonymous_file() -> io::Result<File> {
 fn anonymous_file() -> io::Result<File> {
     Err(io::Error::other("self-update requires Linux or macOS"))
 }
+/// The file `anonymous_file` made, its bytes fixed from here on: every later
+/// write, truncation or resize through the returned file fails.
 #[cfg(target_os = "linux")]
-fn seal_file(file: &File) -> io::Result<()> {
+fn seal_file(file: File) -> io::Result<File> {
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(file)
 }
 /// Darwin has no seals, and no file flag refuses writes through a descriptor
-/// already open for them. Sealing instead points this descriptor at a
-/// read-only clone of the bytes written so far, so every later write or
-/// truncation through it fails, as on a sealed memfd. On APFS the clone
-/// shares the file's blocks; elsewhere the bytes are copied. The clone is
-/// unlinked at once and lives only as long as the descriptor.
+/// already open for them. Sealing instead returns a read-only descriptor of
+/// a clone of the bytes written so far, so every later write or truncation
+/// through it fails, as on a sealed memfd. On APFS the clone shares the
+/// file's blocks; elsewhere the bytes are copied. The clone is unlinked at
+/// once and lives only as long as the returned file.
 #[cfg(target_os = "macos")]
-fn seal_file(file: &File) -> io::Result<()> {
+fn seal_file(file: File) -> io::Result<File> {
     use std::os::unix::fs::FileExt;
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("sealed");
@@ -3954,24 +3976,14 @@ fn seal_file(file: &File) -> io::Result<()> {
             }
         }
     }
-    let sealed = OpenOptions::new()
+    // Opened close-on-exec, as the writable file was.
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC)
-        .open(&path)?;
-    drop(directory);
-    // SAFETY: both descriptors are open; dup2 replaces the one `file` owns
-    // with the read-only clone, keeping its number.
-    if unsafe { libc::dup2(sealed.as_raw_fd(), file.as_raw_fd()) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // dup2 clears close-on-exec on the descriptor it replaces.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+        .open(&path)
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn seal_file(_: &File) -> io::Result<()> {
+fn seal_file(_: File) -> io::Result<File> {
     Err(io::Error::other("self-update requires Linux or macOS"))
 }
 
@@ -4026,10 +4038,16 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 mod tests {
     #[test]
     fn only_macos_sends_updates_to_its_installer() {
-        let refusal = installer_updates_only();
-        assert_eq!(refusal.is_err(), cfg!(target_os = "macos"));
-        assert!(installer_updates().contains(
-            "curl -fsSL https://github.com/CarsonBurke/cagents/releases/latest/download/install-macos.sh | sh."
+        assert_eq!(
+            installer_updates_only(None).is_err(),
+            cfg!(target_os = "macos")
+        );
+        // Each command ends the text, so copying it takes nothing else.
+        assert!(installer_updates(Some("0.2.5")).ends_with(
+            "\n\ncurl -fsSL https://github.com/CarsonBurke/cagents/releases/download/v0.2.5/install-macos.sh | sh -s -- --version 0.2.5"
+        ));
+        assert!(installer_updates(None).ends_with(
+            "\n\ncurl -fsSL https://github.com/CarsonBurke/cagents/releases/latest/download/install-macos.sh | sh"
         ));
     }
 
@@ -5237,7 +5255,7 @@ finally:
             fallback_marker.display(),
         )
         .unwrap();
-        seal_file(&candidate_bytes).unwrap();
+        let candidate_bytes = seal_file(candidate_bytes).unwrap();
         let staged = candidate::Staged::from_file(
             candidate_bytes,
             "new".into(),
@@ -5437,7 +5455,7 @@ finally:
     fn tampered_bytes_fail_and_verified_bytes_cannot_change() {
         let mut file = anonymous_file().unwrap();
         file.write_all(b"trusted archive").unwrap();
-        seal_file(&file).unwrap();
+        let mut file = seal_file(file).unwrap();
         let trusted: [u8; 32] = Sha256::digest(b"trusted archive").into();
         verify_digest(&mut file, &trusted).unwrap();
         assert!(file.write_all(b"tamper").is_err());

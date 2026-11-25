@@ -195,7 +195,7 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         let mut archive = anonymous_file().unwrap();
         archive.write_all(&bytes).unwrap();
-        seal_file(&archive).unwrap();
+        let mut archive = seal_file(archive).unwrap();
         verify_digest(&mut archive, &digest).unwrap();
         let asset = Asset {
             name: "fixture".into(),
