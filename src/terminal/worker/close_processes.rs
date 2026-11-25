@@ -588,7 +588,8 @@ fn session_members(session: libc::pid_t, deadline: Instant) -> Result<Vec<CloseP
     let mut members = Vec::new();
     // getsid observes active session membership even across UIDs. Unrelated
     // processes do not need the destructive census's stronger identity reads.
-    for pid in crate::process::table::list_all().map_err(|error| error.to_string())? {
+    let mut pids = crate::process::table::list_all().map_err(|error| error.to_string())?;
+    for &pid in &pids {
         check_deadline(deadline)?;
         let pid = pid as libc::pid_t;
         // SAFETY: getsid takes a positive PID from the process table.
@@ -604,10 +605,22 @@ fn session_members(session: libc::pid_t, deadline: Instant) -> Result<Vec<CloseP
             continue;
         }
         match read_process(pid) {
-            Ok(process) => members.push(process),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(process) if process.session == session && process.state != b'Z' => {
+                members.push(process);
+            }
+            // A member that departed after the initial list might have
+            // forked a successor. A fresh census must account for it.
+            Ok(_) => return Err(changed().to_string()),
             Err(error) => return Err(error.to_string()),
         }
+    }
+    // Even a member that exited before getsid could have forked after the
+    // first list. Verify the PID set before accepting the observation.
+    let mut current = crate::process::table::list_all().map_err(|error| error.to_string())?;
+    pids.sort_unstable();
+    current.sort_unstable();
+    if pids != current {
+        return Err(changed().to_string());
     }
     check_deadline(deadline)?;
     Ok(members)
