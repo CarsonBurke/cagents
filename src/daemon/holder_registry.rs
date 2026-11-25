@@ -73,8 +73,8 @@ impl Process {
                 .is_none_or(|(_, start)| start != self.start)
     }
 
-    /// As on Linux. A pin never opens on a zombie, so one that opens and
-    /// started when this identity did names the process still running.
+    /// As on Linux. A pin refuses a process that has already exited, a zombie
+    /// included, and the start ticks tell a later process holding the pid.
     #[cfg(all(feature = "host", target_os = "macos"))]
     pub(crate) fn exited(&self) -> bool {
         u32::try_from(self.pid)

@@ -40,6 +40,7 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
         }
         let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
             as libc::socklen_t;
+        let refusing_since = Instant::now();
         loop {
             remaining(deadline)?;
             let descriptor = crate::descriptor::unix_socket(libc::SOCK_STREAM, true)?;
@@ -57,14 +58,11 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
                         std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(5)));
                         continue;
                     }
-                    // Darwin refuses a connection to a full backlog with the
-                    // ECONNREFUSED it gives a socket nobody listens on, so
-                    // there a refusal does not prove the holder is gone.
-                    // Retry it as Linux retries EAGAIN: a busy holder is still
-                    // reached, and a dead one fails at the deadline instead of
-                    // at once.
-                    #[cfg(target_os = "macos")]
-                    Some(libc::ECONNREFUSED) => {
+                    // Darwin answers a full backlog with the refusal it
+                    // gives a socket nobody listens on; see `retry_refusal`.
+                    Some(libc::ECONNREFUSED)
+                        if crate::descriptor::retry_refusal(&error, refusing_since) =>
+                    {
                         drop(descriptor);
                         std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(5)));
                         continue;

@@ -187,6 +187,13 @@ const LISTENER_LIMITS: ListenerLimits = ListenerLimits {
 
 /// A process of the launched server blocked waiting for a file lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    target_os = "macos",
+    allow(
+        dead_code,
+        reason = "Darwin never observes a lock wait; see `launched_lock_wait`"
+    )
+)]
 struct LockWait {
     /// The process holding the lock, when the kernel reports one.
     holder: Option<i32>,

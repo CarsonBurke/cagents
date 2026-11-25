@@ -8153,18 +8153,15 @@ mod tests {
         path: &Path,
     ) -> (std::os::unix::net::UnixListener, Vec<UnixStream>) {
         let listener = crate::descriptor::bind(path).unwrap();
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
-        let pending = (0..2)
-            .map(|_| connect_control_socket(path, Duration::from_millis(100)).unwrap())
-            .collect();
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let pending = vec![connect_control_socket(path, Duration::from_millis(100)).unwrap()];
         (listener, pending)
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
-    )]
     fn control_socket_backlog_pressure_times_out_without_replacing_the_endpoint() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
@@ -8181,10 +8178,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
-    )]
     fn control_socket_retry_connects_and_handshakes_when_the_backlog_drains() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");

@@ -137,9 +137,11 @@ pub(crate) fn unix_socket(kind: libc::c_int, nonblocking: bool) -> io::Result<Ow
 /// with the same `ECONNREFUSED`. A live listener drains its backlog as it
 /// accepts, so there a refusal counts only once it has persisted for
 /// [`REFUSAL_WINDOW`]. That is weaker than Linux: a listener whose backlog
-/// stays full for the whole window is taken for one that stopped. A caller
-/// that never turns a refusal into such a conclusion should instead retry
-/// Darwin's refusals until its own deadline, as Linux callers retry `EAGAIN`.
+/// stays full for the whole window is taken for one that stopped. Retrying
+/// until a caller's own deadline instead, as Linux retries `EAGAIN`, would
+/// make every request to a crashed server, whose socket file stays behind,
+/// wait out that whole deadline. A deadline that ends inside the window
+/// leaves the refusal unproved, so the caller reports a timeout, not absence.
 pub(crate) fn retry_refusal(error: &io::Error, refusing_since: std::time::Instant) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -160,7 +162,7 @@ pub(crate) const REFUSAL_WINDOW: std::time::Duration = std::time::Duration::from
 /// A listen backlog that admits exactly one pending connection, so a test can
 /// fill it with one. Linux admits one more than the backlog; XNU admits the
 /// backlog itself, and replaces a backlog of 0 with its default.
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 pub(crate) const ONE_PENDING_BACKLOG: libc::c_int = if cfg!(target_os = "macos") { 1 } else { 0 };
 
 /// Connects a Unix-domain stream to `path`; see [`keep_options_after_shutdown`].
