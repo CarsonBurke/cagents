@@ -29,6 +29,19 @@ class MarkdownTest {
         )
     }
 
+    @Test
+    fun readsWindowsAndOldMacLineEndings() {
+        assertEquals(
+            listOf(
+                MarkdownBlock.Heading(1, "Title"),
+                MarkdownBlock.Paragraph("one\ntwo"),
+                MarkdownBlock.Code("x\ny"),
+                MarkdownBlock.Paragraph("end"),
+            ),
+            markdownBlocks("# Title\r\none\rtwo\r\n\r\n```\r\nx\ry\r\n```\r\nend\r\n"),
+        )
+    }
+
     private val samples = listOf(
         "## Result\nThe build passes.\nAll green.\n\n```rust\nfn main() {}\n```\nDone.",
         "Intro line\n# Heading right after\nMore text\n\n\n  ```\nindented fence\n\nwith a blank line\n  ```\nAfter.\n",
