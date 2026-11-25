@@ -18,6 +18,8 @@ pub(super) struct State {
     /// Whether this window runs from an installation tree, the only place an
     /// install can leave it behind.
     watch_installation: bool,
+    discovery_watch: usize,
+    discovery_watch_failed: bool,
     #[cfg(feature = "development")]
     watch_review_fixture: bool,
     inspecting: bool,
@@ -135,6 +137,7 @@ pub enum Action {
     StartApply,
     Applied(Result<UpdateJob, String>),
     ProgressWatch(String, bool),
+    DiscoveryWatchFailed(usize),
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
     InspectInstallation,
@@ -142,26 +145,23 @@ pub enum Action {
     Restart,
 }
 
-#[derive(Hash)]
+#[derive(Clone, Hash)]
 enum ProgressScope {
-    Installation,
+    Installation(usize),
     Job(String),
 }
 
 fn watch_progress(scope: &ProgressScope) -> impl iced::futures::Stream<Item = Action> + use<> {
-    let job = match scope {
-        ProgressScope::Installation => None,
-        ProgressScope::Job(job) => Some(job.clone()),
-    };
+    let scope = scope.clone();
     iced::stream::channel(1, async move |mut output| {
-        let active_job = job.is_some();
+        let active_job = matches!(scope, ProgressScope::Job(_));
         if let Ok(Ok(changes)) =
             tokio::task::spawn_blocking(move || crate::update::progress::Changes::watch(active_job))
                 .await
         {
-            let registered = match &job {
-                Some(job) => Action::ProgressWatch(job.clone(), true),
-                None => Action::Poll,
+            let registered = match &scope {
+                ProgressScope::Job(job) => Action::ProgressWatch(job.clone(), true),
+                ProgressScope::Installation(_) => Action::Poll,
             };
             if output.send(registered).await.is_err() {
                 return;
@@ -172,11 +172,12 @@ fn watch_progress(scope: &ProgressScope) -> impl iced::futures::Stream<Item = Ac
                 }
             }
         }
-        if let Some(job) = job {
-            let _ = output.send(Action::ProgressWatch(job, false)).await;
-        }
-        // Keep the fallback active for the rest of this job if its file
-        // watcher could not be registered or disconnected.
+        let failed = match scope {
+            ProgressScope::Job(job) => Action::ProgressWatch(job, false),
+            ProgressScope::Installation(attempt) => Action::DiscoveryWatchFailed(attempt),
+        };
+        let _ = output.send(failed).await;
+        // Use the job's fallback or rearm passive discovery on the next focus.
         std::future::pending::<()>().await;
     })
 }
@@ -770,8 +771,11 @@ impl Cagents {
             #[cfg(feature = "development")]
             let watch_worker = watch_worker || self.update_ui.watch_review_fixture;
             let worker = if watch_worker {
-                Subscription::run_with(ProgressScope::Installation, watch_progress)
-                    .map(Message::UpdateUi)
+                Subscription::run_with(
+                    ProgressScope::Installation(self.update_ui.discovery_watch),
+                    watch_progress,
+                )
+                .map(Message::UpdateUi)
             } else {
                 Subscription::none()
             };
@@ -782,6 +786,9 @@ impl Cagents {
 
     /// Focus returning is when a stale window is about to be used again.
     pub(super) fn installation_focus_regained(&mut self) -> Task<Message> {
+        if std::mem::take(&mut self.update_ui.discovery_watch_failed) {
+            self.update_ui.discovery_watch = self.update_ui.discovery_watch.wrapping_add(1);
+        }
         // A first look that failed for a passing reason (a descriptor limit,
         // an unreadable marker) must not blind the window for good. A source
         // build stays off: it is never inside an installation tree.
@@ -1149,6 +1156,12 @@ impl Cagents {
                         self.status = Some(TransientNotice::error(error.clone()));
                         self.update_ui.error = Some(error);
                     }
+                }
+                Task::none()
+            }
+            Action::DiscoveryWatchFailed(attempt) => {
+                if self.update_ui.discovery_watch == attempt {
+                    self.update_ui.discovery_watch_failed = true;
                 }
                 Task::none()
             }
