@@ -40,9 +40,9 @@ use std::{
 /// The credentials the kernel recorded for the other end of a local socket
 /// when it connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PeerCredentials {
-    pub(crate) uid: u32,
-    pub(crate) pid: u32,
+pub struct PeerCredentials {
+    pub uid: u32,
+    pub pid: u32,
 }
 
 /// The peer's credentials, as the kernel recorded them at `connect` time.
@@ -52,7 +52,7 @@ pub(crate) struct PeerCredentials {
 /// Returns the underlying error when the socket cannot be queried, and
 /// `InvalidData` when the kernel's answer is not the expected record.
 #[cfg(target_os = "linux")]
-pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
+pub fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
     // SAFETY: all-zero bytes are a valid `ucred`, which getsockopt overwrites.
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
     let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
@@ -100,7 +100,7 @@ pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredential
 /// Returns the underlying error when the socket cannot be queried, and
 /// `InvalidData` when the kernel's answer is not the expected record.
 #[cfg(target_os = "macos")]
-pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
+pub fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
     let uid = peer_uid(stream)?;
     let mut pid: libc::pid_t = 0;
     let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::pid_t>())
@@ -190,6 +190,20 @@ pub(crate) fn handed_end_peer<T>(creator: T, recipient: T) -> T {
         let _ = creator;
         recipient
     }
+}
+
+/// A file a process holds open, as the kernel reports its descriptor.
+#[cfg(all(target_os = "macos", feature = "host"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFile {
+    /// The path the kernel last knew the file by.
+    pub path: PathBuf,
+    /// The file's device, as `MetadataExt::dev` reports it.
+    pub device: u64,
+    /// The file's inode.
+    pub inode: u64,
+    /// Whether the descriptor was opened for writing.
+    pub writable: bool,
 }
 
 /// One process, pinned when it was opened.
@@ -375,6 +389,29 @@ impl PinnedProcess {
     /// describe a successor.
     pub(crate) fn holds_open(&self, expected: &Metadata) -> io::Result<bool> {
         self.while_running(self.pin.holds_open(self.pid, expected))
+    }
+
+    /// The arguments the pinned process was started with, each followed by a
+    /// NUL, the program first: what Linux's `/proc/<pid>/cmdline` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when the process has exited, so the answer can never
+    /// describe a successor.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn command_line(&self) -> io::Result<Vec<u8>> {
+        self.while_running(imp::command_line(self.pid))
+    }
+
+    /// The files the pinned process holds open.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when the process has exited, so the answer can never
+    /// describe a successor.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn open_files(&self) -> io::Result<Vec<OpenFile>> {
+        self.while_running(imp::open_files(self.pid))
     }
 
     /// Whether `other` pins the same process as this pin. Both must still be
@@ -793,6 +830,142 @@ mod imp {
     struct VnodeFdInfo {
         pfi: ProcFileInfo,
         pvi: libc::vnode_info,
+    }
+
+    /// `PROC_PIDFDVNODEPATHINFO` from `<sys/proc_info.h>`.
+    #[cfg(feature = "host")]
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    /// `FWRITE` from `<sys/fcntl.h>`, as `fi_openflags` reports it.
+    #[cfg(feature = "host")]
+    const FWRITE: u32 = 0x2;
+
+    /// `struct vnode_fdinfowithpath` from `<sys/proc_info.h>`.
+    #[cfg(feature = "host")]
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+
+    /// The files behind `pid`'s descriptors. A descriptor closed after the
+    /// list was read has nothing to report and is left out, as Linux leaves
+    /// out a `/proc/<pid>/fd` link that no longer reads.
+    #[cfg(feature = "host")]
+    pub(super) fn open_files(pid: u32) -> io::Result<Vec<OpenFile>> {
+        use std::os::unix::ffi::OsStrExt;
+        let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfoWithPath>())
+            .expect("vnode_fdinfowithpath fits c_int");
+        let mut files = Vec::new();
+        for descriptor in descriptors(pid)? {
+            if descriptor.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+                continue;
+            }
+            // SAFETY: all-zero bytes are a valid `vnode_fdinfowithpath`.
+            let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+            // SAFETY: the buffer is writable and exactly `size` bytes.
+            let written = unsafe {
+                libc::proc_pidfdinfo(
+                    pid as libc::c_int,
+                    descriptor.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    (&raw mut info).cast(),
+                    size,
+                )
+            };
+            if written != size {
+                continue;
+            }
+            let path: Vec<u8> = info
+                .pvip
+                .vip_path
+                .as_flattened()
+                .iter()
+                .map(|&byte| byte as u8)
+                .take_while(|&byte| byte != 0)
+                .collect();
+            let stat = &info.pvip.vip_vi.vi_stat;
+            files.push(OpenFile {
+                path: PathBuf::from(std::ffi::OsStr::from_bytes(&path)),
+                device: stat.vst_dev as i32 as u64,
+                inode: stat.vst_ino,
+                writable: info.pfi.fi_openflags & FWRITE != 0,
+            });
+        }
+        Ok(files)
+    }
+
+    /// `pid`'s arguments as `KERN_PROCARGS2` reports them, each followed by a
+    /// NUL. The record is the argument count, the executable path, NUL
+    /// padding, then the arguments and the environment, each NUL-terminated.
+    #[cfg(feature = "host")]
+    pub(super) fn command_line(pid: u32) -> io::Result<Vec<u8>> {
+        let pid =
+            libc::c_int::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::NotFound))?;
+        let mut maximum: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>();
+        let mut name = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: the name is two valid integers and the output is one c_int,
+        // whose size `length` gives.
+        if unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                2,
+                (&raw mut maximum).cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut record = vec![0_u8; usize::try_from(maximum).unwrap_or(0).max(4)];
+        let mut length = record.len();
+        let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: the name is three valid integers, and the buffer is
+        // writable for `length` bytes, which the kernel writes at most.
+        if unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                3,
+                record.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(vanished(io::Error::last_os_error()));
+        }
+        record.truncate(length);
+        arguments_from_record(&record).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the kernel returned a malformed argument record",
+            )
+        })
+    }
+
+    /// The arguments in a `KERN_PROCARGS2` record, each followed by a NUL.
+    #[cfg(feature = "host")]
+    pub(super) fn arguments_from_record(record: &[u8]) -> Option<Vec<u8>> {
+        let count = usize::try_from(i32::from_ne_bytes(record.get(..4)?.try_into().ok()?)).ok()?;
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let rest = record.get(4..)?;
+        let executable_end = rest.iter().position(|&byte| byte == 0)?;
+        let rest = &rest[executable_end..];
+        let first = rest.iter().position(|&byte| byte != 0)?;
+        let mut arguments = &rest[first..];
+        let mut command_line = Vec::new();
+        for _ in 0..count {
+            let end = arguments.iter().position(|&byte| byte == 0)?;
+            command_line.extend_from_slice(&arguments[..=end]);
+            arguments = &arguments[end + 1..];
+        }
+        Some(command_line)
     }
 
     /// When a process started, in `mach_absolute_time` ticks since boot, which
@@ -1626,6 +1799,65 @@ mod tests {
         assert_eq!(
             peer_credentials(&ours).unwrap_err().raw_os_error(),
             Some(libc::ENOTCONN)
+        );
+    }
+
+    /// The pinned process's arguments read as Linux's `/proc/<pid>/cmdline`
+    /// holds them, and its open files with the access each was opened for.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    #[test]
+    fn a_pinned_process_reports_its_arguments_and_open_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let written = directory.path().join("written");
+        let read = directory.path().join("read");
+        std::fs::write(&read, b"").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 8>\"$1\" 9<\"$2\"; exec sleep 30")
+            .arg("sh")
+            .arg(&written)
+            .arg(&read)
+            .spawn()
+            .unwrap();
+        let process = PinnedProcess::open(child.id()).unwrap();
+        settled(&process);
+        assert_eq!(process.command_line().unwrap(), b"sleep\x0030\x00");
+        let files = process.open_files().unwrap();
+        let find = |path: &std::path::Path| {
+            let expected = std::fs::metadata(path).unwrap();
+            files
+                .iter()
+                .find(|file| file.device == expected.dev() && file.inode == expected.ino())
+                .cloned()
+                .unwrap_or_else(|| panic!("{} is not among {files:?}", path.display()))
+        };
+        let (written_file, read_file) = (find(&written), find(&read));
+        assert!(written_file.writable && !read_file.writable);
+        assert_eq!(
+            written_file.path.file_name(),
+            Some(std::ffi::OsStr::new("written"))
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            process.command_line().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    #[test]
+    fn an_argument_record_yields_only_the_arguments() {
+        let mut record = 2_i32.to_ne_bytes().to_vec();
+        record.extend_from_slice(b"/bin/sleep\0\0\0sleep\x0030\x00HOME=/\0");
+        assert_eq!(
+            imp::arguments_from_record(&record).as_deref(),
+            Some(&b"sleep\x0030\x00"[..])
+        );
+        assert_eq!(imp::arguments_from_record(&record[..10]), None);
+        assert_eq!(
+            imp::arguments_from_record(&0_i32.to_ne_bytes()).as_deref(),
+            Some(&b""[..])
         );
     }
 }
