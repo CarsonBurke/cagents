@@ -191,6 +191,22 @@ RECORD = r"""#!/bin/bash
 echo "$(basename "$0") $*" >> "$FIXTURE/calls.log"
 """
 
+# A commit's scripts/package-macos, run on the stand-in Mac from an export of
+# the commit: it records how it was called and writes the three macOS files.
+PACKAGE_MACOS = r"""#!/bin/bash
+set -euo pipefail
+[[ $1 == --output ]] || exit 98
+root=$(cd "$(dirname "$0")/.." && pwd)
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n1)
+echo "package-macos $version epoch=$SOURCE_DATE_EPOCH target=$CARGO_TARGET_DIR git=$([[ -e $root/.git ]] && echo yes || echo no)" \
+    >> "$FIXTURE/calls.log"
+mkdir -p "$2" && cd "$2"
+printf 'macOS archive %s\n' "$version" > "cagents-$version-aarch64-apple-darwin.tar.gz"
+printf "#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n" > install-macos.sh
+sha256sum "cagents-$version-aarch64-apple-darwin.tar.gz" install-macos.sh > SHA256SUMS-macos
+[[ ! -e $FIXTURE/macos-damaged ]] || echo damaged >> install-macos.sh
+"""
+
 SIGN = r"""#!/bin/bash
 echo "ssh-keygen $*" >> "$FIXTURE/calls.log"
 [[ ! -e $FIXTURE/sign-fails ]] || exit 255
@@ -820,6 +836,39 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("needs no version bump", result.stdout)
         self.assertFalse(any(line.startswith("pr ") for line in self.log("gh.log")))
 
+
+    def test_cut_with_a_mac_carries_the_macos_release_built_from_the_commit(self):
+        # A commit from before the macOS packaging cannot build it.
+        self.bundle(self.fix)
+        result = self.release("cut", "--commit", self.fix, "--macos-host", "mac")
+        self.assertIn("has no scripts/package-macos", result.stderr)
+        self.assertFalse((self.root / "bundles/0.2.4").exists())
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        macos = self.commit("feat(release): build the macOS release")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(macos)
+        result = self.release("cut", "--commit", macos, "--macos-host", "mac")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundle = self.root / "bundles/0.2.4"
+        archive = "cagents-0.2.4-aarch64-apple-darwin.tar.gz"
+        self.assertEqual((bundle / archive).read_text(), "macOS archive 0.2.4\n")
+        metadata = json.loads((bundle / "release-metadata.json").read_text())
+        self.assertEqual(metadata["targets"][1]["products"]["cagents"]["archive"], archive)
+        self.assertIn("SHA256SUMS-macos", metadata["assets"])
+        epoch = self.git("show", "-s", "--format=%ct", macos)
+        target = self.host / "Library/Caches/cagents-release/target"
+        self.assertIn(f"package-macos 0.2.4 epoch={epoch} target={target} git=no", self.log("calls.log"))
+        # Only the Cargo target stays on the Mac.
+        self.assertEqual([path.name for path in (self.host / "Library/Caches/cagents-release").iterdir()
+                          if path.name != "target"], [])
+        # Bytes that do not match their checksums are refused, and leave the earlier cut.
+        (self.root / "macos-damaged").touch()
+        result = self.release("cut", "--commit", macos, "--macos-host", "mac", stdin="y\n")
+        self.assertIn("does not match its checksums", result.stderr)
+        self.assertEqual(json.loads((bundle / "release-metadata.json").read_text()), metadata)
+        # Actions builds no macOS release, so it is not silently left out.
+        refused = self.release("cut", "--actions", "--macos-host", "mac")
+        self.assertIn("builds no macOS release", refused.stderr)
 
     def test_cut_for_actions_tags_the_chosen_commit_and_copies_and_signs_nothing(self):
         self.bundle(self.fix)

@@ -1,0 +1,93 @@
+#!/bin/sh
+# Installs a macOS release archive into a private HOME and prefix with
+# install-macos.sh, checks what it installed, reinstalls it, and removes it.
+#
+#   packaging/macos/smoke DIST VERSION PROTOCOL
+#
+# The login item is written but never loaded (--no-start), and the private
+# XDG_RUNTIME_DIR keeps the installer's daemon checks away from any daemon
+# this user runs.
+set -eu
+
+PROGRAM=smoke
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+[ "$#" = 3 ] || fail 'usage: smoke DIST VERSION PROTOCOL'
+DIST=$1 VERSION=$2 PROTOCOL=$3
+ARCHIVE=$DIST/cagents-$VERSION-aarch64-apple-darwin.tar.gz
+
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cagents-macos-smoke.XXXXXX")
+trap 'unregister 2>/dev/null; rm -rf "$ROOT"' EXIT
+trap 'exit 1' HUP INT TERM
+mkdir -p "$ROOT/home" "$ROOT/runtime"
+chmod 0700 "$ROOT/runtime"
+# A path with a space, as the default under Application Support has.
+PREFIX="$ROOT/home/Library/Application Support/cagents-install"
+
+install_release() {
+    env -u CAGENTS_AGENT_AUTHORITY HOME="$ROOT/home" XDG_RUNTIME_DIR="$ROOT/runtime" \
+        CAGENTS_REPOSITORY=CarsonBurke/cagents \
+        CAGENTS_ARCHIVE="$ARCHIVE" CAGENTS_CHECKSUMS="$DIST/SHA256SUMS-macos" \
+        sh "$DIST/install-macos.sh" --prefix "$PREFIX" "$@"
+}
+
+install_release --no-start > "$ROOT/install.log" 2>&1 || { cat "$ROOT/install.log" >&2; fail 'install failed'; }
+[ "$(readlink "$PREFIX/current")" = "versions/$VERSION" ] || fail 'current does not name the release'
+[ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] || fail 'the install root marker is missing'
+[ "$(readlink "$ROOT/home/.local/bin/cagents")" = "$PREFIX/current/bin/cagents" ] || fail 'the cagents command link is wrong'
+[ "$(readlink "$ROOT/home/Applications/Cagents.app")" = "$PREFIX/Cagents.app" ] || fail 'the Applications link is wrong'
+[ "$("$ROOT/home/.local/bin/cagents" --version)" = "cagents $VERSION" ] || fail 'the linked command reports another version'
+[ "$("$ROOT/home/.local/bin/cagents" daemon protocol-version)" = "$PROTOCOL" ] || fail 'the installed daemon protocol differs'
+codesign --verify --strict "$PREFIX/Cagents.app" || fail 'the installed Cagents.app signature is broken'
+# The launcher execs the served version's UI with its arguments, which
+# answers --version without opening a window.
+[ "$("$PREFIX/Cagents.app/Contents/MacOS/Cagents" --version)" = "cagents-ui $VERSION" ] \
+    || fail 'the Cagents.app launcher does not reach the installed cagents-ui'
+AGENT="$ROOT/home/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist"
+plutil -lint -s "$AGENT" || fail 'the login item is not a valid property list'
+[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT")" = "$PREFIX/versions/$VERSION/bin/cagents" ] \
+    || fail 'the login item does not run the version by its real path'
+[ "$(/usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$AGENT")" = true ] || fail 'the login item does not run at load'
+[ -z "$(find "$PREFIX" -xattrname com.apple.quarantine -print 2>/dev/null)" ] || fail 'installed files carry quarantine'
+
+# The daemon, started and stopped through the command link as a person
+# would, in the private runtime directory. On macOS an executable sees the
+# path it was started by, so this needs the CLI to find its companions by
+# its real path (process::current_executable). Until that lands, a failure
+# here is expected and reported, and a pass says to make it required.
+DAEMON_THROUGH_LINK_REQUIRED=0
+cli() {
+    env -u CAGENTS_AGENT_AUTHORITY HOME="$ROOT/home" XDG_RUNTIME_DIR="$ROOT/runtime" "$ROOT/home/.local/bin/cagents" "$@"
+}
+if cli daemon start > "$ROOT/daemon.log" 2>&1 \
+        && cli --no-start daemon status --json > "$ROOT/status.json" 2>> "$ROOT/daemon.log" \
+        && grep -q '"running": *true' "$ROOT/status.json"; then
+    cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started through the link'
+    [ "$DAEMON_THROUGH_LINK_REQUIRED" = 1 ] \
+        || printf '%s: the daemon now starts through the command link; set DAEMON_THROUGH_LINK_REQUIRED=1\n' "$PROGRAM" >&2
+else
+    cli --no-start daemon stop > /dev/null 2>&1 || :
+    if [ "$DAEMON_THROUGH_LINK_REQUIRED" = 1 ]; then
+        cat "$ROOT/daemon.log" >&2
+        fail 'the daemon does not start and stop through the command link'
+    fi
+    printf '%s: expected failure: the daemon does not yet start through the command link (process::current_executable)\n' \
+        "$PROGRAM" >&2
+fi
+
+# Running the launcher registered the private bundle with Launch Services,
+# which is per account; take it back so the account's own stays the one.
+unregister() {
+    "$LSREGISTER" -u "$PREFIX/Cagents.app" >/dev/null 2>&1 || :
+    for copy in "$PREFIX"/versions/*/Cagents.app; do "$LSREGISTER" -u "$copy" >/dev/null 2>&1 || :; done
+}
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+unregister
+install_release --no-start > "$ROOT/reinstall.log" 2>&1 || { cat "$ROOT/reinstall.log" >&2; fail 'reinstalling the same release failed'; }
+install_release --uninstall > "$ROOT/uninstall.log" 2>&1 || { cat "$ROOT/uninstall.log" >&2; fail 'uninstall failed'; }
+[ ! -e "$PREFIX" ] || fail 'uninstall left the prefix behind'
+[ ! -L "$ROOT/home/.local/bin/cagents" ] && [ ! -L "$ROOT/home/Applications/Cagents.app" ] && [ ! -e "$AGENT" ] \
+    || fail 'uninstall left a link or the login item behind'
+printf 'macOS smoke: installed, reinstalled and removed cagents %s\n' "$VERSION"
