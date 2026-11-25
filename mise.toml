@@ -106,6 +106,21 @@ description = "Type-check and lint the dictation helper lane"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.dictate}} "$@"'
 
+[tasks."check:macos:cli"]
+description = "Type-check and lint the control CLI lane for Apple Silicon macOS on the build host, without a Mac"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/check-macos {{vars.cli}} "$@"'
+
+[tasks."check:macos:host"]
+description = "Type-check and lint the terminal daemon lane for Apple Silicon macOS on the build host, without a Mac"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/check-macos {{vars.host}} "$@"'
+
+[tasks."check:macos:ui"]
+description = "Type-check and lint the browserless UI lane for Apple Silicon macOS on the build host, without a Mac"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/check-macos {{vars.ui}} "$@"'
+
 [tasks.check]
 description = "Check that each lane resolves only its own graph, then type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
 usage = 'arg "[unexpected]..." var=#true hide=#true'

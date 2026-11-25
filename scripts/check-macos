@@ -1,0 +1,22 @@
+#!/bin/sh
+# Type-check and lint a lane for Apple Silicon macOS on the Linux build host,
+# without a Mac: Rust cross-checks natively, and scripts/darwin-cc compiles
+# the C that build scripts need. It cannot link or run anything, so behaviour
+# still needs the real Mac.
+#
+#   scripts/check-macos CARGO ARGS...
+#
+# The `mise run check:macos:LANE` tasks pass the lane's arguments from
+# mise.toml's [vars], followed by --all-targets or the caller's own.
+set -eu
+[ "$#" -ge 1 ] || { echo "usage: scripts/check-macos CARGO ARGS... (see mise run check:macos:host)" >&2; exit 2; }
+# Cargo resolves a relative --config path against the directory it runs in,
+# and runs on the build host in that host's copy of this directory, so run
+# from the checkout root, where the wrappers' paths below hold.
+cd "$(dirname "$0")/.."
+exec scripts/cargo-lane clippy --target aarch64-apple-darwin \
+    --config 'env.CC_aarch64_apple_darwin.value="scripts/darwin-cc"' \
+    --config 'env.CC_aarch64_apple_darwin.relative=true' \
+    --config 'env.AR_aarch64_apple_darwin.value="scripts/darwin-ar"' \
+    --config 'env.AR_aarch64_apple_darwin.relative=true' \
+    "$@"
