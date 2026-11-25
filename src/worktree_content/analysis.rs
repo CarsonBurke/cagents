@@ -545,6 +545,7 @@ fn walk(root: &Path, cancellation: &CancellationToken) -> Result<Walk, ContentEr
 /// no longer a directory. The
 /// mount tells apart a bind mount of the same file system; the device, a
 /// Btrfs subvolume, which is no mount. Kernels before 5.8 report no mount.
+#[cfg(target_os = "linux")]
 pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Option<u64>)>> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
@@ -580,6 +581,56 @@ pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Optio
     Ok(Some((
         u64::from(metadata.stx_dev_major),
         u64::from(metadata.stx_dev_minor),
+        mount,
+    )))
+}
+
+/// The device and mount a directory is on, or `None` once it is gone or is
+/// no longer a directory. Darwin gives every volume its own device but has no
+/// mount ID, so the mount is named by where it is mounted: that also tells
+/// apart a mount that shares its parent's device.
+#[cfg(target_os = "macos")]
+pub(super) fn filesystem(path: &Path) -> std::io::Result<Option<(u64, u64, Option<u64>)>> {
+    let vanished = |error: &std::io::Error| {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
+    };
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if vanished(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // A symbolic link is reported as itself, as on Linux; statfs would
+    // describe its target.
+    let mount = if metadata.is_dir() {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let mut status = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: the path is NUL-terminated and the kernel fills the
+        // exclusively borrowed record, which outlives the call.
+        if unsafe { libc::statfs(path.as_ptr(), status.as_mut_ptr()) } < 0 {
+            let error = std::io::Error::last_os_error();
+            return if vanished(&error) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: a successful statfs initialized the record.
+        let status = unsafe { status.assume_init() };
+        // SAFETY: the kernel NUL-terminates the mount point it reports.
+        let mounted_on = unsafe { std::ffi::CStr::from_ptr(status.f_mntonname.as_ptr()) };
+        let digest = Sha256::digest(mounted_on.to_bytes());
+        Some(u64::from_le_bytes(
+            digest[..8].try_into().expect("a SHA-256 digest has eight bytes"),
+        ))
+    } else {
+        None
+    };
+    // `st_dev` is Darwin's 32-bit `dev_t`, widened by the standard library.
+    let device = metadata.dev() as libc::dev_t;
+    Ok(Some((
+        libc::major(device).unsigned_abs().into(),
+        libc::minor(device).unsigned_abs().into(),
         mount,
     )))
 }
