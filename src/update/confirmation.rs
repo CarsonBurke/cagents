@@ -379,6 +379,71 @@ fn wait_with(
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Approval {
+    Required,
+    Granted,
+}
+
+impl Approval {
+    fn covering(confirmed: bool) -> Self {
+        if confirmed {
+            Self::Granted
+        } else {
+            Self::Required
+        }
+    }
+
+    fn publication(self) -> (UpdatePhase, &'static str) {
+        match self {
+            Self::Required => (
+                UpdatePhase::AwaitingConfirmation,
+                "Verified update is ready for review",
+            ),
+            Self::Granted => (
+                UpdatePhase::WaitingForIdle,
+                "Waiting for the confirmed conversations to become idle",
+            ),
+        }
+    }
+}
+
+struct Review {
+    policy: impact::Policy,
+    preview: impact::Preview,
+    nonce: String,
+    approval: Approval,
+}
+
+impl Review {
+    fn new(policy: impact::Policy, preview: impact::Preview, approval: Approval) -> Self {
+        Self {
+            policy,
+            preview,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            approval,
+        }
+    }
+
+    fn observe(&mut self, current: impact::Preview) {
+        if self.preview.preserves_consent(&current) {
+            self.preview = current;
+        } else {
+            *self = Self::new(self.policy, current, Approval::Required);
+        }
+    }
+
+    fn can_finish_review(&self) -> bool {
+        self.approval == Approval::Granted
+            && self.preview.daemon.as_ref().is_none_or(|daemon| {
+                !daemon
+                    .sessions
+                    .iter()
+                    .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
+            })
+    }
+}
+
 fn wait_for(
     state: &Path,
     job: &mut UpdateJob,
@@ -389,20 +454,18 @@ fn wait_for(
 ) -> Result<impact::Preview, UpdateError> {
     let deadline = Instant::now() + lifetime;
     let expires = now_ms().saturating_add(lifetime.as_millis() as u64);
-    let mut policy = reviewed
+    let policy = reviewed
         .as_ref()
         .and_then(|preview| preview.daemon.as_ref())
         .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy);
-    let mut approved = reviewed.is_some();
-    let mut preview = match reviewed {
-        Some(preview) => preview,
-        None => observe(policy)?,
+    let mut review = match reviewed {
+        Some(preview) => Review::new(policy, preview, Approval::Granted),
+        None => Review::new(policy, observe(policy)?, Approval::Required),
     };
-    let mut nonce = uuid::Uuid::new_v4().to_string();
     let mut handoff = None;
     loop {
         if Instant::now() >= deadline {
-            return Err(refused(&preview, true).unwrap_or_else(|| {
+            return Err(refused(&review.preview, true).unwrap_or_else(|| {
                 invalid("Update preview expired without installation; review the update again")
             }));
         }
@@ -414,7 +477,8 @@ fn wait_for(
             // A window's review of blocked work says where it can be stopped.
             // The job's request never changes, so it is read at most once.
             let terminal_command = if !terminal
-                && preview
+                && review
+                    .preview
                     .daemon
                     .as_ref()
                     .is_some_and(impact::DaemonImpact::blocked)
@@ -429,67 +493,58 @@ fn wait_for(
             let confirmation = Confirmation {
                 stop: None,
                 terminal_command,
-                nonce: nonce.clone(),
-                preview: preview.clone(),
+                nonce: review.nonce.clone(),
+                preview: review.preview.clone(),
                 expires_at_unix_ms: expires,
             };
-            publish_review(
-                state,
-                job,
-                confirmation,
-                if approved {
-                    UpdatePhase::WaitingForIdle
-                } else {
-                    UpdatePhase::AwaitingConfirmation
-                },
-                |_| {
-                    Ok(if approved {
-                        "Waiting for the confirmed conversations to become idle".into()
-                    } else {
-                        "Verified update is ready for review".into()
-                    })
-                },
-            )?;
+            let (phase, message) = review.approval.publication();
+            publish_review(state, job, confirmation, phase, |_| Ok(message.to_owned()))?;
         }
         check_review_closed(state, job)?;
-        let path = state.join(format!("{}.{}.decision", job.id, nonce));
+        let path = state.join(format!("{}.{}.decision", job.id, review.nonce));
         match read_private(&path, SMALL_ASSET_LIMIT) {
             Ok(bytes) => {
                 let decision: Decision = serde_json::from_slice(&bytes)?;
-                if decision.job != job.id || decision.nonce != nonce {
+                if decision.job != job.id || decision.nonce != review.nonce {
                     return Err(invalid(
                         "update decision does not match the current preview",
                     ));
                 }
                 fs::remove_file(&path)?;
                 match decision.choice {
-                    Choice::Cancel => return Err(closed(&preview)),
+                    Choice::Cancel => return Err(closed(&review.preview)),
                     Choice::Confirm => {
                         // A window cannot confirm stopping blocked work:
                         // refuse now rather than wait on idle sessions first.
-                        if !terminal && let Some(refused) = refused(&preview, false) {
+                        if !terminal && let Some(refused) = refused(&review.preview, false) {
                             return Err(refused);
                         }
-                        approved = true;
+                        review.approval = Approval::Granted;
                     }
                     Choice::StopListed { .. } => (),
                     Choice::Policy(next) => {
-                        policy = next;
-                        let current = observe(policy)?;
+                        let current = observe(next)?;
                         // Only a terminal can confirm the service stop
                         // this choice advances to.
-                        approved = terminal
-                            && policy_choice_approves_service_floor(&preview, &current, next);
-                        preview = current;
-                        nonce = uuid::Uuid::new_v4().to_string();
+                        let approval = Approval::covering(
+                            terminal
+                                && policy_choice_approves_service_floor(
+                                    &review.preview,
+                                    &current,
+                                    next,
+                                ),
+                        );
+                        review = Review::new(next, current, approval);
                         continue;
                     }
                     Choice::InterruptNow => {
-                        policy = impact::Policy::Interrupt;
+                        let policy = impact::Policy::Interrupt;
                         let current = observe(policy)?;
-                        approved = interruption_preserves_review(&preview, &current);
-                        preview = current;
-                        nonce = uuid::Uuid::new_v4().to_string();
+                        let approval = Approval::covering(interruption_preserves_review(
+                            &review.preview,
+                            &current,
+                        ));
+                        review = Review::new(policy, current, approval);
                         continue;
                     }
                 }
@@ -497,30 +552,18 @@ fn wait_for(
             Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error),
         }
-        let current = observe(policy)?;
-        if !preview.preserves_consent(&current) {
-            approved = false;
-            nonce = uuid::Uuid::new_v4().to_string();
-        }
-        preview = current;
-        if approved
-            && preview.daemon.as_ref().is_none_or(|daemon| {
-                !daemon
-                    .sessions
-                    .iter()
-                    .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
-            })
-        {
+        review.observe(observe(review.policy)?);
+        if review.can_finish_review() {
             check_review_closed(state, job)?;
             // Approved from a window, a blocked review would save and freeze
             // every window, and might interrupt turns, before refusing the
             // stop only a terminal can confirm. Refuse it before any of that.
-            if !terminal && let Some(refused) = refused(&preview, false) {
+            if !terminal && let Some(refused) = refused(&review.preview, false) {
                 return Err(refused);
             }
             // Preserve this exact nonce until the source accepts prepare, so
             // Ctrl-C still cancels while windows are saving and closing.
-            return Ok(preview);
+            return Ok(review.preview);
         }
         thread::sleep(decision_poll());
     }
@@ -777,6 +820,27 @@ mod tests {
         .unwrap();
         let current = published(state, None);
         assert_eq!(current.confirmation, Some(review));
+    }
+
+    #[test]
+    fn approval_survives_idle_progress_and_expires_when_the_scope_changes() {
+        let mut idle = working_preview();
+        let mut review = Review::new(impact::Policy::WhenIdle, idle.clone(), Approval::Granted);
+        let nonce = review.nonce.clone();
+        assert!(!review.can_finish_review());
+
+        idle.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Resumes;
+        review.observe(idle);
+        assert!(review.can_finish_review());
+        assert_eq!(review.nonce, nonce);
+
+        review.observe(preview(true));
+        assert!(!review.can_finish_review());
+        assert_ne!(review.nonce, nonce);
+        assert_eq!(
+            review.approval.publication().0,
+            UpdatePhase::AwaitingConfirmation
+        );
     }
 
     fn published(directory: &Path, previous: Option<&str>) -> UpdateJob {
