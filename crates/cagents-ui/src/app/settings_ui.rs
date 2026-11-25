@@ -335,22 +335,6 @@ fn settings_category_controls<'a>(
             } else {
                 status.into()
             };
-            // The command is shown as well as copied, so the person sees
-            // what they will run.
-            let status = match &updates.installer {
-                Some((_, command)) => widget::column::with_children(vec![
-                    status,
-                    design::body(command.clone())
-                        .font(iced::Font::MONOSPACE)
-                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                        .width(Length::Fill)
-                        .into(),
-                ])
-                .spacing(space::XS)
-                .width(Length::Fill)
-                .into(),
-                None => status,
-            };
             let mut update_row: Vec<Element<'a, Message>> = vec![status];
             if let Some((url, _)) = &updates.installer {
                 update_row.push(update_ui::release_notes_button(url));
@@ -401,11 +385,29 @@ fn settings_category_controls<'a>(
                             Some(reason) => format!("{} {reason}", updates.detail),
                             None => updates.detail.clone(),
                         },
-                        widget::row::with_children(update_row)
-                            .align_y(Alignment::Center)
-                            .spacing(space::S)
-                            .width(Length::Fill)
-                            .into(),
+                        {
+                            let row = widget::row::with_children(update_row)
+                                .align_y(Alignment::Center)
+                                .spacing(space::S)
+                                .width(Length::Fill);
+                            // The command is shown, across the whole field,
+                            // as well as copied: the person sees what they
+                            // will run.
+                            match &updates.installer {
+                                Some((_, command)) => widget::column::with_children(vec![
+                                    row.into(),
+                                    design::body(command.clone())
+                                        .font(iced::Font::MONOSPACE)
+                                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                                        .width(Length::Fill)
+                                        .into(),
+                                ])
+                                .spacing(space::S)
+                                .width(Length::Fill)
+                                .into(),
+                                None => row.into(),
+                            }
+                        },
                     ),
                     crate::settings_widgets::toggle(
                         "Check for updates automatically",
