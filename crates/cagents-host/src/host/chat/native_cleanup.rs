@@ -69,7 +69,7 @@ struct RetainedPair {
 /// ended without a receipt settles only on the evidence that nothing of it can
 /// still run; see `settle_lost_execution`.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
-    close_retained_inner(host, source, None, None)
+    close_retained_inner(host, source, None, None, true)
 }
 
 pub(super) fn close_captured(
@@ -78,7 +78,7 @@ pub(super) fn close_captured(
     target: &super::CloseTarget,
     closing: &capacity::Reservation,
 ) -> Result<(), String> {
-    close_retained_inner(host, source, Some(closing), Some(target))
+    close_retained_inner(host, source, Some(closing), Some(target), false)
 }
 
 fn close_retained_inner(
@@ -86,6 +86,7 @@ fn close_retained_inner(
     source: &Session,
     closing: Option<&capacity::Reservation>,
     expected: Option<&super::CloseTarget>,
+    require_exact: bool,
 ) -> Result<(), String> {
     if let Some(expected) = expected {
         expected
@@ -203,7 +204,7 @@ fn close_retained_inner(
     };
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
-        let receipt = chat::native_holder::closed_source(source, &proof)?;
+        let receipt = close_receipt(source, &proof, require_exact)?;
         let owner = match pending
             .as_ref()
             .map(|pending| pending.owner.record.clone())
@@ -219,7 +220,7 @@ fn close_retained_inner(
         };
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
-            retire_closed_execution(host, source, record, &proof)?;
+            retire_closed_execution(host, source, record, &proof, require_exact)?;
             return Ok(());
         }
         // A holder that died while its provider runs on can no longer be
@@ -320,8 +321,7 @@ fn close_retained_inner(
         // it, settled this close without a receipt, so there is none to
         // confirm. Its close stays pending until the loss is proved; an owner
         // still running keeps its record, which refuses the loss.
-        if pending.paired.is_none() && chat::native_holder::closed_source(source, &proof)?.is_none()
-        {
+        if pending.paired.is_none() && close_receipt(source, &proof, require_exact)?.is_none() {
             chat::native_holder::retire_abandoned(&pending.owner.record)?;
             return super::settle_lost_execution(host, source, &proof);
         }
@@ -358,7 +358,7 @@ fn close_retained_inner(
         chat::native_holder::confirm_pair_closed(source, &proof)?;
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
-        retire_closed_execution(host, source, &pending.owner.record, &proof)?;
+        retire_closed_execution(host, source, &pending.owner.record, &proof, require_exact)?;
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -452,11 +452,24 @@ fn preflight_current_retirements(
     Ok(())
 }
 
+fn close_receipt(
+    source: &Session,
+    proof: &HostSessionProof,
+    require_exact: bool,
+) -> Result<Option<(registry::Record, bool)>, String> {
+    if require_exact {
+        chat::native_holder::closed_source_for_stop(source, proof)
+    } else {
+        chat::native_holder::closed_source(source, proof)
+    }
+}
+
 fn retire_closed_execution(
     host: &SharedHost,
     source: &Session,
     owner: &registry::Record,
     proof: &HostSessionProof,
+    require_exact: bool,
 ) -> Result<(), String> {
     let Ok(registry) = super::super::agent_execution::registry(host) else {
         return Ok(());
@@ -470,7 +483,7 @@ fn retire_closed_execution(
         let crate::agent_execution::HostedSession::Chat(source) = source else {
             return Err("Retained execution ownership changed to another surface".into());
         };
-        if !chat::native_holder::closed_source(&source, proof)?
+        if !close_receipt(&source, proof, require_exact)?
             .is_some_and(|(record, paired_closed)| record == *owner && paired_closed)
         {
             return Err("The current execution descriptor is not covered by this exact native teardown receipt".into());

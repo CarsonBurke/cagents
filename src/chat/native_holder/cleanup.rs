@@ -151,8 +151,8 @@ impl Detached {
         source: crate::chat::Session,
         proof: HostSessionProof,
     ) -> Result<Self, String> {
-        let (receipt, kind) =
-            find_source(&source, &proof)?.ok_or("The native cleanup receipt is unavailable")?;
+        let (receipt, kind) = find_source(&source, &proof, false)?
+            .ok_or("The native cleanup receipt is unavailable")?;
         #[cfg(target_os = "linux")]
         let _ = kind;
         #[cfg(target_os = "macos")]
@@ -342,7 +342,17 @@ pub fn closed_source(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
-    Ok(find_source(source, proof)?.map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
+    Ok(find_source(source, proof, false)?
+        .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
+}
+
+/// Settles an explicit Stop only with evidence for detached-work cleanup.
+pub fn closed_source_for_stop(
+    source: &crate::chat::Session,
+    proof: &HostSessionProof,
+) -> Result<Option<(Record, bool)>, String> {
+    Ok(find_source(source, proof, true)?
+        .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
 }
 
 /// Retires `record` when it names an owner that has ended: its holder and
@@ -363,7 +373,7 @@ pub fn closed_pair_holder(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<Option<Record>, String> {
-    Ok(find_source(source, proof)?.and_then(|(receipt, _)| receipt.paired_holder))
+    Ok(find_source(source, proof, false)?.and_then(|(receipt, _)| receipt.paired_holder))
 }
 
 pub fn confirm_pair_closed(
@@ -371,7 +381,7 @@ pub fn confirm_pair_closed(
     proof: &HostSessionProof,
 ) -> Result<(), String> {
     let (mut receipt, kind) =
-        find_source(source, proof)?.ok_or("The native cleanup receipt is unavailable")?;
+        find_source(source, proof, false)?.ok_or("The native cleanup receipt is unavailable")?;
     receipt.paired_closed = true;
     save(
         &path(receipt.record.terminal, &receipt.record.holder, kind)?,
@@ -382,7 +392,10 @@ pub fn confirm_pair_closed(
 fn find_source(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
+    require_exact: bool,
 ) -> Result<Option<(Receipt, ReceiptKind)>, String> {
+    #[cfg(target_os = "linux")]
+    let _ = require_exact;
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
     if crate::daemon::lease_owner(&paths.lock, proof).map_err(|error| error.to_string())?
         != std::process::id()
@@ -447,11 +460,19 @@ fn find_source(
             // Unrelated old receipts are harmless; only a matching digest is authority.
             true
         })?;
-        if complete && matched.is_some() {
+        if complete && let Some(receipt) = matched {
+            #[cfg(target_os = "macos")]
+            if require_exact
+                && (matches!(kind, ReceiptKind::Spared) || !supports_scoped_spare(&receipt.record))
+            {
+                return Err(
+                    "The native close receipt does not prove detached provider cleanup".into(),
+                );
+            }
             if current.is_some() {
                 return Err("A replacement native holder exists after this exact close receipt; it was not stopped".into());
             }
-            return Ok(matched.map(|receipt| (receipt, kind)));
+            return Ok(Some((receipt, kind)));
         }
     }
     Ok(None)

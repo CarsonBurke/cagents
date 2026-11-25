@@ -396,12 +396,11 @@ impl Holder {
             }
             #[cfg(target_os = "macos")]
             {
-                if !super::cleanup::supports_scoped_spare(&self.identity.record) {
-                    return Err(
-                        "This native holder cannot acknowledge sparing detached work".into(),
-                    );
+                if super::cleanup::supports_scoped_spare(&self.identity.record) {
+                    Request::ReleaseSparingScoped
+                } else {
+                    Request::ReleaseSparing
                 }
-                Request::ReleaseSparingScoped
             }
         } else {
             Request::Release
@@ -409,7 +408,13 @@ impl Holder {
         let report = send(control, &request, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
         let unanswered = match report {
             Ok(Some(Report::Released)) => {
-                if !self.identity.receipt(retain, DetachedWork::Stop)? {
+                let evidence =
+                    if cfg!(target_os = "macos") && matches!(request, Request::ReleaseSparing) {
+                        DetachedWork::Spare
+                    } else {
+                        DetachedWork::Stop
+                    };
+                if !self.identity.receipt(retain, evidence)? {
                     return Err("Native holder released without durable cleanup evidence".into());
                 }
                 self.control.take();
@@ -1006,6 +1011,7 @@ impl Residence {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+        #[cfg(target_os = "linux")]
         self.listener.retire()?;
         #[cfg(target_os = "linux")]
         let kind = ReceiptKind::Exact;
@@ -1025,6 +1031,8 @@ impl Residence {
             &self.recovery,
             kind,
         )?;
+        #[cfg(target_os = "macos")]
+        self.listener.retire()?;
         self.record
             .remove_record(&self.directory)
             .map_err(|error| error.to_string())?;
@@ -3318,6 +3326,7 @@ exec /bin/sleep 60
             .unwrap()
             .unwrap();
         assert_eq!(receipt.0, holder.identity.record);
+        assert!(super::super::closed_source_for_stop(&source, &proof).is_err());
         assert!(holder.identity.receipt(true, DetachedWork::Spare).unwrap());
         assert!(!holder.identity.receipt(true, DetachedWork::Stop).unwrap());
         let startup = super::super::cleanup::Startup {
