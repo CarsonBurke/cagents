@@ -3,6 +3,12 @@ use crate::settings::parse_chords;
 use crate::workspace::{CardWidth, WorkspaceCard};
 use std::collections::HashSet;
 
+/// Matching compares exact chords on every platform; these tests spell
+/// theirs from the Linux table.
+fn linux_shortcuts() -> KeyboardShortcuts {
+    KeyboardShortcuts::for_platform(crate::settings::ShortcutPlatform::Linux)
+}
+
 #[test]
 fn unfocused_file_editor_cannot_overwrite_a_finished_primary_selection() {
     use crate::repository_widget::text_editor::{Action, Content, Edit, TextEditor};
@@ -164,7 +170,7 @@ fn workspace_surface_forwards_drop_targets_in_native_collection_order() {
     use cosmic::iced::clipboard::dnd::{DndAction, Rectangle as DndRectangle};
 
     let renderer = renderer();
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let offset = Vector::new(7.0, -22.0);
     for wrapper in [
         "plain",
@@ -1361,7 +1367,7 @@ fn named_key_press(
 fn global_shortcuts_match_configured_chords_and_repeat_presses() {
     use keyboard::key::Code;
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
     for (character, code, modifiers, action) in [
         ("T", Code::KeyT, ctrl_shift, GlobalShortcut::NewTerminal),
@@ -1500,7 +1506,7 @@ fn global_shortcuts_match_configured_chords_and_repeat_presses() {
 fn new_tab_chord_is_reserved_in_every_pane_and_does_not_repeat() {
     use keyboard::key::Code;
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     for focused in [
         FocusedPane::Other,
         FocusedPane::Terminal,
@@ -1531,7 +1537,7 @@ fn new_tab_chord_is_reserved_in_every_pane_and_does_not_repeat() {
 fn default_shortcuts_leave_shell_keys_to_a_focused_terminal() {
     use keyboard::key::{Code, Named};
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let character = |character: &str, code, modifiers| {
         (
             keyboard::Key::Character(character.into()),
@@ -1593,7 +1599,7 @@ fn default_shortcuts_leave_shell_keys_to_a_focused_terminal() {
 fn project_search_and_pane_find_have_distinct_workspace_chords() {
     use keyboard::key::Code;
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     for focused in [
         FocusedPane::Terminal,
         FocusedPane::Other,
@@ -1622,7 +1628,7 @@ fn project_search_and_pane_find_have_distinct_workspace_chords() {
     // A custom close chord releases the default to the terminal.
     let customized = KeyboardShortcuts {
         close_focused_column: vec!["Ctrl+Shift+W".into()],
-        ..KeyboardShortcuts::default()
+        ..linux_shortcuts()
     };
     assert_eq!(
         global_shortcut(
@@ -1650,7 +1656,7 @@ fn project_search_and_pane_find_have_distinct_workspace_chords() {
 #[test]
 fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
     use keyboard::key::Code;
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     for focused in [
         FocusedPane::Terminal,
         FocusedPane::Review,
@@ -1707,7 +1713,7 @@ fn customized_creation_shortcuts_release_defaults_and_reserve_only_bound_chords(
         clone_pane: vec!["Alt+Shift+E".into()],
         new_channel: vec!["Ctrl+Shift+N".into()],
         new_native_thread: vec![],
-        ..KeyboardShortcuts::default()
+        ..linux_shortcuts()
     };
     for (character, code, default_character, default_code, action) in [
         ("e", Code::KeyE, "d", Code::KeyD, GlobalShortcut::ClonePane),
@@ -1806,7 +1812,7 @@ fn shifted_native_symbols_preserve_primary_dispatch_and_card_input() {
     let mut shortcuts = KeyboardShortcuts {
         chat_model: vec!["Ctrl+Shift+!".into()],
         rename_pane: vec!["Ctrl+Shift+1".into()],
-        ..KeyboardShortcuts::default()
+        ..linux_shortcuts()
     };
     // ChatModel appears earlier in the registry, but its new fallback must
     // not displace an action that already matched the physical digit.
@@ -1925,7 +1931,7 @@ fn wheel_scrolls_card_content_without_moving_the_workspace() {
             )
             .unwrap();
     }
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let mut element = view(
         &workspace,
         &shortcuts,
@@ -2076,7 +2082,7 @@ fn keys_typed_while_the_camera_travels_reach_the_pane_it_is_travelling_to() {
     workspace.focus(ids[6]).unwrap();
     assert_eq!(workspace.camera().offset(), 0.0);
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let mut element = view(
         &workspace,
         &shortcuts,
@@ -2163,7 +2169,7 @@ fn native_scroll_samples_distinguish_redraw_feedback_from_user_wheels() {
             Some("tiny-skia"),
         ))
         .unwrap();
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let scroll_input = Rc::new(Cell::new(false));
     let callback_input = Rc::clone(&scroll_input);
     // Exercise the native scrollable directly: VirtualStrip deliberately
@@ -2259,7 +2265,7 @@ fn a_reported_viewport_width_is_not_reported_twice_in_one_frame() {
             )
             .unwrap();
     }
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let scroll_id = widget::Id::unique();
     let redraw = Event::Window(window::Event::RedrawRequested(Instant::now()));
 
@@ -2494,7 +2500,7 @@ fn workspace_wrappers_preserve_accessible_card_descendants() {
             })
             .collect(),
     };
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let surface: Element<'_, ()> = Element::new(WorkspaceSurface::new(
         strip,
         &shortcuts,
@@ -2546,7 +2552,7 @@ fn opening_card_contents_are_built_before_their_space_is_ready() {
         )
         .unwrap();
     let built = std::cell::RefCell::new(Vec::new());
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let input = InputTrace::default();
     let render = |workspace: &Workspace| {
         let element: Element<'_, ()> = view(
@@ -2606,7 +2612,7 @@ fn composed_workspace_view_exposes_only_visible_card_bodies_to_a_screen_reader()
             .expect("probe for a card the workspace holds") as u64
             + 1
     };
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let mut composed: Element<'_, ()> = view(
         &workspace,
         &shortcuts,
@@ -3239,7 +3245,7 @@ fn workspace_a11y_keeps_a_popup_reachable_where_it_spills_over_a_neighbour() {
 fn only_configured_global_chords_are_reserved_from_card_children() {
     use keyboard::key::{Code, Physical};
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let reserved = |character, code, modifiers| {
         is_global_shortcut_chord(
             &keyboard::Key::Character(character),
@@ -3291,7 +3297,7 @@ fn only_configured_global_chords_are_reserved_from_card_children() {
 fn review_chords_are_reserved_only_while_a_review_pane_has_focus() {
     use keyboard::key::{Code, Physical};
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let reserved = |named, code, modifiers, focused| {
         is_global_shortcut_chord(
             &keyboard::Key::Named(named),
@@ -3364,7 +3370,7 @@ fn held_page_navigation_crosses_four_cards_and_stops_at_edges() {
     }
     workspace.focus(cards[0]).unwrap();
 
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     for repeat in [false, true, true, true] {
         let shortcut = global_shortcut(
             &named_key_press(
@@ -3408,7 +3414,7 @@ fn held_page_navigation_crosses_four_cards_and_stops_at_edges() {
 #[test]
 fn the_inspector_shortcut_acts_only_where_there_is_an_inspector() {
     use keyboard::key::Code;
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
     for (focused, acts) in [
         (FocusedPane::Terminal, true),
@@ -3438,7 +3444,7 @@ fn the_inspector_shortcut_acts_only_where_there_is_an_inspector() {
 #[test]
 fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
     use keyboard::key::Code;
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let ctrl = keyboard::Modifiers::CTRL;
     let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
     // Ctrl+M is carriage return and Ctrl+O is operate-and-get-next to a shell:
@@ -3501,7 +3507,7 @@ fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
 fn shortcut_tooltips_follow_customized_and_unbound_bindings() {
     let mut shortcuts = KeyboardShortcuts {
         search_projects: vec!["Alt+S".into(), "Ctrl+Shift+F".into()],
-        ..KeyboardShortcuts::default()
+        ..linux_shortcuts()
     };
     assert_eq!(
         shortcut_tooltip(GlobalShortcut::FocusProjectSearch, &shortcuts),
@@ -3520,7 +3526,7 @@ fn shortcut_tooltips_follow_customized_and_unbound_bindings() {
 
 #[test]
 fn every_shortcut_descriptor_has_a_unique_configurable_binding() {
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let mut bindings = HashSet::new();
     for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
         assert!(!descriptor.label.is_empty());
@@ -3705,7 +3711,7 @@ fn restored_camera_initializes_native_scroll_once_before_the_first_frame() {
     );
 
     let scroll_id = widget::Id::new("workspace.scroll");
-    let shortcuts = KeyboardShortcuts::default();
+    let shortcuts = linux_shortcuts();
     let mut element: Element<'_, ()> = view(
         &workspace,
         &shortcuts,
@@ -3800,6 +3806,7 @@ fn a_chat_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane()
     use cosmic::iced::advanced::{clipboard, renderer::Headless};
     use keyboard::key::{Code, Physical};
 
+    // The editor's history chords follow the platform, so this test does.
     let shortcuts = KeyboardShortcuts::default();
     let chord = |character: &str, code, modifiers| keyboard::Event::KeyPressed {
         key: keyboard::Key::Character(character.into()),
@@ -3810,7 +3817,7 @@ fn a_chat_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane()
         text: None,
         repeat: false,
     };
-    let control = keyboard::Modifiers::CTRL;
+    let control = keyboard::Modifiers::COMMAND;
     let redo = chord("z", Code::KeyZ, control | keyboard::Modifiers::SHIFT);
     // The default reopen chord is the editor's redo.
     assert_eq!(

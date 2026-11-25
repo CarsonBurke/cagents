@@ -6278,8 +6278,8 @@ mod tests {
                 Status::Active
             },
         };
-        let ctrl = keyboard::Modifiers::CTRL;
-        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let ctrl = keyboard::Modifiers::COMMAND;
+        let ctrl_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
         assert_eq!(
             history_command(&press("z", ctrl, true)),
             Some(HistoryCommand::Undo)
