@@ -200,7 +200,10 @@ pub(super) fn pin_matching(survivor: &Survivor) -> Result<Option<PinnedProcess>,
 
 #[cfg(test)]
 mod tests {
-    use super::{super::end, *};
+    use super::{
+        super::{Pinned, end},
+        *,
+    };
     use std::path::Path;
 
     fn stat(root: &Path, pid: i32, group: i32, session: i32, start: u64) {
