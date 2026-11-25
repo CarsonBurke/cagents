@@ -2035,6 +2035,67 @@ mod tests {
         assert!(!error.contains(&id.to_string()), "{error}");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retry_refuses_beside_a_live_darwin_conversation_writer() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let marker = directory.path().join("writer.pid");
+        let mut original = session(directory.path(), &proof("old"));
+        let conversation = uuid::Uuid::new_v4().to_string();
+        original.launch.program = "codex".into();
+        original.launch.arguments = vec!["resume".into(), conversation.clone()];
+
+        // The scripted replacement serves in this test process. Let the
+        // writer outlive its short-lived launcher so it is outside that
+        // replacement's process tree. Its inherited stdin owns its lifetime.
+        let mut launcher = Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(
+                r#"import os, sys
+if os.fork():
+    os._exit(0)
+os.setsid()
+os.execl('/bin/sh', 'sh', '-c', 'printf "%s\n" "$$" > "$2"; IFS= read -r barrier',
+         'fixture', sys.argv[1], sys.argv[2])
+"#,
+            )
+            .arg(conversation)
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let writer_input = launcher.stdin.take().unwrap();
+        assert!(launcher.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "writer did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let writer = crate::daemon::PinnedProcess::open(pid).unwrap();
+
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+        let error = reconcile_at(original, true, &socket, Path::new("/proc"))
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert!(is_retry_refusal(&error), "{error}");
+        assert!(error.contains(&format!("PID {pid}")), "{error}");
+        assert!(!writer.exited().unwrap());
+        drop(writer_input);
+    }
+
     /// A process that stays unreadable is unknown, and the reader gets words about
     /// what to do, not the scan's own error.
     #[test]
