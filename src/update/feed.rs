@@ -20,7 +20,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-const PUBLIC_FEED: &str = "https://github.com/CarsonBurke/cagents/releases";
+pub(super) const PUBLIC_FEED: &str = "https://github.com/CarsonBurke/cagents/releases";
 /// This build's trust generation. `scripts/publish-release` reads it from
 /// this line; a new generation adds its names to `GENERATIONS`.
 const GENERATION: usize = 2;
@@ -522,8 +522,8 @@ mod tests {
     /// A `file://` feed holding one signed release, read through real curl.
     #[test]
     #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
     )]
     fn a_signed_release_is_discovered_and_downloaded_and_tampering_is_refused() {
         if !curl_available() {
@@ -534,11 +534,11 @@ mod tests {
         let version = "0.2.0";
         let files: [(String, &[u8]); 3] = [
             (
-                format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"),
+                format!("cagents-{version}-{TARGET}.tar.gz"),
                 b"archive bytes",
             ),
-            ("SHA256SUMS".into(), b"checksum bytes"),
-            ("install.sh".into(), b"installer bytes"),
+            (CHECKSUMS.into(), b"checksum bytes"),
+            (INSTALLER.into(), b"installer bytes"),
         ];
         let mut value = metadata(version);
         let release_dir = root.path().join(format!("download/v{version}"));
@@ -575,9 +575,19 @@ mod tests {
         let mut downloaded = Vec::new();
         archive.read_to_end(&mut downloaded).unwrap();
         assert_eq!(downloaded, b"archive bytes");
+        // A sealed memfd refuses the write; on Darwin the descriptor is a
+        // read-only one.
+        let sealed = if cfg!(target_os = "macos") {
+            libc::EBADF
+        } else {
+            libc::EPERM
+        };
         assert_eq!(
-            archive.write_all(b"unverified bytes").unwrap_err().kind(),
-            io::ErrorKind::PermissionDenied
+            archive
+                .write_all(b"unverified bytes")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(sealed)
         );
 
         // Same size, different bytes: the signed digests refuse them.
@@ -588,7 +598,7 @@ mod tests {
                 .to_string(),
             "release SHA-256 verification failed; installation was not changed"
         );
-        fs::write(release_dir.join("install.sh"), b"installer bytez").unwrap();
+        fs::write(release_dir.join(INSTALLER), b"installer bytez").unwrap();
         assert!(
             feed.download(&latest, &latest.installer, &cancellation)
                 .is_err()
@@ -650,11 +660,11 @@ mod tests {
         let directory = root.join(format!("download/v{version}"));
         fs::create_dir_all(&directory).unwrap();
         let mut value = metadata(version);
-        let archive = format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz");
+        let archive = format!("cagents-{version}-{TARGET}.tar.gz");
         for (name, bytes) in [
             (archive.as_str(), &b"archive"[..]),
-            ("SHA256SUMS", b"sums"),
-            ("install.sh", b"installer"),
+            (CHECKSUMS, b"sums"),
+            (INSTALLER, b"installer"),
         ] {
             fs::write(directory.join(name), bytes).unwrap();
             value["assets"][name] = serde_json::json!({
@@ -687,8 +697,8 @@ mod tests {
     /// trusts, as `release-metadata.json`.
     #[test]
     #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
     )]
     fn builds_that_trust_only_the_old_key_are_led_to_the_release_that_trusts_the_new_one() {
         if !curl_available() {
@@ -743,8 +753,8 @@ mod tests {
     /// reads, through the name that release carries.
     #[test]
     #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
     )]
     fn a_release_from_before_generation_2_metadata_still_reads() {
         if !curl_available() {

@@ -354,13 +354,16 @@ struct Installation {
 }
 impl Installation {
     fn detect() -> Result<Self, UpdateError> {
-        if !cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_env = "gnu"
+        if !cfg!(any(
+            all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_env = "gnu"
+            ),
+            all(target_os = "macos", target_arch = "aarch64")
         )) {
             return Err(invalid(
-                "self-update supports only Linux x86_64 GNU release installs",
+                "self-update supports only Linux x86_64 GNU and Apple Silicon macOS release installs",
             ));
         }
         if !cfg!(feature = "full") {
@@ -452,6 +455,26 @@ fn holds_installed_tree(prefix: &Path, version: &str) -> bool {
 fn invalid(message: impl Into<String>) -> UpdateError {
     UpdateError::Invalid(message.into())
 }
+/// macOS cannot hand a running daemon's sessions to another version yet, so
+/// an installation there updates only through its installer, which a person
+/// runs once the daemon has stopped. The app finds a newer release and says
+/// so; it never stops the daemon or installs a release itself.
+fn installer_updates() -> String {
+    format!(
+        "On macOS, update cagents by running its installer again from a system terminal: \
+         curl -fsSL {}/latest/download/install-macos.sh | sh. \
+         It says how to stop the running daemon first.",
+        feed::PUBLIC_FEED
+    )
+}
+
+fn installer_updates_only() -> Result<(), UpdateError> {
+    if cfg!(target_os = "macos") {
+        return Err(invalid(installer_updates()));
+    }
+    Ok(())
+}
+
 fn unsupported_install() -> UpdateError {
     invalid(
         "self-update requires a full user installation made by install.sh; source and OS-package installs must use their original installation method",
@@ -513,6 +536,13 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
         cancellation,
     )?;
     Ok(match release {
+        Some(release) if cfg!(target_os = "macos") => UpdateState::Unsupported {
+            reason: format!(
+                "cagents {} is available. {}",
+                release.version,
+                installer_updates()
+            ),
+        },
         Some(release) => UpdateState::Available {
             release: Box::new(release),
         },
@@ -584,6 +614,7 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
             "a native evidence session never installs a release",
         ));
     }
+    installer_updates_only()?;
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
@@ -603,6 +634,7 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
 }
 
 fn apply_installed_from(window_candidate: Option<&Path>) -> Result<UpdateJob, UpdateError> {
+    installer_updates_only()?;
     recovery::inspect_pending_current()?;
     let mut installation = running_installation()?;
     let layout = locate(&crate::process::current_executable()?)?;
@@ -730,6 +762,7 @@ pub fn upgrade_release(
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
+    installer_updates_only()?;
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     let parsed = stable_version(version)?;
@@ -3813,6 +3846,13 @@ impl StreamingChild {
         } else {
             Ok(())
         };
+        // Darwin refuses to signal a group whose only member is an exited
+        // leader awaiting its reap, as this one is: nothing is left to kill.
+        #[cfg(target_os = "macos")]
+        let cleanup = match cleanup {
+            Err(error) if observed.is_some() && error.raw_os_error() == Some(libc::EPERM) => Ok(()),
+            cleanup => cleanup,
+        };
         // A failed signal must not leave a known-exited original leader as a
         // zombie. Conversely, a known-live signal-denied child cannot be waited
         // on indefinitely just to report cleanup uncertainty.
@@ -3852,9 +3892,15 @@ fn anonymous_file() -> io::Result<File> {
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
-#[cfg(not(target_os = "linux"))]
+/// Darwin has no memfd: an unlinked file in the per-user temporary
+/// directory, which no other process can name. Its descriptor closes on exec.
+#[cfg(target_os = "macos")]
 fn anonymous_file() -> io::Result<File> {
-    Err(io::Error::other("self-update requires Linux"))
+    tempfile::tempfile()
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn anonymous_file() -> io::Result<File> {
+    Err(io::Error::other("self-update requires Linux or macOS"))
 }
 #[cfg(target_os = "linux")]
 fn seal_file(file: &File) -> io::Result<()> {
@@ -3864,9 +3910,69 @@ fn seal_file(file: &File) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "linux"))]
+/// Darwin has no seals, and no file flag refuses writes through a descriptor
+/// already open for them. Sealing instead points this descriptor at a
+/// read-only clone of the bytes written so far, so every later write or
+/// truncation through it fails, as on a sealed memfd. On APFS the clone
+/// shares the file's blocks; elsewhere the bytes are copied. The clone is
+/// unlinked at once and lives only as long as the descriptor.
+#[cfg(target_os = "macos")]
+fn seal_file(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("sealed");
+    let parent = File::open(directory.path())?;
+    // SAFETY: both descriptors are open for the call and the name is
+    // NUL-terminated. The clone is created anew, never followed.
+    let cloned =
+        unsafe { libc::fclonefileat(file.as_raw_fd(), parent.as_raw_fd(), c"sealed".as_ptr(), 0) };
+    if cloned == -1 {
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EXDEV)
+        ) {
+            return Err(error);
+        }
+        let mut copy = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&path)?;
+        let mut buffer = vec![0_u8; 1 << 20];
+        let mut offset = 0;
+        loop {
+            match file.read_at(&mut buffer, offset) {
+                Ok(0) => break,
+                Ok(read) => {
+                    copy.write_all(&buffer[..read])?;
+                    offset += read as u64;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let sealed = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&path)?;
+    drop(directory);
+    // SAFETY: both descriptors are open; dup2 replaces the one `file` owns
+    // with the read-only clone, keeping its number.
+    if unsafe { libc::dup2(sealed.as_raw_fd(), file.as_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // dup2 clears close-on-exec on the descriptor it replaces.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn seal_file(_: &File) -> io::Result<()> {
-    Err(io::Error::other("self-update requires Linux"))
+    Err(io::Error::other("self-update requires Linux or macOS"))
 }
 
 fn checksum_for(manifest: &str, name: &str) -> Result<[u8; 32], UpdateError> {
@@ -3918,6 +4024,15 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_macos_sends_updates_to_its_installer() {
+        let refusal = installer_updates_only();
+        assert_eq!(refusal.is_err(), cfg!(target_os = "macos"));
+        assert!(installer_updates().contains(
+            "curl -fsSL https://github.com/CarsonBurke/cagents/releases/latest/download/install-macos.sh | sh."
+        ));
+    }
+
     #[test]
     fn an_idle_wait_names_each_conversation_as_it_becomes_idle() {
         use crate::model::TerminalId;
@@ -4223,8 +4338,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
     )]
     fn bounded_stream_preserves_success_and_size_failure() {
         let mut file = bounded_command(
@@ -4254,8 +4369,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
     )]
     fn bounded_stream_keeps_live_timeout_and_cancellation_cleanup() {
         // The children outlive the test's wait, so a command that waited for
@@ -4291,8 +4406,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
     )]
     fn streaming_child_observation_keeps_leader_until_final_cleanup() {
         let child = Command::new("/bin/sh")
@@ -5316,8 +5431,8 @@ finally:
 
     #[test]
     #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
     )]
     fn tampered_bytes_fail_and_verified_bytes_cannot_change() {
         let mut file = anonymous_file().unwrap();
