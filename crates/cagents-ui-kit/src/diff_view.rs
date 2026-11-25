@@ -3675,6 +3675,13 @@ mod tests {
                 let changed = vec![0..split];
                 let native = shaped_line_width(text, &changed, &syntax);
                 let cached = ShapeKey::new(text, &syntax, MONO).width(&mut words);
+                // Darwin's native paragraph can report an unbounded width
+                // for a tab. The cached path must agree in that case too.
+                #[cfg(target_os = "macos")]
+                if text.contains('\t') && native == f32::INFINITY {
+                    assert_eq!(cached, native, "{text:?}, font {font:?}");
+                    continue;
+                }
                 assert!(
                     (native - cached).abs() < 0.02,
                     "{text:?}: native {native}, cached {cached}, font {font:?}"
