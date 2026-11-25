@@ -3,6 +3,8 @@
 
 mod cleanup;
 mod transport;
+#[cfg(target_os = "macos")]
+pub use cleanup::inspect_closed_source;
 #[cfg(any(test, feature = "test-support"))]
 pub use cleanup::publish_closed_source;
 pub use cleanup::{

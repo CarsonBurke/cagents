@@ -236,15 +236,7 @@ fn consume(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
     };
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    file.take(256 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() > 256 * 1024 {
-        return Err("Native cleanup receipt is oversized".into());
-    }
-    let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let receipt = read_receipt(file)?;
     if !matches(&receipt) {
         return Err("Native cleanup receipt belongs to another owner".into());
     }
@@ -262,6 +254,99 @@ fn consume(
         Err(error) => return Err(error.to_string()),
     }
     Ok(true)
+}
+
+fn read_receipt(file: fs::File) -> Result<Receipt, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 256 * 1024 {
+        return Err("Native cleanup receipt is oversized".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+/// Read an exact Codex writer's settled receipt for source inspection.
+/// This grants no cleanup authority. Cleanup still requires the daemon lease.
+#[cfg(target_os = "macos")]
+pub fn inspect_closed_source(
+    source: &crate::chat::Session,
+    boot: &crate::model::BootId,
+) -> Result<bool, String> {
+    inspect_closed_source_in(source, boot, &registry::directory(Kind::Native)?)
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_closed_source_in(
+    source: &crate::chat::Session,
+    boot: &crate::model::BootId,
+    directory: &std::path::Path,
+) -> Result<bool, String> {
+    let Some(issued) = source.proof.as_ref() else {
+        return Ok(false);
+    };
+    if source.launch.provider != crate::agent::Provider::Codex
+        || !issued.is_complete()
+        || &issued.boot_id != boot
+    {
+        return Ok(false);
+    }
+    let control = registry::socket(directory, source.id);
+    crate::secure_file::reject_symlink_components(directory).map_err(|error| error.to_string())?;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    let has_discovery = || {
+        registry::execution_record(&control)
+            .map(|record| record.is_some())
+            .map_err(|error| error.to_string())
+    };
+    if has_discovery()? {
+        return Ok(false);
+    }
+    let digest = source_digest(source)?;
+    let prefix = format!("{}-", source.id);
+    let mut candidates = 0;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".closed"))
+        {
+            continue;
+        }
+        candidates += 1;
+        if candidates > 128 {
+            return Err("Too many native cleanup receipts for this identity".into());
+        }
+        let path = entry.path();
+        let file = match crate::secure_file::open_existing_private_file_readonly(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        let receipt = read_receipt(file)?;
+        let holder = &receipt.record.holder;
+        if matches!(receipt.record.version, 3 | 4)
+            && receipt.record.terminal == source.id
+            && receipt.record.kind == Kind::Native
+            && receipt.record.application == crate::instance::APPLICATION_ID
+            && &receipt.record.boot == boot
+            && receipt.proof == *issued
+            && receipt.paired_closed
+            && receipt.sources.contains(&digest)
+            && name == format!("{prefix}{}-{}.closed", holder.pid, holder.start).as_str()
+        {
+            // The receipt is published before discovery is removed.
+            return has_discovery().map(|present| !present);
+        }
+    }
+    Ok(false)
 }
 
 /// An exact issued descriptor can retry a completed close after daemon loss.
@@ -382,6 +467,54 @@ fn find_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_inspection_requires_exact_retirement_and_absent_discovery() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let mut source = super::super::tests::recovery().source;
+        source.launch.session_id = Some("retired-conversation".into());
+        let proof = source.proof.clone().unwrap();
+        let boot = &proof.boot_id;
+        let record = Record {
+            version: 4,
+            build: None,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: boot.clone(),
+            terminal: source.id,
+            holder: Process { pid: 42, start: 1 },
+            root: Process { pid: 43, start: 2 },
+        };
+        let mut receipt = Receipt {
+            record,
+            proof,
+            sources: vec![source_digest(&source).unwrap()],
+            paired_closed: true,
+            paired_holder: None,
+        };
+        let boot = receipt.proof.boot_id.clone();
+        let path = directory.path().join(format!("{}-42-1.closed", source.id));
+        let inspect = |source: &crate::chat::Session| {
+            inspect_closed_source_in(source, &boot, directory.path()).unwrap()
+        };
+        assert!(!inspect(&source));
+        save(&path, &receipt).unwrap();
+        assert!(inspect(&source));
+        let mut different = source.clone();
+        different.launch.session_id = Some("different-conversation".into());
+        assert!(!inspect(&different));
+        different = source.clone();
+        different.proof.as_mut().unwrap().host_incarnation = "different-host".into();
+        assert!(!inspect(&different));
+
+        receipt.record.create(directory.path()).unwrap();
+        assert!(!inspect(&source));
+        receipt.record.remove_record(directory.path()).unwrap();
+        receipt.paired_closed = false;
+        save(&path, &receipt).unwrap();
+        assert!(!inspect(&source));
+    }
 
     #[test]
     fn detached_receipt_keeps_publishing_proof_separate_from_successor_authority() {
