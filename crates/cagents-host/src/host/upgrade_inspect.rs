@@ -2186,6 +2186,7 @@ mod tests {
                 187,
                 191,
                 198,
+                203,
                 crate::terminal_ipc::PROTOCOL_VERSION
             ]
         );
