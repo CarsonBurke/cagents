@@ -1866,7 +1866,7 @@ const PF_EXITING: u64 = 0x4;
 fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
     use rusqlite::{Connection, OpenFlags, config::DbConfig};
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -1903,7 +1903,7 @@ fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry
 fn read_census(path: &Path) -> Result<Census, String> {
     use rusqlite::{Connection, OpenFlags, config::DbConfig};
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,

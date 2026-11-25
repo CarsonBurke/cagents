@@ -55,7 +55,7 @@ fn read_binding(
     source: &Session,
 ) -> Result<(Agent, NativeActorOwnership), String> {
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
