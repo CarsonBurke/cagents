@@ -1517,6 +1517,7 @@ fn bound_socket(processes: &Path, sockets: &[&Path]) -> io::Result<Option<PathBu
 /// [`crate::daemon::lost_processes`]). A process that merely names the
 /// listener, such as one listing its directory, is not one. A process still
 /// starting is not judged: the next look sees it.
+#[cfg(target_os = "linux")]
 pub(super) fn codex_listener_providers(
     pane: crate::model::TerminalId,
     socket: &Path,
@@ -1524,6 +1525,7 @@ pub(super) fn codex_listener_providers(
     processes_serving_listener(Path::new("/proc"), pane, socket, EXEC_SETTLE)
 }
 
+#[cfg(target_os = "linux")]
 fn processes_serving_listener(
     processes: &Path,
     pane: crate::model::TerminalId,

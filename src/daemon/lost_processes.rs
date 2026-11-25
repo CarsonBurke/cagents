@@ -69,6 +69,8 @@ mod platform;
 #[path = "lost_processes/linux.rs"]
 mod platform;
 
+#[cfg(target_os = "macos")]
+pub use platform::listener_providers;
 pub use platform::{census, listener_census};
 
 /// Trim the command line to what can be shown in the close dialog.

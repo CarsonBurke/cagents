@@ -1,5 +1,6 @@
 use super::{PinnedProcess, Process, Survivor, command_for_display};
 use crate::process::table::{self, Record};
+use std::{os::unix::ffi::OsStrExt, path::Path};
 
 /// A reused leader PID excludes its new group or session. An absent leader
 /// leaves the numeric boundary visible, but only the original leader can
@@ -53,19 +54,63 @@ pub fn listener_census(named: &[Process]) -> Result<Vec<Survivor>, String> {
         .map(|process| leader(process).map(|state| (process, state)))
         .collect::<Result<Vec<_>, _>>()?;
     scan(|record| {
+        let mut member = false;
         for &(process, observed) in &leaders {
             if observed != Leader::Reused
                 && (record.bsd.pbsi_pid as i32 == process.pid
                     || record.bsd.pbsi_pgid as i32 == process.pid)
             {
-                return Ok(Some(survivor(
-                    record,
-                    still_proves(record, process, observed)?,
-                )));
+                member = true;
+                if still_proves(record, process, observed)? {
+                    return Ok(Some(survivor(record, true)));
+                }
             }
         }
-        Ok(None)
+        Ok(member.then(|| survivor(record, false)))
     })
+}
+
+/// Positive candidates for a private Codex listener. Restricted processes or
+/// unpublished argv can hide a match, so an empty result grants no close or
+/// launch authority.
+pub fn listener_providers(
+    pane: crate::model::TerminalId,
+    socket: &Path,
+) -> Result<Vec<Process>, String> {
+    let uid = crate::daemon::current_uid();
+    let pids = table::list(uid).map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+    let mut marker = b"cagents-codex-".to_vec();
+    marker.extend_from_slice(pane.to_string().as_bytes());
+    let mut endpoint = b"unix://".to_vec();
+    endpoint.extend_from_slice(socket.as_os_str().as_bytes());
+    let mut joined = b"--listen=".to_vec();
+    joined.extend_from_slice(&endpoint);
+    let mut candidates = Vec::new();
+    for pid in pids {
+        let Ok(pin) = PinnedProcess::open(pid) else {
+            continue;
+        };
+        if pin.uid().ok() != Some(uid) {
+            continue;
+        }
+        let Ok(argv) = pin.command_line() else {
+            continue;
+        };
+        if argv.windows(marker.len()).any(|window| window == marker) {
+            let arguments = argv.split(|byte| *byte == 0).collect::<Vec<_>>();
+            if arguments.contains(&joined.as_slice())
+                || arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == b"--listen" && pair[1] == endpoint)
+            {
+                candidates.push(Process {
+                    pid: pid as i32,
+                    start: pin.started_ticks(),
+                });
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 fn still_proves(record: &Record, original: &Process, before: Leader) -> Result<bool, String> {
@@ -184,5 +229,35 @@ mod tests {
         };
         assert!(census(&earlier, &earlier).unwrap().is_empty());
         assert!(listener_census(&[earlier]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discovers_a_private_listener_by_its_exact_arguments() {
+        let pane = crate::model::TerminalId::new();
+        let socket = format!("/tmp/cagents-codex-{pane}/server");
+        let endpoint = format!("unix://{socket}");
+        let child = ChildGuard(
+            Command::new("/bin/sh")
+                .args(["-c", "read line", "provider", "--listen", &endpoint])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let process = Process::read(child.0.id() as i32).unwrap();
+        let recorded = listener_providers(pane, Path::new(&socket)).unwrap();
+        assert!(recorded.contains(&process));
+        assert!(
+            listener_census(&recorded)
+                .unwrap()
+                .iter()
+                .any(|survivor| survivor.pid == process.pid
+                    && survivor.start == process.start
+                    && survivor.proved)
+        );
+        assert!(
+            listener_providers(pane, Path::new(&format!("{socket}-other")))
+                .unwrap()
+                .is_empty()
+        );
     }
 }
