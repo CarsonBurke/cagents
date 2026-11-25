@@ -1397,23 +1397,24 @@ impl Cagents {
             }
             _ => None,
         };
+        // A development build checks only for a native evidence fixture's
+        // release, and then reports that check as an installed build would.
+        let quiet = development && state.result.is_none() && state.check_error.is_none();
         let installer = match &state.result {
             Some(UpdateState::InstallerAvailable { release, command }) => {
                 Some((release.url.clone(), command.clone()))
             }
             _ => None,
         };
-        // A development build checks only for a native evidence fixture's
-        // release, and then reports what that check found.
-        let (status, failed) = if development && state.result.is_none() {
+        let (status, failed) = if state.checking {
+            ("Checking for updates…".to_owned(), false)
+        } else if let Some(error) = &state.check_error {
+            (format!("Could not check for updates: {error}"), true)
+        } else if quiet {
             (
                 "Update checks are off in development builds".to_owned(),
                 false,
             )
-        } else if state.checking {
-            ("Checking for updates…".to_owned(), false)
-        } else if let Some(error) = &state.check_error {
-            (format!("Could not check for updates: {error}"), true)
         } else {
             match &state.result {
                 Some(UpdateState::Available { release }) => {
@@ -1421,8 +1422,8 @@ impl Cagents {
                 }
                 Some(UpdateState::InstallerAvailable { release, .. }) => (
                     format!(
-                        "cagents {} is available. To update, run its installer in Terminal; \
-                         it says how to stop the running daemon first.",
+                        "cagents {} is available. Copy the installer command and run it in \
+                         Terminal; it explains how to stop cagents first.",
                         release.version
                     ),
                     false,
@@ -1433,7 +1434,7 @@ impl Cagents {
             }
         };
         let detail = match (state.last_checked, self.settings.check_for_updates) {
-            _ if development => {
+            _ if quiet => {
                 "A source build does not download releases; install cagents to update it.".into()
             }
             (Some(checked), true) => format!(
@@ -2332,8 +2333,8 @@ pub(in crate::app) mod tests {
         let summary = app.summarize_updates(false);
         assert_eq!(
             summary.status,
-            "cagents 9.8.7 is available. To update, run its installer in Terminal; \
-             it says how to stop the running daemon first."
+            "cagents 9.8.7 is available. Copy the installer command and run it in \
+             Terminal; it explains how to stop cagents first."
         );
         // Nothing in this window applies it, so nothing waits on a job.
         assert!(summary.available.is_none());
@@ -2342,8 +2343,17 @@ pub(in crate::app) mod tests {
             summary.installer,
             Some(("https://example.invalid/release".into(), command.into()))
         );
+        app.status = None;
         drop(app.update_update_ui(Action::CopyInstallerCommand));
-        assert!(app.status.is_some());
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.as_str()),
+            Some("Copied the installer command")
+        );
+        // Without such a release there is nothing to copy.
+        app.status = None;
+        app.update_ui.result = None;
+        drop(app.update_update_ui(Action::CopyInstallerCommand));
+        assert!(app.status.is_none());
     }
 
     #[test]

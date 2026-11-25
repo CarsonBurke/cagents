@@ -328,13 +328,30 @@ fn settings_category_controls<'a>(
             let status = design::body(updates.status.clone())
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .width(Length::Fill);
-            let mut update_row: Vec<Element<'a, Message>> = vec![if updates.failed {
+            let status: Element<'a, Message> = if updates.failed {
                 status
                     .class(cosmic::theme::Text::Custom(design::destructive_text))
                     .into()
             } else {
                 status.into()
-            }];
+            };
+            // The command is shown as well as copied, so the person sees
+            // what they will run.
+            let status = match &updates.installer {
+                Some((_, command)) => widget::column::with_children(vec![
+                    status,
+                    design::body(command.clone())
+                        .font(iced::Font::MONOSPACE)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .width(Length::Fill)
+                .into(),
+                None => status,
+            };
+            let mut update_row: Vec<Element<'a, Message>> = vec![status];
             if let Some((url, _)) = &updates.installer {
                 update_row.push(update_ui::release_notes_button(url));
                 update_row.push(
