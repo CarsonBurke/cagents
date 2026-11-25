@@ -1048,9 +1048,43 @@ impl ExecutionEvidence {
             self.starting_patience,
             self.deadline,
         );
+        #[cfg(target_os = "macos")]
+        let scan = if self.processes == Path::new("/proc") {
+            // A new allocation from the resume picker has no previous owner
+            // to retire. It still needs the writer scan here and the account's
+            // thread-lock check before it can start a provider.
+            let issued = source.proof.is_some()
+                || source.terminal.is_some()
+                || source.owned_codex_listener.is_some()
+                || source.recorded_codex_socket().is_some()
+                || holders.iter().any(Option::is_some);
+            match scan {
+                // Inspection errors must not use the old-boot exception
+                // when Darwin cannot inspect a potentially current writer.
+                Err(reason) => Ok(CodexExecution::Unproved { reason }),
+                Ok(CodexExecution::Ended) if issued && !earlier_boot => {
+                    let retired = holders.iter().all(Option::is_none)
+                        && crate::chat::native_holder::inspect_closed_source(source, &self.boot)?;
+                    if retired {
+                        Ok(CodexExecution::Ended)
+                    } else {
+                        Ok(CodexExecution::Unproved {
+                            reason:
+                                "No exact retirement proves the prior Darwin Codex writer is gone"
+                                    .into(),
+                        })
+                    }
+                }
+                other => other,
+            }
+        } else {
+            scan
+        };
         if let Some(deadline) = self.deadline {
             check_deadline(deadline)?;
         }
+        #[cfg(target_os = "macos")]
+        let earlier_boot = earlier_boot && self.processes != Path::new("/proc");
         match (scan, retained_processes, unreadable_listener) {
             (Ok(running @ CodexExecution::Running { .. }), _, _) => Ok(running),
             (_, true, _) => Ok(CodexExecution::RetainedProcesses),
@@ -1222,6 +1256,10 @@ fn codex_listener_survives(
     patience: Duration,
     inspection_deadline: Option<Instant>,
 ) -> Result<CodexExecution, String> {
+    #[cfg(target_os = "macos")]
+    if processes == Path::new("/proc") {
+        return darwin_codex_execution(pane, conversation, sockets, inspection_deadline);
+    }
     let patience = Instant::now() + patience;
     let marker = format!("cagents-codex-{pane}");
     let process = CodexProcessJudge {
@@ -1323,6 +1361,93 @@ fn codex_listener_survives(
         Ok(None) => unreadable.map_or(Ok(CodexExecution::Ended), Err),
         Err(reason) => Err(unreadable.unwrap_or(reason)),
     }
+}
+
+/// Inspect only pinned processes belonging to this account. A socket node
+/// can outlive its listener, so a remaining node without a verified writer
+/// is uncertainty. A writer that unlinked its listener is still detectable
+/// through its exact issued arguments.
+#[cfg(target_os = "macos")]
+fn darwin_codex_execution(
+    pane: crate::model::TerminalId,
+    conversation: Option<&str>,
+    sockets: &[&Path],
+    deadline: Option<Instant>,
+) -> Result<CodexExecution, String> {
+    let marker = format!("cagents-codex-{pane}");
+    let (writer, uncertainty) = darwin_codex_writer(deadline, |executable, argv| {
+        codex_writer_arguments(executable, argv, marker.as_bytes(), conversation)
+    })?;
+    if let Some(writer) = writer {
+        return Ok(CodexExecution::Running {
+            pid: Some(writer.pid as u32),
+            socket: sockets
+                .first()
+                .map_or_else(PathBuf::new, |path| path.to_path_buf()),
+        });
+    }
+    for socket in sockets {
+        match std::fs::symlink_metadata(socket) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot verify the prior Codex listener: {error}")),
+            Ok(_) => return Ok(CodexExecution::RetainedProcesses),
+        }
+    }
+    if let Some(reason) = uncertainty {
+        return Err(reason);
+    }
+    Ok(CodexExecution::Ended)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_codex_writer(
+    deadline: Option<Instant>,
+    matches: impl Fn(&Path, &[u8]) -> bool,
+) -> Result<
+    (
+        Option<crate::daemon::holder_registry::Process>,
+        Option<String>,
+    ),
+    String,
+> {
+    use crate::daemon::holder_registry::Process;
+    let pids = crate::process::table::list(crate::daemon::current_uid())
+        .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+    let mut uncertainty = None;
+    for pid in pids
+        .into_iter()
+        .filter(|&pid| pid > 1 && pid != std::process::id())
+    {
+        if let Some(deadline) = deadline {
+            check_deadline(deadline)?;
+        }
+        let observation = (|| {
+            let before = Process::read(pid as i32)?;
+            let executable = before.executable()?;
+            let name = executable.file_name().unwrap_or_default();
+            if !named_codex_writer(name) && !codex_interpreter(name) {
+                return Ok(None);
+            }
+            let (executable, argv) = crate::process::program_of(pid)?;
+            let after = Process::read(pid as i32)?;
+            if before != after {
+                return Ok(None);
+            }
+            if argv.is_empty() {
+                return Err(io::Error::other(CODEX_PROCESS_STARTING));
+            }
+            Ok(matches(&executable, &argv).then_some(before))
+        })();
+        match observation {
+            Ok(Some(owner)) => return Ok((Some(owner), None)),
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                uncertainty.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
+    Ok((None, uncertainty))
 }
 
 /// What one process of the table says of a Codex pane's execution.
@@ -1639,38 +1764,40 @@ fn codex_writer_arguments(
     conversation: Option<&str>,
 ) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let named_writer = |name: &std::ffi::OsStr| {
-        let name = name.as_bytes();
-        let name = name.strip_suffix(b" (deleted)").unwrap_or(name);
-        name == b"codex"
-            || name == b"cagents"
-            || name == b"cagentsd"
-            || name.starts_with(b"cagents-")
-    };
     let name = executable.file_name().unwrap_or_default();
     // Interpreter installations publish the script as argv[1]. Verify the
     // interpreter too, so `ls /path/codex` or `exec -a codex ls` cannot acquire
     // writer identity. Native Codex is identified even with a rewritten argv[0].
-    let interpreter = name
-        .to_str()
-        .is_some_and(crate::agent::Provider::is_interpreter)
-        || matches!(
-            name.as_bytes(),
-            b"sh" | b"bash" | b"dash" | b"python" | b"python3"
-        );
-    let script = interpreter
+    let script = codex_interpreter(name)
         && argv.split(|byte| *byte == 0).nth(1).is_some_and(|script| {
             Path::new(std::ffi::OsStr::from_bytes(script))
                 .file_name()
-                .is_some_and(|name| named_writer(name) || name == "codex.js")
+                .is_some_and(|name| named_codex_writer(name) || name == "codex.js")
         });
-    (named_writer(name) || script)
+    (named_codex_writer(name) || script)
         && argv.split(|byte| *byte == 0).any(|arg| {
             arg.windows(marker.len()).any(|window| window == marker)
                 || conversation
                     .filter(|id| !id.is_empty())
                     .is_some_and(|id| arg.windows(id.len()).any(|window| window == id.as_bytes()))
         })
+}
+
+fn named_codex_writer(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let name = name.as_bytes();
+    let name = name.strip_suffix(b" (deleted)").unwrap_or(name);
+    matches!(name, b"codex" | b"cagents" | b"cagentsd") || name.starts_with(b"cagents-")
+}
+
+fn codex_interpreter(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    name.to_str()
+        .is_some_and(crate::agent::Provider::is_interpreter)
+        || matches!(
+            name.as_bytes(),
+            b"sh" | b"bash" | b"dash" | b"python" | b"python3"
+        )
 }
 
 /// A leader that called pthread_exit no longer exposes /proc/PID/exe even
