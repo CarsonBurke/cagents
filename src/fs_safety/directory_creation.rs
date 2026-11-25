@@ -988,6 +988,7 @@ pub(super) fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root
     }
     // SAFETY: fstatat succeeded, so the buffer is initialized.
     let observed = unsafe { observed.assume_init() };
+    // SAFETY: geteuid has no preconditions and no failure state.
     let unsearchable = observed.st_mode & libc::S_IFMT == libc::S_IFDIR
         && observed.st_uid == unsafe { libc::geteuid() }
         && observed.st_mode & libc::S_IXUSR == 0;
@@ -1501,6 +1502,7 @@ fn unused_name(namespace: &Root) -> Result<OsString, ResolveError> {
 }
 pub(super) fn namespace_protected(root: &Root) -> io::Result<()> {
     let metadata = root.metadata()?;
+    // SAFETY: geteuid has no preconditions and no failure state.
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

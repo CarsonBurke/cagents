@@ -461,6 +461,16 @@ fn directory_entry_identity(
     directory: &Root,
     name: &OsStr,
 ) -> Result<Option<(u64, u64)>, ResolveError> {
+    let (kind, identity) = entry_identity(directory, name)?;
+    Ok((kind == libc::S_IFDIR).then_some(identity))
+}
+
+/// The file type bits and `(device, inode)` of whatever `name` in
+/// `directory` is, observed as [`directory_entry_identity`] does.
+fn entry_identity(
+    directory: &Root,
+    name: &OsStr,
+) -> Result<(libc::mode_t, (u64, u64)), ResolveError> {
     let reported = directory.path.join(name);
     let raw = c_component(name, &directory.path)?;
     let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
@@ -484,7 +494,7 @@ fn directory_entry_identity(
     // The standard library widens Darwin's signed `dev_t` the same way.
     #[cfg(target_os = "macos")]
     let device = entry.st_dev as u64;
-    Ok((entry.st_mode & libc::S_IFMT == libc::S_IFDIR).then_some((device, entry.st_ino)))
+    Ok((entry.st_mode & libc::S_IFMT, (device, entry.st_ino)))
 }
 
 /// The path the kernel currently records for an open descriptor. It is a name,
@@ -1017,8 +1027,9 @@ struct Staging {
     /// The staging directory's name in `parent`.
     name: OsString,
     directory: Root,
-    /// The file's name in `directory`, until it is published.
-    file: Option<OsString>,
+    /// The file's name in `directory` and its `(device, inode)`, until it is
+    /// published.
+    file: Option<(OsString, (u64, u64))>,
     /// Whether `directory` was shown to be an empty one of this user's, and
     /// so may be removed once empty again.
     removable: bool,
@@ -1029,13 +1040,19 @@ struct Staging {
 ///
 /// The file is created `O_EXCL` inside a fresh staging directory made in
 /// `directory`. Before anything is created in it, that directory must be this
-/// user's, empty, mode 0700 and without an ACL, so no other user can list it,
-/// open the file, or replace its name; one that inherited an ACL has it
-/// removed first. mkdir returns no descriptor, so where other users can write
-/// `directory` one of them could swap the staging name for another empty
-/// directory of this user's between mkdir and open. That directory then has
-/// its mode and ACL made private before use, and is removed once empty again,
-/// which a user who can write `directory` could do to it anyway.
+/// user's, mode 0700, without an ACL, and then still empty, so no other user
+/// can list it, open the file, or replace its name; one that inherited an ACL
+/// has it removed first, and anything an inherited entry let another user put
+/// there in the meantime refuses the copy. mkdir returns no descriptor, so
+/// where other users can write `directory` one of them could swap the staging
+/// name for another directory of this user's between mkdir and open. That
+/// directory then has its mode and ACL made private, and is used and removed
+/// only if it is empty, which a user who can write `directory` could do to it
+/// anyway.
+///
+/// A volume mounted to ignore ownership, such as an external drive, enforces
+/// no modes at all, so there the staged file is as reachable as the copy it
+/// becomes once published.
 #[cfg(target_os = "macos")]
 pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<AnonymousFile, ResolveError> {
     use std::os::unix::fs::MetadataExt;
@@ -1081,24 +1098,15 @@ pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<AnonymousFile,
         .map_err(|error| ResolveError::io(&directory.path, &error))?
         .dev();
     // SAFETY: geteuid has no preconditions and no failure state.
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.dev() != parent_device
-    {
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.dev() != parent_device {
         return Err(ResolveError::message(
             &reported,
             "the staging directory is not this user's, on this filesystem",
         ));
     }
-    if !entry_names(&staging.directory, 1)?.0.is_empty() {
-        return Err(ResolveError::message(
-            &reported,
-            "the staging directory was replaced by one that is not empty",
-        ));
-    }
-    // An empty directory of this user's from here on, so dropping `staging`
-    // may remove it while its name still holds it.
-    staging.removable = true;
+    // Made private before it is listed, so neither a umask that withholds
+    // the owner's read nor an inherited entry stops this user listing it, and
+    // whatever another user put there before is still seen below.
     set_directory_permissions(&staging.directory, 0o700)
         .and_then(|()| {
             let listing = File::from(reopen_directory_for_reading(&staging.directory)?);
@@ -1106,13 +1114,28 @@ pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<AnonymousFile,
         })
         .and_then(|()| directory_creation::namespace_protected(&staging.directory))
         .map_err(|error| ResolveError::io(&reported, &error))?;
+    if !entry_names(&staging.directory, 1)?.0.is_empty() {
+        return Err(ResolveError::message(
+            &reported,
+            "the staging directory is not empty",
+        ));
+    }
+    // An empty private directory of this user's from here on, so dropping
+    // `staging` may remove it while its name still holds it.
+    staging.removable = true;
     let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // Dropping `staging` on an error removes the staging directory.
     let (file, file_name) = create_temporary_with(&staging.directory, flags, mode)?;
-    staging.file = Some(file_name);
-    let metadata = file
-        .metadata()
-        .map_err(|error| ResolveError::io(&reported, &error))?;
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            // The name is this user's fresh file, in a directory no one else
+            // can change, so it goes too.
+            let _ = unlink_within(&staging.directory, &file_name);
+            return Err(ResolveError::io(&reported, &error));
+        }
+    };
+    staging.file = Some((file_name, (metadata.dev(), metadata.ino())));
     let file = AnonymousFile {
         file,
         staging: Some(staging),
@@ -1148,7 +1171,7 @@ pub fn link_anonymous_new(
             "Only an unpublished copy file may be published",
         ));
     };
-    let Some(name) = staging.file.as_ref() else {
+    let Some((name, identity)) = staging.file.as_ref() else {
         return Err(ResolveError::message(
             &reported,
             "Only an unpublished copy file may be published",
@@ -1156,8 +1179,12 @@ pub fn link_anonymous_new(
     };
     // Only this user can change the staging directory, so its entry is still
     // the held file unless this user's own processes interfered.
-    let named = entry_identity(&staging.directory, name)?;
-    if !held.is_file() || named != (held.dev(), held.ino()) {
+    let (kind, named) = entry_identity(&staging.directory, name)?;
+    if !held.is_file()
+        || kind != libc::S_IFREG
+        || *identity != (held.dev(), held.ino())
+        || named != *identity
+    {
         return Err(ResolveError::message(
             &reported,
             "The staged copy file was replaced; it was not published",
@@ -1169,42 +1196,19 @@ pub fn link_anonymous_new(
     Ok(())
 }
 
-/// The `(device, inode)` of whatever `name` in `directory` is, without
-/// opening it or following a final link.
-#[cfg(target_os = "macos")]
-fn entry_identity(directory: &Root, name: &OsStr) -> Result<(u64, u64), ResolveError> {
-    let reported = directory.path.join(name);
-    let raw = c_component(name, &directory.path)?;
-    let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
-    // SAFETY: the retained descriptor and `raw` outlive the call, which fills
-    // the buffer and never follows a final symbolic link.
-    let status = unsafe {
-        libc::fstatat(
-            directory.descriptor(),
-            raw.as_ptr(),
-            entry.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if status < 0 {
-        return Err(classify(&reported, &io::Error::last_os_error()));
-    }
-    // SAFETY: fstatat succeeded, so the buffer is initialized.
-    let entry = unsafe { entry.assume_init() };
-    // The standard library widens Darwin's signed `dev_t` the same way.
-    Ok((entry.st_dev as u64, entry.st_ino))
-}
-
 #[cfg(target_os = "macos")]
 impl Drop for Staging {
     /// Removes the unpublished file and then the staging directory, each only
-    /// if it is still the one this created. A failure leaves them in place.
+    /// if its name still holds the one this created. Anything else leaves
+    /// both in place.
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
-        if let Some(file) = self.file.take()
-            && unlink_within(&self.directory, &file).is_err()
-        {
-            return;
+        if let Some((file, identity)) = self.file.take() {
+            let still_named = entry_identity(&self.directory, &file)
+                .is_ok_and(|(kind, named)| kind == libc::S_IFREG && named == identity);
+            if !still_named || unlink_within(&self.directory, &file).is_err() {
+                return;
+            }
         }
         if !self.removable {
             return;
