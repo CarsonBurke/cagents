@@ -1064,7 +1064,8 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn fresh_git_eligibility_preserves_dirty_untracked_locked_changed_and_primary_worktrees() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let parent = Path::new("/var/tmp").canonicalize().unwrap();
+        let directory = tempfile::tempdir_in(parent).unwrap();
         let repository = directory.path().join("repository");
         let worktree = directory.path().join("worktree");
         std::fs::create_dir(&repository).unwrap();
