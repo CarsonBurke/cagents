@@ -63,6 +63,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::daemon::process_scope::{CommandStop, Killer};
+
 const ROOT: &str = "/sys/fs/cgroup";
 const PROVIDER: &str = "provider";
 const COMMAND: &str = "command-";
@@ -76,24 +78,6 @@ const FAST_FOR: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_secs(8);
 /// Ancestors examined to find the command a process belongs to.
 const DEPTH: usize = 64;
-
-/// What ended processes in a cgroup because memory ran out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Killer {
-    /// systemd-oomd, because the system's memory, swap or memory pressure
-    /// passed its limits.
-    Oomd,
-    /// The kernel's OOM killer.
-    Kernel,
-}
-
-/// A command that memory exhaustion stopped while its provider kept running.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommandStop {
-    pub(crate) killer: Killer,
-    /// Processes ended, when the killer reports it.
-    pub(crate) processes: Option<u64>,
-}
 
 /// A provider's cgroup, kept open so its OOM mark stays readable after
 /// systemd removes it, and the sweeper that keeps its commands apart.
