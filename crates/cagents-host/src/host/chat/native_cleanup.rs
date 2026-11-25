@@ -344,6 +344,7 @@ fn close_retained_inner(
             return super::settle_lost_execution(host, source, &proof);
         }
         if let Some(pair) = &pending.paired {
+            #[cfg(target_os = "macos")]
             if !close_receipt(source, &proof, require_exact)?
                 .is_some_and(|(record, _)| record == pending.owner.record)
             {

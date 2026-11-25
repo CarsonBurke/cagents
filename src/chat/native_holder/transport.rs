@@ -2424,6 +2424,7 @@ exec /bin/sleep 60
         }
     }
 
+    #[cfg(target_os = "linux")] // Requires procfs inspection and proof after the provider forks.
     #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
         use std::os::unix::ffi::OsStrExt;
@@ -2663,7 +2664,7 @@ exec /bin/sleep 60
         std::fs::write(cwd.join("marker"), "original").unwrap();
         std::fs::write(
             cwd.join("provider"),
-            "#!/bin/sh\n/bin/cat marker > observed\nexec /bin/sleep 60\n",
+            "#!/bin/sh\nIFS= read -r marker < marker\nprintf '%s' \"$marker\" > observed\nexec /bin/sleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(cwd.join("provider"), std::fs::Permissions::from_mode(0o700))
@@ -3171,9 +3172,21 @@ exec /bin/sleep 60
         holder.close_inner(false, DetachedWork::Stop).unwrap_err();
         assert_eq!(evidence(), Some(record.clone()));
         kill(&record.root);
-        holder.close_inner(false, DetachedWork::Stop).unwrap();
-        assert_eq!(evidence(), None, "its record is retired as discovery would");
-        // Nothing is left to release when the Holder is dropped.
+        let result = holder.close_inner(false, DetachedWork::Stop);
+        #[cfg(target_os = "linux")]
+        {
+            result.unwrap();
+            assert_eq!(evidence(), None, "its record is retired as discovery would");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            result.unwrap_err();
+            assert_eq!(
+                evidence(),
+                Some(record),
+                "a dead watcher cannot prove cleanup"
+            );
+        }
         drop(holder);
     }
 
