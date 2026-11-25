@@ -1131,29 +1131,19 @@ fn submit_chord(
 /// The editing binding for a word-wise delete chord, or `None` for any other
 /// press.
 ///
-/// The default bindings map Ctrl+Backspace to deleting one character, so the
-/// chord every other text field on the desktop uses to remove a word silently
-/// did the same thing as Backspace alone. Selecting the word first and then
-/// deleting the selection is how the editor already removes a range, so this
-/// needs no new editing primitive. Ctrl+Delete is included because the two
-/// directions are one habit.
+/// The default bindings map Ctrl+Backspace (Option+Backspace on macOS) to
+/// deleting one character, so the chord every other text field on the
+/// desktop uses to remove a word silently did the same thing as Backspace
+/// alone. Selecting the word first and then deleting the selection is how the
+/// editor already removes a range, so this needs no new editing primitive.
+/// Delete is included because the two directions are one habit, and on macOS
+/// Command deletes to the line's edge, as it does in every Mac text field.
 fn word_delete(press: &text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
-    if !matches!(press.status, text_editor::Status::Focused { .. })
-        || !press.modifiers.command()
-        || press.modifiers.alt()
-        || press.modifiers.shift()
-    {
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
     }
-    let motion = match press.key {
-        keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-            iced::advanced::text::editor::Motion::WordLeft
-        }
-        keyboard::Key::Named(keyboard::key::Named::Delete) => {
-            iced::advanced::text::editor::Motion::WordRight
-        }
-        _ => return None,
-    };
+    let motion =
+        crate::repository_widget::text_editor::deletion_motion(press.modifiers, &press.key)?;
     Some(text_editor::Binding::Sequence(vec![
         text_editor::Binding::Select(motion),
         text_editor::Binding::Backspace,
