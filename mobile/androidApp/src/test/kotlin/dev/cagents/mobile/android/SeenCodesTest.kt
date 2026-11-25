@@ -23,9 +23,17 @@ class SeenCodesTest {
         assertEquals(Sighting.New, seen.frame(code, 0))
         // Pairing ran for a minute with the camera off, then was cancelled.
         seen.resume()
-        // The camera takes a while to come back, still pointed at the code.
-        assertEquals(Sighting.StillThere, seen.frame(code, 62_000))
-        for (t in 62_100L..70_000L step 100) assertEquals(Sighting.Nothing, seen.frame(code, t))
+        for (t in 62_000L..70_000L step 100) assertEquals(Sighting.StillThere, seen.frame(code, t))
+    }
+
+    @Test
+    fun aSlowCameraStartIsNotLookingAway() {
+        val seen = SeenCodes()
+        seen.frame(code, 0)
+        seen.resume()
+        // Dark, unfocused frames for three seconds while pointed at the code.
+        for (t in 60_000L..63_000L step 250) assertEquals(Sighting.Nothing, seen.frame(null, t))
+        assertEquals(Sighting.StillThere, seen.frame(code, 63_100))
     }
 
     @Test
@@ -33,13 +41,13 @@ class SeenCodesTest {
         val seen = SeenCodes()
         seen.frame(code, 0)
         seen.resume()
-        // Frames with no code, starting the time away only once the camera is back.
-        assertEquals(Sighting.Nothing, seen.frame(null, 60_000))
-        assertEquals(Sighting.Nothing, seen.frame(null, 61_000))
-        assertEquals(Sighting.Nothing, seen.frame(code, 61_200), "back within the time away")
+        assertEquals(Sighting.StillThere, seen.frame(code, 60_000))
+        assertEquals(Sighting.Nothing, seen.frame(null, 60_500))
+        assertEquals(Sighting.StillThere, seen.frame(code, 61_000), "back within the time away")
         assertEquals(Sighting.Nothing, seen.frame(null, 61_500))
-        assertEquals(Sighting.Nothing, seen.frame(null, 62_700))
-        assertEquals(Sighting.New, seen.frame(code, 62_800))
+        assertEquals(Sighting.Nothing, seen.frame(null, 62_600))
+        assertEquals(Sighting.New, seen.frame(code, 62_700))
+        assertEquals(Sighting.Nothing, seen.frame(code, 62_800))
     }
 
     @Test
@@ -60,5 +68,12 @@ class SeenCodesTest {
             t += 250
             assertEquals(Sighting.Nothing, seen.frame(if (it % 3 == 0) null else code, t))
         }
+    }
+
+    @Test
+    fun scanningAgainBeforeAnyCodeIgnoresNothing() {
+        val seen = SeenCodes()
+        seen.resume()
+        assertEquals(Sighting.New, seen.frame(code, 0))
     }
 }

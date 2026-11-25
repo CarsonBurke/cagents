@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.random.Random
 
 data class PhoneKeyInfo(val openSsh: String, val fingerprint: String, val hardwareBacked: Boolean)
 
@@ -57,17 +58,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * never written out.
      */
     private val offeredLinks = mutableMapOf<Long, String>()
-    private var lastOffer = 0L
 
     private val _pairingOffer = MutableStateFlow<Long?>(null)
     /** The newest pairing code offered, to open a pairing screen for. */
     val pairingOffer: StateFlow<Long?> = _pairingOffer.asStateFlow()
 
     fun openPairingLink(link: String) {
-        // From the clock, so no offer matches a pairing screen restored
-        // from before the process was restarted.
-        val offer = maxOf(lastOffer + 1, System.currentTimeMillis())
-        lastOffer = offer
+        // Random, so no offer matches a pairing screen restored from before
+        // the process was restarted.
+        val offer = Random.nextLong(1, Long.MAX_VALUE)
         offeredLinks[offer] = link
         _pairingOffer.value = offer
     }

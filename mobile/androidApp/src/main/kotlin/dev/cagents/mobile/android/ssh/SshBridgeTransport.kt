@@ -212,9 +212,14 @@ private fun SSHClient.disconnectQuietly() {
     runCatching { disconnect() }
 }
 
-private fun describe(e: Throwable, host: String, port: Int): String {
+internal fun describe(e: Throwable, host: String, port: Int): String {
     val address = "$host:$port"
-    return when (generateSequence(e) { it.cause }.last()) {
+    // The first known kind in the chain: on Android a refused connection's
+    // root cause is the system's ErrnoException, under a ConnectException.
+    val known = generateSequence(e) { it.cause }.firstOrNull {
+        it is UnknownHostException || it is ConnectException || it is NoRouteToHostException || it is SocketTimeoutException
+    }
+    return when (known) {
         is UnknownHostException -> "Couldn't find $host. Check the address."
         is ConnectException, is NoRouteToHostException ->
             "Couldn't reach $address. Is the computer awake and on the same network?"

@@ -50,6 +50,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -61,6 +62,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -81,14 +83,14 @@ fun PairingScreen(
     onBack: () -> Unit,
     onPaired: () -> Unit,
     onManual: () -> Unit,
-    vm: PairingViewModel = viewModel(),
+    // The link is taken once, with the model, so a link opens on its code
+    // without asking for the camera or starting it.
+    vm: PairingViewModel = viewModel { PairingViewModel(checkNotNull(this[APPLICATION_KEY]), link()) },
 ) {
-    // Taken once, a recreated screen's model already having it, and before
-    // the first frame: a link opens on its code, without asking for the
-    // camera or starting it.
-    remember(vm) { link()?.let(vm::linked) }
     val state by vm.state.collectAsStateWithLifecycle()
     val hint by vm.hint.collectAsStateWithLifecycle()
+    // Kept for the whole screen, so scanning again doesn't ask again.
+    val cameraAsk = rememberSaveable(saver = CameraAsk.Saver) { CameraAsk() }
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     LaunchedEffect(state) {
@@ -120,7 +122,7 @@ fun PairingScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             when (val s = state) {
-                PairingState.Scanning -> Scanning(hint, onScanned = vm::scanned, onPaste = paste, onManual = onManual)
+                PairingState.Scanning -> Scanning(hint, cameraAsk, onScanned = vm::scanned, onPaste = paste, onManual = onManual)
                 is PairingState.Confirm -> Confirm(s.code, s.warnings.replaces, s.warnings.conflicts, s.fromCamera, onPair = vm::confirm, onCancel = vm::scanAgain)
                 is PairingState.Connecting -> Progress("Connecting to ${s.code.name}…") {
                     OutlinedButton(onClick = vm::scanAgain) { Text("Cancel") }
@@ -135,7 +137,12 @@ fun PairingScreen(
                     Button(onClick = vm::scanAgain) { Text("Scan again") }
                 }
                 is PairingState.Failed -> Outcome(Icons.Outlined.Error, "Couldn't pair", s.message, error = true) {
-                    Button(onClick = vm::scanAgain) { Text("Scan again") }
+                    if (s.code != null) {
+                        Button(onClick = vm::retry) { Text("Try again") }
+                        OutlinedButton(onClick = vm::scanAgain) { Text("Scan again") }
+                    } else {
+                        Button(onClick = vm::scanAgain) { Text("Scan again") }
+                    }
                     TextButton(onClick = onManual) { Text("Set up by hand instead") }
                 }
             }
@@ -144,17 +151,13 @@ fun PairingScreen(
 }
 
 @Composable
-private fun Scanning(hint: String?, onScanned: (String?) -> Unit, onPaste: () -> Unit, onManual: () -> Unit) {
+private fun Scanning(hint: String?, cameraAsk: CameraAsk, onScanned: (String?) -> Unit, onPaste: () -> Unit, onManual: () -> Unit) {
     val context = LocalContext.current
     fun granted() = context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     var camera by remember { mutableStateOf(granted()) }
     val hasCamera = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY) }
     var cameraFailed by remember { mutableStateOf(false) }
-    // Asked once on arriving: the person just chose to scan, which is when the camera is needed.
-    var askedHere by rememberSaveable { mutableStateOf(false) }
-    // Only Settings can allow the camera now: the person refused for good,
-    // so the system answers requests without asking.
-    var onlyInSettings by rememberSaveable { mutableStateOf(false) }
+    var onlyInSettings by cameraAsk.onlyInSettings
     // The activity's own lifecycle, which a screen's lifecycle in the back
     // stack doesn't follow, to see the person return from Settings.
     val activity = LocalActivity.current as? ComponentActivity
@@ -183,8 +186,8 @@ private fun Scanning(hint: String?, onScanned: (String?) -> Unit, onPaste: () ->
         if (camera) onlyInSettings = false
     }
     LaunchedEffect(Unit) {
-        if (hasCamera && !camera && !askedHere) {
-            askedHere = true
+        if (hasCamera && !camera && !cameraAsk.askedHere) {
+            cameraAsk.askedHere = true
             ask()
         }
     }
@@ -361,4 +364,20 @@ private class CameraAsked(context: Context) {
     var before: Boolean
         get() = prefs.getBoolean("camera_asked", false)
         set(value) = prefs.edit().putBoolean("camera_asked", value).apply()
+}
+
+/** Asking for the camera on one pairing screen. */
+private class CameraAsk(askedHere: Boolean = false, onlyInSettings: Boolean = false) {
+    /** Asked once on arriving: the person just chose to scan, which is when the camera is needed. */
+    var askedHere = askedHere
+
+    /** Only Settings can allow the camera now: the system answers requests without asking. */
+    val onlyInSettings = mutableStateOf(onlyInSettings)
+
+    companion object {
+        val Saver = listSaver<CameraAsk, Boolean>(
+            save = { listOf(it.askedHere, it.onlyInSettings.value) },
+            restore = { CameraAsk(it[0], it[1]) },
+        )
+    }
 }

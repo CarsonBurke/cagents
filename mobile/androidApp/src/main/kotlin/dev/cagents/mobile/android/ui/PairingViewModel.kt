@@ -40,14 +40,16 @@ sealed interface PairingState {
 
     data class Declined(val code: PairingCode) : PairingState
 
-    data class Failed(val message: String) : PairingState
+    /** Pairing failed; [code], when it may work on another try, such as after the network came back. */
+    data class Failed(val message: String, val code: PairingCode? = null) : PairingState
 }
 
 /**
- * Runs one pairing for the pairing screen. Leaving the screen clears this
- * model, which closes the connection and so withdraws a pending request.
+ * Runs one pairing for the pairing screen, starting from [link] when another
+ * app opened this one with a code. Leaving the screen clears this model,
+ * which closes the connection and so withdraws a pending request.
  */
-class PairingViewModel(app: Application) : AndroidViewModel(app) {
+class PairingViewModel(app: Application, link: String? = null) : AndroidViewModel(app) {
     private val graph = app.graph
 
     private val _state = MutableStateFlow<PairingState>(PairingState.Scanning)
@@ -60,7 +62,14 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
     private var job: Job? = null
     private var hintJob: Job? = null
     private val seen = SeenCodes()
-    private var linked: String? = null
+    private var hintUntil = 0L
+
+    /** What to say when the camera is still on the code from before scanning again. */
+    private var stillThere = ""
+
+    init {
+        link?.let(::offered)
+    }
 
     private fun now() = System.currentTimeMillis() / 1000
 
@@ -74,7 +83,7 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         when (seen.frame(text, SystemClock.elapsedRealtime())) {
             SeenCodes.Sighting.Nothing -> return
             SeenCodes.Sighting.StillThere -> {
-                showHint("That's the code from before. Point the camera away and back to use it again.")
+                showHint(stillThere)
                 return
             }
             SeenCodes.Sighting.New -> {}
@@ -110,13 +119,6 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
         fromCamera,
     )
 
-    /** A link another app opened this one with; offered once, however often the screen is recreated. */
-    fun linked(link: String) {
-        if (link == linked) return
-        linked = link
-        offered(link)
-    }
-
     /** A code from the clipboard: the person chose it, but it is confirmed like a link. Anything else is only a hint. */
     fun pasted(text: String) {
         if (_state.value != PairingState.Scanning) return
@@ -128,7 +130,15 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun confirm() {
-        val code = (_state.value as? PairingState.Confirm)?.code ?: return
+        pair((_state.value as? PairingState.Confirm)?.code ?: return)
+    }
+
+    /** Tries a failed pairing's code again. */
+    fun retry() {
+        pair((_state.value as? PairingState.Failed)?.code ?: return)
+    }
+
+    private fun pair(code: PairingCode) {
         if (now() > code.expires + PairingCode.CLOCK_SKEW_SECONDS) {
             _state.value = PairingState.Failed("This pairing code has expired. Show a new one on the computer.")
         } else {
@@ -148,6 +158,7 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 PairOutcome.Failed("Couldn't pair: ${e.message ?: e::class.simpleName}")
             }
+            val retryable = now() <= code.expires + PairingCode.CLOCK_SKEW_SECONDS
             _state.value = when (outcome) {
                 is PairOutcome.Paired -> {
                     // Connect with the phone's own key to the computer just saved.
@@ -156,7 +167,7 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
                     PairingState.Paired(code)
                 }
                 PairOutcome.Declined -> PairingState.Declined(code)
-                is PairOutcome.Failed -> PairingState.Failed(outcome.message)
+                is PairOutcome.Failed -> PairingState.Failed(outcome.message, code.takeIf { retryable })
             }
         }
     }
@@ -167,19 +178,35 @@ class PairingViewModel(app: Application) : AndroidViewModel(app) {
      * until it has looked away.
      */
     fun scanAgain() {
+        stillThere = if (_state.value is PairingState.Declined) {
+            "That code was used. Show a new one on the computer."
+        } else {
+            "That's the code from before. Point the camera away and back to use it again."
+        }
         job?.cancel()
         job = null
         seen.resume()
+        hintJob?.cancel()
         _hint.value = null
         _state.value = PairingState.Scanning
     }
 
+    /** Shows [message] for a few seconds, or for as long as it is shown again meanwhile, as with every frame of a code. */
     private fun showHint(message: String) {
         _hint.value = message
-        hintJob?.cancel()
+        hintUntil = SystemClock.elapsedRealtime() + HINT_MILLIS
+        if (hintJob?.isActive == true) return
         hintJob = viewModelScope.launch {
-            delay(4_000)
+            while (true) {
+                val left = hintUntil - SystemClock.elapsedRealtime()
+                if (left <= 0) break
+                delay(left)
+            }
             _hint.value = null
         }
+    }
+
+    private companion object {
+        const val HINT_MILLIS = 4_000L
     }
 }

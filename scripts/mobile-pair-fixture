@@ -55,7 +55,8 @@ start)
     [ ${#hosts[@]} -gt 0 ] || hosts=(10.0.2.2)
     # A directory of its own, made here: sshd trusts its authorized_keys
     # without checking who could write them.
-    mkdir -m 700 "$base" 2>/dev/null || die "$base exists; stop it first, or set CAGENTS_PAIR_FIXTURE"
+    [ ! -e "$base" ] || die "$base exists; stop it first, or set CAGENTS_PAIR_FIXTURE"
+    mkdir -m 700 "$base"
     mkdir -m 700 "$base/home" "$base/run"
     ssh-keygen -q -t ed25519 -N '' -C fixture-host -f "$base/host_key" <<<y >/dev/null
     : >"$base/authorized_keys"
