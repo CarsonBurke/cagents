@@ -3137,7 +3137,8 @@ issue #4045. `mise run check:macos:LANE` type-checks a lane for
 `aarch64-apple-darwin` on the build host. Rust cross-checks natively, and
 `scripts/darwin-cc` compiles the C that build scripts need using the zig that
 `mise.toml` pins. The build host needs that target once:
-`rustup target add aarch64-apple-darwin`. A check cannot link or run
+`rustup target add aarch64-apple-darwin --toolchain 1.93.0` (the
+`rust-toolchain.toml` channel). A check cannot link or run
 anything, so behavior, and anything that needs Apple's frameworks, still has
 to be verified on a real Mac.
 

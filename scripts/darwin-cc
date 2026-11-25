@@ -11,15 +11,19 @@
 set -eu
 tool=cc
 case "${1-}" in cc|ar) tool=$1; shift ;; esac
+version=$(sed -n 's/^zig *= *"\(.*\)"$/\1/p' "$(dirname "$0")/../mise.toml")
+# The zig on PATH if it is the pinned one; otherwise mise's install of it. A
+# mise shim answers only inside a trusted checkout, which the build host's copy
+# of the sources isn't.
 zig=
-if command -v zig >/dev/null 2>&1 && zig version >/dev/null 2>&1; then
+if command -v zig >/dev/null 2>&1 && [ "$(zig version 2>/dev/null)" = "$version" ]; then
     zig=zig
 else
-    # A mise shim answers only inside a trusted checkout; the build host's
-    # copy of the sources isn't one, so fall back to the version mise.toml pins.
-    version=$(sed -n 's/^zig = "\(.*\)"$/\1/p' "$(dirname "$0")/../mise.toml")
-    zig=${MISE_DATA_DIR:-$HOME/.local/share/mise}/installs/zig/$version/bin/zig
-    [ -x "$zig" ] || { echo "darwin-cc: zig $version is not installed; run mise install" >&2; exit 1; }
+    data=${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}
+    for candidate in "$data/installs/zig/$version/bin/zig" "$data/installs/zig/$version/zig"; do
+        [ -x "$candidate" ] && { zig=$candidate; break; }
+    done
+    [ -n "$zig" ] || { echo "darwin-cc: zig $version is not installed; run mise install" >&2; exit 1; }
 fi
 [ "$tool" = ar ] && exec "$zig" ar "$@"
 for argument in "$@"; do
