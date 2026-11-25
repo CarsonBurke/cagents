@@ -607,6 +607,7 @@ pub(crate) struct CurrentExchange {
     current: std::path::PathBuf,
     next: std::path::PathBuf,
     expected: std::path::PathBuf,
+    link: std::path::PathBuf,
     keep_next: bool,
 }
 
@@ -624,6 +625,7 @@ impl CurrentExchange {
             current,
             next,
             expected: expected.to_owned(),
+            link: link.to_owned(),
             keep_next: false,
         };
         // Detect filesystems without atomic exchange before releasing the
@@ -669,6 +671,11 @@ impl CurrentExchange {
     }
 
     pub(crate) fn commit(mut self) -> io::Result<()> {
+        if std::fs::read_link(&self.next)? != self.link {
+            return Err(io::Error::other(
+                "prepared installation pointer changed independently",
+            ));
+        }
         self.swap(&self.current).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -679,7 +686,9 @@ impl CurrentExchange {
             )
         })?;
         // The temporary name now holds the previous public pointer.
-        if std::fs::read_link(&self.next).ok().as_deref() != Some(self.expected.as_path()) {
+        if std::fs::read_link(&self.next).ok().as_deref() != Some(self.expected.as_path())
+            || std::fs::read_link(&self.current).ok().as_deref() != Some(self.link.as_path())
+        {
             return Err(io::Error::other(match self.swap(&self.current) {
                 Ok(()) => "current installation changed independently; the link observed during selection was restored".into(),
                 Err(error) => {

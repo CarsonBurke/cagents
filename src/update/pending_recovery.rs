@@ -165,10 +165,18 @@ pub(crate) fn run(
         let parked = false;
         #[cfg(target_os = "linux")]
         if let Some(standby) = standby.as_mut() {
-            standby.activate(&daemon, Some(&handoff), Some(&receipt), timeout, || {
-                let _ = installed::report_overdue_startup(&state, &mut job);
-            })?;
-            installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout)?;
+            let started = standby
+                .activate(&daemon, Some(&handoff), Some(&receipt), timeout, || {
+                    let _ = installed::report_overdue_startup(&state, &mut job);
+                })
+                .map_err(UpdateError::from)
+                .and_then(|()| {
+                    installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout)
+                });
+            if started.is_err() && standby.may_own_runtime() {
+                guard.leave_launch_fence_with_successor();
+            }
+            started?;
             installed::selected_candidate(&layout.prefix, &layout.version_root)?;
         }
         if !parked {

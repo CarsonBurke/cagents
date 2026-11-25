@@ -448,6 +448,9 @@ pub(super) fn perform(
         } else if candidate.may_own_runtime() {
             guard.set_fallback_executable(root.join("bin/cagents-ui"));
             guard.set_recovery_restore_only();
+            if selection.previous_link.is_some() {
+                guard.leave_launch_fence_with_successor();
+            }
             return Err(result.unwrap_err());
         }
     }
