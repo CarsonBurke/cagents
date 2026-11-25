@@ -1042,8 +1042,17 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_requires_signal_proof() 
     drop(tool_guard);
     fixture.close_after_unproved_loss();
     #[cfg(target_os = "linux")]
-    fixture.assert_settled();
-    assert!(!has_native_owner(&fixture.source).unwrap());
+    {
+        fixture.assert_settled();
+        assert!(!has_native_owner(&fixture.source).unwrap());
+    }
+    #[cfg(target_os = "macos")]
+    assert!(
+        has_native_owner(&fixture.source)
+            .unwrap_err()
+            .message
+            .contains("Cannot confirm detached provider cleanup")
+    );
 }
 
 /// While anything of the old conversation may still run, reopening it keeps
@@ -1308,12 +1317,18 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
         if observed.as_ref().is_ok_and(|argv| argv == &expected) {
             break observed.unwrap();
         }
-        assert!(
-            Instant::now() < deadline,
-            "the fake app-server never recorded {expected:?}: {observed:?}; failure {:?}; holder {:?}",
-            handle.failure(),
-            registry::execution_record(&holder_socket),
-        );
+        if Instant::now() >= deadline {
+            let holder = registry::execution_record(&holder_socket);
+            let image = holder
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map(|record| record.root.executable());
+            panic!(
+                "the fake app-server never recorded {expected:?}: {observed:?}; failure {:?}; holder {holder:?}; image {image:?}",
+                handle.failure(),
+            );
+        }
         thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(
