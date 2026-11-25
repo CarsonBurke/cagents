@@ -88,7 +88,7 @@ code)
     [ -e "$state" ] || die "start it first"
     # shellcheck source=/dev/null
     source "$state"
-    python3 -I - "$base" "$bin" "$port" "$USER" "$(hostname -s)" "${hosts[@]}" <<'PY'
+    /usr/bin/python3 -I - "$base" "$bin" "$port" "$USER" "$(hostname -s)" "${hosts[@]}" <<'PY'
 import base64, os, subprocess, sys, time, urllib.parse
 base, bin_dir, port, user, name, *hosts = sys.argv[1:]
 work = os.path.join(base, "one-time")
@@ -185,7 +185,7 @@ allow | decline)
     [ -e "$base/pairing" ] || die "no pairing; run code first"
     # shellcheck source=/dev/null
     source "$state"
-    python3 -I - "$base" "$bin" "$command" <<'PY'
+    /usr/bin/python3 -I - "$base" "$bin" "$command" <<'PY'
 import json, os, sys, tempfile
 base, bin_dir, outcome = sys.argv[1:]
 directory, line = open(os.path.join(base, "pairing")).read().split("\n", 1)
