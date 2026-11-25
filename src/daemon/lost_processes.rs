@@ -28,11 +28,10 @@
 //! a pidfd and reads it again before signalling it, so a PID that changed
 //! hands since fails that reading, and a pidfd can never signal another
 //! process. A process found since is shown before anything ends it.
-use crate::daemon::holder_registry::Process;
+use crate::{daemon::holder_registry::Process, pinned_process::PinnedProcess};
 use std::{
-    fs::File,
     io,
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::AsRawFd,
     path::Path,
     time::{Duration, Instant},
 };
@@ -288,7 +287,7 @@ pub fn end(
             }
         }
         if pinned.is_empty() {
-            // Each exited or changed between the scan and the pidfd; the next
+            // Each exited or changed between the scan and the pin; the next
             // scan says which, without spinning on /proc meanwhile.
             std::thread::sleep(Duration::from_millis(20));
             continue;
@@ -304,10 +303,10 @@ pub fn end(
     }
 }
 
-/// A survivor held by a pidfd, so that signalling it can never reach another
+/// A survivor held by a pin, so that signalling it can never reach another
 /// process that later takes its PID.
 struct Pinned {
-    pidfd: File,
+    process: PinnedProcess,
     pid: i32,
 }
 
@@ -315,19 +314,13 @@ impl Pinned {
     /// Pins `survivor` if it is still the process the scan found, in the same
     /// group and session. `None` once it has gone or changed.
     fn open(survivor: &Survivor) -> Result<Option<Self>, String> {
-        // SAFETY: scalar arguments; success returns a fresh owned descriptor.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, survivor.pid, 0) };
-        if raw < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(None);
-            }
-            return Err(format!("Cannot hold process {}: {error}", survivor.pid));
-        }
-        // SAFETY: successful pidfd_open above yielded a fresh owned descriptor.
-        let pidfd = unsafe { File::from_raw_fd(raw as libc::c_int) };
+        let process = match PinnedProcess::open_unreaped(survivor.pid as u32) {
+            Ok(process) => process,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("Cannot hold process {}: {error}", survivor.pid)),
+        };
         // Read after pinning: only the same process can still show the same
-        // start time under this PID, so the descriptor names the survivor.
+        // start time under this PID, so the pin names the survivor.
         let same =
             read_stat(&Path::new("/proc").join(survivor.pid.to_string()))?.is_some_and(|stat| {
                 stat.start == survivor.start
@@ -336,30 +329,17 @@ impl Pinned {
                     && !stat.zombie
             });
         Ok(same.then_some(Self {
-            pidfd,
+            process,
             pid: survivor.pid,
         }))
     }
 
     fn signal(&self, signal: i32) -> Result<(), String> {
-        // SAFETY: the descriptor is a live pidfd owned by self; no siginfo.
-        let sent = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                signal,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        if sent < 0 {
-            let error = io::Error::last_os_error();
-            // It has already exited.
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(format!("Cannot end process {}: {error}", self.pid));
-            }
-        }
-        Ok(())
+        // `Ok(false)`: it has already exited.
+        self.process
+            .signal(signal)
+            .map(drop)
+            .map_err(|error| format!("Cannot end process {}: {error}", self.pid))
     }
 }
 
@@ -371,7 +351,7 @@ fn wait_for_exit(mut pinned: Vec<Pinned>, limit: Duration) -> Result<Vec<Pinned>
         let mut polled: Vec<libc::pollfd> = pinned
             .iter()
             .map(|process| libc::pollfd {
-                fd: process.pidfd.as_raw_fd(),
+                fd: process.process.exit_readiness().as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             })

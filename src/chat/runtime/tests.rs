@@ -1411,6 +1411,7 @@ fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
 use super::super::Role;
 use super::*;
 use serde_json::{Value, json};
+use std::os::fd::FromRawFd;
 
 #[test]
 fn a_settled_actor_releases_large_json_frame_slack() {

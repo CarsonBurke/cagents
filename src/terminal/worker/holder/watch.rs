@@ -1,4 +1,4 @@
-//! Observe only the already-authenticated original control socket/root pidfd.
+//! Observe only the already-authenticated original control socket/root pin.
 //! Descriptor handover remains synchronous; this parser handles report frames.
 use super::*;
 use tokio::io::unix::AsyncFd;
@@ -11,7 +11,7 @@ pub(super) struct Watch {
 impl Watch {
     pub(super) fn start(
         control: UnixStream,
-        root: File,
+        root: &PinnedProcess,
         released: std::io::PipeReader,
         exits: Sender<ChildExit>,
         acknowledge: Sender<Result<Acknowledgement, String>>,
@@ -21,7 +21,14 @@ impl Watch {
         // Register every owned descriptor before admitting the observer.
         let _entered = runtime.enter();
         let control = AsyncFd::new(control).map_err(|error| error.to_string())?;
-        let root = AsyncFd::new(root).map_err(|error| error.to_string())?;
+        // A second descriptor for the pin's exit readiness, owned by the
+        // observer; it is only ever polled.
+        let root = root
+            .exit_readiness()
+            .try_clone_to_owned()
+            .map_err(|error| format!("watch terminal root: {error}"))?;
+        let root = AsyncFd::with_interest(root, tokio::io::Interest::READABLE)
+            .map_err(|error| error.to_string())?;
         let released = AsyncFd::new(released).map_err(|error| error.to_string())?;
         let (finished, done) = crossbeam_channel::bounded::<()>(0);
         let task = runtime.spawn(async move {
@@ -46,7 +53,7 @@ impl Watch {
 
 async fn observe(
     control: AsyncFd<UnixStream>,
-    root: AsyncFd<File>,
+    root: AsyncFd<OwnedFd>,
     released: AsyncFd<std::io::PipeReader>,
     exits: Sender<ChildExit>,
     acknowledge: Sender<Result<Acknowledgement, String>>,
@@ -87,7 +94,7 @@ async fn observe(
     }
     tracing::warn!("a terminal holder ended before its root process; the terminal stays attached");
     // Control EOF alone cannot certify the root's exit. Wait for that original
-    // pidfd, or for the owner's release, without synthesizing a known status.
+    // pin, or for the owner's release, without synthesizing a known status.
     tokio::select! {
         biased;
         _ = released.readable() => {},

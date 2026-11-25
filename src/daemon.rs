@@ -2,8 +2,11 @@
 pub(crate) mod adopted_orphans;
 #[cfg(feature = "host")]
 pub(crate) mod child_events;
-#[cfg(all(feature = "host", target_os = "linux"))]
+#[cfg(feature = "host")]
 pub mod child_reaper;
+/// The exact-process pin the daemon waits on and signals, which no process
+/// that later takes its pid can stand in for.
+pub use crate::pinned_process::PinnedProcess;
 #[cfg(any(feature = "host", feature = "ui"))]
 pub mod codex_temp;
 pub mod holder_registry;
@@ -52,7 +55,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::model::{BootId, HostSessionProof};
-use crate::pinned_process::{PinnedProcess, peer_credentials};
+use crate::pinned_process::peer_credentials;
 use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
 #[cfg(feature = "host")]
@@ -150,7 +153,7 @@ pub fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
 pub fn wait_for_activity_until(
     listener: &UnixListener,
     deadline: Option<Instant>,
-    holders: &[Arc<File>],
+    holders: &[Arc<PinnedProcess>],
 ) -> io::Result<()> {
     wait_for_activity_until_with(listener, wakeup()?, deadline, holders)
 }
@@ -165,7 +168,7 @@ fn wait_for_activity_until_with(
     listener: &UnixListener,
     wakeup: &Wakeup,
     deadline: Option<Instant>,
-    holders: &[Arc<File>],
+    holders: &[Arc<PinnedProcess>],
 ) -> io::Result<()> {
     let mut fds = vec![
         libc::pollfd {
@@ -180,7 +183,7 @@ fn wait_for_activity_until_with(
         },
     ];
     fds.extend(holders.iter().map(|holder| libc::pollfd {
-        fd: holder.as_raw_fd(),
+        fd: holder.exit_readiness().as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     }));
@@ -192,7 +195,7 @@ fn wait_for_activity_until_with(
             .min(c_int::MAX as u128) as c_int
     });
     // SAFETY: every entry is initialized, and the listener, wake channel and
-    // borrowed Arc-held original pidfds all outlive this single poll call.
+    // borrowed Arc-held original pins all outlive this single poll call.
     // Rounding upward avoids an early submillisecond deadline/spinning loop.
     let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
     if ready < 0 {
@@ -1464,15 +1467,12 @@ mod tests {
         fs::write(&paths.lock, format!("{{\"pid\":{pid}}}")).unwrap();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
         // Wait for exit without reaping to exercise the zombie case too.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        assert!(descriptor >= 0);
-        let process = unsafe { File::from_raw_fd(descriptor as c_int) };
-        let mut poll = libc::pollfd {
-            fd: process.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        let process = PinnedProcess::open_unreaped(pid).unwrap();
+        assert!(
+            process
+                .wait_for_exit(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
         assert!(HostLease::is_held(&paths).unwrap());
         assert!(!daemon_process_alive_at(&paths).unwrap());
         assert!(child.wait().unwrap().success());
@@ -1531,13 +1531,13 @@ mod tests {
         let _accepted = crate::descriptor::accept(&listener).unwrap();
     }
 
-    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[cfg(feature = "host")]
     struct ActivityWaitChild {
         child: std::process::Child,
-        original: Arc<File>,
+        original: Arc<PinnedProcess>,
     }
 
-    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[cfg(feature = "host")]
     impl ActivityWaitChild {
         fn start() -> Self {
             use std::process::Stdio;
@@ -1550,17 +1550,17 @@ mod tests {
                 .unwrap();
             // The original is still our unreaped Child and waits on its own
             // stdin. Capture once, before any release; never reopen a saved PID.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("capture original activity child: {error}");
-            }
+            let original = match crate::pinned_process::PinnedChild::of(&child) {
+                Ok(pin) => pin.into_process(),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("capture original activity child: {error}");
+                }
+            };
             Self {
                 child,
-                // SAFETY: successful pidfd_open returned this fresh owned fd.
-                original: Arc::new(unsafe { File::from_raw_fd(fd as c_int) }),
+                original: Arc::new(original),
             }
         }
 
@@ -1587,7 +1587,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[cfg(feature = "host")]
     impl Drop for ActivityWaitChild {
         fn drop(&mut self) {
             // Failure-only cleanup acts on the original owned Child; normal
@@ -1599,7 +1599,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[cfg(feature = "host")]
     #[test]
     fn lifecycle_activity_wait_observes_absolute_deadline_without_other_activity() {
         use std::{sync::mpsc, time::Duration};
@@ -1641,7 +1641,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[cfg(feature = "host")]
     #[test]
     fn lifecycle_activity_wait_wakes_on_original_holder_exit_with_quiet_listener_and_wake() {
         use std::{sync::mpsc, time::Duration};
@@ -1698,15 +1698,10 @@ mod tests {
             unsafe { libc::poll(quiet.as_mut_ptr(), quiet.len() as _, 0) },
             0
         );
-        let mut exited = libc::pollfd {
-            fd: child.original.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert!(unsafe { libc::poll(&mut exited, 1, 0) } > 0 && exited.revents & libc::POLLIN != 0);
+        assert!(child.original.exited().unwrap());
     }
 
-    #[cfg(all(feature = "host", target_os = "linux"))]
+    #[cfg(feature = "host")]
     #[test]
     fn lifecycle_activity_wait_preserves_local_wake_with_pending_holder_and_deadline() {
         use std::{sync::mpsc, time::Duration};

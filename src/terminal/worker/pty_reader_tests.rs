@@ -1,5 +1,6 @@
 //! Actual PTY readiness and bounded parser backpressure, without a child.
 use super::*;
+use std::os::fd::FromRawFd;
 
 struct Reading {
     reader: File,
