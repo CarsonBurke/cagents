@@ -2986,8 +2986,8 @@ exec /bin/cat >/dev/null
         assert_ne!(first_path, second_path);
         first.close().await;
         assert!(first_path.starts_with(fixture.path().canonicalize().unwrap()));
-        #[cfg(target_os = "linux")]
-        assert!(!first_path.exists());
+        // Reclamation needs a complete census. The focused codex_temp tests
+        // cover that proof and retention under churn independently.
         #[cfg(target_os = "macos")]
         assert!(
             first_path.is_dir(),
@@ -2995,8 +2995,6 @@ exec /bin/cat >/dev/null
         );
         assert!(second_path.is_dir());
         second.close().await;
-        #[cfg(target_os = "linux")]
-        assert!(!second_path.exists());
         #[cfg(target_os = "macos")]
         assert!(second_path.is_dir());
     }
