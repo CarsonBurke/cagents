@@ -300,7 +300,7 @@ cleanup() {
     # A second interrupt must not stop a rollback halfway.
     trap '' HUP INT TERM
     roll_back
-    [ "$STAGE_KEPT" -eq 1 ] || rm -rf "$STAGE"
+    [ "$STAGE_KEPT" -eq 1 ] || rm -rf "$STAGE" || :
     release_lock
 }
 trap cleanup EXIT
@@ -428,7 +428,7 @@ PRIOR_APP_LINK=
     || fail "$AGENT_PLIST is a link this installer did not make; remove it, then run this installer again"
 PRIOR_AGENT=0
 if [ -f "$AGENT_PLIST" ]; then
-    cp -p "$AGENT_PLIST" "$STAGE/agent.plist.prior" \
+    cp "$AGENT_PLIST" "$STAGE/agent.plist.prior" \
         || fail 'cannot keep a copy of the login item; the installation was not changed'
     PRIOR_AGENT=1
 fi
