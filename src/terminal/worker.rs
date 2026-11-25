@@ -1311,6 +1311,16 @@ impl TerminalHandle {
             .try_clone_to_owned()
             .map(File::from)
     }
+    /// PID from the exact root pin retained by the test's input worker.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn original_root_pid_for_test(&self) -> Option<u32> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .map(PinnedProcess::pid)
+    }
+
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
     /// these atomic worker checks do not make a source mutation atomic.
