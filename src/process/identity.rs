@@ -191,6 +191,13 @@ pub(crate) fn finish_unreaped_group(pid: i32, timeout: std::time::Duration) -> i
 
 #[cfg(all(target_os = "macos", feature = "host"))]
 fn group_has_other_members(group: u32) -> io::Result<bool> {
+    Ok(group_members(group)?
+        .into_iter()
+        .any(|pid| pid as u32 != group))
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn group_members(group: u32) -> io::Result<Vec<libc::pid_t>> {
     // XNU's PROC_PGRP_ONLY lists the exact group even when a member changed
     // UID. A same-user census could miss a member that refused the signal.
     const PROC_PGRP_ONLY: u32 = 2;
@@ -218,10 +225,11 @@ fn group_has_other_members(group: u32) -> io::Result<bool> {
     if bytes < 0 || bytes >= capacity || !(bytes as usize).is_multiple_of(width) {
         return Err(io::Error::other("Incomplete provider process group census"));
     }
-    Ok(entries
-        .into_iter()
-        .take(bytes as usize / width)
-        .any(|pid| pid != 0 && pid as u32 != group))
+    entries.truncate(bytes as usize / width);
+    entries.retain(|pid| *pid > 0);
+    entries.sort_unstable();
+    entries.dedup();
+    Ok(entries)
 }
 
 /// The status of a child whose exit the kernel has already announced, by
