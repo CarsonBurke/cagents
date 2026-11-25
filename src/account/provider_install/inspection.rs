@@ -382,13 +382,33 @@ mod tests {
     fn status_round_trips_non_utf8_paths() {
         let fixture = Fixture::new();
         let prefix = fixture.data.join(OsString::from_vec(b"npm-\xff".to_vec()));
-        let mut status = fixture.status(Provider::Codex);
-        // Keep raw paths in the serialization fixture even on filesystems
-        // that refuse to create entries whose names are not valid UTF-8.
-        status.executable = Some(prefix.join("bin/codex"));
-        status.resolved_executable =
-            Some(prefix.join("lib/node_modules/@openai/codex/bin/codex.js"));
-        status.install_method = ProviderInstallMethod::Npm { prefix };
+        #[cfg(target_os = "linux")]
+        let status = {
+            let binary = fixture.file(
+                prefix.join("lib/node_modules/@openai/codex/bin/codex.js"),
+                b"fake",
+            );
+            symlink(binary, fixture.bin.join("codex")).unwrap();
+            let status = fixture.status(Provider::Codex);
+            assert_eq!(
+                status.install_method,
+                ProviderInstallMethod::Npm {
+                    prefix: prefix.canonicalize().unwrap(),
+                },
+            );
+            status
+        };
+        #[cfg(target_os = "macos")]
+        let status = {
+            // APFS refuses names that are not valid UTF-8. Exercise the
+            // serialized fields without creating the paths on disk.
+            let mut status = fixture.status(Provider::Codex);
+            status.executable = Some(prefix.join("bin/codex"));
+            status.resolved_executable =
+                Some(prefix.join("lib/node_modules/@openai/codex/bin/codex.js"));
+            status.install_method = ProviderInstallMethod::Npm { prefix };
+            status
+        };
         assert_eq!(
             postcard::from_bytes::<ProviderStatus>(&postcard::to_allocvec(&status).unwrap())
                 .unwrap(),
