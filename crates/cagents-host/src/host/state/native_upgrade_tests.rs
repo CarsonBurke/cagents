@@ -22,6 +22,19 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
     use crate::terminal_ipc::{ClientRequest, ServerResponse};
     use std::io;
 
+    struct CloseFixtureChat<'a>(&'a SharedHost, Option<TerminalId>);
+    impl Drop for CloseFixtureChat<'_> {
+        fn drop(&mut self) {
+            if let Some(chat_id) = self.1 {
+                let _ = super::super::client::process_request(
+                    self.0,
+                    1,
+                    ClientRequest::ChatClose { chat_id },
+                );
+            }
+        }
+    }
+
     const PAIRED_TEST: &str = "host::state::native_upgrade_tests::paired_codex_close_prepares_floor_resume_with_exact_receipts";
     if std::env::var(MODE).as_deref() != Ok("paired-floor") {
         let fixture = tempfile::Builder::new()
@@ -76,6 +89,7 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
         Arc::new(crate::chat::protocol::ExecutionContext::default()),
     )
     .unwrap();
+    let mut close_source = CloseFixtureChat(&host, Some(chat_id));
     let handle = host.lock().unwrap().chats[&chat_id].handle.clone();
     wait_durable(&handle);
 
@@ -128,6 +142,8 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
     let ServerResponse::ChatClosed { snapshot, .. } = closed else {
         panic!("expected an ordinary close, got {closed:?}");
     };
+    close_source.1 = None;
+    drop(close_source);
     wait_until(
         || !native_owner.holder.is_current() && !terminal_owner.holder.is_current(),
         "original holders survived close",
@@ -225,6 +241,7 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
         },
     )
     .unwrap();
+    let mut close_resumed = CloseFixtureChat(&host, Some(resumed_id));
     assert!(matches!(resumed, ServerResponse::ChatAttached { .. }));
     let resumed_handle = host.lock().unwrap().chats[&resumed_id].handle.clone();
     wait_durable(&resumed_handle);
@@ -241,6 +258,7 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
     )
     .unwrap();
     assert!(matches!(closed, ServerResponse::ChatClosed { .. }));
+    close_resumed.1 = None;
     wait_until(
         || !resumed_owner.holder.is_current() && !resumed_owner.root.is_current(),
         "the resumed fixture provider survived close",
@@ -1947,7 +1965,7 @@ fn install_provider(root: &std::path::Path) -> std::path::PathBuf {
         format!(
             r#"#!/bin/sh
 set -eu
-if [ "${{1:-}}" = --remote ]; then
+if [ "${{1:-}}" = resume ]; then
   : > "${{0%/*}}/../console-ready"
   exec /bin/sleep 300
 fi
