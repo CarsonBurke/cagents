@@ -2163,7 +2163,7 @@ fn detached_policy_descendant_is_retained_through_settlement(cancelled: bool) {
         &["config", "core.hooksPath", policy.to_str().unwrap()],
     );
     let hook = policy.join("reference-transaction");
-    fs::write(&hook, "#!/bin/sh\nset -eu\ninput=$(/bin/cat)\nif [ \"$1\" = committed ] && printf '%s' \"$input\" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then\n /usr/bin/setsid /usr/bin/timeout 120 /bin/sh -c 'touch \"$CAGENTS_PR_PRIVATE/descendant-started\"; while [ ! -e \"$CAGENTS_PR_PRIVATE/release-descendant\" ]; do /bin/sleep 0.02; done; touch \"$CAGENTS_PR_PRIVATE/descendant-retired\"' </dev/null >/dev/null 2>&1 &\nfi\n").unwrap();
+    fs::write(&hook, "#!/bin/sh\nset -eu\ninput=$(/bin/cat)\nif [ \"$1\" = committed ] && printf '%s' \"$input\" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then\n /usr/bin/python3 -c 'import os,signal,sys; os.setsid(); signal.alarm(120); os.execv(sys.argv[1],sys.argv[1:])' /bin/sh -c 'touch \"$CAGENTS_PR_PRIVATE/descendant-started\"; while [ ! -e \"$CAGENTS_PR_PRIVATE/release-descendant\" ]; do /bin/sleep 0.02; done; touch \"$CAGENTS_PR_PRIVATE/descendant-retired\"' </dev/null >/dev/null 2>&1 &\nfi\n").unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
     let plan = fixture.prepare(&fixture.request(new.clone()));
     let cancel = CancellationToken::default();
@@ -2276,7 +2276,7 @@ fn policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_rece
 set -eu
 input=$(/bin/cat)
 if [ "$1" = committed ] && printf '%s' "$input" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then
- /usr/bin/setsid /usr/bin/timeout 120 /bin/sh -c '
+ /usr/bin/python3 -c 'import os,signal,sys; os.setsid(); signal.alarm(120); os.execv(sys.argv[1],sys.argv[1:])' /bin/sh -c '
   touch "$CAGENTS_PR_PRIVATE/late-child-started"
   while [ ! -e "$CAGENTS_PR_PRIVATE/release-late-child" ]; do /bin/sleep 0.02; done
   printf "\n[branch \"feature\"]\n merge = refs/heads/changed-by-child\n" >> "$CAGENTS_PR_COMMON_FD/config"
