@@ -13,8 +13,9 @@ use std::time::Instant;
 
 /// Received rights arrive close-on-exec on Linux. Darwin has no such flag, so
 /// [`receive_part`] marks each one as soon as `recvmsg` returns. A child
-/// forked in between keeps it only if it skips
-/// [`crate::daemon::seal_inherited_descriptors`].
+/// another thread forks in between keeps the right unless its spawn runs
+/// [`crate::daemon::seal_inherited_descriptors`]: holder and provider spawns
+/// do; `process::ProcessSpec` commands do not yet.
 #[cfg(target_os = "linux")]
 const RECEIVE_CLOEXEC: libc::c_int = libc::MSG_CMSG_CLOEXEC;
 #[cfg(target_os = "macos")]
