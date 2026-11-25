@@ -644,13 +644,6 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
     let unrecorded = add_chat(&mut source, impact::Disposition::Resumes, false);
     let mut survivors = Survivors::default();
     survivors.record_prepared(&source.preview, source.preview.daemon.as_ref().unwrap());
-    survivors.prepared_source = Some(PreparationEvidence {
-        daemon: source.preview.daemon.clone().unwrap(),
-        census: crate::upgrade::recovery::Census {
-            chats: source.inventory.chats.clone(),
-            ..Default::default()
-        },
-    });
     let terminal = TerminalId::new();
     survivors
         .labels
@@ -661,10 +654,25 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
     survivors
         .labels
         .insert(unrecorded, "Unrecorded chat · alpha".into());
-    survivors.recovery_outcome = Some(crate::upgrade::recovery::RecoveryOutcome {
-        paused_chats: vec![chat, unrecorded],
-        paused_terminals: vec![terminal],
-    });
+    let before_verification = survivors.prepared_report();
+    assert!(survivors.paused_report().is_empty());
+    survivors.record_verified_pauses(
+        &recovery::Outcome::Usable {
+            serving: source
+                .preview
+                .daemon
+                .as_ref()
+                .unwrap()
+                .capability
+                .proof
+                .clone(),
+            terminals: 0,
+            chats: 0,
+            paused_chats: vec![chat, unrecorded],
+            paused_terminals: vec![terminal],
+        },
+        |id| *id == chat,
+    );
     let report = survivors.paused_report();
     assert!(
         report.contains("Offline tool rows · alpha: open its tab to continue"),
@@ -683,15 +691,15 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
         !report.contains("Unrecorded chat · alpha: choose Resume"),
         "{report}"
     );
-    assert!(
-        survivors
-            .prepared_report()
-            .contains("its conversation is paused after recovery")
-    );
+    assert_eq!(survivors.prepared_report(), before_verification);
+
+    let list = stop_list(&source.preview, &source.inventory, true).unwrap();
+    let stopped = list.items.into_iter().find(|item| item.id == chat).unwrap();
+    survivors.ended.insert((stopped.kind, stopped.id), stopped);
     assert!(
         !survivors
-            .prepared_report()
-            .contains("resumes after the update")
+            .paused_report()
+            .contains("Offline tool rows · alpha")
     );
 }
 
@@ -951,7 +959,7 @@ fn partial_interruption_effects_are_reported_without_claiming_daemon_preparation
     survivors.late_turns.insert(first);
     let report = survivors.prepared_report();
     assert!(
-        report.contains("Offline tool rows · alpha: current turn interrupted"),
+        report.contains("Current turns interrupted:\n  Offline tool rows · alpha\n"),
         "{report}"
     );
     assert!(
@@ -2535,7 +2543,7 @@ fn completed_service_stop_reports_background_tasks_and_their_recovery() {
 }
 
 #[test]
-fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery() {
+fn accepted_prepare_reports_interrupted_turns_without_forecasting_recovery() {
     let mut source = fixture();
     let unchanged = add_chat(&mut source, impact::Disposition::Resumes, true);
     let resumes = add_chat(&mut source, impact::Disposition::Interrupted, true);
@@ -2571,13 +2579,12 @@ fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery(
     let daemon = source.preview.daemon.as_ref().unwrap();
     survivors.record_prepared(&source.preview, daemon);
     let report = survivors.prepared_report();
+    assert!(report.contains("  Reviewed automatic resume\n"), "{report}");
     assert!(
-        report.contains(
-            "Reviewed automatic resume: current turn interrupted; its saved conversation was kept"
-        ),
+        report.contains("  Reviewed paused conversation\n"),
         "{report}"
     );
-    assert!(report.contains("Reviewed paused conversation: current turn interrupted; after the update: its conversation could not be confirmed. Open its tab; if the conversation doesn't reopen, the tab says what to do"), "{report}");
+    assert!(!report.contains("could not be confirmed"), "{report}");
     assert!(
         report.contains("3 background tasks stopped; they do not resume automatically."),
         "{report}"

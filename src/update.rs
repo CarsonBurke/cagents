@@ -2385,7 +2385,7 @@ fn perform_update(
         &recovery,
         state,
         job,
-        install_result.is_ok().then_some(&*survivors),
+        install_result.is_ok().then_some(survivors),
     )?;
     let (new, old) = (&release.version, &installation.version);
     match restored {
@@ -2497,7 +2497,7 @@ fn verify_reopened_service(
     recovery: &recovery::Context,
     state: &Path,
     job: &mut UpdateJob,
-    successor: Option<&floor::Survivors>,
+    successor: Option<&mut floor::Survivors>,
 ) -> Result<Handoff, UpdateError> {
     let census = recovery
         .census
@@ -2523,10 +2523,11 @@ fn verify_reopened_service(
     if matches!(receipt.outcome, recovery::Outcome::NoSource) {
         Ok(Handoff::NoDaemon)
     } else if receipt.usable() {
-        if let Some(successor) = successor
-            && let Err(error) = successor.confirm_successor(&receipt)
-        {
-            return report_recovery_failure(state, job, error);
+        if let Some(successor) = successor {
+            if let Err(error) = successor.confirm_successor(&receipt) {
+                return report_recovery_failure(state, job, error);
+            }
+            successor.record_verified_pauses(&receipt.outcome, |id| census.has_recorded_chat(*id));
         }
         Ok(Handoff::Served)
     } else {

@@ -1248,6 +1248,7 @@ pub(super) struct Survivors {
     recovery_capture_error: Option<String>,
     receipt: Option<crate::upgrade::recovery::Receipt>,
     recovery_outcome: Option<crate::upgrade::recovery::RecoveryOutcome>,
+    verified_paused_history: BTreeSet<TerminalId>,
     successor_target: Option<PathBuf>,
     interrupted: BTreeMap<(impact::SessionKind, TerminalId), InterruptedTurn>,
     unconfirmed_interrupts: BTreeMap<(impact::SessionKind, TerminalId), String>,
@@ -1280,7 +1281,6 @@ impl PreparationEvidence {
 
 struct InterruptedTurn {
     label: String,
-    recovery: String,
     background_tasks: BTreeSet<String>,
 }
 
@@ -1370,6 +1370,29 @@ impl Survivors {
         }
     }
 
+    pub(super) fn record_verified_pauses(
+        &mut self,
+        outcome: &recovery::Outcome,
+        has_recorded_chat: impl FnMut(&TerminalId) -> bool,
+    ) {
+        if let recovery::Outcome::Usable {
+            paused_chats,
+            paused_terminals,
+            ..
+        } = outcome
+        {
+            self.verified_paused_history = paused_chats
+                .iter()
+                .copied()
+                .filter(has_recorded_chat)
+                .collect();
+            self.recovery_outcome = Some(crate::upgrade::recovery::RecoveryOutcome {
+                paused_chats: paused_chats.clone(),
+                paused_terminals: paused_terminals.clone(),
+            });
+        }
+    }
+
     /// Failure cleanup cannot fall through to the ordinary checkpoint replay
     /// after an accepted preparation. It may keep a verified serving daemon or
     /// retain Prepared evidence for explicit recovery.
@@ -1391,23 +1414,30 @@ impl Survivors {
         if outcome.paused_chats.is_empty() && outcome.paused_terminals.is_empty() {
             return String::new();
         }
-        let mut report = String::from("\nPaused after update recovery:\n");
+        let mut report = String::new();
         for id in &outcome.paused_chats {
+            if self
+                .ended
+                .contains_key(&(impact::SessionKind::NativeChat, *id))
+            {
+                continue;
+            }
             let label = self
                 .labels
                 .get(id)
                 .map(String::as_str)
                 .unwrap_or("Conversation");
-            let recorded = self.prepared_source.as_ref().is_some_and(|evidence| {
-                evidence.census.chats.iter().any(|chat| {
-                    chat.id == *id
-                        && chat
-                            .launch
-                            .session_id
-                            .as_ref()
-                            .is_some_and(|id| !id.trim().is_empty())
-                })
-            });
+            let recorded = self.verified_paused_history.contains(id)
+                || self.prepared_source.as_ref().is_some_and(|evidence| {
+                    evidence.census.chats.iter().any(|chat| {
+                        chat.id == *id
+                            && chat
+                                .launch
+                                .session_id
+                                .as_ref()
+                                .is_some_and(|id| !id.trim().is_empty())
+                    })
+                });
             let action = if recorded {
                 "open its tab to continue"
             } else {
@@ -1416,6 +1446,12 @@ impl Survivors {
             report.push_str(&format!("  {label}: {action}\n"));
         }
         for id in &outcome.paused_terminals {
+            if self
+                .ended
+                .contains_key(&(impact::SessionKind::Terminal, *id))
+            {
+                continue;
+            }
             let label = self
                 .labels
                 .get(id)
@@ -1423,7 +1459,11 @@ impl Survivors {
                 .unwrap_or("Terminal");
             report.push_str(&format!("  {label}: reopen a terminal to continue\n"));
         }
-        report
+        if report.is_empty() {
+            report
+        } else {
+            format!("\nPaused after update recovery:\n{report}")
+        }
     }
 
     fn record_interrupt_requests(
@@ -1474,19 +1514,10 @@ impl Survivors {
                 .unwrap_or(&session.title)
                 .clone();
             self.unconfirmed_interrupts.remove(&key);
-            let recovery = reviewed
-                .stopped
-                .iter()
-                .find(|pane| pane.pane == session.id)
-                .map_or_else(
-                    || "its saved conversation was kept".to_owned(),
-                    |pane| format!("after the update: {}. {}", pane.reason, pane.recovery),
-                );
             self.interrupted
                 .entry(key)
                 .or_insert_with(|| InterruptedTurn {
                     label,
-                    recovery,
                     background_tasks: session.interrupted_subagents.iter().cloned().collect(),
                 });
         }
@@ -1505,20 +1536,8 @@ impl Survivors {
         if !turns.is_empty() {
             report.push_str("\nCurrent turns interrupted:\n");
         }
-        for ((_, id), turn) in &turns {
-            let recovery = if self
-                .recovery_outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.paused_chats.contains(id))
-            {
-                "its conversation is paused after recovery"
-            } else {
-                &turn.recovery
-            };
-            report.push_str(&format!(
-                "  {}: current turn interrupted; {}\n",
-                turn.label, recovery
-            ));
+        for (_, turn) in &turns {
+            report.push_str(&format!("  {}\n", turn.label));
         }
         for ((_, id), turn) in &self.interrupted {
             if self.late_turns.contains(id) {
