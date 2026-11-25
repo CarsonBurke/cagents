@@ -229,7 +229,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
     if [ -e "$PREFIX" ]; then
         [ ! -d "$APP" ] || register_app -u "$APP"
         rm -rf "$PREFIX/versions" "$PREFIX/current" "$APP" "$PREFIX/.update" "$PREFIX"/.stage.* "$PREFIX"/.current.* \
-            "$PREFIX/.previous" "$HOME/Library/LaunchAgents"/.cagents-install.*
+            "$PREFIX/.previous"
         rm -f "$PREFIX/.cagents-install-root"
         release_lock
         LOCK=
@@ -453,8 +453,13 @@ PRIOR_BIN_LINK=
 [ ! -L "$BIN_LINK" ] || PRIOR_BIN_LINK=$(readlink "$BIN_LINK")
 PRIOR_APP_LINK=
 [ ! -L "$APP_LINK" ] || PRIOR_APP_LINK=$(readlink "$APP_LINK")
-[ ! -L "$AGENT_PLIST" ] \
-    || fail "$AGENT_PLIST is a link this installer did not make; remove it, then run this installer again"
+# Each is published by renaming a staged file over it, and a rename onto a
+# folder or link would move the file inside or past it instead.
+for published in "$AGENT_PLIST" "$PREFIX/.previous"; do
+    if exists "$published" && { [ -L "$published" ] || [ ! -f "$published" ]; }; then
+        fail "$published is not a file this installer made; remove it, then run this installer again"
+    fi
+done
 PRIOR_AGENT=0
 if [ -f "$AGENT_PLIST" ]; then
     cp "$AGENT_PLIST" "$AGENT_PRIOR" \
