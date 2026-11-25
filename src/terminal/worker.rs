@@ -5823,21 +5823,9 @@ impl Worker {
             self.handle_command(command);
         }
         let _admitted = if conventional_interrupt {
-            // TIOCSIG targets the foreground group bound to this exact PTY.
-            // Raw applications and extended key encodings retain their bytes.
-            // Darwin declares the request narrower than `ioctl` takes it.
-            #[cfg(target_os = "linux")]
-            let request = libc::TIOCSIG;
-            #[cfg(target_os = "macos")]
-            let request = libc::c_ulong::from(libc::TIOCSIG);
-            let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), request, libc::SIGINT) };
-            if result < 0 {
-                self.error(
-                    "interrupt terminal",
-                    std::io::Error::last_os_error().to_string(),
-                );
-            }
-            result >= 0
+            // Reply and cleanup sends above may have started a protocol
+            // frame since the original cancellation decision.
+            self.signal_interrupt(!can_flush_kernel || !self.pending_input.can_flush_kernel())
         } else if let Some(input) = interrupt_key {
             let mut release = input.clone();
             release.action = KeyAction::Release;
@@ -5864,6 +5852,115 @@ impl Worker {
             admitted
         };
         boundary
+    }
+
+    fn signal_interrupt(&self, preserve_kernel: bool) -> bool {
+        #[cfg(target_os = "macos")]
+        if preserve_kernel {
+            // Darwin TIOCSIG can flush both tty queues. In particular, a
+            // bracketed paste must never lose the opener it already sent.
+            return match self.interrupt_foreground_without_flushing() {
+                Ok(()) => true,
+                Err(message) => {
+                    self.input_notice("interrupt terminal", message);
+                    false
+                }
+            };
+        }
+        #[cfg(target_os = "linux")]
+        let _ = preserve_kernel;
+        #[cfg(target_os = "linux")]
+        let request = libc::TIOCSIG;
+        #[cfg(target_os = "macos")]
+        let request = libc::c_ulong::from(libc::TIOCSIG);
+        // SAFETY: the live master targets its bound tty and TIOCSIG takes
+        // the signal number by value.
+        let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), request, libc::SIGINT) };
+        if result < 0 {
+            self.error(
+                "interrupt terminal",
+                std::io::Error::last_os_error().to_string(),
+            );
+        }
+        result >= 0
+    }
+
+    #[cfg(target_os = "macos")]
+    fn interrupt_foreground_without_flushing(&self) -> Result<(), String> {
+        use crate::process::{group_members, table};
+
+        // PROC_FLAG_CONTROLT from <sys/proc_info.h>. The tty driver also
+        // skips group members that have given up their controlling tty.
+        const CONTROLLING_TTY: u32 = 0x80;
+        const MAX_GROUP_MEMBERS: usize = 256;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let within_budget = || {
+            (Instant::now() < deadline)
+                .then_some(())
+                .ok_or("The foreground interrupt exceeded its process inspection budget")
+        };
+        let group = self
+            .foreground_group()
+            .ok_or("Cannot identify the terminal's foreground job")?;
+        let session = self.child.pid();
+        let matching_epoch = |pid| -> Result<Option<u64>, String> {
+            let record = match table::record(pid) {
+                Ok(record) => record,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            if record.bsd.pbsi_status == libc::SZOMB || record.bsd.pbsi_flags & CONTROLLING_TTY == 0
+            {
+                return Ok(None);
+            }
+            if record.bsd.pbsi_pgid != group as u32 || record.session != Some(session) {
+                return Err(
+                    "The terminal's foreground job changed before it could be interrupted".into(),
+                );
+            }
+            record
+                .start
+                .map(Some)
+                .ok_or_else(|| "Cannot verify a foreground process's identity".into())
+        };
+        let members = group_members(group as u32).map_err(|error| error.to_string())?;
+        if members.len() > MAX_GROUP_MEMBERS {
+            return Err("The foreground group is too large to interrupt without flushing".into());
+        }
+        let mut targets = Vec::new();
+        for pid in members {
+            within_budget()?;
+            if let Some(start) = matching_epoch(pid)? {
+                match crate::pinned_process::PinnedProcess::open_live_started(pid as u32, start) {
+                    Ok(pin) => targets.push((pid, start, pin)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        // A numeric group cannot authorize a broadcast. Only captured
+        // members that still belong to the exact held tty receive SIGINT.
+        // Older Darwin releases have no public atomic pin-to-signal call.
+        // Recheck membership and the pin as close to delivery as possible.
+        let mut delivered = false;
+        for (pid, start, pin) in targets {
+            within_budget()?;
+            if self.foreground_group() != Some(group) {
+                return Err(
+                    "The terminal's foreground job changed before the interrupt finished".into(),
+                );
+            }
+            if matching_epoch(pid)? == Some(start) {
+                within_budget()?;
+                delivered |= pin
+                    .signal(libc::SIGINT)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if !delivered {
+            return Err("No verified foreground process could be interrupted".into());
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

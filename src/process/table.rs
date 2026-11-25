@@ -78,14 +78,14 @@ fn list_pids(selector: u32, argument: u32, includes_self: bool) -> io::Result<Ve
 /// The process-table fields available even across user IDs. A zombie retains
 /// its process group, but `getsid` can no longer read its session. A missing
 /// start time means the row can block an operation but cannot authorize a signal.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) struct Record {
     pub(crate) bsd: libc::proc_bsdshortinfo,
     pub(crate) session: Option<libc::pid_t>,
     pub(crate) start: Option<u64>,
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn record(pid: libc::pid_t) -> io::Result<Record> {
     if pid <= 0 {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -102,12 +102,12 @@ pub(crate) fn record(pid: libc::pid_t) -> io::Result<Record> {
     Err(process_changed())
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 fn process_changed() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "process changed during census")
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 fn read_record(pid: libc::pid_t) -> io::Result<Record> {
     let before = crate::pinned_process::started_ticks_of(pid as u32);
     let bsd = short_bsd_info(pid)?;
@@ -141,7 +141,7 @@ fn read_record(pid: libc::pid_t) -> io::Result<Record> {
     })
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(super) fn short_bsd_info(pid: libc::pid_t) -> io::Result<libc::proc_bsdshortinfo> {
     // SAFETY: the kernel record contains only integers and byte arrays.
     let mut bsd: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
@@ -164,7 +164,7 @@ pub(super) fn short_bsd_info(pid: libc::pid_t) -> io::Result<libc::proc_bsdshort
     Ok(bsd)
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 fn check_record_size(written: libc::c_int, expected: libc::c_int) -> io::Result<()> {
     if written <= 0 {
         return Err(failure());

@@ -1,6 +1,8 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
 pub mod floor;
 pub mod recovery;
+#[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+mod surviving_darwin;
 #[cfg(any(feature = "host", feature = "ui"))]
 use crate::lineage_birth::LineageBirth;
 use crate::model::HostSessionProof;
@@ -183,17 +185,17 @@ pub enum SurvivorLink {
     Lineage,
 }
 
-/// A process of this user whose environment the kernel won't show, because it
-/// made itself undumpable (ssh-agent) or changed credentials (an SSH login's
-/// `sshd-session`). Its arguments and cgroup were read and don't tie it to the
-/// terminal; only the terminal's markers could, and they can't be read.
+/// A process of this user whose lineage markers could not be read. No known
+/// conversation argument or other process evidence ties it to the terminal.
 #[cfg(any(feature = "host", feature = "ui"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadableProcess {
     pub pid: u32,
-    /// Clock ticks after boot. With the PID it names one process, so leaving
-    /// it running can't extend to a later process given the same PID.
+    /// Kernel start ticks in the current boot. Along with the PID they name
+    /// one process lifetime.
     start: Option<u64>,
+    #[cfg(target_os = "macos")]
+    boot: Option<crate::model::BootId>,
     /// The kernel's short name for it, unless it exited during the scan.
     pub name: Option<String>,
     /// Its unified-hierarchy cgroup, which anyone can read.
@@ -208,6 +210,8 @@ impl UnreadableProcess {
         Self {
             pid,
             start: Some(start),
+            #[cfg(target_os = "macos")]
+            boot: None,
             name: Some(name.into()),
             cgroup: None,
         }
@@ -240,6 +244,10 @@ impl UnreadableProcess {
     }
 
     fn same_process(&self, other: &Self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.boot != other.boot {
+            return false;
+        }
         self.pid == other.pid && self.start.is_some() && self.start == other.start
     }
 }
@@ -291,6 +299,10 @@ pub fn surviving_process(
 ) -> Result<Option<SurvivingProcess>, ScanError> {
     // Only the real process table goes with this instance's records.
     let real = proc_root == Path::new("/proc");
+    #[cfg(target_os = "macos")]
+    if real {
+        return surviving_darwin::scan(session, owner, leave);
+    }
     scan_for_survivor(
         session,
         owner,
@@ -304,13 +316,56 @@ pub fn surviving_process(
     )
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
+struct SurvivorEvidence {
+    exact_identity: Option<(crate::agent::Provider, uuid::Uuid)>,
+    markers: [String; 2],
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl SurvivorEvidence {
+    fn new(session: &TerminalSession) -> Self {
+        Self {
+            exact_identity: session
+                .agent_resume_recipe()
+                .as_ref()
+                .and_then(exact_conversation),
+            markers: [
+                format!("CAGENTS_TERMINAL_ID={}", session.id),
+                format!(
+                    "CAGENTS_RECOVERY_ORIGIN={}",
+                    session.recovery_origin.unwrap_or(session.id)
+                ),
+            ],
+        }
+    }
+
+    fn names_conversation<'a>(&self, mut arguments: impl Iterator<Item = &'a [u8]>) -> bool {
+        self.exact_identity.is_some_and(|(provider, id)| {
+            arguments.any(|argument| {
+                std::str::from_utf8(argument).ok().is_some_and(|argument| {
+                    uuid::Uuid::parse_str(argument).ok() == Some(id)
+                        || provider
+                            .session_file_id(Path::new(argument))
+                            .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
+                            == Some(id)
+                })
+            })
+        })
+    }
+
+    fn carries_marker<'a>(&self, mut entries: impl Iterator<Item = &'a [u8]>) -> bool {
+        entries.any(|entry| self.markers.iter().any(|marker| entry == marker.as_bytes()))
+    }
+}
+
 /// A process shows no arguments for a moment while it execs or exits, which on a
 /// machine that's building happens often enough that one read alone would turn
 /// people away. Only the read that failed is repeated: repeating the whole scan
 /// let several processes that keep re-execing each fail a different attempt.
 /// A process that stays unreadable still fails: unknown is not absent.
 #[cfg(any(feature = "host", feature = "ui"))]
-fn settle<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+fn settle<T, E>(mut read: impl FnMut() -> Result<T, E>) -> Result<T, E> {
     const ATTEMPTS: usize = 4;
     const WAIT: std::time::Duration = if cfg!(any(test, feature = "test-support")) {
         std::time::Duration::from_millis(1)
@@ -472,9 +527,7 @@ struct Scan<'a> {
     table: &'a ProcessTable,
     #[cfg(target_os = "linux")]
     manager: Option<UserManagerSession>,
-    exact_identity: Option<(crate::agent::Provider, uuid::Uuid)>,
-    terminal_marker: String,
-    origin_marker: String,
+    evidence: SurvivorEvidence,
     unit: Option<&'a str>,
 }
 
@@ -487,15 +540,7 @@ impl<'a> Scan<'a> {
             table,
             #[cfg(target_os = "linux")]
             manager: UserManagerSession::connect(),
-            exact_identity: session
-                .agent_resume_recipe()
-                .as_ref()
-                .and_then(exact_conversation),
-            terminal_marker: format!("CAGENTS_TERMINAL_ID={}", session.id),
-            origin_marker: format!(
-                "CAGENTS_RECOVERY_ORIGIN={}",
-                session.recovery_origin.unwrap_or(session.id)
-            ),
+            evidence: SurvivorEvidence::new(session),
             unit: systemd_unit(&session.launch),
         }
     }
@@ -515,9 +560,8 @@ impl<'a> Scan<'a> {
     }
 
     fn carries_marker(&self, environment: &[u8]) -> bool {
-        environment.split(|byte| *byte == 0).any(|entry| {
-            entry == self.terminal_marker.as_bytes() || entry == self.origin_marker.as_bytes()
-        })
+        self.evidence
+            .carries_marker(environment.split(|byte| *byte == 0))
     }
 
     fn inspect(&self, pid: u32) -> Result<Inspected, String> {
@@ -562,17 +606,10 @@ impl<'a> Scan<'a> {
             }
             return Err(format!("cannot inspect process invocation ({pid})"));
         }
-        if argv.split(|byte| *byte == 0).any(|arg| {
-            self.exact_identity.is_some_and(|(provider, id)| {
-                std::str::from_utf8(arg).ok().is_some_and(|arg| {
-                    uuid::Uuid::parse_str(arg).ok() == Some(id)
-                        || provider
-                            .session_file_id(Path::new(arg))
-                            .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
-                            == Some(id)
-                })
-            })
-        }) {
+        if self
+            .evidence
+            .names_conversation(argv.split(|byte| *byte == 0))
+        {
             return Ok(Inspected::Survivor(survivor(
                 &path,
                 pid,
@@ -627,6 +664,8 @@ impl<'a> Scan<'a> {
                 return Ok(Inspected::Unreadable(UnreadableProcess {
                     pid,
                     start: self.table.starts.get(&pid).copied(),
+                    #[cfg(target_os = "macos")]
+                    boot: None,
                     name: process_name(&path),
                     cgroup: fs::read_to_string(path.join("cgroup"))
                         .ok()
@@ -3864,7 +3903,7 @@ mod tests {
         assert_eq!(scans, 3);
 
         let mut scans = 0;
-        let unknown = settle::<()>(|| {
+        let unknown = settle::<(), _>(|| {
             scans += 1;
             Err("cannot inspect process invocation (42)".to_owned())
         });

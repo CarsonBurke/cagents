@@ -28,6 +28,10 @@ pub(super) fn isolated(variable: &str, test: impl FnOnce()) {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
     }
+    // The fixture process supplies the same pre-exec tracker as a native
+    // retained helper. Never enable process-wide sweeping in the harness.
+    #[cfg(target_os = "macos")]
+    crate::daemon::adopted_orphans::become_sweeper();
     test();
 }
 

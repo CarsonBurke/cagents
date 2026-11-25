@@ -2916,15 +2916,17 @@ fn canonical_upgrade_requires_exact_lineage_before_attach_and_never_starts() {
             live = host_proof("unexpected-live");
         }
         let (client, mut server) = UnixStream::pair().unwrap();
+        // XNU can reject socket options once the client closes. Arm the
+        // fixture's deadlines while both ends are still open.
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let original = source.clone();
         let canonical = expected.clone();
         let worker = thread::spawn(move || {
-            server
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            server
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
             let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
             let mut requests = Vec::new();
             while let Some(request) = codec.read::<ClientEnvelope>(&mut server).unwrap() {
