@@ -312,15 +312,26 @@ fn is_locked(lock: &Path, locked: &HashMap<u64, Vec<u32>>) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_locked(lock: &Path) -> bool {
-    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    let Ok(named) = std::fs::symlink_metadata(lock) else {
+        return false;
+    };
+    if !named.is_file() {
+        return false;
+    }
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(lock)
     else {
         return false;
     };
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+    if !file.metadata().is_ok_and(|metadata| {
+        metadata.is_file() && metadata.dev() == named.dev() && metadata.ino() == named.ino()
+    }) {
         return false;
     }
     // XNU tests both flock and record locks against this range. A conflicting
