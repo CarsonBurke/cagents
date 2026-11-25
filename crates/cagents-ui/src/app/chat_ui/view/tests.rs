@@ -6512,6 +6512,24 @@ pub(super) fn lay_out(
     accounts: Option<ChatAccounts>,
     roles: &[&str],
 ) -> Laid {
+    lay_out_on(
+        runtime,
+        width,
+        accounts,
+        roles,
+        Some("feature/a-long-branch-name"),
+    )
+}
+
+/// [`lay_out`] on `branch`, or in a place with no branch to show, such as a
+/// detached worktree.
+fn lay_out_on(
+    runtime: &Runtime,
+    width: f32,
+    accounts: Option<ChatAccounts>,
+    roles: &[&str],
+    branch: Option<&str>,
+) -> Laid {
     use iced::advanced::{
         Layout, layout,
         widget::{Operation, Tree, operation::Focusable},
@@ -6556,7 +6574,7 @@ pub(super) fn lay_out(
         width,
         0.0,
         Place {
-            branch: Some("feature/a-long-branch-name".into()),
+            branch: branch.map(Into::into),
         },
         true,
         accounts,
@@ -6960,28 +6978,71 @@ fn footer_starts_and_ends_beneath_the_composer_glyphs() {
         "chat-actions",
         "chat-account-picker",
         "chat-permission-picker",
+        "chat-submit-0",
+        "chat-dictate",
     ];
-    // Where the composer's `+` glyph starts: the inset the footer's first
-    // glyph shares.
+    let glyph = f32::from(design::ROW_ICON_SIZE);
+    // Where the composer's `+` glyph starts, and where its last control's
+    // glyph ends: the insets the footer's outer glyphs share.
     let glyph_left = |laid: &Laid| {
         let plus = laid.controls["chat-actions"];
-        plus.x + (plus.width - f32::from(design::ROW_ICON_SIZE)) / 2.0
+        plus.x + (plus.width - glyph) / 2.0
     };
+    let glyph_right = |laid: &Laid| {
+        let last = ["chat-submit-0", "chat-dictate"]
+            .iter()
+            .filter_map(|role| laid.controls.get(*role))
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .expect("the composer has a trailing control");
+        last.x + (last.width + glyph) / 2.0
+    };
+    // A draft with something to send, so the composer ends on a control,
+    // and nothing spent yet.
     let draft = || {
         let (mut runtime, handle) = furnished_runtime();
         runtime.connection = Connection::Draft;
+        Arc::make_mut(&mut runtime.snapshot).usage = Default::default();
+        runtime
+            .attachments
+            .push(chat::Attachment::file("/project/screenshot.png"));
         (runtime, handle)
     };
     for width in [320.0_f32, 470.0, 900.0] {
-        let fit = FooterFit::for_width(width);
-        // A draft's account is a picker. Where it leads the row, its glyph,
-        // inside its own padding, starts beneath the `+`, and its hover
-        // background stays inside the composer's edge.
+        // A draft's account is a picker. Leading the row, as it does where
+        // there is no branch to show, its glyph starts beneath the `+`,
+        // inside its own padding, and its hover background stays inside
+        // the composer's edge.
         let (runtime, _handle) = draft();
-        let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
+        let laid = lay_out_on(&runtime, width, Some(fixture_accounts()), &roles, None);
         let picker = laid.controls["chat-account-picker"];
-        if fit == FooterFit::Wide {
-            // The branch leads a wide footer, its icon then its name.
+        assert!(
+            (picker.x + CONTROL_PADDING[1] - glyph_left(&laid)).abs() <= 1.0,
+            "account glyph starts beneath `+` at {width}: {picker:?} vs {}",
+            glyph_left(&laid)
+        );
+        assert!(
+            picker.x >= laid.footer.x + step::GAP_M,
+            "hover background stays in the column at {width}: {picker:?}"
+        );
+        // Nothing spent yet: the footer ends on the permission picker,
+        // whose chevron ends beneath the composer's last glyph and whose
+        // hover background stays inside the composer.
+        let permissions = laid.controls["chat-permission-picker"];
+        assert!(
+            (permissions.x + permissions.width - CONTROL_PADDING[1] - glyph_right(&laid)).abs()
+                <= 1.0,
+            "permission chevron ends beneath the composer's last glyph at {width}: \
+             {permissions:?} vs {}",
+            glyph_right(&laid)
+        );
+        assert!(
+            permissions.x + permissions.width <= laid.footer.x + laid.footer.width - step::GAP_M,
+            "hover background stays in the column at {width}: {permissions:?}"
+        );
+        // A branch, where one is shown, leads in the picker's place: its
+        // icon, then its name.
+        let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
+        if FooterFit::for_width(width) == FooterFit::Wide {
             let branch = laid
                 .placed_text
                 .iter()
@@ -6997,17 +7058,8 @@ fn footer_starts_and_ends_beneath_the_composer_glyphs() {
                 glyph_left(&laid)
             );
         } else {
-            assert!(
-                (picker.x + CONTROL_PADDING[1] - glyph_left(&laid)).abs() <= 1.0,
-                "account glyph starts beneath `+` at {width}: {picker:?} vs {}",
-                glyph_left(&laid)
-            );
-            assert!(
-                picker.x >= laid.footer.x + step::GAP_M,
-                "hover background stays in the column at {width}: {picker:?}"
-            );
-            // Once the conversation starts the account is a label, its glyph
-            // where the picker's was.
+            // Once the conversation starts the account is a label, its
+            // glyph where the picker's was.
             let (runtime, _handle) = furnished_runtime();
             let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
             let account = laid
@@ -7022,18 +7074,6 @@ fn footer_starts_and_ends_beneath_the_composer_glyphs() {
                 "account label keeps the picker's place at {width}: {account:?} vs {picker:?}"
             );
         }
-        // Nothing spent yet: the footer ends on the permission picker, whose
-        // chevron ends where the spend would have.
-        let (mut runtime, _handle) = draft();
-        Arc::make_mut(&mut runtime.snapshot).usage = Default::default();
-        let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
-        let permissions = laid.controls["chat-permission-picker"];
-        let inner_right = laid.footer.x + laid.footer.width - (step::GAP_M + COMPOSER_PADDING);
-        assert!(
-            (permissions.x + permissions.width - CONTROL_PADDING[1] - inner_right).abs() <= 1.0,
-            "permission picker ends at the composer's glyph inset at {width}: {permissions:?}, \
-             expected content to end at {inner_right}"
-        );
     }
 }
 
