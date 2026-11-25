@@ -429,6 +429,7 @@ class InstallerCoordinator(unittest.TestCase):
         marker = candidate / '.cagents-local-candidate-v1'
         self.assertEqual(marker.read_text(), '9.9.8\n')
         self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+        self.assertFalse((candidate / '.deferred-owner.json').exists())
         self.assertTrue(os.access(candidate / 'bin/cagents', os.X_OK))
         self.assertFalse(any(e['event'] == 'daemon-start-fixture' for e in self.events()))
 

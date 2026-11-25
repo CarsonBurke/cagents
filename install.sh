@@ -2121,6 +2121,9 @@ if [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$HAD_CURRENT" -eq 1 ]; then
         || fail 'the selected version belongs to another installation'
     (set -C; printf '%s\n' "${selected_root##*/}" > "$NEW_VERSION_DIR/$LOCAL_CANDIDATE_MARKER") \
         || fail 'cannot mark the staged local build'
+    # The coordinator still has its receipt. Only legacy publishes have
+    # a routing marker that permits selecting them over a live source.
+    rm -f "$NEW_VERSION_DIR/.deferred-owner.json"
     sync -f "$PREFIX/versions" || fail 'could not durably stage the local build'
 else
     CURRENT_TEMP=$PREFIX/.current.$$
