@@ -3853,14 +3853,10 @@ impl Worker {
                 let cleanup = if self.checked_shutdown {
                     Ok(())
                 } else {
-                    let mut deadline = Instant::now() + budget.deadline;
-                    if natural_census && let Some(close) = &self.natural_close {
-                        deadline = deadline.min(close.deadline);
-                    }
                     confirm_exited_family(
                         &self.child,
                         &self.master,
-                        deadline,
+                        Instant::now() + budget.deadline,
                         budget.census_reserve,
                     )
                 };
