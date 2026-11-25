@@ -402,4 +402,63 @@ class RemoteControllerTest {
         bridge.acceptWelcomed()
         controller.await { it.connection == ConnectionState.Connected }
     }
+
+    @Test
+    fun goingToTheBackgroundUnwatchesConversationsAtOnceButKeepsTheConnection() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        controller.setForeground(false)
+        val unwatch = connection.nextRequest()
+        assertEquals("conversation.unwatch", unwatch.op)
+        assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
+        connection.ok(unwatch)
+        assertEquals(ConnectionState.Connected, controller.state.value.connection)
+        assertEquals("Hello", (controller.state.value.conversations.getValue(S).items.single().body as ItemBody.Text).text)
+
+        // Back within the grace: the same connection watches it again, for what was missed.
+        controller.setForeground(true)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = """["a","b"]""", items = "[${text("a", "Hello")},${text("b", "Missed")}]"))
+        controller.await { it.conversations[S]?.items?.size == 2 }
+    }
+
+    @Test
+    fun aQuickSwitchAwayAndBackLeavesConversationsWatched() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        controller.setForeground(false)
+        controller.setForeground(true)
+        // The next request is for this one, not an unwatch or a watch of the first.
+        controller.open("other")
+        val next = connection.nextRequest()
+        assertEquals("conversation.watch", next.op)
+        assertEquals("other", next.params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun aConversationOpenedInTheBackgroundIsWatchedOnReturn() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("notifications.watch"))
+
+        controller.setForeground(false)
+        controller.open(S)
+        // Reconnecting in the background watches nothing either.
+        connection.hangUp()
+        val again = bridge.acceptWelcomed()
+        again.ok(again.expect("notifications.watch"))
+        controller.await { it.connection == ConnectionState.Connected }
+
+        controller.setForeground(true)
+        val watch = again.nextRequest()
+        assertEquals("conversation.watch", watch.op)
+        assertEquals(S, watch.params["session"]!!.jsonPrimitive.content)
+    }
 }

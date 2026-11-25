@@ -90,6 +90,14 @@ class RemoteController(
 
     private var loop: Job? = null
     private var backgroundStop: Job? = null
+
+    /**
+     * Whether the person may be looking at the app. Only then are its
+     * conversations watched: a watching phone counts as someone following
+     * them on the computer.
+     */
+    @kotlin.concurrent.Volatile
+    private var foreground = true
     private val wake = Channel<Unit>(Channel.CONFLATED)
 
     @kotlin.concurrent.Volatile
@@ -108,10 +116,10 @@ class RemoteController(
     private data class Sync(val session: String, val kind: SyncKind)
 
     private enum class SyncKind {
-        /** Watch it if held and not ended, unwatch it otherwise. */
+        /** Watch it if held and not ended, unwatch it otherwise; unwatch every one in the background. */
         Settle,
 
-        /** Watch it if held, even when ended or already watched, for a fresh reset. */
+        /** Watch it if held, even when ended or already watched, for a fresh reset; not in the background. */
         Watch,
 
         /** Like [Watch], unless the recovery that asked for it was settled meanwhile. */
@@ -167,23 +175,28 @@ class RemoteController(
     }
 
     /**
-     * Follows the app going to the background and back. In the background the
-     * connection stays for [ControllerConfig.backgroundGrace], so a quick
-     * switch away doesn't drop it, and then closes; it no longer counts as the
-     * person looking at the open conversations.
+     * Follows the app going to the background and back. In the background
+     * the open conversations are unwatched at once, since nobody is looking
+     * at them. The connection stays for [ControllerConfig.backgroundGrace],
+     * so a quick switch away doesn't drop it, and then closes. Coming back
+     * watches them again.
      */
     fun setForeground(foreground: Boolean) {
+        this.foreground = foreground
         if (foreground) {
             start()
-            return
-        }
-        locked {
-            backgroundStop?.cancel()
-            backgroundStop = scope.launch {
-                delay(config.backgroundGrace)
-                disconnect()
+        } else {
+            locked {
+                backgroundStop?.cancel()
+                backgroundStop = scope.launch {
+                    delay(config.backgroundGrace)
+                    disconnect()
+                }
             }
         }
+        // Settles each one by whether it is wanted now, after a quick switch
+        // away and back, which may be no change at all.
+        _state.value.conversations.keys.forEach { sync(it, SyncKind.Settle) }
     }
 
     /** Follows a conversation, now and after every reconnect. */
@@ -323,9 +336,9 @@ class RemoteController(
             if (kind == SyncKind.Resync && locked { session !in resyncing }) continue
             val force = kind != SyncKind.Settle
             // An ended conversation, whose updates stopped or can't be read, is
-            // let go unless asked for again.
+            // let go unless asked for again; in the background, every one is.
             val held = _state.value.conversations[session]
-            val wanted = held != null && (force || held.ended == null)
+            val wanted = held != null && foreground && (force || held.ended == null)
             try {
                 if (wanted && (force || session !in watched)) {
                     try {
