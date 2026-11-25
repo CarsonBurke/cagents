@@ -365,7 +365,7 @@ impl SurvivorEvidence {
 /// let several processes that keep re-execing each fail a different attempt.
 /// A process that stays unreadable still fails: unknown is not absent.
 #[cfg(any(feature = "host", feature = "ui"))]
-fn settle<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+fn settle<T, E>(mut read: impl FnMut() -> Result<T, E>) -> Result<T, E> {
     const ATTEMPTS: usize = 4;
     const WAIT: std::time::Duration = if cfg!(any(test, feature = "test-support")) {
         std::time::Duration::from_millis(1)

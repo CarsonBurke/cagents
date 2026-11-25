@@ -53,75 +53,49 @@ fn scan_pids(
         if owned_by_current_daemon(before, owner, uid, &records) {
             continue;
         }
-        let arguments = settle(|| {
-            let arguments = inspect::arguments(pid).map_err(process_error)?;
-            if arguments.arguments.first().is_none_or(Vec::is_empty) {
-                return Err(format!("cannot inspect process invocation ({pid})"));
-            }
-            Ok(arguments)
-        });
-        let after = match live_record(pid, uid) {
-            Ok(Some(after))
-                if same_lifetime(before, &after)
-                    && before.session == after.session
-                    && before.bsd.pbsi_comm == after.bsd.pbsi_comm =>
-            {
-                after
-            }
-            Ok(Some(_)) => {
-                incomplete.get_or_insert_with(|| {
-                    format!("cannot confirm process identity during recovery ({pid})")
-                });
-                continue;
-            }
+        let (after, invocation) = match settle(|| observe(pid, uid, before, &evidence)) {
+            Ok(Some((after, invocation))) => (after, Some(invocation)),
             Ok(None) => continue,
-            Err(error) => {
+            Err(ObservationError::Incomplete(error)) => {
                 incomplete.get_or_insert(error);
                 continue;
             }
-        };
-        let name = process_name(&after);
-        match arguments {
-            Ok(arguments) => {
-                let argv = arguments.arguments.iter().map(Vec::as_slice);
-                if evidence.names_conversation(argv.clone()) {
-                    return Ok(Some(SurvivingProcess {
-                        pid,
-                        name,
-                        link: SurvivorLink::Conversation,
-                        reason: format!(
-                            "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
-                        ),
-                    }));
-                }
-                // Darwin's path padding can consume an empty argv[0] and
-                // put the first environment variable at the end of argv.
-                if evidence
-                    .carries_marker(argv.chain(arguments.environment.iter().map(Vec::as_slice)))
-                {
-                    return Ok(Some(SurvivingProcess {
-                        pid,
-                        name,
-                        link: SurvivorLink::Lineage,
-                        reason: format!(
-                            "terminal {} still has a live process ({pid}); preserving it",
-                            session.id
-                        ),
-                    }));
-                }
-                if !arguments.environment.is_empty() {
-                    continue;
-                }
-                // XNU can return an invocation with the environment hidden
-                // by SIP. An empty environment does not prove no marker.
-            }
-            Err(error) if evidence.exact_identity.is_some() => {
+            Err(ObservationError::Invocation(_, error)) if evidence.exact_identity.is_some() => {
                 // A process older than the lineage can independently open
                 // the conversation. Birth and Leave cannot rule that out.
                 incomplete.get_or_insert(error);
                 continue;
             }
-            Err(_) => {}
+            Err(ObservationError::Invocation(after, _)) => (after, None),
+        };
+        let name = process_name(&after);
+        if let Some(invocation) = invocation {
+            if invocation.conversation {
+                return Ok(Some(SurvivingProcess {
+                    pid,
+                    name,
+                    link: SurvivorLink::Conversation,
+                    reason: format!(
+                        "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
+                    ),
+                }));
+            }
+            if invocation.marked {
+                return Ok(Some(SurvivingProcess {
+                    pid,
+                    name,
+                    link: SurvivorLink::Lineage,
+                    reason: format!(
+                        "terminal {} still has a live process ({pid}); preserving it",
+                        session.id
+                    ),
+                }));
+            }
+            if invocation.environment_visible {
+                continue;
+            }
+            // XNU can return an invocation with the environment hidden
+            // by SIP. An empty environment does not prove no marker.
         }
         let process = UnreadableProcess {
             pid,
@@ -149,6 +123,70 @@ fn scan_pids(
         Ok(None)
     } else {
         Err(ScanError::Unreadable(unreadable))
+    }
+}
+
+struct Invocation {
+    conversation: bool,
+    marked: bool,
+    environment_visible: bool,
+}
+
+fn read_invocation(record: &[u8], evidence: &SurvivorEvidence) -> Option<Invocation> {
+    let arguments = inspect::parse_arguments(record)?;
+    if arguments.arguments.first().is_none_or(Vec::is_empty) {
+        return None;
+    }
+    Some(Invocation {
+        conversation: evidence.names_conversation(arguments.arguments.iter().map(Vec::as_slice)),
+        // The ordinary parser ends the environment at the first empty
+        // entry. Compare exact marker tokens throughout the returned bytes;
+        // an empty entry, or an empty argv[0], cannot hide a positive marker.
+        marked: evidence.carries_marker(record[4..].split(|byte| *byte == 0)),
+        environment_visible: !arguments.environment.is_empty(),
+    })
+}
+
+enum ObservationError {
+    Incomplete(String),
+    Invocation(table::Record, String),
+}
+
+fn observe(
+    pid: u32,
+    uid: u32,
+    captured: &table::Record,
+    evidence: &SurvivorEvidence,
+) -> Result<Option<(table::Record, Invocation)>, ObservationError> {
+    let identity_changed = || {
+        ObservationError::Incomplete(format!(
+            "cannot confirm process identity during recovery ({pid})"
+        ))
+    };
+    let Some(before) = live_record(pid, uid).map_err(ObservationError::Incomplete)? else {
+        return Ok(None);
+    };
+    if !same_lifetime(captured, &before) {
+        return Err(identity_changed());
+    }
+    let invocation = inspect::argument_record(pid)
+        .map_err(process_error)
+        .and_then(|record| {
+            read_invocation(&record, evidence)
+                .ok_or_else(|| format!("cannot inspect process invocation ({pid})"))
+        });
+    let Some(after) = live_record(pid, uid).map_err(ObservationError::Incomplete)? else {
+        return Ok(None);
+    };
+    if !same_lifetime(&before, &after)
+        || before.session != after.session
+        || before.bsd.pbsi_comm != after.bsd.pbsi_comm
+    {
+        return Err(identity_changed());
+    }
+    match invocation {
+        Ok(invocation) => Ok(Some((after, invocation))),
+        Err(error) => Err(ObservationError::Invocation(after, error)),
     }
 }
 
@@ -180,19 +218,21 @@ fn owned_by_current_daemon(
     if owner != std::process::id() && !records.contains_key(&owner) {
         return false;
     }
+    let leaf = member;
+    let still_current = |before: &table::Record| {
+        live_record(before.bsd.pbsi_pid, uid).is_ok_and(|after| {
+            after.is_some_and(|after| {
+                same_lifetime(before, &after) && before.bsd.pbsi_ppid == after.bsd.pbsi_ppid
+            })
+        })
+    };
     let mut chain = Vec::new();
     for _ in 0..records.len() {
         chain.push(member);
         if member.bsd.pbsi_pid == owner
             || (owner == std::process::id() && member.bsd.pbsi_ppid == owner)
         {
-            return chain.into_iter().all(|before| {
-                live_record(before.bsd.pbsi_pid, uid).is_ok_and(|after| {
-                    after.is_some_and(|after| {
-                        same_lifetime(before, &after) && before.bsd.pbsi_ppid == after.bsd.pbsi_ppid
-                    })
-                })
-            });
+            return chain.into_iter().rev().all(still_current) && still_current(leaf);
         }
         let Some(parent) = records.get(&member.bsd.pbsi_ppid) else {
             return false;
@@ -298,6 +338,18 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_environment_entry_does_not_hide_a_later_lineage_marker() {
+        let evidence = SurvivorEvidence::new(&source());
+        let mut record = 1_i32.to_ne_bytes().to_vec();
+        record.extend_from_slice(b"/bin/cat\0\0cat\0EXAMPLE=1\0\0");
+        record.extend_from_slice(evidence.markers[0].as_bytes());
+        record.push(0);
+        let invocation = read_invocation(&record, &evidence).unwrap();
+        assert!(invocation.environment_visible);
+        assert!(invocation.marked);
+    }
+
+    #[test]
     fn exact_writer_still_blocks_when_argv_is_visible_and_environment_is_hidden() {
         let mut source = source();
         let conversation = uuid::Uuid::new_v4().to_string();
@@ -365,12 +417,21 @@ mod tests {
             std::process::Command::new(signed_cat(directory.path(), true))
                 .env("CAGENTS_TERMINAL_ID", source.id.to_string()),
         );
-        let arguments = inspect::arguments(child.pid()).unwrap();
-        assert!(!arguments.arguments.is_empty());
-        assert!(
-            arguments.environment.is_empty(),
-            "the restricted fixture requires SIP to withhold its environment"
-        );
+        let record = inspect::argument_record(child.pid()).unwrap();
+        let invocation = read_invocation(&record, &SurvivorEvidence::new(&source)).unwrap();
+        // Kernels with less restrictive visibility must still block on the
+        // positive marker. On a SIP-protected Mac exercise the hidden case.
+        if invocation.marked {
+            assert_eq!(
+                scan_child(&source, &child, &[], None)
+                    .unwrap()
+                    .unwrap()
+                    .link,
+                SurvivorLink::Lineage
+            );
+            return;
+        }
+        assert!(!invocation.environment_visible);
         let ScanError::Unreadable(processes) = scan_child(&source, &child, &[], None).unwrap_err()
         else {
             panic!("the process with hidden markers must require a decision");

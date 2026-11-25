@@ -75,6 +75,11 @@ fn nul_terminated(entries: &[Vec<u8>]) -> Vec<u8> {
 /// Returns the underlying error when the kernel refuses, and `InvalidData`
 /// when its record is malformed.
 pub fn arguments(pid: u32) -> io::Result<Arguments> {
+    parse_arguments(&argument_record(pid)?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed process arguments"))
+}
+
+pub(crate) fn argument_record(pid: u32) -> io::Result<Vec<u8>> {
     // Reserved, not zeroed: most records are far smaller than the limit, so
     // only the pages the kernel writes are touched.
     let mut buffer: Vec<u8> = Vec::with_capacity(argument_limit()?);
@@ -104,8 +109,7 @@ pub fn arguments(pid: u32) -> io::Result<Arguments> {
     // SAFETY: the kernel initialized the first `length` bytes and the
     // preceding check confirms they are within the allocation.
     unsafe { buffer.set_len(length) };
-    parse_arguments(&buffer)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed process arguments"))
+    Ok(buffer)
 }
 
 /// `pid` as the kernel's interfaces take it.
@@ -210,7 +214,7 @@ fn argument_limit() -> io::Result<usize> {
 /// `KERN_PROCARGS2` is the argument count, the executable's path, NUL
 /// padding, then `argc` NUL-terminated arguments and the NUL-terminated
 /// environment, which ends at an empty entry or the end of the record.
-fn parse_arguments(record: &[u8]) -> Option<Arguments> {
+pub(crate) fn parse_arguments(record: &[u8]) -> Option<Arguments> {
     let count = usize::try_from(i32::from_ne_bytes(record.get(..4)?.try_into().ok()?)).ok()?;
     let rest = record.get(4..)?;
     let rest = match rest.iter().position(|byte| *byte == 0) {
