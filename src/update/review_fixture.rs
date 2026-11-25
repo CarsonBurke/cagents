@@ -45,6 +45,12 @@ pub(super) fn offers_release(root: &Path) -> bool {
     root.join(RELEASE).exists()
 }
 
+/// Whether the fixture's release is offered as macOS offers one: through
+/// its installer, while `home/.config/fixture-update-installer` is present.
+pub(super) fn offers_installer(root: &Path) -> bool {
+    root.join("home/.config/fixture-update-installer").exists()
+}
+
 const RELEASE: &str = "home/.config/fixture-update-release.json";
 
 fn read_fixture(path: &Path) -> Result<Option<Vec<u8>>, UpdateError> {

@@ -1204,7 +1204,7 @@ fn floor_record_helper(
     let mut file = anonymous_file()?;
     file.write_all(&record.encode_capture().map_err(invalid)?)?;
     file.seek(SeekFrom::Start(0))?;
-    seal_file(&file)?;
+    let file = seal_file(file)?;
     let fd = file.as_raw_fd();
     let mut command = Command::new(helper);
     crate::install_guard::sanitize_child_environment(&mut command);

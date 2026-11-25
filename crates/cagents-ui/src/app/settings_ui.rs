@@ -328,14 +328,23 @@ fn settings_category_controls<'a>(
             let status = design::body(updates.status.clone())
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .width(Length::Fill);
-            let mut update_row: Vec<Element<'a, Message>> = vec![if updates.failed {
+            let status: Element<'a, Message> = if updates.failed {
                 status
                     .class(cosmic::theme::Text::Custom(design::destructive_text))
                     .into()
             } else {
                 status.into()
-            }];
-            if let Some((_, url)) = &updates.available {
+            };
+            let mut update_row: Vec<Element<'a, Message>> = vec![status];
+            if let Some((url, _)) = &updates.installer {
+                update_row.push(update_ui::release_notes_button(url));
+                update_row.push(
+                    crate::ui_controls::button::primary("Copy installer command")
+                        .id(widget::Id::new("settings.updates.copy-installer"))
+                        .on_press(Message::UpdateUi(update_ui::Action::CopyInstallerCommand))
+                        .into(),
+                );
+            } else if let Some((_, url)) = &updates.available {
                 update_row.push(update_ui::release_notes_button(url));
                 update_row.push(
                     // `Apply` is refused while this window is blocked, so the
@@ -376,11 +385,29 @@ fn settings_category_controls<'a>(
                             Some(reason) => format!("{} {reason}", updates.detail),
                             None => updates.detail.clone(),
                         },
-                        widget::row::with_children(update_row)
-                            .align_y(Alignment::Center)
-                            .spacing(space::S)
-                            .width(Length::Fill)
-                            .into(),
+                        {
+                            let row = widget::row::with_children(update_row)
+                                .align_y(Alignment::Center)
+                                .spacing(space::S)
+                                .width(Length::Fill);
+                            // The command is shown, across the whole field,
+                            // as well as copied: the person sees what they
+                            // will run.
+                            match &updates.installer {
+                                Some((_, command)) => widget::column::with_children(vec![
+                                    row.into(),
+                                    design::body(command.clone())
+                                        .font(iced::Font::MONOSPACE)
+                                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                                        .width(Length::Fill)
+                                        .into(),
+                                ])
+                                .spacing(space::S)
+                                .width(Length::Fill)
+                                .into(),
+                                None => row.into(),
+                            }
+                        },
                     ),
                     crate::settings_widgets::toggle(
                         "Check for updates automatically",
@@ -2056,6 +2083,7 @@ mod keyboard_table_tests {
                 failed: false,
                 can_check: false,
                 available: None,
+                installer: None,
                 apply_blocker: None,
                 detail: String::new(),
             },

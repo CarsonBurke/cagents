@@ -194,7 +194,7 @@ pub(super) fn perform(
     if executable.metadata()?.len() > 512 * 1024 * 1024 {
         return Err(invalid("installed CLI exceeds update size limit"));
     }
-    seal_file(&executable)?;
+    let executable = seal_file(executable)?;
     let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged =
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;

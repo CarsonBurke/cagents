@@ -1588,6 +1588,9 @@ To show what the header offers when a newer release exists, also copy
 otherwise never runs, reports that release as available at startup and on
 "Check again". Under native evidence, `apply` refuses every release, so
 "Update to" and "Retry update to" fail without installing anything.
+To show how macOS offers that release, through its installer, also create an
+empty `home/.config/fixture-update-installer`: About then says the release is
+available and offers "Copy installer command" instead of "Review update".
 
 This loads data into the actual native dialog and supports scrolling and Copy
 details. It does not run providers, inspect a live update inventory, perform an
