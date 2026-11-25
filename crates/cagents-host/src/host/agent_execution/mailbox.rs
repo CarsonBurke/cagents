@@ -1439,6 +1439,10 @@ mod tests {
             RetainedInputOutcome::Disconnected,
         ] {
             let refused = matches!(&outcome, RetainedInputOutcome::Acknowledged(Err(_)));
+            let awaits_receipt = matches!(
+                &outcome,
+                RetainedInputOutcome::Unavailable | RetainedInputOutcome::Disconnected
+            );
             let directory = tempfile::tempdir().unwrap();
             let registry = Arc::new(Mutex::new(
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
@@ -1507,8 +1511,12 @@ mod tests {
                 assert_eq!(settled.state, State::Delivered);
                 assert_eq!(settled.to.session, Some(session));
                 let retained = actor.pending_retained_inputs();
-                assert_eq!(retained.len(), 1);
-                assert_eq!(retained[0].sequence, 1);
+                // Unknown is a received, terminal receipt. Connection
+                // loss retains the envelope until replay yields a receipt.
+                assert_eq!(retained.len(), usize::from(awaits_receipt));
+                if let Some(envelope) = retained.first() {
+                    assert_eq!(envelope.sequence, 1);
+                }
                 // The real courier path must observe Delivered and return
                 // before allocating any replacement input envelope.
                 courier.hand_over(&message, session, &actor).unwrap();

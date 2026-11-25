@@ -365,10 +365,15 @@ pub(crate) fn placement(cgroup: &str, uid: u32) -> Placement {
 /// Always `None` on Darwin, which has no cgroups; see [`cgroup_namespace`].
 #[cfg(feature = "host")]
 pub(crate) fn launch_containment() -> Option<String> {
-    let listing = fs::read_to_string("/proc/self/cgroup").ok()?;
-    (placement(unified_cgroup(&listing)?, crate::daemon::current_uid()) == Placement::Inside)
-        .then(cgroup_namespace)
-        .flatten()
+    #[cfg(target_os = "linux")]
+    {
+        let listing = fs::read_to_string("/proc/self/cgroup").ok()?;
+        (placement(unified_cgroup(&listing)?, crate::daemon::current_uid()) == Placement::Inside)
+            .then(cgroup_namespace)
+            .flatten()
+    }
+    #[cfg(target_os = "macos")]
+    None
 }
 
 /// Opens this boot's epoch for the instance, when `first`. A failure leaves the

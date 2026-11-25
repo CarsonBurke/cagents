@@ -3493,7 +3493,7 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
 
 /// Lifecycle fixtures inspect real kernel data for their owned process roster
 /// and prove provider retirement without unrelated protected host processes.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(in crate::host) fn restore_upgrade_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,

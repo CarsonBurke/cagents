@@ -11,7 +11,8 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
     const FIXTURE: &str = "CAGENTS_STRICT_UPGRADE_FIXTURE";
     const TEST: &str = "host::state::strict_upgrade_tests::confirmed_carry_failures_preserve_real_owners_through_shutdown";
     let Ok(root) = std::env::var(FIXTURE) else {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let parent = std::path::Path::new("/var/tmp").canonicalize().unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
         for path in ["run", "home", "data", "config", "cache"] {
             fs::create_dir(root.path().join(path)).unwrap();
         }
@@ -27,7 +28,9 @@ fn confirmed_carry_failures_preserve_real_owners_through_shutdown() {
             .env("XDG_CACHE_HOME", root.path().join("cache"))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // Each case can start a holder and adopt it through a separate
+        // daemon incarnation. Use an aggregate deadline for this coordinator.
+        let deadline = Instant::now() + 4 * crate::terminal::SPAWN_START_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success());

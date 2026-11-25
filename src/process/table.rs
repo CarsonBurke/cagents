@@ -109,25 +109,8 @@ fn process_changed() -> io::Error {
 
 #[cfg(any(feature = "host", feature = "ui"))]
 fn read_record(pid: libc::pid_t) -> io::Result<Record> {
-    // SAFETY: the kernel record contains only integers and byte arrays.
-    let mut bsd: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of_val(&bsd) as libc::c_int;
     let before = crate::pinned_process::started_ticks_of(pid as u32);
-    // SAFETY: bsd is writable for exactly size bytes. A nonzero arg asks
-    // XNU to include the zombie list for this flavor.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDT_SHORTBSDINFO,
-            1,
-            (&raw mut bsd).cast(),
-            size,
-        )
-    };
-    check_record_size(written, size)?;
-    if bsd.pbsi_pid != pid as u32 {
-        return Err(io::Error::other("the kernel returned an unexpected PID"));
-    }
+    let bsd = short_bsd_info(pid)?;
     // SAFETY: the positive PID asks for the corresponding process's session.
     let session = unsafe { libc::getsid(pid) };
     let session = if session < 0 {
@@ -156,6 +139,29 @@ fn read_record(pid: libc::pid_t) -> io::Result<Record> {
         session,
         start,
     })
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(super) fn short_bsd_info(pid: libc::pid_t) -> io::Result<libc::proc_bsdshortinfo> {
+    // SAFETY: the kernel record contains only integers and byte arrays.
+    let mut bsd: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&bsd) as libc::c_int;
+    // SAFETY: bsd is writable for exactly size bytes. A nonzero arg asks
+    // XNU to include the zombie list for this flavor.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            1,
+            (&raw mut bsd).cast(),
+            size,
+        )
+    };
+    check_record_size(written, size)?;
+    if bsd.pbsi_pid != pid as u32 {
+        return Err(io::Error::other("the kernel returned an unexpected PID"));
+    }
+    Ok(bsd)
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
