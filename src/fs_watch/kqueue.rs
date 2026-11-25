@@ -10,9 +10,14 @@
 //! unforced unmount while it is watched.
 //!
 //! Darwin reports every unlink as `NOTE_DELETE`, including a rename over the
-//! file and the removal of one of several hard links. inotify reports
-//! `IN_DELETE_SELF` and drops the watch only once the last link is gone, so a
-//! deletion here drops the watch only when the held file has no links left.
+//! file and the removal of one of several hard links. inotify drops a watch
+//! with `IN_DELETE_SELF` only once the last link is gone, so a deletion here
+//! drops the watch only when the held file has no links left. inotify also
+//! waits for every other open descriptor to close first, while this drops it
+//! at once; either way the subscriber wakes and watches again. On NFS, which
+//! renames an open unlinked file to `.nfsXXXX`, the link count stays 1, so
+//! the watch stays on that file until the caller's own inode check at the
+//! path moves it.
 
 use super::Event;
 use std::{
@@ -20,7 +25,7 @@ use std::{
     fs::File,
     io,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
         unix::fs::MetadataExt,
     },
 };
@@ -95,7 +100,7 @@ impl Kernel {
         let queue = unsafe { OwnedFd::from_raw_fd(queue) };
         // kqueue descriptors are not inherited across fork, but mark it
         // close-on-exec as well so no exec'd child sees it.
-        crate::descriptor::set_close_on_exec(std::os::fd::AsFd::as_fd(&queue))?;
+        crate::descriptor::set_close_on_exec(queue.as_fd())?;
         Ok(Self(queue))
     }
 

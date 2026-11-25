@@ -18,7 +18,7 @@ use std::{
     fs::File,
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     thread,
 };
 
@@ -37,7 +37,10 @@ enum Event {
     Changed(kernel::Id),
     /// The kernel dropped the watch, so its subscribers must watch again.
     Gone(kernel::Id),
-    /// Events were lost, so any subscriber may have missed a change.
+    /// Events were lost, so any subscriber may have missed a change. A
+    /// kqueue filter accumulates its changes instead of queueing them, so
+    /// only inotify overflows.
+    #[cfg(target_os = "linux")]
     Overflow,
 }
 
@@ -102,7 +105,7 @@ impl FileWatches {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<State>> {
+    fn lock(&self) -> MutexGuard<'_, Option<State>> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
@@ -124,6 +127,7 @@ impl FileWatches {
                 break;
             };
             batch.events(registry, |event| match event {
+                #[cfg(target_os = "linux")]
                 Event::Overflow => {
                     for wake in subscribers.values().flatten() {
                         signal(wake);
@@ -248,7 +252,8 @@ mod tests {
         assert_eq!(first_watch.id, duplicate.id);
         assert_ne!(first_watch.id, second_watch.id);
 
-        writeln!(first, "first change").unwrap();
+        // One write each, so one change raises one wake.
+        first.write_all(b"first change\n").unwrap();
         assert!(ready(&first_watch, 2000));
         assert!(ready(&duplicate, 2000));
         assert!(!ready(&second_watch, 0));
@@ -257,7 +262,8 @@ mod tests {
         File::from(duplicate.wake.watch.try_clone().unwrap())
             .read_exact(&mut [0; 8])
             .unwrap();
-        writeln!(first, "another change").unwrap();
+        assert!(!ready(&duplicate, 0), "the wake was drained");
+        first.write_all(b"another change\n").unwrap();
         assert!(ready(&duplicate, 2000));
 
         let id = duplicate.id;
@@ -272,7 +278,7 @@ mod tests {
                 .contains_key(&id)
         );
 
-        writeln!(second, "other transcript").unwrap();
+        second.write_all(b"other transcript\n").unwrap();
         assert!(ready(&second_watch, 2000));
     }
 
@@ -346,6 +352,12 @@ mod tests {
                 !ready(&bystander, 100),
                 "{name} leaves an unrelated watcher"
             );
+            // Linux reports an unlink's link-count change before it drops
+            // the watch, so a dropped watch may follow its first wake.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while gone && watched(&target) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             assert_eq!(watched(&target), !gone, "{name} keeps or drops the watch");
             assert!(watched(&bystander), "{name} keeps the unrelated watch");
         }
