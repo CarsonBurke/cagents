@@ -3,6 +3,7 @@
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
 use crate::chat::runtime::{OutboxEntry, RetirementInspection, VerifiedRetirement};
+use crate::daemon::owned_children::DetachedWork;
 use crate::host::model::NativeActorEvent;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1709,6 +1710,7 @@ fn finish_interrupted_exit_for_start(
         None,
         None,
         Ending::Stopped,
+        restart_close_scope(host, inspection.source.id),
     )
     .map_err(SetupError::Unavailable)?;
     Ok(true)
@@ -1778,9 +1780,29 @@ pub(in crate::host) fn finish_exited_attachment_for_start(
         }
         super::CloseTarget::from_record(record)
     };
-    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)
-        .map_err(chat::protocol::SetupError::Unavailable)?;
+    close_with_target(
+        host,
+        source,
+        None,
+        Some(&target),
+        None,
+        Ending::Stopped,
+        restart_close_scope(host, source.id),
+    )
+    .map_err(chat::protocol::SetupError::Unavailable)?;
     Ok(true)
+}
+
+/// Resume may finish an interrupted daemon shutdown. Reuse its normal
+/// per-conversation disposition so a completed interactive Spare can settle.
+fn restart_close_scope(host: &SharedHost, id: TerminalId) -> DetachedWork {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (host, id);
+        DetachedWork::Stop
+    }
+    #[cfg(target_os = "macos")]
+    super::super::agent_execution::detached_work_on_close(host, id)
 }
 
 /// Whether `issued`'s paired CLI view has no worker here and its original
@@ -2400,7 +2422,24 @@ pub(super) fn close_unattached(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, discovered, None, None, Ending::Closed)
+    close_unattached_with(host, requested, discovered, DetachedWork::Stop)
+}
+
+pub(super) fn close_unattached_with(
+    host: &SharedHost,
+    requested: &Session,
+    discovered: Option<crate::daemon::holder_registry::Record>,
+    detached: DetachedWork,
+) -> Result<(), String> {
+    close_with_target(
+        host,
+        requested,
+        discovered,
+        None,
+        None,
+        Ending::Closed,
+        detached,
+    )
 }
 
 /// A hosted close must retain its exact admission capability across cleanup.
@@ -2409,8 +2448,17 @@ pub(super) fn close_captured(
     requested: &Session,
     target: &super::CloseTarget,
     closing: Option<&super::capacity::Reservation>,
+    detached: DetachedWork,
 ) -> Result<(), String> {
-    close_with_target(host, requested, None, Some(target), closing, Ending::Closed)
+    close_with_target(
+        host,
+        requested,
+        None,
+        Some(target),
+        closing,
+        Ending::Closed,
+        detached,
+    )
 }
 
 /// What a retained cleanup ends besides the helper and its provider.
@@ -2463,6 +2511,7 @@ fn close_with_target(
     expected: Option<&super::CloseTarget>,
     closing: Option<&super::capacity::Reservation>,
     ending: Ending,
+    detached: DetachedWork,
 ) -> Result<(), String> {
     struct Reservation {
         host: SharedHost,
@@ -2515,6 +2564,7 @@ fn close_with_target(
     if !present {
         let exited = match cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
             CleanupRetirement::Verified(verified) => {
+                require_retirement_scope(&verified, detached)?;
                 return close_verified_unattached(host, requested, &proof, verified, ending);
             }
             CleanupRetirement::None => None,
@@ -2652,6 +2702,7 @@ fn close_with_target(
                 )
             }
             RetirementInspection::Verified(verified) => {
+                require_retirement_scope(&verified, detached)?;
                 let receipt = verified.receipt();
                 if receipt.identity != identity {
                     return Err("The retained cleanup receipt belongs to another actor".into());
@@ -2738,6 +2789,8 @@ fn close_with_target(
         .require_current(host)
         .map_err(|error| error.message)?;
     if retired.is_none() {
+        #[cfg(target_os = "macos")]
+        handle.decide_detached_work(detached);
         handle.close()?;
     }
     target
@@ -2916,6 +2969,19 @@ fn cleanup_retirement(
             }
         }
     }
+}
+
+fn require_retirement_scope(
+    verified: &VerifiedRetirement,
+    detached: DetachedWork,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let _ = (verified, detached);
+    #[cfg(target_os = "macos")]
+    if detached == DetachedWork::Stop && !verified.receipt().detached_cleanup_proved {
+        return Err("The retained retirement does not prove detached provider cleanup".into());
+    }
+    Ok(())
 }
 
 /// A verified capsule grants no live attachment, input or account access.

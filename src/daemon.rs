@@ -5,7 +5,7 @@ pub(crate) mod child_events;
 #[cfg(feature = "host")]
 pub mod child_reaper;
 #[cfg(all(feature = "host", target_os = "macos"))]
-mod descendants;
+pub(crate) mod descendants;
 /// The exact-process pin the daemon waits on and signals, which no process
 /// that later takes its pid can stand in for.
 pub use crate::pinned_process::PinnedProcess;
