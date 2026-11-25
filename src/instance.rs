@@ -2532,9 +2532,7 @@ impl UiActivationListener {
         let socket_path = runtime_directory.join(socket);
         prepare_activation_socket_path(&socket_path)?;
         let listener = crate::descriptor::bind(&socket_path)?;
-        // SAFETY: fchmod receives the bound listener's live descriptor.
-        if unsafe { libc::fchmod(listener.as_raw_fd(), PRIVATE_SOCKET_MODE) } != 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = restrict_activation_socket(&listener, &socket_path) {
             let _ = fs::remove_file(&socket_path);
             return Err(error);
         }
@@ -2840,6 +2838,45 @@ fn require_owned_runtime_directory(runtime_directory: &Path) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "runtime path is not an owned directory",
         ));
+    }
+    Ok(())
+}
+
+/// Leaves a bound activation socket readable and writable by its owner only.
+#[cfg(all(feature = "ui", target_os = "linux"))]
+fn restrict_activation_socket(listener: &UnixListener, _path: &Path) -> io::Result<()> {
+    // SAFETY: fchmod receives the bound listener's live descriptor.
+    if unsafe { libc::fchmod(listener.as_raw_fd(), PRIVATE_SOCKET_MODE) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Leaves a bound activation socket readable and writable by its owner only.
+///
+/// XNU's fchmod refuses a socket with `EINVAL`, so the mode is set through the
+/// path just bound, without following a symlink. That is weaker than Linux's
+/// descriptor-based change: a process of this user that replaces the socket
+/// in the window between bind and chmod could have the mode applied to its
+/// replacement instead. No one else can: the runtime directory `runtime_base`
+/// creates is verified private, and one named by `XDG_RUNTIME_DIR` is trusted
+/// as it is on Linux.
+#[cfg(all(feature = "ui", target_os = "macos"))]
+fn restrict_activation_socket(_listener: &UnixListener, path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: the path is a NUL-terminated string that outlives the call.
+    let changed = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            PRIVATE_SOCKET_MODE,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if changed != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -4968,14 +5005,20 @@ mod tests {
     fn editor_activation_supports_isolated_runtime_and_full_window_name() {
         use crate::notifications::{Application, Destination};
         let root = tempfile::tempdir_in("/tmp").unwrap();
-        let padding = 37 - root.path().as_os_str().len() - 1;
-        let runtime = root.path().join("r".repeat(padding));
-        fs::create_dir(&runtime).unwrap();
         let destination = Destination {
             application: Application::Ceditor,
             window: "w".repeat(40),
         };
         destination.validate().unwrap();
+        // The longest runtime directory whose socket path, separator and
+        // terminating NUL still fit this platform's sun_path.
+        // SAFETY: sockaddr_un is plain data, valid when zeroed.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let sun_path = address.sun_path.len();
+        let longest = sun_path - 1 - 1 - destination_socket_name(&destination).len();
+        let padding = longest - root.path().as_os_str().len() - 1;
+        let runtime = root.path().join("r".repeat(padding));
+        fs::create_dir(&runtime).unwrap();
         let (sender, receiver) = async_channel::bounded(1);
         let listener = UiActivationListener::bind_named(
             &runtime,

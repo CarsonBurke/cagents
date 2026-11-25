@@ -1260,6 +1260,10 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "asserts POSIX ACL semantics, where the ACL mask is the group mode; Darwin ACLs leave the mode alone"
+    )]
     fn editor_copy_preserves_access_acl_and_removes_unwanted_inheritance() {
         use crate::fs_safety::acl_fixture::{
             access_acl, restrictive_access_acl, set_default_acl, set_test_access_acl,
@@ -1743,8 +1747,10 @@ mod tests {
         symlink("CLAUDE.md", root.path().join("AGENTS.md")).unwrap();
         symlink("../../CLAUDE.md", root.path().join("docs/guide/AGENTS.md")).unwrap();
         symlink("./notes.txt", root.path().join("docs/README")).unwrap();
+        // A link names its target as the kernel resolves it: Darwin's
+        // temporary directory sits under the `/var` symlink.
         symlink(
-            root.path().join("docs/notes.txt"),
+            root.path().canonicalize().unwrap().join("docs/notes.txt"),
             root.path().join("absolute"),
         )
         .unwrap();

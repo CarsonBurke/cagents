@@ -991,6 +991,10 @@ fn an_undefined_merge_driver_falls_back_to_text() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS is case-insensitive by default, so A.txt replaces a.txt rather than joining it"
+)]
 fn files_differing_only_in_case_are_seen() {
     let fixture = Fixture::new();
     git(&fixture.repository, &["config", "core.ignoreCase", "true"]);
@@ -1060,6 +1064,10 @@ fn an_unremovable_directory_blocks() {
 /// Mounts a file system inside the worktree, in a mount namespace of a child
 /// test process where unprivileged namespaces allow.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "needs a Linux mount namespace; see darwin_mount_identity_separates_volumes"
+)]
 fn a_mount_inside_the_worktree_blocks() {
     const CHILD: &str = "CAGENTS_CONTENT_MOUNT_TEST";
     let unshare = || {
@@ -1286,6 +1294,10 @@ fn a_read_only_directory_blocks() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses names that are not UTF-8, so git cannot create the branch's loose ref"
+)]
 fn non_utf8_branch_inspection_refuses_lossy_fences() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     let fixture = Fixture::new();
@@ -1311,5 +1323,29 @@ fn non_utf8_branch_inspection_refuses_lossy_fences() {
             .to_string()
             .contains("git printed non-UTF-8 where a name was due"),
         "{error}"
+    );
+}
+
+/// `/dev` is its own devfs mount, apart from the volume that holds the
+/// temporary directory, while two paths on one volume share an identity. (The
+/// system and data volumes of an APFS volume group report one identity, so `/`
+/// cannot stand in for another mount here.)
+#[cfg(target_os = "macos")]
+#[test]
+fn darwin_mount_identity_separates_volumes() {
+    let fixture = Fixture::new();
+    let mount = |path: &Path| {
+        analysis::filesystem(path)
+            .unwrap()
+            .and_then(|filesystem| filesystem.mount)
+            .expect("Darwin reports every file system's identity")
+    };
+    let worktree = mount(&fixture.worktree);
+    assert_eq!(worktree, mount(&fixture.repository));
+    assert_ne!(worktree, mount(Path::new("/dev")));
+    assert!(
+        analysis::filesystem(&fixture.worktree.join("absent"))
+            .unwrap()
+            .is_none()
     );
 }

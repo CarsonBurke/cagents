@@ -284,12 +284,16 @@ fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
 /// Ends this process with SIGTERM once the process that started it exits, as
 /// Linux's parent death signal does. A kqueue watches the parent's exit, and
 /// checking that the parent is unchanged after registering rules out watching
-/// a later process that reused its pid.
+/// a later process that reused its pid. Darwin has no subreapers, so a parent
+/// of launchd (pid 1) means the window that started this one already exited.
 #[cfg(target_os = "macos")]
 fn end_with_parent() -> std::io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // SAFETY: getppid has no preconditions and no failure state.
     let parent = unsafe { libc::getppid() };
+    if parent == 1 {
+        return Err(std::io::Error::other("the waiting window has exited"));
+    }
     // SAFETY: kqueue takes no arguments and returns a new descriptor or -1.
     let raw = unsafe { libc::kqueue() };
     if raw < 0 {
@@ -323,7 +327,7 @@ fn end_with_parent() -> std::io::Result<()> {
     {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: as above.
+    // SAFETY: getppid has no preconditions and no failure state.
     if unsafe { libc::getppid() } != parent {
         return Err(std::io::Error::other("the waiting window has exited"));
     }

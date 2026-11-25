@@ -114,9 +114,6 @@ pub fn scan(
 ) -> Option<Scan> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    if len >= UNCACHE_BYTES {
-        read_uncached(&file);
-    }
     // A transcript found not to be a resumable conversation is trusted to
     // stay one only while it still holds the bytes that decided it: one
     // rewritten in place may now hold a conversation.
@@ -126,6 +123,9 @@ pub fn scan(
         .unwrap_or_default();
     if scan.settled_negative() {
         return Some(scan);
+    }
+    if len >= UNCACHE_BYTES {
+        read_uncached(&file);
     }
     file.seek(SeekFrom::Start(scan.offset)).ok()?;
     let mut reader = Records::new(provider, path, &mut scan);
@@ -304,7 +304,9 @@ fn boundary(file: &mut std::fs::File, scan: &Scan) -> Option<u64> {
 fn read_uncached(_file: &std::fs::File) {}
 
 /// Darwin cannot drop a file's cached pages after the fact, so a large
-/// transcript is read without caching it instead. Advisory only.
+/// transcript is read without caching it instead. Advisory only. Unlike
+/// Linux, which keeps the pages of a scan that settles as a negative partway
+/// through, this cannot know in advance, so those reads go uncached too.
 #[cfg(target_os = "macos")]
 fn read_uncached(file: &std::fs::File) {
     use std::os::fd::AsRawFd;

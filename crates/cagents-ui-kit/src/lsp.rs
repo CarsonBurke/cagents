@@ -1724,9 +1724,13 @@ impl ChildProcess {
             .id()
             .ok_or_else(|| io::Error::other("Child already reaped"))?;
         // This is our freshly spawned, still-unreaped child, and only `stop`
-        // or Tokio's drop reaper ever reaps it.
-        let identity = cagents::process::identity::unreaped_child_identity(process_group)
-            .and_then(tokio::io::unix::AsyncFd::new);
+        // or Tokio's drop reaper ever reaps it. The handle only ever turns
+        // readable, and a Darwin kqueue refuses to be watched for writing.
+        let identity = cagents::process::identity::unreaped_child_identity(process_group).and_then(
+            |identity| {
+                tokio::io::unix::AsyncFd::with_interest(identity, tokio::io::Interest::READABLE)
+            },
+        );
         match identity {
             Ok(identity) => Ok(Self {
                 child,
