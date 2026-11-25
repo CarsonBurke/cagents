@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn a_headless_open_agent_and_its_paired_terminal_reference_saved_history() {
-        let (registry, _, mut agent) = paired_fixture();
+        let (mut registry, _, mut agent) = paired_fixture();
         let Some(HostedSession::Chat(chat)) = &mut agent.session else {
             panic!("fixture starts with a paired chat");
         };
@@ -442,7 +442,7 @@ mod tests {
             open_agent_sessions(&registry.db).unwrap(),
             BTreeSet::from([chat_id, paired]),
         );
-        close_presentation(&registry, &agent);
+        registry.close_agent(&agent.origin, agent.id).unwrap();
         assert!(open_agent_sessions(&registry.db).unwrap().is_empty());
     }
 
