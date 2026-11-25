@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 pub(in crate::host) struct AgentRunUpdateRisk {
     pub session: crate::chat::Session,
     pub queued_prompts: bool,
+    pub runs: Vec<RunId>,
 }
 
 /// Authorization refusals remain distinct from registry/record failures until
@@ -399,31 +400,37 @@ impl Registry {
         let mut query = self
             .db
             .prepare(&format!(
-                "SELECT a.record, EXISTS(SELECT 1 FROM agent_runs r
+                "SELECT a.record, active.id, EXISTS(SELECT 1 FROM agent_runs r
                    WHERE r.agent = a.id AND {UNSENT}
                    AND substr(r.idempotency_key, 1, length(?1)) <> ?1)
-                 FROM agents a WHERE a.closed = 0 AND a.session_id IS NOT NULL
-                   AND EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id
-                       AND r.state IN ('running', 'waiting'))"
+                 FROM agent_runs active JOIN agents a ON a.id = active.agent
+                 WHERE active.state IN ('running', 'waiting')
+                   AND a.closed = 0 AND a.session_id IS NOT NULL"
             ))
             .map_err(|error| error.to_string())?;
         let records = query
             .query_map([crate::agent_execution::MESSAGE_RUN_KEY], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
             })
             .map_err(|error| error.to_string())?;
         let mut risks = BTreeMap::new();
         for record in records {
-            let (record, queued_prompts) = record.map_err(|error| error.to_string())?;
+            let (record, run, queued_prompts) = record.map_err(|error| error.to_string())?;
             let agent: Agent = decode(&record)?;
             if let Some(HostedSession::Chat(chat)) = agent.session {
-                risks.insert(
-                    chat.id,
-                    AgentRunUpdateRisk {
+                risks
+                    .entry(chat.id)
+                    .or_insert_with(|| AgentRunUpdateRisk {
                         session: chat,
                         queued_prompts,
-                    },
-                );
+                        runs: Vec::new(),
+                    })
+                    .runs
+                    .push(run.parse().map_err(|_| "Invalid stored run ID")?);
             }
         }
         Ok(risks)

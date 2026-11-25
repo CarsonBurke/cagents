@@ -3705,7 +3705,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         );
         let reason = impact.sessions[0].review().reason;
         assert!(reason.contains("without a confirmed result"), "{reason}");
-        assert!(reason.contains("queued prompts stay unsent"), "{reason}");
+        assert!(reason.contains("queued prompts unsent"), "{reason}");
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     // A delivery already in flight is never redispatched after a restart:

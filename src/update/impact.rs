@@ -196,9 +196,22 @@ pub struct SessionReview {
     pub title: String,
     pub disposition: Disposition,
     pub reason: String,
+    pub warns_about_agent_run: bool,
 }
 
 impl SessionImpact {
+    fn permits_agent_run_warning(&self, observed: &Self, policy: Policy) -> bool {
+        match (policy, self.disposition, observed.disposition) {
+            // This risk is disclosed as a consequence of updating sooner.
+            (Policy::WhenIdle, _, Disposition::WaitsForIdle) => true,
+            // A wait never accepted this risk for the handoff itself.
+            (Policy::WhenIdle, Disposition::WaitsForIdle, _) => {
+                !observed.reason.unconfirmed_agent_run()
+            }
+            _ => self.reason.permits_agent_run_warning(&observed.reason),
+        }
+    }
+
     /// Whether the source's checkpoint must carry this owner. Only a
     /// conversation whose provider already ended is reviewed without one.
     pub fn checkpointed(&self) -> bool {
@@ -208,9 +221,19 @@ impl SessionImpact {
     }
 
     pub fn review(&self) -> SessionReview {
+        let warns_about_agent_run = self.kind == SessionKind::NativeChat
+            && matches!(
+                self.disposition,
+                Disposition::Continues
+                    | Disposition::Resumes
+                    | Disposition::WaitsForIdle
+                    | Disposition::Interrupted
+            )
+            && self.reason.unconfirmed_agent_run();
         let mut reason: String = match self.disposition {
             Disposition::Continues => match self.kind {
                 SessionKind::Terminal => "The terminal and its running processes stay alive.".into(),
+                SessionKind::NativeChat if warns_about_agent_run => "Its conversation keeps running.".into(),
                 SessionKind::NativeChat => "The conversation and its running work stay alive.".into(),
             },
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
@@ -249,16 +272,14 @@ impl SessionImpact {
                 },
             },
         };
-        if matches!(
-            self.disposition,
-            Disposition::WaitsForIdle | Disposition::Interrupted
-        ) && let SessionCause::AgentRunUnconfirmed { queued_prompts } = self.reason
+        if warns_about_agent_run
+            && let SessionCause::AgentRunUnconfirmed { queued_prompts } = self.reason
         {
-            reason.push_str(" Updating now can leave this agent’s run without a confirmed result. If that happens, the agent stops taking new work.");
+            reason.push_str(" Updating now can leave this agent’s run without a confirmed result. The agent may then stop taking new work");
             if queued_prompts {
-                reason.push_str(" Its queued prompts stay unsent.");
+                reason.push_str(", leaving its queued prompts unsent");
             }
-            reason.push_str(" Messages can still reach the conversation after it reopens.");
+            reason.push_str(". Messages can still reach the conversation after it reopens.");
         }
         SessionReview {
             id: self.id,
@@ -266,6 +287,7 @@ impl SessionImpact {
             title: self.title.clone(),
             disposition: self.disposition,
             reason,
+            warns_about_agent_run,
         }
     }
 }
@@ -373,8 +395,7 @@ impl DaemonImpact {
                         .map(String::as_str)
                         .collect();
                     previous.identity == current.identity
-                        && (self.policy == Policy::WhenIdle
-                            || previous.reason.permits_agent_run_warning(&current.reason))
+                        && previous.permits_agent_run_warning(current, self.policy)
                         && current
                             .interrupted_subagents
                             .iter()
@@ -667,6 +688,17 @@ pub(super) mod tests {
             daemon.sessions[0].disposition = Disposition::WaitsForIdle;
         }
         assert!(still_working.preserves_consent(&queued));
+
+        // The warning shown on a waiting row was about updating sooner.
+        let waiting_with_queue = queued.clone();
+
+        // Carrying the conversation does not guarantee the agent's result.
+        for preview in [&mut still_working, &mut queued] {
+            preview.daemon.as_mut().unwrap().sessions[0].disposition = Disposition::Continues;
+        }
+        assert!(!still_working.preserves_consent(&queued));
+        assert!(!waiting_with_queue.preserves_consent(&queued));
+        assert!(queued.preserves_consent(&still_working));
     }
 
     fn preview_with_daemon(daemon: DaemonImpact) -> Preview {
@@ -1131,11 +1163,11 @@ impl Preview {
                 };
                 // The daemon comparison above proved these are the same owners
                 // and only permitted activity settlement or shrinking task sets.
-                // Keep all titles, source reasons, saved outcomes and notices so
-                // settling work cannot conceal any other change to the review.
+                // Keep titles, other source reasons, saved outcomes and notices
+                // so settling work cannot conceal any other change to the review.
                 session.disposition = now.disposition;
-                // Waiting does not approve interruption. Under Interrupt the
-                // daemon comparison already excludes a new or larger warning.
+                // A wait doesn't approve interruption. For work that will
+                // cross the handoff now, the daemon already rejected a wider warning.
                 if now.reason.unconfirmed_agent_run()
                     || (session.reason.unconfirmed_agent_run()
                         && now.reason != SessionCause::PendingDelivery)

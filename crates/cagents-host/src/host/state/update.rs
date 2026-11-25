@@ -265,10 +265,11 @@ impl HostState {
             let aligned = crate::chat::protocol::align_resume_identity(&mut launch).is_ok();
             let continuity = record.handle.native_continuity();
             let durable = continuity.retains_provider();
+            let actor = record.handle.actor_identity();
             let retained_claude = matches!(
                 continuity,
                 crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
-            ) && record.handle.actor_identity().is_some();
+            ) && actor.is_some();
             let hosted_source = !super::super::chat::owns_codex_listener(&record.session)
                 && self
                     .terminals
@@ -288,6 +289,24 @@ impl HostState {
                 source.launch.session_id = confirmed.clone();
             }
             let migration = crate::upgrade::handoff::validate_chat_source(&source, &launch);
+            let agent_warning = || {
+                let risk = agent_runs.get(&id).filter(|risk| {
+                    crate::agent_execution::same_chat_process(&risk.session, &record.session)
+                })?;
+                if retained_claude
+                    && actor
+                        .as_ref()
+                        .is_some_and(|identity| identity.instance == record.execution_instance)
+                {
+                    let retained = record.handle.retained_runs();
+                    if risk.runs.iter().all(|run| retained.contains(run)) {
+                        return None;
+                    }
+                }
+                Some(SessionCause::AgentRunUnconfirmed {
+                    queued_prompts: risk.queued_prompts,
+                })
+            };
             let (disposition, reason) = if record.returning_terminal {
                 (Disposition::Blocked, SessionCause::ReturningToTerminal)
             } else if self.provider_ended(id, record) {
@@ -317,31 +336,27 @@ impl HostState {
             } else if durable {
                 (
                     Disposition::Continues,
-                    "The provider, active turn, and pending approvals stay alive while the application reconnects.".into(),
+                    agent_warning().unwrap_or_else(|| {
+                        "The provider, active turn, and pending approvals stay alive while the application reconnects.".into()
+                    }),
                 )
             } else if busy {
-                let warning = agent_runs
-                    .get(&id)
-                    .filter(|risk| {
-                        crate::agent_execution::same_chat_process(&risk.session, &record.session)
-                    })
-                    .map(|risk| SessionCause::AgentRunUnconfirmed {
-                        queued_prompts: risk.queued_prompts,
-                    });
                 match policy {
                     Policy::WhenIdle => (
                         Disposition::WaitsForIdle,
-                        warning.unwrap_or_else(|| waits_for_idle_reason(&hold).into()),
+                        agent_warning().unwrap_or_else(|| waits_for_idle_reason(&hold).into()),
                     ),
                     Policy::Interrupt => (
                         Disposition::Interrupted,
-                        warning.unwrap_or_else(|| interrupted_reason(&hold).into()),
+                        agent_warning().unwrap_or_else(|| interrupted_reason(&hold).into()),
                     ),
                 }
             } else {
                 (
                     Disposition::Resumes,
-                    "The saved conversation will reopen with a new provider process.".into(),
+                    agent_warning().unwrap_or_else(|| {
+                        "The saved conversation will reopen with a new provider process.".into()
+                    }),
                 )
             };
             impact.sessions.push(SessionImpact {

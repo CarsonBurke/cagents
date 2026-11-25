@@ -1269,7 +1269,15 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         track(id);
         ids.insert(thread, id);
     }
-    let (agent, queued) = queue_messages_during_turn(&host, &root, ids[restarted]);
+    use crate::update::impact::Disposition;
+    verify_agent_run_warning(&host, &root, ids[retained], Disposition::Continues, &[]);
+    let (agent, queued) = verify_agent_run_warning(
+        &host,
+        &root,
+        ids[restarted],
+        Disposition::Interrupted,
+        &[FIRST_MESSAGE, SECOND_MESSAGE],
+    );
     let idle =
         super::update::inspect(&host, crate::update::impact::Policy::WhenIdle, true).unwrap();
     let (prepared, _, shutdown) = super::super::client::process_request(
@@ -1518,10 +1526,12 @@ const HELD_PROMPT: &str = "Work until this test interrupts the turn";
 const FIRST_MESSAGE: &str = "first accepted message";
 const SECOND_MESSAGE: &str = "second accepted message";
 
-fn queue_messages_during_turn(
+fn verify_agent_run_warning(
     host: &SharedHost,
     root: &std::path::Path,
     id: TerminalId,
+    disposition: crate::update::impact::Disposition,
+    messages: &[&str],
 ) -> (crate::model::AgentId, Vec<crate::model::RunId>) {
     use super::super::agent_execution as execution;
     use crate::agent_execution::{
@@ -1557,7 +1567,7 @@ fn queue_messages_during_turn(
                     reasoning_effort: None,
                 }),
                 prompt: HELD_PROMPT.into(),
-                idempotency_key: "run-before-upgrade".into(),
+                idempotency_key: format!("run-before-upgrade-{id}"),
             },
             crate::chat::now_ms().unwrap(),
         )
@@ -1583,9 +1593,9 @@ fn queue_messages_during_turn(
         "the original turn did not start",
     );
 
-    let queued: Vec<_> = [FIRST_MESSAGE, SECOND_MESSAGE]
-        .into_iter()
-        .map(|body| {
+    let queued: Vec<_> = messages
+        .iter()
+        .map(|&body| {
             let handed = execution::mailbox::hand(
                 host,
                 &Authority::default(),
@@ -1612,21 +1622,30 @@ fn queue_messages_during_turn(
         })
         .collect();
 
-    let impact =
-        super::update::inspect(host, crate::update::impact::Policy::Interrupt, false).unwrap();
-    assert!(!impact.blocked(), "{impact:?}");
-    let session = impact.sessions.iter().find(|item| item.id == id).unwrap();
-    assert_eq!(
-        session.disposition,
-        crate::update::impact::Disposition::Interrupted
-    );
-    assert_eq!(
-        session.reason,
-        crate::update::impact::SessionCause::AgentRunUnconfirmed {
-            queued_prompts: false
-        }
-    );
-    assert!(!session.review().reason.contains("queued prompts"));
+    use crate::update::impact::{Disposition, Policy, SessionCause};
+    let idle_disposition = if disposition == Disposition::Interrupted {
+        Disposition::WaitsForIdle
+    } else {
+        disposition
+    };
+    for (policy, expected) in [
+        (Policy::WhenIdle, idle_disposition),
+        (Policy::Interrupt, disposition),
+    ] {
+        let impact = super::update::inspect(host, policy, false).unwrap();
+        assert!(!impact.blocked(), "{impact:?}");
+        let session = impact.sessions.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(session.disposition, expected);
+        assert_eq!(
+            session.reason,
+            SessionCause::AgentRunUnconfirmed {
+                queued_prompts: false
+            }
+        );
+        let reason = session.review().reason;
+        assert!(reason.contains("without a confirmed result"), "{reason}");
+        assert!(!reason.contains("queued prompts"), "{reason}");
+    }
     // Interrupt the exact active run. The held message runs stay unclaimed.
     handle.interrupt_run(run).unwrap();
     wait_until(

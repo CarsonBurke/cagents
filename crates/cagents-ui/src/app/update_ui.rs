@@ -688,15 +688,17 @@ impl Cagents {
                         .into(),
                 );
             }
-            // What stands in the way leads; what merely happens follows.
-            let (attention, settled): (Vec<_>, Vec<_>) = daemon
-                .sessions
-                .iter()
-                .partition(|session| session.disposition == Disposition::Blocked);
+            // Keep blockers and risks visible before the ordinary outcomes.
+            let mut sessions: Vec<_> = daemon.sessions.iter().collect();
+            sessions.sort_by_key(|session| {
+                (
+                    session.disposition != Disposition::Blocked,
+                    !session.reason.unconfirmed_agent_run(),
+                )
+            });
             rows.extend(
-                attention
+                sessions
                     .into_iter()
-                    .chain(settled)
                     .map(|session| self.update_session_row(session, interruptions.is_some())),
             );
             rows.extend(daemon.review_notices().into_iter().map(notice_body));
@@ -821,10 +823,7 @@ impl Cagents {
                 .spacing(space::S)
                 .into(),
         ]);
-        if !working
-            || !session.interrupted_subagents.is_empty()
-            || session.reason.unconfirmed_agent_run()
-        {
+        if !working || !session.interrupted_subagents.is_empty() || review.warns_about_agent_run {
             row = row.push(notice_detail(review.reason));
         }
         row.spacing(space::XXS).into()
