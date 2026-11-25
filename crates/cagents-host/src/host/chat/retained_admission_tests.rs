@@ -24,6 +24,11 @@ fn isolated(name: &str) -> Option<PathBuf> {
     } else {
         tempfile::tempdir_in("/var/tmp").unwrap()
     };
+    #[cfg(target_os = "macos")]
+    let canonical = directory.path().canonicalize().unwrap();
+    #[cfg(target_os = "macos")]
+    let root = canonical.as_path();
+    #[cfg(target_os = "linux")]
     let root = directory.path();
     // SDK fixtures and private helper authority require a private root;
     // tempfile's directory mode can inherit a broader caller policy.
@@ -58,6 +63,10 @@ fn isolated(name: &str) -> Option<PathBuf> {
         ])
         .env_clear()
         .envs(crate::retained_fixture::owner_env())
+        .envs(
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .map(|authority| (crate::agent_execution::AUTHORITY_ENV, authority)),
+        )
         .env(MODE, name)
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
         .env("CAGENTS_HOLDER_ROOT", root)
@@ -808,11 +817,8 @@ impl Drop for HostClientWire {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
