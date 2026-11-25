@@ -773,7 +773,7 @@ fn matching_job(pid: libc::pid_t, executable: &str) -> Option<ShutdownJob> {
 }
 
 #[cfg(target_os = "linux")]
-fn job_is_stopped(pid: libc::pid_t) -> bool {
+pub(super) fn job_is_stopped(pid: libc::pid_t) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         stat.rsplit_once(") ")
             .is_some_and(|(_, fields)| fields.starts_with('T'))
@@ -781,7 +781,7 @@ fn job_is_stopped(pid: libc::pid_t) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn job_is_stopped(pid: libc::pid_t) -> bool {
+pub(super) fn job_is_stopped(pid: libc::pid_t) -> bool {
     crate::process::table::record(pid).is_ok_and(|record| record.bsd.pbsi_status == libc::SSTOP)
 }
 

@@ -722,14 +722,7 @@ os.write(1, b'PAIR_DONE')
         );
         let pid = worker.child_identity.as_ref().unwrap().process.pid;
         let stopped = Instant::now() + Duration::from_secs(3);
-        loop {
-            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-            if stat
-                .rsplit_once(") ")
-                .is_some_and(|(_, rest)| rest.starts_with('T'))
-            {
-                break;
-            }
+        while !super::close_tests::job_is_stopped(pid) {
             assert!(Instant::now() < stopped);
             thread::sleep(Duration::from_millis(1));
         }
