@@ -51,6 +51,7 @@ use objc2_app_kit::{
     NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSView, NSWindow, NSWindowButton,
     NSWindowStyleMask,
 };
+use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags, CGEventType};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSRect, NSString};
 
 use crate::sidebar::{WindowControls, WindowControlsEdge};
@@ -256,10 +257,10 @@ fn secondary_click_with_control() {
                 if !convert {
                     return unchanged;
                 }
-                NSEventType::RightMouseDown
+                CGEventType::RightMouseDown
             }
-            NSEventType::LeftMouseDragged if converting.get() => NSEventType::RightMouseDragged,
-            NSEventType::LeftMouseUp if converting.replace(false) => NSEventType::RightMouseUp,
+            NSEventType::LeftMouseDragged if converting.get() => CGEventType::RightMouseDragged,
+            NSEventType::LeftMouseUp if converting.replace(false) => CGEventType::RightMouseUp,
             _ => return unchanged,
         };
         // AppKit takes the returned event without a reference of its own.
@@ -279,20 +280,27 @@ fn secondary_click_with_control() {
 
 /// `event`, a primary button event, as the secondary button's `kind`, with
 /// Control lifted. winit reads the button from the event's button number,
-/// which AppKit derives from the type.
-fn as_secondary(event: &NSEvent, kind: NSEventType) -> Option<Retained<NSEvent>> {
-    NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-        kind,
-        event.locationInWindow(),
-        event.modifierFlags().difference(NSEventModifierFlags::Control),
-        event.timestamp(),
-        event.windowNumber(),
-        None,
-        event.eventNumber(),
-        event.clickCount(),
-        event.pressure(),
-    )
+/// which AppKit takes from the Quartz event; an event AppKit creates from its
+/// type alone keeps button 0. So this edits a copy of the Quartz event, which
+/// also keeps its window, location, time, click count and pressure.
+fn as_secondary(event: &NSEvent, kind: CGEventType) -> Option<Retained<NSEvent>> {
+    let copy = CGEvent::new_copy(event.CGEvent().as_deref())?;
+    let secondary = Some(&*copy);
+    CGEvent::set_type(secondary, kind);
+    CGEvent::set_integer_value_field(
+        secondary,
+        CGEventField::MouseEventButtonNumber,
+        SECONDARY_BUTTON,
+    );
+    CGEvent::set_flags(
+        secondary,
+        CGEvent::flags(secondary).difference(CGEventFlags::MaskControl),
+    );
+    NSEvent::eventWithCGEvent(&copy)
 }
+
+/// Quartz's number for the secondary (right) mouse button.
+const SECONDARY_BUTTON: i64 = 1;
 
 /// The traffic lights' extent from the window's top corner on their side, in
 /// points, with the margin AppKit gives them at the window edge kept after
@@ -363,17 +371,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(press.buttonNumber(), 0);
-        for kind in [
-            NSEventType::RightMouseDown,
-            NSEventType::RightMouseDragged,
-            NSEventType::RightMouseUp,
+        for (quartz, kind) in [
+            (CGEventType::RightMouseDown, NSEventType::RightMouseDown),
+            (
+                CGEventType::RightMouseDragged,
+                NSEventType::RightMouseDragged,
+            ),
+            (CGEventType::RightMouseUp, NSEventType::RightMouseUp),
         ] {
-            let secondary = as_secondary(&press, kind).unwrap();
+            let secondary = as_secondary(&press, quartz).unwrap();
             assert_eq!(secondary.r#type(), kind);
             assert_eq!(secondary.buttonNumber(), 1, "{kind:?}");
-            assert_eq!(secondary.modifierFlags(), NSEventModifierFlags::Shift);
+            assert_eq!(
+                secondary.modifierFlags() & NSEventModifierFlags::DeviceIndependentFlagsMask,
+                NSEventModifierFlags::Shift
+            );
             assert_eq!(secondary.locationInWindow(), NSPoint::new(10.0, 20.0));
             assert_eq!(secondary.clickCount(), 1);
+            assert_eq!(secondary.timestamp(), 1.0);
         }
     }
 }
