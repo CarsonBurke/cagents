@@ -2411,7 +2411,8 @@ mod tests {
         assert_eq!(budget.pixels.available_permits(), 128 * 128 * 4);
     }
     #[test]
-    fn composer_thumbnail_rejects_fifo_and_preserves_non_utf8_file_paths() {
+    fn composer_thumbnail_rejects_fifo_and_reads_exact_file_names() {
+        #[cfg(target_os = "linux")]
         use std::os::unix::ffi::OsStringExt;
         let directory = tempfile::tempdir().unwrap();
         let fifo = directory.path().join("fifo.png");
@@ -2426,9 +2427,11 @@ mod tests {
             Loaded::Unavailable
         ));
         task.join().unwrap();
-        let path = directory
-            .path()
-            .join(std::ffi::OsString::from_vec(b"image-\xff.png".to_vec()));
+        #[cfg(target_os = "linux")]
+        let filename = std::ffi::OsString::from_vec(b"image-\xff.png".to_vec());
+        #[cfg(target_os = "macos")] // APFS requires valid UTF-8 filenames.
+        let filename = std::ffi::OsString::from("image-雪.png");
+        let path = directory.path().join(filename);
         std::fs::write(&path, png()).unwrap();
         assert!(matches!(
             thumbnail(&path),

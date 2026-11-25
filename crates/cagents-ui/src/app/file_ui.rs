@@ -588,14 +588,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_utf8_file_link_persists_and_restores_the_exact_selected_file() {
+    async fn escaped_file_link_persists_and_restores_the_exact_selected_file() {
+        #[cfg(target_os = "linux")]
         use std::os::unix::ffi::OsStringExt;
         let directory = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
         let name = std::ffi::OsString::from_vec(b"byte-\xff.txt".to_vec());
+        #[cfg(target_os = "macos")] // APFS requires valid UTF-8 filenames.
+        let name = std::ffi::OsString::from("byte-雪.txt");
         let path = directory.path().join(&name);
         std::fs::write(&path, "owned raw filename content").unwrap();
         let target = Url::from_file_path(&path).unwrap().to_string();
+        #[cfg(target_os = "linux")]
         assert!(target.contains("%FF"));
+        #[cfg(target_os = "macos")]
+        assert!(target.contains("%E9%9B%AA"));
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.settings.editor_auto_save = false;
         app.workspace.resize_viewport(1200.0);

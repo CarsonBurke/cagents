@@ -8390,7 +8390,10 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             git(root, &["init", "-b", "feature"]);
+            #[cfg(target_os = "linux")]
             let unusual = RepoPath::from_bytes(b":(glob)*\n\xff").unwrap();
+            #[cfg(target_os = "macos")] // APFS requires valid UTF-8.
+            let unusual = RepoPath::from_bytes(":(glob)*\n雪".as_bytes()).unwrap();
             for name in ["old.txt", "deleted.txt", "unselected.txt"] {
                 fs::write(root.join(name), b"base\n").unwrap();
             }
