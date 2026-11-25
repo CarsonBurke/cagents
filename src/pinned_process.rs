@@ -269,6 +269,21 @@ impl PinnedProcess {
         Ok(Self { pid, pin })
     }
 
+    /// Pins a live process at the given start epoch without waiting for XNU
+    /// to publish an exiting process's zombie record.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn open_live_started(pid: u32, started: u64) -> io::Result<Self> {
+        if pid <= 1 || libc::pid_t::try_from(pid).is_err() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"));
+        }
+        let pin = imp::Pin::open_with_zombies(pid, false)?;
+        let process = Self { pid, pin };
+        if process.started_ticks() != started || process.exited()? {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        Ok(process)
+    }
+
     /// A second pin of the same process, sharing its exit readiness.
     ///
     /// # Errors
@@ -1061,6 +1076,10 @@ mod imp {
         }
 
         pub(super) fn open(pid: u32) -> io::Result<Self> {
+            Self::open_with_zombies(pid, true)
+        }
+
+        pub(super) fn open_with_zombies(pid: u32, allow_zombie: bool) -> io::Result<Self> {
             let watch = queue()?;
             // The registration binds to whichever process held the pid at that
             // instant. The start time read on both sides of it names that
@@ -1082,7 +1101,7 @@ mod imp {
                     Ok(Self { watch, start })
                 }
                 // XNU refuses to watch a process that is exiting or a zombie.
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) && allow_zombie => {
                     let start = zombie_start(pid)?;
                     if before.is_ok_and(|before| before != start) {
                         return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -1090,7 +1109,7 @@ mod imp {
                     latch(&watch)?;
                     Ok(Self { watch, start })
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(vanished(error)),
             }
         }
 

@@ -5921,9 +5921,11 @@ impl Worker {
         for pid in members {
             within_budget()?;
             if let Some(start) = matching_epoch(pid)? {
-                let pin = crate::pinned_process::PinnedProcess::open_started(pid as u32, start)
-                    .map_err(|error| error.to_string())?;
-                targets.push((pid, start, pin));
+                match crate::pinned_process::PinnedProcess::open_live_started(pid as u32, start) {
+                    Ok(pin) => targets.push((pid, start, pin)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
             }
         }
         // A numeric group cannot authorize a broadcast. Only captured
@@ -5939,6 +5941,7 @@ impl Worker {
                 );
             }
             if matching_epoch(pid)? == Some(start) {
+                within_budget()?;
                 delivered |= pin
                     .signal(libc::SIGINT)
                     .map_err(|error| error.to_string())?;
