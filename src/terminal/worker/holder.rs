@@ -3519,6 +3519,9 @@ mod tests {
         adopted.held.holder.commit_adoption().unwrap();
         let mut writer = File::from(adopted.held.master.duplicate().unwrap());
         std::io::Write::write_all(&mut writer, b"finish\n").unwrap();
+        // Darwin drains slave output before completing the root's exit.
+        #[cfg(target_os = "macos")]
+        assert!(read_until(&adopted.held.master, "completed-result").contains("completed-result"));
         assert_eq!(
             exited
                 .recv_timeout(Duration::from_secs(5))
