@@ -509,7 +509,6 @@ fn process_runtime_identity(
     {
         return Some(identity);
     }
-    let mut identity = None;
     // The kernel reports open files by their resolved path, and a session root
     // is often a symbolic link, such as a dotfiles checkout linked into HOME.
     let expected = session_root.join(provider.session_directory());
