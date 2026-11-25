@@ -319,8 +319,9 @@ pub struct Ceiling {
     provider: Option<Provider>,
     /// The session's own mode, when it is known and rankable.
     mode: Option<Mode>,
-    /// The mode the provider reported when cagents can't rank it, so that a
-    /// refusal names what it saw.
+    /// The mode the provider reported, and why it counts as asking, when
+    /// cagents can't rank it as reported, so that a refusal names what it
+    /// saw, as in "auto mode, which cagents can't rank".
     reported: Option<String>,
 }
 
@@ -342,7 +343,9 @@ impl Ceiling {
         Self {
             provider: Some(provider),
             mode,
-            reported: reported.filter(|_| mode.is_none()).map(str::to_owned),
+            reported: reported
+                .filter(|_| mode.is_none())
+                .map(|mode| format!("{mode} mode, which cagents can't rank")),
         }
     }
 
@@ -384,7 +387,19 @@ impl Ceiling {
         recipe: &crate::model::LaunchRecipe,
     ) -> Self {
         let confirmed = Self::confirmed(provider, confirmed);
-        if confirmed.mode.is_some() {
+        if let Some(mode) = confirmed.mode {
+            // What Muse's switches that withhold writes or the shell leave of
+            // its mode is not established, so a looser one counts as asking.
+            if mode.tier() > Tier::Ask && withholds_tools(provider, &recipe.arguments) {
+                return Self {
+                    mode: None,
+                    reported: Some(format!(
+                        "{} mode with writes or the shell withheld",
+                        mode.name()
+                    )),
+                    ..confirmed
+                };
+            }
             return confirmed;
         }
         let launched = Self {
@@ -414,7 +429,7 @@ impl Ceiling {
         match (self.mode, &self.reported) {
             (Some(mode), _) => format!("This agent runs in {} mode", mode.name()),
             (None, Some(reported)) => format!(
-                "This agent runs in {reported} mode, which cagents can't rank, so it counts as asking for approval"
+                "This agent runs in {reported}, so it counts as asking for approval"
             ),
             (None, None) => "This agent's own permission mode isn't confirmed, so it counts as asking for approval".into(),
         }
@@ -545,6 +560,22 @@ impl Ceiling {
     }
 }
 
+/// Whether a Muse command line withholds writes or the shell, whatever the
+/// rest of it is: a value that reads as either only makes the ceiling
+/// stricter.
+#[cfg(feature = "host")]
+fn withholds_tools(provider: Provider, arguments: &[String]) -> bool {
+    provider == Provider::Muse
+        && arguments
+            .iter()
+            .take_while(|argument| *argument != "--")
+            .any(|argument| WITHHOLDING.contains(&argument.split('=').next().unwrap_or(argument)))
+}
+
+/// Muse's switches that withhold a tool from every mode.
+#[cfg(feature = "host")]
+const WITHHOLDING: [&str; 2] = ["--disable-write", "--disable-shell"];
+
 /// The mode a provider CLI's command line and environment start it in, when
 /// they name one cagents can rank.
 #[cfg(feature = "host")]
@@ -630,7 +661,7 @@ fn launched_mode(
                     return (!switch(&["--sandbox"]))
                         .then_some(Mode::Acp(Claude::BypassPermissions, BYPASS));
                 }
-                Provider::Muse if switch(&["--disable-write", "--disable-shell"]) => {
+                Provider::Muse if switch(&WITHHOLDING) => {
                     return None;
                 }
                 _ => {}
@@ -1567,6 +1598,52 @@ mod tests {
         assert_eq!(
             Ceiling::conversation(Provider::Codex, Some("workspaceWrite"), &read_only).tier(),
             Tier::AutoEdit
+        );
+    }
+
+    /// A native Muse conversation that withholds writes or the shell starts
+    /// no child above asking, whatever mode Muse confirms.
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_muse_conversation_withholding_tools_counts_as_asking() {
+        let recipe = |arguments: &[&str]| crate::model::LaunchRecipe {
+            program: "muse".into(),
+            arguments: arguments.iter().map(|&argument| argument.into()).collect(),
+            working_directory: "/".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        for withheld in ["--disable-write", "--disable-shell"] {
+            let ceiling = Ceiling::conversation(Provider::Muse, Some("auto"), &recipe(&[withheld]));
+            assert_eq!(ceiling.tier(), Tier::Ask, "{withheld}");
+            assert_eq!(
+                ceiling.child(Provider::Claude, Some("acceptEdits")),
+                Err("This agent runs in auto mode with writes or the shell withheld, so it counts as asking for approval, and it can't start a Claude Code child in acceptEdits. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())
+            );
+            // A stricter confirmed mode keeps its own ceiling.
+            assert_eq!(
+                Ceiling::conversation(Provider::Muse, Some("dontAsk"), &recipe(&[withheld])),
+                Ceiling::confirmed(Provider::Muse, Some("dontAsk"))
+            );
+        }
+        // Without either, and with either only as the prompt, the confirmed
+        // mode stands.
+        for arguments in [&[][..], &["--", "--disable-write"][..]] {
+            assert_eq!(
+                Ceiling::conversation(Provider::Muse, Some("auto"), &recipe(arguments)).tier(),
+                Tier::AutoRun,
+                "{arguments:?}"
+            );
+        }
+        // Only Muse's switches.
+        assert_eq!(
+            Ceiling::conversation(
+                Provider::Claude,
+                Some("auto"),
+                &recipe(&["--disable-write"])
+            )
+            .tier(),
+            Tier::AutoRun
         );
     }
 }
