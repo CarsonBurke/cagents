@@ -17,9 +17,12 @@ pub fn private_cli(root: &Path) -> CommandSpec {
         .arg("--json")
         .cwd(root);
     // Match the fixture's env_clear Command without inheriting the invoking
-    // provider session, account overrides, or application profile.
+    // provider session, account overrides, or application profile. Retain the
+    // caller's delegated authority across the fixture invocation.
     for (name, _) in std::env::vars_os() {
-        spec = spec.env_remove(name);
+        if name != cagents::agent_execution::AUTHORITY_ENV {
+            spec = spec.env_remove(name);
+        }
     }
     for (name, leaf) in [
         ("HOME", "home"),
@@ -112,17 +115,31 @@ mod tests {
     #[test]
     fn private_profile_and_directory_survive_capture() {
         let root = tempfile::tempdir().unwrap();
-        let spec = private_program(root.path(), "/usr/bin/env");
+        let spec = private_program(root.path(), "/bin/sh").args([
+            "-c",
+            "printf '%s\\n' \"$HOME\" \"$TMPDIR\" \"${CAGENTS_AGENT_AUTHORITY+present}\"",
+        ]);
+        let command = spec.to_command();
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            environment.values().filter(|value| value.is_some()).count(),
+            7
+        );
+        assert!(std::env::vars_os().all(|(name, _)| {
+            name == cagents::agent_execution::AUTHORITY_ENV
+                || environment.contains_key(name.as_os_str())
+        }));
         let output = capture(spec, Instant::now() + Duration::from_secs(5)).unwrap();
         assert!(output.status.success());
-        let environment = String::from_utf8(output.stdout).unwrap();
-        let actual: std::collections::BTreeMap<_, _> = environment
-            .lines()
-            .map(|line| line.split_once('=').unwrap())
-            .collect();
-        assert_eq!(actual.len(), 7, "inherited environment entered private CLI");
-        assert_eq!(actual["HOME"], root.path().join("home").to_str().unwrap());
-        assert_eq!(actual["TMPDIR"], root.path().join("tmp").to_str().unwrap());
+        let variables = String::from_utf8(output.stdout).unwrap();
+        let mut values = variables.lines();
+        assert_eq!(values.next(), root.path().join("home").to_str());
+        assert_eq!(values.next(), root.path().join("tmp").to_str());
+        let authority = std::env::var_os(cagents::agent_execution::AUTHORITY_ENV);
+        assert_eq!(
+            values.next(),
+            Some(if authority.is_some() { "present" } else { "" })
+        );
 
         let spec = private_program(root.path(), "/bin/pwd");
         let output = capture(spec, Instant::now() + Duration::from_secs(5)).unwrap();
