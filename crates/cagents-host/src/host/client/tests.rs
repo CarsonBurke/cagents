@@ -3968,6 +3968,7 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
 
     let repository = directory.path().join("repo");
     std::fs::create_dir(&repository).unwrap();
+    let repository = repository.canonicalize().unwrap();
     let open = ModelEdit::OpenProject {
         kind: Default::default(),
         repository: repository.clone(),
