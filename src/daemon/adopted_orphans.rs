@@ -151,16 +151,19 @@ pub(crate) fn reap_exited(limit: usize) -> io::Result<Sweep> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::{
         os::unix::process::ExitStatusExt,
         time::{Duration, Instant},
     };
 
+    #[cfg(target_os = "linux")]
     fn child_state(pid: i32) -> Option<char> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         stat[stat.rfind(')')? + 2..].chars().next()
     }
 
+    #[cfg(target_os = "linux")]
     fn zombie_children() -> Vec<i32> {
         super::super::owned_children::direct_children()
             .unwrap()
@@ -171,6 +174,7 @@ mod tests {
 
     /// Every case runs in a re-executed, single-test process that is its own
     /// subreaper, so neither the harness nor other tests share its children.
+    #[cfg(target_os = "linux")]
     fn isolated(stage: &str, body: impl FnOnce()) {
         if std::env::var_os(stage).is_none() {
             let test = std::thread::current().name().unwrap().to_owned();
@@ -191,6 +195,7 @@ mod tests {
         body();
     }
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn sweep_reaps_burst_orphans_and_preserves_owned_and_live_children() {
         isolated("CAGENTS_ADOPTED_ORPHANS_BURST_TEST", || {
@@ -280,6 +285,7 @@ exit 7"#,
         });
     }
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn a_sweep_cannot_reap_an_owned_child_that_exits_before_registration() {
         isolated("CAGENTS_ADOPTED_ORPHANS_RACE_TEST", || {

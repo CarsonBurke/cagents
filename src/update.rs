@@ -6457,24 +6457,14 @@ sys.stdin.buffer.read(1)
         let leaked_pid: u32 = ready.trim().parse().unwrap();
         let source = HandoffSource::pin(&paths, &proof).unwrap();
         // Pin the deliberate leak before allowing the original daemon to exit.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, leaked_pid, 0) };
-        assert!(fd >= 0);
-        struct Leak(File);
+        struct Leak(crate::pinned_process::PinnedProcess);
         impl Drop for Leak {
             fn drop(&mut self) {
-                // SAFETY: the exact fixture process is pinned, never looked up again.
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        self.0.as_raw_fd(),
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    );
-                }
+                // The exact fixture process is pinned, never looked up again.
+                let _ = self.0.signal(libc::SIGKILL);
             }
         }
-        let leak = Leak(unsafe { File::from_raw_fd(fd as i32) });
+        let leak = Leak(crate::pinned_process::PinnedProcess::open(leaked_pid).unwrap());
         daemon.stdin.take().unwrap().write_all(b"x").unwrap();
         assert!(daemon.wait().unwrap().success());
         let state = root.path().to_owned();

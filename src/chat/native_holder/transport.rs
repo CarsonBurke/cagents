@@ -1612,6 +1612,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_IDLE_REAPER_TEST";
@@ -1717,6 +1718,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_live_adopted_fixture_process(process: &Process) {
         assert!(process.is_current(), "fixture child identity changed");
         let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid)).unwrap();
@@ -1754,6 +1756,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn idle_reaping_preserves_a_live_provider_and_its_live_adopted_tool() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_LIVE_REAPER_TEST";
@@ -1921,6 +1924,7 @@ exec /bin/sleep 60
         }
     }
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn post_child_census_failure_preserves_live_ownership_and_services_control() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_CENSUS_FAILURE_TEST";
@@ -3063,6 +3067,7 @@ exec /bin/sleep 60
         }
     }
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn subreaper_close_reaps_tools_that_left_the_original_group() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_SUBREAPER_TEST";

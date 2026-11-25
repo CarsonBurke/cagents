@@ -443,7 +443,7 @@ impl chat::protocol::LaunchCleanup for StartupOwner {
         Ok(*outcome)
     }
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn fixture_preserve_and_join(actor: &RemoteActor) {
     actor.preserve().unwrap();
     // Model the old daemon's exit before rotating its lease. Preserve stops
@@ -773,7 +773,7 @@ impl RemoteActor {
             (self.0.notify)(Update::RetainedOutcomes);
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub fn native_holder_record(&self) -> &Record {
         &self.0.identity.record
     }
@@ -1705,7 +1705,7 @@ impl RemoteActor {
         self.0.stop.store(true, Ordering::Release);
         self.0.wake.notify();
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(in crate::chat::runtime) fn pinned_launch_directory(
         &self,
     ) -> Result<(crate::agent_execution::DirectoryIdentity, Arc<File>), String> {
@@ -4561,7 +4561,8 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+// Runs the real helper beneath a private subreaper, which only Linux has.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "recognition_tests.rs"]
 mod recognition_tests;
 

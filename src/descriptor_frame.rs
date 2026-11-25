@@ -435,17 +435,21 @@ mod tests {
     }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
-        let mut descriptors = [-1; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
-        unsafe {
-            (
-                OwnedFd::from_raw_fd(descriptors[0]),
-                OwnedFd::from_raw_fd(descriptors[1]),
-            )
+        let (reader, writer) = std::io::pipe().unwrap();
+        let (reader, writer) = (OwnedFd::from(reader), OwnedFd::from(writer));
+        for end in [&reader, &writer] {
+            // SAFETY: F_GETFL and F_SETFL take no pointer, on a descriptor
+            // this test owns.
+            unsafe {
+                let flags = libc::fcntl(end.as_raw_fd(), libc::F_GETFL);
+                assert!(flags >= 0);
+                assert_eq!(
+                    libc::fcntl(end.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    0
+                );
+            }
         }
+        (reader, writer)
     }
 
     fn assert_pipe_closed(reader: &OwnedFd) {
@@ -680,7 +684,13 @@ mod tests {
         assert!(error.contains("truncated"));
         drop(descriptors);
         assert_pipe_closed(&reader);
+    }
 
+    /// Linux attaches credentials a socket asked for as a second control
+    /// message; Darwin has no such option for a socket pair.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credentials_beside_rights_are_unexpected_and_close_the_rights() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let enabled: libc::c_int = 1;
         assert_eq!(

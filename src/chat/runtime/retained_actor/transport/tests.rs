@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
     if crate::retained_fixture::run_isolated() {
@@ -174,6 +175,7 @@ IFS= read -r frame || :
     assert!(!socket.exists() && !record_path.exists());
 }
 
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn serving_actor_reaps_adopted_orphans_as_they_exit_and_sleeps_while_idle() {
     if crate::retained_fixture::run_isolated() {
@@ -379,6 +381,7 @@ while IFS= read -r frame; do :; done
     assert!(!provider.is_current(), "original provider must be reaped");
 }
 
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn an_ordinary_close_leaves_what_the_provider_leaves() {
     if crate::retained_fixture::run_isolated() {
@@ -631,6 +634,7 @@ fn continuity_loss_refuses_unchanged_presentation_without_mutating_source_or_cop
     .unwrap();
     assert_eq!(copied, before_page);
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
     if crate::retained_fixture::run_isolated() {
@@ -850,6 +854,7 @@ fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
         assert!(retired.paired_holder.is_none());
     }
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn authenticated_directory_pin_keeps_original_after_replacement_and_epoch_change() {
     if crate::retained_fixture::run_isolated() {
@@ -1049,6 +1054,7 @@ fn helper_control_rejects_regular_files_and_unconnected_listeners() {
     assert!(validate_control_descriptor(client.as_raw_fd()).is_ok());
     assert!(validate_control_descriptor(server.as_raw_fd()).is_ok());
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn helper_restores_descriptor_seal_before_any_provider_exec() {
     if crate::retained_fixture::run_isolated() {
@@ -3362,6 +3368,7 @@ fn lost_input_reply_keeps_the_original_envelope_and_fences_new_input() {
     assert!(actor.pending_inputs().is_empty());
     assert_eq!(*actor.0.input_sequence.lock().unwrap(), 2);
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn adopted_real_helper_reclaims_prior_acknowledgements_before_more_than_capacity_commands() {
     if crate::retained_fixture::run_isolated() {

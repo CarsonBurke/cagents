@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::Provider;
 
+#[cfg(target_os = "linux")]
 fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
     Launch {
         provider: crate::agent::Provider::Codex,

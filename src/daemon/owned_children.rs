@@ -427,10 +427,12 @@ record "$3" $left; record "$2" $running
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn detached_work(root: &Path) -> Work {
         detached_work_under(root, std::process::id() as i32)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn exists(pid: i32) -> bool {
         Path::new(&format!("/proc/{pid}")).exists()
     }
@@ -443,6 +445,7 @@ record "$3" $left; record "$2" $running
 
     /// Whether `pid` is gone once `reap` has collected what has exited: a
     /// signalled process exits, and is adopted here, only shortly after.
+    #[cfg(target_os = "linux")]
     pub(crate) fn ends(pid: i32, mut reap: impl FnMut()) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while exists(pid) && Instant::now() < deadline {

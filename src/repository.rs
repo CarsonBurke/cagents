@@ -7997,11 +7997,14 @@ mod tests {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
         }
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         mod scale_support {
             include!("../tests/support/repository_scale.rs");
         }
+        #[cfg(target_os = "linux")]
         use scale_support::isolated_large_pathspec_test;
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         #[test]
         fn small_membership_queries_do_not_enumerate_large_index_or_head_tree() {
             isolated_large_pathspec_test(
