@@ -215,6 +215,11 @@ impl CellMetrics {
     }
 
     fn measure(font_size: f32, scale_factor: f32, family: &'static str) -> Self {
+        // Shaping a face without advances fails inside swash, so it is never
+        // measured; see `face_has_advances`.
+        if !family.is_empty() && !family_has_advances(family) {
+            return Self::measure(font_size, scale_factor, "");
+        }
         // Every face is measured up front: one face that is not fixed-pitch
         // disqualifies the whole family, and the same measurement then sets
         // that face's drawing size.
@@ -295,6 +300,64 @@ fn measured_advance(sample: &str, font_size: f32, family: &'static str, key: Fac
         ellipsize: text::Ellipsize::None,
     });
     paragraph.min_bounds().width / sample.len() as f32
+}
+
+/// Whether every installed face named `family` can be shaped.
+fn family_has_advances(family: &str) -> bool {
+    let fonts = font_system()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let database = fonts.db();
+    database
+        .faces()
+        .filter(|face| face.families.iter().any(|(name, _)| name == family))
+        .all(|face| face_has_advances(database, face.id))
+}
+
+/// Whether a face declares horizontal advances: an `hhea` table whose
+/// `numberOfHMetrics` is not zero.
+///
+/// macOS ships bitmap faces without them, such as GB18030 Bitmap, which
+/// reports itself monospaced. swash looks a glyph's advance up at
+/// `numberOfHMetrics - 1`, which underflows: shaping one panics wherever
+/// overflow checks are on, the development runner included, and measures
+/// zero width elsewhere. Such a face is never offered or drawn with.
+pub fn face_has_advances(
+    database: &cosmic_text::fontdb::Database,
+    face: cosmic_text::fontdb::ID,
+) -> bool {
+    database
+        .with_face_data(face, |data, index| horizontal_metric_count(data, index))
+        .flatten()
+        .is_some_and(|count| count > 0)
+}
+
+/// `numberOfHMetrics` from the `hhea` table of face `index` in an OpenType
+/// font or collection.
+fn horizontal_metric_count(data: &[u8], index: u32) -> Option<u16> {
+    let u16_at = |offset: usize| {
+        data.get(offset..offset.checked_add(2)?)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+    };
+    let u32_at = |offset: usize| {
+        data.get(offset..offset.checked_add(4)?)
+            .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let directory = if data.get(..4)? == b"ttcf" {
+        usize::try_from(u32_at(12 + 4 * usize::try_from(index).ok()?)?).ok()?
+    } else if index == 0 {
+        0
+    } else {
+        return None;
+    };
+    let tables = usize::from(u16_at(directory + 4)?);
+    (0..tables).find_map(|table| {
+        let record = directory + 12 + table * 16;
+        if data.get(record..record + 4)? != b"hhea" {
+            return None;
+        }
+        u16_at(usize::try_from(u32_at(record + 8)?).ok()?.checked_add(34)?)
+    })
 }
 
 /// Whether `key` in `family` advances the narrow ASCII glyphs by `base` too,
@@ -5219,6 +5282,7 @@ mod tests {
             .db()
             .faces()
             .filter(|face| face.monospaced == monospaced)
+            .filter(|face| face_has_advances(guard.db(), face.id))
             .filter_map(|face| face.families.first())
             .map(|(name, _)| intern_family(name))
             .collect();
@@ -5236,6 +5300,58 @@ mod tests {
             advance(ADVANCE_SAMPLE, font_size, family, key)
                 .is_none_or(|base| is_fixed_pitch(font_size, family, key, base))
         })
+    }
+
+    /// An OpenType table directory holding one `hhea` table, alone or as the
+    /// second face of a collection.
+    fn font_with_metric_count(count: u16, collection: bool) -> Vec<u8> {
+        let directory = if collection { 20 } else { 0 };
+        let table = directory + 12 + 16;
+        let mut data = Vec::new();
+        if collection {
+            data.extend(b"ttcf");
+            data.extend([0, 1, 0, 0]);
+            data.extend(2u32.to_be_bytes());
+            data.extend(0u32.to_be_bytes());
+            data.extend((directory as u32).to_be_bytes());
+        }
+        data.extend([0, 1, 0, 0]);
+        data.extend(1u16.to_be_bytes());
+        data.extend([0; 6]);
+        data.extend(b"hhea");
+        data.extend([0; 4]);
+        data.extend((table as u32).to_be_bytes());
+        data.extend(36u32.to_be_bytes());
+        data.extend([0; 34]);
+        data.extend(count.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn a_face_without_horizontal_metrics_is_recognized() {
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(0, false), 0),
+            Some(0)
+        );
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(7, false), 0),
+            Some(7)
+        );
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(7, true), 1),
+            Some(7)
+        );
+        // A single font has no second face, and a truncated one no table.
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(7, false), 1),
+            None
+        );
+        let truncated = font_with_metric_count(7, false);
+        assert_eq!(
+            horizontal_metric_count(&truncated[..truncated.len() - 1], 0),
+            None
+        );
+        assert_eq!(horizontal_metric_count(b"", 0), None);
     }
 
     #[test]
@@ -5605,6 +5721,8 @@ mod tests {
         );
     }
 
+    /// Mac keyboards have no Insert key, so macOS binds no Insert chords.
+    #[cfg(target_os = "linux")]
     #[test]
     fn shift_insert_pastes_without_ctrl_or_alt() {
         let key = keyboard::Key::Named(keyboard::key::Named::Insert);
