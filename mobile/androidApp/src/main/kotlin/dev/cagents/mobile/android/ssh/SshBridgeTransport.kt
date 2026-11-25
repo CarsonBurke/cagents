@@ -7,8 +7,10 @@ import dev.cagents.mobile.client.BridgeTransport
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.LineChannel
 import dev.cagents.mobile.client.firstToSucceed
+import dev.cagents.mobile.client.mostTelling
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runInterruptible
@@ -59,6 +61,8 @@ class SshBridgeTransport(
                 key = phoneKey(),
                 hostKeys = StoredHostKeys(hostKeys, target),
                 command = target.command,
+                // A computer named by its pairing code was paired; one set up by hand has no name.
+                paired = target.name.isNotBlank(),
                 unauthorized = { host ->
                     ConnectFailure.Unauthorized(
                         "${target.user}@$host didn't accept this phone's key. " +
@@ -108,6 +112,8 @@ internal class SshTarget(
     val command: String,
     /** The failure when [host] refuses [key]. */
     val unauthorized: (host: String) -> ConnectFailure,
+    /** Whether [hosts] came from a pairing code, local network addresses among them; see [mostTelling]. */
+    val paired: Boolean = false,
 )
 
 /** How long a preferred address has before the next one is tried as well. */
@@ -118,38 +124,47 @@ private const val KEEPALIVE_SECONDS = 20
  * Connects to the first of the target's hosts to answer with an acceptable
  * host key, authenticates there, and runs its command.
  */
-internal suspend fun openSsh(target: SshTarget): LineChannel = withContext(Dispatchers.IO) {
-    // Everything here may touch the network, disconnecting included, which
-    // Android refuses on the main thread.
-    val client = try {
-        firstToSucceed(target.hosts, ADDRESS_HEAD_START, discard = { it.disconnectQuietly() }) { host ->
-            connect(target, host)
-        }
-    } catch (e: AllFailed) {
-        throw mostTelling(e.failures, target)
-    }
-    // Set once the channel exists, so whatever happens after, including a
-    // cancellation that discards the result, the connection is closed.
+internal suspend fun openSsh(target: SshTarget): LineChannel {
+    // Set once the channel exists, outside the IO context: a cancellation as
+    // that context returns discards its result, and the channel with it, so
+    // it is closed here rather than left connected.
     var made: SshLineChannel? = null
     try {
-        blocking(client) {
-            val host = client.remoteHostname
-            try {
-                client.authPublickey(target.user, SigningKeyProvider(target.key))
-            } catch (e: UserAuthException) {
-                throw target.unauthorized(host)
+        return withContext(Dispatchers.IO) {
+            // Everything here may touch the network, disconnecting included,
+            // which Android refuses on the main thread.
+            val client = try {
+                firstToSucceed(target.hosts, ADDRESS_HEAD_START, discard = { it.disconnectQuietly() }) { host ->
+                    connect(target, host)
+                }
+            } catch (e: AllFailed) {
+                throw mostTelling(e.failures, target.name, target.hosts, target.paired)
             }
-            client.connection.keepAlive.keepAliveInterval = KEEPALIVE_SECONDS
-            val session = client.startSession()
-            SshLineChannel(client, session.exec(target.command)).also { made = it }
+            try {
+                blocking(client) {
+                    val host = client.remoteHostname
+                    try {
+                        client.authPublickey(target.user, SigningKeyProvider(target.key))
+                    } catch (e: UserAuthException) {
+                        throw target.unauthorized(host)
+                    }
+                    client.connection.keepAlive.keepAliveInterval = KEEPALIVE_SECONDS
+                    val session = client.startSession()
+                    SshLineChannel(client, session.exec(target.command)).also { made = it }
+                }
+            } catch (e: Throwable) {
+                made?.close() ?: client.disconnectQuietly()
+                made = null
+                throw when (e) {
+                    is CancellationException, is ConnectFailure -> e
+                    is Exception -> ConnectFailure.Network(describe(e, client.remoteHostname, target.port), e)
+                    else -> e
+                }
+            }
         }
-    } catch (e: Throwable) {
-        made?.close() ?: client.disconnectQuietly()
-        throw when (e) {
-            is CancellationException, is ConnectFailure -> e
-            is Exception -> ConnectFailure.Network(describe(e, client.remoteHostname, target.port), e)
-            else -> e
-        }
+    } catch (e: CancellationException) {
+        made?.let { withContext(NonCancellable + Dispatchers.IO) { it.close() } }
+        throw e
     }
 }
 
@@ -196,22 +211,6 @@ private suspend fun <T> blocking(client: SSHClient, work: () -> T): T = coroutin
 private fun SSHClient.disconnectQuietly() {
     runCatching { disconnect() }
 }
-
-/**
- * Of every address's failure, the one that says most: a host key that
- * doesn't match above all, since it may mean an impersonator; then one to
- * trust; then a refusal; and only then that nothing answered.
- */
-private fun mostTelling(failures: List<Throwable>, target: SshTarget): Throwable =
-    failures.firstOrNull { it is ConnectFailure.HostKeyChanged }
-        ?: failures.firstOrNull { it is ConnectFailure.UnknownHostKey }
-        ?: failures.firstOrNull { it is ConnectFailure && it !is ConnectFailure.Network }
-        ?: failures.singleOrNull()
-        ?: ConnectFailure.Network(
-            "Couldn't reach ${target.name} at any of its ${target.hosts.size} addresses. " +
-                "Is it awake, and is this phone on its network or on Tailscale?",
-            failures.first(),
-        )
 
 private fun describe(e: Throwable, host: String, port: Int): String {
     val address = "$host:$port"
@@ -311,10 +310,11 @@ private class SshLineChannel(
         return line
     }
 
-    private fun refusal(): ConnectFailure? {
+    /** Waits up to a second for the rest of standard error, off the caller's thread, which may be the main one. */
+    private suspend fun refusal(): ConnectFailure? = withContext(Dispatchers.IO) {
         stderrReader.join(1_000)
         val text = synchronized(stderr) { stderr.toString().trim() }
-        return text.takeIf { it.isNotEmpty() }?.let { ConnectFailure.Refused(it) }
+        text.takeIf { it.isNotEmpty() }?.let { ConnectFailure.Refused(it) }
     }
 
     override suspend fun writeLine(line: String) = writeLock.withLock {
