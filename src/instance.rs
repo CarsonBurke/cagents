@@ -1689,7 +1689,10 @@ impl UiUpdateGuard {
 
     /// An exact successor may still be restoring and holds its own copy of
     /// the launch fence. Close this copy without unlocking that description.
-    #[cfg(target_os = "linux")]
+    #[cfg_attr(
+        target_os = "macos",
+        allow(dead_code, reason = "Darwin updater wiring is separate")
+    )]
     pub(crate) fn leave_launch_fence_with_successor(&mut self) {
         if let Some(lock) = self.lock.take() {
             drop(lock.into_file());
@@ -2238,6 +2241,16 @@ pub fn validate_stage_guard() -> io::Result<()> {
     validate_install_fence(false)
 }
 
+/// Keep legacy-window exclusion from Parked through the daemon's readiness
+/// acknowledgement, even if the coordinator releases its own description.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn reserve_standby_legacy_fence() -> io::Result<OwnedLock> {
+    owned_lock(
+        &runtime_directory()?.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )
+}
+
 fn validate_install_fence(require_closed: bool) -> io::Result<()> {
     use std::os::fd::BorrowedFd;
     if env::var(INSTALL_GUARD_ENV).ok().as_deref() != Some("197") {
@@ -2266,13 +2279,26 @@ fn validate_install_fence(require_closed: bool) -> io::Result<()> {
             "installer inherited a different update fence",
         ));
     }
-    match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
-        Ok(_) => return Err(io::Error::other("installer update fence is not held")),
-        Err(error) => return Err(error),
+    #[cfg(target_os = "linux")]
+    {
+        match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+            Ok(_) => return Err(io::Error::other("installer update fence is not held")),
+            Err(error) => return Err(error),
+        }
+        if unsafe { libc::flock(INSTALL_GUARD_FD, libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+            return Err(io::Error::other("installer does not own the update fence"));
+        }
     }
-    if unsafe { libc::flock(INSTALL_GUARD_FD, libc::LOCK_EX | libc::LOCK_NB) } == -1 {
-        return Err(io::Error::other("installer does not own the update fence"));
+    #[cfg(target_os = "macos")]
+    {
+        crate::flock::verify_inherited_exclusive(&inherited)?;
+        let current = fs::symlink_metadata(&path)?;
+        if !current.is_file() || (current.dev(), current.ino()) != (actual.dev(), actual.ino()) {
+            return Err(io::Error::other(
+                "installer update fence changed during validation",
+            ));
+        }
     }
     if require_closed && !running_window_slots(&runtime)?.is_empty() {
         return Err(io::Error::other(

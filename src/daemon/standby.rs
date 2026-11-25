@@ -24,7 +24,7 @@ use std::{
 #[cfg(feature = "host")]
 use std::{
     fs::File,
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd},
 };
 #[cfg(feature = "host")]
 use {super::lease_handoff::DAEMON_LEASE_ENV, crate::upgrade::recovery::RECOVERY_FD_ENV};
@@ -141,12 +141,57 @@ fn wait_for_start(
     }
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    allow(dead_code, reason = "Darwin updater wiring is separate")
+)]
 pub(crate) struct Parked {
     channel: UnixStream,
     child: Option<Child>,
     transferred: bool,
+    #[cfg(target_os = "macos")]
+    image: Option<ParkedImage>,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Deserialize, Serialize)]
+struct ImageAttestation {
+    start: u64,
+    address: u64,
+}
+
+#[cfg(target_os = "macos")]
+struct ParkedImage {
+    process: crate::pinned_process::PinnedProcess,
+    expected: (u64, u64),
+    address: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "Darwin updater wiring is separate")
+)]
+impl ParkedImage {
+    fn verify(&self) -> io::Result<()> {
+        let path = fs::metadata(self.process.executable()?)?;
+        let mapped = crate::process::mapped_region_identity(self.process.pid(), self.address)?;
+        if (path.dev(), path.ino()) != self.expected
+            || mapped != self.expected
+            || self.process.exited()?
+        {
+            return Err(io::Error::other(
+                "the replacement process is not the verified daemon executable",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(
+    target_os = "macos",
+    allow(dead_code, reason = "Darwin updater wiring is separate")
+)]
 impl Parked {
     pub(crate) fn launch(
         executable: &Path,
@@ -155,6 +200,7 @@ impl Parked {
         previous_current: Option<&Path>,
     ) -> io::Result<Self> {
         let (channel, receiver) = UnixStream::pair()?;
+        crate::descriptor::keep_options_after_shutdown(channel.as_fd())?;
         let mut command = Command::new(executable);
         command
             .arg(ARGUMENT)
@@ -177,20 +223,59 @@ impl Parked {
         // replacement should own the other end after this launch.
         drop(command);
         let pid = child.id();
-        let parked = Self {
+        let mut parked = Self {
             channel,
             child: Some(child),
             transferred: false,
+            #[cfg(target_os = "macos")]
+            image: None,
         };
         parked.channel.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
-        expect(&parked.channel, Status::Parked)?;
+        parked.verify_launch(pid, expected)?;
+        Ok(parked)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_launch(&mut self, pid: u32, expected: (u64, u64)) -> io::Result<()> {
+        expect(&self.channel, Status::Parked)?;
         let actual = fs::metadata(format!("/proc/{pid}/exe"))?;
         if (actual.dev(), actual.ino()) != expected {
             return Err(io::Error::other(
                 "the replacement process is not the verified daemon executable",
             ));
         }
-        Ok(parked)
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_launch(&mut self, pid: u32, expected: (u64, u64)) -> io::Result<()> {
+        let process = crate::pinned_process::PinnedProcess::open(pid)?;
+        expect(&self.channel, Status::Parked)?;
+        let (attestation, _): (ImageAttestation, _) = receive_json_with_fds_until(
+            &self.channel,
+            Instant::now() + TRANSFER_TIMEOUT,
+            FRAME_LIMIT,
+            0,
+            FrameByteOrder::LittleEndian,
+        )
+        .map_err(io::Error::other)?;
+        let peer = crate::pinned_process::peer_credentials(&self.channel)?;
+        if peer.uid != super::current_uid()
+            || peer.pid != pid
+            || attestation.start != process.started_ticks()
+        {
+            return Err(io::Error::other(
+                "the standby report does not belong to the launched process epoch",
+            ));
+        }
+        let image = ParkedImage {
+            process,
+            expected,
+            address: attestation.address,
+        };
+        image.verify()?;
+        self.image = Some(image);
+        Ok(())
     }
 
     pub(crate) fn check_running(&mut self) -> io::Result<()> {
@@ -199,6 +284,11 @@ impl Parked {
                 "replacement daemon exited before activation ({status})"
             )));
         }
+        #[cfg(target_os = "macos")]
+        self.image
+            .as_ref()
+            .expect("verified standby image")
+            .verify()?;
         Ok(())
     }
 
@@ -227,6 +317,12 @@ impl Parked {
         overdue: impl FnOnce(),
     ) -> io::Result<()> {
         self.check_running()?;
+        #[cfg(target_os = "macos")]
+        if lease.is_none() || receipt.is_some() {
+            return Err(io::Error::other(
+                "Darwin standby requires a runtime lease transfer",
+            ));
+        }
         let mut descriptors = lease
             .into_iter()
             .map(LeaseHandoff::descriptor)
@@ -288,7 +384,10 @@ impl Drop for Parked {
 #[cfg(feature = "host")]
 pub struct Activated {
     channel: UnixStream,
+    #[cfg(target_os = "linux")]
     publication: Option<crate::update::LocalPublication>,
+    #[cfg(target_os = "macos")]
+    _legacy_fence: crate::instance::OwnedLock,
 }
 
 #[cfg(feature = "host")]
@@ -306,6 +405,7 @@ impl Activated {
             .and_then(|()| send(stream, &reason, &[]));
     }
 
+    #[cfg(target_os = "linux")]
     pub fn take_local_publication(&mut self) -> Option<crate::update::LocalPublication> {
         self.publication.take()
     }
@@ -322,16 +422,40 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     // scope enrollment must never inherit a copy across their own exec.
     super::seal_inherited_descriptors()?;
     crate::instance::validate_stage_guard()?;
+    #[cfg(target_os = "macos")]
+    let legacy_fence = crate::instance::reserve_standby_legacy_fence()?;
+    #[cfg(target_os = "linux")]
     let publication = std::env::var_os(LOCAL_PREVIOUS_CURRENT)
         .map(|expected| {
             crate::update::LocalPublication::prepare(Path::new(&expected)).map_err(io::Error::other)
         })
         .transpose()?;
+    #[cfg(target_os = "macos")]
+    if std::env::var_os(LOCAL_PREVIOUS_CURRENT).is_some() {
+        return Err(io::Error::other(
+            "the Darwin coordinator owns installation publication",
+        ));
+    }
     // SAFETY: activation runs before the daemon starts any threads.
     unsafe { std::env::remove_var(LOCAL_PREVIOUS_CURRENT) };
     let stdin = io::stdin();
     let mut control = UnixStream::from(stdin.as_fd().try_clone_to_owned()?);
     control.peer_addr()?;
+    #[cfg(target_os = "macos")]
+    {
+        let coordinator = crate::pinned_process::peer_credentials(&control)?;
+        // SAFETY: getppid takes no arguments and does not mutate state.
+        let parent = unsafe { libc::getppid() };
+        if parent <= 1
+            || coordinator.pid != parent as u32
+            || coordinator.uid != super::current_uid()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid standby coordinator",
+            ));
+        }
+    }
     let null = File::open("/dev/null")?;
     // SAFETY: stdin is the private channel supplied by the coordinator. Only
     // the retained copy is needed, and no other thread can observe the remap.
@@ -343,6 +467,15 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     // The direct process-group launch remains safe without systemd.
     let _ = super::process_scope::enroll_current_process();
     send_status(&control, Status::Parked)?;
+    #[cfg(target_os = "macos")]
+    send(
+        &control,
+        &ImageAttestation {
+            start: crate::pinned_process::started_ticks_of(std::process::id())?,
+            address: crate::process::own_code_address(),
+        },
+        &[],
+    )?;
     // Waiting for the originating worker to close the source can take as
     // long as its reviewed work. EOF abandons the standby if that worker exits.
     let mut begin = [0];
@@ -351,9 +484,16 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         return Err(io::Error::other("invalid replacement daemon activation"));
     }
     let (request, descriptors) = receive_activation(&control)?;
+    #[cfg(target_os = "linux")]
     if matches!(request, Activation::Fresh) && publication.is_none() {
         return Err(io::Error::other(
             "fresh standby activation requires a local update",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    if !matches!(request, Activation::Lease) {
+        return Err(io::Error::other(
+            "Darwin standby requires a runtime lease transfer",
         ));
     }
     install_descriptors(descriptors, &request.slots())?;
@@ -369,7 +509,10 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     }
     Ok(Activated {
         channel: control,
+        #[cfg(target_os = "linux")]
         publication,
+        #[cfg(target_os = "macos")]
+        _legacy_fence: legacy_fence,
     })
 }
 
@@ -398,6 +541,7 @@ fn install_descriptors(descriptors: Vec<OwnedFd>, slots: &[i32]) -> io::Result<(
     let copies = descriptors
         .iter()
         .map(|descriptor| {
+            // SAFETY: the source is live, and the lower bound is beyond the reserved slots.
             let fd = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
@@ -408,13 +552,17 @@ fn install_descriptors(descriptors: Vec<OwnedFd>, slots: &[i32]) -> io::Result<(
         .collect::<io::Result<Vec<_>>>()?;
     // Close the received numbers before reusing any reserved slot.
     drop(descriptors);
+    let mut installed = Vec::with_capacity(slots.len());
     for (descriptor, &slot) in copies.iter().zip(slots) {
+        // SAFETY: activation is single-threaded and F_GETFD only probes the slot.
         if unsafe { libc::fcntl(slot, libc::F_GETFD) } != -1 {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
-        if unsafe { libc::dup3(descriptor.as_raw_fd(), slot, libc::O_CLOEXEC) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
+        installed.push(crate::descriptor::duplicate_to(descriptor.as_fd(), slot)?);
+    }
+    for descriptor in installed {
+        // The startup readers take ownership of every slot after this returns.
+        let _ = descriptor.into_raw_fd();
     }
     Ok(())
 }
@@ -461,6 +609,64 @@ mod tests {
         assert_eq!(lease.stream_position().unwrap(), 2);
     }
 
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    #[test]
+    fn coordinator_disconnect_leaves_only_complete_transfers_with_custody() {
+        let (worker, daemon) = UnixStream::pair().unwrap();
+        drop(worker);
+        assert!(receive_activation(&daemon).is_err());
+
+        let (mut worker, daemon) = UnixStream::pair().unwrap();
+        worker.write_all(&[4, 0, 0, 0, b'{']).unwrap();
+        drop(worker);
+        assert!(receive_activation(&daemon).is_err());
+
+        let (worker, daemon) = UnixStream::pair().unwrap();
+        let lease = tempfile::NamedTempFile::new().unwrap();
+        let owner = lease.reopen().unwrap();
+        // SAFETY: owner is a live regular file and the probe never blocks.
+        assert_eq!(
+            unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        send(&worker, &Activation::Lease, &[owner.as_fd()]).unwrap();
+        drop(worker);
+        drop(owner);
+        let (_, mut rights) = receive_activation(&daemon).unwrap();
+        let received = File::from(rights.pop().unwrap());
+        crate::flock::verify_inherited_exclusive(&received).unwrap();
+        assert!(crate::flock::verify_inherited_exclusive(&lease.reopen().unwrap()).is_err());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    #[test]
+    fn expected_image_must_match_the_vnode_mapped_at_the_attested_address() {
+        let process = crate::pinned_process::PinnedProcess::open(std::process::id()).unwrap();
+        let metadata = fs::metadata(process.executable().unwrap()).unwrap();
+        let image = ParkedImage {
+            process,
+            expected: (metadata.dev(), metadata.ino()),
+            address: crate::process::own_code_address(),
+        };
+        image.verify().unwrap();
+        // SAFETY: dlsym looks up a valid C string. The address belongs to
+        // libSystem's mapping and is never dereferenced here.
+        let other_code = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getpid".as_ptr()) };
+        assert!(!other_code.is_null());
+        let mut image = image;
+        let own_code = image.address;
+        image.address = other_code as usize as u64;
+        assert!(image.verify().is_err());
+        image.address = own_code;
+        let wrong = tempfile::tempfile().unwrap().metadata().unwrap();
+        ParkedImage {
+            expected: (wrong.dev(), wrong.ino()),
+            ..image
+        }
+        .verify()
+        .unwrap_err();
+    }
+
     #[test]
     fn the_parked_acknowledgement_cannot_confirm_startup() {
         let (worker, daemon) = UnixStream::pair().unwrap();
@@ -473,6 +679,19 @@ mod tests {
         let (worker, daemon) = UnixStream::pair().unwrap();
         wait_for_start(&worker, Duration::from_millis(5), || {
             send_status(&daemon, Status::Started).unwrap();
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_buffered_start_ack_survives_peer_close() {
+        let (worker, daemon) = UnixStream::pair().unwrap();
+        crate::descriptor::keep_options_after_shutdown(worker.as_fd()).unwrap();
+        send_status(&daemon, Status::Started).unwrap();
+        drop(daemon);
+        wait_for_start(&worker, TRANSFER_TIMEOUT, || {
+            panic!("buffered acknowledgement overdue")
         })
         .unwrap();
     }

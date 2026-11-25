@@ -409,9 +409,7 @@ pub(super) fn shared_launch_fence(
     }
 }
 
-/// Read fdinfo on this exact description, not a PID-file claim or contention
-/// on another descriptor. An inherited flock retains its original owner's PID.
-fn validate_fence(file: &File) -> io::Result<()> {
+fn validate_fence_inode(file: &File) -> io::Result<fs::Metadata> {
     let actual = file.metadata()?;
     validate_private_file(&actual)?;
     let expected = fs::symlink_metadata(fence_path()?)?;
@@ -420,12 +418,29 @@ fn validate_fence(file: &File) -> io::Result<()> {
             "daemon inherited a different launch fence",
         ));
     }
+    Ok(actual)
+}
+
+/// Read fdinfo on this exact description, not a PID-file claim or contention
+/// on another descriptor. An inherited flock retains its original owner's PID.
+#[cfg(target_os = "linux")]
+fn validate_fence(file: &File) -> io::Result<()> {
+    let actual = validate_fence_inode(file)?;
     if !holds_flock(file, actual.ino())? {
         return Err(io::Error::other(
             "daemon inherited an unheld launch fence description",
         ));
     }
     Ok(())
+}
+
+/// Darwin's updater forwards its existing exclusive launch fence. It cannot
+/// use the Linux path that verifies and then upgrades an inherited SH flock.
+#[cfg(target_os = "macos")]
+fn validate_fence(file: &File) -> io::Result<()> {
+    validate_fence_inode(file)?;
+    crate::flock::verify_inherited_exclusive(file)?;
+    validate_fence_inode(file).map(drop)
 }
 
 /// Whether this exact open description holds a whole-file flock on `inode`.
@@ -447,16 +462,6 @@ fn holds_flock(file: &File, inode: u64) -> io::Result<bool> {
                     .and_then(|inode| inode.parse::<u64>().ok())
                     == Some(inode)
         }))
-}
-
-/// Darwin cannot tell which description holds a flock. Only the self-update
-/// handoff, which Darwin refuses, forwards a fence, so none is trusted.
-#[cfg(not(target_os = "linux"))]
-fn holds_flock(_: &File, _: u64) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "an inherited launch fence can be verified only on Linux",
-    ))
 }
 
 fn inherited_fence() -> io::Result<Option<(File, i32)>> {

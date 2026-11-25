@@ -125,7 +125,6 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
-    #[cfg(target_os = "linux")]
     let standby = if matches.get_flag("await-update-handoff") {
         // SAFETY: the daemon has not initialized admission or started threads.
         match unsafe { cagents::daemon::standby::await_activation() } {
@@ -138,10 +137,6 @@ fn main() -> std::process::ExitCode {
     } else {
         None
     };
-    #[cfg(not(target_os = "linux"))]
-    if matches.get_flag("await-update-handoff") {
-        return std::process::ExitCode::FAILURE;
-    }
     // SAFETY: entry is still single-threaded. After the maintenance flags,
     // whose answers and refusals belong on the caller's stderr, and before
     // admission, so a refused start is in the development log too.
@@ -150,7 +145,6 @@ fn main() -> std::process::ExitCode {
     let admission = match unsafe { cagents_host::host::prepare_daemon_admission() } {
         Ok(admission) => admission,
         Err(error) => {
-            #[cfg(target_os = "linux")]
             if let Some(standby) = &standby {
                 standby.failed(&error);
             }
@@ -158,7 +152,6 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    #[cfg(target_os = "linux")]
     let admission = admission.with_update_standby(standby);
     // Both of these precede runtime startup: the daemon is spawned with stdout and stderr
     // on /dev/null, so without a durable sink a panic in the process that owns

@@ -235,7 +235,6 @@ pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
     lease: Option<std::fs::File>,
     retirement_owned_by_updater: bool,
-    #[cfg(target_os = "linux")]
     standby: Option<daemon::standby::Activated>,
 }
 
@@ -268,7 +267,6 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
     state.publishing_startup = false;
 }
 
-#[cfg(target_os = "linux")]
 impl DaemonAdmission {
     #[doc(hidden)]
     pub fn with_update_standby(mut self, standby: Option<daemon::standby::Activated>) -> Self {
@@ -301,7 +299,6 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
         _guard: admission,
         lease,
         retirement_owned_by_updater,
-        #[cfg(target_os = "linux")]
         standby: None,
     })
 }
@@ -619,6 +616,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
     #[cfg(target_os = "linux")]
     let mut standby = admission.standby.take();
+    #[cfg(target_os = "macos")]
+    let standby = admission.standby.take();
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -928,7 +927,6 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             tracing::warn!(%error, "recovery completion proof could not be scheduled; serving owners were kept");
         }
     }
-    #[cfg(target_os = "linux")]
     if let Some(standby) = standby
         && let Err(error) = standby.started()
     {
