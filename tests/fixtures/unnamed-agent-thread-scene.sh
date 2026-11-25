@@ -36,6 +36,8 @@ survivors=$CAGENTS_EVIDENCE_TASK/unnamed-agent-thread-survivors
 evidence() { "$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" "$@"; }
 case "$scene" in
 seed)
+    # The peer saves the thread's rollout, so a later peer can resume it.
+    evidence env sh -c 'mkdir -p "$HOME/.codex" && touch "$HOME/.codex/fixture-rollouts"'
     evidence cli project open "$fixture/project" >/dev/null
     evidence cli --json channel spawn --repository "$fixture/project" --title 'Design review' >"$scene_state/channel.json"
     channel=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["channel"]["id"])' "$scene_state/channel.json")
