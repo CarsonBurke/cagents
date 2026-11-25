@@ -963,13 +963,23 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
         return;
     };
     let fixture = Fixture::new(&root);
+    #[cfg(target_os = "linux")]
+    let sleep = std::path::PathBuf::from("/bin/sleep");
+    #[cfg(target_os = "macos")]
+    let sleep = {
+        let sleep = root.join("sleep");
+        std::fs::copy("/bin/sleep", &sleep).unwrap();
+        sign_fixture_program(&sleep);
+        sleep
+    };
     let spawned = Spawned::running(
         &fixture.source,
         "/bin/sh",
         &[
             "-c",
-            "/bin/sleep 120 & echo $! > \"$0\"; exec /bin/sleep 120",
+            "\"$1\" 120 & echo $! > \"$0\"; exec \"$1\" 120",
             "tool-pid",
+            sleep.to_str().unwrap(),
         ],
     );
     let record = Spawned::record(&fixture.source);
@@ -991,6 +1001,15 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
         }
     };
     let tool = registry::Process::read(tool_pid).unwrap();
+    struct ToolGuard(crate::pinned_process::PinnedProcess);
+    impl Drop for ToolGuard {
+        fn drop(&mut self) {
+            let _ = self.0.signal(libc::SIGKILL);
+        }
+    }
+    let _tool = ToolGuard(
+        crate::pinned_process::PinnedProcess::open_started(tool.pid as u32, tool.start).unwrap(),
+    );
     kill(&record.holder);
     kill(&record.root);
     assert!(tool.is_current(), "the tool outlived its provider");
@@ -1277,14 +1296,13 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let argv = loop {
-        if let Ok(argv) = std::fs::read_to_string(root.join("started-argv"))
-            && argv == expected
-        {
-            break argv;
+        let observed = std::fs::read_to_string(root.join("started-argv"));
+        if observed.as_ref().is_ok_and(|argv| argv == &expected) {
+            break observed.unwrap();
         }
         assert!(
             Instant::now() < deadline,
-            "the fake app-server never launched"
+            "the fake app-server never recorded {expected:?}: {observed:?}"
         );
         thread::sleep(Duration::from_millis(5));
     };
@@ -1314,6 +1332,33 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
 /// arguments. It never contacts a provider; stdin keeps it alive until drop.
 struct CodexProcess(std::process::Child);
 
+#[cfg(target_os = "macos")]
+fn sign_fixture_program(program: &std::path::Path) {
+    // An Apple system signature hides the fixture's identifying environment.
+    let signed = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(program)
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn assert_retirement_unproved(failure: ProtocolError) {
+    assert!(failure.retryable, "{failure:?}");
+    assert!(
+        failure
+            .message
+            .contains("No exact retirement proves the prior Darwin Codex writer is gone"),
+        "{}",
+        failure.message
+    );
+}
+
 impl CodexProcess {
     fn new(root: &std::path::Path, arguments: &[&str]) -> Self {
         use std::io::Read;
@@ -1321,18 +1366,7 @@ impl CodexProcess {
         std::fs::create_dir_all(program.parent().unwrap()).unwrap();
         std::fs::copy("/bin/bash", &program).unwrap();
         #[cfg(target_os = "macos")]
-        {
-            let signed = std::process::Command::new("/usr/bin/codesign")
-                .args(["--force", "--sign", "-"])
-                .arg(&program)
-                .output()
-                .unwrap();
-            assert!(
-                signed.status.success(),
-                "{}",
-                String::from_utf8_lossy(&signed.stderr)
-            );
-        }
+        sign_fixture_program(&program);
         let mut child = std::process::Command::new(&program)
             .args(["-c", "printf ready; IFS= read -r release", "codex"])
             .args(arguments)
@@ -1668,11 +1702,20 @@ fn codex_start_refuses_a_bound_unlinked_published_target() {
     std::os::unix::fs::symlink(&target, fixture.socket()).unwrap();
     std::fs::remove_file(&target).unwrap();
     let failure = codex_start(&fixture).unwrap_err();
+    #[cfg(target_os = "linux")]
     assert!(
         failure.message.ends_with(&format!(
             "Codex is still serving this conversation at {}. Stop that server, then try again.",
             target.display()
         )),
+        "{}",
+        failure.message
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        failure
+            .message
+            .contains("previous Codex execution still has live processes"),
         "{}",
         failure.message
     );
@@ -1741,17 +1784,20 @@ fn codex_picker_resume_refuses_the_old_panes_surviving_marked_process() {
     assert!(!root.join("started-argv").exists());
     assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
     drop(writer);
+    let retry = process_inner(
+        &fixture.host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    );
+    #[cfg(target_os = "linux")]
     assert!(matches!(
-        process_inner(
-            &fixture.host,
-            1,
-            ClientRequest::ChatPrepareResume {
-                source: fixture.source.clone(),
-            },
-        )
-        .unwrap(),
+        retry.unwrap(),
         ServerResponse::ChatResumePrepared { .. }
     ));
+    #[cfg(target_os = "macos")]
+    assert_retirement_unproved(retry.unwrap_err());
     assert!(!root.join("started-argv").exists());
 }
 
@@ -1952,7 +1998,13 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
         thread::sleep(Duration::from_millis(10));
     }
     fixture.host.lock().unwrap().terminals.remove(&id);
+    #[cfg(target_os = "linux")]
     assert_codex_started(&fixture, &root);
+    #[cfg(target_os = "macos")]
+    {
+        assert_retirement_unproved(codex_start(&fixture).unwrap_err());
+        assert!(!root.join("started-argv").exists());
+    }
 }
 
 #[test]
