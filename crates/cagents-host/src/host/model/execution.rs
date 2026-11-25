@@ -6360,7 +6360,7 @@ mod tests {
     fn fixture() -> (Registry, tempfile::TempDir, Submit) {
         let directory = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
-        let repository = directory.path().to_owned();
+        let repository = directory.path().canonicalize().unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
                 repository: repository.clone(),
