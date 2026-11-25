@@ -252,13 +252,17 @@ impl OwnedChildren {
             if self.detached == DetachedWork::Spare {
                 // Let the provider end its own session, as quitting its CLI
                 // would, before anything is forced.
-                self.signal_provider(libc::SIGTERM);
+                self.signal_provider(libc::SIGTERM)?;
                 let grace = Instant::now() + crate::chat::TERMINATE_GRACE.min(timeout);
                 while !(self.exited() && self.provider.exited()) && Instant::now() < grace {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            self.signal_provider(libc::SIGKILL);
+            self.signal_provider(libc::SIGKILL)?;
+            #[cfg(target_os = "macos")]
+            if let Some(child) = &self.child {
+                crate::process::identity::wait_for_unreaped_group_exit(child.id() as i32, timeout)?;
+            }
             self.group_signalled = true;
         }
         // The grace above is the provider's own; reaping gets the timeout.
@@ -269,15 +273,30 @@ impl OwnedChildren {
         }
     }
 
-    fn signal_provider(&self, signal: libc::c_int) {
+    fn signal_provider(&self, signal: libc::c_int) -> io::Result<()> {
         if let Some(child) = &self.child {
             // The group leader is still our unreaped child, so this number
             // cannot have been recycled. Never use it again after reaping.
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::kill(-(child.id() as i32), signal);
             }
+            #[cfg(target_os = "macos")]
+            {
+                let pid = child.id() as i32;
+                crate::process::identity::signal_unreaped_group(pid, signal)?;
+                // SAFETY: this helper owns the unreaped child. It may have
+                // left the original group, but its own pid is still reserved.
+                if unsafe { libc::kill(pid, signal) } == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
+                }
+            }
         }
         self.provider.signal(signal);
+        Ok(())
     }
 
     fn stop_children(&mut self, deadline: Instant) -> io::Result<bool> {

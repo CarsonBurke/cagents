@@ -2421,6 +2421,9 @@ impl ChildGuard {
             })
         });
         let pid = self.child.id() as i32;
+        #[cfg(target_os = "macos")]
+        let signal_group = |signal| crate::process::identity::signal_unreaped_group(pid, signal);
+        #[cfg(target_os = "linux")]
         let signal_group = |signal| {
             // SAFETY: the sole-reaper guard keeps our leader unreaped until
             // after both signals, reserving its numeric group identity.
@@ -2445,6 +2448,20 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
+        #[cfg(target_os = "macos")]
+        {
+            let timeout = Duration::from_secs(2);
+            // Keep the original child un-reaped until the group census has
+            // completed even if it left the group before its shutdown.
+            self.identity.signal(libc::SIGKILL)?;
+            if self.observe_exit_within(timeout)?.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Provider did not exit",
+                ));
+            }
+            crate::process::identity::wait_for_unreaped_group_exit(pid, timeout)?;
+        }
         // Commands in process groups of their own outlive that signal. A
         // force-stopped provider's would hold memory the system needed, with
         // no agent left to use them, so they end with it, as do those of an
