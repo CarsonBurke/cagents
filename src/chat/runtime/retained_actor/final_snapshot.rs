@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 /// Observation is not retirement authority. Only the validated capsule grants
 /// a caller access to the authenticated, fully joined retirement descriptor.
@@ -97,7 +97,14 @@ pub(super) fn save(
             "The final retained publication exceeds the private bounded snapshot capacity".into(),
         );
     }
-    save_at(&path(&identity.record)?, &bytes)
+    let path = path(&identity.record)?;
+    #[cfg(target_os = "macos")]
+    let path = if detached_cleanup_proved {
+        path
+    } else {
+        path.with_extension("final-spared")
+    };
+    save_at(&path, &bytes)
 }
 /// Publishes a complete receipt by rename, without fsync. Receipts live in the
 /// runtime directory beside the boot-bound holder records that validate them,
@@ -141,10 +148,8 @@ fn read_receipt(record: &Record) -> Result<Receipt, String> {
         .ok_or_else(|| "The helper has not published its final retained snapshot".into())
 }
 fn read_receipt_if_published(record: &Record) -> Result<Option<Receipt>, String> {
-    let file = match crate::secure_file::open_existing_private_file_readonly(&path(record)?) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+    let Some((file, _)) = open_publication(&path(record)?, "final-spared")? else {
+        return Ok(None);
     };
     let mut bytes = Vec::new();
     file.take((MAX_FRAME + 1) as u64)
@@ -155,6 +160,28 @@ fn read_receipt_if_published(record: &Record) -> Result<Option<Receipt>, String>
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     Ok(Some(receipt))
+}
+/// Older helpers and daemons only see the exact receipt filenames.
+fn open_publication(
+    exact: &Path,
+    #[cfg_attr(target_os = "linux", allow(unused_variables))] spared_extension: &str,
+) -> Result<Option<(std::fs::File, PathBuf)>, String> {
+    use crate::secure_file::open_existing_private_file_readonly as open;
+    match open(exact) {
+        Ok(file) => return Ok(Some((file, exact.to_path_buf()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let spared = exact.with_extension(spared_extension);
+        match open(&spared) {
+            Ok(file) => return Ok(Some((file, spared))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
 }
 fn validate_publication(
     receipt: &Receipt,
@@ -244,6 +271,12 @@ fn retirement_path(record: &Record) -> Result<PathBuf, String> {
 }
 pub(super) fn publish_retirement(receipt: RetirementReceipt) -> Result<(), String> {
     let path = retirement_path(&receipt.identity.record)?;
+    #[cfg(target_os = "macos")]
+    let path = if receipt.detached_cleanup_proved {
+        path
+    } else {
+        path.with_extension("retired-spared")
+    };
     let bytes = serde_json::to_vec(&Retirement {
         protocol: PROTOCOL,
         semantic_acknowledged: true,
@@ -316,14 +349,9 @@ fn inspect_retirement_with_proof(
     if !execution_exit::identity_absent(&record.root)? {
         return Ok(RetirementInspection::ExitedUnproved);
     }
-    let file =
-        match crate::secure_file::open_existing_private_file_readonly(&retirement_path(record)?) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RetirementInspection::ExitedUnproved);
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+    let Some((file, _)) = open_publication(&retirement_path(record)?, "retired-spared")? else {
+        return Ok(RetirementInspection::ExitedUnproved);
+    };
     let mut bytes = Vec::new();
     file.take((MAX_RETIREMENT + 1) as u64)
         .read_to_end(&mut bytes)
@@ -511,7 +539,9 @@ pub(super) fn compact_retired(record: &Record, current: &HostSessionProof) -> Re
     {
         return Ok(0);
     }
-    let path = path(record)?;
+    let Some((_, path)) = open_publication(&path(record)?, "final-spared")? else {
+        return Ok(0);
+    };
     let mut receipt = read_receipt(record)?;
     if !compact(&mut receipt) {
         return Ok(0);
@@ -633,6 +663,8 @@ pub mod fixture {
         )
         .unwrap();
         publish_retirement(RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),
@@ -815,6 +847,8 @@ mod tests {
             compacted: false,
         };
         let make = || RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),
@@ -907,6 +941,8 @@ mod tests {
             compacted: false,
         };
         let retired = RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),
@@ -959,6 +995,8 @@ mod tests {
             protocol: PROTOCOL,
             semantic_acknowledged: true,
             receipt: RetirementReceipt {
+                #[cfg(target_os = "macos")]
+                detached_cleanup_proved: true,
                 installed: true,
                 identity: identity.clone(),
                 proof: proof.clone(),
@@ -1135,6 +1173,8 @@ os.waitpid(pid,0)
         )
         .unwrap();
         let receipt = RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),

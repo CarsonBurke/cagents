@@ -143,6 +143,9 @@ pub struct RetirementReceipt {
     pub launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     pub confirmed_session: Option<String>,
     pub paired_holder: Option<crate::terminal::holder::Record>,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached_cleanup_proved: bool,
 }
 pub(super) fn legacy_installed() -> bool {
     true
@@ -2563,13 +2566,7 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
         #[cfg(target_os = "linux")]
         self.close()?;
         #[cfg(target_os = "macos")]
-        {
-            let publication: ClosePublication = self.call("close", json!([false]))?;
-            if !publication.detached_cleanup_proved {
-                return Err("Retained actor did not prove detached provider cleanup".into());
-            }
-            self.publish_close_result(Ok(publication), true)?;
-        }
+        self.close_method("close", json!([false]))?;
         self.finish_close()?;
         Ok(chat::protocol::LaunchOutcome::TeardownProved)
     }
@@ -3976,6 +3973,8 @@ impl Server {
                         .map_err(str::to_owned),
                     confirmed_session: confirmed,
                     paired_holder: self.paired_holder.clone(),
+                    #[cfg(target_os = "macos")]
+                    detached_cleanup_proved: self.actor.detached_cleanup_proved(),
                 })?;
                 if self.installed {
                     journal.allow_retired_cache_removal()?;
@@ -4041,6 +4040,7 @@ impl Server {
             && detached == DetachedWork::Stop
             && !self.actor.detached_cleanup_proved()
         {
+            self.actor.stop_observed_detached()?;
             return Err("The previous close did not prove detached provider cleanup".into());
         }
         Ok(())

@@ -896,7 +896,16 @@ impl LocalHandle {
                         .ok()
                         .flatten()
                         .and_then(|s| s.code());
-                    child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    #[cfg(target_os = "linux")]
+                    {
+                        child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(disposition) = detached_work.get() {
+                            child.stop_detached = disposition == DetachedWork::Stop;
+                        }
+                    }
                     let result = child.terminate();
                     #[cfg(target_os = "macos")]
                     if child.terminated
