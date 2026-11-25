@@ -29,6 +29,8 @@ pub(crate) use backend::{
 };
 
 /// What ended processes in a cgroup because memory ran out.
+// Only a Linux scope reports one; elsewhere callers still read the type.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Killer {
     /// systemd-oomd, because the system's memory, swap or memory pressure
@@ -39,6 +41,7 @@ pub(crate) enum Killer {
 }
 
 /// A command that memory exhaustion stopped while its provider kept running.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandStop {
     pub(crate) killer: Killer,
