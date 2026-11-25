@@ -879,8 +879,8 @@ impl Residence {
                 })?;
         let mut command = spawn.command();
         command.envs(TEMP_ENV_KEYS.map(|key| (key, temp.path())));
-        let child = match command.spawn() {
-            Ok(child) => Server(crate::daemon::owned_children::OwnedChildren::new(child)),
+        let child = match crate::daemon::owned_children::OwnedChildren::spawn(command) {
+            Ok(child) => Server(child),
             Err(error) => {
                 return Err(error.to_string());
             }
@@ -946,9 +946,10 @@ impl Residence {
                     .into(),
             );
         }
-        self.child
-            .require_cleanup_proof()
-            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "macos")]
+        if !self.child.release_complete() {
+            return Err("Cannot prove cleanup of detached provider work on macOS".into());
+        }
         if let Some(temp) = self.temp.take() {
             let path = temp.path().to_path_buf();
             if let Err(error) = temp.close_if_unused() {
@@ -965,15 +966,21 @@ impl Residence {
             }
         }
         self.listener.retire()?;
-        super::cleanup::publish(
-            &self.record,
-            self.recovery
-                .source
-                .proof
-                .as_ref()
-                .ok_or("Native holder has no release proof")?,
-            &self.recovery,
-        )?;
+        #[cfg(target_os = "linux")]
+        let exact_cleanup = true;
+        #[cfg(target_os = "macos")]
+        let exact_cleanup = self.child.cleanup_proved();
+        if exact_cleanup {
+            super::cleanup::publish(
+                &self.record,
+                self.recovery
+                    .source
+                    .proof
+                    .as_ref()
+                    .ok_or("Native holder has no release proof")?,
+                &self.recovery,
+            )?;
+        }
         self.record
             .remove_record(&self.directory)
             .map_err(|error| error.to_string())?;
@@ -1268,12 +1275,15 @@ fn wait_for_control(
     children: &crate::daemon::owned_children::OwnedChildren,
     child_events: &ChildEvents,
 ) -> io::Result<()> {
-    wait_for_control_with_reaper(fd, child_events, || children.reap_exited_descendants())
+    wait_for_control_with_reaper(fd, child_events, children.descendant_events(), || {
+        children.reap_exited_descendants()
+    })
 }
 
 fn wait_for_control_with_reaper(
     fd: RawFd,
     child_events: &ChildEvents,
+    descendant_events: Option<RawFd>,
     mut reap: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let mut reported = false;
@@ -1302,13 +1312,21 @@ fn wait_for_control_with_reaper(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: descendant_events.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: the array and both owned descriptors remain live throughout
-        // poll. No timer is armed: an idle holder sleeps indefinitely.
+        // SAFETY: the array and each borrowed descriptor remain live
+        // throughout poll. Absent watches use an ignored negative fd. No
+        // timer is armed: an idle holder sleeps indefinitely.
         match unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) } {
             result if result > 0 => {
                 if poll[1].revents != 0 {
                     child_events.drain()?;
+                }
+                if poll[1].revents != 0 || poll[2].revents != 0 {
                     // A simultaneous control event must not postpone reaping.
                     inspect_children();
                 }
@@ -1383,12 +1401,24 @@ impl Drop for Residence {
         }
         // No completion receipt or discovery retirement until every owned
         // descendant is reaped. A stuck child leaves this small owner alive.
+        #[cfg(target_os = "linux")]
         while !self
             .child
             .terminate(Duration::from_secs(2))
             .unwrap_or(false)
         {
             std::thread::sleep(Duration::from_millis(100));
+        }
+        // This helper can lose sight of detached work. Bound its final
+        // attempt and preserve the discovery record when proof is unavailable.
+        #[cfg(target_os = "macos")]
+        if !self
+            .child
+            .terminate(Duration::from_secs(2))
+            .unwrap_or(false)
+            || !self.child.release_complete()
+        {
+            return;
         }
         // Only that wait is unbounded. Once the provider is gone, a release
         // that cannot be recorded (its runtime directory removed, say) would
@@ -1421,9 +1451,12 @@ impl std::ops::DerefMut for Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         while !self.terminate(Duration::from_secs(2)).unwrap_or(false) {
             std::thread::sleep(Duration::from_millis(100));
         }
+        #[cfg(target_os = "macos")]
+        let _ = self.terminate(Duration::from_secs(2));
     }
 }
 
@@ -1605,13 +1638,20 @@ extern "C" fn serve_if_requested() {
             drop(control);
             while residence.orphan() {}
         }
-        Ok(())
+        #[cfg(target_os = "linux")]
+        return Ok(());
+        #[cfg(target_os = "macos")]
+        return Ok(residence.child.cleanup_proved());
     })();
     #[cfg(target_os = "macos")]
     if provider_started {
-        // Explicit Close publishes its own receipt. Abnormal exit cannot
-        // promote an empty wait set to proof about tools reparented to launchd.
-        std::process::exit(i32::from(result.is_err()));
+        // The watch must cover the whole executed lifetime with no unknown
+        // fork. Regular teardown cannot infer that from an empty wait set.
+        std::process::exit(if result == Ok(true) {
+            CLEANUP_PROVED
+        } else {
+            i32::from(result.is_err())
+        });
     }
     #[cfg(target_os = "linux")]
     let _ = (provider_started, result);
@@ -2197,7 +2237,7 @@ exec /bin/sleep 60
             let mut release_error = None;
             let mut observation_error = None;
             let mut gate = Some(gate);
-            let waited = wait_for_control_with_reaper(fd, &child_events, || {
+            let waited = wait_for_control_with_reaper(fd, &child_events, None, || {
                 calls += 1;
                 if calls == 1 {
                     server.reap_exited_descendants()?;
