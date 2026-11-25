@@ -165,6 +165,8 @@ enum Request {
     /// Stop the provider but leave running the work it had already detached.
     /// Sent only to a holder reporting `sparing_release`.
     ReleaseSparing,
+    #[cfg(target_os = "macos")]
+    ReleaseSparingScoped,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -376,11 +378,7 @@ impl Holder {
         retain: bool,
         detached: DetachedWork,
     ) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        if retain && detached == DetachedWork::Spare {
-            return Err("An exact native cleanup receipt requires stopping detached work".into());
-        }
-        if self.identity.receipt(retain)? {
+        if self.identity.receipt(retain, detached)? {
             self.control.take();
             self.release_on_drop = false;
             return Ok(());
@@ -392,14 +390,26 @@ impl Holder {
             return self.identity.close_with(retain, detached);
         };
         let request = if detached == DetachedWork::Spare && self.sparing_release {
-            Request::ReleaseSparing
+            #[cfg(target_os = "linux")]
+            {
+                Request::ReleaseSparing
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if !super::cleanup::supports_scoped_spare(&self.identity.record) {
+                    return Err(
+                        "This native holder cannot acknowledge sparing detached work".into(),
+                    );
+                }
+                Request::ReleaseSparingScoped
+            }
         } else {
             Request::Release
         };
         let report = send(control, &request, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
         let unanswered = match report {
             Ok(Some(Report::Released)) => {
-                if !self.identity.receipt(retain)? {
+                if !self.identity.receipt(retain, DetachedWork::Stop)? {
                     return Err("Native holder released without durable cleanup evidence".into());
                 }
                 self.control.take();
@@ -407,7 +417,14 @@ impl Holder {
                 return Ok(());
             }
             #[cfg(target_os = "macos")]
-            Ok(Some(Report::ReleasedSparing)) if matches!(request, Request::ReleaseSparing) => {
+            Ok(Some(Report::ReleasedSparing))
+                if matches!(request, Request::ReleaseSparingScoped) =>
+            {
+                if !self.identity.receipt(retain, DetachedWork::Spare)? {
+                    return Err(
+                        "Native holder spared work without durable provider-close evidence".into(),
+                    );
+                }
                 self.control.take();
                 self.release_on_drop = false;
                 return Ok(());
@@ -422,7 +439,7 @@ impl Holder {
         // A holder that exited with its provider closes its control connection
         // without answering, and never will. If it wrote its receipt first,
         // that receipt settles the close as a reply would have.
-        if !self.identity.receipt(retain)? && !self.identity.retire_exited() {
+        if !self.identity.receipt(retain, detached)? && !self.identity.retire_exited() {
             return Err(unanswered);
         }
         self.control.take();
@@ -661,6 +678,8 @@ pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
                 source: retained_source,
                 original_role: None,
                 receipt_proof: source_proof.clone(),
+                #[cfg(target_os = "macos")]
+                known_spared: false,
             },
         }),
         Err(error) => {
@@ -795,6 +814,8 @@ pub fn adopt(
                         proof: proof.clone(),
                         original_role,
                         receipt_proof: proof.clone(),
+                        #[cfg(target_os = "macos")]
+                        known_spared: false,
                     },
                 },
                 recovery,
@@ -837,7 +858,7 @@ struct Residence {
     recovery: Recovery,
     child: Server,
     child_events: ChildEvents,
-    released: bool,
+    released: Option<super::cleanup::ReceiptKind>,
     _working_directory: Option<std::fs::File>,
     provider_pidfd: crate::pinned_process::PinnedProcess,
     owner_application: String,
@@ -899,9 +920,16 @@ impl Residence {
         };
         on_spawn();
         temp.launched();
+        let build = registry::BuildIdentity::current(Kind::Native);
+        #[cfg(target_os = "macos")]
+        let build = {
+            let mut build = build;
+            build.capabilities.push(super::cleanup::SCOPED_SPARE.into());
+            build
+        };
         let record = Record {
             version: 4,
-            build: Some(registry::BuildIdentity::current(Kind::Native)),
+            build: Some(build),
             kind: Kind::Native,
             application: crate::instance::APPLICATION_ID.into(),
             boot,
@@ -920,7 +948,7 @@ impl Residence {
             recovery: spawn.recovery,
             child,
             child_events,
-            released: false,
+            released: None,
             _working_directory: working_directory,
             temp: Some(temp),
         };
@@ -944,9 +972,10 @@ impl Residence {
         self.provider_pidfd.exited().unwrap_or(false)
     }
 
-    fn release(&mut self) -> Result<(), String> {
-        if self.released {
-            return Ok(());
+    fn release(&mut self) -> Result<super::cleanup::ReceiptKind, String> {
+        use super::cleanup::ReceiptKind;
+        if let Some(kind) = self.released {
+            return Ok(kind);
         }
         if !self
             .child
@@ -979,31 +1008,34 @@ impl Residence {
         }
         self.listener.retire()?;
         #[cfg(target_os = "linux")]
-        let exact_cleanup = true;
+        let kind = ReceiptKind::Exact;
         #[cfg(target_os = "macos")]
-        let exact_cleanup = self.child.cleanup_proved();
-        if exact_cleanup {
-            super::cleanup::publish(
-                &self.record,
-                self.recovery
-                    .source
-                    .proof
-                    .as_ref()
-                    .ok_or("Native holder has no release proof")?,
-                &self.recovery,
-            )?;
-        }
+        let kind = if self.child.cleanup_proved() {
+            ReceiptKind::Exact
+        } else {
+            ReceiptKind::Spared
+        };
+        super::cleanup::publish(
+            &self.record,
+            self.recovery
+                .source
+                .proof
+                .as_ref()
+                .ok_or("Native holder has no release proof")?,
+            &self.recovery,
+            kind,
+        )?;
         self.record
             .remove_record(&self.directory)
             .map_err(|error| error.to_string())?;
-        self.released = true;
-        Ok(())
+        self.released = Some(kind);
+        Ok(kind)
     }
 
     fn pinned_launch_directory(
         &self,
     ) -> Result<(crate::agent_execution::DirectoryIdentity, &std::fs::File), String> {
-        if self.released {
+        if self.released.is_some() {
             return Err("Original native provider was released".into());
         }
         ensure_provider_live(&self.provider_pidfd)?;
@@ -1052,72 +1084,76 @@ impl Residence {
                 }
                 continue;
             }
-            let response = match request {
-                Request::Release | Request::ReleaseSparing => {
-                    let detached = if matches!(request, Request::ReleaseSparing) {
-                        DetachedWork::Spare
-                    } else {
-                        DetachedWork::Stop
-                    };
-                    // A server its launcher started is the provider's own.
-                    let server: Vec<Process> =
-                        self.recovery.server_process.iter().cloned().collect();
-                    match self
-                        .child
-                        .decide_detached(detached, &server)
-                        .map_err(|error| error.to_string())
-                        .and_then(|()| self.release())
-                    {
-                        Ok(()) => {
-                            #[cfg(target_os = "linux")]
-                            let report = Report::Released;
+            let detached = match request {
+                Request::Release => Some(DetachedWork::Stop),
+                #[cfg(target_os = "linux")]
+                Request::ReleaseSparing => Some(DetachedWork::Spare),
+                #[cfg(target_os = "macos")]
+                Request::ReleaseSparingScoped => Some(DetachedWork::Spare),
+                _ => None,
+            };
+            let response = if let Some(detached) = detached {
+                // A server its launcher started is the provider's own.
+                let server: Vec<Process> = self.recovery.server_process.iter().cloned().collect();
+                match self
+                    .child
+                    .decide_detached(detached, &server)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| self.release())
+                {
+                    Ok(kind) => {
+                        let report = match kind {
+                            super::cleanup::ReceiptKind::Exact => Report::Released,
                             #[cfg(target_os = "macos")]
-                            let report = if self.child.cleanup_proved() {
-                                Report::Released
-                            } else {
-                                Report::ReleasedSparing
-                            };
-                            let _ = send(&control, &report, TIMEOUT);
-                            return false;
-                        }
-                        Err(error) => Report::Failed(error),
+                            super::cleanup::ReceiptKind::Spared => Report::ReleasedSparing,
+                        };
+                        let _ = send(&control, &report, TIMEOUT);
+                        return false;
                     }
-                }
-                Request::Confirm {
-                    thread,
-                    identity,
-                    process,
-                } => {
-                    match self
-                        .verify_server(&process)
-                        .and_then(|()| pin_provider_process(&process))
-                        .and_then(|pidfd| {
-                            let server = process.pid as u32;
-                            let watched = process.clone();
-                            self.recovery.confirm(thread, identity, process)?;
-                            self.child.watch_server(watched);
-                            self.provider_pidfd = pidfd;
-                            self.keep_commands_apart(server);
-                            Ok(())
-                        }) {
-                        Ok(()) => Report::Confirmed,
-                        Err(error) => Report::Failed(error),
-                    }
-                }
-                Request::UpdateSource {
-                    source,
-                    execution_console,
-                    paired_holder,
-                } => match self.recovery.update_source_for_role(
-                    source,
-                    execution_console,
-                    paired_holder,
-                    &self.owner_application,
-                ) {
-                    Ok(()) => Report::SourceUpdated,
                     Err(error) => Report::Failed(error),
-                },
-                _ => Report::Failed("Unexpected request on an owned native holder".into()),
+                }
+            } else {
+                match request {
+                    #[cfg(target_os = "macos")]
+                    Request::ReleaseSparing => Report::Failed(
+                        "This caller cannot acknowledge a scoped native close".into(),
+                    ),
+                    Request::Confirm {
+                        thread,
+                        identity,
+                        process,
+                    } => {
+                        match self
+                            .verify_server(&process)
+                            .and_then(|()| pin_provider_process(&process))
+                            .and_then(|pidfd| {
+                                let server = process.pid as u32;
+                                let watched = process.clone();
+                                self.recovery.confirm(thread, identity, process)?;
+                                self.child.watch_server(watched);
+                                self.provider_pidfd = pidfd;
+                                self.keep_commands_apart(server);
+                                Ok(())
+                            }) {
+                            Ok(()) => Report::Confirmed,
+                            Err(error) => Report::Failed(error),
+                        }
+                    }
+                    Request::UpdateSource {
+                        source,
+                        execution_console,
+                        paired_holder,
+                    } => match self.recovery.update_source_for_role(
+                        source,
+                        execution_console,
+                        paired_holder,
+                        &self.owner_application,
+                    ) {
+                        Ok(()) => Report::SourceUpdated,
+                        Err(error) => Report::Failed(error),
+                    },
+                    _ => Report::Failed("Unexpected request on an owned native holder".into()),
+                }
             };
             if send(&control, &response, TIMEOUT).is_err() {
                 return self.recovery.is_durable();
@@ -1416,7 +1452,7 @@ impl Drop for Listener {
 
 impl Drop for Residence {
     fn drop(&mut self) {
-        if self.released {
+        if self.released.is_some() {
             return;
         }
         // No completion receipt or discovery retirement until every owned

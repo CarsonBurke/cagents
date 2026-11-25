@@ -448,6 +448,18 @@ impl OwnedChildren {
     }
 }
 
+pub(crate) fn require_detached_cleanup_proof(detached: DetachedWork) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if detached == DetachedWork::Stop {
+        return Err(io::Error::other(
+            "The provider stopped, but macOS could not confirm cleanup of detached processes",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let _ = detached;
+    Ok(())
+}
+
 /// Whether `pid`, an unreaped child of this process, exited by `SIGKILL`.
 /// WNOWAIT leaves its status for the reap; any other process fails with
 /// ECHILD.
