@@ -308,7 +308,7 @@ pub(super) fn perform(
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
     let handoff_kind =
-        verify_reopened_service(&recovery, state, job, result.is_ok().then_some(&*survivors))?;
+        verify_reopened_service(&recovery, state, job, result.is_ok().then_some(survivors))?;
     finish_reopening_windows(state, job, result, handoff_kind, reopened)
 }
 

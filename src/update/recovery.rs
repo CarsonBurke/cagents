@@ -109,6 +109,17 @@ impl std::fmt::Display for TargetRecoveryRequired {
 impl std::error::Error for TargetRecoveryRequired {}
 
 impl Census {
+    pub(super) fn has_recorded_chat(&self, id: crate::model::TerminalId) -> bool {
+        self.chats.iter().any(|chat| {
+            chat.id == id
+                && chat
+                    .launch
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|identity| !identity.trim().is_empty())
+        })
+    }
+
     fn from_recovered(
         transaction: String,
         recovered: &crate::upgrade::recovery::AlreadyRecovered,
