@@ -103,10 +103,12 @@ fn isolated(name: &str) -> Option<PathBuf> {
     };
     // Failed assertions or a hung child must not retain these private helpers.
     cleanup_discoveries(&root.join("run"));
+    let output = fs::read_to_string(stdout).unwrap();
     assert!(
-        status.is_some_and(|status| status.success()),
-        "isolated admission fixture failed or exceeded 90 seconds:\n{}\n{}",
-        fs::read_to_string(stdout).unwrap(),
+        status.is_some_and(|status| status.success())
+            && output.contains("test result: ok. 1 passed"),
+        "isolated admission fixture failed, selected no test, or exceeded 90 seconds:\n{}\n{}",
+        output,
         fs::read_to_string(stderr).unwrap()
     );
     None
