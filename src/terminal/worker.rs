@@ -5882,6 +5882,13 @@ impl Worker {
         // PROC_FLAG_CONTROLT from <sys/proc_info.h>. The tty driver also
         // skips group members that have given up their controlling tty.
         const CONTROLLING_TTY: u32 = 0x80;
+        const MAX_GROUP_MEMBERS: usize = 256;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let within_budget = || {
+            (Instant::now() < deadline)
+                .then_some(())
+                .ok_or("The foreground interrupt exceeded its process inspection budget")
+        };
         let group = self
             .foreground_group()
             .ok_or("Cannot identify the terminal's foreground job")?;
@@ -5906,8 +5913,13 @@ impl Worker {
                 .map(Some)
                 .ok_or_else(|| "Cannot verify a foreground process's identity".into())
         };
+        let members = group_members(group as u32).map_err(|error| error.to_string())?;
+        if members.len() > MAX_GROUP_MEMBERS {
+            return Err("The foreground group is too large to interrupt without flushing".into());
+        }
         let mut targets = Vec::new();
-        for pid in group_members(group as u32).map_err(|error| error.to_string())? {
+        for pid in members {
+            within_budget()?;
             if let Some(start) = matching_epoch(pid)? {
                 let pin = crate::pinned_process::PinnedProcess::open_started(pid as u32, start)
                     .map_err(|error| error.to_string())?;
@@ -5916,8 +5928,11 @@ impl Worker {
         }
         // A numeric group cannot authorize a broadcast. Only captured
         // members that still belong to the exact held tty receive SIGINT.
+        // Older Darwin releases have no public atomic pin-to-signal call.
+        // Recheck membership and the pin as close to delivery as possible.
         let mut delivered = false;
         for (pid, start, pin) in targets {
+            within_budget()?;
             if self.foreground_group() != Some(group) {
                 return Err(
                     "The terminal's foreground job changed before the interrupt finished".into(),

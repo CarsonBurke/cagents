@@ -226,7 +226,10 @@ pub(crate) fn group_members(group: u32) -> io::Result<Vec<libc::pid_t>> {
         return Err(io::Error::other("Incomplete provider process group census"));
     }
     entries.truncate(bytes as usize / width);
-    entries.retain(|pid| *pid > 0);
+    if entries.iter().any(|pid| *pid < 0) {
+        return Err(io::Error::other("Invalid process in group census"));
+    }
+    entries.retain(|pid| *pid != 0);
     entries.sort_unstable();
     entries.dedup();
     Ok(entries)
