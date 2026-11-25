@@ -150,9 +150,9 @@ pub fn child_exit_status(
     waited_status(pid, flags)
 }
 
-/// Darwin's group signal can return EPERM for a group containing only an
-/// unreaped zombie, as well as for a group with unsignalable live members.
-/// Only ignore EPERM after checking the reserved group for live processes.
+/// Try to signal an owned group. Darwin returns EPERM both when the group
+/// contains only a zombie and when no member permits the signal. The caller
+/// confirms group exit with `finish_unreaped_group` before reaping.
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) fn signal_unreaped_group(pid: i32, signal: libc::c_int) -> io::Result<()> {
     // SAFETY: caller owns the unreaped child that reserves this group ID.
@@ -161,34 +161,36 @@ pub(crate) fn signal_unreaped_group(pid: i32, signal: libc::c_int) -> io::Result
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(()),
-        Some(libc::EPERM) if !group_has_live_members(pid as u32)? => Ok(()),
+        Some(libc::ESRCH | libc::EPERM) => Ok(()),
         _ => Err(error),
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
-pub(crate) fn wait_for_unreaped_group_exit(
-    pid: i32,
-    timeout: std::time::Duration,
-) -> io::Result<()> {
+pub(crate) fn finish_unreaped_group(pid: i32, timeout: std::time::Duration) -> io::Result<()> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + timeout;
-    while group_has_live_members(pid as u32)? {
+    // Check the leader's exit before taking the group snapshot. Every other
+    // listed member counts, even if it vanishes before it could be pinned:
+    // it could have forked a new member while exiting.
+    while waited_status(pid as u32, libc::WEXITED | libc::WNOWAIT)?.is_none()
+        || group_has_other_members(pid as u32)?
+    {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Provider process group still has live members",
+                "Provider process group has not finished exiting",
             ));
         }
+        signal_unreaped_group(pid, libc::SIGKILL)?;
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
     Ok(())
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
-fn group_has_live_members(group: u32) -> io::Result<bool> {
+fn group_has_other_members(group: u32) -> io::Result<bool> {
     // XNU's PROC_PGRP_ONLY lists the exact group even when a member changed
     // UID. A same-user census could miss a member that refused the signal.
     const PROC_PGRP_ONLY: u32 = 2;
@@ -216,18 +218,10 @@ fn group_has_live_members(group: u32) -> io::Result<bool> {
     if bytes < 0 || bytes >= capacity || !(bytes as usize).is_multiple_of(width) {
         return Err(io::Error::other("Incomplete provider process group census"));
     }
-    for pid in entries
+    Ok(entries
         .into_iter()
         .take(bytes as usize / width)
-        .filter(|&pid| pid != 0)
-    {
-        match crate::pinned_process::PinnedProcess::open(pid as u32) {
-            Ok(_) => return Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(false)
+        .any(|pid| pid != 0 && pid as u32 != group))
 }
 
 /// The status of a child whose exit the kernel has already announced, by

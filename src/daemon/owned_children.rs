@@ -261,7 +261,7 @@ impl OwnedChildren {
             self.signal_provider(libc::SIGKILL)?;
             #[cfg(target_os = "macos")]
             if let Some(child) = &self.child {
-                crate::process::identity::wait_for_unreaped_group_exit(child.id() as i32, timeout)?;
+                crate::process::identity::finish_unreaped_group(child.id() as i32, timeout)?;
             }
             self.group_signalled = true;
         }

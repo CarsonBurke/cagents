@@ -2454,13 +2454,7 @@ impl ChildGuard {
             // Keep the original child un-reaped until the group census has
             // completed even if it left the group before its shutdown.
             self.identity.signal(libc::SIGKILL)?;
-            if self.observe_exit_within(timeout)?.is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Provider did not exit",
-                ));
-            }
-            crate::process::identity::wait_for_unreaped_group_exit(pid, timeout)?;
+            crate::process::identity::finish_unreaped_group(pid, timeout)?;
         }
         // Commands in process groups of their own outlive that signal. A
         // force-stopped provider's would hold memory the system needed, with
