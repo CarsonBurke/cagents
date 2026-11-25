@@ -749,6 +749,10 @@ mod tests {
         handle.shutdown().unwrap();
     }
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+    )]
     fn continuously_dirty_output_keeps_two_custom_viewports_responsive() {
         if crate::retained_fixture::run_isolated() {
             return;

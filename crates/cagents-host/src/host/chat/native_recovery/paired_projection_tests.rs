@@ -487,6 +487,10 @@ fn refused_native_restore(fixture: &Fixture) -> crate::chat::StartFailure {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn retained_pair_checkpoints_and_reattaches_across_multiple_upgrade_hops() {
     if std::env::var(MODE).as_deref() == Ok("provider") {
         return provider();

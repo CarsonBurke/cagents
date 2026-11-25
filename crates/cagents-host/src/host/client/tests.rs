@@ -604,6 +604,9 @@ fn retention_client_host(
 
 /// Hold the real handler after final retirement but before serve_with can
 /// enqueue its response. Ordinary exit must not seal that delivery gap.
+// Linux only: the private-runtime harness lives in the exit-drain fixtures,
+// which watch processes through pidfds and `/proc`.
+#[cfg(target_os = "linux")]
 #[test]
 fn destructive_terminal_replies_drain_before_ordinary_exit_seals_delivery() {
     use std::sync::mpsc;
@@ -2997,6 +3000,9 @@ fn panic_test_host(name: &str) -> (HostSessionProof, SharedHost) {
     (proof, host)
 }
 
+// Linux only: the private-runtime harness lives in the exit-drain fixtures,
+// which watch processes through pidfds and `/proc`.
+#[cfg(target_os = "linux")]
 #[test]
 fn agent_close_reply_drains_before_ordinary_exit_seals_delivery() {
     use crate::agent_execution::{

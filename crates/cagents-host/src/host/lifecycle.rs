@@ -497,7 +497,7 @@ fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> 
     Ok(true)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -516,10 +516,7 @@ mod tests {
         collections::BTreeMap,
         fs::{self, File},
         io::Write,
-        os::{
-            fd::FromRawFd,
-            unix::fs::{MetadataExt, PermissionsExt, symlink},
-        },
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
         process::{Child, Command, Stdio},
         thread,
     };
@@ -599,7 +596,7 @@ mod tests {
     struct CensusChild {
         child: Child,
         identity: Process,
-        _original: File,
+        _original: crate::daemon::PinnedProcess,
     }
     impl CensusChild {
         fn start() -> Self {
@@ -610,17 +607,15 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            // SAFETY: this original unreaped Child is blocked on its private
-            // stdin; pidfd_open takes scalar arguments and returns a fresh fd.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("pin actual census child: {error}");
-            }
-            // SAFETY: the successful syscall above transferred this fresh fd.
-            let original = unsafe { File::from_raw_fd(fd as i32) };
+            // This original unreaped Child is blocked on its private stdin.
+            let original = match crate::daemon::PinnedProcess::open(child.id()) {
+                Ok(original) => original,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("pin actual census child: {error}");
+                }
+            };
             let identity = Process::read(child.id() as i32).unwrap();
             Self {
                 child,

@@ -70,6 +70,10 @@ fn reaped_process() -> crate::daemon::holder_registry::Process {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn collection_compacts_every_committed_verified_retirement_and_nothing_else() {
     // A supervisor refuses an --exact that selects nothing, bounds a hang and
     // reaps whatever the body leaves behind.

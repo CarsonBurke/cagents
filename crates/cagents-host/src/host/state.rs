@@ -6301,7 +6301,9 @@ mod redraw_identity_tests;
 mod redraw_ordering_tests;
 #[cfg(test)]
 mod relaunch_lineage_tests;
-#[cfg(test)]
+// Linux only: its fixture pins each child by pidfd and reads its state and
+// working directory from `/proc`.
+#[cfg(all(test, target_os = "linux"))]
 mod retained_child_shutdown_tests;
 #[cfg(test)]
 mod strict_upgrade_tests;

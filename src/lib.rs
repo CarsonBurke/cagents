@@ -69,8 +69,9 @@ pub fn refuse_filtered_test_run(mut arguments: impl Iterator<Item = String>) {
 
 crate::test_binary_setup!();
 
-// The host crate's tests share the retained-fixture supervisor.
-#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+// The host crate's tests share the retained-fixture supervisor. Darwin
+// compiles it so those tests build there, and it fails closed when run.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod retained_fixture;
 #[cfg(all(test, feature = "host", target_os = "linux"))]

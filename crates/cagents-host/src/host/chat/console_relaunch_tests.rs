@@ -12,21 +12,37 @@ use crate::{
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn daemon_eof_relaunches_only_the_console_and_keeps_its_running_turn() {
     run_case(None);
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn console_replacement_recovers_a_crash_after_unpair_ack() {
     run_case(Some("unpair"));
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn console_replacement_recovers_spawn_before_its_holder_receipt_is_saved() {
     run_case(Some("spawn"));
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn console_replacement_recovers_pair_ack_before_registry_commit() {
     run_case(Some("pair"));
 }

@@ -16,6 +16,10 @@ const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ROLLOUT_MISSING: &str = "no rollout found for thread id";
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fails() {
     match std::env::var(MODE).as_deref() {
         Ok("provider") => return provider(),
@@ -1189,6 +1193,10 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
 const RESTART_TEST: &str = "host::state::native_upgrade_tests::upgrade_restore_stops_only_the_conversations_whose_restart_fails";
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     match std::env::var(MODE).as_deref() {
         Ok("provider") => return provider(),

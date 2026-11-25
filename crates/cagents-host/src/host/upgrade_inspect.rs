@@ -2917,6 +2917,9 @@ mod tests {
     /// one among every other process on the host. A process of this user
     /// that hides its executable, as `systemd --user` or ssh-agent do on a
     /// real host, is among them.
+    // Linux only: it hides a process with `prctl` and scans `/proc`, which the
+    // Linux upgrade inspection reads.
+    #[cfg(target_os = "linux")]
     #[test]
     fn real_exec_churn_reports_only_explicit_argument_settlement_uncertainty() {
         use std::os::unix::process::CommandExt;
@@ -3255,6 +3258,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+    )]
     fn codex_pane_with_a_surviving_server_or_holder_is_live_work() {
         use std::io::Read;
         // Other tests must not fork while this test owns a listener whose
@@ -3460,6 +3467,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+    )]
     fn codex_long_holder_socket_alias_blocks_until_listener_exits() {
         // A concurrent fork can retain a listener until its child execs. Keep
         // final-close assertions in a child where other tests cannot fork it.

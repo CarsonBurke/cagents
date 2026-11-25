@@ -409,6 +409,10 @@ impl Drop for Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_chat() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -729,6 +733,10 @@ fn verify_over_private_socket(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_census() {
     if crate::retained_fixture::run_isolated_with_timeout(Duration::from_secs(1020)) {
         return;

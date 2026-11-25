@@ -1,3 +1,6 @@
+// Linux only: a precheck needs a subreaper to prove its executor's tree is
+// gone, so on Darwin it fails closed before it runs anything (#4045).
+#![cfg(target_os = "linux")]
 #[path = "support/precheck_receipt_guardian.rs"]
 mod guardian;
 

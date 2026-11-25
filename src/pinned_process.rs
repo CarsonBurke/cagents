@@ -221,7 +221,7 @@ impl PinnedProcess {
     /// Returns `NotFound` when no such process exists (or it has already
     /// exited), `InvalidInput` for pid 0 or 1, and the underlying error for
     /// every other failure.
-    pub(crate) fn open(pid: u32) -> io::Result<Self> {
+    pub fn open(pid: u32) -> io::Result<Self> {
         let process = Self::open_unreaped(pid)?;
         if process.exited()? {
             return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -325,7 +325,7 @@ impl PinnedProcess {
     /// # Errors
     ///
     /// Returns the underlying error when the pin cannot be queried.
-    pub(crate) fn exited(&self) -> io::Result<bool> {
+    pub fn exited(&self) -> io::Result<bool> {
         ready(self.exit_readiness(), Duration::ZERO)
     }
 
@@ -356,7 +356,7 @@ impl PinnedProcess {
     ///
     /// Returns the underlying error for any failure other than the process
     /// being gone.
-    pub(crate) fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
+    pub fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
         self.pin.signal(self.pid, signal)
     }
 

@@ -27,6 +27,10 @@ pub(super) fn retained_helper_executable() -> std::path::PathBuf {
 // Exercise the actual shutdown tail, not a hand-built PreparedUpgrade. The
 // provider, holder, checkpoint and successor all retain one issued session.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -35,6 +39,10 @@ fn committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -453,6 +461,10 @@ fn retained_upgrade_tail(fail_final_save: bool) {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -461,6 +473,10 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn retained_terminal_handoff_proves_original_console_cleanup() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -469,6 +485,10 @@ fn retained_terminal_handoff_proves_original_console_cleanup() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn retained_checked_terminal_close_proves_original_console_cleanup() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -477,6 +497,10 @@ fn retained_checked_terminal_close_proves_original_console_cleanup() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn retained_completed_terminal_release_proves_original_console_cleanup() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -1281,6 +1305,7 @@ fn close_owner_diagnostic(
     }).to_string()
 }
 
+#[cfg(target_os = "linux")]
 fn sigkill_retirement_diagnostic(
     identity: &chat::runtime::ActorIdentity,
     proof: &HostSessionProof,
@@ -2069,6 +2094,10 @@ impl Drop for SigkillCoordinator {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn slow_turn_survives_sigkill_of_the_host_owner_process() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -2078,6 +2107,10 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn semantic_retirement_precedes_original_parent_wait_after_host_sigkill() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -2679,6 +2712,10 @@ fn sigkill_host_fixture(semantic_held: bool) {
 /// No prompt is written in this fixture: an initialized actor still lacks a
 /// provider-confirmed thread while its exact ownership proof rotates.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provider_result() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -2960,6 +2997,10 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
 /// host has published the registry receipt. A successor must finish that exact
 /// commit using the roster and private receipt, without recreating an actor.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -3419,6 +3460,10 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -3859,6 +3904,10 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
 /// client connects, so the saved pane reopens instead of waiting on a closed
 /// owner.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -4243,6 +4292,10 @@ fn kill_helper_then_provider(record: &crate::daemon::holder_registry::Record) {
 /// process group or session are gone. A survivor in the provider's group
 /// refuses, and its exit then allows exactly one proved successor.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -4461,6 +4514,10 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
 /// helper, its provider and everything in their process groups and sessions
 /// are gone, and a survivor keeps the refusal, saying what still runs.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_survives() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -4766,6 +4823,10 @@ fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_surviv
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
     if crate::retained_fixture::run_isolated() {
         return;

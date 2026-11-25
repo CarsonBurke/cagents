@@ -18,7 +18,7 @@ use std::{
 };
 
 mod pane_move;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod pending_tests;
 #[cfg(test)]
 mod tests;
