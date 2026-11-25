@@ -7,6 +7,8 @@ pub mod child_reaper;
 /// The exact-process pin the daemon waits on and signals, which no process
 /// that later takes its pid can stand in for.
 pub use crate::pinned_process::PinnedProcess;
+/// What the kernel reports for the other end of a local socket.
+pub use crate::pinned_process::{PeerCredentials, peer_credentials};
 #[cfg(any(feature = "host", feature = "ui"))]
 pub mod codex_temp;
 pub mod holder_registry;
@@ -55,7 +57,6 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::model::{BootId, HostSessionProof};
-use crate::pinned_process::peer_credentials;
 use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
 #[cfg(feature = "host")]

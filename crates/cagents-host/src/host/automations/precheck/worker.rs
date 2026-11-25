@@ -631,9 +631,11 @@ fn supervisor(directory: &Path, request: &Request, _lease: File) -> io::Result<(
     if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
         return Err(io::Error::last_os_error());
     }
-    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // The receipt claims the executor's whole tree is gone, which only a
+    // subreaper can prove. Darwin has none, so there a precheck fails here,
+    // before it records a start or runs anything, rather than leave orphans
+    // it could not account for.
+    crate::process::become_subreaper()?;
     let pid = std::process::id();
     let stat = fs::read(format!("/proc/{pid}/stat"))?;
     let (_, start) = crate::model::agent_recovery::process_identity(&stat)

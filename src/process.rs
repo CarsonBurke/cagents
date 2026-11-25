@@ -37,6 +37,77 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub use crate::pinned_process::OpenFile;
+
+/// The executable and command line of process `pid`, its arguments each
+/// followed by a NUL, the program first, as Linux's `/proc/<pid>/cmdline`
+/// holds them. Darwin reads both through a pin, so neither can describe a
+/// successor to the pid.
+///
+/// # Errors
+///
+/// Returns the underlying error when either cannot be read, `NotFound` when
+/// the process has gone.
+#[cfg(feature = "host")]
+pub fn program_of(pid: u32) -> io::Result<(PathBuf, Vec<u8>)> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok((
+            std::fs::read_link(format!("/proc/{pid}/exe"))?,
+            std::fs::read(format!("/proc/{pid}/cmdline"))?,
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let process = crate::pinned_process::PinnedProcess::open(pid)?;
+        Ok((process.executable()?, process.command_line()?))
+    }
+}
+
+/// The first process of this account, other than this one, that holds open
+/// a file `wanted` accepts.
+///
+/// A process that exits during the census, or whose descriptors the kernel
+/// refuses this account, as it refuses a protected process's, is passed
+/// over: it names nothing, as on Linux a process whose `/proc/<pid>/fd` does
+/// not read names nothing.
+///
+/// # Errors
+///
+/// Returns the underlying error when the process table, or a listed
+/// process's descriptors, cannot be read for any other reason.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub fn account_process_holding(
+    mut wanted: impl FnMut(&OpenFile) -> bool,
+) -> io::Result<Option<u32>> {
+    let own = std::process::id();
+    for pid in table::list(crate::daemon::current_uid())? {
+        // launchd is not this account's, and cannot be pinned.
+        if pid == own || pid <= 1 {
+            continue;
+        }
+        let files = match crate::pinned_process::PinnedProcess::open(pid)
+            .and_then(|process| process.open_files())
+        {
+            Ok(files) => files,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if files.iter().any(&mut wanted) {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
 /// Names this process for `ps` and `top`. Darwin names a process after its
 /// executable image and offers no way to rename it, so there this does nothing.
 #[cfg(feature = "host")]
@@ -55,7 +126,7 @@ pub(crate) fn set_name(name: &std::ffi::CStr) {
 /// has no subreaper, so it refuses rather than let a holder claim a proof it
 /// cannot make; the descendant tracker replaces this there (#4045).
 #[cfg(feature = "host")]
-pub(crate) fn become_subreaper() -> io::Result<()> {
+pub fn become_subreaper() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: prctl takes scalar arguments.

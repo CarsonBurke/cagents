@@ -94,9 +94,9 @@ struct OpenHow {
 /// and an ancestor walk stops below one; neither can be resolved beneath
 /// there in any case.
 #[cfg(target_os = "linux")]
-pub(crate) const DIRECTORY_HANDLE: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
+pub const DIRECTORY_HANDLE: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
 #[cfg(target_os = "macos")]
-pub(crate) const DIRECTORY_HANDLE: libc::c_int = libc::O_SEARCH;
+pub const DIRECTORY_HANDLE: libc::c_int = libc::O_SEARCH;
 
 /// Flags for an intermediate component of the component-at-a-time walk. The
 /// walk checks each one is a directory, so Linux needs no `O_DIRECTORY`; on
