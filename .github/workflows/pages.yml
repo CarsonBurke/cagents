@@ -6,12 +6,10 @@ on:
       - main
     paths:
       - ".github/workflows/pages.yml"
-      - "docs/installation.md"
       - "website/**"
   pull_request:
     paths:
       - ".github/workflows/pages.yml"
-      - "docs/installation.md"
       - "website/**"
   workflow_dispatch:
 

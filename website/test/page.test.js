@@ -8,7 +8,6 @@ const repository = new URL("../", root);
 const screens = loadScreens(root);
 const page = renderPage(readFileSync(new URL("index.html", root), "utf8"), {
   screens,
-  installCommand: readFileSync(new URL("src/install-command.sh", root), "utf8"),
 });
 
 test("every screenshot has both formats in every theme it lists, at a sensible weight", () => {
@@ -36,6 +35,15 @@ test("images are sized, described and lazy below the fold", () => {
   const shots = images.filter((tag) => tag.includes("/screens/"));
   assert.match(shots[0], /fetchpriority="high"/, "the hero loads first");
   for (const tag of shots.slice(1)) assert.match(tag, /loading="lazy"/, tag);
+});
+
+test("each screenshot links directly to its fallback image", () => {
+  const previews = [...page.matchAll(/<a class="shot-expand" href="([^"]+)">([\s\S]*?)<\/a>/g)];
+  assert.equal(previews.length, Object.keys(screens).length);
+  for (const [, path, content] of previews) {
+    assert.ok(existsSync(new URL(path.slice(1), root)), `${path} is missing`);
+    assert.ok(content.includes(`<img src="${path}"`), `${path} is not the preview's fallback image`);
+  }
 });
 
 test("in-page links and repository links lead somewhere", () => {
