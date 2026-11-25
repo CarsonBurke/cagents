@@ -2417,7 +2417,6 @@ fn verify_close_ownership(
 
 /// Explicit cleanup of an authenticated helper which has no client attachment.
 /// Adoption retains the original reducer and pipes; this path never launches.
-#[cfg(test)]
 pub(super) fn close_unattached(
     host: &SharedHost,
     requested: &Session,
