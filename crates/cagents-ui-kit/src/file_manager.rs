@@ -125,9 +125,98 @@ impl SystemUrlOpener {
     }
 }
 
+/// Opens `url` through `open(1)` without running anything the person did
+/// not choose to run.
+///
+/// Given a path, `open` launches an application bundle, runs a `.command`
+/// script in Terminal or starts an installer, and a file an agent wrote
+/// carries no quarantine, so Gatekeeper never asks first. So web and mail
+/// links open in their default applications; a local page, image, PDF or
+/// plain-text document opens in the application its kind names, which
+/// macOS picks by extension, so a script named `.png` still only displays;
+/// a plain folder opens in Finder; and any other local item, scripts and
+/// bundles among them, is only selected in Finder, to be opened deliberately.
+/// Other schemes are refused: an `ssh:`, `x-apple.` or application link can
+/// act without asking. Linux leaves this to the portal, which asks.
+///
+/// The item is classified, then opened: an agent that replaced a plain
+/// folder with an application bundle in between would have Finder open
+/// the bundle.
 #[cfg(target_os = "macos")]
 pub async fn open_system_url(url: Url) -> Result<(), String> {
-    open_system_url_with_opener(&url, tokio::process::Command::new(MACOS_OPEN)).await
+    let presented = SanitizedLocation::from(&url);
+    let mut open = tokio::process::Command::new(MACOS_OPEN);
+    match macos_open(&url).await? {
+        // A URL begins with its scheme, so it cannot read as an option.
+        MacosOpen::Url => open.arg("-u").arg(url.as_str()),
+        MacosOpen::Document(path) => open.arg("--").arg(path),
+        MacosOpen::Folder(path) => open.args(["-a", "Finder", "--"]).arg(path),
+        MacosOpen::Reveal(path) => open.args(["-R", "--"]).arg(path),
+    };
+    run_opener(open)
+        .await
+        .map_err(|outcome| format!("could not open {presented}; system opener {outcome}"))
+}
+
+/// How [`open_system_url`] has `open(1)` handle a URL.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum MacosOpen {
+    Url,
+    Document(std::path::PathBuf),
+    Folder(std::path::PathBuf),
+    Reveal(std::path::PathBuf),
+}
+
+/// Kinds whose default applications only display or edit them: pages open
+/// in the browser, as browserless mode needs for a saved local page, images
+/// and PDFs in Preview, text in a text editor. Source code is left out:
+/// macOS opens a `.py` or `.sh` in a launcher or Terminal, which runs it.
+#[cfg(target_os = "macos")]
+const DOCUMENT_EXTENSIONS: &[&str] = &[
+    "avif", "bmp", "csv", "gif", "heic", "heif", "htm", "html", "jpeg", "jpg", "json", "log",
+    "markdown", "md", "pdf", "png", "svg", "tif", "tiff", "txt", "webp", "xhtml",
+];
+
+#[cfg(target_os = "macos")]
+async fn macos_open(url: &Url) -> Result<MacosOpen, String> {
+    match url.scheme() {
+        "http" | "https" | "mailto" => return Ok(MacosOpen::Url),
+        "file" => {}
+        _ => return Err("cagents opens only web, mail and local links on macOS".to_owned()),
+    }
+    let path = url
+        .to_file_path()
+        .map_err(|_| "Could not open a link to another computer's file".to_owned())?;
+    // Launch Services opens a symbolic link as what it leads to, so that is
+    // what is classified and opened.
+    let path = tokio::fs::canonicalize(&path)
+        .await
+        .map_err(|error| format!("Could not open the item: {error}"))?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| format!("Could not open the item: {error}"))?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    Ok(if metadata.is_dir() {
+        // Bundles are folders that Finder launches or installs, and every
+        // kind macOS knows is named by its extension.
+        if extension.is_some()
+            || tokio::fs::try_exists(path.join("Contents/Info.plist"))
+                .await
+                .unwrap_or(true)
+        {
+            MacosOpen::Reveal(path)
+        } else {
+            MacosOpen::Folder(path)
+        }
+    } else if extension.is_some_and(|extension| DOCUMENT_EXTENSIONS.contains(&extension.as_str())) {
+        MacosOpen::Document(path)
+    } else {
+        MacosOpen::Reveal(path)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -237,6 +326,70 @@ mod tests {
             error,
             "Could not open the containing folder: No system opener"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_opens_nothing_that_could_run() {
+        let directory = tempfile::tempdir().unwrap();
+        // The temporary directory is itself reached through a link.
+        let root = directory.path().canonicalize().unwrap();
+        let item = |name: &str| root.join(name);
+        std::fs::write(item("photo.PNG"), b"").unwrap();
+        std::fs::write(item("page.html"), b"").unwrap();
+        std::fs::write(item("tool.py"), b"").unwrap();
+        std::fs::write(item("run.command"), b"#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(item("run.command"), item("alias.png")).unwrap();
+        std::fs::create_dir(item("plain")).unwrap();
+        std::fs::create_dir_all(item("Tool.app/Contents")).unwrap();
+        std::fs::create_dir_all(item("bare/Contents")).unwrap();
+        std::fs::write(item("bare/Contents/Info.plist"), b"").unwrap();
+        let open = |path: std::path::PathBuf| async move {
+            macos_open(&Url::from_file_path(path).unwrap())
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            open(item("photo.PNG")).await,
+            MacosOpen::Document(item("photo.PNG"))
+        );
+        assert_eq!(
+            open(item("page.html")).await,
+            MacosOpen::Document(item("page.html"))
+        );
+        assert_eq!(open(item("plain")).await, MacosOpen::Folder(item("plain")));
+        // An alias is opened as what it leads to.
+        assert_eq!(
+            open(item("alias.png")).await,
+            MacosOpen::Reveal(item("run.command"))
+        );
+        for name in ["run.command", "tool.py", "Tool.app", "bare"] {
+            assert_eq!(
+                open(item(name)).await,
+                MacosOpen::Reveal(item(name)),
+                "{name}"
+            );
+        }
+        for url in [
+            "https://example.com/",
+            "http://example.com/",
+            "mailto:a@example.com",
+        ] {
+            assert_eq!(
+                macos_open(&Url::parse(url).unwrap()).await,
+                Ok(MacosOpen::Url)
+            );
+        }
+        for url in [
+            "ssh://host",
+            "x-apple.systempreferences:",
+            "vscode://file/a",
+        ] {
+            assert!(
+                macos_open(&Url::parse(url).unwrap()).await.is_err(),
+                "{url}"
+            );
+        }
     }
 
     #[tokio::test]
