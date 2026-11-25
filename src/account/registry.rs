@@ -1952,6 +1952,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("existing-codex");
         fs::create_dir(&home).unwrap();
+        // The interactive linker supplies the checked, canonical home.
+        let home = home.canonicalize().unwrap();
         let history = home.join("session_index.jsonl");
         fs::write(&history, "saved session").unwrap();
         let store = Store::at(directory.path().join("config"));
@@ -2118,6 +2120,7 @@ mod tests {
         let managed_home = homes.path(Provider::Codex, managed_key);
         fs::create_dir_all(&managed_home).unwrap();
         registry.accounts[0].linked_home = Some(managed_home.clone());
+        let selected = managed_home.canonicalize().unwrap();
         registry.accounts.push(Registered {
             key: managed_key,
             provider: Provider::Codex,
@@ -2132,7 +2135,7 @@ mod tests {
             registry.link(
                 Provider::Codex,
                 Uuid::new_v4(),
-                managed_home,
+                selected,
                 None,
                 Some(&homes),
                 3
@@ -2216,6 +2219,7 @@ mod tests {
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
         let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        let selected = home.canonicalize().unwrap();
         let history = home.join("history.jsonl");
         fs::write(&history, "saved conversation").unwrap();
         fs::File::open(&home)
@@ -2268,7 +2272,7 @@ mod tests {
             registry.link(
                 Provider::Claude,
                 Uuid::new_v4(),
-                home.clone(),
+                selected.clone(),
                 Some(&home),
                 Some(&homes),
                 2
@@ -2280,7 +2284,7 @@ mod tests {
             registry.link(
                 Provider::Claude,
                 Uuid::new_v4(),
-                home,
+                selected,
                 None,
                 Some(&homes),
                 2

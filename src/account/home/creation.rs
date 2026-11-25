@@ -225,7 +225,9 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(Some(result.clone()), captured);
+        // The creation receipt records the canonical spelling of the
+        // retained directory, including Darwin's sealed temporary alias.
+        assert_eq!(Some((result.0, result.1.canonicalize().unwrap())), captured);
         assert_eq!(store.load().unwrap().pending().len(), 1);
         assert_eq!(
             fs::read_to_string(result.1.join("settings.json")).unwrap(),
