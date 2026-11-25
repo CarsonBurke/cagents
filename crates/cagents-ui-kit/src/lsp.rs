@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::ops::{ControlFlow, Range};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1696,7 +1696,7 @@ impl PublishedGroup {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn current(&self) -> u32 {
         match *self.0.lock().unwrap() {
             GroupPublication::Live(group) => group,
@@ -1723,16 +1723,10 @@ impl ChildProcess {
         let process_group = child
             .id()
             .ok_or_else(|| io::Error::other("Child already reaped"))?;
-        let identity = (|| {
-            // SAFETY: this is our freshly spawned, still-unreaped child.
-            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process_group, 0) };
-            if descriptor < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: pidfd_open returned a new descriptor owned here.
-            let identity = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
-            tokio::io::unix::AsyncFd::new(identity)
-        })();
+        // This is our freshly spawned, still-unreaped child, and only `stop`
+        // or Tokio's drop reaper ever reaps it.
+        let identity = cagents::process::identity::unreaped_child_identity(process_group)
+            .and_then(tokio::io::unix::AsyncFd::new);
         match identity {
             Ok(identity) => Ok(Self {
                 child,
@@ -1763,30 +1757,17 @@ impl ChildProcess {
         true
     }
 
-    /// Observe the original child without reaping. A numeric wait target could
-    /// instead observe another direct child after the old PID was recycled.
+    /// Observe the original child without reaping, so its PID stays reserved
+    /// and is never recycled for another child this could observe instead.
     fn observed_exit(&self) -> io::Result<bool> {
-        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: the owned pidfd identifies the original child. WNOWAIT
-            // keeps its zombie reserved until all group signals are finished.
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.identity.get_ref().as_raw_fd() as libc::id_t,
-                    &mut information,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                // SAFETY: successful waitid initialized this status field.
-                return Ok(unsafe { information.si_pid() } != 0);
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
+        // WNOWAIT keeps the zombie reserved until all group signals are
+        // finished.
+        cagents::process::identity::child_exit_status(
+            self.identity.get_ref(),
+            self.process_group,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+        .map(|status| status.is_some())
     }
 
     /// Give the child time to exit, end its original group, then reap it.
@@ -1840,7 +1821,7 @@ impl ChildProcess {
         if self.observed_exit()? {
             return Ok(true);
         }
-        // pidfd readiness is terminal and never needs clearing. No blocking
+        // Exit readiness is terminal and never needs clearing. No blocking
         // wait or periodic polling occupies the shared Tokio runtime.
         match tokio::time::timeout(grace, self.identity.readable()).await {
             Ok(Ok(_ready)) => self.observed_exit(),

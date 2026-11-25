@@ -2070,19 +2070,65 @@ mod tests {
         // `S_ISGID` to a process that is not in the file's group.
         fs::set_permissions(&path, Permissions::from_mode(0o2750)).unwrap();
         let installed = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        // Darwin's xattr calls also take a resource-fork position and options.
+        fn set_attribute(file: &File, name: &std::ffi::CStr, value: &[u8]) -> bool {
+            let descriptor = std::os::fd::AsRawFd::as_raw_fd(file);
+            // SAFETY: the descriptor is live and both the name and the value
+            // outlive the call.
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::fsetxattr(
+                    descriptor,
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            // SAFETY: as above.
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::fsetxattr(
+                    descriptor,
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            result == 0
+        }
+        fn get_attribute(file: &File, name: &std::ffi::CStr, value: &mut [u8]) -> isize {
+            let descriptor = std::os::fd::AsRawFd::as_raw_fd(file);
+            // SAFETY: the descriptor is live, and the buffer length is passed
+            // exactly.
+            #[cfg(target_os = "linux")]
+            let read = unsafe {
+                libc::fgetxattr(
+                    descriptor,
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            // SAFETY: as above.
+            #[cfg(target_os = "macos")]
+            let read = unsafe {
+                libc::fgetxattr(
+                    descriptor,
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            read
+        }
         let attribute = c"user.cagents.test";
         let file = File::open(&path).unwrap();
-        // SAFETY: the descriptor is live and both the name and the value
-        // outlive the call.
-        let supported = unsafe {
-            libc::fsetxattr(
-                std::os::fd::AsRawFd::as_raw_fd(&file),
-                attribute.as_ptr(),
-                c"kept".as_ptr().cast(),
-                4,
-                0,
-            )
-        } == 0;
+        let supported = set_attribute(&file, attribute, b"kept");
         drop(file);
 
         let outcome = save_file(
@@ -2103,15 +2149,7 @@ mod tests {
         if supported {
             let file = File::open(&path).unwrap();
             let mut value = [0_u8; 8];
-            // SAFETY: as above; the buffer length is passed exactly.
-            let read = unsafe {
-                libc::fgetxattr(
-                    std::os::fd::AsRawFd::as_raw_fd(&file),
-                    attribute.as_ptr(),
-                    value.as_mut_ptr().cast(),
-                    value.len(),
-                )
-            };
+            let read = get_attribute(&file, attribute, &mut value);
             assert_eq!(read, 4, "a save must carry the user's attributes across");
             assert_eq!(&value[..4], b"kept");
         }

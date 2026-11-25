@@ -9118,10 +9118,11 @@ impl cosmic::iced::advanced::widget::Operation for VisitAll {
 /// every frame.
 #[test]
 fn rows_out_of_view_let_frame_broadcasts_pass() {
+    #[cfg(target_os = "linux")]
+    use cosmic::iced::event::{PlatformSpecific, wayland};
     use cosmic::iced::{
         Event, Point, Vector,
         advanced::{Shell, clipboard, mouse},
-        event::{PlatformSpecific, wayland},
         keyboard,
         time::Instant,
         window,
@@ -9192,6 +9193,8 @@ fn rows_out_of_view_let_frame_broadcasts_pass() {
     };
 
     assert_eq!(send(list, tree, redraw(), away, &top), rows(&[0..10], &[]));
+    // Only Wayland sends a resize request to every widget.
+    #[cfg(target_os = "linux")]
     assert_eq!(
         send(
             list,

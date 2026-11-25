@@ -79,6 +79,7 @@ const MAX_HELPER_CPU_SECONDS: u64 = 12;
 /// multiplies rather than a limit a real document can trip: the fanout tree
 /// needs orders of magnitude more and dies here in about a second, ending
 /// the helper instead of the host's memory.
+#[cfg(target_os = "linux")]
 const MAX_HELPER_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Identifies the frame and the layout of everything after it.
@@ -426,14 +427,33 @@ fn reported_line(stderr: &[u8]) -> Option<String> {
 }
 
 fn restrict_helper_resources() -> Result<(), String> {
-    lower_limit(libc::RLIMIT_AS, MAX_HELPER_ADDRESS_SPACE_BYTES)?;
+    bound_address_space()?;
     lower_limit(libc::RLIMIT_CPU, MAX_HELPER_CPU_SECONDS)?;
     // A helper that aborts on a document built to overflow the parser's stack
     // should not also hand the system a multi-gigabyte core file to write.
     lower_limit(libc::RLIMIT_CORE, 0)
 }
 
-fn lower_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> Result<(), String> {
+#[cfg(target_os = "linux")]
+fn bound_address_space() -> Result<(), String> {
+    lower_limit(libc::RLIMIT_AS, MAX_HELPER_ADDRESS_SPACE_BYTES)
+}
+
+/// Darwin refuses an address-space limit below what every process already
+/// maps, a few hundred gigabytes of shared cache and reservations, and it
+/// enforces no data limit. No unprivileged process can bound its own memory
+/// there, so the helper refuses the document rather than parse it unbounded.
+#[cfg(target_os = "macos")]
+fn bound_address_space() -> Result<(), String> {
+    Err("this system cannot bound the renderer's memory".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+type Resource = libc::__rlimit_resource_t;
+#[cfg(target_os = "macos")]
+type Resource = libc::c_int;
+
+fn lower_limit(resource: Resource, value: libc::rlim_t) -> Result<(), String> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

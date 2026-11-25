@@ -2095,6 +2095,8 @@ mod tests {
     /// What keeping the grammar costs the process, and whether letting it go
     /// gives that back: resident memory before a load, while kept after
     /// highlighting a few languages, and once the linger has passed.
+    // Reads glibc's resident set from `/proc` and trims glibc's heap.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "measurement; run with --ignored --nocapture"]
     fn what_a_kept_grammar_costs_the_process() {

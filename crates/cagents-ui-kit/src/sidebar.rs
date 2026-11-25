@@ -13635,13 +13635,14 @@ mod row_interaction {
     };
     use crate::interaction::PinnedHeaders;
     use cosmic::iced::advanced::Renderer as _;
+    #[cfg(target_os = "linux")]
+    use cosmic::iced::event::{PlatformSpecific, wayland};
     use cosmic::iced::{
         Event, Length, Point, Rectangle, Size, Vector,
         advanced::{
             Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
             widget::{Id, Operation, Tree, operation, tree},
         },
-        event::{PlatformSpecific, wayland},
         keyboard, mouse, window,
     };
     use cosmic::{Element, Renderer, Theme};
@@ -13659,14 +13660,15 @@ mod row_interaction {
     /// draw. Keys, modifier changes, presses and releases still reach every
     /// row, since a focused or pressed row may be scrolled away.
     fn routine(event: &Event) -> bool {
-        matches!(
-            event,
+        match event {
             Event::Window(window::Event::RedrawRequested(_))
-                | Event::Mouse(mouse::Event::CursorMoved { .. })
-                | Event::PlatformSpecific(PlatformSpecific::Wayland(
-                    wayland::Event::RequestResize | wayland::Event::Frame(..)
-                ))
-        )
+            | Event::Mouse(mouse::Event::CursorMoved { .. }) => true,
+            #[cfg(target_os = "linux")]
+            Event::PlatformSpecific(PlatformSpecific::Wayland(
+                wayland::Event::RequestResize | wayland::Event::Frame(..),
+            )) => true,
+            _ => false,
+        }
     }
 
     /// One coordinate shared by the list and its groups, refreshed on each widget
