@@ -847,7 +847,7 @@ mod tests {
                 ..Default::default()
             },
             #[cfg(target_os = "macos")]
-            detached_cleanup_proved: false,
+            detached_cleanup_proved: true,
             compacted: false,
         };
         let make = || RetirementReceipt {
@@ -941,7 +941,7 @@ mod tests {
                 ..Default::default()
             },
             #[cfg(target_os = "macos")]
-            detached_cleanup_proved: false,
+            detached_cleanup_proved: true,
             compacted: false,
         };
         let retired = RetirementReceipt {
