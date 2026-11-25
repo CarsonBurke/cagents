@@ -7234,25 +7234,14 @@ mod reconciliation_tests {
         };
         write(recovery::outcome_path(&state, JOB), "pending.json");
 
-        // The old worker installed this daemon and is still running.
         let step = || settle_after_worker(&layout, &state, &serving).unwrap();
-        thread::scope(|scope| {
-            let worker = acquire_lock(&state).unwrap();
-            let (settled, verdict) = std::sync::mpsc::channel();
-            scope.spawn(move || settled.send(step()).unwrap());
-            job.phase = UpdatePhase::Failed;
-            job.message =
-                "The confirmed successor does not serve this update's matched protocol".into();
-            write_job(&state, &job).unwrap();
-            assert!(matches!(
-                verdict.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ));
-            drop(worker);
+        job.phase = UpdatePhase::Failed;
+        job.message =
+            "The confirmed successor does not serve this update's matched protocol".into();
+        write_job(&state, &job).unwrap();
 
-            // It left its placeholder: nothing proved the service.
-            assert_eq!(verdict.recv_timeout(Duration::from_secs(5)).unwrap(), None);
-        });
+        // The older worker left its placeholder: nothing proved the service.
+        assert_eq!(step(), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // Its receipt names a daemon that has since restarted.
         write(recovery::outcome_path(&state, JOB), "recovery.json");
@@ -7271,8 +7260,29 @@ mod reconciliation_tests {
         job.recorded_by = None;
         write_job(&state, &job).unwrap();
 
-        // Its receipt names this daemon: the update completed.
-        assert_eq!(step(), Some(JOB.into()));
+        // An active worker can replace its placeholder with the exact
+        // serving proof. The same waiter must use that final receipt.
+        thread::scope(|scope| {
+            let worker = acquire_lock(&state).unwrap();
+            write(recovery::outcome_path(&state, JOB), "pending.json");
+            let (waiting, started) = std::sync::mpsc::channel();
+            let (settled, verdict) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                waiting.send(()).unwrap();
+                settled.send(step()).unwrap();
+            });
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                verdict.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            write(recovery::outcome_path(&state, JOB), "recovery.json");
+            drop(worker);
+            assert_eq!(
+                verdict.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Some(JOB.into())
+            );
+        });
         let settled = recorded();
         assert_eq!(settled.phase, UpdatePhase::Complete);
         assert_eq!(settled.version, "0.2.4");
