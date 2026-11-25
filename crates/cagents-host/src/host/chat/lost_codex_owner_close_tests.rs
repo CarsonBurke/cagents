@@ -933,6 +933,8 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
     {
         close().unwrap();
         fixture.assert_settled();
+        assert!(!has_native_owner(&fixture.source).unwrap());
+        assert!(!fixture.socket().parent().unwrap().exists());
     }
     #[cfg(target_os = "macos")]
     {
@@ -1019,14 +1021,16 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_requires_signal_proof() 
             .collect::<Vec<_>>(),
         [(tool_pid, "sleep", cfg!(target_os = "linux"))]
     );
-    let remaining = lost_processes(&fixture.host, &fixture.source, &[found[0].process]).unwrap();
     #[cfg(target_os = "linux")]
     {
+        let remaining = lost_processes(&fixture.host, &fixture.source, &shown(&found)).unwrap();
         assert!(remaining.is_empty());
         assert!(tool.reaped(), "ending left the tool running");
     }
     #[cfg(target_os = "macos")]
     {
+        let remaining =
+            lost_processes(&fixture.host, &fixture.source, &[found[0].process]).unwrap();
         assert_eq!(remaining, found);
         assert!(
             !tool_guard.0.exited().unwrap(),
