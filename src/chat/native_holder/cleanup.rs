@@ -23,6 +23,26 @@ pub struct Detached {
     pub(super) receipt_proof: HostSessionProof,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ReceiptKind {
+    Exact,
+    #[cfg(target_os = "macos")]
+    Spared,
+}
+
+#[cfg(target_os = "macos")]
+pub(super) const SCOPED_SPARE: &str = "native-scope-spare-1";
+
+#[cfg(target_os = "macos")]
+pub(super) fn supports_scoped_spare(record: &Record) -> bool {
+    record.build.as_ref().is_some_and(|build| {
+        build
+            .capabilities
+            .iter()
+            .any(|capability| capability == SCOPED_SPARE)
+    })
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Receipt {
     record: Record,
@@ -40,9 +60,14 @@ pub(super) fn source_digest(source: &crate::chat::Session) -> Result<[u8; 32], S
     Ok(Sha256::digest(serde_json::to_vec(source).map_err(|error| error.to_string())?).into())
 }
 
-fn path(terminal: TerminalId, holder: &Process) -> Result<PathBuf, String> {
+fn path(terminal: TerminalId, holder: &Process, kind: ReceiptKind) -> Result<PathBuf, String> {
+    let extension = match kind {
+        ReceiptKind::Exact => "closed",
+        #[cfg(target_os = "macos")]
+        ReceiptKind::Spared => "spared",
+    };
     Ok(registry::directory(Kind::Native)?.join(format!(
-        "{}-{}-{}.closed",
+        "{}-{}-{}.{extension}",
         terminal, holder.pid, holder.start
     )))
 }
@@ -51,6 +76,7 @@ pub(super) fn publish(
     record: &Record,
     proof: &HostSessionProof,
     recovery: &super::Recovery,
+    kind: ReceiptKind,
 ) -> Result<(), String> {
     let receipt = Receipt {
         record: record.clone(),
@@ -64,7 +90,7 @@ pub(super) fn publish(
         paired_closed: recovery.source.terminal.is_none(),
         paired_holder: recovery.paired_holder.clone(),
     };
-    let path = path(record.terminal, &record.holder)?;
+    let path = path(record.terminal, &record.holder, kind)?;
     save(&path, &receipt)
 }
 
@@ -82,7 +108,10 @@ pub fn publish_closed_source(
         paired_closed: source.terminal.is_none(),
         paired_holder: None,
     };
-    save(&path(record.terminal, &record.holder)?, &receipt)
+    save(
+        &path(record.terminal, &record.holder, ReceiptKind::Exact)?,
+        &receipt,
+    )
 }
 
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
@@ -119,12 +148,10 @@ impl Detached {
         record: Record,
         source: crate::chat::Session,
         proof: HostSessionProof,
+        require_exact: bool,
     ) -> Result<Self, String> {
-        let receipt =
-            find_source(&source, &proof)?.ok_or("The native cleanup receipt is unavailable")?;
-        if receipt.record != record {
-            return Err("Native cleanup receipt changed".into());
-        }
+        let (receipt, _) = find_source(&source, &proof, require_exact, Some(&record))?
+            .ok_or("The native cleanup receipt is unavailable")?;
         let original_role = registry::OriginalRole::authenticated(&record, &receipt.proof, &proof)?;
         Ok(Self {
             record,
@@ -141,7 +168,11 @@ impl Detached {
     }
 
     pub fn close_retaining_receipt(&self) -> Result<(), String> {
-        self.close_with(true, DetachedWork::Stop)
+        self.close_retaining_receipt_with(DetachedWork::Stop)
+    }
+
+    pub fn close_retaining_receipt_with(&self, detached: DetachedWork) -> Result<(), String> {
+        self.close_with(true, detached)
     }
 
     pub(crate) fn close_with(&self, retain: bool, detached: DetachedWork) -> Result<(), String> {
@@ -152,7 +183,7 @@ impl Detached {
         {
             return Err("Native cleanup caller no longer owns the daemon lease".into());
         }
-        if self.receipt(retain)? || self.retire_exited() {
+        if self.receipt(retain, detached)? || self.retire_exited() {
             return Ok(());
         }
         let (recovery, _) = super::transport::inspect(&self.record, &self.proof)?;
@@ -178,7 +209,7 @@ impl Detached {
 
     #[cfg(test)]
     pub fn consume_receipt(&self) -> Result<bool, String> {
-        self.receipt(false)
+        self.receipt(false, DetachedWork::Stop)
     }
 
     fn matches_receipt(&self, receipt: &Receipt) -> bool {
@@ -191,13 +222,32 @@ impl Detached {
                     .is_some_and(|role| role.matches(&receipt.record, &self.proof)))
     }
 
-    pub(super) fn receipt(&self, retain: bool) -> Result<bool, String> {
-        consume(
+    pub(super) fn receipt(&self, retain: bool, detached: DetachedWork) -> Result<bool, String> {
+        #[cfg(target_os = "macos")]
+        if detached == DetachedWork::Stop && !supports_scoped_spare(&self.record) {
+            // A legacy Darwin close receipt did not encode its cleanup scope.
+            return Ok(false);
+        }
+        let exact = consume(
             self.record.terminal,
             &self.record.holder,
+            ReceiptKind::Exact,
             retain,
             |receipt| self.matches_receipt(receipt),
-        )
+        )?;
+        #[cfg(target_os = "linux")]
+        let _ = detached;
+        #[cfg(target_os = "macos")]
+        if !exact && detached == DetachedWork::Spare && supports_scoped_spare(&self.record) {
+            return consume(
+                self.record.terminal,
+                &self.record.holder,
+                ReceiptKind::Spared,
+                retain,
+                |receipt| self.matches_receipt(receipt),
+            );
+        }
+        Ok(exact)
     }
 }
 
@@ -212,25 +262,36 @@ pub(super) struct Startup {
 
 impl Startup {
     pub fn consume(&self) -> Result<bool, String> {
-        consume(self.terminal, &self.holder, false, |receipt| {
-            matches!(receipt.record.version, 3 | 4)
-                && receipt.record.terminal == self.terminal
-                && receipt.record.holder == self.holder
-                && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
-                && receipt.record.boot == self.proof.boot_id
-                && receipt.proof == self.proof
-        })
+        consume(
+            self.terminal,
+            &self.holder,
+            ReceiptKind::Exact,
+            false,
+            |receipt| {
+                #[cfg(target_os = "macos")]
+                if !supports_scoped_spare(&receipt.record) {
+                    return false;
+                }
+                matches!(receipt.record.version, 3 | 4)
+                    && receipt.record.terminal == self.terminal
+                    && receipt.record.holder == self.holder
+                    && receipt.record.kind == Kind::Native
+                    && receipt.record.application == crate::instance::APPLICATION_ID
+                    && receipt.record.boot == self.proof.boot_id
+                    && receipt.proof == self.proof
+            },
+        )
     }
 }
 
 fn consume(
     terminal: TerminalId,
     holder: &Process,
+    kind: ReceiptKind,
     retain: bool,
     matches: impl FnOnce(&Receipt) -> bool,
 ) -> Result<bool, String> {
-    let path = path(terminal, holder)?;
+    let path = path(terminal, holder, kind)?;
     let file = match crate::secure_file::open_existing_private_file(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -355,7 +416,28 @@ pub fn closed_source(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
-    Ok(find_source(source, proof)?.map(|receipt| (receipt.record, receipt.paired_closed)))
+    Ok(find_source(source, proof, false, None)?
+        .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
+}
+
+/// Settles an explicit Stop only with evidence for detached-work cleanup.
+pub fn closed_source_for_stop(
+    source: &crate::chat::Session,
+    proof: &HostSessionProof,
+) -> Result<Option<(Record, bool)>, String> {
+    Ok(find_source(source, proof, true, None)?
+        .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
+}
+
+/// Restricts a retry to the holder captured before the first cleanup attempt.
+pub fn closed_source_for_owner(
+    source: &crate::chat::Session,
+    proof: &HostSessionProof,
+    owner: &Record,
+    require_exact: bool,
+) -> Result<Option<(Record, bool)>, String> {
+    Ok(find_source(source, proof, require_exact, Some(owner))?
+        .map(|(receipt, _)| (receipt.record, receipt.paired_closed)))
 }
 
 /// Retires `record` when it names an owner that has ended: its holder and
@@ -375,19 +457,24 @@ pub fn retire_abandoned(record: &Record) -> Result<bool, String> {
 pub fn closed_pair_holder(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
+    owner: &Record,
+    require_exact: bool,
 ) -> Result<Option<Record>, String> {
-    Ok(find_source(source, proof)?.and_then(|receipt| receipt.paired_holder))
+    Ok(find_source(source, proof, require_exact, Some(owner))?
+        .and_then(|(receipt, _)| receipt.paired_holder))
 }
 
 pub fn confirm_pair_closed(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
+    owner: &Record,
+    require_exact: bool,
 ) -> Result<(), String> {
-    let mut receipt =
-        find_source(source, proof)?.ok_or("The native cleanup receipt is unavailable")?;
+    let (mut receipt, kind) = find_source(source, proof, require_exact, Some(owner))?
+        .ok_or("The native cleanup receipt is unavailable")?;
     receipt.paired_closed = true;
     save(
-        &path(receipt.record.terminal, &receipt.record.holder)?,
+        &path(receipt.record.terminal, &receipt.record.holder, kind)?,
         &receipt,
     )
 }
@@ -395,7 +482,11 @@ pub fn confirm_pair_closed(
 fn find_source(
     source: &crate::chat::Session,
     proof: &HostSessionProof,
-) -> Result<Option<Receipt>, String> {
+    require_exact: bool,
+    owner: Option<&Record>,
+) -> Result<Option<(Receipt, ReceiptKind)>, String> {
+    #[cfg(target_os = "linux")]
+    let _ = require_exact;
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
     if crate::daemon::lease_owner(&paths.lock, proof).map_err(|error| error.to_string())?
         != std::process::id()
@@ -408,15 +499,19 @@ fn find_source(
     let digest = source_digest(source)?;
     let prefix = format!("{}-", source.id);
     let mut candidates = 0;
+    #[cfg(target_os = "macos")]
+    let mut spared = None;
     for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
-        let Some(name) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(&prefix))
-            .and_then(|name| name.strip_suffix(".closed"))
-        else {
+        let Some(name) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
             continue;
+        };
+        let (name, kind) = match name.rsplit_once('.') {
+            Some((name, "closed")) => (name, ReceiptKind::Exact),
+            #[cfg(target_os = "macos")]
+            Some((name, "spared")) => (name, ReceiptKind::Spared),
+            _ => continue,
         };
         candidates += 1;
         if candidates > 128 {
@@ -430,8 +525,13 @@ fn find_source(
         };
         let holder = Process { pid, start };
         let mut matched = None;
-        let complete = consume(source.id, &holder, true, |receipt| {
+        let complete = consume(source.id, &holder, kind, true, |receipt| {
+            #[cfg(target_os = "macos")]
+            if matches!(kind, ReceiptKind::Spared) && !supports_scoped_spare(&receipt.record) {
+                return false;
+            }
             if matches!(receipt.record.version, 3 | 4)
+                && owner.is_none_or(|owner| *owner == receipt.record)
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native
@@ -454,12 +554,25 @@ fn find_source(
             // Unrelated old receipts are harmless; only a matching digest is authority.
             true
         })?;
-        if complete && matched.is_some() {
+        if complete && let Some(receipt) = matched {
             if current.is_some() {
                 return Err("A replacement native holder exists after this exact close receipt; it was not stopped".into());
             }
-            return Ok(matched);
+            #[cfg(target_os = "macos")]
+            if matches!(kind, ReceiptKind::Spared) || !supports_scoped_spare(&receipt.record) {
+                spared.get_or_insert((receipt, kind));
+                continue;
+            }
+            return Ok(Some((receipt, kind)));
         }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(receipt) = spared {
+        return if require_exact {
+            Err("The native close receipt does not prove detached provider cleanup".into())
+        } else {
+            Ok(Some(receipt))
+        };
     }
     Ok(None)
 }

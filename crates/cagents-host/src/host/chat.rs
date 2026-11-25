@@ -1215,7 +1215,7 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
         }
         return Ok(());
     }
-    close_retained_native(host, session)
+    native_cleanup::close_from_pane(host, session)
 }
 
 /// Settles the Close of a conversation whose native owner ended without a
@@ -4968,9 +4968,8 @@ pub(super) fn close_captured(
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
-    handle.decide_detached_work(super::agent_execution::detached_work_on_close(
-        host, source.id,
-    ));
+    let detached = super::agent_execution::detached_work_on_close(host, source.id);
+    handle.decide_detached_work(detached);
     if let Err(error) = handle.close_for_resume() {
         // Its Release failed. When that is because the helper died while the
         // provider runs on, say what holds the conversation; the pane offers
@@ -4999,17 +4998,25 @@ pub(super) fn close_captured(
         // still needs an authenticated terminal cleanup receipt. Keep helper
         // discovery and exact close authority until both owners are proved
         // closed and their semantic retirement has committed.
-        native_cleanup::close_captured(host, &retained, &target, &closing).map_err(unavailable)?;
+        native_cleanup::close_captured(host, &retained, &target, &closing, detached)
+            .map_err(unavailable)?;
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
-    let closed_receipt = if matches!(
-        retained.native_continuity,
-        chat::NativeContinuity::Durable { .. }
-    ) {
+    let closed_receipt = if !pending_cleanup
+        && matches!(
+            retained.native_continuity,
+            chat::NativeContinuity::Durable { .. }
+        ) {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        chat::native_holder::closed_source(&retained, state.proof())
-            .map_err(unavailable)?
-            .is_some()
+        #[cfg(target_os = "macos")]
+        let receipt = if detached == crate::daemon::owned_children::DetachedWork::Stop {
+            chat::native_holder::closed_source_for_stop(&retained, state.proof())
+        } else {
+            chat::native_holder::closed_source(&retained, state.proof())
+        };
+        #[cfg(target_os = "linux")]
+        let receipt = chat::native_holder::closed_source(&retained, state.proof());
+        receipt.map_err(unavailable)?.is_some()
     } else {
         false
     };
@@ -5018,7 +5025,8 @@ pub(super) fn close_captured(
         // gone. A server preserved by an earlier failed adoption must
         // also acknowledge exact cleanup before this close can succeed.
         target.require_current(host)?;
-        native_cleanup::close_captured(host, &retained, &target, &closing).map_err(unavailable)?;
+        native_cleanup::close_captured(host, &retained, &target, &closing, detached)
+            .map_err(unavailable)?;
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
     let terminal = {

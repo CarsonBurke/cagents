@@ -1,6 +1,9 @@
 //! Exact, retryable cleanup when a retained provider cannot attach its history.
 use super::*;
-use crate::daemon::holder_registry::{self as registry, Kind};
+use crate::daemon::{
+    holder_registry::{self as registry, Kind},
+    owned_children::DetachedWork,
+};
 
 #[derive(Clone)]
 pub(in crate::host) struct NativeClose {
@@ -69,7 +72,15 @@ struct RetainedPair {
 /// ended without a receipt settles only on the evidence that nothing of it can
 /// still run; see `settle_lost_execution`.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
-    close_retained_inner(host, source, None, None)
+    close_retained_inner(host, source, None, None, DetachedWork::Stop)
+}
+
+pub(super) fn close_from_pane(host: &SharedHost, source: &Session) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let detached = DetachedWork::Stop;
+    #[cfg(target_os = "macos")]
+    let detached = super::super::agent_execution::detached_work_on_close(host, source.id);
+    close_retained_inner(host, source, None, None, detached)
 }
 
 pub(super) fn close_captured(
@@ -77,8 +88,9 @@ pub(super) fn close_captured(
     source: &Session,
     target: &super::CloseTarget,
     closing: &capacity::Reservation,
+    detached: DetachedWork,
 ) -> Result<(), String> {
-    close_retained_inner(host, source, Some(closing), Some(target))
+    close_retained_inner(host, source, Some(closing), Some(target), detached)
 }
 
 fn close_retained_inner(
@@ -86,7 +98,9 @@ fn close_retained_inner(
     source: &Session,
     closing: Option<&capacity::Reservation>,
     expected: Option<&super::CloseTarget>,
+    detached: DetachedWork,
 ) -> Result<(), String> {
+    let require_exact = detached == DetachedWork::Stop;
     if let Some(expected) = expected {
         expected
             .require_current(host)
@@ -203,7 +217,15 @@ fn close_retained_inner(
     };
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
-        let receipt = chat::native_holder::closed_source(source, &proof)?;
+        let receipt = match &pending {
+            Some(pending) => chat::native_holder::closed_source_for_owner(
+                source,
+                &proof,
+                &pending.owner.record,
+                require_exact,
+            ),
+            None => close_receipt(source, &proof, require_exact),
+        }?;
         let owner = match pending
             .as_ref()
             .map(|pending| pending.owner.record.clone())
@@ -219,7 +241,8 @@ fn close_retained_inner(
         };
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
-            retire_closed_execution(host, source, record, &proof)?;
+            debug_assert_eq!(*record, owner);
+            retire_closed_execution(host, source, &owner, &proof, require_exact)?;
             return Ok(());
         }
         // A holder that died while its provider runs on can no longer be
@@ -235,13 +258,15 @@ fn close_retained_inner(
                 let pending = NativeClose {
                     source: source.clone(),
                     named: named.clone(),
-                    owner: chat::native_holder::Detached::from_receipt(record, source.clone(), proof.clone())?,
+                    owner: chat::native_holder::Detached::from_receipt(
+                        record.clone(), source.clone(), proof.clone(), require_exact,
+                    )?,
                     closed: true,
                     paired: retained_pair(
                         host,
                         source,
                         source.terminal.as_deref(),
-                        Some(&chat::native_holder::closed_pair_holder(source, &proof)?.ok_or("The native cleanup receipt lacks its original paired holder identity")?),
+                        Some(&chat::native_holder::closed_pair_holder(source, &proof, &record, require_exact)?.ok_or("The native cleanup receipt lacks its original paired holder identity")?),
                         &proof,
                     )?,
                 };
@@ -304,7 +329,10 @@ fn close_retained_inner(
                 .map_err(|error| error.message)?;
         }
         if !pending.closed {
+            #[cfg(target_os = "linux")]
             pending.owner.close_retaining_receipt()?;
+            #[cfg(target_os = "macos")]
+            pending.owner.close_retaining_receipt_with(detached)?;
             pending.closed = true;
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -320,12 +348,23 @@ fn close_retained_inner(
         // it, settled this close without a receipt, so there is none to
         // confirm. Its close stays pending until the loss is proved; an owner
         // still running keeps its record, which refuses the loss.
-        if pending.paired.is_none() && chat::native_holder::closed_source(source, &proof)?.is_none()
-        {
+        let owned_receipt = chat::native_holder::closed_source_for_owner(
+            source,
+            &proof,
+            &pending.owner.record,
+            require_exact,
+        )?;
+        if pending.paired.is_none() && owned_receipt.is_none() {
             chat::native_holder::retire_abandoned(&pending.owner.record)?;
             return super::settle_lost_execution(host, source, &proof);
         }
         if let Some(pair) = &pending.paired {
+            #[cfg(target_os = "macos")]
+            if owned_receipt.is_none() {
+                return Err(
+                    "The native close receipt for the paired terminal is unavailable".into(),
+                );
+            }
             if let Some(source) = &pair.source {
                 let handle = pair.handle.as_ref().expect("captured worker source");
                 handle.close_with_receipt(source, &proof)?;
@@ -355,10 +394,15 @@ fn close_retained_inner(
             }
             state.retire_terminal(pair.holder.terminal);
         }
-        chat::native_holder::confirm_pair_closed(source, &proof)?;
+        chat::native_holder::confirm_pair_closed(
+            source,
+            &proof,
+            &pending.owner.record,
+            require_exact,
+        )?;
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
-        retire_closed_execution(host, source, &pending.owner.record, &proof)?;
+        retire_closed_execution(host, source, &pending.owner.record, &proof, require_exact)?;
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -427,8 +471,8 @@ fn preflight_current_retirements(
         let crate::agent_execution::HostedSession::Chat(current) = &retained else {
             return Err("Retained execution ownership changed to another surface".into());
         };
-        let recognized_receipt = chat::native_holder::closed_source(current, proof)?
-            .is_some_and(|(record, _)| record == *owner);
+        let recognized_receipt =
+            chat::native_holder::closed_source_for_owner(current, proof, owner, false)?.is_some();
         if !recognized_receipt {
             if lineage.is_none() {
                 let (recovery, _) = chat::native_holder::inspect(owner, proof)?;
@@ -452,11 +496,24 @@ fn preflight_current_retirements(
     Ok(())
 }
 
+fn close_receipt(
+    source: &Session,
+    proof: &HostSessionProof,
+    require_exact: bool,
+) -> Result<Option<(registry::Record, bool)>, String> {
+    if require_exact {
+        chat::native_holder::closed_source_for_stop(source, proof)
+    } else {
+        chat::native_holder::closed_source(source, proof)
+    }
+}
+
 fn retire_closed_execution(
     host: &SharedHost,
     source: &Session,
     owner: &registry::Record,
     proof: &HostSessionProof,
+    require_exact: bool,
 ) -> Result<(), String> {
     let Ok(registry) = super::super::agent_execution::registry(host) else {
         return Ok(());
@@ -470,8 +527,8 @@ fn retire_closed_execution(
         let crate::agent_execution::HostedSession::Chat(source) = source else {
             return Err("Retained execution ownership changed to another surface".into());
         };
-        if !chat::native_holder::closed_source(&source, proof)?
-            .is_some_and(|(record, paired_closed)| record == *owner && paired_closed)
+        if !chat::native_holder::closed_source_for_owner(&source, proof, owner, require_exact)?
+            .is_some_and(|(_, paired_closed)| paired_closed)
         {
             return Err("The current execution descriptor is not covered by this exact native teardown receipt".into());
         }

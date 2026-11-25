@@ -113,6 +113,8 @@ impl Pinned {
 /// child of that process; this cleanup must never run inside the daemon.
 pub struct OwnedChildren {
     child: Option<Child>,
+    #[cfg(target_os = "macos")]
+    descendants: Option<std::cell::RefCell<super::descendants::Tracker>>,
     group_signalled: bool,
     detached: DetachedWork,
     /// More of the provider's own processes, such as a server its launcher
@@ -130,11 +132,52 @@ impl OwnedChildren {
     pub fn new(child: Child) -> Self {
         Self {
             child: Some(child),
+            #[cfg(target_os = "macos")]
+            descendants: None,
             group_signalled: false,
             detached: DetachedWork::Stop,
             provider: Pinned::default(),
             server: None,
             server_killed: Default::default(),
+        }
+    }
+
+    /// Start an exact owned root. Darwin registers its fork and exit watch
+    /// before the child can exec into provider code.
+    pub(crate) fn spawn(command: std::process::Command) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut command = command;
+            command.spawn().map(Self::new)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (child, tracker) = super::descendants::Tracker::spawn(command)?;
+            let mut owner = Self::new(child);
+            owner.descendants = Some(std::cell::RefCell::new(tracker));
+            Ok(owner)
+        }
+    }
+
+    /// Darwin can prove exact cleanup only for a root watched before exec
+    /// that never forked. This is the only Darwin evidence for exit 73.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn cleanup_proved(&mut self) -> bool {
+        self.child.is_none()
+            && !self.provider.remain()
+            && self
+                .descendants
+                .as_mut()
+                .is_some_and(|tracker| tracker.get_mut().prove_empty())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn release_complete(&mut self) -> bool {
+        if self.detached == DetachedWork::Spare {
+            // This request authorized leaving detached work alive.
+            self.child.is_none() && !self.provider.remain()
+        } else {
+            self.cleanup_proved()
         }
     }
 
@@ -186,11 +229,15 @@ impl OwnedChildren {
         self.child.as_ref().expect("owned provider").id() as i32
     }
 
-    /// The child reaper establishes that the original provider and its known
-    /// group ended. Darwin hands escaped descendants to launchd, so ECHILD
-    /// alone cannot authorize a Stop receipt for a provider that ran there.
-    pub(crate) fn require_cleanup_proof(&self) -> io::Result<()> {
-        require_detached_cleanup_proof(self.detached)
+    /// A Darwin watch wakes a dedicated holder when a provider forks.
+    pub(crate) fn descendant_events(&self) -> Option<std::os::fd::RawFd> {
+        #[cfg(target_os = "linux")]
+        return None;
+        #[cfg(target_os = "macos")]
+        return self
+            .descendants
+            .as_ref()
+            .map(|tracker| tracker.borrow().fd());
     }
 
     pub(crate) fn exited(&self) -> bool {
@@ -213,6 +260,10 @@ impl OwnedChildren {
     /// Keeping that leader unreaped also reserves its process-group identifier
     /// until `terminate` has sent the group's final signal.
     pub(crate) fn reap_exited_descendants(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(tracker) = &self.descendants {
+            tracker.borrow_mut().observe()?;
+        }
         for pid in direct_children()? {
             if self
                 .child
@@ -260,8 +311,16 @@ impl OwnedChildren {
             }
             self.signal_provider(libc::SIGKILL)?;
             #[cfg(target_os = "macos")]
-            if let Some(child) = &self.child {
-                crate::process::identity::finish_unreaped_group(child.id() as i32, timeout)?;
+            if let Some(child) = &self.child
+                && let Err(error) =
+                    crate::process::identity::finish_unreaped_group(child.id() as i32, timeout)
+            {
+                if self.detached == DetachedWork::Stop
+                    && let Some(tracker) = &mut self.descendants
+                {
+                    let _ = tracker.get_mut().stop_known(timeout);
+                }
+                return Err(error);
             }
             self.group_signalled = true;
         }
@@ -301,6 +360,18 @@ impl OwnedChildren {
 
     fn stop_children(&mut self, deadline: Instant) -> io::Result<bool> {
         loop {
+            #[cfg(target_os = "macos")]
+            let descendants = self
+                .descendants
+                .as_mut()
+                .map_or(Ok(true), |tracker| tracker.get_mut().stop());
+            #[cfg(target_os = "linux")]
+            let descendants = Ok(true);
+
+            // The unreaped root still reserves its group. Sweep it once more
+            // after the census, while that address still has authority.
+            #[cfg(target_os = "macos")]
+            let final_group_signal = self.signal_provider(libc::SIGKILL);
             for pid in direct_children()? {
                 // No other thread or handler reaps children in this process.
                 // A child that exits stays a zombie until the loop below.
@@ -310,8 +381,14 @@ impl OwnedChildren {
                     return Err(io::Error::last_os_error());
                 }
             }
-            if self.reap()? {
-                return Ok(true);
+            let reaped = self.reap()?;
+            #[cfg(target_os = "macos")]
+            final_group_signal?;
+            if reaped {
+                match descendants {
+                    Ok(false) => {}
+                    outcome => return outcome,
+                }
             }
             if Instant::now() >= deadline {
                 return Ok(false);
@@ -428,7 +505,7 @@ pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
         .collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))] // Adopts work through the Linux subreaper.
 pub(crate) mod tests {
     use super::*;
     use std::{os::unix::process::CommandExt, path::Path, process::Command};

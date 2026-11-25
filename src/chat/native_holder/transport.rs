@@ -165,6 +165,8 @@ enum Request {
     /// Stop the provider but leave running the work it had already detached.
     /// Sent only to a holder reporting `sparing_release`.
     ReleaseSparing,
+    #[cfg(target_os = "macos")]
+    ReleaseSparingScoped,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -180,6 +182,8 @@ enum Report {
     Confirmed,
     SourceUpdated,
     Released,
+    #[cfg(target_os = "macos")]
+    ReleasedSparing,
     Inspected {
         protocol: u32,
         record: Record,
@@ -374,7 +378,7 @@ impl Holder {
         retain: bool,
         detached: DetachedWork,
     ) -> Result<(), String> {
-        if self.identity.receipt(retain)? {
+        if self.identity.receipt(retain, detached)? {
             self.control.take();
             self.release_on_drop = false;
             return Ok(());
@@ -386,15 +390,45 @@ impl Holder {
             return self.identity.close_with(retain, detached);
         };
         let request = if detached == DetachedWork::Spare && self.sparing_release {
-            Request::ReleaseSparing
+            #[cfg(target_os = "linux")]
+            {
+                Request::ReleaseSparing
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if super::cleanup::supports_scoped_spare(&self.identity.record) {
+                    Request::ReleaseSparingScoped
+                } else {
+                    Request::ReleaseSparing
+                }
+            }
         } else {
             Request::Release
         };
         let report = send(control, &request, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
         let unanswered = match report {
             Ok(Some(Report::Released)) => {
-                if !self.identity.receipt(retain)? {
+                let evidence =
+                    if cfg!(target_os = "macos") && matches!(request, Request::ReleaseSparing) {
+                        DetachedWork::Spare
+                    } else {
+                        DetachedWork::Stop
+                    };
+                if !self.identity.receipt(retain, evidence)? {
                     return Err("Native holder released without durable cleanup evidence".into());
+                }
+                self.control.take();
+                self.release_on_drop = false;
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            Ok(Some(Report::ReleasedSparing))
+                if matches!(request, Request::ReleaseSparingScoped) =>
+            {
+                if !self.identity.receipt(retain, DetachedWork::Spare)? {
+                    return Err(
+                        "Native holder spared work without durable provider-close evidence".into(),
+                    );
                 }
                 self.control.take();
                 self.release_on_drop = false;
@@ -410,7 +444,7 @@ impl Holder {
         // A holder that exited with its provider closes its control connection
         // without answering, and never will. If it wrote its receipt first,
         // that receipt settles the close as a reply would have.
-        if !self.identity.receipt(retain)? && !self.identity.retire_exited() {
+        if !self.identity.receipt(retain, detached)? && !self.identity.retire_exited() {
             return Err(unanswered);
         }
         self.control.take();
@@ -825,7 +859,7 @@ struct Residence {
     recovery: Recovery,
     child: Server,
     child_events: ChildEvents,
-    released: bool,
+    released: Option<super::cleanup::ReceiptKind>,
     _working_directory: Option<std::fs::File>,
     provider_pidfd: crate::pinned_process::PinnedProcess,
     owner_application: String,
@@ -879,17 +913,24 @@ impl Residence {
                 })?;
         let mut command = spawn.command();
         command.envs(TEMP_ENV_KEYS.map(|key| (key, temp.path())));
-        let child = match command.spawn() {
-            Ok(child) => Server(crate::daemon::owned_children::OwnedChildren::new(child)),
+        let child = match crate::daemon::owned_children::OwnedChildren::spawn(command) {
+            Ok(child) => Server(child),
             Err(error) => {
                 return Err(error.to_string());
             }
         };
         on_spawn();
         temp.launched();
+        let build = registry::BuildIdentity::current(Kind::Native);
+        #[cfg(target_os = "macos")]
+        let build = {
+            let mut build = build;
+            build.capabilities.push(super::cleanup::SCOPED_SPARE.into());
+            build
+        };
         let record = Record {
             version: 4,
-            build: Some(registry::BuildIdentity::current(Kind::Native)),
+            build: Some(build),
             kind: Kind::Native,
             application: crate::instance::APPLICATION_ID.into(),
             boot,
@@ -908,7 +949,7 @@ impl Residence {
             recovery: spawn.recovery,
             child,
             child_events,
-            released: false,
+            released: None,
             _working_directory: working_directory,
             temp: Some(temp),
         };
@@ -932,9 +973,10 @@ impl Residence {
         self.provider_pidfd.exited().unwrap_or(false)
     }
 
-    fn release(&mut self) -> Result<(), String> {
-        if self.released {
-            return Ok(());
+    fn release(&mut self) -> Result<super::cleanup::ReceiptKind, String> {
+        use super::cleanup::ReceiptKind;
+        if let Some(kind) = self.released {
+            return Ok(kind);
         }
         if !self
             .child
@@ -946,9 +988,10 @@ impl Residence {
                     .into(),
             );
         }
-        self.child
-            .require_cleanup_proof()
-            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "macos")]
+        if !self.child.release_complete() {
+            return Err("Cannot prove cleanup of detached provider work on macOS".into());
+        }
         if let Some(temp) = self.temp.take() {
             let path = temp.path().to_path_buf();
             if let Err(error) = temp.close_if_unused() {
@@ -964,7 +1007,16 @@ impl Residence {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+        #[cfg(target_os = "linux")]
         self.listener.retire()?;
+        #[cfg(target_os = "linux")]
+        let kind = ReceiptKind::Exact;
+        #[cfg(target_os = "macos")]
+        let kind = if self.child.cleanup_proved() {
+            ReceiptKind::Exact
+        } else {
+            ReceiptKind::Spared
+        };
         super::cleanup::publish(
             &self.record,
             self.recovery
@@ -973,18 +1025,21 @@ impl Residence {
                 .as_ref()
                 .ok_or("Native holder has no release proof")?,
             &self.recovery,
+            kind,
         )?;
+        #[cfg(target_os = "macos")]
+        self.listener.retire()?;
         self.record
             .remove_record(&self.directory)
             .map_err(|error| error.to_string())?;
-        self.released = true;
-        Ok(())
+        self.released = Some(kind);
+        Ok(kind)
     }
 
     fn pinned_launch_directory(
         &self,
     ) -> Result<(crate::agent_execution::DirectoryIdentity, &std::fs::File), String> {
-        if self.released {
+        if self.released.is_some() {
             return Err("Original native provider was released".into());
         }
         ensure_provider_live(&self.provider_pidfd)?;
@@ -1033,64 +1088,76 @@ impl Residence {
                 }
                 continue;
             }
-            let response = match request {
-                Request::Release | Request::ReleaseSparing => {
-                    let detached = if matches!(request, Request::ReleaseSparing) {
-                        DetachedWork::Spare
-                    } else {
-                        DetachedWork::Stop
-                    };
-                    // A server its launcher started is the provider's own.
-                    let server: Vec<Process> =
-                        self.recovery.server_process.iter().cloned().collect();
-                    match self
-                        .child
-                        .decide_detached(detached, &server)
-                        .map_err(|error| error.to_string())
-                        .and_then(|()| self.release())
-                    {
-                        Ok(()) => {
-                            let _ = send(&control, &Report::Released, TIMEOUT);
-                            return false;
-                        }
-                        Err(error) => Report::Failed(error),
+            let detached = match request {
+                Request::Release => Some(DetachedWork::Stop),
+                #[cfg(target_os = "linux")]
+                Request::ReleaseSparing => Some(DetachedWork::Spare),
+                #[cfg(target_os = "macos")]
+                Request::ReleaseSparingScoped => Some(DetachedWork::Spare),
+                _ => None,
+            };
+            let response = if let Some(detached) = detached {
+                // A server its launcher started is the provider's own.
+                let server: Vec<Process> = self.recovery.server_process.iter().cloned().collect();
+                match self
+                    .child
+                    .decide_detached(detached, &server)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| self.release())
+                {
+                    Ok(kind) => {
+                        let report = match kind {
+                            super::cleanup::ReceiptKind::Exact => Report::Released,
+                            #[cfg(target_os = "macos")]
+                            super::cleanup::ReceiptKind::Spared => Report::ReleasedSparing,
+                        };
+                        let _ = send(&control, &report, TIMEOUT);
+                        return false;
                     }
-                }
-                Request::Confirm {
-                    thread,
-                    identity,
-                    process,
-                } => {
-                    match self
-                        .verify_server(&process)
-                        .and_then(|()| pin_provider_process(&process))
-                        .and_then(|pidfd| {
-                            let server = process.pid as u32;
-                            let watched = process.clone();
-                            self.recovery.confirm(thread, identity, process)?;
-                            self.child.watch_server(watched);
-                            self.provider_pidfd = pidfd;
-                            self.keep_commands_apart(server);
-                            Ok(())
-                        }) {
-                        Ok(()) => Report::Confirmed,
-                        Err(error) => Report::Failed(error),
-                    }
-                }
-                Request::UpdateSource {
-                    source,
-                    execution_console,
-                    paired_holder,
-                } => match self.recovery.update_source_for_role(
-                    source,
-                    execution_console,
-                    paired_holder,
-                    &self.owner_application,
-                ) {
-                    Ok(()) => Report::SourceUpdated,
                     Err(error) => Report::Failed(error),
-                },
-                _ => Report::Failed("Unexpected request on an owned native holder".into()),
+                }
+            } else {
+                match request {
+                    #[cfg(target_os = "macos")]
+                    Request::ReleaseSparing => Report::Failed(
+                        "This caller cannot acknowledge a scoped native close".into(),
+                    ),
+                    Request::Confirm {
+                        thread,
+                        identity,
+                        process,
+                    } => {
+                        match self
+                            .verify_server(&process)
+                            .and_then(|()| pin_provider_process(&process))
+                            .and_then(|pidfd| {
+                                let server = process.pid as u32;
+                                let watched = process.clone();
+                                self.recovery.confirm(thread, identity, process)?;
+                                self.child.watch_server(watched);
+                                self.provider_pidfd = pidfd;
+                                self.keep_commands_apart(server);
+                                Ok(())
+                            }) {
+                            Ok(()) => Report::Confirmed,
+                            Err(error) => Report::Failed(error),
+                        }
+                    }
+                    Request::UpdateSource {
+                        source,
+                        execution_console,
+                        paired_holder,
+                    } => match self.recovery.update_source_for_role(
+                        source,
+                        execution_console,
+                        paired_holder,
+                        &self.owner_application,
+                    ) {
+                        Ok(()) => Report::SourceUpdated,
+                        Err(error) => Report::Failed(error),
+                    },
+                    _ => Report::Failed("Unexpected request on an owned native holder".into()),
+                }
             };
             if send(&control, &response, TIMEOUT).is_err() {
                 return self.recovery.is_durable();
@@ -1268,12 +1335,15 @@ fn wait_for_control(
     children: &crate::daemon::owned_children::OwnedChildren,
     child_events: &ChildEvents,
 ) -> io::Result<()> {
-    wait_for_control_with_reaper(fd, child_events, || children.reap_exited_descendants())
+    wait_for_control_with_reaper(fd, child_events, children.descendant_events(), || {
+        children.reap_exited_descendants()
+    })
 }
 
 fn wait_for_control_with_reaper(
     fd: RawFd,
     child_events: &ChildEvents,
+    descendant_events: Option<RawFd>,
     mut reap: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let mut reported = false;
@@ -1302,13 +1372,21 @@ fn wait_for_control_with_reaper(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: descendant_events.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: the array and both owned descriptors remain live throughout
-        // poll. No timer is armed: an idle holder sleeps indefinitely.
+        // SAFETY: the array and each borrowed descriptor remain live
+        // throughout poll. Absent watches use an ignored negative fd. No
+        // timer is armed: an idle holder sleeps indefinitely.
         match unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) } {
             result if result > 0 => {
                 if poll[1].revents != 0 {
                     child_events.drain()?;
+                }
+                if poll[1].revents != 0 || poll[2].revents != 0 {
                     // A simultaneous control event must not postpone reaping.
                     inspect_children();
                 }
@@ -1378,17 +1456,29 @@ impl Drop for Listener {
 
 impl Drop for Residence {
     fn drop(&mut self) {
-        if self.released {
+        if self.released.is_some() {
             return;
         }
         // No completion receipt or discovery retirement until every owned
         // descendant is reaped. A stuck child leaves this small owner alive.
+        #[cfg(target_os = "linux")]
         while !self
             .child
             .terminate(Duration::from_secs(2))
             .unwrap_or(false)
         {
             std::thread::sleep(Duration::from_millis(100));
+        }
+        // This helper can lose sight of detached work. Bound its final
+        // attempt and preserve the discovery record when proof is unavailable.
+        #[cfg(target_os = "macos")]
+        if !self
+            .child
+            .terminate(Duration::from_secs(2))
+            .unwrap_or(false)
+            || !self.child.release_complete()
+        {
+            return;
         }
         // Only that wait is unbounded. Once the provider is gone, a release
         // that cannot be recorded (its runtime directory removed, say) would
@@ -1421,9 +1511,12 @@ impl std::ops::DerefMut for Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         while !self.terminate(Duration::from_secs(2)).unwrap_or(false) {
             std::thread::sleep(Duration::from_millis(100));
         }
+        #[cfg(target_os = "macos")]
+        let _ = self.terminate(Duration::from_secs(2));
     }
 }
 
@@ -1605,13 +1698,20 @@ extern "C" fn serve_if_requested() {
             drop(control);
             while residence.orphan() {}
         }
-        Ok(())
+        #[cfg(target_os = "linux")]
+        return Ok(());
+        #[cfg(target_os = "macos")]
+        return Ok(residence.child.cleanup_proved());
     })();
     #[cfg(target_os = "macos")]
     if provider_started {
-        // Explicit Close publishes its own receipt. Abnormal exit cannot
-        // promote an empty wait set to proof about tools reparented to launchd.
-        std::process::exit(i32::from(result.is_err()));
+        // The watch must cover the whole executed lifetime with no unknown
+        // fork. Regular teardown cannot infer that from an empty wait set.
+        std::process::exit(if result == Ok(true) {
+            CLEANUP_PROVED
+        } else {
+            i32::from(result.is_err())
+        });
     }
     #[cfg(target_os = "linux")]
     let _ = (provider_started, result);
@@ -2197,7 +2297,7 @@ exec /bin/sleep 60
             let mut release_error = None;
             let mut observation_error = None;
             let mut gate = Some(gate);
-            let waited = wait_for_control_with_reaper(fd, &child_events, || {
+            let waited = wait_for_control_with_reaper(fd, &child_events, None, || {
                 calls += 1;
                 if calls == 1 {
                     server.reap_exited_descendants()?;
@@ -2324,6 +2424,7 @@ exec /bin/sleep 60
         }
     }
 
+    #[cfg(target_os = "linux")] // Requires procfs inspection and proof after the provider forks.
     #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
         use std::os::unix::ffi::OsStrExt;
@@ -2563,7 +2664,7 @@ exec /bin/sleep 60
         std::fs::write(cwd.join("marker"), "original").unwrap();
         std::fs::write(
             cwd.join("provider"),
-            "#!/bin/sh\n/bin/cat marker > observed\nexec /bin/sleep 60\n",
+            "#!/bin/sh\nIFS= read -r marker < marker\nprintf '%s' \"$marker\" > observed\nexec /bin/sleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(cwd.join("provider"), std::fs::Permissions::from_mode(0o700))
@@ -3071,9 +3172,21 @@ exec /bin/sleep 60
         holder.close_inner(false, DetachedWork::Stop).unwrap_err();
         assert_eq!(evidence(), Some(record.clone()));
         kill(&record.root);
-        holder.close_inner(false, DetachedWork::Stop).unwrap();
-        assert_eq!(evidence(), None, "its record is retired as discovery would");
-        // Nothing is left to release when the Holder is dropped.
+        let result = holder.close_inner(false, DetachedWork::Stop);
+        #[cfg(target_os = "linux")]
+        {
+            result.unwrap();
+            assert_eq!(evidence(), None, "its record is retired as discovery would");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            result.unwrap_err();
+            assert_eq!(
+                evidence(),
+                Some(record),
+                "a dead watcher cannot prove cleanup"
+            );
+        }
         drop(holder);
     }
 
@@ -3153,6 +3266,87 @@ exec /bin/sleep 60
         assert!(record.root.reaped(), "the holder stopped its provider");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_explicit_spare_keeps_resume_evidence_separate_from_exact_cleanup() {
+        const STAGE: &str = "CAGENTS_NATIVE_SCOPED_SPARE_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::an_explicit_spare_keeps_resume_evidence_separate_from_exact_cleanup", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        let listener = source.owned_codex_listener.as_mut().unwrap();
+        listener.allocator.boot_id = boot;
+        let socket = listener.socket.clone();
+        let working = tempfile::tempdir().unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let working = working.path();
+        let spec = ProcessSpec {
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "/bin/sleep 10 & echo ready > ready; wait".into(),
+            ],
+            working_directory: working.to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+            execution: Some(context.clone()),
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            messages: None,
+            stdout_noise: None,
+            followed: false,
+        };
+        let mut holder = spawn(spec, source.clone()).unwrap();
+        context.installed();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !working.join("ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "provider did not start its child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let control = holder.control.as_ref().unwrap();
+        send(control, &Request::ReleaseSparing, TIMEOUT).unwrap();
+        assert!(matches!(
+            receive(control, TIMEOUT).unwrap(),
+            Some(Report::Failed(_))
+        ));
+        assert!(holder.identity.record.root.is_current());
+        holder.close_inner(true, DetachedWork::Spare).unwrap();
+        let receipt = super::super::closed_source(&source, &proof)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.0, holder.identity.record);
+        assert!(super::super::closed_source_for_stop(&source, &proof).is_err());
+        assert!(holder.identity.receipt(true, DetachedWork::Spare).unwrap());
+        assert!(!holder.identity.receipt(true, DetachedWork::Stop).unwrap());
+        let startup = super::super::cleanup::Startup {
+            terminal: source.id,
+            holder: holder.identity.record.holder.clone(),
+            proof,
+        };
+        assert!(!startup.consume().unwrap());
+    }
+
+    #[cfg(target_os = "linux")] // The fixture asserts reparenting to the holder as a subreaper.
     #[test]
     fn an_ordinary_release_leaves_what_the_provider_leaves() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_SPARING_TEST";
