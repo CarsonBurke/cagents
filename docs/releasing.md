@@ -149,10 +149,13 @@ cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
 The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
 the release's members, refuses links in the tree, and checks every signature in
 a staging directory before it moves the release into place. It prepares the
-bundle and login item there too, checks that each program runs from its
-version tree, and only then moves `current`, the bundle, the links and the
-login item; a failure or interrupt before it records the version kept for
-rollback puts each back, leaving the previous installation as it was. It holds
+bundle there too, and the login item in a hidden folder beside the one it
+replaces, so that publishing it is a rename on the same volume whatever the
+prefix. It checks that each program runs from its version tree, and only then
+moves `current`, the bundle, the links and the login item. Renaming the record
+of the version kept for rollback into place commits the install; a failure or
+interrupt before that puts each change back, judging what to undo from what
+each step left on disk, so the previous installation stays as it was. It holds
 a lock on the prefix while it works. It installs over a running daemon only of the
 same version, asking the installed CLI, which speaks that daemon's protocol:
 the daemon cannot yet hand its sessions to another version on macOS, so it
