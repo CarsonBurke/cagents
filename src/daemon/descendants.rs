@@ -16,10 +16,10 @@ use std::{
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-pub(super) struct Tracker {
+pub(crate) struct Tracker {
     queue: OwnedFd,
     root: Process,
     tracked: BTreeMap<i32, Process>,
@@ -28,7 +28,7 @@ pub(super) struct Tracker {
 }
 
 impl Tracker {
-    pub(super) fn fd(&self) -> RawFd {
+    pub(crate) fn fd(&self) -> RawFd {
         self.queue.as_raw_fd()
     }
 
@@ -68,7 +68,7 @@ impl Tracker {
                     drop(child);
                     result
                 })?;
-            let tracker = (|| {
+            let tracker = (|| -> io::Result<Self> {
                 let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
                 owner.read_exact(&mut bytes)?;
                 let pid = libc::pid_t::from_ne_bytes(bytes);
@@ -205,7 +205,7 @@ impl Tracker {
 
     /// A control or child wake can give us a pending fork to inspect. Idle
     /// service does not scan the process table without an observed fork.
-    pub(super) fn observe(&mut self) -> io::Result<()> {
+    pub(crate) fn observe(&mut self) -> io::Result<()> {
         if self.events()? {
             self.capture().inspect_err(|_| self.lost_coverage = true)?;
         }
@@ -217,6 +217,9 @@ impl Tracker {
     /// observed epochs so later reparenting cannot hide them.
     pub(super) fn census(&mut self) -> io::Result<()> {
         self.events()?;
+        if self.observed_no_fork_exit() {
+            return Ok(());
+        }
         self.capture().inspect_err(|_| self.lost_coverage = true)
     }
 
@@ -309,7 +312,7 @@ impl Tracker {
 
     /// Stop all still-observable exact descendants. Darwin's process pin
     /// documents the residual check-to-signal interval for non-children.
-    pub(super) fn stop(&mut self) -> io::Result<bool> {
+    pub(crate) fn stop(&mut self) -> io::Result<bool> {
         let mut failure = self.census().err();
         let mut live = false;
         for process in self.tracked.values() {
@@ -325,13 +328,27 @@ impl Tracker {
         failure.map_or(Ok(!live), Err)
     }
 
+    pub(crate) fn stop_known(&mut self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while !self.stop()? {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "known provider descendants are still stopping",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
     /// Called only after the owner has reaped the root. Observation of all
     /// known exits is weaker than a watch that saw no fork the entire time.
-    pub(super) fn prove_empty(&mut self) -> bool {
-        self.events().is_ok()
-            && self.reaped_exit_event
-            && !self.lost_coverage
-            && self.tracked.is_empty()
+    pub(crate) fn prove_empty(&mut self) -> bool {
+        self.events().is_ok() && self.observed_no_fork_exit()
+    }
+
+    fn observed_no_fork_exit(&self) -> bool {
+        self.reaped_exit_event && !self.lost_coverage && self.tracked.is_empty()
     }
 }
 

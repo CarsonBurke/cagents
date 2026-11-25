@@ -311,8 +311,16 @@ impl OwnedChildren {
             }
             self.signal_provider(libc::SIGKILL)?;
             #[cfg(target_os = "macos")]
-            if let Some(child) = &self.child {
-                crate::process::identity::finish_unreaped_group(child.id() as i32, timeout)?;
+            if let Some(child) = &self.child
+                && let Err(error) =
+                    crate::process::identity::finish_unreaped_group(child.id() as i32, timeout)
+            {
+                if self.detached == DetachedWork::Stop
+                    && let Some(tracker) = &mut self.descendants
+                {
+                    let _ = tracker.get_mut().stop_known(timeout);
+                }
+                return Err(error);
             }
             self.group_signalled = true;
         }
@@ -440,18 +448,6 @@ impl OwnedChildren {
     }
 }
 
-pub(crate) fn require_detached_cleanup_proof(detached: DetachedWork) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    if detached == DetachedWork::Stop {
-        return Err(io::Error::other(
-            "The provider stopped, but macOS could not confirm cleanup of detached processes",
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    let _ = detached;
-    Ok(())
-}
-
 /// Whether `pid`, an unreaped child of this process, exited by `SIGKILL`.
 /// WNOWAIT leaves its status for the reap; any other process fails with
 /// ECHILD.
@@ -497,7 +493,7 @@ pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
         .collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))] // Adopts work through the Linux subreaper.
 pub(crate) mod tests {
     use super::*;
     use std::{os::unix::process::CommandExt, path::Path, process::Command};

@@ -180,6 +180,8 @@ enum Report {
     Confirmed,
     SourceUpdated,
     Released,
+    #[cfg(target_os = "macos")]
+    ReleasedSparing,
     Inspected {
         protocol: u32,
         record: Record,
@@ -374,6 +376,10 @@ impl Holder {
         retain: bool,
         detached: DetachedWork,
     ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if retain && detached == DetachedWork::Spare {
+            return Err("An exact native cleanup receipt requires stopping detached work".into());
+        }
         if self.identity.receipt(retain)? {
             self.control.take();
             self.release_on_drop = false;
@@ -396,6 +402,12 @@ impl Holder {
                 if !self.identity.receipt(retain)? {
                     return Err("Native holder released without durable cleanup evidence".into());
                 }
+                self.control.take();
+                self.release_on_drop = false;
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            Ok(Some(Report::ReleasedSparing)) if matches!(request, Request::ReleaseSparing) => {
                 self.control.take();
                 self.release_on_drop = false;
                 return Ok(());
@@ -1057,7 +1069,15 @@ impl Residence {
                         .and_then(|()| self.release())
                     {
                         Ok(()) => {
-                            let _ = send(&control, &Report::Released, TIMEOUT);
+                            #[cfg(target_os = "linux")]
+                            let report = Report::Released;
+                            #[cfg(target_os = "macos")]
+                            let report = if self.child.cleanup_proved() {
+                                Report::Released
+                            } else {
+                                Report::ReleasedSparing
+                            };
+                            let _ = send(&control, &report, TIMEOUT);
                             return false;
                         }
                         Err(error) => Report::Failed(error),
@@ -3193,6 +3213,7 @@ exec /bin/sleep 60
         assert!(record.root.reaped(), "the holder stopped its provider");
     }
 
+    #[cfg(target_os = "linux")] // The fixture asserts reparenting to the holder as a subreaper.
     #[test]
     fn an_ordinary_release_leaves_what_the_provider_leaves() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_SPARING_TEST";
