@@ -766,8 +766,9 @@ fn prepare_with_checkpoints(
             )));
         }
         // Establish anonymous-file support before creating copy directories.
-        // Its inode stays unnamed until exact-FD no-replace publication; a
-        // shared parent cannot replace a temporary source or cleanup target.
+        // Its inode stays out of other users' reach until exact no-replace
+        // publication; a shared parent cannot replace a temporary source or
+        // cleanup target.
         let mut output = fs_safety::create_anonymous_in(target, 0o600).map_err(error)?;
         let parent = fs_safety::create_directories_beneath(
             target,
@@ -809,7 +810,7 @@ fn prepare_with_checkpoints(
             before_copy_publication(&parent, &output, &path);
             fs_safety::link_anonymous_new(
                 &parent,
-                &output,
+                &mut output,
                 path.file_name().expect("matched file has a name"),
             )
             .map_err(SetupError::Filesystem)
@@ -966,10 +967,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn copy_only_preserves_modes_skips_missing_sources_and_never_overwrites_tracked_files() {
         let fixture = Fixture::new();
         let plan = fixture.config("copy = ['.env*', 'tracked', 'missing/local.toml']");
@@ -1121,10 +1118,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn literal_copy_works_without_enumerating_primary_directory() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
@@ -1139,11 +1132,63 @@ mod tests {
         );
     }
 
+    /// Linux keeps the output unnamed until publication, so no entry in the
+    /// destination can stand in for it.
+    #[cfg(target_os = "linux")]
+    fn assert_unreachable_before_publication(parent: &fs_safety::Root, output: &fs::File) {
+        assert_eq!(output.metadata().unwrap().nlink(), 0);
+        assert!(
+            !fs::read_dir(parent.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".cagents-tmp-")
+            }),
+            "the copied output must have no replaceable source entry"
+        );
+    }
+
+    /// Darwin names the output once, inside a staging directory only this
+    /// user can enter or change, and nowhere in the destination itself.
+    #[cfg(target_os = "macos")]
+    fn assert_unreachable_before_publication(parent: &fs_safety::Root, output: &fs::File) {
+        let held = output.metadata().unwrap();
+        assert_eq!(held.nlink(), 1);
+        let mut staging = Vec::new();
+        for entry in fs::read_dir(parent.path()).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            assert_ne!(
+                (metadata.dev(), metadata.ino()),
+                (held.dev(), held.ino()),
+                "the copied output must have no replaceable source entry"
+            );
+            if metadata.is_dir()
+                && entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".cagents-tmp-")
+            {
+                assert_eq!(metadata.mode() & 0o7777, 0o700);
+                staging.push(entry.path());
+            }
+        }
+        let [staging] = staging.as_slice() else {
+            panic!("expected one staging directory, found {staging:?}");
+        };
+        let names: Vec<_> = fs::read_dir(staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let [named] = names.as_slice() else {
+            panic!("expected the staged output alone, found {names:?}");
+        };
+        let named = fs::symlink_metadata(named).unwrap();
+        assert_eq!((named.dev(), named.ino()), (held.dev(), held.ino()));
+    }
+
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn anonymous_copy_publishes_the_owned_inode_and_never_cleans_foreign_names() {
         use std::os::unix::fs::FileExt;
         for collision in [false, true] {
@@ -1164,17 +1209,7 @@ mod tests {
                 || {},
                 |parent, output, path| {
                     assert_eq!(path, Path::new(".env"));
-                    assert_eq!(output.metadata().unwrap().nlink(), 0);
-                    assert!(
-                        !fs::read_dir(parent.path()).unwrap().any(|entry| {
-                            entry
-                                .unwrap()
-                                .file_name()
-                                .as_encoded_bytes()
-                                .starts_with(b".cagents-tmp-")
-                        }),
-                        "the copied output must have no replaceable source entry"
-                    );
+                    assert_unreachable_before_publication(parent, output);
                     retained = Some(output.try_clone().unwrap());
                     fs::write(&foreign, "foreign temporary lookalike").unwrap();
                     if collision {
@@ -1220,10 +1255,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn anonymous_copy_preserves_mode_under_restrictive_umask() {
         const CHILD: &str = "CAGENTS_SETUP_ANONYMOUS_UMASK_CHILD";
         if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
@@ -1550,10 +1581,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn copy_preserves_bytes_mode_and_matching_source_group() {
         // This ordinary copy control does not exercise group restoration:
         // preserve_group returns before fchown when both groups already match.
@@ -1590,10 +1617,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn recursive_globs_are_bounded_to_real_directories_and_copy_nested_files() {
         let fixture = Fixture::new();
         fs::create_dir_all(fixture.primary.join("config/nested")).unwrap();
@@ -1636,10 +1659,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn broad_globs_do_not_copy_other_managed_worktrees_or_the_destination() {
         let fixture = Fixture::with_nested_destination(true);
         let other = fixture.primary.join(".worktrees/other");
@@ -1686,10 +1705,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn keeps_existing_untracked_and_dangling_symlink_destinations() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "source").unwrap();
@@ -1711,10 +1726,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn explicit_trust_is_project_local_and_exact_config_changes_revoke_it() {
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
@@ -1804,10 +1815,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "copies need an unnamed file, which fs_safety refuses on Darwin for want of O_TMPFILE"
-    )]
     fn inherited_git_environment_cannot_redirect_setup() {
         const CHILD_PRIMARY: &str = "CAGENTS_SETUP_TEST_PRIMARY";
         const CHILD_DESTINATION: &str = "CAGENTS_SETUP_TEST_DESTINATION";

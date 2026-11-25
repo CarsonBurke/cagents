@@ -969,7 +969,7 @@ fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveEr
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveError> {
+pub(super) fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveError> {
     let reported = parent.path.join(name);
     let leaf = c_component(name.as_os_str(), &parent.path)?;
     let mut observed = std::mem::MaybeUninit::<libc::stat>::zeroed();
@@ -988,6 +988,7 @@ fn resolve_fresh_directory(parent: &Root, name: &Path) -> Result<Root, ResolveEr
     }
     // SAFETY: fstatat succeeded, so the buffer is initialized.
     let observed = unsafe { observed.assume_init() };
+    // SAFETY: geteuid has no preconditions and no failure state.
     let unsearchable = observed.st_mode & libc::S_IFMT == libc::S_IFDIR
         && observed.st_uid == unsafe { libc::geteuid() }
         && observed.st_mode & libc::S_IXUSR == 0;
@@ -1499,8 +1500,9 @@ fn unused_name(namespace: &Root) -> Result<OsString, ResolveError> {
     // No existence check is authority. Every actual mkdir/rename is exclusive.
     temporary_name().map_err(|e| ResolveError::io(&namespace.path, &e))
 }
-fn namespace_protected(root: &Root) -> io::Result<()> {
+pub(super) fn namespace_protected(root: &Root) -> io::Result<()> {
     let metadata = root.metadata()?;
+    // SAFETY: geteuid has no preconditions and no failure state.
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

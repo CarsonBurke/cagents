@@ -461,6 +461,16 @@ fn directory_entry_identity(
     directory: &Root,
     name: &OsStr,
 ) -> Result<Option<(u64, u64)>, ResolveError> {
+    let (kind, identity) = entry_identity(directory, name)?;
+    Ok((kind == libc::S_IFDIR).then_some(identity))
+}
+
+/// The file type bits and `(device, inode)` of whatever `name` in
+/// `directory` is, observed as [`directory_entry_identity`] does.
+fn entry_identity(
+    directory: &Root,
+    name: &OsStr,
+) -> Result<(libc::mode_t, (u64, u64)), ResolveError> {
     let reported = directory.path.join(name);
     let raw = c_component(name, &directory.path)?;
     let mut entry = std::mem::MaybeUninit::<libc::stat>::zeroed();
@@ -484,7 +494,7 @@ fn directory_entry_identity(
     // The standard library widens Darwin's signed `dev_t` the same way.
     #[cfg(target_os = "macos")]
     let device = entry.st_dev as u64;
-    Ok((entry.st_mode & libc::S_IFMT == libc::S_IFDIR).then_some((device, entry.st_ino)))
+    Ok((entry.st_mode & libc::S_IFMT, (device, entry.st_ino)))
 }
 
 /// The path the kernel currently records for an open descriptor. It is a name,
@@ -892,12 +902,41 @@ fn clear_errno() {
     }
 }
 
+/// A regular file being written for publication under a new name, which no
+/// other user can reach or replace until [`link_anonymous_new`] publishes it.
+///
+/// Linux keeps it unnamed (`O_TMPFILE`). Darwin has no unnamed files, so it
+/// names the file inside a fresh staging directory that only this user can
+/// enter or change, and removes both when the file is dropped unpublished or
+/// once it is published. A process that dies first leaves that staging
+/// directory behind, which Linux never does.
+#[derive(Debug)]
+pub struct AnonymousFile {
+    file: File,
+    #[cfg(target_os = "macos")]
+    staging: Option<Staging>,
+}
+
+impl std::ops::Deref for AnonymousFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for AnonymousFile {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
 /// Creates an unnamed regular file on this retained directory's filesystem.
 ///
 /// No directory entry can be substituted or require cleanup. Unsupported
 /// filesystems are an explicit refusal; there is no named temporary fallback.
 #[cfg(target_os = "linux")]
-pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveError> {
+pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<AnonymousFile, ResolveError> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: the Root owns its descriptor, the literal is NUL-terminated,
     // and a successful openat returns a fresh owned descriptor.
@@ -929,7 +968,7 @@ pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveE
             "The copy file is not an unnamed regular inode",
         ));
     }
-    Ok(file)
+    Ok(AnonymousFile { file })
 }
 
 /// Publishes the exact unnamed file without replacing a destination entry.
@@ -939,7 +978,12 @@ pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<File, ResolveE
 /// The caller keeps the File alive across linkat. Failure leaves the output
 /// unnamed and never unlinks or overwrites anything in the destination.
 #[cfg(target_os = "linux")]
-pub fn link_anonymous_new(directory: &Root, file: &File, to: &OsStr) -> Result<(), ResolveError> {
+pub fn link_anonymous_new(
+    directory: &Root,
+    file: &mut AnonymousFile,
+    to: &OsStr,
+) -> Result<(), ResolveError> {
+    let file = &file.file;
     use std::os::unix::fs::MetadataExt;
     let destination = c_component(to, directory.path())?;
     let metadata = file
@@ -973,24 +1017,211 @@ pub fn link_anonymous_new(directory: &Root, file: &File, to: &OsStr) -> Result<(
     Ok(())
 }
 
-/// Darwin has no unnamed file (`O_TMPFILE`), and this contract allows no named
-/// temporary in its place, so the refusal is the one unsupported filesystems
-/// give on Linux.
+/// The private directory that names a Darwin [`AnonymousFile`] until it is
+/// published.
 #[cfg(target_os = "macos")]
-pub fn create_anonymous_in(directory: &Root, _mode: u32) -> Result<File, ResolveError> {
-    Err(ResolveError::message(
-        directory.path(),
-        "Cannot create an anonymous copy file; this platform has no O_TMPFILE",
-    ))
+#[derive(Debug)]
+struct Staging {
+    /// The directory that holds the staging directory.
+    parent: Root,
+    /// The staging directory's name in `parent`.
+    name: OsString,
+    directory: Root,
+    /// The file's name in `directory` and its `(device, inode)`, until it is
+    /// published.
+    file: Option<(OsString, (u64, u64))>,
+    /// Whether `directory` was shown to be an empty one of this user's, and
+    /// so may be removed once empty again.
+    removable: bool,
 }
 
-/// See the Darwin [`create_anonymous_in`]: no unnamed file can exist to publish.
+/// Creates a regular file on this retained directory's filesystem that other
+/// users cannot reach, for [`link_anonymous_new`] to publish.
+///
+/// The file is created `O_EXCL` inside a fresh staging directory made in
+/// `directory`. Before anything is created in it, that directory must be this
+/// user's, mode 0700, without an ACL, and then still empty, so no other user
+/// can list it, open the file, or replace its name; one that inherited an ACL
+/// has it removed first, and anything an inherited entry let another user put
+/// there in the meantime refuses the copy. mkdir returns no descriptor, so
+/// where other users can write `directory` one of them could swap the staging
+/// name for another directory of this user's between mkdir and open. That
+/// directory then has its mode and ACL made private, and is used and removed
+/// only if it is empty, which a user who can write `directory` could do to it
+/// anyway.
+///
+/// A volume mounted to ignore ownership, such as an external drive, enforces
+/// no modes at all, so there the staged file is as reachable as the copy it
+/// becomes once published.
 #[cfg(target_os = "macos")]
-pub fn link_anonymous_new(directory: &Root, _file: &File, to: &OsStr) -> Result<(), ResolveError> {
-    Err(ResolveError::message(
-        &directory.path.join(to),
-        "Only an unnamed regular copy file may be published",
-    ))
+pub fn create_anonymous_in(directory: &Root, mode: u32) -> Result<AnonymousFile, ResolveError> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = directory
+        .try_clone()
+        .map_err(|error| ResolveError::io(&directory.path, &error))?;
+    let mut created = None;
+    for _ in 0..TEMPORARY_NAME_ATTEMPTS {
+        let name = temporary_name().map_err(|error| ResolveError::io(&directory.path, &error))?;
+        let raw = c_component(&name, &directory.path)?;
+        // SAFETY: the Root owns its descriptor and the name outlives the call.
+        if unsafe { libc::mkdirat(directory.descriptor(), raw.as_ptr(), 0o700) } == 0 {
+            created = Some(name);
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(ResolveError::io(&directory.path, &error));
+        }
+    }
+    let name = created.ok_or_else(|| {
+        ResolveError::message(
+            &directory.path,
+            "no unused staging directory name was found",
+        )
+    })?;
+    let reported = directory.path.join(&name);
+    // A fresh name that cannot be opened is left alone: nothing shows that
+    // what it holds now is the directory just made.
+    let mut staging = Staging {
+        directory: directory_creation::resolve_fresh_directory(directory, Path::new(&name))?,
+        parent,
+        name,
+        file: None,
+        removable: false,
+    };
+    let metadata = staging
+        .directory
+        .metadata()
+        .map_err(|error| ResolveError::io(&reported, &error))?;
+    let parent_device = directory
+        .metadata()
+        .map_err(|error| ResolveError::io(&directory.path, &error))?
+        .dev();
+    // SAFETY: geteuid has no preconditions and no failure state.
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.dev() != parent_device {
+        return Err(ResolveError::message(
+            &reported,
+            "the staging directory is not this user's, on this filesystem",
+        ));
+    }
+    // Made private before it is listed, so neither a umask that withholds
+    // the owner's read nor an inherited entry stops this user listing it, and
+    // whatever another user put there before is still seen below.
+    set_directory_permissions(&staging.directory, 0o700)
+        .and_then(|()| {
+            let listing = File::from(reopen_directory_for_reading(&staging.directory)?);
+            AccessAcl(None).apply(&listing)
+        })
+        .and_then(|()| directory_creation::namespace_protected(&staging.directory))
+        .map_err(|error| ResolveError::io(&reported, &error))?;
+    if !entry_names(&staging.directory, 1)?.0.is_empty() {
+        return Err(ResolveError::message(
+            &reported,
+            "the staging directory is not empty",
+        ));
+    }
+    // An empty private directory of this user's from here on, so dropping
+    // `staging` may remove it while its name still holds it.
+    staging.removable = true;
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // Dropping `staging` on an error removes the staging directory.
+    let (file, file_name) = create_temporary_with(&staging.directory, flags, mode)?;
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            // The name is this user's fresh file, in a directory no one else
+            // can change, so it goes too.
+            let _ = unlink_within(&staging.directory, &file_name);
+            return Err(ResolveError::io(&reported, &error));
+        }
+    };
+    staging.file = Some((file_name, (metadata.dev(), metadata.ino())));
+    let file = AnonymousFile {
+        file,
+        staging: Some(staging),
+    };
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(ResolveError::message(
+            &reported,
+            "The copy file is not a fresh regular inode",
+        ));
+    }
+    Ok(file)
+}
+
+/// Publishes the exact staged file under `to` without replacing a destination
+/// entry, by an exclusive rename out of its private staging directory; then
+/// removes that directory. Failure leaves the file staged and never unlinks
+/// or overwrites anything in the destination.
+#[cfg(target_os = "macos")]
+pub fn link_anonymous_new(
+    directory: &Root,
+    file: &mut AnonymousFile,
+    to: &OsStr,
+) -> Result<(), ResolveError> {
+    use std::os::unix::fs::MetadataExt;
+    let reported = directory.path.join(to);
+    let held = file
+        .file
+        .metadata()
+        .map_err(|error| ResolveError::io(&reported, &error))?;
+    let Some(staging) = file.staging.as_mut() else {
+        return Err(ResolveError::message(
+            &reported,
+            "Only an unpublished copy file may be published",
+        ));
+    };
+    let Some((name, identity)) = staging.file.as_ref() else {
+        return Err(ResolveError::message(
+            &reported,
+            "Only an unpublished copy file may be published",
+        ));
+    };
+    // Only this user can change the staging directory, so its entry is still
+    // the held file unless this user's own processes interfered.
+    let (kind, named) = entry_identity(&staging.directory, name)?;
+    if !held.is_file()
+        || kind != libc::S_IFREG
+        || *identity != (held.dev(), held.ino())
+        || named != *identity
+    {
+        return Err(ResolveError::message(
+            &reported,
+            "The staged copy file was replaced; it was not published",
+        ));
+    }
+    rename_new_between(&staging.directory, name, directory, to)?;
+    staging.file = None;
+    file.staging = None;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Staging {
+    /// Removes the unpublished file and then the staging directory, each only
+    /// if its name still holds the one this created. Anything else leaves
+    /// both in place.
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if let Some((file, identity)) = self.file.take() {
+            let still_named = entry_identity(&self.directory, &file)
+                .is_ok_and(|(kind, named)| kind == libc::S_IFREG && named == identity);
+            if !still_named || unlink_within(&self.directory, &file).is_err() {
+                return;
+            }
+        }
+        if !self.removable {
+            return;
+        }
+        let Ok(held) = self.directory.metadata() else {
+            return;
+        };
+        let still_named = directory_entry_identity(&self.parent, &self.name)
+            .is_ok_and(|named| named == Some((held.dev(), held.ino())));
+        if still_named {
+            let _ = remove_directory_within(&self.parent, &self.name);
+        }
+    }
 }
 
 /// Creates a file inside `directory` with `mode`, for the atomic
@@ -1002,6 +1233,16 @@ pub fn link_anonymous_new(directory: &Root, _file: &File, to: &OsStr) -> Result<
 /// the case where randomness is unavailable.
 pub fn create_temporary_in(directory: &Root, mode: u32) -> Result<(File, OsString), ResolveError> {
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    create_temporary_with(directory, flags, mode)
+}
+
+/// [`create_temporary_in`] with the caller's `open` flags, which must include
+/// `O_CREAT | O_EXCL | O_NOFOLLOW`.
+fn create_temporary_with(
+    directory: &Root,
+    flags: libc::c_int,
+    mode: u32,
+) -> Result<(File, OsString), ResolveError> {
     let mode = kernel_mode(mode).map_err(|error| ResolveError::io(&directory.path, &error))?;
     let mut last = None;
     for _ in 0..TEMPORARY_NAME_ATTEMPTS {
