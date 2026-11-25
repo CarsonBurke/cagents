@@ -809,14 +809,16 @@ mod tests {
         assert!(journal.record(run, false).unwrap().is_some());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn database_uri_preserves_non_utf8_and_uri_metacharacters() {
+    fn database_uri_preserves_unusual_file_names_and_uri_metacharacters() {
+        #[cfg(target_os = "linux")]
         use std::os::unix::ffi::OsStringExt;
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(std::ffi::OsString::from_vec(
-            b"attention-\xff?#%.sqlite3".to_vec(),
-        ));
+        #[cfg(target_os = "linux")]
+        let name = std::ffi::OsString::from_vec(b"attention-\xff?#%.sqlite3".to_vec());
+        #[cfg(target_os = "macos")] // APFS requires valid UTF-8.
+        let name = std::ffi::OsString::from("attention-雪?#%.sqlite3");
+        let path = directory.path().join(name);
         let mut journal = Journal::open(&path).unwrap();
         let notice = journal
             .record(event(TerminalId::new(), "uri"), false)
