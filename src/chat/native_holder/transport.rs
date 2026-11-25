@@ -1507,8 +1507,7 @@ fn read_exact(
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or("Native holder read timed out")?;
-        control
-            .set_read_timeout(Some(remaining))
+        crate::descriptor::set_read_timeout_or_hangup(control, Some(remaining))
             .map_err(|error| error.to_string())?;
         match (&*control).read(bytes) {
             Ok(0) if !read => return Ok(false),
