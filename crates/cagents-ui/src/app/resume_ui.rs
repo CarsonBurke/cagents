@@ -2610,11 +2610,19 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
             .reaches()
             .map(|reach| {
                 let count = counts[reach.index()].to_string();
-                let label = format!("{} {count}", scope.label(reach));
                 // As a scan finds conversations, the counts climb; each
                 // segment keeps room for three digits, so the others don't
                 // shuffle along the bar while it does.
-                let room = format!("{} {}", scope.label(reach), "0".repeat(count.len().max(3)));
+                let room = "0".repeat(count.len().max(3));
+                let counted = |count: String| -> Element<'a, Message> {
+                    widget::row::with_children(vec![
+                        design::body(scope.label(reach)).into(),
+                        crate::ui_controls::count_badge(count, Default::default()),
+                    ])
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center)
+                    .into()
+                };
                 // The sidebar's icons: its worktree glyph for a worktree, a
                 // folder for a project.
                 let icon = match reach {
@@ -2630,8 +2638,8 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
                     ));
                 }
                 contents.push(crate::ui_controls::reserved(
-                    design::body(label),
-                    [design::body(room).into()],
+                    counted(count),
+                    [counted(room)],
                     iced::alignment::Horizontal::Left,
                 ));
                 widget::button::custom(
@@ -2764,17 +2772,15 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 80.0)),
             );
-            // Every box but the labels themselves, which center in the
-            // room their segment keeps.
-            fn boxes(node: &layout::Node, found: &mut Vec<iced::Rectangle>) {
-                if !node.children().is_empty() {
-                    found.push(node.bounds());
-                }
-                node.children().iter().for_each(|child| boxes(child, found));
-            }
-            let mut found = Vec::new();
-            boxes(&node, &mut found);
-            (node.size(), found)
+            // The bar and each segment in it; a segment's label and count
+            // center in the room it keeps, so they may move within it.
+            let segments: Vec<iced::Rectangle> = node
+                .children()
+                .iter()
+                .flat_map(|bar| bar.children().iter().map(layout::Node::bounds))
+                .collect();
+            assert_eq!(segments.len(), 3, "{counts:?}");
+            (node.size(), segments)
         };
         let first = segments([1, 4, 9]);
         for counts in [[12, 40, 98], [120, 400, 999]] {

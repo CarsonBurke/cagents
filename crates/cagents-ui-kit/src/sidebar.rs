@@ -7387,8 +7387,9 @@ fn worktree_group_row(
         grid.rail(glyph, rail::Badges::attention(attention))
     } else {
         let label = widget::row::with_children(vec![
-            design::body("Worktrees").width(Length::Fill).into(),
-            design::caption(count.to_string()).into(),
+            design::body("Worktrees").into(),
+            crate::ui_controls::count_badge(count.to_string(), Default::default()),
+            widget::Space::new().width(Length::Fill).into(),
         ])
         .spacing(space::XS)
         .align_y(Alignment::Center)
@@ -10484,9 +10485,8 @@ fn source_control_panel<'a>(
 ///
 /// Every tab is a word, never a bare glyph, and each keeps a stable id so
 /// focus and the accessibility tree survive a switch. A view that holds a
-/// countable list states its count beside its name, so what is behind a tab
-/// is readable before it is opened; the working tree's count takes the same
-/// warning tone the shell uses for a dirty worktree.
+/// countable list states its count in a badge beside its name, so what is
+/// behind a tab is readable before it is opened.
 fn panel_navigation<'a>(
     source: &'a SourceControlModel,
     modal_open: bool,
@@ -10500,7 +10500,7 @@ fn panel_navigation<'a>(
         source
             .change_count_label
             .as_deref()
-            .map(|count| (Cow::Borrowed(count), design::muted_text as fn(&_) -> _))
+            .map(|count| (Cow::Borrowed(count), crate::ui_controls::CountTone::Neutral))
     };
     let tabs = match navigation {
         PanelNavigation::None => return None,
@@ -10514,7 +10514,7 @@ fn panel_navigation<'a>(
                     ChangesTab::Branch => match &source.branch_changes {
                         BranchChanges::Ready(branch) if !branch.rows.is_empty() => Some((
                             Cow::Borrowed(&*branch.count_label),
-                            design::muted_text as fn(&_) -> _,
+                            crate::ui_controls::CountTone::Neutral,
                         )),
                         _ => None,
                     },
@@ -10627,7 +10627,9 @@ fn worktree_panel_chrome_with_footer<'a, M: 'a>(
 #[derive(Debug, Clone, PartialEq)]
 struct SectionHeader {
     icon: Icon,
-    title: String,
+    title: &'static str,
+    /// Drawn as a badge after the title.
+    count: Option<RowCount>,
     /// The accessible name and the tooltip. Both name the action rather than
     /// the section, because the row is a control.
     action_name: String,
@@ -10649,10 +10651,8 @@ impl SectionHeader {
             } else {
                 Icon::ChevronRight
             },
-            title: match count {
-                Some(count) => format!("{} ({count})", section.title()),
-                None => section.title().to_owned(),
-            },
+            title: section.title(),
+            count,
             action_name: format!(
                 "{} {}",
                 if expanded { "Collapse" } else { "Expand" },
@@ -10693,9 +10693,12 @@ fn panel_section<'a>(
             widget::container(parts.icon.handle().icon().size(ROW_ICON_SIZE))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
-            crate::ui_controls::FadeText::heading(parts.title)
-                .width(Length::Fill)
-                .into(),
+            crate::ui_controls::FadeText::heading(parts.title).into(),
+            parts.count.map_or_else(
+                || widget::Space::new().into(),
+                |count| crate::ui_controls::count_badge(count.to_string(), Default::default()),
+            ),
+            widget::Space::new().width(Length::Fill).into(),
         ])
         .align_y(Alignment::Center)
         .spacing(space::XS)
@@ -11221,8 +11224,10 @@ fn changes_section<'a>(
             section,
             source.chrome.section_id(section).clone(),
             // A count matters most while the rows are not drawn: a bare
-            // "Unstaged" does not say it is folding forty files away.
-            Some(RowCount::exact(group.rows().len())),
+            // "Unstaged" does not say it is folding forty files away. A
+            // folded Untracked group was not walked, so it has no count.
+            (group.area != ChangeArea::Untracked || expanded)
+                .then(|| RowCount::exact(group.rows().len())),
             expanded,
             modal_open,
             actions,

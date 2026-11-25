@@ -846,11 +846,10 @@ impl Runtime {
                             design::caption(section.heading())
                                 .class(cosmic::theme::Text::Custom(design::muted_text))
                                 .into(),
-                            design::caption(count.to_string())
-                                .class(cosmic::theme::Text::Custom(design::muted_text))
-                                .into(),
+                            crate::ui_controls::count_badge(count.to_string(), Default::default()),
                         ])
-                        .spacing(space::XS),
+                        .spacing(space::XS)
+                        .align_y(Alignment::Center),
                     )
                     .padding([0.0, space::S])
                     .height(Length::Fixed(HEADING_HEIGHT))
