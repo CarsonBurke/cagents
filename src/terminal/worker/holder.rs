@@ -2595,7 +2595,10 @@ mod tests {
         drop(held);
         let (exits, exited) = crossbeam_channel::bounded(1);
         let adopted = adopt(&socket, exits).unwrap();
-        assert_eq!(registry::Process::read(adopted.held.child.pid()).unwrap(), child);
+        assert_eq!(
+            registry::Process::read(adopted.held.child.pid()).unwrap(),
+            child
+        );
         let peer = peer_credentials(&adopted.held.holder.control).unwrap();
         assert_eq!(registry::Process::read(peer.pid as i32).unwrap(), holder);
         let adopted_pin = adopted.held.launch_directory.as_ref().unwrap();
