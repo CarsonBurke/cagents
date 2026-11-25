@@ -1833,7 +1833,7 @@ fn completed_presentation(mut job: UpdateJob) -> UpdateJob {
 /// `protocol_check_could_have_failed_it`, for the build serving now, whose
 /// receipt shows `proof` serving. Whether `proof` is the daemon serving now
 /// is the caller's to establish. Returns whether the job is now complete.
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(feature = "ui")]
 fn settle_as_completed(
     state: &Path,
     judged: &UpdateJob,
@@ -1844,6 +1844,15 @@ fn settle_as_completed(
         Err(UpdateError::Busy) => return Ok(false),
         lock => lock?,
     };
+    settle_under_worker_lease(state, judged, proof)
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+fn settle_under_worker_lease(
+    state: &Path,
+    judged: &UpdateJob,
+    proof: &crate::model::HostSessionProof,
+) -> Result<bool, UpdateError> {
     let current: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
     if current.id != judged.id
@@ -1881,11 +1890,6 @@ fn settle_as_completed(
     Ok(true)
 }
 
-/// How long a daemon of an update's target waits for the worker that
-/// installed it to finish, before leaving its failure to a window.
-#[cfg(feature = "host")]
-const SUCCESSOR_SETTLE_PATIENCE: Duration = Duration::from_secs(30 * 60);
-
 /// Run once by a daemon that has finished starting, serving as `serving`.
 ///
 /// A 0.2.3 worker records its update failed after this build already took
@@ -1907,62 +1911,35 @@ pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
     if !state.is_dir() {
         return;
     }
-    let spawned = thread::Builder::new()
-        .name("update-settle".into())
-        .spawn(move || {
-            let deadline = Instant::now() + SUCCESSOR_SETTLE_PATIENCE;
-            loop {
-                match successor_settle_step(&layout, &state, &serving) {
-                    Ok(SettleStep::Wait) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(500));
-                    }
-                    Ok(SettleStep::Settled(job)) => {
-                        tracing::info!(job, "settled an older worker's update failure as complete");
-                        return;
-                    }
-                    Ok(_) => return,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not settle the last update's record");
-                        return;
-                    }
+    let spawned =
+        thread::Builder::new().name("update-settle".into()).spawn(
+            move || match settle_after_worker(&layout, &state, &serving) {
+                Ok(Some(job)) => {
+                    tracing::info!(job, "settled an older worker's update failure as complete");
                 }
-            }
-        });
+                Ok(None) => (),
+                Err(error) => tracing::warn!(%error, "could not settle the last update's record"),
+            },
+        );
     if let Err(error) = spawned {
         tracing::warn!(%error, "could not watch the last update's record");
     }
 }
 
 #[cfg(feature = "host")]
-#[derive(Debug, PartialEq, Eq)]
-enum SettleStep {
-    /// The worker is still running; look again.
-    Wait,
-    /// Nothing here for this daemon to settle.
-    Done,
-    Settled(String),
-}
-
-#[cfg(feature = "host")]
-fn successor_settle_step(
+fn settle_after_worker(
     layout: &InstallLayout,
     state: &Path,
     serving: &crate::model::HostSessionProof,
-) -> Result<SettleStep, UpdateError> {
-    // The lease first: a receipt read once its worker has gone is its last.
-    let worker_running = match acquire_lock(state) {
-        Ok(_lease) => false,
-        Err(UpdateError::Busy) => true,
-        Err(error) => return Err(error),
-    };
-    if worker_running {
-        return Ok(SettleStep::Wait);
-    }
+) -> Result<Option<String>, UpdateError> {
+    // The kernel wakes this thread when the original worker releases the
+    // lease, including on process exit. Keep it through the verdict so a new
+    // job cannot change status between reading and recording the outcome.
+    let file = open_worker_lock(state)?;
+    let _lease = crate::instance::owned_file_lock(file, libc::LOCK_EX)?;
     let job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(SettleStep::Done);
-        }
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     if job.phase != UpdatePhase::Failed
@@ -1970,13 +1947,9 @@ fn successor_settle_step(
         || !protocol_check_could_have_failed_it(&job)
         || served_version_root(layout)? != layout.version_root
     {
-        return Ok(SettleStep::Done);
+        return Ok(None);
     }
-    Ok(if settle_as_completed(state, &job, serving)? {
-        SettleStep::Settled(job.id)
-    } else {
-        SettleStep::Done
-    })
+    Ok(settle_under_worker_lease(state, &job, serving)?.then_some(job.id))
 }
 
 #[cfg(any(feature = "ui", test))]
@@ -3574,6 +3547,10 @@ fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
     Ok(())
 }
 fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
+    lock_file(open_worker_lock(state)?)
+}
+
+fn open_worker_lock(state: &Path) -> Result<File, UpdateError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3583,7 +3560,7 @@ fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError>
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(state.join("lock"))?;
     validate_lock(&file)?;
-    lock_file(file)
+    Ok(file)
 }
 
 fn lock_file(file: File) -> Result<crate::instance::OwnedLock, UpdateError> {
@@ -7258,38 +7235,44 @@ mod reconciliation_tests {
         write(recovery::outcome_path(&state, JOB), "pending.json");
 
         // The old worker installed this daemon and is still running.
-        let worker = acquire_lock(&state).unwrap();
-        let step = || successor_settle_step(&layout, &state, &serving).unwrap();
-        assert_eq!(step(), SettleStep::Wait);
-        job.phase = UpdatePhase::Failed;
-        job.message =
-            "The confirmed successor does not serve this update's matched protocol".into();
-        write_job(&state, &job).unwrap();
-        assert_eq!(step(), SettleStep::Wait);
-        drop(worker);
+        let step = || settle_after_worker(&layout, &state, &serving).unwrap();
+        thread::scope(|scope| {
+            let worker = acquire_lock(&state).unwrap();
+            let (settled, verdict) = std::sync::mpsc::channel();
+            scope.spawn(move || settled.send(step()).unwrap());
+            job.phase = UpdatePhase::Failed;
+            job.message =
+                "The confirmed successor does not serve this update's matched protocol".into();
+            write_job(&state, &job).unwrap();
+            assert!(matches!(
+                verdict.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(worker);
 
-        // It left its placeholder: nothing proved the service.
-        assert_eq!(step(), SettleStep::Done);
+            // It left its placeholder: nothing proved the service.
+            assert_eq!(verdict.recv_timeout(Duration::from_secs(5)).unwrap(), None);
+        });
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // Its receipt names a daemon that has since restarted.
         write(recovery::outcome_path(&state, JOB), "recovery.json");
         let mut restarted = serving.clone();
         restarted.host_incarnation = crate::model::HostIncarnation::new("restarted");
         assert_eq!(
-            successor_settle_step(&layout, &state, &restarted).unwrap(),
-            SettleStep::Done
+            settle_after_worker(&layout, &state, &restarted).unwrap(),
+            None
         );
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // A worker that records its release reports its own verdict.
         job.recorded_by = Some("0.2.4".into());
         write_job(&state, &job).unwrap();
-        assert_eq!(step(), SettleStep::Done);
+        assert_eq!(step(), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         job.recorded_by = None;
         write_job(&state, &job).unwrap();
 
         // Its receipt names this daemon: the update completed.
-        assert_eq!(step(), SettleStep::Settled(JOB.into()));
+        assert_eq!(step(), Some(JOB.into()));
         let settled = recorded();
         assert_eq!(settled.phase, UpdatePhase::Complete);
         assert_eq!(settled.version, "0.2.4");
@@ -7308,8 +7291,8 @@ mod reconciliation_tests {
         assert!(state.join(format!("{JOB}.complete")).is_file());
         // Settled for good: a later daemon finds nothing to do.
         assert_eq!(
-            successor_settle_step(&layout, &state, &restarted).unwrap(),
-            SettleStep::Done
+            settle_after_worker(&layout, &state, &restarted).unwrap(),
+            None
         );
         assert_eq!(recorded().phase, UpdatePhase::Complete);
     }
