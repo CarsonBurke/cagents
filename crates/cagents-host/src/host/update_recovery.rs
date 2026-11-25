@@ -606,6 +606,69 @@ mod tests {
         (registry, pane)
     }
 
+    /// A daemon that cannot open its shared model still hosts terminals, as
+    /// its entry point documents: ordinary startup passes over the retained
+    /// receipts and losses only that model could commit, and becomes ready.
+    #[test]
+    fn ordinary_startup_without_the_shared_model_still_becomes_ready() {
+        const ROOT: &str = "CAGENTS_STORELESS_STARTUP_TEST_ROOT";
+        let Some(root) = std::env::var_os(ROOT) else {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            for name in ["home", "run", "data", "config", "cache", "state"] {
+                crate::secure_file::prepare_private_directory(&root.path().join(name)).unwrap();
+            }
+            let selector = std::thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(ROOT, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        };
+        assert!(
+            crate::instance::project_dirs()
+                .unwrap()
+                .data_dir()
+                .starts_with(&root)
+        );
+        // A directory where the store belongs: the store cannot be opened, and
+        // the host never installs a model, as at a daemon's startup.
+        let store = crate::instance::project_dirs()
+            .unwrap()
+            .data_dir()
+            .join("workspace-model.sqlite3");
+        std::fs::create_dir_all(&store).unwrap();
+        assert!(model::Registry::open().is_err());
+        let host = Arc::new(state::HostLock::new(state::HostState::new(
+            HostSessionProof {
+                host_session_id: "storeless-startup".into(),
+                boot_id: "private-test-boot".into(),
+                host_incarnation: "storeless".into(),
+            },
+        )));
+        assert!(agent_execution::registry(&host).is_err());
+        restore_ordinary(&host).unwrap();
+        assert!(matches!(
+            host.lock().unwrap().startup_state(),
+            crate::terminal_ipc::StartupState::Ready
+        ));
+    }
+
     #[test]
     fn paused_record_never_learns_missing_identity_from_later_alias() {
         let proof = |epoch: &str| HostSessionProof {
@@ -709,8 +772,11 @@ mod tests {
             let selector = std::thread::current().name().unwrap().to_owned();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
                 .env(ROOT, root.path())
                 .env("HOME", root.path().join("home"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
                 .env("XDG_RUNTIME_DIR", root.path().join("run"))
                 .env("XDG_DATA_HOME", root.path().join("data"))
                 .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -1339,8 +1405,11 @@ mod tests {
             let selector = std::thread::current().name().unwrap().to_owned();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
                 .env(ROOT, root.path())
                 .env("HOME", root.path().join("home"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
                 .env("XDG_RUNTIME_DIR", root.path().join("run"))
                 .env("XDG_DATA_HOME", root.path().join("data"))
                 .env("XDG_CONFIG_HOME", root.path().join("config"))

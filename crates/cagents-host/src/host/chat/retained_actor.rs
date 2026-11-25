@@ -3142,7 +3142,11 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
             })
             .collect::<Vec<_>>()
     };
-    let registry = super::super::agent_execution::registry(host)?;
+    // Without the shared model no loss can be committed; each helper retains
+    // its losses for the daemon that can, as it does for one not committed yet.
+    let Ok(registry) = super::super::agent_execution::registry(host) else {
+        return Ok(());
+    };
     for target in actors {
         if let Err(error) = reconcile_startup_loss(host, &registry, &target) {
             tracing::warn!(id = %target.source.id, %error,
@@ -3393,7 +3397,11 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
         }
         state.proof().clone()
     };
-    let registry = super::super::agent_execution::registry(host)?;
+    // A daemon without its shared model has no receipts to commit; each
+    // retirement stays unknown until a daemon that can open it reconciles it.
+    let Ok(registry) = super::super::agent_execution::registry(host) else {
+        return Ok(());
+    };
     let mut after = None;
     loop {
         let page = registry

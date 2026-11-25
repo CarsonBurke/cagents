@@ -166,7 +166,15 @@ pub(in crate::host) fn restore_presentations(
     {
         return Ok(());
     }
-    let mut registry = Registry::open()?;
+    // A daemon that cannot open the store still hosts terminals. The ledger
+    // keeps each unrestored presentation for the daemon that can.
+    let mut registry = match Registry::open() {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::warn!(%error, "update floor presentations wait for the shared model");
+            return Ok(());
+        }
+    };
     for record in &mut ledger.records {
         registry.restore_update_floor(record)?;
     }

@@ -3533,7 +3533,12 @@ fn restore_terminal_execution_authority(
     previous: &[TerminalSession],
 ) -> Result<(), String> {
     use crate::agent_execution::HostedSession;
-    let registry = super::agent_execution::registry(host)?;
+    // Without the shared model the daemon hosts the terminal and nothing can
+    // dispatch to it. Its agent stays on the previous descriptor, so a later
+    // prompt is refused, as for a relaunch whose authority could not move.
+    let Ok(registry) = super::agent_execution::registry(host) else {
+        return Ok(());
+    };
     let authority = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())

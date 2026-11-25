@@ -28,7 +28,7 @@ fn connect(path: &Path, readonly: bool) -> Result<Connection, String> {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     };
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|e| e.to_string())?;
@@ -324,7 +324,7 @@ fn reject_unjournaled_layout(path: &Path) -> Result<(), String> {
     // Use the default SQLite VFS so closing this connection still respects the
     // other connections' same-process POSIX lock ownership.
     let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
-    let mut uri = url::Url::from_file_path(absolute)
+    let mut uri = url::Url::from_file_path(crate::secure_file::sqlite_path(&absolute))
         .map_err(|_| "workspace registry path cannot be represented as a file URL")?;
     uri.query_pairs_mut()
         .append_pair("mode", "ro")

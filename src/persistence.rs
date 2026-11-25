@@ -860,13 +860,15 @@ impl StateStore {
             .tempfile_in(parent)?;
         // VACUUM INTO accepts an existing empty file; tempfile keeps it private.
         let connection = Connection::open_with_flags(
-            source,
+            crate::secure_file::sqlite_path(source),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         connection.execute(
             "VACUUM INTO ?1",
-            [temporary.path().to_string_lossy().as_ref()],
+            [crate::secure_file::sqlite_path(temporary.path())
+                .to_string_lossy()
+                .as_ref()],
         )?;
         temporary.as_file().sync_all()?;
         temporary
@@ -936,7 +938,8 @@ impl StateStore {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let mut connection = Connection::open_with_flags(path, flags)?;
+        let mut connection =
+            Connection::open_with_flags(crate::secure_file::sqlite_path(path), flags)?;
         configure_connection(&connection, options.busy_timeout)?;
         enforce_sqlite_sidecars(path)?;
         migrate(&mut connection)?;
@@ -1074,7 +1077,7 @@ impl StateStore {
             return Err(invalid_state!("invalid canonical pane repair"));
         }
         let mut connection = Connection::open_with_flags(
-            path,
+            crate::secure_file::sqlite_path(path.as_ref()),
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -2825,7 +2828,7 @@ pub fn transcript_name(path: &Path) -> Option<&str> {
 /// writes to a database another window owns.
 pub fn read_claimed_transcript_names(path: &Path) -> Result<HashSet<String>> {
     let connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
@@ -2838,7 +2841,7 @@ pub fn read_claimed_transcript_names(path: &Path) -> Result<HashSet<String>> {
 /// writer. Closed chats remain navigable through the conversation resume path.
 pub fn read_navigable_session_ids(path: &Path) -> Result<Vec<TerminalId>> {
     let mut connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
@@ -3085,7 +3088,7 @@ pub fn read_labeled_migration_sessions_with_budget(
 
     budget.check_deadline()?;
     let mut connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(Duration::from_millis(100))?;
@@ -3378,7 +3381,7 @@ pub(crate) fn read_migration_session_at(
 /// database. Only open cards with explicit navigation ownership contribute.
 pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, SavedSessionOwner)>> {
     let mut connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
@@ -7407,7 +7410,7 @@ mod tests {
             matches!(StateStore::open(&path, boot("different-boot")), Err(StoreError::UnsupportedSchema { found, supported }) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
         );
         let connection = Connection::open_with_flags(
-            &path,
+            crate::secure_file::sqlite_path(&path),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .unwrap();
