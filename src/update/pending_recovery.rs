@@ -280,6 +280,8 @@ pub(crate) fn run(
     let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
     let windows = recovery_window_slots(&pending.windows, &current_windows);
     let id = uuid::Uuid::new_v4().to_string();
+    let census = recovery::Census::from_pending(id.clone(), &pending)?;
+    census.save(&recovery::census_path(&state, &id))?;
     let log_path = state.join(format!("{id}.log"));
     let log = private_create(&log_path)?;
     let mut receipt = pending
@@ -345,7 +347,15 @@ pub(crate) fn run(
             .ok_or_else(|| invalid("The recovery checkpoint disappeared while reopening panes"))?;
         verify(&pending, &daemon)?;
         recovery::retire_current_service(source::BusyPatience::for_one_run())?;
-        verify(&pending, &daemon)
+        let outcome = verify_census(&census, &daemon)?;
+        outcome
+            .save(&recovery::outcome_path(&state, &job.id))
+            .map_err(|error| {
+                invalid(format!(
+                    "Saved windows reopened, but the verified recovery result could not be saved: {error}"
+                ))
+            })?;
+        Ok(outcome)
     });
     match result {
         Ok(outcome) => {
@@ -390,6 +400,14 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
 /// busy daemon delays the check, and the windows it may keep closed, at most
 /// that long.
 fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt, UpdateError> {
+    let census = recovery::Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?;
+    verify_census(&census, daemon)
+}
+
+fn verify_census(
+    census: &recovery::Census,
+    daemon: &Path,
+) -> Result<recovery::Receipt, UpdateError> {
     let busy = source::BusyPatience::for_one_run();
     let socket = crate::terminal_ipc::daemon_socket_path()?;
     let mut client = source::Client::connect(&socket)
@@ -404,8 +422,7 @@ fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt,
     // The fence is asked again while the daemon finishes another operation,
     // which refuses it before issuing anything, rather than failing recovery.
     let generation = client.inventory_generation()?;
-    let original = recovery::Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?;
-    let receipt = original.verify(busy)?;
+    let receipt = census.verify(busy)?;
     if let Some(error) = receipt.still_busy() {
         return Err(error);
     }
