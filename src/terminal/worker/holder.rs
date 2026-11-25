@@ -2401,6 +2401,7 @@ mod tests {
         held.holder.process.as_ref().unwrap().child.id()
     }
 
+    #[cfg(target_os = "linux")]
     fn alive(pid: libc::pid_t) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
@@ -2414,6 +2415,20 @@ mod tests {
                 Some(state != "Z" && state != "X")
             })
             .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn alive(pid: libc::pid_t) -> bool {
+        match PinnedProcess::open(pid as u32) {
+            Ok(pin) => !pin.exited().unwrap(),
+            Err(error)
+                if error.raw_os_error() == Some(libc::ESRCH)
+                    || error.kind() == io::ErrorKind::NotFound =>
+            {
+                false
+            }
+            Err(error) => panic!("cannot observe process {pid}: {error}"),
+        }
     }
 
     fn wait_gone(pid: libc::pid_t) {
@@ -2513,7 +2528,15 @@ mod tests {
             std::fs::create_dir_all(original.join("bin")).unwrap();
             std::fs::write(original.join("payload"), "ORIGINAL_PAYLOAD\n").unwrap();
             let program = original.join("bin/probe");
-            std::fs::write(&program, "#!/bin/sh\n/usr/bin/stat -Lc 'PIN_ID:%d:%i' .\n/bin/cat payload\nprintf 'PIN_OK\\n'\n").unwrap();
+            #[cfg(target_os = "linux")]
+            let stat = "/usr/bin/stat -Lc 'PIN_ID:%d:%i' .";
+            #[cfg(target_os = "macos")]
+            let stat = "/usr/bin/stat -f 'PIN_ID:%d:%i' .";
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\n{stat}\n/bin/cat payload\nprintf 'PIN_OK\n'\n"),
+            )
+            .unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
             let mut command = CommandBuilder::new(if relative_path {
                 "probe"
@@ -2849,7 +2872,7 @@ mod tests {
         }
         // Truly absent cwd retains portable-pty's selected HOME fallback.
         let mut command = CommandBuilder::new("/bin/sh");
-        command.args(["-c", "echo HOME_PIN_READY; read line"]);
+        command.args(["-c", "stty -echo; echo HOME_PIN_READY; read line"]);
         command.env("HOME", directory.path());
         let (exits, exited) = crossbeam_channel::bounded(1);
         let held = spawn(command, size(), exits).unwrap();
@@ -2875,7 +2898,12 @@ mod tests {
     #[test]
     fn a_held_root_runs_on_the_passed_pty_and_reports_its_exit() {
         let (exits, exited) = crossbeam_channel::bounded(1);
-        let held = spawn(command("stty size; read line; exit 7"), size(), exits).unwrap();
+        let held = spawn(
+            command("stty -echo; stty size; read line; exit 7"),
+            size(),
+            exits,
+        )
+        .unwrap();
         assert!(held.child.unreaped());
         crate::daemon::process_scope::tests::assert_separate(
             holder_pid(&held),
@@ -2943,6 +2971,7 @@ mod tests {
     fn the_root_leads_its_own_session_apart_from_its_holder() {
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let held = spawn(command("read line"), size(), exits).unwrap();
+        #[cfg(target_os = "linux")]
         let session = |pid: u32| {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
             let fields: Vec<_> = stat
@@ -2955,6 +2984,11 @@ mod tests {
                 fields[1].parse::<i32>().unwrap(),
                 fields[3].parse::<i32>().unwrap(),
             )
+        };
+        #[cfg(target_os = "macos")]
+        let session = |pid: u32| {
+            let record = crate::process::table::record(pid as libc::pid_t).unwrap();
+            (record.bsd.pbsi_ppid as libc::pid_t, record.session.unwrap())
         };
         let holder = holder_pid(&held);
         let (holder_parent, holder_session) = session(holder);
@@ -3030,7 +3064,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
+        #[cfg(target_os = "linux")]
         assert!(!private_tmp.exists(), "reaping the root must remove TMPDIR");
+        #[cfg(target_os = "macos")]
+        assert!(
+            private_tmp.is_dir(),
+            "Darwin retains potentially occupied directories"
+        );
         drop(adopted);
         reaper.await_free(1);
         assert!(
@@ -3279,7 +3319,7 @@ mod tests {
             let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
             let (exits, _exited) = crossbeam_channel::bounded(1);
             let held = spawn_recoverable(
-                command("echo ready; while read line; do if [ \"$line\" = finish ]; then echo completed-result; exit 7; fi; echo still-running:$line; done"),
+                command("stty -echo; echo ready; while read line; do if [ \"$line\" = finish ]; then echo completed-result; exit 7; fi; echo still-running:$line; done"),
                 size(),
                 exits,
                 Some(recovery),
@@ -3517,6 +3557,7 @@ mod tests {
                 .exit_code(),
             7
         );
+        #[cfg(target_os = "linux")]
         assert!(String::from_utf8_lossy(&restored.output).contains("completed-result"));
         restored.held.holder.commit_adoption().unwrap();
         // This fixture has observed the exact root exit and drained retained
@@ -3576,7 +3617,12 @@ mod tests {
     #[test]
     fn a_root_outliving_its_holder_reports_only_its_own_exit() {
         let (exits, exited) = crossbeam_channel::bounded(1);
-        let held = spawn(command("echo ready; read line; exit 4"), size(), exits).unwrap();
+        let held = spawn(
+            command("stty -echo; echo ready; read line; exit 4"),
+            size(),
+            exits,
+        )
+        .unwrap();
         read_until(&held.master, "ready");
         let holder = holder_pid(&held) as libc::pid_t;
         // SAFETY: signals a child this test spawned.
@@ -3714,7 +3760,10 @@ mod tests {
             "Retained terminal carry fixture: {}",
             directory.path().display()
         );
-        let (socket, root) = detached("echo ready; read line; exit 2", directory.path());
+        let (socket, root) = detached(
+            "stty -echo; echo ready; read line; exit 2",
+            directory.path(),
+        );
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let held = adopt(&socket, exits).unwrap().held;
         let Held { mut holder, .. } = held;
