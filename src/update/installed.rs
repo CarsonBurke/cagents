@@ -255,7 +255,7 @@ pub(super) fn perform(
         )?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         #[cfg(target_os = "linux")]
-        if let Some(standby) = standby.take() {
+        if let Some(standby) = standby.as_mut() {
             let pid = standby.pid();
             let daemon = root.join("bin").join(DAEMON_BINARY);
             let lease = handoff.as_ref().ok_or_else(|| {
@@ -264,7 +264,15 @@ pub(super) fn perform(
             startup_attempted = true;
             startup_owned = true;
             standby
-                .activate(&daemon, lease, survivors.recovery_receipt(), timeout)
+                .activate(
+                    &daemon,
+                    lease,
+                    survivors.recovery_receipt(),
+                    timeout,
+                    || {
+                        let _ = report_overdue_startup(state, job);
+                    },
+                )
                 .map_err(|error| {
                     invalid(format!(
                         "The replacement terminal service did not confirm startup: {error}"
@@ -306,6 +314,22 @@ pub(super) fn perform(
         // Ready, then prove this job's recovery inventory against it.
         confirm_daemon_ready(&root.join("bin/cagentsd"), None, timeout)
     })();
+    #[cfg(target_os = "linux")]
+    if result.is_err()
+        && let Some(candidate) = standby.as_mut()
+        && candidate.may_own_runtime()
+    {
+        let daemon = root.join("bin").join(DAEMON_BINARY);
+        let timeout = crate::install_guard::daemon_start_timeout()?;
+        // A missing acknowledgement can race a serving replacement. Only
+        // its authenticated readiness or exact process exit resolves custody.
+        if confirm_daemon_ready(&daemon, Some(candidate.pid()), timeout).is_ok() {
+            result = Ok(());
+        } else if candidate.may_own_runtime() {
+            guard.set_fallback_executable(root.join("bin/cagents-ui"));
+            return Err(result.unwrap_err());
+        }
+    }
     // No parked process should retain a launch-fence copy while closing an
     // unsuccessful transaction and reopening the old application.
     #[cfg(target_os = "linux")]
@@ -674,13 +698,16 @@ fn wait_for_daemon_start(
     job: &mut UpdateJob,
 ) -> Result<(), crate::install_guard::DaemonStartError> {
     crate::install_guard::wait_daemon_start_with_progress(command, timeout, || {
-        let persisted = set_phase(state, job, UpdatePhase::Installing, WAITING_FOR_STARTUP)
-            .map_err(|error| io::Error::other(error.to_string()));
-        // The CLI worker has no global tracing subscriber. Its ordinary
-        // captured stderr remains useful even if the status file cannot update.
-        let logged = writeln!(io::stderr().lock(), "{WAITING_FOR_STARTUP}");
-        persisted.and(logged)
+        report_overdue_startup(state, job)
     })
+}
+
+fn report_overdue_startup(state: &Path, job: &mut UpdateJob) -> io::Result<()> {
+    let persisted = set_phase(state, job, UpdatePhase::Installing, WAITING_FOR_STARTUP)
+        .map_err(|error| io::Error::other(error.to_string()));
+    // The captured stderr remains useful even if the status file cannot update.
+    let logged = writeln!(io::stderr().lock(), "{WAITING_FOR_STARTUP}");
+    persisted.and(logged)
 }
 
 /// Bound on each captured stream: a `daemon start` envelope is well under a

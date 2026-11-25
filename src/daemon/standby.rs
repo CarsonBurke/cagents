@@ -12,7 +12,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
         unix::{fs::MetadataExt, net::UnixStream, process::CommandExt},
@@ -24,7 +24,6 @@ use std::{
 #[cfg(feature = "host")]
 use std::{
     fs::File,
-    io::Read,
     os::fd::{AsRawFd, FromRawFd},
 };
 #[cfg(feature = "host")]
@@ -51,11 +50,18 @@ impl Activation {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 enum Status {
     Parked,
     Started,
-    Failed(String),
+}
+
+#[cfg(any(feature = "host", test))]
+fn send_status(mut stream: &UnixStream, status: Status) -> io::Result<()> {
+    match status {
+        Status::Parked => stream.write_all(&[1]),
+        Status::Started => stream.write_all(&[2]),
+    }
 }
 
 fn send(
@@ -75,18 +81,26 @@ fn send(
     .map_err(io::Error::other)
 }
 
-fn expect(stream: &UnixStream, status: Status, timeout: Duration) -> io::Result<()> {
-    let (actual, _): (Status, _) = receive_json_with_fds_until(
-        stream,
-        Instant::now() + timeout,
-        FRAME_LIMIT,
-        0,
-        FrameByteOrder::LittleEndian,
-    )
-    .map_err(io::Error::other)?;
-    if let Status::Failed(reason) = actual {
-        return Err(io::Error::other(reason));
-    }
+fn expect(mut stream: &UnixStream, status: Status) -> io::Result<()> {
+    // One byte means a missed deadline consumes no portion of the reply.
+    let mut reply = [0];
+    stream.read_exact(&mut reply)?;
+    let actual = match reply[0] {
+        1 => Status::Parked,
+        2 => Status::Started,
+        3 => {
+            let (reason, _): (String, _) = receive_json_with_fds_until(
+                stream,
+                Instant::now() + TRANSFER_TIMEOUT,
+                FRAME_LIMIT,
+                0,
+                FrameByteOrder::LittleEndian,
+            )
+            .map_err(io::Error::other)?;
+            return Err(io::Error::other(reason));
+        }
+        _ => return Err(io::Error::other("invalid replacement daemon startup reply")),
+    };
     if actual != status {
         return Err(io::Error::other(
             "unexpected replacement daemon startup state",
@@ -95,9 +109,33 @@ fn expect(stream: &UnixStream, status: Status, timeout: Duration) -> io::Result<
     Ok(())
 }
 
+fn wait_for_start(
+    stream: &UnixStream,
+    timeout: Duration,
+    overdue: impl FnOnce(),
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    match expect(stream, Status::Started) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            overdue();
+            // Keep the original lease and window fence while this exact
+            // process settles. A deadline alone grants no rollback right.
+            stream.set_read_timeout(None)?;
+            expect(stream, Status::Started)
+        }
+        result => result,
+    }
+}
+
 pub(crate) struct Parked {
     channel: UnixStream,
     child: Option<Child>,
+    transferred: bool,
 }
 
 impl Parked {
@@ -128,8 +166,10 @@ impl Parked {
         let parked = Self {
             channel,
             child: Some(child),
+            transferred: false,
         };
-        expect(&parked.channel, Status::Parked, TRANSFER_TIMEOUT)?;
+        parked.channel.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
+        expect(&parked.channel, Status::Parked)?;
         let actual = fs::metadata(format!("/proc/{pid}/exe"))?;
         if (actual.dev(), actual.ino()) != expected {
             return Err(io::Error::other(
@@ -152,12 +192,25 @@ impl Parked {
         self.child.as_ref().unwrap().id()
     }
 
+    /// The public lock file can still describe the former owner during
+    /// activation. An unreaped exact child is the authority in that gap.
+    pub(crate) fn may_own_runtime(&mut self) -> bool {
+        self.transferred
+            && !self
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .is_ok_and(|status| status.is_some())
+    }
+
     pub(crate) fn activate(
-        mut self,
+        &mut self,
         executable: &Path,
         lease: &LeaseHandoff,
         receipt: Option<&Receipt>,
         timeout: Duration,
+        overdue: impl FnOnce(),
     ) -> io::Result<()> {
         self.check_running()?;
         let mut descriptors = vec![lease.descriptor()];
@@ -171,29 +224,27 @@ impl Parked {
         };
         // From the first transfer byte onward the child might receive
         // authority. Never kill it on loss of communication after this point.
-        let mut child = self.child.take().unwrap();
-        let result = (|| {
-            self.channel.write_all(&[0])?;
-            send(&self.channel, &request, &descriptors)?;
-            expect(&self.channel, Status::Started, timeout)
-        })();
-        // A successful child serves indefinitely. A failed child is reaped
-        // without delaying independent inventory verification or shutdown.
-        let _ = std::thread::Builder::new()
-            .name("cagentsd-update-reaper".into())
-            .spawn(move || {
-                let _ = child.wait();
-            });
-        result
+        self.transferred = true;
+        self.channel.write_all(&[0])?;
+        send(&self.channel, &request, &descriptors)?;
+        wait_for_start(&self.channel, timeout, overdue)
     }
 }
 
 impl Drop for Parked {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // We still own an unreaped direct child and have sent no authority.
-            let _ = child.kill();
-            let _ = child.wait();
+            if self.transferred {
+                // After transfer the process may be hosting the workspace.
+                let _ = std::thread::Builder::new()
+                    .name("cagentsd-update-reaper".into())
+                    .spawn(move || {
+                        let _ = child.wait();
+                    });
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -205,12 +256,15 @@ pub struct Activated(UnixStream);
 impl Activated {
     /// The host accepted custody and can now answer its authenticated socket.
     pub fn started(self) -> io::Result<()> {
-        send(&self.0, &Status::Started, &[])
+        send_status(&self.0, Status::Started)
     }
 
     pub fn failed(&self, reason: &impl std::fmt::Display) {
-        let reason = reason.to_string().chars().take(512).collect();
-        let _ = send(&self.0, &Status::Failed(reason), &[]);
+        let mut stream = &self.0;
+        let reason: String = reason.to_string().chars().take(512).collect();
+        let _ = stream
+            .write_all(&[3])
+            .and_then(|()| send(stream, &reason, &[]));
     }
 }
 
@@ -238,7 +292,7 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     // accepts custody. This transfers no handoff authority to the manager.
     // The direct process-group launch remains safe without systemd.
     let _ = super::process_scope::enroll_current_process();
-    send(&control, &Status::Parked, &[])?;
+    send_status(&control, Status::Parked)?;
     // Waiting for the originating worker to close the source can take as
     // long as its reviewed work. EOF abandons the standby if that worker exits.
     let mut begin = [0];
@@ -341,7 +395,16 @@ mod tests {
     #[test]
     fn the_parked_acknowledgement_cannot_confirm_startup() {
         let (worker, daemon) = UnixStream::pair().unwrap();
-        send(&daemon, &Status::Parked, &[]).unwrap();
-        assert!(expect(&worker, Status::Started, TRANSFER_TIMEOUT).is_err());
+        send_status(&daemon, Status::Parked).unwrap();
+        assert!(expect(&worker, Status::Started).is_err());
+    }
+
+    #[test]
+    fn startup_progress_keeps_waiting_for_the_exact_replacement() {
+        let (worker, daemon) = UnixStream::pair().unwrap();
+        wait_for_start(&worker, Duration::from_millis(5), || {
+            send_status(&daemon, Status::Started).unwrap();
+        })
+        .unwrap();
     }
 }
