@@ -84,18 +84,21 @@ impl UpdateWait {
 
     /// What a saved pane still waiting for its workspace says about it: a
     /// title when the update is the reason, and the sentence under it.
-    pub(super) fn admission(self) -> (Option<&'static str>, String) {
+    /// `held` says why the pane's view itself is not admitted yet, when the
+    /// update is not the reason.
+    pub(super) fn admission(self, held: Option<&str>) -> (Option<&'static str>, String) {
         const DRAFT_KEPT: &str = "Your unsent draft is kept here.";
-        match self {
-            Self::Restoring => (
+        match (self, held) {
+            (Self::Unconfirmed, Some(held)) => (None, format!("{held} {DRAFT_KEPT}")),
+            (Self::Restoring, _) => (
                 Some(RESTORING_TITLE),
                 format!("{RESTORING} This pane reopens when that finishes. {DRAFT_KEPT}"),
             ),
-            Self::Held => (
+            (Self::Held, _) => (
                 Some(HELD_TITLE),
                 format!("{HELD} {HELD_STEPS} {DRAFT_KEPT}"),
             ),
-            Self::Unconfirmed => (
+            (Self::Unconfirmed, None) => (
                 None,
                 format!("This pane reopens when cagents reconnects to its workspace. {DRAFT_KEPT}"),
             ),
@@ -163,8 +166,13 @@ impl Cagents {
 
     /// Whether any pane waits on the daemon's update restore: a saved pane
     /// its workspace has not admitted, or a start the restore refused.
-    fn waits_on_update_recovery(&self) -> bool {
-        !self.durable.pending_chat_admissions.is_empty() || self.update_refusals_stand()
+    pub(in crate::app) fn waits_on_update_recovery(&self) -> bool {
+        // A kept draft copy is never admitted, so it waits on nothing.
+        self.durable
+            .pending_chat_admissions
+            .keys()
+            .any(|card| !self.is_retained_chat_copy(*card))
+            || self.update_refusals_stand()
     }
 
     /// Whether any pane holds a start the update restore refused.

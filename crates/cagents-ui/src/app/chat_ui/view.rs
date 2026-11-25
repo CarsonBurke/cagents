@@ -1642,11 +1642,8 @@ impl Cagents {
             return done;
         }
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime))
-                if runtime.awaiting_admission()
-                    && self.shared_views.quarantined.contains(&card) =>
-            {
-                runtime.pending_admission_view(trailing_clearance, true)
+            Some(CardRuntime::Chat(runtime)) if runtime.awaiting_admission() => {
+                runtime.pending_admission_view(trailing_clearance, self.pending_pane(card))
             }
             Some(CardRuntime::Chat(runtime)) => {
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory);
@@ -3375,7 +3372,10 @@ impl Runtime {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
         if self.awaiting_admission() {
-            return self.pending_admission_view(transcript_clearance, false);
+            return self.pending_admission_view(
+                transcript_clearance,
+                super::pending_admission::PendingPane::Waiting { held: None },
+            );
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.

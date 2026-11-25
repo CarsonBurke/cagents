@@ -120,6 +120,9 @@ mod monospace;
 mod opening_name;
 mod patch_view;
 mod pending_admission;
+#[cfg(test)]
+pub(in crate::app) use pending_admission::RETAINED_COPY_TITLE;
+pub(in crate::app) use pending_admission::same_conversation;
 mod permissions;
 mod preparation;
 mod prompt;
@@ -10635,16 +10638,16 @@ impl Cagents {
         };
         // A model or effort pick is not unsaved work: it does not keep a pane
         // another window closed, or hold back a shared identity change.
+        // Neither is whitespace, such as a stray space left in a composer.
         runtime.is_some_and(|runtime| {
             runtime.closed_elsewhere
-                || runtime.has_unsent_text()
-                || !runtime.unsent_attachments().is_empty()
+                || runtime.has_unsent_words_or_attachments()
                 || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
             .drafts
             .get(&card)
-            .is_some_and(|draft| !draft.is_empty())
+            .is_some_and(|draft| !draft.trim().is_empty())
             || self
                 .chat_ui
                 .draft_attachments
@@ -10704,6 +10707,49 @@ impl Cagents {
             self.chat_ui.draft_models.insert(canonical, model);
         }
         true
+    }
+
+    /// Whether chat `card` has more under way than a draft: a start, a
+    /// parked runtime, a send, or a close from another window.
+    pub(super) fn chat_alias_busy(&self, card: CardId) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        self.chat_ui.phases.contains_key(&card)
+            || self.chat_ui.parked.contains_key(&card)
+            || runtime.is_some_and(|runtime| {
+                runtime.closed_elsewhere || runtime.transition_blocker().is_some()
+            })
+    }
+
+    /// Drops the saved text and attachments of chat `card`, which is going.
+    pub(super) fn forget_saved_chat_draft(&mut self, card: CardId) {
+        self.chat_ui.drafts.remove(&card);
+        self.chat_ui.draft_attachments.remove(&card);
+    }
+
+    /// Moves the unsent text and attachments of chat `from`, about to be
+    /// retired, to chat `to`, whose own draft is empty.
+    pub(super) fn move_unsent_chat(&mut self, from: CardId, to: CardId) {
+        self.stash_unsent_chat(from);
+        let text = self.chat_ui.drafts.remove(&from);
+        let attachments = self.chat_ui.draft_attachments.remove(&from);
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&to) {
+            if let Some(text) = text {
+                runtime.replace_draft(text_editor::Content::with_text(&text));
+            }
+            if let Some(attachments) = attachments {
+                runtime.replace_attachments(attachments);
+            }
+            return;
+        }
+        if let Some(text) = text {
+            self.chat_ui.drafts.insert(to, text);
+        }
+        if let Some(attachments) = attachments {
+            self.chat_ui.draft_attachments.insert(to, attachments);
+        }
     }
 
     pub(super) fn shared_chat_detach(&mut self, card: CardId) {

@@ -24380,6 +24380,27 @@ fn assert_inert_live_recovery_copy(f: &LiveSharedRecovery) {
     assert!(f.app.durable.local_only_cards.contains(&copy));
 }
 
+fn assert_draft_kept_without_copy(f: &mut LiveSharedRecovery, canonical: &chat::Session) {
+    assert!(
+        f.app.durable.local_only_cards.is_empty(),
+        "no copy of the pane is kept"
+    );
+    assert!(!f.app.cards.iter().any(|(card, value)| *card != f.card
+        && matches!(value, CardRuntime::Chat(runtime) if runtime.session == f.source)));
+    assert_eq!(
+        f.app.card_state(f.card).unwrap().kind,
+        CardKind::Chat(canonical.clone())
+    );
+    assert_eq!(
+        f.app
+            .persistent_workspace()
+            .chat_drafts
+            .get(&f.card)
+            .map(String::as_str),
+        Some(f.draft.as_str())
+    );
+}
+
 #[test]
 fn retained_live_model_upgrade_first_identity_and_bound_reset_require_the_same_exact_checkpoint() {
     for first_identity in [true, false] {
@@ -24442,6 +24463,7 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
             unreachable!()
         };
         next.proof.as_mut().unwrap().host_incarnation = "still-newer-daemon".into();
+        let next = next.clone();
         if case == "newer canonical before Ready" {
             drop(f.app.update(Message::WorkspaceModelObserved(
                 super::super::workspace_model_sync::ModelUpdate::Read(newer.clone()),
@@ -24459,7 +24481,9 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
             assert!(!chat_runtime(&f.app, f.card).connected());
         } else if case == "newer canonical before Ready" {
             assert_no_live_upgrade_checkpoint(checkpoint);
-            assert_inert_live_recovery_copy(&f);
+            // Only the proof changed: the same conversation keeps its pane
+            // and draft, and no copy is left beside it.
+            assert_draft_kept_without_copy(&mut f, &next);
         } else {
             let receipt = account_commit_reply(checkpoint);
             if case == "writer refusal" {
