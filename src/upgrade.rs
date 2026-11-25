@@ -3903,7 +3903,7 @@ mod tests {
         assert_eq!(scans, 3);
 
         let mut scans = 0;
-        let unknown = settle::<()>(|| {
+        let unknown = settle::<(), _>(|| {
             scans += 1;
             Err("cannot inspect process invocation (42)".to_owned())
         });
