@@ -3439,12 +3439,15 @@ fn the_inspector_shortcut_acts_only_where_there_is_an_inspector() {
 fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
     use keyboard::key::Code;
     let shortcuts = KeyboardShortcuts::default();
-    let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
-    for (key, code, action) in [
-        ("a", Code::KeyA, GlobalShortcut::ChatAccount),
-        ("m", Code::KeyM, GlobalShortcut::ChatModel),
-        ("o", Code::KeyO, GlobalShortcut::ChatPermissions),
-        (" ", Code::Space, GlobalShortcut::Dictate),
+    let ctrl = keyboard::Modifiers::CTRL;
+    let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    // Ctrl+M is carriage return and Ctrl+O is operate-and-get-next to a shell:
+    // a focused terminal must still receive both.
+    for (key, code, modifiers, action) in [
+        ("a", Code::KeyA, ctrl_shift, GlobalShortcut::ChatAccount),
+        ("m", Code::KeyM, ctrl, GlobalShortcut::ChatModel),
+        ("o", Code::KeyO, ctrl, GlobalShortcut::ChatPermissions),
+        (" ", Code::Space, ctrl_shift, GlobalShortcut::Dictate),
     ] {
         for focused in [
             FocusedPane::Terminal,
@@ -3486,7 +3489,7 @@ fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
     );
     assert_eq!(
         global_shortcut(
-            &key_press("m", Code::KeyM, modifiers, false),
+            &key_press("m", Code::KeyM, ctrl, false),
             &customized,
             FocusedPane::Chat
         ),
