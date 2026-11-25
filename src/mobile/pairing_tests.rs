@@ -306,6 +306,30 @@ fn a_pairing_authorizes_a_one_time_key_for_the_pairing_command_alone() {
     assert_eq!(parsed.key, PublicKey::ed25519(&public));
 }
 
+/// The app's parser reads this same file (`mobile/shared`'s
+/// `RecordedPairingCodeTest`), so a change to how codes are written shows up
+/// on both sides.
+#[test]
+fn the_code_is_the_one_recorded_for_the_app() {
+    let mut scene = scene();
+    scene.pairing.seed = std::array::from_fn(|index| index as u8);
+    let code = scene.pairing.code(&Connect {
+        name: "Büro station".into(),
+        user: "person".into(),
+        port: 2222,
+        host_key: Some("SHA256:uNiVztksCs+hcc0u9e8BujQXVUpKZIDTMczCvj3t/2s".into()),
+        hosts: vec![
+            "workstation.tail1234.ts.net".into(),
+            "100.101.102.103".into(),
+            "192.168.1.20".into(),
+        ],
+    });
+    assert_eq!(
+        code,
+        include_str!("../../crates/mobile-api/fixtures/pairing-code-v1.txt").trim_end()
+    );
+}
+
 #[test]
 fn allowing_a_phone_swaps_the_one_time_key_for_the_phones_own() {
     let scene = scene();

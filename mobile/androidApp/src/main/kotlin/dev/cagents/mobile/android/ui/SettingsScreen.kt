@@ -21,6 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material3.Button
@@ -66,17 +67,31 @@ fun SettingsScreen(
     canGoBack: Boolean,
     onBack: () -> Unit,
     onConnected: () -> Unit,
+    onScan: () -> Unit,
 ) {
     val saved by vm.settings.collectAsStateWithLifecycle()
     val phoneKey by vm.phoneKey.collectAsStateWithLifecycle()
-    val pinned by vm.pinnedFingerprint.collectAsStateWithLifecycle()
-    var host by rememberSaveable { mutableStateOf(saved.host) }
+    val pinned by vm.pinnedFingerprints.collectAsStateWithLifecycle()
+    var host by rememberSaveable { mutableStateOf(saved.hosts.joinToString(", ")) }
     var port by rememberSaveable { mutableStateOf(saved.port.toString()) }
     var user by rememberSaveable { mutableStateOf(saved.user) }
     var command by rememberSaveable { mutableStateOf(saved.command) }
     var advanced by rememberSaveable { mutableStateOf(saved.command != ConnectionSettings.DEFAULT_COMMAND) }
     val firstRun = !saved.isComplete
-    val draft = ConnectionSettings(host.trim(), port.toIntOrNull() ?: 0, user.trim(), command)
+    val manualSetup by vm.manualSetup.collectAsStateWithLifecycle()
+    // A first run leads with pairing, and a paired computer needs no fields;
+    // they are for setting a computer up by hand.
+    val paired = !firstRun && saved.name.isNotEmpty()
+    val manual = (!firstRun && !paired) || manualSetup
+    val hosts = ConnectionSettings.parseHosts(host)
+    val draft = ConnectionSettings(
+        hosts = hosts,
+        port = port.toIntOrNull() ?: 0,
+        user = user.trim(),
+        command = command,
+        // The paired computer's name goes with its addresses.
+        name = if (hosts == saved.hosts) saved.name else "",
+    )
     val changed = draft.copy(command = draft.command.trim()) != saved
 
     Scaffold(
@@ -107,70 +122,136 @@ fun SettingsScreen(
                 )
             }
 
-            SectionTitle("Computer")
-            OutlinedTextField(
-                value = host,
-                onValueChange = { host = it },
-                label = { Text("Address") },
-                placeholder = { Text("192.168.1.20 or workstation.local") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(
-                    value = user,
-                    onValueChange = { user = it },
-                    label = { Text("User") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
-                    modifier = Modifier.weight(2f),
+            if (firstRun) {
+                Button(onClick = onScan, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+                    Icon(Icons.Outlined.QrCodeScanner, null, Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Scan pairing code")
+                }
+                Text(
+                    "On your computer, click the phone icon in the status bar, then Pair a phone.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                OutlinedTextField(
-                    value = port,
-                    onValueChange = { value -> port = value.filter(Char::isDigit).take(5) },
-                    label = { Text("Port") },
-                    singleLine = true,
-                    isError = port.toIntOrNull()?.let { it !in 1..65535 } ?: true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
-                    modifier = Modifier.weight(1f),
-                )
+                if (!manual) {
+                    TextButton(onClick = { vm.showManualSetup() }) { Text("Set up by hand instead") }
+                }
             }
-            if (advanced) {
+            if (paired && !manual) {
+                SectionTitle("Computer")
+                Text("Paired with ${saved.name}", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "${saved.user}@${saved.hosts.joinToString(", ")}, port ${saved.port}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Outlined.QrCodeScanner, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Pair again or with another computer")
+                }
+                TextButton(onClick = { vm.showManualSetup() }) { Text("Edit the connection by hand") }
+            }
+            if (manual) {
+                SectionTitle("Computer")
+                if (!firstRun) {
+                    OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Outlined.QrCodeScanner, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Pair by scanning a code")
+                    }
+                }
                 OutlinedTextField(
-                    value = command,
-                    onValueChange = { command = it },
-                    label = { Text("Remote command") },
-                    supportingText = { Text("Ignored when authorized_keys sets command= for this key, as recommended.") },
+                    value = host,
+                    onValueChange = { host = it },
+                    label = { Text("Address") },
+                    placeholder = { Text("192.168.1.20 or workstation.local") },
+                    supportingText = if (hosts.size > 1 || saved.hosts.size > 1) {
+                        { Text("Tried in order. Separate addresses with commas.") }
+                    } else {
+                        null
+                    },
                     singleLine = true,
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
                     modifier = Modifier.fillMaxWidth(),
                 )
-            } else {
-                TextButton(onClick = { advanced = true }) { Text("Advanced") }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = user,
+                        onValueChange = { user = it },
+                        label = { Text("User") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
+                        modifier = Modifier.weight(2f),
+                    )
+                    OutlinedTextField(
+                        value = port,
+                        onValueChange = { value -> port = value.filter(Char::isDigit).take(5) },
+                        label = { Text("Port") },
+                        singleLine = true,
+                        isError = port.toIntOrNull()?.let { it !in 1..65535 } ?: true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (advanced) {
+                    OutlinedTextField(
+                        value = command,
+                        onValueChange = { command = it },
+                        label = { Text("Remote command") },
+                        supportingText = { Text("Ignored when authorized_keys sets command= for this key, as recommended.") },
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    TextButton(onClick = { advanced = true }) { Text("Advanced") }
+                }
+
+                Button(
+                    onClick = {
+                        vm.saveSettings(draft)
+                        onConnected()
+                    },
+                    enabled = draft.isComplete && (changed || firstRun),
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                ) { Text(if (firstRun) "Connect" else "Save and reconnect") }
+
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                PhoneKeySection(phoneKey, user.trim(), snackbar)
             }
 
-            Button(
-                onClick = {
-                    vm.saveSettings(draft)
-                    onConnected()
-                },
-                enabled = draft.isComplete && (changed || firstRun),
-                modifier = Modifier.fillMaxWidth().height(48.dp),
-            ) { Text(if (firstRun) "Connect" else "Save and reconnect") }
-
-            HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            PhoneKeySection(phoneKey, user.trim(), snackbar)
-
-            if (pinned != null && saved.isComplete) {
+            if (pinned.isNotEmpty() && saved.isComplete) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 SectionTitle("Trusted computer")
-                Text(
-                    "${saved.host}:${saved.port} is trusted with this host key fingerprint:",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Fingerprint(pinned!!)
-                OutlinedButton(onClick = vm::forgetHostKey) { Text("Forget this computer's key") }
+                val keys = pinned.values.distinct()
+                if (keys.size == 1) {
+                    Text(
+                        "${saved.label} (${pinned.keys.joinToString(", ")}, port ${saved.port}) is trusted with this host key fingerprint:",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Fingerprint(keys.single())
+                } else {
+                    // Trusted on first use one address at a time, so they may not all be the same computer.
+                    Text(
+                        "${saved.label}'s addresses are trusted with different host keys. Each should be the computer's own:",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    for ((host, key) in pinned) {
+                        Text("$host, port ${saved.port}", style = MaterialTheme.typography.labelMedium)
+                        Fingerprint(key)
+                    }
+                }
+                if (paired) {
+                    // Forgetting it would trust whichever key answers next, instead of the one its code named.
+                    Text(
+                        "The key came from its pairing code. If ${saved.label} was reinstalled, pair with it again.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    OutlinedButton(onClick = { vm.forgetHostKey() }) { Text("Forget this computer's key") }
+                }
             }
 
             Spacer(Modifier.height(8.dp))

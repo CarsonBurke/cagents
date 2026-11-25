@@ -16,13 +16,17 @@ import dev.cagents.mobile.protocol.SendMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.random.Random
 
-data class PhoneKeyInfo(val openSsh: String, val hardwareBacked: Boolean)
+data class PhoneKeyInfo(val openSsh: String, val fingerprint: String, val hardwareBacked: Boolean)
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val graph = app.graph
@@ -34,9 +38,44 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _phoneKey = MutableStateFlow<Result<PhoneKeyInfo>?>(null)
     val phoneKey: StateFlow<Result<PhoneKeyInfo>?> = _phoneKey.asStateFlow()
 
-    private val _pinned = MutableStateFlow(graph.hostKeys.pinned(settings.value.hostKeyId))
-    /** The fingerprint trusted for the configured computer, if any. */
-    val pinnedFingerprint: StateFlow<String?> = _pinned.asStateFlow()
+    /** The fingerprint trusted at each of the configured computer's addresses that has one, in their order. */
+    val pinnedFingerprints: StateFlow<Map<String, String>> = combine(settings, graph.hostKeys.revision) { settings, _ ->
+        settings.hosts.mapNotNull { host -> graph.hostKeys.pinned(settings.hostKeyId(host))?.let { host to it } }.toMap()
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    private val _manualSetup = MutableStateFlow(false)
+    /** Whether Settings shows the fields for setting up a computer by hand, rather than leading with pairing. */
+    val manualSetup: StateFlow<Boolean> = _manualSetup.asStateFlow()
+
+    fun showManualSetup(show: Boolean = true) {
+        _manualSetup.value = show
+    }
+
+    /**
+     * Pairing codes other apps opened this one with, by offer, until a
+     * pairing screen takes them. Kept here rather than in the screen's
+     * route, which is saved with the activity, so a code's one-time key is
+     * never written out.
+     */
+    private val offeredLinks = mutableMapOf<Long, String>()
+
+    private val _pairingOffer = MutableStateFlow<Long?>(null)
+    /** The newest pairing code offered, to open a pairing screen for. */
+    val pairingOffer: StateFlow<Long?> = _pairingOffer.asStateFlow()
+
+    fun openPairingLink(link: String) {
+        // Random, so no offer matches a pairing screen restored from before
+        // the process was restarted.
+        val offer = Random.nextLong(1, Long.MAX_VALUE)
+        offeredLinks[offer] = link
+        _pairingOffer.value = offer
+    }
+
+    /** The pairing code for [offer], once; null after that, or after the process was restarted. */
+    fun takePairingLink(offer: Long): String? {
+        if (_pairingOffer.value == offer) _pairingOffer.value = null
+        return offeredLinks.remove(offer)
+    }
 
     private val _messages = Channel<String>(Channel.BUFFERED)
     /** Short messages for a snackbar, such as why an action failed. */
@@ -45,28 +84,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     init {
         viewModelScope.launch {
             _phoneKey.value = withContext(Dispatchers.IO) {
-                runCatching { PhoneKey.get(app).let { PhoneKeyInfo(it.openSsh, it.hardwareBacked) } }
+                runCatching { PhoneKey.get(app).let { PhoneKeyInfo(it.openSsh, it.fingerprint, it.hardwareBacked) } }
             }
         }
     }
 
     fun saveSettings(new: ConnectionSettings) {
         graph.settings.save(new)
-        _pinned.value = graph.hostKeys.pinned(settings.value.hostKeyId)
         // Closing the old connection may wait on the network.
         viewModelScope.launch(Dispatchers.Default) { controller.restart() }
     }
 
     fun trustHostKey(failure: ConnectFailure.UnknownHostKey) {
-        graph.hostKeys.pin(settings.value.hostKeyId, failure.fingerprint, failure.keyType)
-        _pinned.value = failure.fingerprint
+        val settings = settings.value
+        graph.hostKeys.pin(listOf(settings.hostKeyId(failure.host.ifEmpty { settings.host })), failure.fingerprint, failure.keyType)
         controller.retryNow()
     }
 
-    /** Forgets the trusted host key, so the next connection asks again. */
-    fun forgetHostKey() {
-        graph.hostKeys.forget(settings.value.hostKeyId)
-        _pinned.value = null
+    /**
+     * Forgets the trusted host key at [host], or at every address when null,
+     * so the next connection there asks again.
+     */
+    fun forgetHostKey(host: String? = null) {
+        val settings = settings.value
+        graph.hostKeys.forget(host?.let { listOf(settings.hostKeyId(it)) } ?: settings.hostKeyIds)
         controller.retryNow()
     }
 

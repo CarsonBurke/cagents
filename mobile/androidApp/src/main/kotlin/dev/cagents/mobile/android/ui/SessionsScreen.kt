@@ -97,7 +97,7 @@ fun SessionsScreen(
                 TopAppBar(
                     title = {
                         Column {
-                            Text(remote.welcome?.host ?: settings.host.ifBlank { "cagents" })
+                            Text(remote.welcome?.host ?: settings.label.ifBlank { "cagents" })
                             val subtitle = when (remote.connection) {
                                 ConnectionState.Connected -> remote.welcome?.let { "cagents ${it.serverVersion}" }
                                 else -> null
@@ -132,7 +132,7 @@ fun SessionsScreen(
                     CircularProgressIndicator()
                 }
             }
-            overview.isEmpty -> EmptySessions(Modifier.padding(padding), remote.welcome?.host ?: settings.host)
+            overview.isEmpty -> EmptySessions(Modifier.padding(padding), remote.welcome?.host ?: settings.label)
             else -> LazyColumn(
                 contentPadding = PaddingValues(
                     top = padding.calculateTopPadding(),

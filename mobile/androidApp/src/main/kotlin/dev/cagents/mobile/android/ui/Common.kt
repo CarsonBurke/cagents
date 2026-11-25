@@ -120,7 +120,7 @@ private fun Banner(
  * a trusted one presents a different key.
  */
 @Composable
-fun HostKeyDialogs(vm: MainViewModel) {
+fun HostKeyDialogs(vm: MainViewModel, onPairAgain: () -> Unit) {
     val remote by vm.remote.collectAsStateWithLifecycle()
     val settings by vm.settings.collectAsStateWithLifecycle()
     val failure = (remote.connection as? ConnectionState.NeedsAction)?.failure
@@ -131,7 +131,7 @@ fun HostKeyDialogs(vm: MainViewModel) {
             AlertDialog(
                 onDismissRequest = { vm.dismissHostKey(failure.fingerprint) },
                 icon = { Icon(Icons.Outlined.Key, contentDescription = null) },
-                title = { Text("Trust ${settings.host}?") },
+                title = { Text("Trust ${failure.host.ifEmpty { settings.host }}?") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("This is the first connection to this computer. Check that its fingerprint matches before trusting it.")
@@ -151,10 +151,13 @@ fun HostKeyDialogs(vm: MainViewModel) {
             AlertDialog(
                 onDismissRequest = { vm.dismissHostKey(failure.fingerprint) },
                 icon = { Icon(Icons.Outlined.WarningAmber, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
-                title = { Text("${settings.host} changed its identity") },
+                title = { Text("${failure.host.ifEmpty { settings.host }} changed its identity") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Its host key differs from the one you trusted. If you didn't reinstall the computer or its SSH server, someone may be impersonating it.")
+                        if (settings.name.isNotEmpty()) {
+                            Text("If you did, pair again from the computer to trust its new key.")
+                        }
                         Text("Now", style = MaterialTheme.typography.labelMedium)
                         Fingerprint(failure.fingerprint)
                         Text("Trusted", style = MaterialTheme.typography.labelMedium)
@@ -165,8 +168,16 @@ fun HostKeyDialogs(vm: MainViewModel) {
                     TextButton(onClick = { vm.dismissHostKey(failure.fingerprint) }) { Text("Keep the old key") }
                 },
                 dismissButton = {
-                    TextButton(onClick = vm::forgetHostKey) {
-                        Text("Forget old key", color = MaterialTheme.colorScheme.error)
+                    // A paired computer's key came from its pairing code, so a new one comes from a new code.
+                    if (settings.name.isNotEmpty()) {
+                        TextButton(onClick = {
+                            vm.dismissHostKey(failure.fingerprint)
+                            onPairAgain()
+                        }) { Text("Pair again") }
+                    } else {
+                        TextButton(onClick = { vm.forgetHostKey(failure.host.ifEmpty { null }) }) {
+                            Text("Forget old key", color = MaterialTheme.colorScheme.error)
+                        }
                     }
                 },
             )

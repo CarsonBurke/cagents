@@ -29,17 +29,16 @@ import javax.crypto.spec.GCMParameterSpec
  * stored encrypted with an AES key that the Keystore holds.
  */
 class PhoneKey private constructor(
-    /** The raw 32-byte public key. */
-    val publicKey: ByteArray,
+    override val publicKey: ByteArray,
     private val signer: (ByteArray) -> ByteArray,
     /** True when the private key stays inside the Android Keystore. */
     val hardwareBacked: Boolean,
-) {
-    fun sign(data: ByteArray): ByteArray = signer(data)
+) : SigningKey {
+    override fun sign(data: ByteArray): ByteArray = signer(data)
 
     /** The key as one `authorized_keys` entry, without options. */
     val openSsh: String
-        get() = "ssh-ed25519 ${Base64.encodeToString(publicBlob(publicKey), Base64.NO_WRAP)} $COMMENT"
+        get() = "$openSshKey $COMMENT"
 
     companion object {
         const val COMMENT = "cagents-phone"

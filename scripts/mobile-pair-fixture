@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Pair the Android app with a throwaway computer, to exercise pairing end to
+# end without touching your own SSH server or ~/.ssh/authorized_keys.
+#
+#   scripts/mobile-pair-fixture start CAGENTS_BIN_DIR [--host ADDRESS]... [--port PORT]
+#   scripts/mobile-pair-fixture code              # prints a new pairing code, writes code.png
+#   scripts/mobile-pair-fixture requests          # the phone's request, once it has asked
+#   scripts/mobile-pair-fixture allow | decline   # answer it, as the desktop's popover does
+#   scripts/mobile-pair-fixture stop              # stop sshd and remove everything
+#
+# start runs sshd as you, listening only on loopback (port 2244 by default),
+# with its own host key and its own authorized_keys under
+# $CAGENTS_PAIR_FIXTURE (default /var/tmp/cagents-pair-fixture-$USER). An
+# emulator reaches it at 10.0.2.2, the default --host; for a phone over
+# `adb reverse tcp:2244 tcp:2244`, use --host 127.0.0.1. CAGENTS_BIN_DIR
+# holds a matched cagents and cagentsd, such as a main build the sentinel
+# kept. Their bridges run with a HOME and XDG_RUNTIME_DIR of their own, so
+# the phone sees the fixture's daemon and none of your sessions.
+#
+# code writes what `Pairing::start` and `Pairing::code` (src/mobile/pairing.rs)
+# write: a one-time key authorized with `restrict`, an `expiry-time` and the
+# `daemon bridge --pair DIR` command, and DIR with its `expires`. code.png is
+# the code as a QR code, for an emulator's camera:
+#   emulator -avd NAME -camera-back virtualscene -virtualscene-poster wall=.../code.png
+# allow does what `Pairing::allow` does: it replaces the one-time line with
+# the phone's restricted `--mobile` line and writes the decision.
+#
+# Run it from a shell of your own: the bridge refuses to pair under an agent's
+# authority, and this does nothing to get past that.
+set -euo pipefail
+
+base=${CAGENTS_PAIR_FIXTURE:-/var/tmp/cagents-pair-fixture-$USER}
+state=$base/state
+
+die() { echo "mobile-pair-fixture: $*" >&2; exit 1; }
+[ $# -ge 1 ] || die "usage: see the comment at the top of $0"
+command=$1
+shift
+
+case $command in
+start)
+    [ $# -ge 1 ] || die "start needs CAGENTS_BIN_DIR"
+    bin=$(cd "$1" && pwd)
+    shift
+    [ -x "$bin/cagents" ] && [ -x "$bin/cagentsd" ] || die "$bin needs both cagents and cagentsd"
+    hosts=()
+    port=2244
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --host) hosts+=("$2"); shift 2 ;;
+            --port) port=$2; shift 2 ;;
+            *) die "unknown option $1" ;;
+        esac
+    done
+    [ ${#hosts[@]} -gt 0 ] || hosts=(10.0.2.2)
+    # A directory of its own, made here: sshd trusts its authorized_keys
+    # without checking who could write them.
+    [ ! -e "$base" ] || die "$base exists; stop it first, or set CAGENTS_PAIR_FIXTURE"
+    mkdir -m 700 "$base"
+    mkdir -m 700 "$base/home" "$base/run"
+    ssh-keygen -q -t ed25519 -N '' -C fixture-host -f "$base/host_key" <<<y >/dev/null
+    : >"$base/authorized_keys"
+    chmod 600 "$base/authorized_keys"
+    cat >"$base/sshd_config" <<EOF
+ListenAddress 127.0.0.1:$port
+HostKey $base/host_key
+PidFile $base/sshd.pid
+AuthorizedKeysFile $base/authorized_keys
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+AllowUsers $USER
+EOF
+    {
+        printf 'bin=%q\n' "$bin"
+        printf 'port=%q\n' "$port"
+        printf 'hosts=(%s)\n' "$(printf '%q ' "${hosts[@]}")"
+    } >"$state"
+    sshd=$(command -v sshd || echo /usr/sbin/sshd)
+    "$sshd" -f "$base/sshd_config" -E "$base/sshd.log"
+    for _ in $(seq 50); do [ -s "$base/sshd.pid" ] && break; sleep 0.1; done
+    [ -s "$base/sshd.pid" ] || die "sshd didn't start; see $base/sshd.log"
+    echo "sshd on 127.0.0.1:$port, host key $(ssh-keygen -lf "$base/host_key.pub" | cut -d' ' -f2)"
+    ;;
+code)
+    [ -e "$state" ] || die "start it first"
+    # shellcheck source=/dev/null
+    source "$state"
+    /usr/bin/python3 -I - "$base" "$bin" "$port" "$USER" "$(hostname -s)" "${hosts[@]}" <<'PY'
+import base64, os, subprocess, sys, time, urllib.parse
+base, bin_dir, port, user, name, *hosts = sys.argv[1:]
+work = os.path.join(base, "one-time")
+if os.path.exists(work):
+    os.remove(work)
+    os.remove(work + ".pub")
+subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", work], check=True)
+
+def field(blob, at):
+    size = int.from_bytes(blob[at:at + 4], "big")
+    return blob[at + 4:at + 4 + size], at + 4 + size
+
+# The seed is the first half of the private part of OpenSSH's key format.
+armored = "".join(line for line in open(work) if not line.startswith("-----"))
+blob = base64.b64decode(armored)
+at = len(b"openssh-key-v1\0")
+for _ in range(3):  # cipher, kdf, kdf options
+    _, at = field(blob, at)
+at += 4  # key count
+_, at = field(blob, at)  # public key
+private, _ = field(blob, at)
+at = 8  # check integers
+_, at = field(private, at)  # key type
+_, at = field(private, at)  # public key
+secret, _ = field(private, at)
+seed = secret[:32]
+os.remove(work)
+public = open(work + ".pub").read().split()[:2]
+os.remove(work + ".pub")
+
+identity = os.urandom(8).hex()
+expires = int(time.time()) + 300
+pairings = os.path.join(base, "run", "cagents-phone-pairing")
+os.makedirs(pairings, mode=0o700, exist_ok=True)
+directory = os.path.join(pairings, identity)
+os.mkdir(directory, 0o700)
+with open(os.path.join(directory, "expires"), "w") as f:
+    f.write(str(expires))
+expiry = time.strftime("%Y%m%d%H%MZ", time.gmtime(expires + 120))
+line = (f'expiry-time="{expiry}",command="{bin_dir}/cagents daemon bridge --pair {directory}",restrict '
+        f"{public[0]} {public[1]} cagents-pairing-{identity}\n")
+with open(os.path.join(base, "authorized_keys"), "a") as f:
+    f.write(line)
+with open(os.path.join(base, "pairing"), "w") as f:
+    f.write(directory + "\n" + line)
+
+host_key = subprocess.run(["ssh-keygen", "-lf", os.path.join(base, "host_key.pub")],
+                          capture_output=True, text=True, check=True).stdout.split()[1]
+query = [("v", "1"), ("name", name), ("user", user), ("port", port), ("hostkey", host_key)]
+query += [("host", host) for host in hosts]
+query += [("key", base64.urlsafe_b64encode(seed).decode().rstrip("=")), ("expires", str(expires))]
+code = "cagents-mobile://pair?" + urllib.parse.urlencode(query)
+with open(os.path.join(base, "code"), "w") as f:
+    f.write(code + "\n")
+print(code)
+PY
+    if command -v qrencode >/dev/null; then
+        qrencode -s 12 -m 4 -o "$base/code.png" <"$base/code"
+    else
+        # zxing's encoder from the Gradle cache, which the app's build already downloaded.
+        jar=$(find ~/.gradle/caches -name 'core-3.5*.jar' -path '*zxing*' 2>/dev/null | head -n1)
+        java=$(command -v java || find ~/.gradle/jdks -maxdepth 3 -name bin -path '*21*' -exec echo {}/java \; 2>/dev/null | head -n1)
+        if [ -n "$jar" ] && [ -n "$java" ]; then
+            cat >"$base/Qr.java" <<'JAVA'
+import com.google.zxing.*;
+import com.google.zxing.qrcode.QRCodeWriter;
+import java.awt.image.BufferedImage;
+import java.nio.file.*;
+import java.util.Map;
+public class Qr {
+    public static void main(String[] args) throws Exception {
+        String text = Files.readString(Path.of(args[0])).trim();
+        var matrix = new QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, Map.of(EncodeHintType.MARGIN, 4));
+        int scale = 12, size = matrix.getWidth() * scale;
+        var image = new BufferedImage(size, size, BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+                image.setRGB(x, y, matrix.get(x / scale, y / scale) ? 0x000000 : 0xFFFFFF);
+        javax.imageio.ImageIO.write(image, "png", Path.of(args[1]).toFile());
+    }
+}
+JAVA
+            "$java" -cp "$jar" "$base/Qr.java" "$base/code" "$base/code.png"
+        else
+            echo "mobile-pair-fixture: no qrencode or zxing found, so no code.png" >&2
+        fi
+    fi
+    ;;
+requests)
+    directory=$(head -n1 "$base/pairing")
+    cat "$directory/request.json" 2>/dev/null && echo || echo "No request yet."
+    ;;
+allow | decline)
+    [ -e "$base/pairing" ] || die "no pairing; run code first"
+    # shellcheck source=/dev/null
+    source "$state"
+    /usr/bin/python3 -I - "$base" "$bin" "$command" <<'PY'
+import json, os, sys, tempfile
+base, bin_dir, outcome = sys.argv[1:]
+directory, line = open(os.path.join(base, "pairing")).read().split("\n", 1)
+request = json.load(open(os.path.join(directory, "request.json")))
+keys_path = os.path.join(base, "authorized_keys")
+kept = [l for l in open(keys_path).read().splitlines(keepends=True) if l != line]
+if outcome == "allow":
+    environment = f"HOME={base}/home XDG_RUNTIME_DIR={base}/run"
+    kept.append(f'command="env {environment} {bin_dir}/cagents daemon bridge --mobile",restrict '
+                f"{request['key']} {request['name']}\n")
+with open(keys_path, "w") as f:
+    f.writelines(kept)
+word = "allowed" if outcome == "allow" else "declined"
+with tempfile.NamedTemporaryFile("w", dir=directory, delete=False) as f:
+    f.write(word)
+os.rename(f.name, os.path.join(directory, "decision"))
+print(f"{word}: {request['name']}")
+PY
+    rm -f "$base/pairing"
+    ;;
+stop)
+    if [ -s "$base/sshd.pid" ]; then kill "$(cat "$base/sshd.pid")" 2>/dev/null || true; fi
+    pkill -f "$base/run" 2>/dev/null || true
+    # The fixture's daemon, started by a bridge, runs under the fixture's HOME.
+    for pid in $(pgrep -u "$USER" cagentsd 2>/dev/null); do
+        if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "HOME=$base/home"; then kill "$pid" || true; fi
+    done
+    rm -rf "$base"
+    echo "stopped and removed $base"
+    ;;
+*) die "unknown command $command" ;;
+esac
