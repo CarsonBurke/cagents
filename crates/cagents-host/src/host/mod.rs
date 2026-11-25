@@ -240,6 +240,35 @@ pub struct DaemonAdmission {
 }
 
 #[cfg(target_os = "linux")]
+struct StartupPublication {
+    publication: crate::update::LocalPublication,
+    _admission: DaemonAdmission,
+}
+
+#[cfg(target_os = "linux")]
+fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPublication>) {
+    if pending.is_none() {
+        return;
+    }
+    use crate::terminal_ipc::StartupState;
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let readiness = state.startup_state_before_publication();
+    if matches!(readiness, StartupState::Restoring { .. }) {
+        return;
+    }
+    let publication = pending.take().unwrap();
+    // A retained startup owns the only listener that can inspect its original
+    // work. Give the public launcher that listener's protocol while leaving
+    // its Retained status and verification outcome intact.
+    if let Err(error) = publication.publication.publish() {
+        let detail = format!("Could not select the restored application: {error}");
+        state.retain_startup_recovery(detail.clone());
+        tracing::error!(%detail, "restored startup owners were kept");
+    }
+    state.publishing_startup = false;
+}
+
+#[cfg(target_os = "linux")]
 impl DaemonAdmission {
     #[doc(hidden)]
     pub fn with_update_standby(mut self, standby: Option<daemon::standby::Activated>) -> Self {
@@ -589,7 +618,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let paths = RuntimePaths::discover()?;
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
     #[cfg(target_os = "linux")]
-    let standby = admission.standby.take();
+    let mut standby = admission.standby.take();
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -740,6 +769,25 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     })?;
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("restore complete; release admission", None);
+    #[cfg(target_os = "linux")]
+    let mut pending_publication = if let Some(publication) = standby
+        .as_mut()
+        .and_then(daemon::standby::Activated::take_local_publication)
+    {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publishing_startup = true;
+        Some(StartupPublication {
+            publication,
+            _admission: admission,
+        })
+    } else {
+        drop(admission);
+        None
+    };
+    #[cfg(target_os = "linux")]
+    publish_restored_selection(&host, &mut pending_publication);
+    #[cfg(not(target_os = "linux"))]
     drop(admission);
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("admission released", None);
@@ -889,6 +937,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         tracing::warn!(%error, "replacement daemon startup acknowledgement was not delivered");
     }
     loop {
+        #[cfg(target_os = "linux")]
+        publish_restored_selection(&host, &mut pending_publication);
         reap_finished(&mut clients);
         if daemon::termination_requested() {
             host.lock()

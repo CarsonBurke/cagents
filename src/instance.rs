@@ -1623,6 +1623,15 @@ impl UiUpdateGuard {
         self.restore_policy = WindowRestorePolicy::ExistingOnly;
     }
 
+    /// An exact successor may still be restoring and holds its own copy of
+    /// the launch fence. Close this copy without unlocking that description.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn leave_launch_fence_with_successor(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            drop(lock.into_file());
+        }
+    }
+
     pub fn has_running_windows(&self) -> io::Result<bool> {
         running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
     }
@@ -4036,6 +4045,22 @@ mod tests {
             verified_windows_within(runtime.path(), Path::new("/proc"), Duration::ZERO).is_err()
         );
         assert!(guard.verified_windows().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_update_can_leave_the_launch_fence_with_its_exact_successor() {
+        let runtime = tempdir().unwrap();
+        let path = runtime
+            .path()
+            .join(format!("{APPLICATION_LOCK_FILE}.update"));
+        let mut guard = guard_in(runtime.path());
+        let inherited = guard.lock.as_ref().unwrap().try_clone().unwrap();
+        guard.leave_launch_fence_with_successor();
+        drop(guard);
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(inherited);
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
     }
 
     #[test]

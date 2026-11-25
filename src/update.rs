@@ -12,6 +12,11 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
+#[cfg(all(target_os = "linux", feature = "host"))]
+mod publication;
+#[cfg(all(target_os = "linux", feature = "host"))]
+#[doc(hidden)]
+pub use publication::LocalPublication;
 mod pending_recovery;
 pub mod progress;
 pub mod recovery;
@@ -420,13 +425,17 @@ const PREPARED_CANDIDATE_MARKER: &str = ".cagents-prepared-candidate-v1.json";
 
 /// Whether `install.sh` left the version tree at `root` as a candidate it has
 /// not verified, such as one kept after a failed or rolled-back update. It
-/// removes both markers once it verifies a publication; a later install of that
+/// removes these markers once it verifies a publication; a later install of that
 /// release revalidates a marked tree. Releases before that removal left the
 /// prepared marker on trees they published, which are refused here too.
 pub(crate) fn is_unverified_candidate(root: &Path) -> bool {
-    [RETAINED_CANDIDATE_MARKER, PREPARED_CANDIDATE_MARKER]
-        .iter()
-        .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
+    [
+        RETAINED_CANDIDATE_MARKER,
+        PREPARED_CANDIDATE_MARKER,
+        installed::LOCAL_STAGE_MARKER,
+    ]
+    .iter()
+    .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
 }
 
 /// Whether `install.sh` would refuse to install `version` again because this
@@ -588,32 +597,38 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
 }
 
 pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
-    apply_installed_from(executable, false)
+    apply_installed_from(Some(executable))
 }
 
-fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
+fn apply_installed_from(window_candidate: Option<&Path>) -> Result<UpdateJob, UpdateError> {
     recovery::inspect_pending_current()?;
     let mut installation = running_installation()?;
     let layout = locate(&crate::process::current_executable()?)?;
     let served = served_version_root(&layout)?;
-    if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
-        return Err(invalid(
-            "the installed candidate changed; inspect the installation again",
-        ));
-    }
-    // The served build owns every update, including an older daemon's
-    // replacement and a remaining window-only replacement.
-    installation.version = installed_entry_worker(&layout, &served)?;
-    let version = served
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(unsupported_install)?
-        .to_owned();
+    let candidate = match window_candidate {
+        None => installed_terminal_candidate(&layout, &served)?,
+        Some(executable) => {
+            if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
+                return Err(invalid(
+                    "the installed candidate changed; inspect the installation again",
+                ));
+            }
+            served.clone()
+        }
+    };
+    // The candidate owns its update. For a privately staged CLI, compare
+    // against the public version so an absent daemon still permits the switch.
+    let source_layout = if candidate == served {
+        layout
+    } else {
+        locate(&served.join("bin/cagents-ui"))?
+    };
+    installation.version = installed_entry_worker(&source_layout, &candidate)?;
     start_job(
         &installation,
-        &version,
-        &if terminal {
-            UpdateRequest::InstalledFromTerminal { root: served }
+        &installation.version,
+        &if window_candidate.is_none() {
+            UpdateRequest::InstalledFromTerminal { root: candidate }
         } else {
             UpdateRequest::Installed { root: served }
         },
@@ -683,16 +698,28 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
-    // An interrupted preparation has its own immutable source census. Do not
-    // route this retry through old `current` or construct a fresh empty source.
-    recovery::inspect_pending_current()?;
-    let layout = locate(&crate::process::current_executable()?)?;
-    let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
     if cancellation::requested() {
         return Err(UpdateError::Cancelled);
     }
-    let initial = apply_installed_from(&candidate, true)?;
+    let initial = apply_installed_from(None)?;
     drive_terminal_review(initial, yes, interrupt)
+}
+
+fn installed_terminal_candidate(
+    caller: &InstallLayout,
+    served: &Path,
+) -> Result<PathBuf, UpdateError> {
+    if caller.version_root != served {
+        match fs::symlink_metadata(caller.version_root.join(installed::LOCAL_STAGE_MARKER)) {
+            Ok(_) => {
+                installed::Selection::capture(caller)?;
+                return Ok(caller.version_root.clone());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(served.to_owned())
 }
 
 pub fn upgrade_release(
@@ -2322,7 +2349,7 @@ fn perform_update(
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
-    let context = ReviewContext::capture(installation)?;
+    let context = ReviewContext::capture(&installation.version)?;
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
         Installation::detect()?;
@@ -2659,7 +2686,7 @@ struct ReviewContext {
 }
 
 impl ReviewContext {
-    fn capture(installation: &Installation) -> Result<Self, UpdateError> {
+    fn capture(selected_version: &str) -> Result<Self, UpdateError> {
         let guard = crate::instance::UiUpdateGuard::acquire()?;
         let windows = guard.verified_windows()?;
         let layout = locate(&crate::process::current_executable()?)?;
@@ -2670,7 +2697,7 @@ impl ReviewContext {
                     .first()
                     .and_then(|window| locate(&window.executable).ok().map(|layout| layout.version))
             })
-            .unwrap_or_else(|| installation.version.clone());
+            .unwrap_or_else(|| selected_version.to_owned());
         Ok(Self {
             from_version,
             windows: windows.len(),
@@ -6260,7 +6287,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 // This fixture itself runs outside an installation. The public
                 // entry cannot guess a target from its supplied UI path; the
                 // managed old UI/CLI routes are exercised above.
-                apply_installed_from(&root.path().join("versions/new/bin/cagents-ui"), true),
+                apply_installed(&root.path().join("versions/new/bin/cagents-ui")),
                 Err(UpdateError::Invalid(_))
             ));
             let original = recovery::census_path(root.path(), &job.id);

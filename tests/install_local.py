@@ -105,6 +105,29 @@ class InstallLocalHead(unittest.TestCase):
         self.assert_built(result)
         self.assertIn(f"Building main at {self.short()}.\n", result.stdout)
 
+    def test_a_staged_build_is_reused_through_its_own_cli(self):
+        prefix = self.home / "data/cagents-install"
+        version = f"1.2.3+local.{self.short()}"
+        staged = prefix / "versions" / version
+        (prefix / "versions/source").mkdir(parents=True)
+        (prefix / "current").symlink_to("versions/source")
+        (staged / "bin").mkdir(parents=True)
+        (staged / ".cagents-local-candidate-v1").write_text("source\n")
+        cli = staged / "bin/cagents"
+        cli.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+        cli.chmod(0o755)
+
+        result = self.run_script("--stage-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{cli} daemon upgrade", result.stdout)
+        result = self.run_script("--yes", "--interrupt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.endswith("daemon\nupgrade\n--yes\n--interrupt\n"))
+        self.assertEqual((prefix / "current").readlink(), Path("versions/source"))
+        self.assertFalse(self.builds.exists())
+        (staged / ".cagents-local-candidate-v1").write_text("previous-source\n")
+        self.assert_built(self.run_script())
+
     def test_stale_detached_head_is_refused_with_the_update_command(self):
         stale = self.short()
         self.publish("second")

@@ -120,6 +120,7 @@ UNINSTALL=0
 PURGE=0
 RESTART_DAEMON=0
 STAGE_ONLY=0
+STAGE_FOR_UPGRADE=0
 SELECT_VERSION=
 REQUIRE_EMPTY_DAEMON=0
 RELAUNCH_AGENTS=
@@ -140,6 +141,11 @@ while [ "$#" -gt 0 ]; do
             ;;
         --stage-only)
             STAGE_ONLY=1
+            shift
+            ;;
+        --stage-for-upgrade)
+            STAGE_ONLY=1
+            STAGE_FOR_UPGRADE=1
             shift
             ;;
         --prepare-candidate|--prepared-candidate)
@@ -226,6 +232,7 @@ if [ -n "$SELECT_VERSION" ]; then
     # Selection never closes windows or touches the daemon. Requiring the
     # option that promises this keeps the effect explicit at the call site.
     [ "$STAGE_ONLY" -eq 1 ] || fail '--select requires --stage-only'
+    [ "$STAGE_FOR_UPGRADE" -eq 0 ] || fail '--select cannot be combined with --stage-for-upgrade'
     case $SELECT_VERSION in
         v*) SELECT_VERSION=${SELECT_VERSION#v} ;;
     esac
@@ -673,6 +680,7 @@ DOWNLOAD_DIR=$(mktemp -d "$TEMP_ROOT/cagents-download.XXXXXX")
 INSTALL_STAGE=
 NEW_VERSION_DIR=
 NEW_VERSION_PREPARED=0
+NEW_VERSION_LOCAL_STAGE=0
 NEW_VERSION_EXISTING=0
 NEW_VERSION_FRESH=0
 NEW_VERSION_RETAINED=0
@@ -1187,9 +1195,12 @@ awk '
     }
 ' "$ARCHIVE_VERBOSE" || fail 'archive contains links, special files, or invalid entry types'
 PREPARED_MARKER=.cagents-prepared-candidate-v1.json
+LOCAL_CANDIDATE_MARKER=.cagents-local-candidate-v1
+LOCAL_SOURCE_MARKER=.cagents-local-source-v1
 RETAINED_MARKER=.cagents-retained-candidate-v1.json
 validate_version_members() {
-    awk -v top="$1" -v installed="$2" -v prepared="$PREPARED_MARKER" -v retained="$RETAINED_MARKER" '
+    awk -v top="$1" -v installed="$2" -v prepared="$PREPARED_MARKER" -v retained="$RETAINED_MARKER" \
+        -v staged="$LOCAL_CANDIDATE_MARKER" -v source="$LOCAL_SOURCE_MARKER" '
     function allowed(path) {
         return path == top "/" ||
             path == top "/bin/" ||
@@ -1222,7 +1233,8 @@ validate_version_members() {
             path == top "/share/doc/cagents/LICENSE" ||
             path == top "/share/doc/cagents/THIRD-PARTY-NOTICES" ||
             (installed && (path == top "/.deferred-owner.json" ||
-                path == top "/" prepared || path == top "/" retained))
+                path == top "/" prepared || path == top "/" retained ||
+                path == top "/" staged || path == top "/" source))
     }
     !allowed($0) || seen[$0]++ { exit 1 }
     $0 == top "/bin/cagents" { required[1] = 1 }
@@ -1350,7 +1362,11 @@ else
         [ "$INSTALLER_ACTUAL" = "$INSTALLER_HASH" ] || fail 'installer SHA-256 verification failed'
     fi
     set -- --version "$VERSION" --prefix "$PREFIX"
-    [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --stage-only
+    if [ "$STAGE_FOR_UPGRADE" -eq 1 ]; then
+        set -- "$@" --stage-for-upgrade
+    elif [ "$STAGE_ONLY" -eq 1 ]; then
+        set -- "$@" --stage-only
+    fi
     [ -z "$SELECT_VERSION" ] || set -- "$@" --select "$SELECT_VERSION"
     [ "$RESTART_DAEMON" -eq 0 ] || set -- "$@" --restart-daemon
     [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || set -- "$@" --require-empty-daemon
@@ -1439,6 +1455,21 @@ prune_installed_versions() (
         # rollback target, so preserve the versions the last switch kept.
         [ -d "$previous_root" ] && [ "$previous_root" != "$versions_root/$VERSION" ] || exit 0
     fi
+    expected_current=versions/$VERSION
+    rollback_root=
+    if [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$HAD_CURRENT" -eq 1 ]; then
+        # A cancelled stage must keep the serving version's rollback tree.
+        # Older installations do not record it, so wait for the next install
+        # once a local publication names the exact predecessor.
+        last_source=$previous_root/$LOCAL_SOURCE_MARKER
+        [ "$(find "$last_source" -maxdepth 0 -type f -uid "$owner_uid" -perm 0600 -print 2>/dev/null)" = "$last_source" ] || exit 0
+        rollback_version=$(cat "$last_source") || exit 0
+        case $rollback_version in
+            ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) exit 0 ;;
+        esac
+        rollback_root=$versions_root/$rollback_version
+        expected_current=$PREVIOUS_CURRENT_TARGET
+    fi
     owner_root=
     if [ -n "${CAGENTS_INSTALL_OWNER_CLI:-}" ]; then
         owner_root=$(readlink -f -- "${CAGENTS_INSTALL_OWNER_CLI%/bin/cagents}") || exit 0
@@ -1471,14 +1502,15 @@ prune_installed_versions() (
             "$VERSION"|*..*|*[!0-9A-Za-z.+~-]*) continue ;;
         esac
         case $in_use in *"|$name|"*) continue ;; esac
-        [ "$old_tree" != "$previous_root" ] && [ "$old_tree" != "$owner_root" ] || continue
+        [ "$old_tree" != "$previous_root" ] && [ "$old_tree" != "$owner_root" ] \
+            && [ "$old_tree" != "$rollback_root" ] || continue
         [ -d "$old_tree" ] && [ ! -L "$old_tree" ] || continue
         [ "$(find "$old_tree" -maxdepth 0 -uid "$owner_uid" ! -perm /022 -print)" = "$old_tree" ] || continue
 
         # Keep private retry candidates for two weeks. A reviewed worker with
         # an inherited daemon lease still owns recovery even after its inner
         # installer commits, so leave marked trees to a later standalone pass.
-        for marker in "$old_tree/$PREPARED_MARKER" "$old_tree/$RETAINED_MARKER"; do
+        for marker in "$old_tree/$PREPARED_MARKER" "$old_tree/$RETAINED_MARKER" "$old_tree/$LOCAL_CANDIDATE_MARKER"; do
             [ -e "$marker" ] || [ -L "$marker" ] || continue
             if [ -n "${CAGENTS_DAEMON_LEASE_FD:-}" ] || \
                 [ "$(find "$marker" -maxdepth 0 -type f -mtime +13 -print)" != "$marker" ]; then
@@ -1494,7 +1526,7 @@ prune_installed_versions() (
             -o -type d -printf "$name/%P/\n" -o -type f -printf "$name/%P\n" \
             -o -printf 'unknown\n' > "$DOWNLOAD_DIR/retention-members" || continue
         validate_version_members "$name" 1 < "$DOWNLOAD_DIR/retention-members" || continue
-        [ "$(readlink "$PREFIX/current" 2>/dev/null)" = "versions/$VERSION" ] || exit 0
+        [ "$(readlink "$PREFIX/current" 2>/dev/null)" = "$expected_current" ] || exit 0
         rm -rf --one-file-system -- "$old_tree" || \
             printf '%s: could not prune old version at %s\n' "$PROGRAM" "$old_tree" >&2
     done
@@ -1598,7 +1630,15 @@ if [ -n "$PREPARED_CANDIDATE" ] || [ -e "$PREFIX/versions/$VERSION" ] || [ -L "$
         fi
         NEW_VERSION_RETAINED=1
     fi
-    if [ "$NEW_VERSION_PREPARED" -eq 0 ] && [ "$NEW_VERSION_RETAINED" -eq 0 ]; then
+    local_marker=$prepared_root/$LOCAL_CANDIDATE_MARKER
+    if [ -e "$local_marker" ] || [ -L "$local_marker" ]; then
+        [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$NEW_VERSION_PREPARED" -eq 0 ] \
+            && [ "$NEW_VERSION_RETAINED" -eq 0 ] \
+            && [ "$(find "$local_marker" -maxdepth 0 -type f -uid "$(id -u)" -perm 0600 -print)" = "$local_marker" ] \
+            || fail 'the private stage requires the local installer and its verified archive'
+        NEW_VERSION_LOCAL_STAGE=1
+    fi
+    if [ "$NEW_VERSION_PREPARED" -eq 0 ] && [ "$NEW_VERSION_RETAINED" -eq 0 ] && [ "$NEW_VERSION_LOCAL_STAGE" -eq 0 ]; then
         [ -z "$PREPARE_CANDIDATE$PREPARED_CANDIDATE" ] \
             || fail 'the prepared candidate does not match this private job and verified archive'
         EXISTING_INSTALLED=1
@@ -1782,16 +1822,17 @@ if [ "$NEW_VERSION_EXISTING" -eq 1 ]; then
     # Pass untrusted existing names as argv, not lines: a newline in an extra
     # name must not split it into two apparently valid archive members.
     find "$NEW_VERSION_DIR" -mindepth 1 -exec sh -c '
-        prepared_root=$1 expected_root=$2 marker=$3 retained=$4
-        shift 4
+        prepared_root=$1 expected_root=$2 marker=$3 retained=$4 staged=$5
+        shift 5
         for actual do
             member=${actual#"$prepared_root/"}
-            { [ "$member" = "$marker" ] || [ "$member" = "$retained" ]; } && continue
+            { [ "$member" = "$marker" ] || [ "$member" = "$retained" ] || [ "$member" = "$staged" ]; } && continue
             [ -e "$expected_root/$member" ] || exit 1
         done
     ' cagents-prepared-tree "$NEW_VERSION_DIR" "$INSTALL_STAGE/$TOP_LEVEL" \
         "$( [ "$NEW_VERSION_PREPARED" -eq 0 ] || printf '%s' "$PREPARED_MARKER" )" \
-        "$( [ "$NEW_VERSION_RETAINED" -eq 0 ] || printf '%s' "$RETAINED_MARKER" )" {} + \
+        "$( [ "$NEW_VERSION_RETAINED" -eq 0 ] || printf '%s' "$RETAINED_MARKER" )" \
+        "$( [ "$NEW_VERSION_LOCAL_STAGE" -eq 0 ] || printf '%s' "$LOCAL_CANDIDATE_MARKER" )" {} + \
         || fail 'the prepared candidate contains unexpected entries'
     rm -rf "$INSTALL_STAGE"
 else
@@ -2012,6 +2053,11 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
     # become current. The coordinator authenticates the unchanged live owner.
     installer_tool "$COORDINATOR" record-deferred-install --stage-only --prefix "$PREFIX" --version-root "$NEW_VERSION_DIR" >/dev/null \
         || fail 'cannot preserve the running owner for this staged update; installation was not changed'
+    if [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$HAD_CURRENT" -eq 1 ]; then
+        # Only legacy publishes have a routing marker that permits selecting
+        # them over a live source. The coordinator has received its receipt.
+        rm -f "$NEW_VERSION_DIR/.deferred-owner.json"
+    fi
     DAEMON_DEFERRED=1
 elif [ "$HAD_CURRENT" -eq 1 ]; then
     if [ "$RESTART_DAEMON" -eq 1 ]; then
@@ -2100,11 +2146,27 @@ if [ "$HAD_CURRENT" -eq 1 ] && [ "$RESTART_DAEMON" -eq 1 ] && [ "$DAEMON_DEFERRE
         *[!0-9]*) fail 'the shared-model store schema is unreadable; installation was not changed' ;;
     esac
 fi
-CURRENT_TEMP=$PREFIX/.current.$$
-rm -f "$CURRENT_TEMP"
-ln -s "versions/$VERSION" "$CURRENT_TEMP"
-CURRENT_SWITCHED=1
-mv -Tf "$CURRENT_TEMP" "$PREFIX/current"
+if [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$HAD_CURRENT" -eq 1 ]; then
+    # Only the reviewed worker may publish this tree. Bind it to the installed
+    # source that owns the public launchers at the time of staging.
+    selected_root=$(readlink -f -- "$PREFIX/current") \
+        || fail 'cannot resolve the selected version'
+    [ "${selected_root%/*}" = "$(readlink -f -- "$PREFIX/versions")" ] \
+        || fail 'the selected version belongs to another installation'
+    PREPARED_MARKER_TEMP=$NEW_VERSION_DIR/.local-candidate.$$
+    (set -C; printf '%s\n' "${selected_root##*/}" > "$PREPARED_MARKER_TEMP") \
+        || fail 'cannot mark the staged local build'
+    mv -Tf "$PREPARED_MARKER_TEMP" "$NEW_VERSION_DIR/$LOCAL_CANDIDATE_MARKER" \
+        || fail 'cannot refresh the staged local build'
+    PREPARED_MARKER_TEMP=
+    sync -f "$PREFIX/versions" || fail 'could not durably stage the local build'
+else
+    CURRENT_TEMP=$PREFIX/.current.$$
+    rm -f "$CURRENT_TEMP"
+    ln -s "versions/$VERSION" "$CURRENT_TEMP"
+    CURRENT_SWITCHED=1
+    mv -Tf "$CURRENT_TEMP" "$PREFIX/current"
+fi
 
 # Publish launchers only after their executable and icon targets exist. Menus
 # can cache a dangling desktop link as missing until their next full rescan.
@@ -2162,7 +2224,11 @@ prune_installed_versions
 refresh_launcher_caches
 
 
-if [ "$STAGE_ONLY" -eq 1 ]; then
+if [ "$STAGE_FOR_UPGRADE" -eq 1 ] && [ "$HAD_CURRENT" -eq 1 ]; then
+    printf 'Staged cagents %s. Your current installation is still serving.\n' "$VERSION"
+elif [ "$STAGE_FOR_UPGRADE" -eq 1 ]; then
+    printf 'Installed cagents %s. The terminal service starts when you open cagents.\n' "$VERSION"
+elif [ "$STAGE_ONLY" -eq 1 ]; then
     printf 'Staged cagents %s; existing windows and the previous service state were preserved. Run cagents daemon upgrade to apply it when ready.\n' "$VERSION"
 elif [ "$DAEMON_DEFERRED" -eq 1 ]; then
     printf 'Installed cagents %s; running sessions were preserved. Run cagents daemon upgrade to finish updating the daemon.\n' "$VERSION"
