@@ -6,7 +6,10 @@ fn retained_call_and_adoption_bound_the_connect_phase_without_disturbing_owner()
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("actor");
     let listener = crate::descriptor::bind(&socket).unwrap();
-    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    assert_eq!(
+        unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+        0
+    );
     let original = UnixStream::connect(&socket).unwrap();
     let mut actor = RemoteActor::fixture();
     let remote = Arc::get_mut(&mut actor.0).unwrap();

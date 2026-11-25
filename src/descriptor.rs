@@ -128,6 +128,43 @@ pub(crate) fn unix_socket(kind: libc::c_int, nonblocking: bool) -> io::Result<Ow
     Ok(socket)
 }
 
+/// Whether a refused Unix-domain `connect` should be tried again before it
+/// counts as proof that nothing listens there. `refusing_since` is when the
+/// first refusal of this endpoint was seen.
+///
+/// Linux refuses only a socket nobody listens on, and answers a full backlog
+/// with `EAGAIN`, so a refusal is final there. Darwin refuses a full backlog
+/// with the same `ECONNREFUSED`. A live listener drains its backlog as it
+/// accepts, so there a refusal counts only once it has persisted for
+/// [`REFUSAL_WINDOW`]. That is weaker than Linux: a listener whose backlog
+/// stays full for the whole window is taken for one that stopped. Retrying
+/// until a caller's own deadline instead, as Linux retries `EAGAIN`, would
+/// make every request to a crashed server, whose socket file stays behind,
+/// wait out that whole deadline. A deadline that ends inside the window
+/// leaves the refusal unproved, so the caller reports a timeout, not absence.
+pub(crate) fn retry_refusal(error: &io::Error, refusing_since: std::time::Instant) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (error, refusing_since);
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        error.kind() == io::ErrorKind::ConnectionRefused
+            && refusing_since.elapsed() < REFUSAL_WINDOW
+    }
+}
+
+/// How long Darwin must keep refusing; see [`retry_refusal`].
+#[cfg(target_os = "macos")]
+pub(crate) const REFUSAL_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A listen backlog that admits exactly one pending connection, so a test can
+/// fill it with one. Linux admits one more than the backlog; XNU admits the
+/// backlog itself, and replaces a backlog of 0 with its default.
+#[cfg(test)]
+pub(crate) const ONE_PENDING_BACKLOG: libc::c_int = if cfg!(target_os = "macos") { 1 } else { 0 };
+
 /// Connects a Unix-domain stream to `path`; see [`keep_options_after_shutdown`].
 pub(crate) fn connect(path: &std::path::Path) -> io::Result<UnixStream> {
     let stream = UnixStream::connect(path)?;

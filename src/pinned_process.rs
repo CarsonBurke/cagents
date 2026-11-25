@@ -167,6 +167,25 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     peer_credentials(stream).map(|credentials| credentials.uid)
 }
 
+/// Which of two processes [`peer_credentials`] names for the end of a
+/// socketpair that `creator` made and handed to `recipient`, once `recipient`
+/// has used it. Linux records the creator when the pair is made and never
+/// changes it; Darwin names the last process to use the end, which is then
+/// `recipient`.
+#[cfg(feature = "host")]
+pub(crate) fn handed_end_peer<T>(creator: T, recipient: T) -> T {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = recipient;
+        creator
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = creator;
+        recipient
+    }
+}
+
 /// One process, pinned when it was opened.
 #[derive(Debug)]
 pub(crate) struct PinnedProcess {
@@ -996,5 +1015,35 @@ mod tests {
                 pid: std::process::id(),
             }
         );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_handed_socketpair_end_names_the_peer_its_platform_promises() {
+        use std::{io::Read, os::unix::process::CommandExt};
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let handed = theirs.as_raw_fd();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf z >&3; exec sleep 30");
+        // SAFETY: dup2 is async-signal-safe, and `handed` stays open in the
+        // parent until spawn returns.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(handed, 3) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(theirs);
+        let mut byte = [0];
+        ours.read_exact(&mut byte).unwrap();
+        assert_eq!(
+            peer_credentials(&ours).unwrap().pid,
+            handed_end_peer(std::process::id(), child.id())
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

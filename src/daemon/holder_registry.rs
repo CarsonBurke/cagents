@@ -54,6 +54,35 @@ impl Process {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
     }
 
+    /// Whether this exact process has exited: it is gone, its pid names a
+    /// later process, or it is a zombie its parent has not reaped yet, which
+    /// [`Self::is_current`] still counts. A process that cannot be inspected
+    /// counts as exited.
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    pub(crate) fn exited(&self) -> bool {
+        let Ok(stat) = fs::read(format!("/proc/{}/stat", self.pid)) else {
+            return true;
+        };
+        let zombie = std::str::from_utf8(&stat)
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')'))
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            .is_some_and(|state| state == "Z");
+        zombie
+            || crate::model::agent_recovery::process_identity(&stat)
+                .is_none_or(|(_, start)| start != self.start)
+    }
+
+    /// As on Linux. A pin refuses a process that has already exited, a zombie
+    /// included, and the start ticks tell a later process holding the pid.
+    #[cfg(all(feature = "host", target_os = "macos"))]
+    pub(crate) fn exited(&self) -> bool {
+        u32::try_from(self.pid)
+            .ok()
+            .and_then(|pid| crate::pinned_process::PinnedProcess::open(pid).ok())
+            .is_none_or(|process| process.started_ticks() != self.start)
+    }
+
     /// Whether this exact process is gone within 15 seconds. Exit proofs, such
     /// as a readable pidfd or a zombie state, come before the parent reaps the
     /// process, and until then its `/proc` entry still names this identity.
@@ -247,7 +276,8 @@ pub fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
 }
 
 /// A Unix address includes its terminating NUL. Filesystem paths have no such
-/// small limit; Linux can resolve a long endpoint through a held directory FD.
+/// small limit; [`with_socket_address`] reaches a longer endpoint through its
+/// held directory.
 #[cfg(feature = "host")]
 pub fn socket_fits(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -258,12 +288,26 @@ pub fn socket_fits(path: &Path) -> bool {
     path.as_os_str().as_bytes().len() < capacity
 }
 
+/// Runs `operation` with an address that reaches the endpoint at `path`, for
+/// `bind`, `connect` or a `stat` of the socket. A path that fits `sun_path` is
+/// passed as is. A longer one is reached through its parent directory, opened
+/// once and checked to be private, so the operation acts in exactly the
+/// directory that was checked:
+///
+/// * Linux passes `/proc/self/fd/N/<name>` for the held directory.
+/// * Darwin has neither `/proc` nor `bindat`/`connectat`, but each thread can
+///   have its own working directory. `operation` runs on a thread of its own
+///   whose working directory is the held one, and is passed the bare name. No
+///   other code runs on that thread, so nothing else resolves paths there.
+///
+/// Either way the endpoint stays at its full path, so discovery,
+/// authentication and inode-based retirement keep their identity and survive
+/// daemon upgrades.
 #[cfg(feature = "host")]
-pub fn with_socket_address<T>(
+pub fn with_socket_address<T: Send>(
     path: &Path,
-    operation: impl FnOnce(&Path) -> io::Result<T>,
+    operation: impl FnOnce(&Path) -> io::Result<T> + Send,
 ) -> io::Result<T> {
-    use std::os::fd::AsRawFd;
     if socket_fits(path) {
         return operation(path);
     }
@@ -297,11 +341,63 @@ pub fn with_socket_address<T>(
             "unsafe holder socket directory",
         ));
     }
-    // Hold the FD until bind/connect completes. The endpoint remains at its
-    // original filesystem path, so discovery, authentication, and inode-based
-    // retirement retain their existing identity and survive daemon upgrades.
-    let address = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
-    operation(&address)
+    // Hold the directory until the operation completes.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let address = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+        operation(&address)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsFd;
+        let name = Path::new(name);
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("socket-address".into())
+                .spawn_scoped(scope, || {
+                    enter_directory(directory.as_fd())?;
+                    operation(name)
+                })?
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+}
+
+/// Makes `directory` the calling thread's working directory, leaving every
+/// other thread's alone.
+///
+/// `pthread_fchdir_np` is exported by `libsystem_pthread`, whose own `fts`
+/// uses it, but no SDK header declares it. It is looked up rather than linked
+/// so that a system without it refuses long endpoints instead of refusing to
+/// start the program.
+#[cfg(all(feature = "host", target_os = "macos"))]
+fn enter_directory(directory: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    type ThreadFchdir = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
+    static THREAD_FCHDIR: std::sync::OnceLock<Option<ThreadFchdir>> = std::sync::OnceLock::new();
+    let thread_fchdir = THREAD_FCHDIR
+        .get_or_init(|| {
+            // SAFETY: the name is NUL-terminated, and RTLD_DEFAULT only searches
+            // the images already loaded.
+            let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"pthread_fchdir_np".as_ptr()) };
+            // SAFETY: `pthread_fchdir_np` is `int pthread_fchdir_np(int fd)`.
+            (!symbol.is_null())
+                .then(|| unsafe { std::mem::transmute::<*mut libc::c_void, ThreadFchdir>(symbol) })
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this system cannot reach a holder endpoint longer than a Unix socket address",
+            )
+        })?;
+    // SAFETY: it only changes this thread's working directory to an open
+    // directory descriptor.
+    if unsafe { thread_fchdir(directory.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "host")]
@@ -1099,6 +1195,7 @@ mod tests {
     #[test]
     fn unix_address_boundary_preserves_full_endpoint_and_discovery_identity() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let working_directory = std::env::current_dir().unwrap();
         // SAFETY: plain data, only the array length is used.
         let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
             .sun_path
@@ -1113,7 +1210,24 @@ mod tests {
             let client = connect(&endpoint).unwrap();
             let (server, _) = crate::descriptor::accept(&listener).unwrap();
             assert!(client.peer_addr().unwrap().as_pathname().is_some());
-            drop((client, server, listener));
+            let deadline = connect_until(
+                &endpoint,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+            let (bounded, _) = crate::descriptor::accept(&listener).unwrap();
+            let socket = fs::metadata(&endpoint).unwrap();
+            let observed = with_socket_address(&endpoint, |address| {
+                crate::agent::observe::socket::connect(address, socket.dev(), socket.ino())
+                    .map_err(|error| io::Error::other(String::from(error)))
+            })
+            .unwrap();
+            let (observer, _) = crate::descriptor::accept(&listener).unwrap();
+            // Reaching a long endpoint leaves this thread where it was.
+            assert_eq!(std::env::current_dir().unwrap(), working_directory);
+            drop((
+                client, server, deadline, bounded, observed, observer, listener,
+            ));
             let mut proof = record();
             proof.terminal = endpoint
                 .file_name()

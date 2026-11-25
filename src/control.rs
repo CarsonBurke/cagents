@@ -1057,6 +1057,8 @@ impl std::fmt::Debug for ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
+/// Darwin answers that pressure with a refusal, which callers take to mean no
+/// daemon runs; see [`crate::descriptor::retry_refusal`].
 pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
@@ -1071,6 +1073,7 @@ pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<Unix
         *target = *byte as _;
     }
     let deadline = Instant::now() + timeout;
+    let refusing_since = Instant::now();
     let mut delay = Duration::from_millis(1);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1099,7 +1102,8 @@ pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<Unix
         if !matches!(
             error.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
+        ) && !crate::descriptor::retry_refusal(&error, refusing_since)
+        {
             return Err(error);
         }
         // EAGAIN has not queued a connection. Close this attempt before
@@ -8149,18 +8153,15 @@ mod tests {
         path: &Path,
     ) -> (std::os::unix::net::UnixListener, Vec<UnixStream>) {
         let listener = crate::descriptor::bind(path).unwrap();
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
-        let pending = (0..2)
-            .map(|_| connect_control_socket(path, Duration::from_millis(100)).unwrap())
-            .collect();
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let pending = vec![connect_control_socket(path, Duration::from_millis(100)).unwrap()];
         (listener, pending)
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
-    )]
     fn control_socket_backlog_pressure_times_out_without_replacing_the_endpoint() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
@@ -8177,10 +8178,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "Darwin refuses a connection beyond the backlog, as it does an unserved socket"
-    )]
     fn control_socket_retry_connects_and_handshakes_when_the_backlog_drains() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
