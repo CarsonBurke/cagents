@@ -1218,6 +1218,12 @@ fn owns_lease(
     process_owns_slot(&proc_root.join(pid.to_string()), pid, expected)
 }
 
+/// Darwin's proof names less than Linux's: the process holds the lease's
+/// inode open while some open file description holds a lock on it. It cannot
+/// tell which description holds the lock, nor that the lock is exclusive
+/// rather than shared, so another process of this user holding the lease open
+/// beside its owner passes too. Any failure to list or read the process
+/// refuses the proof.
 #[cfg(target_os = "macos")]
 fn owns_lease(
     _proc_root: &Path,
@@ -3299,6 +3305,94 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
+
+    /// A process that holds a lease file's lock owns it; once it lets go of
+    /// the lock it does not, though it keeps the file open, and a process
+    /// that never opened the file never does. The processes are this test
+    /// binary, re-executed.
+    #[test]
+    fn only_the_process_holding_a_lease_lock_owns_the_lease() {
+        use std::io::{BufRead, BufReader, Write};
+        const ROLE: &str = "CAGENTS_TEST_LEASE_ROLE";
+        const LEASE: &str = "CAGENTS_TEST_LEASE_PATH";
+        if let Some(role) = env::var_os(ROLE) {
+            let lease = File::open(env::var_os(LEASE).unwrap()).unwrap();
+            let flock = |operation| {
+                // SAFETY: flock takes no pointer, on a descriptor this owns.
+                assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), operation) }, 0);
+            };
+            let mut line = String::new();
+            if role == "holder" {
+                flock(libc::LOCK_EX);
+                println!("locked");
+                std::io::stdin().read_line(&mut line).unwrap();
+                flock(libc::LOCK_UN);
+                println!("unlocked");
+            } else {
+                println!("open");
+            }
+            std::io::stdin().read_line(&mut line).unwrap();
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("lease");
+        fs::write(&path, "").unwrap();
+        let spawn = |role: &str| {
+            let mut child = process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::tests::only_the_process_holding_a_lease_lock_owns_the_lease",
+                    "--nocapture",
+                ])
+                .env(ROLE, role)
+                .env(LEASE, &path)
+                .stdin(process::Stdio::piped())
+                .stdout(process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+            (child, lines)
+        };
+        // The harness prints its own lines around the role's.
+        let expect = |lines: &mut std::io::Lines<BufReader<process::ChildStdout>>, said: &str| {
+            assert!(
+                lines.any(|line| line.unwrap() == said),
+                "the fixture never said {said}"
+            );
+        };
+        let (mut holder, mut holder_said) = spawn("holder");
+        expect(&mut holder_said, "locked");
+        let (bystander, mut bystander_said) = spawn("bystander");
+        expect(&mut bystander_said, "open");
+        let lease = File::open(&path).unwrap();
+        let expected = lease.metadata().unwrap();
+        let owns = |child: &process::Child| {
+            let process = PinnedProcess::open(child.id()).unwrap();
+            owns_lease(Path::new("/proc"), &process, &lease, &expected).unwrap()
+        };
+        let stranger = process::Command::new("sleep")
+            .arg("30")
+            .stdin(process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        assert!(owns(&holder));
+        assert!(!owns(&stranger));
+        // Linux reads which descriptor holds the lock. Darwin can only see
+        // that the file is open while some process holds its lock, so a
+        // process holding it open beside the owner passes there too.
+        assert_eq!(owns(&bystander), cfg!(target_os = "macos"));
+
+        writeln!(holder.stdin.as_mut().unwrap()).unwrap();
+        expect(&mut holder_said, "unlocked");
+        assert!(!owns(&holder));
+        assert!(!owns(&bystander));
+
+        for mut child in [holder, bystander, stranger] {
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
+    }
 
     #[test]
     fn a_namespace_names_its_development_instance() {
