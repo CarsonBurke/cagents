@@ -521,7 +521,50 @@ impl ShortcutPlatform {
             Self::MacOs => MACOS_FIXED_SHORTCUTS,
         }
     }
+
+    /// Chords the system or the application menu takes before the window
+    /// sees them, with why a binding to one could never run.
+    const fn system_chords(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Linux => &[],
+            Self::MacOs => MACOS_SYSTEM_CHORDS,
+        }
+    }
 }
+
+/// The app menu's and Window menu's key equivalents, and the system-wide
+/// chords macOS sets by default. Each would be taken before the window saw it.
+const MACOS_SYSTEM_CHORDS: &[(&str, &str)] = &[
+    ("Cmd+Q", "Cmd+Q quits cagents"),
+    ("Cmd+H", "Cmd+H hides cagents"),
+    ("Cmd+Option+H", "Cmd+Option+H hides other applications"),
+    ("Cmd+M", "Cmd+M minimizes the window"),
+    ("Cmd+Ctrl+F", "Cmd+Ctrl+F enters full screen"),
+    ("Cmd+Tab", "Cmd+Tab switches applications"),
+    ("Cmd+Shift+Tab", "Cmd+Shift+Tab switches applications"),
+    ("Cmd+Space", "Cmd+Space opens Spotlight"),
+    ("Cmd+Option+Space", "Cmd+Option+Space opens a Finder search"),
+    (
+        "Cmd+Ctrl+Space",
+        "Cmd+Ctrl+Space opens the character viewer",
+    ),
+    ("Cmd+Ctrl+Q", "Cmd+Ctrl+Q locks the screen"),
+    ("Cmd+Shift+Q", "Cmd+Shift+Q logs out"),
+    ("Cmd+Option+Shift+Q", "Cmd+Option+Shift+Q logs out"),
+    ("Cmd+Option+D", "Cmd+Option+D shows and hides the Dock"),
+    ("Ctrl+Up", "Ctrl+Up opens Mission Control"),
+    ("Ctrl+Down", "Ctrl+Down shows the application's windows"),
+    ("Ctrl+Left", "Ctrl+Left moves to the previous space"),
+    ("Ctrl+Right", "Ctrl+Right moves to the next space"),
+    ("Ctrl+Space", "Ctrl+Space switches the input source"),
+    (
+        "Ctrl+Option+Space",
+        "Ctrl+Option+Space switches the input source",
+    ),
+    ("Cmd+Shift+3", "Cmd+Shift+3 takes a screenshot"),
+    ("Cmd+Shift+4", "Cmd+Shift+4 takes a screenshot"),
+    ("Cmd+Shift+5", "Cmd+Shift+5 takes a screenshot"),
+];
 
 /// Whether held modifiers are this platform's primary shortcut modifier,
 /// with or without Shift: Command on macOS and Control elsewhere, the key
@@ -960,6 +1003,13 @@ fn shortcut_chord_refusal_on(
     platform: ShortcutPlatform,
 ) -> Option<&'static str> {
     if let Some(reason) = withheld_from_the_card(binding) {
+        return Some(reason);
+    }
+    if let Some((_, reason)) = platform
+        .system_chords()
+        .iter()
+        .find(|(chord, _)| parse_shortcut(chord).is_ok_and(|system| system == binding))
+    {
         return Some(reason);
     }
     platform
@@ -6937,6 +6987,32 @@ new_thread = "Alt+Shift+G"
         assert_eq!(fixed("Copy terminal selection"), ["Cmd+C"]);
         assert_eq!(fixed("Paste into terminal"), ["Cmd+V"]);
         assert_eq!(fixed("Cycle recent panes"), ["Ctrl+Tab", "Ctrl+Shift+Tab"]);
+    }
+
+    /// A binding the system or the menu bar takes first would never run.
+    #[test]
+    fn macos_refuses_the_chords_its_system_and_menus_take() {
+        for (chord, reason) in ShortcutPlatform::MacOs.system_chords() {
+            let binding = parse_shortcut(chord).unwrap();
+            assert_eq!(
+                shortcut_chord_refusal_on(binding, ShortcutPlatform::MacOs),
+                Some(*reason)
+            );
+            assert_ne!(
+                shortcut_chord_refusal_on(binding, ShortcutPlatform::Linux),
+                Some(*reason)
+            );
+        }
+        let quit = parse_shortcut("Command+Q").unwrap();
+        assert_eq!(
+            shortcut_chord_refusal_on(quit, ShortcutPlatform::MacOs),
+            Some("Cmd+Q quits cagents")
+        );
+        let unrelated = parse_shortcut("Cmd+Shift+K").unwrap();
+        assert_eq!(
+            shortcut_chord_refusal_on(unrelated, ShortcutPlatform::MacOs),
+            None
+        );
     }
 
     #[test]
