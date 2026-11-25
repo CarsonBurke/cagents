@@ -1845,12 +1845,13 @@ impl Cagents {
                 // Stepping through the gallery changes only the viewer.
                 Some((read, Projection::Unchanged))
             }
-            // Layout-independent, like the other Ctrl chords.
+            // Layout-independent, like the other primary-modifier chords.
             Key::Character(_)
-                if modifiers.command()
-                    && !modifiers.shift()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
+                if crate::settings::primary_alone(
+                    modifiers.control(),
+                    modifiers.alt(),
+                    modifiers.logo(),
+                ) && !modifiers.shift()
                     && key
                         .to_latin(*physical_key)
                         .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>

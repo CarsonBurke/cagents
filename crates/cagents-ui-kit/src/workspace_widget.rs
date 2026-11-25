@@ -1047,7 +1047,8 @@ pub fn recordable_shortcut_character(
     })
 }
 
-/// Whether a chord is undo or redo (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y) pressed in
+/// Whether a chord is undo or redo (primary+Z, primary+Shift+Z, primary+Y,
+/// the primary modifier being Ctrl on Linux and Cmd on macOS) pressed in
 /// a chat pane, whose message editor has an undo history of its own.
 ///
 /// The pane's content sees such a chord before the workspace does: the
@@ -1061,9 +1062,7 @@ pub(crate) fn defers_to_focused_editor(
     focused: FocusedPane,
 ) -> bool {
     focused == FocusedPane::Chat
-        && modifiers.command()
-        && !modifiers.alt()
-        && !modifiers.logo()
+        && crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
         && match latin_key(key, physical_key) {
             Some('z') => true,
             Some('y') => !modifiers.shift(),
