@@ -130,7 +130,7 @@ pub(super) fn cancellation_path(state: &Path, job: &str) -> Result<Option<PathBu
 
 /// True means cancellation was recorded before the preparation boundary.
 /// False means the worker must finish restoring service instead.
-pub(super) fn cancel(job: &str) -> Result<bool, UpdateError> {
+pub fn cancel(job: &str) -> Result<bool, UpdateError> {
     let state = running_installation()?.state_dir()?;
     cancel_at(&state, job)
 }
@@ -469,15 +469,25 @@ impl Review {
 
     fn observe(&mut self, current: impact::Preview) {
         if self.preview.preserves_consent(&current) {
+            if self.policy == impact::Policy::WhenIdle
+                && self
+                    .preview
+                    .daemon
+                    .as_ref()
+                    .zip(current.daemon.as_ref())
+                    .is_some_and(|(before, after)| before.expands_interruption_warning(after))
+            {
+                self.nonce = uuid::Uuid::new_v4().to_string();
+            }
             self.preview = current;
         } else {
             *self = Self::new(self.policy, current, Approval::Required);
         }
     }
 
-    fn can_finish_review(&self) -> bool {
+    fn can_finish_review(&self, preview: &impact::Preview) -> bool {
         self.approval == Approval::Granted
-            && self.preview.daemon.as_ref().is_none_or(|daemon| {
+            && preview.daemon.as_ref().is_none_or(|daemon| {
                 !daemon
                     .sessions
                     .iter()
@@ -506,6 +516,7 @@ fn wait_for(
     };
     let mut handoff = None;
     let mut answered = None;
+    let mut observed = None;
     loop {
         if Instant::now() >= deadline {
             return Err(refused(&review.preview, true).unwrap_or_else(|| {
@@ -517,6 +528,21 @@ fn wait_for(
             // before refreshing its nonce, including while observe was busy.
             let _decisions = DecisionLease::acquire(state, &job.id)?;
             check_review_closed(state, job)?;
+            if let Some(current) = observed.take() {
+                let path = state.join(format!("{}.{}.decision", job.id, review.nonce));
+                // An answer admitted while observing the source belongs to
+                // the published review. Read it before replacing that review.
+                if answered.as_ref() == Some(&path) || !path.try_exists()? {
+                    review.observe(current);
+                    if review.can_finish_review(&review.preview) {
+                        if !terminal && let Some(refused) = refused(&review.preview, false) {
+                            return Err(refused);
+                        }
+                        // Keep the published nonce cancellable until prepare.
+                        return Ok(review.preview);
+                    }
+                }
+            }
             // A window's review of blocked work says where it can be stopped.
             // The job's request never changes, so it is read at most once.
             let terminal_command = if !terminal
@@ -600,20 +626,11 @@ fn wait_for(
             Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error),
         }
-        review.observe(observe(review.policy)?);
-        if review.can_finish_review() {
-            check_review_closed(state, job)?;
-            // Approved from a window, a blocked review would save and freeze
-            // every window, and might interrupt turns, before refusing the
-            // stop only a terminal can confirm. Refuse it before any of that.
-            if !terminal && let Some(refused) = refused(&review.preview, false) {
-                return Err(refused);
-            }
-            // Preserve this exact nonce until the source accepts prepare, so
-            // Ctrl-C still cancels while windows are saving and closing.
-            return Ok(review.preview);
+        let current = observe(review.policy)?;
+        if !review.can_finish_review(&current) {
+            thread::sleep(decision_poll());
         }
-        thread::sleep(decision_poll());
+        observed = Some(current);
     }
 }
 
@@ -894,20 +911,41 @@ mod tests {
         let mut idle = working_preview();
         let mut review = Review::new(impact::Policy::WhenIdle, idle.clone(), Approval::Granted);
         let nonce = review.nonce.clone();
-        assert!(!review.can_finish_review());
+        assert!(!review.can_finish_review(&review.preview));
 
         idle.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Resumes;
         review.observe(idle);
-        assert!(review.can_finish_review());
+        assert!(review.can_finish_review(&review.preview));
         assert_eq!(review.nonce, nonce);
 
         review.observe(preview(true));
-        assert!(!review.can_finish_review());
+        assert!(!review.can_finish_review(&review.preview));
         assert_ne!(review.nonce, nonce);
         assert_eq!(
             review.approval.publication().0,
             UpdatePhase::AwaitingConfirmation
         );
+    }
+
+    #[test]
+    fn a_new_interruption_warning_renews_the_nonce_and_keeps_the_idle_approval() {
+        let mut current = working_preview();
+        let mut review = Review::new(impact::Policy::WhenIdle, current.clone(), Approval::Granted);
+        for queued_prompts in [false, true] {
+            let before = review.nonce.clone();
+            current.daemon.as_mut().unwrap().sessions[0].reason =
+                impact::SessionCause::AgentRunUnconfirmed { queued_prompts };
+            review.observe(current.clone());
+            assert_ne!(review.nonce, before);
+            assert_eq!(review.approval.publication().0, UpdatePhase::WaitingForIdle);
+        }
+        let warned = review.nonce.clone();
+        current.daemon.as_mut().unwrap().sessions[0].reason =
+            impact::SessionCause::AgentRunUnconfirmed {
+                queued_prompts: false,
+            };
+        review.observe(current);
+        assert_eq!(review.nonce, warned);
     }
 
     fn published(directory: &Path, previous: Option<&str>) -> UpdateJob {
@@ -1386,6 +1424,59 @@ mod tests {
             .expect("i must finish without a second confirmation")
             .unwrap();
         assert_eq!(completed.daemon.unwrap().policy, impact::Policy::Interrupt);
+    }
+
+    #[test]
+    fn update_now_racing_an_expanded_warning_reviews_it_before_interrupting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let (observing, entered) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let previous = working_preview();
+            let mut current = previous.clone();
+            current.daemon.as_mut().unwrap().sessions[0].reason =
+                impact::SessionCause::AgentRunUnconfirmed {
+                    queued_prompts: true,
+                };
+            let mut first = true;
+            wait_approved(&path, &mut job(&path), false, previous, |policy| {
+                if std::mem::take(&mut first) {
+                    observing.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(match policy {
+                    impact::Policy::WhenIdle => current.clone(),
+                    impact::Policy::Interrupt => {
+                        super::super::review::interruption_review(&current)
+                    }
+                })
+            })
+        });
+        let waiting = published(directory.path(), None);
+        assert_eq!(waiting.phase, UpdatePhase::WaitingForIdle);
+        let nonce = waiting.confirmation.unwrap().nonce;
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        decide_at(directory.path(), &waiting.id, &nonce, Choice::InterruptNow).unwrap();
+        release.send(()).unwrap();
+
+        let renewed = published(directory.path(), Some(&nonce));
+        let confirmation = renewed.confirmation.unwrap();
+        decide_at(
+            directory.path(),
+            &renewed.id,
+            &confirmation.nonce,
+            Choice::Cancel,
+        )
+        .unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(UpdateError::Cancelled)
+        ));
+        assert_eq!(renewed.phase, UpdatePhase::AwaitingConfirmation);
+        let daemon = confirmation.preview.daemon.unwrap();
+        assert_eq!(daemon.policy, impact::Policy::Interrupt);
+        assert!(daemon.sessions[0].review().warns_about_agent_run);
     }
 
     #[test]

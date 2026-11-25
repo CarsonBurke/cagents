@@ -372,6 +372,20 @@ impl DaemonImpact {
             })
     }
 
+    /// An idle approval can outlive new warnings about interrupting a turn.
+    /// A separate choice to interrupt still has to show those warnings.
+    pub(super) fn expands_interruption_warning(&self, observed: &Self) -> bool {
+        observed.sessions.iter().any(|current| {
+            current.disposition == Disposition::WaitsForIdle
+                && current.reason.unconfirmed_agent_run()
+                && !self.sessions.iter().any(|previous| {
+                    previous.id == current.id
+                        && previous.kind == current.kind
+                        && previous.reason.permits_agent_run_warning(&current.reason)
+                })
+        })
+    }
+
     /// A renewed short-lived capability may retain consent only for the same
     /// daemon and exact session owners. Waiting authorizes the observed busy
     /// conversations to become idle; it never authorizes an extra interruption.

@@ -25,7 +25,9 @@ mod retention;
 mod review_fixture;
 pub use recovery::TargetRecoveryRequired;
 pub mod source;
-pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
+pub use confirmation::{
+    Choice as UpdateChoice, Confirmation as UpdateConfirmation, cancel, decide,
+};
 pub mod impact;
 mod review;
 pub mod source_inspection;
@@ -136,7 +138,7 @@ pub enum UpdateError {
     TargetRecoveryRequired(Box<recovery::TargetRecoveryRequired>),
     #[error("Update cancelled")]
     Cancelled,
-    #[error("Update preview changed or expired. Review the current preview.")]
+    #[error("The update changed before your choice could be applied.")]
     DecisionExpired,
     #[error("The update review already has an answer.")]
     DecisionAlreadySubmitted,
