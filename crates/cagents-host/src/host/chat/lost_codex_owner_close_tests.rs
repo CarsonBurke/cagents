@@ -1007,9 +1007,9 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
             let _ = self.0.signal(libc::SIGKILL);
         }
     }
-    let _tool = ToolGuard(
-        crate::pinned_process::PinnedProcess::open_started(tool.pid as u32, tool.start).unwrap(),
-    );
+    let pin = crate::pinned_process::PinnedProcess::open(tool.pid as u32).unwrap();
+    assert!(tool.is_current());
+    let _tool = ToolGuard(pin);
     kill(&record.holder);
     kill(&record.root);
     assert!(tool.is_current(), "the tool outlived its provider");
