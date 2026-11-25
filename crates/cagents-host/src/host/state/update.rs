@@ -52,7 +52,8 @@ pub(in crate::host) fn inspect(
         )
     };
     let mut blockers = cleanup_failures;
-    // Agents whose only outstanding work is queued for their own conversation.
+    // Agents whose only outstanding work is a delivery in flight to their own
+    // conversation. Runs still queued unsent are carried and hold nothing.
     let mut queued = BTreeMap::new();
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -160,10 +161,12 @@ impl HostState {
         self.upgrade_impact_with_queued(policy, &BTreeSet::new())
     }
 
-    /// `queued` names conversations that have messages accepted for them but
-    /// not yet delivered. An accepted run is never redispatched after a
-    /// restart, so the update waits for each one to receive them, under
-    /// either policy; interrupting its turn would not deliver them.
+    /// `queued` names conversations with a delivery in flight: a run a
+    /// dispatcher has claimed but the provider has not yet started. A claimed
+    /// run is never redispatched after a restart, so the update waits for
+    /// each one to receive it, under either policy; interrupting its turn
+    /// would not deliver it. Runs still queued unsent are not named: they
+    /// follow their agent through the restart.
     pub(in crate::host) fn upgrade_impact_with_queued(
         &mut self,
         policy: Policy,
