@@ -1,5 +1,7 @@
 //! Bounded synchronous process execution shared by UI services and daemon workers.
 
+#[cfg(any(feature = "host", feature = "ui", test))]
+pub(crate) mod clock;
 pub(crate) mod identity;
 mod poll;
 

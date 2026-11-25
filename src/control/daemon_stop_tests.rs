@@ -16,11 +16,7 @@ fn shutdown_peer() {
     let paths = paths(&root);
     let proof = HostSessionProof {
         host_session_id: crate::model::HostSessionId::new("stop-fixture"),
-        boot_id: crate::model::BootId::new(
-            fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .unwrap()
-                .trim(),
-        ),
+        boot_id: crate::model::current_boot_id().unwrap(),
         host_incarnation: crate::model::HostIncarnation::new("stop-fixture"),
     };
     let lease = HostLease::acquire(&paths, &proof).unwrap();

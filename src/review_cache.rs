@@ -32,41 +32,26 @@ impl WriteOrder {
         static EPOCH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
         let epoch = EPOCH
             .get_or_init(|| {
-                let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                let boot = crate::model::current_boot_id()
                     .map_err(|error| format!("Cannot identify the review-cache clock: {error}"))?;
-                let boot = uuid::Uuid::parse_str(boot.trim())
+                let boot = uuid::Uuid::parse_str(boot.as_str())
                     .map_err(|error| format!("Invalid review-cache boot identity: {error}"))?;
                 Ok(format!("boottime-v1:{boot}"))
             })
             .clone()?;
-        let mut time = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: time is a valid writable timespec for the duration of the call.
-        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } != 0 {
-            return Err(format!(
-                "Cannot read the review-cache clock: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        let since_boot = crate::process::clock::since_boot()
+            .map_err(|error| format!("Cannot read the review-cache clock: {error}"))?;
         Ok(Self {
             epoch,
-            tick: Self::checked_tick(time.tv_sec, time.tv_nsec)?,
+            tick: Self::checked_tick(since_boot)?,
         })
     }
 
-    fn checked_tick(seconds: libc::time_t, nanos: libc::c_long) -> Result<u64, String> {
-        let tick = u64::try_from(seconds)
+    fn checked_tick(since_boot: std::time::Duration) -> Result<u64, String> {
+        u64::try_from(since_boot.as_nanos())
             .ok()
-            .zip(
-                u64::try_from(nanos)
-                    .ok()
-                    .filter(|nanos| *nanos < 1_000_000_000),
-            )
-            .and_then(|(seconds, nanos)| seconds.checked_mul(1_000_000_000)?.checked_add(nanos))
-            .filter(|tick| *tick <= i64::MAX as u64);
-        tick.ok_or_else(|| "Review-cache clock is outside its supported range".into())
+            .filter(|tick| *tick <= i64::MAX as u64)
+            .ok_or_else(|| "Review-cache clock is outside its supported range".into())
     }
 
     pub(crate) fn superseded_by(&self, epoch: &str, tick: u64) -> bool {
@@ -382,20 +367,12 @@ mod tests {
 
     #[test]
     fn boot_order_bounds_equal_ticks_and_legacy_epochs_in_both_stores() {
-        assert_eq!(WriteOrder::checked_tick(1, 3).unwrap(), 1_000_000_003);
-        for (seconds, nanos) in [
-            (-1, 0),
-            (0, -1),
-            (0, 1_000_000_000),
-            (i64::MAX, 0),
-            (9_223_372_036, 854_775_808),
-        ] {
-            assert!(WriteOrder::checked_tick(seconds, nanos).is_err());
-        }
-        assert_eq!(
-            WriteOrder::checked_tick(9_223_372_036, 854_775_807).unwrap(),
-            i64::MAX as u64
-        );
+        let at =
+            |seconds, nanos| WriteOrder::checked_tick(std::time::Duration::new(seconds, nanos));
+        assert_eq!(at(1, 3).unwrap(), 1_000_000_003);
+        assert_eq!(at(9_223_372_036, 854_775_807).unwrap(), i64::MAX as u64);
+        assert!(at(9_223_372_036, 854_775_808).is_err());
+        assert!(WriteOrder::checked_tick(std::time::Duration::MAX).is_err());
         for lane in ["sqlite", "json"] {
             let directory = tempfile::tempdir().unwrap();
             let store = store_for_lane(directory.path(), lane);

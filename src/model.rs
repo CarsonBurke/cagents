@@ -124,10 +124,9 @@ evidence_type!(BootId);
 evidence_type!(HostSessionId);
 evidence_type!(HostIncarnation);
 
-/// Read the current Linux boot identifier, without imposing a caller's validation policy.
+/// The kernel's identifier for the current boot, which changes on every boot.
 pub fn current_boot_id() -> std::io::Result<BootId> {
-    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    Ok(BootId::new(value.trim()))
+    crate::daemon::read_boot_id()
 }
 
 /// Durable card existence. Closing and closed cards remain durable so an
