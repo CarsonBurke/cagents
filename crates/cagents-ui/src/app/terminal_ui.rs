@@ -938,10 +938,11 @@ impl Cagents {
         items.push(command("Find…", Action::Open(card)));
         if let Some(link) = &context.link {
             items.push(
-                widget::button::text(if link.scheme() == "file" {
-                    "Open file · Ctrl+click"
-                } else {
-                    "Open link · Ctrl+click"
+                widget::button::text(match (link.scheme() == "file", cfg!(target_os = "macos")) {
+                    (true, false) => "Open file · Ctrl+click",
+                    (false, false) => "Open link · Ctrl+click",
+                    (true, true) => "Open file · Cmd+click",
+                    (false, true) => "Open link · Cmd+click",
                 })
                 .width(Length::Fill)
                 .on_press(Message::OpenLink(

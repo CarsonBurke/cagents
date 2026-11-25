@@ -2613,6 +2613,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
+                if !reaches_the_child(*modifiers) {
+                    return;
+                }
                 let input = key_press(
                     key,
                     modified_key,
@@ -2668,6 +2671,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
+                if !reaches_the_child(*modifiers) {
+                    return;
+                }
                 let input = key_release(key, *physical_key, *modifiers);
                 match self.handle.key(input) {
                     Ok(()) => shell.capture_event(),
@@ -2690,7 +2696,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     let cell = self.cell_at(geometry, position);
                     state.last_motion_cell = Some(cell);
                     if *button == IcedMouseButton::Left
-                        && state.modifiers.control
+                        && opens_links(&state.modifiers)
                         && let Some(open) = &self.on_open_link
                         && let Some(link) = state.links.borrow_mut().at(
                             &self.snapshot,
@@ -3452,7 +3458,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         );
         if let Some(position) = geometry.cursor_position(cursor) {
             let cell = self.cell_at(geometry, position);
-            if tree.state.downcast_ref::<WidgetState>().modifiers.control
+            if opens_links(&tree.state.downcast_ref::<WidgetState>().modifiers)
                 && self.on_open_link.is_some()
                 && tree
                     .state
@@ -4065,22 +4071,33 @@ enum ClipboardChord {
     Paste,
 }
 
-/// Ctrl+Shift+C and Ctrl+Shift+V, by the Latin key in their place so the
-/// chords survive a switch to a non-Latin layout.
+/// Ctrl+Shift+C and Ctrl+Shift+V, or Command+C and Command+V on macOS, by
+/// the Latin key in their place so the chords survive a switch to a
+/// non-Latin layout. Shift+Insert pastes on Linux, as it does on X11 and
+/// Wayland.
 fn clipboard_chord(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> Option<ClipboardChord> {
-    if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Insert)
-        && modifiers.shift()
-        && !modifiers.control()
-        && !modifiers.alt()
-        && !modifiers.logo()
+    #[cfg(target_os = "linux")]
     {
-        return Some(ClipboardChord::Paste);
+        if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Insert)
+            && modifiers.shift()
+            && !modifiers.control()
+            && !modifiers.alt()
+            && !modifiers.logo()
+        {
+            return Some(ClipboardChord::Paste);
+        }
+        if !modifiers.control() || !modifiers.shift() || modifiers.alt() || modifiers.logo() {
+            return None;
+        }
     }
-    if !modifiers.control() || !modifiers.shift() || modifiers.alt() || modifiers.logo() {
+    // Command is the application's, never the child's, so it needs no Shift
+    // to set these apart from the child's Control chords.
+    #[cfg(target_os = "macos")]
+    if !modifiers.logo() || modifiers.control() || modifiers.shift() || modifiers.alt() {
         return None;
     }
     // iced reports the key without modifiers, but a capital costs nothing to
@@ -4089,6 +4106,30 @@ fn clipboard_chord(
         'c' => Some(ClipboardChord::Copy),
         'v' => Some(ClipboardChord::Paste),
         _ => None,
+    }
+}
+
+/// Whether a click with these modifiers held opens the link under it:
+/// Ctrl+click on Linux and Command+click on macOS, as their terminals do.
+fn opens_links(modifiers: &KeyModifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.super_key
+    } else {
+        modifiers.control
+    }
+}
+
+/// Whether a key event with these modifiers goes to the program in the
+/// terminal. On macOS a Command chord belongs to the application, as in every
+/// macOS terminal: one the workspace leaves unbound is left uncaptured, so it
+/// neither types its letter nor reaches the program.
+fn reaches_the_child(modifiers: keyboard::Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    return !modifiers.logo();
+    #[cfg(target_os = "linux")]
+    {
+        let _ = modifiers;
+        true
     }
 }
 
@@ -4306,7 +4347,11 @@ mod tests {
         );
 
         // Copy and paste follow the same key.
-        let chord = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let chord = if cfg!(target_os = "macos") {
+            keyboard::Modifiers::LOGO
+        } else {
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT
+        };
         assert_eq!(
             clipboard_chord(&key("С"), physical(keyboard::key::Code::KeyC), chord),
             Some(ClipboardChord::Copy)
@@ -4327,6 +4372,34 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Control chords are the program's on every platform: Ctrl+C interrupts
+    /// and Ctrl+V quotes the next character. Only the platform's own copy and
+    /// paste chords stay in the terminal.
+    #[test]
+    fn control_chords_reach_the_program_and_command_chords_stay_on_macos() {
+        let key = |text: &str| keyboard::Key::Character(text.into());
+        let c = keyboard::key::Physical::Code(keyboard::key::Code::KeyC);
+        let control = keyboard::Modifiers::CTRL;
+        assert_eq!(clipboard_chord(&key("c"), c, control), None);
+        assert!(reaches_the_child(control));
+        assert!(reaches_the_child(control | keyboard::Modifiers::SHIFT));
+        let command = keyboard::Modifiers::LOGO;
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                clipboard_chord(&key("c"), c, command),
+                Some(ClipboardChord::Copy)
+            );
+            assert_eq!(
+                clipboard_chord(&key("c"), c, control | keyboard::Modifiers::SHIFT),
+                None
+            );
+            assert!(!reaches_the_child(command));
+        } else {
+            assert_eq!(clipboard_chord(&key("c"), c, command), None);
+            assert!(reaches_the_child(command));
+        }
     }
 
     #[test]

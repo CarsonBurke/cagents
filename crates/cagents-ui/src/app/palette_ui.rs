@@ -588,15 +588,14 @@ impl Cagents {
                 };
                 if let Some(name) = name {
                     let mut chord = String::new();
-                    for (held, name) in [
-                        (modifiers.control(), "Ctrl+"),
-                        (modifiers.alt(), "Alt+"),
-                        (modifiers.logo(), "Super+"),
-                        (modifiers.shift(), "Shift+"),
-                    ] {
-                        if held {
-                            chord.push_str(name);
-                        }
+                    for name in settings::ModifierNames::CURRENT.held(
+                        modifiers.control(),
+                        modifiers.alt(),
+                        modifiers.logo(),
+                        modifiers.shift(),
+                    ) {
+                        chord.push_str(name);
+                        chord.push('+');
                     }
                     chord.push_str(if name == "," {
                         "Comma"

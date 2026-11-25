@@ -3031,10 +3031,8 @@ fn is_save_press(event: &keyboard::Event) -> bool {
             repeat: false,
             ..
         } if key.eq_ignore_ascii_case("s")
-            && modifiers.control()
-            && !modifiers.alt()
+            && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && !modifiers.shift()
-            && !modifiers.logo()
     )
 }
 
@@ -3051,10 +3049,10 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     else {
         return None;
     };
-    if modifiers.logo() || modifiers.shift() {
+    if modifiers.shift() {
         return None;
     }
-    if modifiers.control() && !modifiers.alt() {
+    if settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
         return match key
             .to_latin(*physical_key)
             .map(|key| key.to_ascii_lowercase())
@@ -3063,6 +3061,9 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
             Some('r') => Some(Message::BrowserReload(card)),
             _ => None,
         };
+    }
+    if modifiers.logo() {
+        return None;
     }
     match key.as_ref() {
         Key::Named(Named::ArrowLeft) if modifiers.alt() && !modifiers.control() => {
@@ -8583,9 +8584,10 @@ impl Cagents {
     }
 
     fn open_clicked_link(&mut self, url: Url) -> Task<Message> {
+        // Ctrl+click on Linux, Command+click on macOS.
         let gesture =
             self.keyboard_modifiers
-                .control()
+                .command()
                 .then_some(if self.keyboard_modifiers.shift() {
                     LinkOpenGesture::ControlShiftClick
                 } else {
@@ -10899,10 +10901,8 @@ impl Cagents {
                 modifiers,
                 ..
             } = &event
-            && modifiers.control()
+            && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && modifiers.shift()
-            && !modifiers.alt()
-            && !modifiers.logo()
             && key.eq_ignore_ascii_case("s")
             && let Some(card) = self.workspace.focused()
             && !self.pane_content_inputs_blocked(card)

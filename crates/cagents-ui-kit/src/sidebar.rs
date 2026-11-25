@@ -11859,7 +11859,7 @@ fn changes_footer<'a>(
                     press.key,
                     cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter)
                 ) {
-                    if press.modifiers.control() && can_commit {
+                    if press.modifiers.command() && can_commit {
                         Some(cosmic::iced::widget::text_editor::Binding::Custom(
                             subject_submit.clone(),
                         ))
@@ -11909,7 +11909,7 @@ fn changes_footer<'a>(
                 ) {
                     return None;
                 }
-                if press.modifiers.control()
+                if press.modifiers.command()
                     && matches!(
                         press.key,
                         cosmic::iced::keyboard::Key::Named(

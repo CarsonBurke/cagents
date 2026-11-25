@@ -292,7 +292,7 @@ pub fn font_zoom_chord(
         Key,
         key::{Code, Physical},
     };
-    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+    if !crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
         return None;
     }
     match (key.as_ref(), physical) {

@@ -751,13 +751,18 @@ fn submit_control(
     enter_sends: bool,
     unsendable: Option<blocked_recovery::Unsendable>,
 ) -> (Icon, String) {
-    let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
+    let (command_enter, command_shift_enter) = if cfg!(target_os = "macos") {
+        ("Cmd+Enter", "Cmd+Shift+Enter")
+    } else {
+        ("Ctrl+Enter", "Ctrl+Shift+Enter")
+    };
+    let primary = if enter_sends { "Enter" } else { command_enter };
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
         (PromptMode::Steer, 0) => (Icon::Send, "Steer the active turn", primary),
-        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", command_shift_enter),
         (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
-        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", command_shift_enter),
     };
     let tail = unsendable.map_or(chord, |unsendable| unsendable.reason);
     (name, format!("{verb} — {tail}"))

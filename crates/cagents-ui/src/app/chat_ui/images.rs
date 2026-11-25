@@ -1552,7 +1552,11 @@ impl Gallery {
             command(
                 Icon::Copy,
                 "Copy",
-                "Copy image (Ctrl+C)",
+                if cfg!(target_os = "macos") {
+                    "Copy image (Cmd+C)"
+                } else {
+                    "Copy image (Ctrl+C)"
+                },
                 image.map(|image| Action::Image(image, ImageCommand::Copy)),
             ),
             command(
@@ -1614,10 +1618,15 @@ impl Gallery {
             toolbar.into(),
             label,
             canvas,
-            design::caption(if self.entries.len() > 1 {
-                "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
-            } else {
-                "Scroll to zoom · Drag to pan · Ctrl+C to copy"
+            design::caption(match (self.entries.len() > 1, cfg!(target_os = "macos")) {
+                (true, true) => {
+                    "Scroll to zoom · Drag to pan · Left / Right to browse · Cmd+C to copy"
+                }
+                (true, false) => {
+                    "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
+                }
+                (false, true) => "Scroll to zoom · Drag to pan · Cmd+C to copy",
+                (false, false) => "Scroll to zoom · Drag to pan · Ctrl+C to copy",
             })
             .into(),
         ]
