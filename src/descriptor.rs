@@ -428,8 +428,9 @@ fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
     Ok(format!("/proc/self/fd/{}", file.as_raw_fd()).into())
 }
 
+/// The kernel's current path for an open file, which follows renames.
 #[cfg(target_os = "macos")]
-fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
+pub(crate) fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
     crate::fs_safety::descriptor_path(file.as_raw_fd())
 }
 

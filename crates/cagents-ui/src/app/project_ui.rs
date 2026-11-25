@@ -1347,7 +1347,11 @@ impl Cagents {
                     }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
-                        return launch_task(PathBuf::from("xdg-open"), target.path, false);
+                        return launch_task(
+                            PathBuf::from(file_manager::FOLDER_OPENER),
+                            target.path,
+                            false,
+                        );
                     }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;

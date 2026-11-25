@@ -1,5 +1,10 @@
-use std::{future::Future, path::Path, process::Stdio, time::Duration};
+//! Hands files, folders and URLs to the desktop: through the freedesktop
+//! file manager interface and portals on Linux, and through `open(1)` on
+//! macOS, which reveals an item selected in Finder and opens anything else
+//! with its default application.
+use std::{future::Future, path::Path, process::Stdio};
 
+#[cfg(target_os = "linux")]
 use ashpd::zbus;
 use url::Url;
 
@@ -15,7 +20,9 @@ pub async fn reveal(path: &Path) -> Result<RevealOutcome, String> {
     reveal_with(path, show_item, open_system_url).await
 }
 
+#[cfg(target_os = "linux")]
 async fn show_item(uri: Url) -> Result<(), String> {
+    use std::time::Duration;
     // A desktop without this interface can still open the containing folder.
     // Bound activation time so an unresponsive file manager cannot prevent
     // that fallback indefinitely.
@@ -36,6 +43,32 @@ async fn show_item(uri: Url) -> Result<(), String> {
     .map_err(|_| "File manager did not respond".to_owned())?
     .map_err(|error| error.to_string())
 }
+
+/// Finder selects the item in its folder, the way the freedesktop
+/// `ShowItems` does.
+#[cfg(target_os = "macos")]
+async fn show_item(uri: Url) -> Result<(), String> {
+    let path = uri
+        .to_file_path()
+        .map_err(|_| "Could not reveal a non-local path".to_owned())?;
+    let mut open = tokio::process::Command::new(MACOS_OPEN);
+    // `--` keeps a name starting with a dash from reading as an option.
+    open.args(["-R", "--"]).arg(path);
+    run_opener(open)
+        .await
+        .map_err(|status| format!("Finder could not reveal the item: {status}"))
+}
+
+/// macOS's opener, by absolute path so a `PATH` entry cannot stand in for it.
+#[cfg(target_os = "macos")]
+const MACOS_OPEN: &str = "/usr/bin/open";
+
+/// The program that opens a folder in the desktop's file manager when given
+/// its path.
+#[cfg(target_os = "linux")]
+pub const FOLDER_OPENER: &str = "xdg-open";
+#[cfg(target_os = "macos")]
+pub const FOLDER_OPENER: &str = MACOS_OPEN;
 
 async fn reveal_with<S, O, SF, OF>(
     path: &Path,
@@ -92,6 +125,12 @@ impl SystemUrlOpener {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub async fn open_system_url(url: Url) -> Result<(), String> {
+    open_system_url_with_opener(&url, tokio::process::Command::new(MACOS_OPEN)).await
+}
+
+#[cfg(target_os = "linux")]
 pub async fn open_system_url(url: Url) -> Result<(), String> {
     let portal_result = async {
         let request = ashpd::desktop::open_uri::OpenFileRequest::default()
@@ -114,8 +153,21 @@ pub async fn open_system_url_with_opener(
     mut opener: tokio::process::Command,
 ) -> Result<(), String> {
     let presented = SanitizedLocation::from(url);
+    // Linux reaches the opener only after the portal failed.
+    let failed = if cfg!(target_os = "linux") {
+        "desktop portal could not open"
+    } else {
+        "could not open"
+    };
+    opener.arg(url.as_str());
+    run_opener(opener)
+        .await
+        .map_err(|outcome| format!("{failed} {presented}; system opener {outcome}"))
+}
+
+/// Runs an opener to completion, or says how it failed.
+async fn run_opener(mut opener: tokio::process::Command) -> Result<(), String> {
     let result = opener
-        .arg(url.as_str())
         .stdin(Stdio::null())
         // An opener can echo its argument in diagnostics. The authoritative
         // URL may contain credentials, query data, or a fragment, so neither
@@ -124,15 +176,10 @@ pub async fn open_system_url_with_opener(
         .stderr(Stdio::null())
         .status()
         .await;
-
     match result {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!(
-            "desktop portal could not open {presented}; system opener exited with {status}"
-        )),
-        Err(error) => Err(format!(
-            "desktop portal could not open {presented}; system opener could not be started: {error}"
-        )),
+        Ok(status) => Err(format!("exited with {status}")),
+        Err(error) => Err(format!("could not be started: {error}")),
     }
 }
 
