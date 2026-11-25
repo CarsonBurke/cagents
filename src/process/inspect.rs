@@ -108,6 +108,73 @@ fn kernel_pid(pid: u32) -> io::Result<libc::c_int> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))
 }
 
+/// The working directory reported for a process. This is a kernel path
+/// observation, not a retained directory or proof it cannot change.
+#[cfg(feature = "host")]
+pub(crate) fn working_directory(pid: u32) -> io::Result<PathBuf> {
+    let pid = kernel_pid(pid)?;
+    // PROC_FLAG_THCWD in <sys/proc_info.h>. A single process-wide path
+    // cannot describe a process with a thread-specific working directory.
+    const PROC_FLAG_THCWD: u32 = 0x100;
+    if super::table::record(pid)?.bsd.pbsi_flags & PROC_FLAG_THCWD != 0 {
+        return Err(io::Error::other(
+            "process has a thread-specific working directory",
+        ));
+    }
+    // SAFETY: zero is valid for the integer and path-buffer fields.
+    let mut paths: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&paths) as libc::c_int;
+    // SAFETY: paths is writable for the declared buffer length.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut paths).cast(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short working directory record",
+        ));
+    }
+    // SAFETY: vip_path contains only bytes and its bindings lay them out in
+    // contiguous arrays. Inspect at most the size actually in the record.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            paths.pvi_cdir.vip_path.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(&paths.pvi_cdir.vip_path),
+        )
+    };
+    let path = std::ffi::CStr::from_bytes_until_nul(bytes).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "unterminated working directory")
+    })?;
+    let path = PathBuf::from(OsString::from_vec(path.to_bytes().to_vec()));
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "working directory has no absolute name",
+        ));
+    }
+    let metadata = std::fs::metadata(&path)?;
+    use std::os::unix::fs::MetadataExt;
+    let vnode = &paths.pvi_cdir.vip_vi.vi_stat;
+    if !metadata.is_dir()
+        || metadata.dev() != vnode.vst_dev as i32 as u64
+        || metadata.ino() != vnode.vst_ino
+    {
+        return Err(io::Error::other(
+            "working directory no longer names the observed vnode",
+        ));
+    }
+    Ok(path)
+}
+
 /// The largest argument record the kernel produces.
 fn argument_limit() -> io::Result<usize> {
     let mut limit: libc::c_int = 0;
@@ -207,6 +274,25 @@ pub fn open_files(pid: u32, limit: usize) -> io::Result<Vec<OpenFile>> {
             Err(error) if matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOENT)) => {}
             Err(error) => return Err(error),
         }
+    }
+    Ok(files)
+}
+
+/// A bounded, complete observation for a caller making an identity claim.
+/// A changed descriptor is uncertainty, even if a later scan could retry.
+#[cfg(feature = "host")]
+pub(crate) fn observed_open_files(pid: u32, limit: usize) -> io::Result<Vec<OpenFile>> {
+    let mut files = Vec::new();
+    for descriptor in descriptors(pid)?
+        .into_iter()
+        .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+    {
+        if files.len() == limit {
+            return Err(io::Error::other(
+                "process holds too many files to establish identity",
+            ));
+        }
+        files.push(open_file(pid, descriptor.proc_fd)?);
     }
     Ok(files)
 }

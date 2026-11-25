@@ -987,11 +987,19 @@ mod imp {
             let mut pids = vec![0 as libc::pid_t; capacity];
             let size = libc::c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>())
                 .map_err(|_| io::Error::other("too many child processes"))?;
-            // SAFETY: the buffer is writable and exactly `size` bytes; the call
-            // answers how many pids it wrote.
+            // SAFETY: errno is local to this thread. libproc reports an error
+            // as zero children with errno set, so clear it before asking.
+            // The buffer is writable and exactly `size` bytes.
             let count = unsafe {
+                *libc::__error() = 0;
                 libc::proc_listchildpids(pid as libc::pid_t, pids.as_mut_ptr().cast(), size)
             };
+            if count == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error().is_some_and(|errno| errno != 0) {
+                    return Err(vanished(error));
+                }
+            }
             let count = usize::try_from(count).map_err(|_| vanished(io::Error::last_os_error()))?;
             // A full buffer may have been cut short; ask again with more room.
             if count < capacity {
