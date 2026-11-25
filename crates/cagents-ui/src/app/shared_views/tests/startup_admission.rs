@@ -1663,6 +1663,9 @@ fn canonical_retirement_before_upgrade_ready_preserves_source_content_and_ignore
     exercise_canonical_upgrade(false, true);
 }
 
+// Darwin's Unix sockets can still accept a peer write after a read-only
+// shutdown; this fixture requires Linux's immediate broken-pipe signal.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission() {
     if isolated("an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admission") {
