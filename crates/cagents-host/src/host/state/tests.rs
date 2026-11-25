@@ -3697,10 +3697,15 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         let impact = update::inspect(&host, policy, false).unwrap();
         assert!(impact.blockers.is_empty(), "{:?}", impact.blockers);
         assert_eq!(impact.sessions[0].disposition, disposition);
-        assert_ne!(
+        assert_eq!(
             impact.sessions[0].reason,
-            crate::update::impact::SessionCause::PendingDelivery
+            crate::update::impact::SessionCause::AgentRunUnconfirmed {
+                queued_prompts: true
+            }
         );
+        let reason = impact.sessions[0].review().reason;
+        assert!(reason.contains("without a confirmed result"), "{reason}");
+        assert!(reason.contains("queued prompts stay unsent"), "{reason}");
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     // A delivery already in flight is never redispatched after a restart:
@@ -3708,7 +3713,11 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
     // conversation rather than to an anonymous blocker.
     for policy in [Policy::WhenIdle, Policy::Interrupt] {
         let queued = state
-            .upgrade_impact_with_queued(policy, &BTreeSet::from([interrupt.sessions[0].id]))
+            .upgrade_impact_with_agent_work(
+                policy,
+                &BTreeSet::from([interrupt.sessions[0].id]),
+                &BTreeMap::new(),
+            )
             .unwrap();
         assert!(queued.blockers.is_empty());
         assert_eq!(queued.sessions[0].disposition, Disposition::WaitsForIdle);

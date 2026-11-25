@@ -821,7 +821,10 @@ impl Cagents {
                 .spacing(space::S)
                 .into(),
         ]);
-        if !working || !session.interrupted_subagents.is_empty() {
+        if !working
+            || !session.interrupted_subagents.is_empty()
+            || session.reason.unconfirmed_agent_run()
+        {
             row = row.push(notice_detail(review.reason));
         }
         row.spacing(space::XXS).into()

@@ -1,4 +1,5 @@
 use super::*;
+use crate::host::model::AgentRunUpdateRisk;
 use crate::update::impact::{
     DaemonImpact, Disposition, Policy, SessionCause, SessionImpact, SessionKind,
 };
@@ -55,8 +56,12 @@ pub(in crate::host) fn inspect(
     // Agents whose only outstanding work is a delivery in flight to their own
     // conversation. Runs still queued unsent are carried and hold nothing.
     let mut queued = BTreeMap::new();
+    let mut agent_runs = BTreeMap::new();
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        agent_runs = registry
+            .agent_runs_at_risk_on_restart()
+            .map_err(upgrade_error)?;
         for hold in registry.agent_update_holds().map_err(upgrade_error)? {
             match hold.session {
                 Some(session) => {
@@ -103,7 +108,7 @@ pub(in crate::host) fn inspect(
     let mut impact = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .upgrade_impact_with_queued(policy, &queued.keys().copied().collect())?;
+        .upgrade_impact_with_agent_work(policy, &queued.keys().copied().collect(), &agent_runs)?;
     // Queued work no listed conversation will deliver still fences the update.
     for (session, blocker) in queued {
         if !impact.sessions.iter().any(|item| {
@@ -158,7 +163,7 @@ impl HostState {
 
     #[cfg(test)]
     pub(crate) fn upgrade_impact(&mut self, policy: Policy) -> Result<DaemonImpact, ProtocolError> {
-        self.upgrade_impact_with_queued(policy, &BTreeSet::new())
+        self.upgrade_impact_with_agent_work(policy, &BTreeSet::new(), &BTreeMap::new())
     }
 
     /// `queued` names conversations with a delivery in flight: a run a
@@ -167,10 +172,11 @@ impl HostState {
     /// each one to receive it, under either policy; interrupting its turn
     /// would not deliver it. Runs still queued unsent are not named: they
     /// follow their agent through the restart.
-    pub(in crate::host) fn upgrade_impact_with_queued(
+    pub(in crate::host) fn upgrade_impact_with_agent_work(
         &mut self,
         policy: Policy,
         queued: &BTreeSet<TerminalId>,
+        agent_runs: &BTreeMap<TerminalId, AgentRunUpdateRisk>,
     ) -> Result<DaemonImpact, ProtocolError> {
         let capability = self
             .shutdown_preflight(Instant::now())
@@ -313,13 +319,25 @@ impl HostState {
                     Disposition::Continues,
                     "The provider, active turn, and pending approvals stay alive while the application reconnects.".into(),
                 )
-            } else if busy && policy == Policy::WhenIdle {
-                (
-                    Disposition::WaitsForIdle,
-                    waits_for_idle_reason(&hold).into(),
-                )
             } else if busy {
-                (Disposition::Interrupted, interrupted_reason(&hold).into())
+                let warning = agent_runs
+                    .get(&id)
+                    .filter(|risk| {
+                        crate::agent_execution::same_chat_process(&risk.session, &record.session)
+                    })
+                    .map(|risk| SessionCause::AgentRunUnconfirmed {
+                        queued_prompts: risk.queued_prompts,
+                    });
+                match policy {
+                    Policy::WhenIdle => (
+                        Disposition::WaitsForIdle,
+                        warning.unwrap_or_else(|| waits_for_idle_reason(&hold).into()),
+                    ),
+                    Policy::Interrupt => (
+                        Disposition::Interrupted,
+                        warning.unwrap_or_else(|| interrupted_reason(&hold).into()),
+                    ),
+                }
             } else {
                 (
                     Disposition::Resumes,

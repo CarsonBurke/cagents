@@ -1615,9 +1615,18 @@ fn queue_messages_during_turn(
     let impact =
         super::update::inspect(host, crate::update::impact::Policy::Interrupt, false).unwrap();
     assert!(!impact.blocked(), "{impact:?}");
-    assert!(impact.sessions.iter().any(|item| {
-        item.id == id && item.disposition == crate::update::impact::Disposition::Interrupted
-    }));
+    let session = impact.sessions.iter().find(|item| item.id == id).unwrap();
+    assert_eq!(
+        session.disposition,
+        crate::update::impact::Disposition::Interrupted
+    );
+    assert_eq!(
+        session.reason,
+        crate::update::impact::SessionCause::AgentRunUnconfirmed {
+            queued_prompts: false
+        }
+    );
+    assert!(!session.review().reason.contains("queued prompts"));
     // Interrupt the exact active run. The held message runs stay unclaimed.
     handle.interrupt_run(run).unwrap();
     wait_until(
