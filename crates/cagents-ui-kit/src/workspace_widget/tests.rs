@@ -3421,6 +3421,8 @@ fn the_inspector_shortcut_acts_only_where_there_is_an_inspector() {
         (FocusedPane::Review, true),
         (FocusedPane::Chat, true),
         (FocusedPane::Other, true),
+        (FocusedPane::Browser { inspector: true }, true),
+        (FocusedPane::Browser { inspector: false }, false),
         (FocusedPane::NoInspector, false),
         (FocusedPane::None, false),
     ] {
@@ -3841,8 +3843,10 @@ fn a_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane() {
         (FocusedPane::Chat, true),
         (FocusedPane::Review, true),
         (FocusedPane::Other, true),
-        // A terminal would take every key, so the workspace keeps it.
+        // A terminal or a browser page would take every key, so the
+        // workspace keeps it.
         (FocusedPane::Terminal, false),
+        (FocusedPane::Browser { inspector: true }, false),
     ] {
         let mut element: Element<'_, Option<CardId>> = WorkspaceSurface::new(
             Element::new(KeyProbe(card)),
@@ -3880,6 +3884,11 @@ fn a_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane() {
     assert!(!deferred_shortcut_taken(&redo, false, FocusedPane::Chat));
     assert!(deferred_shortcut_taken(&redo, true, FocusedPane::Other));
     assert!(!deferred_shortcut_taken(&redo, true, FocusedPane::Terminal));
+    assert!(!deferred_shortcut_taken(
+        &redo,
+        true,
+        FocusedPane::Browser { inspector: false }
+    ));
     for (event, defers) in [
         (chord("z", Code::KeyZ, control), true),
         (chord("y", Code::KeyY, control), true),

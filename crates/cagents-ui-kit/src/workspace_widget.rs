@@ -133,7 +133,12 @@ impl ShortcutScope {
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => focused == FocusedPane::Chat,
-            Self::Inspector => !matches!(focused, FocusedPane::NoInspector | FocusedPane::None),
+            Self::Inspector => !matches!(
+                focused,
+                FocusedPane::NoInspector
+                    | FocusedPane::None
+                    | FocusedPane::Browser { inspector: false }
+            ),
         }
     }
 }
@@ -151,6 +156,10 @@ pub enum FocusedPane {
     /// which belongs to no worktree, or a browser outside a worktree's
     /// workspace, which has no worktree to show.
     NoInspector,
+    /// An embedded browser page, which takes every key it is given for the
+    /// page; `inspector` is whether the pane offers one, as a browser outside
+    /// a worktree's workspace does not.
+    Browser { inspector: bool },
     /// Any other pane.
     Other,
     /// No pane has focus.
@@ -1055,17 +1064,19 @@ pub fn recordable_shortcut_character(
 /// The pane's content sees such a chord before the workspace does: the
 /// focused editor takes it, and the workspace's action bound to the same
 /// chord, such as reopening a closed pane on primary+Shift+Z, runs only when
-/// nothing there took it ([`deferred_shortcut_taken`]). A terminal is left
-/// out: it takes every key for its process, so the chord would never reach
-/// the workspace.
+/// nothing there took it ([`deferred_shortcut_taken`]). A terminal and a
+/// browser page are left out: each takes every key for its program, so the
+/// chord would never reach the workspace.
 pub(crate) fn defers_to_focused_editor(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     focused: FocusedPane,
 ) -> bool {
-    !matches!(focused, FocusedPane::Terminal | FocusedPane::None)
-        && crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
+    !matches!(
+        focused,
+        FocusedPane::Terminal | FocusedPane::Browser { .. } | FocusedPane::None
+    ) && crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
         && match latin_key(key, physical_key) {
             Some('z') => true,
             Some('y') => !modifiers.shift(),
