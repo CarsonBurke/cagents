@@ -1001,13 +1001,13 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
         }
     };
     let tool = registry::Process::read(tool_pid).unwrap();
-    struct ToolGuard(crate::pinned_process::PinnedProcess);
+    struct ToolGuard(crate::daemon::PinnedProcess);
     impl Drop for ToolGuard {
         fn drop(&mut self) {
             let _ = self.0.signal(libc::SIGKILL);
         }
     }
-    let pin = crate::pinned_process::PinnedProcess::open(tool.pid as u32).unwrap();
+    let pin = crate::daemon::PinnedProcess::open(tool.pid as u32).unwrap();
     assert!(tool.is_current());
     let _tool = ToolGuard(pin);
     kill(&record.holder);
