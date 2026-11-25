@@ -2145,7 +2145,6 @@ fn spawn_provider(
     let mut process = Process::new(&spec.program);
     process
         .args(&spec.arguments)
-        .current_dir(&spec.working_directory)
         .env_clear()
         // Callers withhold these already; no path may hand a provider the
         // session its daemon or a saved recipe came from.
@@ -2158,6 +2157,8 @@ fn spawn_provider(
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
         .process_group(0);
+    #[cfg(target_os = "linux")]
+    process.current_dir(&spec.working_directory);
     crate::descriptor_limit::inherit(&mut process);
     let original = spec
         .execution
@@ -2209,9 +2210,11 @@ fn spawn_provider(
         use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
 
         let inherited = spec.environment.get("TMPDIR").map(std::ffi::OsStr::new);
-        let cwd = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        let temporary = PrivateDir::create(inherited, Some(&cwd))
-            .map_err(|error| format!("Cannot create private Codex temporary directory: {error}"))?;
+        let temporary =
+            PrivateDir::create_for_launch(inherited, Some(&directory), &spec.working_directory)
+                .map_err(|error| {
+                    format!("Cannot create private Codex temporary directory: {error}")
+                })?;
         process.envs(TEMP_ENV_KEYS.map(|key| (key, temporary.path())));
         Some(temporary)
     } else {

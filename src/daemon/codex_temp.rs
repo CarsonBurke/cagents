@@ -26,6 +26,27 @@ pub(crate) struct PrivateDir {
 }
 
 impl PrivateDir {
+    /// Relative temporary directories are resolved from the provider's held
+    /// launch directory. An absolute path needs no working-directory lookup.
+    #[cfg(feature = "host")]
+    pub(crate) fn create_for_launch(
+        inherited: Option<&OsStr>,
+        directory: Option<&fs::File>,
+        fallback: &Path,
+    ) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let cwd = directory.map(crate::descriptor::path_of).transpose()?;
+        #[cfg(target_os = "macos")]
+        let cwd = if inherited.is_some_and(|path| !path.is_empty() && Path::new(path).is_relative())
+            || std::env::temp_dir().is_relative()
+        {
+            directory.map(crate::fs_safety::reaching_path).transpose()?
+        } else {
+            None
+        };
+        Self::create(inherited, Some(cwd.as_deref().unwrap_or(fallback)))
+    }
+
     /// Codex makes TMPDIR a writable sandbox root. Keep its synthetic files
     /// private while inheriting the filesystem selected for temporary files.
     pub(crate) fn create(inherited: Option<&OsStr>, cwd: Option<&Path>) -> io::Result<Self> {
