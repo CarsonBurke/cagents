@@ -3816,16 +3816,6 @@ impl Worker {
             }
         }
 
-        // A readable root pidfd only selected this reconciliation route. The
-        // actual holder report and PTY EOF together prove natural completion.
-        let natural_close = self.natural_close.take().map(|close| {
-            let drained = !shutting_down
-                && !self.checked_close_started
-                && self.pty_eof
-                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
-            (close, drained)
-        });
-
         // A last bell may still be waiting for its cadence deadline when the
         // PTY drains. Deliver its attention before completion, without holding
         // teardown open for a timer.
@@ -3851,16 +3841,26 @@ impl Worker {
             // Nothing will end a synchronized update the child left open.
             self.capture_when_ready(false);
         }
-        let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
+        // Darwin revokes the controlling tty when its session leader exits.
+        // EOF can arrive while other processes in that session are still live.
+        let natural_census = cfg!(target_os = "macos")
+            && !shutting_down
+            && self.pty_eof
+            && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+        let shutdown_cleanup_confirmed = if (shutting_down || natural_census) && !self.carried {
             let budget = self.published.shutdown_budget();
             if exited {
                 let cleanup = if self.checked_shutdown {
                     Ok(())
                 } else {
+                    let mut deadline = Instant::now() + budget.deadline;
+                    if natural_census && let Some(close) = &self.natural_close {
+                        deadline = deadline.min(close.deadline);
+                    }
                     confirm_exited_family(
                         &self.child,
                         &self.master,
-                        Instant::now() + budget.deadline,
+                        deadline,
                         budget.census_reserve,
                     )
                 };
@@ -3926,6 +3926,14 @@ impl Worker {
         // The shared input seal alone is insufficient: carry also uses it.
         let family_cleanup_confirmed =
             shutdown_cleanup_confirmed && (!self.checked_close_started || self.checked_shutdown);
+        let natural_close = self.natural_close.take().map(|close| {
+            let drained = !shutting_down
+                && !self.checked_close_started
+                && family_cleanup_confirmed
+                && self.pty_eof
+                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+            (close, drained)
+        });
         let completion = self.root_exit.take().and_then(|event| match event {
             TerminalEvent::Exited {
                 exit_code,
@@ -3994,7 +4002,7 @@ impl Worker {
             {
                 self.error("retain unconfirmed terminal screen", error);
             }
-            if shutting_down {
+            if shutting_down || natural_census {
                 self.holder.leave_after_unconfirmed_shutdown();
             } else {
                 self.holder.leave_for_successor();
