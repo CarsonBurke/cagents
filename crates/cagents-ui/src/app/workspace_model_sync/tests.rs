@@ -4354,6 +4354,131 @@ fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
     );
 }
 
+/// #3095: an agent's card, and the pane a window wrote for it, were made
+/// before the provider named the agent's Codex thread. The card learns the
+/// ID once the agent holds it, whether or not the pane does yet; an agent
+/// descriptor that differs in more than the ID changes nothing.
+#[test]
+fn an_existing_agent_card_learns_the_thread_its_agent_names() {
+    use crate::agent_execution::HostedSession;
+    for shown_by_pane in [false, true] {
+        let (mut app, mut agent, mut pane, destination) = unloaded_chat_label_fixture();
+        let Some(HostedSession::Chat(mut unnamed)) = agent.session.clone() else {
+            unreachable!()
+        };
+        unnamed.launch.provider = crate::agent::Provider::Codex;
+        unnamed.launch.recipe.program = "codex".into();
+        unnamed.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        let proof = unnamed.proof.clone().unwrap();
+        assert!(unnamed.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+        agent.spec.provider = crate::agent::Provider::Codex;
+        agent.session = Some(HostedSession::Chat(unnamed.clone()));
+        pane.kind = CardKind::Chat(unnamed.clone());
+        if shown_by_pane {
+            app.workspace_model.views = vec![crate::workspace_model::views::View {
+                scope: crate::agent_execution::Placement::Channel(destination),
+                revision: 9,
+                panes: vec![pane.clone()],
+                retired: vec![],
+            }];
+        }
+        app.workspace_model.agents = vec![agent.clone()];
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        let card = pane.id;
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(unnamed.clone())
+        );
+
+        // Only a different conversation's descriptor: the card keeps its own.
+        let mut other = unnamed.clone();
+        other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        other.owned_codex_listener = None;
+        agent.session = Some(HostedSession::Chat(other));
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(unnamed.clone())
+        );
+
+        let mut named = unnamed.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        named.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        agent.session = Some(HostedSession::Chat(named.clone()));
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named.clone()),
+            "the card takes the agent's thread"
+        );
+        drop(app.reconcile_workspace_model());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named),
+            "a pane without the ID does not take it back"
+        );
+    }
+}
+
+/// #3095: a new card made from a pane that lacks the thread its agent names
+/// takes the agent's ID. A Claude pane without its agent's ID may show a
+/// cleared conversation, so its card keeps the pane's descriptor.
+#[test]
+fn a_new_agent_card_takes_only_the_codex_thread_its_pane_lacks() {
+    use crate::agent_execution::HostedSession;
+    for codex in [true, false] {
+        let (mut app, mut agent, mut pane, destination) = unloaded_chat_label_fixture();
+        let Some(HostedSession::Chat(mut unnamed)) = agent.session.clone() else {
+            unreachable!()
+        };
+        if codex {
+            unnamed.launch.provider = crate::agent::Provider::Codex;
+            unnamed.launch.recipe.program = "codex".into();
+            unnamed.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+            let proof = unnamed.proof.clone().unwrap();
+            assert!(unnamed.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+            agent.spec.provider = crate::agent::Provider::Codex;
+        } else {
+            unnamed.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        }
+        unnamed.launch.session_id = None;
+        let mut named = unnamed.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if codex {
+            named.native_continuity = crate::chat::NativeContinuity::Durable {
+                provider_version: "0.157.1".into(),
+            };
+        }
+        assert!(crate::chat::is_confirmed_identity_update(&unnamed, &named));
+        agent.session = Some(HostedSession::Chat(named.clone()));
+        pane.kind = CardKind::Chat(unnamed.clone());
+        app.workspace_model.views = vec![crate::workspace_model::views::View {
+            scope: crate::agent_execution::Placement::Channel(destination),
+            revision: 9,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        }];
+        app.workspace_model.agents = vec![agent.clone()];
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Chat(if codex { named } else { unnamed }),
+            "codex: {codex}"
+        );
+    }
+}
+
 #[test]
 fn unloaded_spawn_label_reaches_the_sidebar_attention_row_without_a_model_change() {
     use crate::agent_execution::{Placement, agent_label};

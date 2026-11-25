@@ -11046,6 +11046,35 @@ impl Cagents {
                         .is_some_and(|owner| owner.id() == source.id))
         })
     }
+    /// The conversation `source`, card `card`'s descriptor, is when its open
+    /// agent holds the ID the card lacks and nothing else of the two differs:
+    /// the same chat, proof, launch and owned listener
+    /// ([`chat::is_first_codex_identity_update`]). Nothing is inferred from
+    /// the provider's saved conversations.
+    fn open_agent_conversation(
+        &self,
+        card: CardId,
+        source: &chat::Session,
+    ) -> Option<chat::Session> {
+        if source.launch.session_id.is_some() {
+            return None;
+        }
+        let managed = crate::model::AgentId::from_uuid(card.as_uuid());
+        self.workspace_model
+            .agents
+            .iter()
+            .find_map(|agent| match &agent.session {
+                Some(crate::agent_execution::HostedSession::Chat(saved))
+                    if !agent.closed
+                        && (agent.id == managed || saved.id == source.id)
+                        && chat::is_first_codex_identity_update(source, saved) =>
+                {
+                    Some(saved.clone())
+                }
+                _ => None,
+            })
+    }
+
     pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return None;
@@ -14005,6 +14034,23 @@ impl Cagents {
                         return retained.0;
                     }
                     return Task::none();
+                }
+                // The card never learned its conversation, but its open agent
+                // did: the provider named the thread after the card's
+                // descriptor was written. The card takes that exact ID and
+                // reopens the conversation instead of reporting it lost. An
+                // account recovery's own start is not redirected.
+                if let Err(failure) = &result
+                    && account_source.is_none()
+                    && failure.recovery == chat::Recovery::Fresh
+                    && let Some(named) = self.open_agent_conversation(target.card, &attempt.session)
+                {
+                    tracing::info!(card = %target.card, "reopening the conversation the card's agent names");
+                    if let Some(state) = self.card_state_mut(target.card) {
+                        state.kind = CardKind::Chat(named.clone());
+                    }
+                    self.persist();
+                    return self.start_chat(target.card, named, attempt.intent, None, false);
                 }
                 match result {
                     Ok(handle) => {

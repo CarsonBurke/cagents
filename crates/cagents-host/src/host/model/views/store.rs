@@ -603,6 +603,24 @@ pub(in crate::host::model) fn chat_pane(
         .transpose()
 }
 
+/// Whether a pane presents chat `id` without its provider's conversation ID:
+/// the one indexed read callers make before reading the pane's view.
+pub(in crate::host::model) fn chat_pane_lacks_identity(
+    db: &Connection,
+    id: crate::model::TerminalId,
+) -> Result<bool, String> {
+    db.prepare_cached(
+        "SELECT provider_session IS NULL FROM panes WHERE kind = 'chat' AND resource = ?1",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_row([id.to_string()], |row| row.get::<_, bool>(0))
+            .optional()
+    })
+    .map(|lacks| lacks.unwrap_or(false))
+    .map_err(sql)
+}
+
 /// Every scope of `repository`: its worktrees and its channels.
 pub(in crate::host::model) fn project_scopes(
     db: &Connection,

@@ -19308,6 +19308,67 @@ fn unreachable_unnamed_agent(kept_runtime: bool) -> (Cagents, CardId, chat::Sess
     (app, card, session)
 }
 
+/// #3095: the provider named an agent's thread after the card's descriptor
+/// was written, so the card lacks the ID its open agent holds. Once its
+/// daemon is gone, the card takes that exact ID and reopens the conversation
+/// rather than saying cagents lost track of it. An agent whose descriptor
+/// differs in more than the ID names another conversation, and the card is
+/// refused as before.
+#[test]
+fn an_agents_card_missing_the_thread_its_agent_names_reopens_it() {
+    for same_launch in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let mut session = chat_runtime(&app, card).session.clone();
+        session.reset_owned_codex_listener();
+        let proof = session.proof.clone().expect("a started conversation");
+        assert!(session.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+        assert!(session.launch.session_id.is_none());
+        let mut named = session.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if !same_launch {
+            named.launch.recipe.arguments.push("--model".into());
+        }
+        app.workspace_model.agents = vec![crate::app::channel_ui::close_tests::agent(&named)];
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());
+        let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::fresh("fixture: daemon gone")),
+        );
+        if !same_launch {
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(session.clone())
+            );
+            assert!(app.unnamed_agent(card).is_some());
+            continue;
+        }
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named.clone()),
+            "the card names the agent's thread"
+        );
+        assert!(app.unnamed_agent(card).is_none());
+        assert!(!app.chat_ui.blocked_starts.contains_key(&card));
+        let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get(&card) else {
+            panic!("the card reopens the named conversation");
+        };
+        assert_eq!(attempt.session, named);
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|retiring| retiring.card != card),
+            "nothing gives up the agent's conversation"
+        );
+    }
+}
+
 /// #3095: an agent's Codex conversation whose thread ID was never saved
 /// came back from an abandoned update as a draft, and giving up the old
 /// conversation retired the agent. The card keeps the conversation and says
