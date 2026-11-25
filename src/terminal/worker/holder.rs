@@ -3020,6 +3020,7 @@ mod tests {
         let observed_tmp = directory.path().join("tmp-path");
         terminal.args([std::ffi::OsStr::new("fixture"), observed_tmp.as_os_str()]);
         terminal.env("XDG_RUNTIME_DIR", directory.path());
+        terminal.env("TMPDIR", directory.path());
         let mut held = spawn_reserved(
             terminal,
             size(),
