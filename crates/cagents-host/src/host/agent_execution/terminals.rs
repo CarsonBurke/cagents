@@ -116,6 +116,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ApplyWorkspaceEdit { .. }
         | R::RefreshAgentActivity { .. }
         | R::ObserveReviewRequests { .. }
+        | R::ObserveReviewMonitor { .. }
         | R::WatchNotifications { .. }
         | R::NotificationPresence { .. }
         | R::ReadNotifications

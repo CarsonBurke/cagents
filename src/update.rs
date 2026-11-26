@@ -8,7 +8,13 @@ mod confirmation;
 #[cfg(target_os = "macos")]
 mod cutover;
 #[cfg(all(target_os = "macos", feature = "host"))]
-pub(crate) use cutover::record as record_ready_cutover;
+#[doc(hidden)]
+pub use cutover::{
+    LiveInventory as CutoverLiveInventory, StartupCheckpoint as CutoverStartupCheckpoint,
+    startup_checkpoint as cutover_startup_checkpoint,
+};
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use cutover::{Original as ReadyCutoverOriginal, record as record_ready_cutover};
 mod feed;
 mod floor;
 mod floor_display;
@@ -2105,7 +2111,11 @@ fn settle_under_worker_lease(
 /// the worker's own verifier receipt names this daemon serving, it settles the
 /// job complete. Anything else leaves the record as it is.
 #[cfg(feature = "host")]
-pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
+pub fn settle_as_successor(
+    serving: crate::model::HostSessionProof,
+    #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
+    #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory + Send + 'static,
+) {
     let Ok(executable) = crate::process::current_executable() else {
         return;
     };
@@ -2119,7 +2129,15 @@ pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
     }
     let spawned =
         thread::Builder::new().name("update-settle".into()).spawn(
-            move || match settle_after_worker(&layout, &state, &serving) {
+            move || match settle_after_worker(
+                &layout,
+                &state,
+                &serving,
+                #[cfg(target_os = "macos")]
+                entry_checkpoint,
+                #[cfg(target_os = "macos")]
+                observe_live,
+            ) {
                 Ok(Some(job)) => {
                     tracing::info!(
                         job,
@@ -2140,6 +2158,8 @@ fn settle_after_worker(
     layout: &InstallLayout,
     state: &Path,
     serving: &crate::model::HostSessionProof,
+    #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
+    #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory,
 ) -> Result<Option<String>, UpdateError> {
     // The kernel wakes this thread when the original worker releases the
     // lease, including on process exit. Keep it through the verdict so a new
@@ -2152,7 +2172,14 @@ fn settle_after_worker(
         Err(error) => return Err(error),
     };
     #[cfg(target_os = "macos")]
-    if let Some(completed) = cutover::finish(layout, state, serving, job.clone())? {
+    if let Some(completed) = cutover::finish(
+        layout,
+        state,
+        serving,
+        job.clone(),
+        entry_checkpoint,
+        observe_live,
+    )? {
         return Ok(Some(completed));
     }
     if job.phase != UpdatePhase::Failed
@@ -7693,7 +7720,19 @@ mod reconciliation_tests {
         };
         write(recovery::outcome_path(&state, JOB), "pending.json");
 
-        let step = || settle_after_worker(&layout, &state, &serving).unwrap();
+        let settle = |proof: &crate::model::HostSessionProof| {
+            settle_after_worker(
+                &layout,
+                &state,
+                proof,
+                #[cfg(target_os = "macos")]
+                CutoverStartupCheckpoint::Absent,
+                #[cfg(target_os = "macos")]
+                || unreachable!("legacy receipts do not inspect a cutover roster"),
+            )
+            .unwrap()
+        };
+        let step = || settle(&serving);
         job.phase = UpdatePhase::Failed;
         job.message =
             "The confirmed successor does not serve this update's matched protocol".into();
@@ -7706,10 +7745,7 @@ mod reconciliation_tests {
         write(recovery::outcome_path(&state, JOB), "recovery.json");
         let mut restarted = serving.clone();
         restarted.host_incarnation = crate::model::HostIncarnation::new("restarted");
-        assert_eq!(
-            settle_after_worker(&layout, &state, &restarted).unwrap(),
-            None
-        );
+        assert_eq!(settle(&restarted), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // A worker that records its release reports its own verdict.
         job.recorded_by = Some("0.2.4".into());
@@ -7759,10 +7795,7 @@ mod reconciliation_tests {
         assert_eq!(history["recorded"]["message"], job.message.as_str());
         assert!(state.join(format!("{JOB}.complete")).is_file());
         // Settled for good: a later daemon finds nothing to do.
-        assert_eq!(
-            settle_after_worker(&layout, &state, &restarted).unwrap(),
-            None
-        );
+        assert_eq!(settle(&restarted), None);
         assert_eq!(recorded().phase, UpdatePhase::Complete);
     }
 }

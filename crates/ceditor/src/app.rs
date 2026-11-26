@@ -2625,7 +2625,11 @@ impl Editor {
             .collect::<Vec<_>>();
         let task = self
             .review_requests
-            .update(action, repositories)
+            .update_observing(
+                action,
+                repositories,
+                cagents::notifications::Application::Ceditor,
+            )
             .map(Message::ReviewRequests)
             .map(cosmic::Action::App);
         let report = self.report_review_requests();

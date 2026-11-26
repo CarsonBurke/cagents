@@ -767,11 +767,18 @@ pub(crate) struct Preparation {
 
 pub(crate) struct CapturedPreparation(Preparation);
 
+#[cfg(target_os = "macos")]
+enum StandbyCheckpoint {
+    Prepared,
+    /// Keep the original Ready inode alive until standby custody settles.
+    Ready(File),
+}
+
 pub(crate) struct Receipt {
     #[cfg(target_os = "linux")]
     receipt: File,
     #[cfg(target_os = "macos")]
-    phase: Phase,
+    checkpoint: StandbyCheckpoint,
     worker: File,
     fence: File,
     legacy: File,
@@ -1438,7 +1445,7 @@ impl PendingRecovery {
             #[cfg(target_os = "linux")]
             receipt: sealed_receipt(&authority).map_err(|e| e.to_string())?,
             #[cfg(target_os = "macos")]
-            phase: Phase::Prepared,
+            checkpoint: StandbyCheckpoint::Prepared,
             worker,
             fence,
             legacy,
@@ -1638,8 +1645,9 @@ impl CapturedPreparation {
     ) -> Result<Option<Receipt>, String> {
         let mut preparation = self.0;
         preparation.validate_continuity()?;
-        let bytes = read_checkpoint(&preparation.authority.checkpoint_path)?
+        let input = open_checkpoint(&preparation.authority.checkpoint_path)?
             .ok_or("The acknowledged checkpoint disappeared before recovery")?;
+        let bytes = read_checkpoint_input(&input)?;
         let phase = validate_checkpoint(&preparation.authority, &bytes)?;
         if phase == Phase::Ready {
             // The same acknowledged source may finish Prepared -> Ready while
@@ -1683,7 +1691,11 @@ impl CapturedPreparation {
             #[cfg(target_os = "linux")]
             receipt: sealed_receipt(&preparation.authority).map_err(|e| e.to_string())?,
             #[cfg(target_os = "macos")]
-            phase,
+            checkpoint: if phase == Phase::Ready {
+                StandbyCheckpoint::Ready(input)
+            } else {
+                StandbyCheckpoint::Prepared
+            },
             worker: preparation.worker,
             fence: preparation.fence,
             legacy: preparation.legacy,
@@ -1696,7 +1708,7 @@ impl CapturedPreparation {
 impl Receipt {
     #[cfg(target_os = "macos")]
     pub(crate) fn is_ready(&self) -> bool {
-        self.phase == Phase::Ready
+        matches!(self.checkpoint, StandbyCheckpoint::Ready(_))
     }
     pub(crate) fn saved_windows(&self) -> &[String] {
         &self.authority.windows
@@ -1729,6 +1741,27 @@ impl Receipt {
             })?,
             &self.legacy,
         ])
+    }
+
+    /// The original, exact Ready bytes still precede any provider restore.
+    /// A changed phase or even a byte change removes the retry authority.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ready_before_restore(&self) -> Result<bool, String> {
+        let StandbyCheckpoint::Ready(original) = &self.checkpoint else {
+            return Ok(false);
+        };
+        let Some(current) = open_checkpoint(&self.authority.checkpoint_path)? else {
+            return Ok(false);
+        };
+        let original = original.metadata().map_err(|error| error.to_string())?;
+        let current_metadata = current.metadata().map_err(|error| error.to_string())?;
+        // A failed restore can write byte-identical Ready contents again.
+        // It does so by atomic replacement, so those bytes are a different
+        // file and cannot authorize an automatic replay from this worker.
+        Ok(
+            (original.dev(), original.ino()) == (current_metadata.dev(), current_metadata.ino())
+                && digest(&read_checkpoint_input(&current)?) == self.authority.checkpoint_hash,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -2235,7 +2268,7 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
+fn open_checkpoint(path: &Path) -> Result<Option<File>, String> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -2254,6 +2287,16 @@ fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
     {
         return Err("Unsafe or oversized preparation evidence; recovery was refused".into());
     }
+    Ok(Some(file))
+}
+
+fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    open_checkpoint(path)?
+        .map(|file| read_checkpoint_input(&file))
+        .transpose()
+}
+
+fn read_checkpoint_input(file: &File) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     file.take(LIMIT + 1)
         .read_to_end(&mut bytes)
@@ -2261,7 +2304,7 @@ fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
     if bytes.len() as u64 > LIMIT {
         return Err("Preparation evidence exceeds its byte limit".into());
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 fn require_absent_checkpoint(path: &Path) -> Result<(), String> {
@@ -4384,7 +4427,10 @@ impl ReadyAdmission {
             &authority.job_request_hash,
             &authority.checkpoint_hash,
             &authority.target,
-            &authority.source,
+            crate::update::ReadyCutoverOriginal {
+                source: &authority.source,
+                inventory: &authority.census,
+            },
             successor,
             &authority.windows,
         )

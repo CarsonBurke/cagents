@@ -4640,6 +4640,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
             | Update::ConversationNameChanged
             | Update::RecordChanged
             | Update::FailureChanged
+            | Update::TurnStarted { .. }
             | Update::Execution { .. } => None,
         })
         .collect();

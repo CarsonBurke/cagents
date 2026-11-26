@@ -190,6 +190,8 @@ pub struct Resident {
     pub owns_work: bool,
     pub installed: bool,
     pub close: CloseObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attention_turn: Option<(u64, u64)>,
     pub idle: bool,
     /// Whether the provider holds messages the person queued, which go
     /// before the courier's. A helper that predates it reports none.
@@ -586,6 +588,7 @@ impl RemoteActor {
                 closing: false,
                 owns_work: true,
             },
+            attention_turn: None,
             idle: true,
             queued_input: false,
             failure: None,
@@ -711,6 +714,10 @@ impl RemoteActor {
         identity.sequence
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(in crate::chat::runtime) fn take_pending_visibility_fixture(&self) -> Option<bool> {
+        self.0.desired_visible.lock().unwrap().take()
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub fn distinct_attachment_fixture(&self) -> Self {
         let mut other = Self::fixture();
@@ -869,6 +876,7 @@ impl RemoteActor {
     pub fn wake_outcomes(&self) {
         let state = self.state();
         if state.completed_without_work()
+            || state.attention_turn.is_some()
             || state.waiting_attention == Some(super::journal::WaitingAttention::Resolved)
             || state.legacy_activity_is_settled()
             || state.outbox_latest > state.outbox_ack
@@ -945,6 +953,14 @@ impl RemoteActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    pub fn attention_turn(&self, sequence: Option<u64>) -> Result<Option<(u64, u64)>, String> {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if sequence.is_some_and(|sequence| sequence > state.outbox_latest) {
+            return Err("The latest retained outcome is awaiting its actor publication".into());
+        }
+        Ok(state.attention_turn)
     }
     pub fn refresh_state(&self) -> Result<(), String> {
         self.refresh_state_until(Instant::now() + TIMEOUT)
@@ -1681,6 +1697,12 @@ impl RemoteActor {
             {
                 resident.waiting_attention = state.waiting_attention;
             }
+            // The journal can advance before its change callback publishes a
+            // new revision. A late response from the same actor must preserve
+            // a confirmed turn already accepted at that revision.
+            if resident.close.actor_id == state.close.actor_id {
+                resident.attention_turn = resident.attention_turn.max(state.attention_turn);
+            }
             // Legacy activity was copied before the outbox lock. Confirm
             // settlement with an RPC started after a settled sample of the
             // same outbox arrived. Equal-clock replies already in flight
@@ -1736,6 +1758,7 @@ impl RemoteActor {
             // window subscribes and no semantic outcome accompanies it.
             if identity_changed
                 || (resident.completed_without_work() && !state.completed_without_work())
+                || resident.attention_turn != state.attention_turn
                 || (resident.outbox_latest > resident.outbox_ack
                     && resident.outbox_latest != state.outbox_latest)
                 || resident.waiting_attention != state.waiting_attention
@@ -3325,6 +3348,7 @@ impl Server {
                 chat::NativeContinuity::ReconnectOnly
             },
             close,
+            attention_turn: journal.attention_turn(),
             installed: self.installed,
             owns_work: owns_work || failure.is_some(),
             completed,
