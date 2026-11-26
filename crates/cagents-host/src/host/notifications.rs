@@ -215,6 +215,14 @@ impl Pending {
         Ok(())
     }
 
+    fn commit_next_retirement(&mut self, journal: &mut Journal) -> Result<Option<Target>, String> {
+        let Some(target) = self.retired.first() else {
+            return Ok(None);
+        };
+        journal.retire(target.clone())?;
+        Ok(self.retired.pop_first())
+    }
+
     /// This batch's work with `newer`, a later batch, applied after it, as if
     /// both had been queued as one: a later retirement withdraws an earlier
     /// event for its session, and a later event replaces an earlier one.
@@ -1331,9 +1339,10 @@ fn settle_attention_at_shutdown(
         tracing::warn!(%error, "retiring retained turn attention could not settle during shutdown");
         return true;
     }
-    for target in std::mem::take(&mut pending.retired) {
-        if let Err(error) = journal.retire(target) {
+    while !pending.retired.is_empty() {
+        if let Err(error) = pending.commit_next_retirement(journal) {
             tracing::warn!(%error, "accepted notice retirement could not settle during shutdown");
+            return true;
         }
     }
     if let Err(error) = pending.flush_retained_turns(journal, false, |_| {}) {
@@ -2076,20 +2085,30 @@ async fn run(
             deferred = pending.deferred();
             continue;
         }
-        for session in std::mem::take(&mut pending.retired) {
+        while !pending.retired.is_empty() {
             if settle_attention_at_shutdown(&shared, journal, &mut pending) {
                 return;
             }
-            delivery.remove(&session);
+            let target = match pending.commit_next_retirement(journal) {
+                Ok(Some(target)) => target,
+                Ok(None) => break,
+                Err(error) => {
+                    snapshot.diagnostic = Some(error.clone());
+                    publish(&shared, &host, snapshot.clone());
+                    answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                    proxy = None;
+                    next_attempt = store.retry_failed_write(error, Instant::now());
+                    deferred = pending.deferred();
+                    continue 'broker;
+                }
+            };
+            delivery.remove(&target);
             if let Some(old) = snapshot
                 .notices
                 .iter()
-                .find(|notice| notice.event.target() == session)
+                .find(|notice| notice.event.target() == target)
             {
                 withdraw_notice(&mut withdrawals, old);
-            }
-            if let Err(error) = journal.retire(session) {
-                snapshot.diagnostic = Some(error);
             }
         }
         match apply_predecessor_reads(
@@ -4652,6 +4671,46 @@ mod tests {
             rows.iter()
                 .any(|notice| notice.id == previous.id && notice.acknowledged)
         );
+    }
+
+    #[test]
+    fn shutdown_finishes_every_retirement_still_in_the_broker_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let notices: Vec<_> = [TerminalId::new(), TerminalId::new(), TerminalId::new()]
+            .into_iter()
+            .map(|session| {
+                let notice = journal
+                    .record(attention_event(session, "prior"), false)
+                    .unwrap()
+                    .unwrap();
+                handle.retire(session);
+                notice
+            })
+            .collect();
+        let mut pending = take_pending(&shared);
+        assert!(
+            pending
+                .commit_next_retirement(&mut journal)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(pending.retired.len(), 2);
+        handle.change(|pending| pending.stopped = true);
+        assert!(settle_attention_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &mut pending,
+        ));
+        assert!(pending.retired.is_empty());
+        assert!(journal.list().unwrap().is_empty());
+        let withdrawals = journal.group_withdrawals_for(&[]).unwrap();
+        for notice in notices {
+            assert!(withdrawals.contains(&notice.id));
+            assert!(withdrawals.contains(&batching::desktop_id(&notice.event.target())));
+        }
     }
 
     #[test]
