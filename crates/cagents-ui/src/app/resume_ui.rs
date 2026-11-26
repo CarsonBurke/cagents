@@ -4608,7 +4608,7 @@ mod tests {
             let entry = saved(directory.path());
             let source = entry.session.clone();
             let (writer, _) = SessionRuntime::open(
-                &directory.path().join("resume.sqlite3"),
+                directory.path().join("resume.sqlite3"),
                 crate::model::BootId::new("stopped-history-daemon"),
             )
             .unwrap();

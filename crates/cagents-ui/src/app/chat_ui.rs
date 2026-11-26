@@ -3545,6 +3545,20 @@ enum DraftEcho {
     Latest(SentAfter),
 }
 
+/// Where the next confirmed receipt belongs in this unsent draft.
+#[derive(Clone, Copy, Default)]
+enum QueueDraftPosition {
+    #[default]
+    Beginning,
+    AfterRecovered {
+        revision: u64,
+        bytes: usize,
+        files: usize,
+    },
+    /// A restored draft keeps its contents but has no saved insertion point.
+    End,
+}
+
 /// What came back to the composer from a provider queue that did not survive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RestoredWaiting {
@@ -3694,6 +3708,7 @@ pub(super) struct Runtime {
     /// this conversation stopped, now returned to the composer unsent. Shown
     /// beside the draft until it is sent or the notice is dismissed.
     restored_waiting: Option<RestoredWaiting>,
+    queue_draft_position: QueueDraftPosition,
     /// The provider queue a parked runtime last saved, by entry, as a parked
     /// runtime does not refresh the snapshot a live one compares against.
     parked_queue: Vec<String>,
@@ -4879,8 +4894,74 @@ impl Runtime {
             receipt_changed |= receipt.remember(&message.id);
         }
         let changed = receipt_changed || !restored.is_empty();
-        self.restore_waiting(restored);
+        if let Some((text, attachments, notice)) = RestoredWaiting::collect(&restored) {
+            self.insert_recovered_queue(&text, attachments);
+            self.restored_waiting = Some(notice.including(self.restored_waiting));
+        }
         changed
+    }
+
+    fn insert_recovered_queue(&mut self, text: &str, attachments: Vec<Attachment>) {
+        if text.is_empty() && attachments.is_empty() {
+            return;
+        }
+        let (bytes, files) = if matches!(self.queue_draft_position, QueueDraftPosition::Beginning) {
+            let boundary = (text.len(), attachments.len());
+            self.prepend_to_draft(text, attachments);
+            boundary
+        } else {
+            let mut draft = self.unsent_text();
+            let existing = self.unsent_attachments().to_vec();
+            let (offset, file_offset) = match self.queue_draft_position {
+                QueueDraftPosition::AfterRecovered {
+                    revision,
+                    bytes,
+                    files,
+                } if revision == self.revision
+                    && draft.is_char_boundary(bytes)
+                    && files <= existing.len() =>
+                {
+                    (bytes, files)
+                }
+                // An edit can replace the old prefix. Preserve the complete
+                // draft and put the new receipt after whatever remains.
+                _ => (draft.len(), existing.len()),
+            };
+            let mut end = offset;
+            if !text.is_empty() {
+                let before = offset > 0 && !draft[..offset].ends_with('\n');
+                let after = offset < draft.len() && !draft[offset..].starts_with('\n');
+                let separator = if before { "\n" } else { "" };
+                let insertion = format!("{separator}{text}");
+                draft.insert_str(offset, &insertion);
+                end += insertion.len();
+                if after {
+                    draft.insert(end, '\n');
+                }
+            }
+            let before_caret = &draft[..end];
+            let mut composer = text_editor::Content::with_text(&draft);
+            composer.move_to(text_editor::Cursor {
+                position: text_editor::Position {
+                    line: before_caret.bytes().filter(|byte| *byte == b'\n').count(),
+                    column: before_caret.rsplit('\n').next().unwrap_or_default().len(),
+                },
+                selection: None,
+            });
+            self.replace_draft(composer);
+            self.end_history_walk();
+            let previous_count = existing.len();
+            self.replace_attachments(existing);
+            self.merge_attachments(attachments);
+            let added = self.attachments.len() - previous_count;
+            self.attachments[file_offset..].rotate_right(added);
+            (end, file_offset + added)
+        };
+        self.queue_draft_position = QueueDraftPosition::AfterRecovered {
+            revision: self.revision,
+            bytes,
+            files,
+        };
     }
 
     /// Returns to the composer the messages a provider that did not come back
@@ -5394,6 +5475,7 @@ impl Runtime {
             complete_exit_queue: false,
             resend: None,
             restored_waiting: None,
+            queue_draft_position: QueueDraftPosition::Beginning,
             parked_queue: Vec::new(),
             composer_actions: false,
             composer_actions_query: String::new(),
@@ -10906,11 +10988,14 @@ impl Cagents {
         if let Some(attachments) = self.chat_ui.draft_attachments.remove(&card) {
             runtime.replace_attachments(attachments);
         }
-        runtime.restored_queue = self
-            .chat_ui
-            .restored_queues
-            .remove(&card)
-            .filter(|receipt| receipt.source == runtime.session.id);
+        let receipt = self.chat_ui.restored_queues.remove(&card);
+        if receipt
+            .as_ref()
+            .is_some_and(|receipt| !receipt.ids.is_empty())
+        {
+            runtime.queue_draft_position = QueueDraftPosition::End;
+        }
+        runtime.restored_queue = receipt.filter(|receipt| receipt.source == runtime.session.id);
         if let Some(notice) = self.chat_ui.restored_draft_queues.remove(&card) {
             runtime.restored_waiting = Some(notice);
         }

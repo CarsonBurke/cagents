@@ -26912,7 +26912,7 @@ fn early_completed_queues_recover_in_delivery_order() {
 
         let directory = tempfile::tempdir().unwrap();
         let (writer, _) = crate::session::SessionRuntime::open(
-            &directory.path().join("early-receipts.sqlite3"),
+            directory.path().join("early-receipts.sqlite3"),
             crate::model::BootId::new("early-completed-queue-fixture"),
         )
         .unwrap();
@@ -26987,6 +26987,79 @@ fn early_completed_queues_recover_in_delivery_order() {
         let store = writer.operation_store();
         assert!(store.has_returned_chat_queue(card, previous_key).unwrap());
         assert!(store.has_returned_chat_queue(card, current_key).unwrap());
+    }
+}
+
+#[test]
+fn a_later_completion_stays_after_the_recovered_prefix_or_the_edited_draft() {
+    for edited in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+        let source = chat_runtime(&app, card).session.clone();
+        app.cards.remove(&card);
+        app.chat_ui
+            .drafts
+            .insert(card, "Independently typed".into());
+        let typed_file = Attachment::file("/project/typed.txt");
+        app.chat_ui
+            .draft_attachments
+            .insert(card, vec![typed_file.clone()]);
+
+        drop(app.start_chat(card, source.clone(), chat::Intent::Restore, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        let older_file = Attachment::file("/project/older.txt");
+        let current_file = Attachment::file("/project/current.txt");
+        let mut older = provider_message("older-1", "Earlier recovered résumé");
+        older.attachments.push(older_file.clone());
+        drop(app.handle_chat_ui(Action::Wake(
+            target,
+            Wake::CompletedQueue {
+                source: Box::new(source.clone()),
+                messages: vec![older],
+                current: false,
+            },
+        )));
+        answer_start(&mut app, target, Ok(handle));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "Earlier recovered résumé\nIndependently typed",
+        );
+        dismiss_restored_queue_notice(&mut app, card);
+
+        let revised_file = Attachment::file("/project/revised.txt");
+        if edited {
+            write(&mut app, card, " with a user edit");
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .attach([revised_file.path.clone()]);
+        }
+        let before = chat_runtime(&app, card).composer.text();
+        let mut current = provider_message("current-1", "Later recovered message");
+        current.attachments.push(current_file.clone());
+        drop(app.handle_chat_ui(Action::Wake(
+            target,
+            Wake::CompletedQueue {
+                source: Box::new(source),
+                messages: vec![current],
+                current: true,
+            },
+        )));
+
+        let runtime = chat_runtime(&app, card);
+        let (text, files) = if edited {
+            (
+                format!("{}\nLater recovered message", before.trim_end()),
+                vec![older_file, typed_file, revised_file, current_file],
+            )
+        } else {
+            (
+                "Earlier recovered résumé\nLater recovered message\nIndependently typed".into(),
+                vec![older_file, current_file, typed_file],
+            )
+        };
+        assert_eq!(runtime.composer.text().trim(), text, "edited={edited}");
+        assert_eq!(runtime.attachments, files, "edited={edited}");
     }
 }
 
