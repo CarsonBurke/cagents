@@ -221,6 +221,13 @@ pub enum UpdateReadiness {
     Unready,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedWaiting {
+    Current,
+    Superseded,
+    Resolved,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Update {
     /// Helper outbox has uncommitted semantic evidence; wake the host broker.

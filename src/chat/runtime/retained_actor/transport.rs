@@ -233,9 +233,37 @@ pub struct Resident {
     pub retained_runs: Vec<crate::model::RunId>,
     pub outbox_ack: u64,
     pub outbox_latest: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    waiting_attention: Option<super::journal::WaitingAttention>,
+    /// Local compatibility evidence from successive authenticated old-helper
+    /// publications. A helper never sets this bit.
+    #[serde(skip)]
+    legacy_waiting_settled: bool,
     changed: u64,
 }
 impl Resident {
+    fn completed_without_work(&self) -> bool {
+        self.completed && !self.owns_work
+    }
+
+    fn legacy_activity_is_settled(&self) -> bool {
+        use crate::agent::ActivityState;
+        self.waiting_attention.is_none()
+            && !self.waiting
+            && self.requests.is_empty()
+            && matches!(self.activity, ActivityState::Idle | ActivityState::Working)
+    }
+
+    fn waiting_state_cursor(&self) -> u64 {
+        // A conditional request is otherwise suppressed by an old helper
+        // whose settled state has not changed since the first observation.
+        if self.legacy_activity_is_settled() && !self.legacy_waiting_settled {
+            self.changed ^ (1u64 << 63)
+        } else {
+            self.changed
+        }
+    }
+
     fn has_retirable_inputs(&self) -> bool {
         self.terminal_input_count
             .unwrap_or(self.acknowledged_input_count)
@@ -579,6 +607,8 @@ impl RemoteActor {
             retained_runs: Vec::new(),
             outbox_ack: 0,
             outbox_latest: 0,
+            waiting_attention: None,
+            legacy_waiting_settled: false,
             changed: 1,
         };
         Self(Arc::new(Remote {
@@ -712,6 +742,67 @@ impl RemoteActor {
         }
         actor
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completed_waiting_fixture() -> Self {
+        let actor = Self::fixture();
+        {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.completed = true;
+            state.owns_work = false;
+            state.activity = crate::agent::ActivityState::Unknown;
+            state.outbox_latest = 1;
+        }
+        actor
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_waiting_fixture() -> Self {
+        let actor = Self::fixture();
+        {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.activity = crate::agent::ActivityState::Waiting;
+            state.waiting = true;
+            state.idle = false;
+            state.outbox_latest = 4;
+            state.waiting_attention = Some(super::journal::WaitingAttention::Open(3));
+        }
+        actor
+    }
+
+    pub fn waiting_resolution(
+        &self,
+        through: Option<u64>,
+    ) -> Option<crate::chat::runtime::RetainedWaiting> {
+        use crate::chat::runtime::RetainedWaiting;
+
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if through.is_some_and(|sequence| sequence > state.outbox_latest) {
+            return None;
+        }
+        if state.completed {
+            return Some(if state.owns_work {
+                RetainedWaiting::Current
+            } else {
+                RetainedWaiting::Resolved
+            });
+        }
+        use super::journal::WaitingAttention;
+        // Both this disposition and the outbox clock came from the same
+        // journal lock. The earlier activity projection may predate them.
+        Some(match state.waiting_attention {
+            Some(WaitingAttention::Resolved) => RetainedWaiting::Resolved,
+            None if state.legacy_waiting_settled => RetainedWaiting::Resolved,
+            Some(WaitingAttention::Open(current))
+                if through.is_some_and(|sequence| sequence < current) =>
+            {
+                RetainedWaiting::Superseded
+            }
+            _ => RetainedWaiting::Current,
+        })
+    }
     pub fn close_proved(
         identity: &ActorIdentity,
         proof: &HostSessionProof,
@@ -777,7 +868,10 @@ impl RemoteActor {
     }
     pub fn wake_outcomes(&self) {
         let state = self.state();
-        if state.outbox_latest > state.outbox_ack
+        if state.completed_without_work()
+            || state.waiting_attention == Some(super::journal::WaitingAttention::Resolved)
+            || state.legacy_activity_is_settled()
+            || state.outbox_latest > state.outbox_ack
             || state
                 .continuity_loss
                 .as_ref()
@@ -865,8 +959,10 @@ impl RemoteActor {
         if self.0.stop.load(Ordering::Acquire) && !closed {
             return Err("This retained actor attachment is unavailable; authenticate a new attachment before refreshing".into());
         }
+        let before = self.state();
+        let after = before.waiting_state_cursor();
         if let Some(mut resident) =
-            self.call_until::<Option<Resident>>("state", json!([self.state().changed]), deadline)?
+            self.call_until::<Option<Resident>>("state", json!([after]), deadline)?
         {
             if self.0.stop.load(Ordering::Acquire) {
                 if !closed || !resident.close.completed {
@@ -879,9 +975,13 @@ impl RemoteActor {
                 resident.ready = false;
                 resident.idle = false;
                 resident.busy = false;
-                let (changed, generation) = (resident.changed, resident.generation);
+                let (changed, generation, outbox) = (
+                    resident.changed,
+                    resident.generation,
+                    resident.outbox_latest,
+                );
                 let active_model_clock = (resident.close.actor_id, resident.active_model_revision);
-                if !self.publish_resident_inner(resident, true) {
+                if !self.publish_resident_inner(resident, true, Some(&before)) {
                     // Another refresh, such as the outcome broker's while a
                     // close drains the outbox, can publish a newer closed
                     // reply first. This older one is then only stale.
@@ -889,13 +989,16 @@ impl RemoteActor {
                     if !(current.completed
                         && (current.changed > changed
                             || current.generation > generation
+                            || current.outbox_latest > outbox
                             || (current.close.actor_id == active_model_clock.0
                                 && current.active_model_revision > active_model_clock.1)))
                     {
                         return Err("Closed actor metadata was superseded during refresh".into());
                     }
                 }
-            } else if !self.publish_resident(resident) && self.0.stop.load(Ordering::Acquire) {
+            } else if !self.publish_resident_inner(resident, false, Some(&before))
+                && self.0.stop.load(Ordering::Acquire)
+            {
                 return Err("Retained actor attachment closed during refresh".into());
             }
         }
@@ -1377,7 +1480,7 @@ impl RemoteActor {
                     #[cfg(not(debug_assertions))]
                     let held = Ok(());
                     let response = held.and_then(|()| {
-                        actor.call::<Option<Resident>>("state", json!([old.changed]))
+                        actor.call::<Option<Resident>>("state", json!([old.waiting_state_cursor()]))
                     });
                     let mut retry_housekeeping = response.is_err();
                     // What the reader shows was published before the helper
@@ -1407,7 +1510,7 @@ impl RemoteActor {
                         break;
                     }
                     if let Ok(Some(state)) = response
-                        && !actor.publish_resident(state)
+                        && !actor.publish_resident_inner(state, false, Some(&old))
                         && actor.0.stop.load(Ordering::Acquire)
                     {
                         break;
@@ -1530,9 +1633,14 @@ impl RemoteActor {
         }
     }
     fn publish_resident(&self, resident: Resident) -> bool {
-        self.publish_resident_inner(resident, false)
+        self.publish_resident_inner(resident, false, None)
     }
-    fn publish_resident_inner(&self, resident: Resident, allow_closed: bool) -> bool {
+    fn publish_resident_inner(
+        &self,
+        mut resident: Resident,
+        allow_closed: bool,
+        before_request: Option<&Resident>,
+    ) -> bool {
         // Serialize metadata admission and all notifications together. Notify
         // callbacks enqueue host updates; the resident lock is never held
         // while invoking them, so consumers may read the accepted projection.
@@ -1546,6 +1654,7 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                || resident.outbox_latest < state.outbox_latest
                 // A model update can precede its change callback while both
                 // general clocks still match an older in-flight sample.
                 || (resident.close.actor_id == state.close.actor_id
@@ -1560,6 +1669,32 @@ impl RemoteActor {
             {
                 return false;
             }
+            use super::journal::WaitingAttention;
+            // The helper advances the outbox to open a new wait. Resolving
+            // one needs no outbox entry and may get sampled before the change
+            // callback advances the revision. Preserve that resolution when
+            // an older reply for the same helper and outbox arrives last.
+            if state.waiting_attention == Some(WaitingAttention::Resolved)
+                && resident.waiting_attention.is_some()
+                && resident.close.actor_id == state.close.actor_id
+                && resident.outbox_latest == state.outbox_latest
+            {
+                resident.waiting_attention = state.waiting_attention;
+            }
+            // Legacy activity was copied before the outbox lock. Confirm
+            // settlement with an RPC started after a settled sample of the
+            // same outbox arrived. Equal-clock replies already in flight
+            // can both carry activity from before that outbox opened a wait.
+            resident.legacy_waiting_settled = resident.legacy_activity_is_settled()
+                && state.legacy_activity_is_settled()
+                && resident.close.actor_id == state.close.actor_id
+                && resident.outbox_latest == state.outbox_latest
+                && (state.legacy_waiting_settled
+                    || before_request.is_some_and(|before| {
+                        before.legacy_activity_is_settled()
+                            && resident.close.actor_id == before.close.actor_id
+                            && resident.outbox_latest == before.outbox_latest
+                    }));
             let mut updates = Vec::new();
             let generation = resident.generation;
             let identity_changed = resident.confirmed_session != state.confirmed_session;
@@ -1600,8 +1735,12 @@ impl RemoteActor {
             // Conversation identity is durable daemon metadata even when no
             // window subscribes and no semantic outcome accompanies it.
             if identity_changed
+                || (resident.completed_without_work() && !state.completed_without_work())
                 || (resident.outbox_latest > resident.outbox_ack
                     && resident.outbox_latest != state.outbox_latest)
+                || resident.waiting_attention != state.waiting_attention
+                || (resident.legacy_activity_is_settled() && !resident.legacy_waiting_settled)
+                || resident.legacy_waiting_settled != state.legacy_waiting_settled
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -1648,6 +1787,7 @@ impl RemoteActor {
         self.0.stop.store(true, Ordering::Release);
         self.0.wake.notify();
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let settled = state.completed_without_work();
         if let Some(mut resident) = resident {
             // A close response may also have been issued before installation
             // was acknowledged. Keep that actor-scoped fact monotonic while
@@ -1664,15 +1804,19 @@ impl RemoteActor {
             }
             *state = Arc::new(resident);
         }
-        let state = Arc::make_mut(&mut state);
-        state.completed = true;
-        state.owns_work = false;
-        state.idle = false;
-        state.ready = false;
-        state.failure = None;
-        state.close.completed = true;
-        state.close.owns_work = false;
-        state.close.closing = true;
+        let closed = Arc::make_mut(&mut state);
+        closed.completed = true;
+        closed.owns_work = false;
+        closed.idle = false;
+        closed.ready = false;
+        closed.failure = None;
+        closed.close.completed = true;
+        closed.close.owns_work = false;
+        closed.close.closing = true;
+        drop(state);
+        if !settled {
+            (self.0.notify)(Update::RetainedOutcomes);
+        }
     }
     fn endpoint_failed(&self, error: &str) -> bool {
         terminal_endpoint_error(error, self.0.identity.record.holder.is_current())
@@ -3205,6 +3349,8 @@ impl Server {
             retained_runs: journal.retained_runs()?,
             outbox_ack: journal.acknowledged()?,
             outbox_latest: journal.latest()?,
+            waiting_attention: journal.waiting_attention,
+            legacy_waiting_settled: false,
             changed,
         })
     }

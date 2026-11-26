@@ -1410,6 +1410,19 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         };
         match closed {
             Ok(()) if !upgrading => {
+                {
+                    let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // An already-acknowledged helper outbox can be empty at
+                    // close even though its published request is still unread.
+                    if state
+                        .chats
+                        .get(&session.id)
+                        .is_some_and(|record| record.handle.same_attachment(&chat))
+                        && let Some(notifications) = &state.notifications
+                    {
+                        notifications.clear_session_waiting(session.id);
+                    }
+                }
                 // Ordinary shutdown proved this exact provider stopped. End its
                 // delegated authority and runs before a new daemon can resume
                 // the UI descriptor with another proof; absence alone cannot do

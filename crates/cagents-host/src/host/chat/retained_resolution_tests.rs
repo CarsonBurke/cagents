@@ -468,6 +468,65 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn ordinary_shutdown_settles_a_wait_with_an_already_acknowledged_helper_outbox() {
+    #[cfg(target_os = "linux")]
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::new(root);
+    let handle = fixture.handle();
+    // A published waiting notice can outlast its helper's acknowledged
+    // outbox. Seed that durable half of the boundary while leaving the real
+    // retained owner responsive to an ordinary close.
+    let notifications = fixture.broker.as_ref().unwrap().handle();
+    let receipt = notifications
+        .record_committed(crate::notifications::Event::session(
+            fixture.original.id,
+            Provider::Claude,
+            fixture.root.join("project"),
+            crate::notifications::Evidence {
+                key: "previously published waiting request".into(),
+                kind: crate::notifications::Kind::Waiting,
+            },
+        ))
+        .unwrap();
+    receipt
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let unread_wait = || {
+        notifications.snapshot().notices.into_iter().find(|notice| {
+            notice.event.source_session() == Some(fixture.original.id)
+                && notice.event.evidence.kind == crate::notifications::Kind::Waiting
+                && !notice.acknowledged
+        })
+    };
+    wait(
+        || unread_wait().is_some(),
+        "the waiting notice did not publish",
+    );
+    let notice = unread_wait().unwrap();
+    assert!(handle.uncommitted_outcomes().unwrap().is_empty());
+    fixture.host.lock().unwrap().graceful_shutdown();
+    super::super::finish_chat_shutdown(&fixture.host).unwrap();
+    drop(fixture.broker.take());
+
+    let path = crate::instance::project_dirs()
+        .unwrap()
+        .data_dir()
+        .join("agent-attention.sqlite3");
+    let (_, mut reopened) = super::super::notifications::JournalTestBridge::new(&path).unwrap();
+    assert!(
+        reopened
+            .list()
+            .unwrap()
+            .into_iter()
+            .any(|stored| stored.id == notice.id && stored.acknowledged)
+    );
+}
+
+#[test]
 fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
     #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {

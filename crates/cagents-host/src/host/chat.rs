@@ -609,6 +609,24 @@ fn changed_for_instance(
     {
         courier.wake();
     }
+    // A live provider that starts working again or becomes idle has settled
+    // its request. Unknown may mean a lost attachment, so require a
+    // completed actor without retained work before clearing on exit.
+    if let Some(record) = state.chats.get(&id)
+        && let Some(notifications) = &state.notifications
+        && record.handle.actor_identity().is_none()
+        && (matches!(
+            &update,
+            Update::Activity {
+                state: crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle,
+                ..
+            }
+        ) || (matches!(&update, Update::Observed { .. })
+            && record.handle.is_completed()
+            && !record.handle.owns_work()))
+    {
+        notifications.clear_session_waiting(id);
+    }
     if let Update::Attention(evidence) | Update::AttentionContext { evidence, .. } = &update {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications

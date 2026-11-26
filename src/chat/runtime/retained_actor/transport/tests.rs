@@ -1901,6 +1901,238 @@ fn resident_naming_and_notification_projections_do_not_need_a_helper_socket() {
     assert!(!actor.0.socket.exists());
 }
 #[test]
+fn a_delayed_waiting_sample_cannot_undo_an_exact_resolution() {
+    use super::super::journal::WaitingAttention;
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let fixture = resident_fixture();
+    let actor = RemoteActor::fixture();
+    *actor.0.state.lock().unwrap() = Arc::new(fixture.server.resident().unwrap());
+
+    let append = |update| {
+        // Stop at the journal publication, before the notification callback
+        // advances the helper's general revision.
+        fixture
+            .server
+            .journal
+            .lock()
+            .unwrap()
+            .append(&update, None)
+            .unwrap();
+        fixture.server.resident().unwrap()
+    };
+    let open = |key: &str| {
+        append(Update::Attention(crate::notifications::Evidence {
+            key: key.into(),
+            kind: crate::notifications::Kind::Waiting,
+        }))
+    };
+    let working = Update::Activity {
+        state: ActivityState::Working,
+        generation: 0,
+    };
+    let initial = fixture.server.resident().unwrap();
+    assert_eq!(initial.waiting_attention, Some(WaitingAttention::Unknown));
+    assert!(actor.publish_resident(append(working.clone())));
+    assert!(actor.publish_resident(initial));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    let earlier = open("first request");
+    let sequence = earlier.outbox_latest;
+    assert!(actor.publish_resident(earlier.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Current)
+    );
+
+    let settled = append(working);
+    assert_eq!(settled.changed, earlier.changed);
+    assert_eq!(settled.generation, earlier.generation);
+    assert_eq!(settled.outbox_latest, sequence);
+    assert!(actor.publish_resident(settled));
+    assert!(actor.publish_resident(earlier));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    let later = open("next request");
+    let next_sequence = later.outbox_latest;
+    assert!(next_sequence > sequence);
+    assert!(actor.publish_resident(later));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Superseded)
+    );
+    assert_eq!(
+        actor.waiting_resolution(Some(next_sequence)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
+fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let actor = RemoteActor::fixture();
+    let mut older = actor.state().as_ref().clone();
+    older.waiting_attention = None;
+    older.completed = false;
+    older.activity = ActivityState::Waiting;
+    older.waiting = true;
+    older.outbox_latest = 3;
+    assert!(actor.publish_resident(older.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+
+    let mut working = older.clone();
+    working.activity = ActivityState::Working;
+    working.waiting = false;
+    working.changed += 1;
+    assert!(actor.publish_resident(working.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+    assert!(actor.publish_resident_inner(working.clone(), false, Some(&working)));
+    assert!(actor.state().legacy_waiting_settled);
+    assert_eq!(actor.state().waiting_attention, None);
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    // The old transport may have copied Working just before another wait
+    // advanced the journal. That mixed sample cannot clear the new request.
+    working.changed += 1;
+    working.outbox_latest = 4;
+    assert!(actor.publish_resident(working));
+    assert_eq!(
+        actor.waiting_resolution(Some(4)),
+        Some(RetainedWaiting::Current)
+    );
+    older.changed += 3;
+    older.outbox_latest = 4;
+    assert!(actor.publish_resident(older));
+    assert_eq!(
+        actor.waiting_resolution(Some(4)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
+fn older_legacy_replies_cannot_confirm_a_wait_opened_after_they_were_requested() {
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let actor = RemoteActor::fixture();
+    let mut initial = actor.state().as_ref().clone();
+    initial.waiting_attention = None;
+    initial.completed = false;
+    initial.activity = ActivityState::Working;
+    initial.waiting = false;
+    initial.outbox_latest = 2;
+    assert!(actor.publish_resident(initial.clone()));
+
+    let mut newest = initial.clone();
+    newest.activity = ActivityState::Waiting;
+    newest.waiting = true;
+    newest.outbox_latest = 3;
+    assert!(actor.publish_resident(newest.clone()));
+
+    let mut delayed = initial.clone();
+    delayed.outbox_latest = 3;
+    // Two readers copied Working before the outbox received the new wait.
+    for _ in 0..2 {
+        assert!(actor.publish_resident_inner(delayed.clone(), false, Some(&initial)));
+        assert_eq!(
+            actor.waiting_resolution(Some(3)),
+            Some(RetainedWaiting::Current)
+        );
+    }
+    // Re-reading after the first publication sees the current Waiting.
+    assert!(actor.publish_resident_inner(newest, false, Some(&delayed)));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
+fn an_idle_legacy_attachment_fetches_a_full_state_at_the_same_revision() {
+    let mut fixture = resident_fixture();
+    fixture.server.actor.0.state.lock().unwrap().ready = true;
+    fixture.server.journal.lock().unwrap().waiting_attention = None;
+    let revision = fixture.server.revision();
+    let proof = fixture.server.proof.clone();
+    let epoch = fixture.server.epoch;
+    let state = |after| Invocation {
+        proof: proof.clone(),
+        epoch: Some(epoch),
+        method: "state".into(),
+        args: json!([after]),
+    };
+    let ordinary = state(revision);
+    assert!(fixture.server.invoke(ordinary).unwrap().is_null());
+    let actor = RemoteActor::fixture();
+    let mut initial = fixture.server.resident().unwrap();
+    assert!(initial.legacy_activity_is_settled());
+    initial.generation = initial.generation.max(actor.state().generation);
+    initial.changed = initial.changed.max(actor.state().changed);
+    assert!(actor.publish_resident(initial));
+    let before = actor.state();
+    let after = before.waiting_state_cursor();
+    assert_ne!(after, revision);
+    let forced = state(after);
+    let next: Option<Resident> =
+        serde_json::from_value(fixture.server.invoke(forced).unwrap()).unwrap();
+    let mut next = next.expect("unchanged revision still carries the authenticated state");
+    next.generation = actor.state().generation;
+    next.changed = actor.state().changed;
+    assert!(actor.publish_resident_inner(next, false, Some(&before)));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(crate::chat::runtime::RetainedWaiting::Resolved)
+    );
+}
+
+#[test]
+fn a_wait_appended_after_active_metadata_was_sampled_is_still_open() {
+    use super::super::journal::WaitingAttention;
+
+    let fixture = resident_fixture();
+    let open = Update::Attention(crate::notifications::Evidence {
+        key: "wait-after-copy".into(),
+        kind: crate::notifications::Kind::Waiting,
+    });
+    let first = fixture
+        .server
+        .resident_after_copy(|| {
+            let mut journal = fixture.server.journal.lock().unwrap();
+            journal.append(&open, None).unwrap();
+        })
+        .unwrap();
+    assert!(!first.activity.waits_on_user());
+    assert_eq!(
+        first.waiting_attention,
+        Some(WaitingAttention::Open(first.outbox_latest))
+    );
+    let sequence = first.outbox_latest;
+    let proxy = RemoteActor::fixture();
+    *proxy.0.state.lock().unwrap() = Arc::new(first);
+    assert_eq!(
+        proxy.waiting_resolution(Some(sequence)),
+        Some(crate::chat::runtime::RetainedWaiting::Current)
+    );
+}
+#[test]
 fn concurrent_ready_publication_cannot_be_hidden_by_a_new_revision_on_old_metadata() {
     let mut fixture = resident_fixture();
     fixture.server.actor.0.state.lock().unwrap().ready = false;
@@ -2401,6 +2633,59 @@ fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
     assert!(
         received.try_iter().next().is_none(),
         "unchanged metadata must not churn the broker"
+    );
+}
+
+#[test]
+fn confirmed_completion_wakes_settlement_even_with_an_unchanged_wait_and_outbox() {
+    use crate::chat::runtime::RetainedWaiting;
+    let mut actor = RemoteActor::open_waiting_fixture();
+    let (sent, received) = crossbeam_channel::unbounded();
+    Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+        sent.send(update).unwrap();
+    });
+    let mut resident = actor.state().as_ref().clone();
+    resident.outbox_ack = resident.outbox_latest;
+    assert!(actor.publish_resident(resident.clone()));
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    resident.completed = true;
+    resident.owns_work = true;
+    assert!(actor.publish_resident(resident.clone()));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Current)
+    );
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    resident.owns_work = false;
+    assert!(actor.publish_resident(resident.clone()));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Resolved)
+    );
+    assert!(
+        received
+            .try_iter()
+            .any(|update| matches!(update, Update::RetainedOutcomes))
+    );
+    assert!(actor.publish_resident(resident));
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    actor.wake_outcomes();
+    assert!(
+        received
+            .try_iter()
+            .any(|update| matches!(update, Update::RetainedOutcomes))
     );
 }
 
