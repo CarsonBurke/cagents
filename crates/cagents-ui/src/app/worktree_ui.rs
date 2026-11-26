@@ -1836,7 +1836,10 @@ mod tests {
             app.workspace.order().collect::<Vec<_>>(),
             vec![loose.id, companion.id]
         );
-        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/tmp")));
+        assert_eq!(
+            app.terminal_directory(),
+            Some(PathBuf::from("/tmp").canonicalize().unwrap())
+        );
         let _ = app.select_worktree("/home/user".into(), false);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![home.id]);
         let _ = app.select_worktree("/repo".into(), false);
@@ -2798,8 +2801,9 @@ mod tests {
     #[test]
     fn known_roots_resolve_once_and_again_when_a_row_lists_one() {
         let directory = tempfile::tempdir().unwrap();
-        let real = directory.path().join("real");
-        let alias = directory.path().join("alias");
+        let root = directory.path().canonicalize().unwrap();
+        let real = root.as_path().join("real");
+        let alias = root.as_path().join("alias");
         std::fs::create_dir_all(real.join("existing")).unwrap();
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let mut known = KnownWorktreeRoots::from_iter([

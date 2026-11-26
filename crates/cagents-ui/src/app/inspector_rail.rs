@@ -79,9 +79,10 @@ impl Cagents {
             marks.push(
                 widget::column::with_children(vec![
                     crate::ui_controls::passive_icon(Icon::PullRequest, design::COMPACT_ICON_SIZE),
-                    design::caption(work.to_string())
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .into(),
+                    crate::ui_controls::count_badge(
+                        work.to_string(),
+                        crate::ui_controls::CountTone::Neutral,
+                    ),
                 ])
                 .spacing(space::XXS)
                 .align_x(Alignment::Center)

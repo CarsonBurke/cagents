@@ -18,6 +18,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use cagents_mobile_api::*;
 use serde_json::{Value, json};
 
+const READ_CHECKPOINT: &str = "1d79da8a-cd02-454c-a74e-411012875f33";
 const RECORD: &str = "CAGENTS_RECORD_MOBILE_API";
 
 fn recordings_path() -> PathBuf {
@@ -80,6 +81,7 @@ fn state() -> ConversationState {
         activity: Activity::Waiting,
         busy: true,
         ready: true,
+        can_attach_image: true,
         exited: false,
         error: Some("Usage limit reached".into()),
         read_only: Some("Saved history".into()),
@@ -177,6 +179,28 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             request(8, Call::UnwatchConversation { session: session() }),
         ),
         (
+            "terminal.watch",
+            request(24, Call::WatchTerminal { session: session() }),
+        ),
+        (
+            "terminal.unwatch",
+            request(25, Call::UnwatchTerminal { session: session() }),
+        ),
+        (
+            "conversation.read_checkpoint",
+            request(26, Call::RefreshReadCheckpoint { session: session() }),
+        ),
+        (
+            "conversation.read",
+            request(
+                27,
+                Call::ReadConversation {
+                    session: session(),
+                    checkpoint: READ_CHECKPOINT.into(),
+                },
+            ),
+        ),
+        (
             "conversation.load_earlier",
             request(9, Call::LoadEarlier { session: session() }),
         ),
@@ -190,6 +214,93 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                     mode: SendMode::Steer,
                 },
             ),
+        ),
+        (
+            "conversation.output",
+            request(
+                20,
+                Call::ReadOutput {
+                    session: session(),
+                    item: "c".into(),
+                    cursor: None,
+                },
+            ),
+        ),
+        (
+            "conversation.diff",
+            request(
+                21,
+                Call::ReadDiff {
+                    session: session(),
+                    item: "edit".into(),
+                    path: "src/lib.rs".into(),
+                    cursor: Some("next".into()),
+                },
+            ),
+        ),
+        (
+            "conversation.image",
+            request(
+                22,
+                Call::ReadImage {
+                    session: session(),
+                    item: "image".into(),
+                    cursor: None,
+                },
+            ),
+        ),
+        (
+            "conversation.send_image",
+            request(
+                23,
+                Call::SendImage {
+                    session: session(),
+                    text: "Look here".into(),
+                    name: "image.png".into(),
+                    png_base64: "aW1hZ2U=".into(),
+                    mode: SendMode::Send,
+                },
+            ),
+        ),
+        (
+            "ok output page",
+            server(ServerLine::Ok {
+                id: 20,
+                page: Some(DetailPage {
+                    body: DetailBody::Output {
+                        text: "Done\n".into(),
+                    },
+                    next: Some("next".into()),
+                }),
+            }),
+        ),
+        (
+            "ok diff page",
+            server(ServerLine::Ok {
+                id: 21,
+                page: Some(DetailPage {
+                    body: DetailBody::Diff {
+                        patches: vec![DiffPart {
+                            item: "edit".into(),
+                            text: "-old\n+new\n".into(),
+                            offset: 0,
+                        }],
+                    },
+                    next: None,
+                }),
+            }),
+        ),
+        (
+            "ok image page",
+            server(ServerLine::Ok {
+                id: 22,
+                page: Some(DetailPage {
+                    body: DetailBody::Image {
+                        base64: "aW1hZ2U=".into(),
+                    },
+                    next: None,
+                }),
+            }),
         ),
         (
             "conversation.interrupt",
@@ -216,9 +327,19 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                 api: 1,
                 server_version: "0.1.3".into(),
                 host: Some("desktop".into()),
+                conversation_details: false,
             })),
         ),
-        ("ok", server(ServerLine::Ok { id: 7 })),
+        (
+            "welcome conversation details",
+            server(ServerLine::Welcome(Welcome {
+                api: 1,
+                server_version: "0.1.3".into(),
+                host: Some("desktop".into()),
+                conversation_details: true,
+            })),
+        ),
+        ("ok", server(ServerLine::Ok { id: 7, page: None })),
         (
             "error",
             server(ServerLine::Error {
@@ -262,6 +383,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                         run: Some(RunState::Running),
                     }),
                     watchable: true,
+                    terminal_watchable: false,
                 }],
             })),
         ),
@@ -270,6 +392,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: true,
+                read_checkpoint: Some(READ_CHECKPOINT.into()),
                 state: state(),
                 order: Some(vec!["i1".into(), "i2".into()]),
                 items: vec![
@@ -310,6 +433,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: false,
+                read_checkpoint: None,
                 state: state(),
                 order: None,
                 items: vec![
@@ -346,6 +470,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                             input: "{}".into(),
                             output: "done".into(),
                             clipped: false,
+                            output_clipped: false,
                             status: ToolStatus::Waiting,
                         },
                     ),
@@ -354,6 +479,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                         Role::User,
                         ItemBody::Image {
                             description: "A screenshot".into(),
+                            available: true,
                         },
                     ),
                     item(
@@ -377,6 +503,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: false,
+                read_checkpoint: None,
                 state: state(),
                 order: None,
                 items: vec![item(
@@ -407,6 +534,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                 notices: vec![Notice {
                     id: "0b0e7a52-6f6b-4f7c-8a35-5c9f3f0e2d11".into(),
                     kind: NoticeKind::Waiting,
+                    asks: true,
                     title: "Agent needs your attention".into(),
                     session: Some(session()),
                     conversation: Some("Fix the build".into()),
@@ -414,6 +542,76 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                     request: Some(RequestKind::Approval),
                     provider: Some("claude".into()),
                 }],
+            })),
+        ),
+        (
+            "event notifications asks",
+            event(Event::Notifications(Notifications {
+                notices: vec![
+                    Notice {
+                        id: "review".into(),
+                        kind: NoticeKind::ReviewRequested,
+                        asks: true,
+                        title: "Your review was requested".into(),
+                        session: None,
+                        conversation: None,
+                        preview: None,
+                        request: None,
+                        provider: None,
+                    },
+                    Notice {
+                        id: "outcome".into(),
+                        kind: NoticeKind::Succeeded,
+                        asks: false,
+                        title: "Agent finished".into(),
+                        session: Some(session()),
+                        conversation: None,
+                        preview: None,
+                        request: None,
+                        provider: None,
+                    },
+                ],
+            })),
+        ),
+        (
+            "event terminal session",
+            event(Event::Sessions(Sessions {
+                sessions: vec![Session {
+                    id: session(),
+                    lineage: session(),
+                    surface: Surface::Terminal,
+                    provider: Some("claude".into()),
+                    provider_label: Some("Claude Code".into()),
+                    title: None,
+                    project: None,
+                    directory: None,
+                    activity: Activity::Working,
+                    exited: false,
+                    failure: None,
+                    active_at: None,
+                    agent: None,
+                    watchable: false,
+                    terminal_watchable: true,
+                }],
+            })),
+        ),
+        (
+            "event terminal_screen",
+            event(Event::TerminalScreen(TerminalScreen {
+                session: session(),
+                activity: Activity::Working,
+                last_output_at: Some(1_700_000_000_000),
+                columns: 80,
+                rows: 2,
+                lines: vec!["Running tests".into(), "  3 passed".into()],
+                clipped: false,
+            })),
+        ),
+        (
+            "event terminal_ended",
+            event(Event::TerminalEnded(TerminalEnded {
+                session: session(),
+                message: "The terminal is no longer running this agent.".into(),
             })),
         ),
         (

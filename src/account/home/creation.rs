@@ -9,7 +9,7 @@ use std::os::{
 /// reconstructed from an existing directory or an "empty" observation. This
 /// is creation provenance only; it does not grant provider/history read access.
 /// Deliberately has no Clone, Deserialize or public constructor.
-pub(crate) struct NewHomeCreationReceipt {
+pub struct NewHomeCreationReceipt {
     #[cfg_attr(
         not(any(test, feature = "host")),
         expect(
@@ -32,7 +32,7 @@ pub(crate) struct NewHomeCreationReceipt {
     directory: fs::File,
 }
 impl NewHomeCreationReceipt {
-    pub(crate) fn revalidate(&self) -> io::Result<()> {
+    pub fn revalidate(&self) -> io::Result<()> {
         crate::secure_file::reject_symlink_components(&self.path)?;
         same_directory(&self.parent, &self.parent_path)?;
         same_directory(&self.directory, &self.path)
@@ -68,7 +68,10 @@ impl NewHomeCreationReceipt {
         }
         // SAFETY: fstatat succeeded, so it wrote the whole structure.
         let named = unsafe { named.assume_init() };
-        if (named.st_dev, named.st_ino) != (held.dev(), held.ino()) {
+        // `dev_t` is signed on Darwin; std widens it the same way.
+        #[allow(clippy::unnecessary_cast)]
+        let named = (named.st_dev as u64, named.st_ino);
+        if named != (held.dev(), held.ino()) {
             return Err(io::Error::other(
                 "The newly created account directory changed; files were retained",
             ));
@@ -90,20 +93,20 @@ impl NewHomeCreationReceipt {
 /// What host enrollment and initializers read from a fresh home.
 #[cfg(any(test, feature = "host"))]
 impl NewHomeCreationReceipt {
-    pub(crate) fn provider(&self) -> Provider {
+    pub fn provider(&self) -> Provider {
         self.provider
     }
-    pub(crate) fn key(&self) -> Uuid {
+    pub fn key(&self) -> Uuid {
         self.key
     }
-    pub(crate) fn home(&self) -> &Path {
+    pub fn home(&self) -> &Path {
         &self.path
     }
     #[cfg(test)]
     pub(crate) fn parent(&self) -> &fs::File {
         &self.parent
     }
-    pub(crate) fn directory(&self) -> &fs::File {
+    pub fn directory(&self) -> &fs::File {
         &self.directory
     }
 }
@@ -222,7 +225,9 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(Some(result.clone()), captured);
+        // The creation receipt records the canonical spelling of the
+        // retained directory, including Darwin's sealed temporary alias.
+        assert_eq!(Some((result.0, result.1.canonicalize().unwrap())), captured);
         assert_eq!(store.load().unwrap().pending().len(), 1);
         assert_eq!(
             fs::read_to_string(result.1.join("settings.json")).unwrap(),

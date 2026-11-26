@@ -16,7 +16,7 @@ pub struct ProjectLocation {
 
 /// Preserve an already-open folder identity before interpreting new Git
 /// metadata. Otherwise checkouts and linked worktrees resolve to one Git key.
-pub(crate) fn resolve(
+pub fn resolve(
     path: &Path,
     model: Option<&crate::workspace_model::WorkspaceModel>,
 ) -> Result<ProjectLocation, String> {
@@ -122,22 +122,19 @@ fn has_git_metadata(directory: &Path) -> Result<bool, String> {
 /// belongs to. Read from the filesystem as Git discovers a repository, without
 /// running Git, so listing many sessions stays cheap.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Placement {
+pub struct Placement {
     pub worktree: Option<PathBuf>,
     pub project: Option<PathBuf>,
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+pub fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
     place_among(path, &model.projects)
 }
 
 /// [`place`] among `projects`, for a client that read the open projects
 /// rather than the whole workspace model.
-pub(crate) fn place_among(
-    path: &Path,
-    projects: &[crate::workspace_model::ModelProject],
-) -> Placement {
+pub fn place_among(path: &Path, projects: &[crate::workspace_model::ModelProject]) -> Placement {
     let Ok(directory) = fs::canonicalize(path) else {
         return Placement::default();
     };
@@ -198,7 +195,7 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
 /// its index and `HEAD`, and the common directory it shares objects and refs
 /// with every other worktree of the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GitDirectories {
+pub struct GitDirectories {
     pub private: PathBuf,
     pub common: PathBuf,
 }
@@ -208,7 +205,7 @@ pub(crate) struct GitDirectories {
 /// directory, and that directory names the shared one it borrows objects and
 /// refs from. `None` when the checkout has no marker, or one that names
 /// nothing readable; such a marker is skipped, not trusted.
-pub(crate) fn git_directories(checkout: &Path) -> Option<GitDirectories> {
+pub fn git_directories(checkout: &Path) -> Option<GitDirectories> {
     let marker = checkout.join(".git");
     if !crate::git_marker::present(&marker).ok()? {
         return None;
@@ -216,15 +213,35 @@ pub(crate) fn git_directories(checkout: &Path) -> Option<GitDirectories> {
     let private = if fs::metadata(&marker).ok()?.is_dir() {
         fs::canonicalize(&marker).ok()?
     } else {
-        let content = fs::read_to_string(&marker).ok()?;
+        let content = git_marker_text(&marker).ok()?;
         fs::canonicalize(checkout.join(line(content.strip_prefix("gitdir: ")?))).ok()?
     };
-    let common = match fs::read_to_string(private.join("commondir")) {
+    let common = match git_marker_text(&private.join("commondir")) {
         Ok(common) => fs::canonicalize(private.join(line(&common))).ok()?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => private.clone(),
         Err(_) => return None,
     };
     Some(GitDirectories { private, common })
+}
+
+fn git_marker_text(path: &Path) -> io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // A Git path fits well within this limit. Do not wait for an unusual
+    // filesystem entry while reading project metadata at launch.
+    const MAX_GIT_MARKER: u64 = 64 * 1024;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("Git marker is not a regular file"));
+    }
+    let bytes = crate::fs_safety::read_bounded(&mut file, MAX_GIT_MARKER)?;
+    if bytes.len() as u64 > MAX_GIT_MARKER {
+        return Err(io::Error::other("Git marker exceeds 64 KiB"));
+    }
+    String::from_utf8(bytes).map_err(io::Error::other)
 }
 
 /// One line of a Git metadata file, which Git accepts with CRLF too.

@@ -48,6 +48,14 @@ no child or other rows, so a capture can show an ordinary Codex turn.
 With CODEX_HOME/fixture-unnamed-child present, the collaboration calls and the
 thread listing report the child without a nickname, as Codex can before it has
 named one; only the child's own thread read reports it as Quinn.
+With CODEX_HOME/fixture-multi-agent-v2 present, each prompt instead plays a
+turn of Codex's second multi-agent version, as Codex 0.172 sends one: it
+starts two subagents, Arendt and Hume, each announced only by a
+subAgentActivity item, with no thread/started and no collaboration call naming
+them, waits for both to report, then answers. The thread listing names each
+child, with its agent path, once its turn has started.
+With CODEX_HOME/fixture-running-child-past-window present, thread/list exposes
+33 active children, with the oldest on the second page. Their turns stay open.
 """
 import copy
 import fcntl
@@ -60,7 +68,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import uuid
 
 sys.dont_write_bytecode = True
@@ -129,10 +136,6 @@ def items(child):
          {**settled_collab, "id": "interrupt", "tool": "interruptAgent", "status": "interrupted"}),
         ({"id": "sleep", "type": "sleep", "durationMs": 30_000},
          {"id": "sleep", "type": "sleep", "durationMs": 30_000}),
-        ({"id": "activity", "type": "subAgentActivity", "kind": "started",
-          "agentThreadId": child, "agentPath": "/root/review"},
-         {"id": "activity", "type": "subAgentActivity", "kind": "completed",
-          "agentThreadId": child, "agentPath": "/root/review"}),
         (None,
          {"id": "hook", "type": "hookPrompt", "fragments": [
              {"hookRunId": "run-1", "text": "Follow the repository style guide."},
@@ -151,6 +154,12 @@ def items(child):
              {"path": "src/load.rs", "kind": {"type": "update", "move_path": "src/settings/load.rs"},
               "diff": "@@ -1,3 +1,3 @@\n use super::Settings;\n-use crate::load::parse;\n+use crate::settings::parse;\n \n"}]}),
     ]
+
+
+# The subagents a turn of the second multi-agent version starts: each one's
+# nickname, agent path and report.
+V2_CHILDREN = (("Arendt", "/root/review_tool_rows", "Reviewed the tool rows: each row names its tool and target."),
+               ("Hume", "/root/check_docs_links", "Checked the docs links: every link resolves."))
 
 
 def web_items():
@@ -213,6 +222,11 @@ def write_rollout(codex_home, thread, cwd):
 class Scenario:
     def __init__(self):
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
+        # The second subagent of a multi-agent v2 turn.
+        self.second = str(uuid.uuid4())
+        self.second_latest = None
+        # Whether the home asks for the second multi-agent version's turn.
+        self.v2 = False
         # With fixture-nested-child, a subagent the child spawned in an
         # earlier session: listed, never live, and read only through its parent.
         self.grandchild = str(uuid.uuid4())
@@ -246,6 +260,7 @@ class Scenario:
         with self._changed:
             return copy.deepcopy({"thread": self.thread, "child": self.child,
                                   "grandchild": self.grandchild,
+                                  "second": self.second, "second_latest": self.second_latest,
                                   "latest": self.latest, "child_latest": self.child_latest,
                                   "model": self.model, "reasoning": self.reasoning,
                                   "interrupting": sorted(self.interrupting)})
@@ -258,25 +273,35 @@ class Scenario:
     def _restore(self, state):
         self.thread, self.child = state["thread"], state["child"]
         self.grandchild = state.get("grandchild", self.grandchild)
+        self.second = state.get("second", self.second)
+        self.second_latest = copy.deepcopy(state.get("second_latest"))
         self.latest = copy.deepcopy(state["latest"])
         self.child_latest = copy.deepcopy(state.get("child_latest"))
         self.model = state.get("model", "fixture-mini")
         self.reasoning = state.get("reasoning")
         self.interrupting = set(map(tuple, state.get("interrupting", ())))
         self._generations.clear()
-        for thread in (self.thread, self.child):
+        for thread in self._threads():
             self._advance(thread)
+
+    def _threads(self):
+        """The threads whose turns this scenario plays."""
+        return (self.thread, self.child, self.second)
 
     def _latest(self, thread):
         if thread == self.thread:
             return self.latest
         if thread == self.child:
             return self.child_latest
+        if thread == self.second:
+            return self.second_latest
         return None
 
     def _store(self, thread, turn):
         if thread == self.thread:
             self.latest = copy.deepcopy(turn)
+        elif thread == self.second:
+            self.second_latest = copy.deepcopy(turn)
         else:
             self.child_latest = copy.deepcopy(turn)
 
@@ -288,8 +313,6 @@ class Scenario:
             active = status == "inProgress"
             if self.child in item.get("agentsStates", {}):
                 item["agentsStates"][self.child]["status"] = "running" if active else status
-            if item.get("type") == "subAgentActivity" and item.get("agentThreadId") == self.child:
-                item["kind"] = "started" if active else "completed"
         return item
 
     def metadata(self, thread):
@@ -297,6 +320,8 @@ class Scenario:
             return self._metadata(thread)
 
     def _metadata(self, thread):
+        if thread == self.second or self.v2 and thread == self.child:
+            return self._v2_metadata(thread)
         if thread == self.grandchild:
             return {"id": thread, "name": "Nested review", "parentThreadId": self.child,
                     "agentNickname": "Ada",
@@ -312,6 +337,22 @@ class Scenario:
                            else "idle" if not child or thread in self.loaded
                            else "notLoaded"}, "canAcceptDirectInput": not child}
 
+    def _v2_metadata(self, thread):
+        """A subagent of the second multi-agent version, as Codex lists one:
+        named by its nickname, its agent path in its source."""
+        nickname, path, _ = V2_CHILDREN[thread == self.second]
+        latest = self._latest(thread)
+        active = latest and latest["status"] == "inProgress"
+        return {"id": thread, "name": None, "preview": "", "parentThreadId": self.thread,
+                "agentNickname": nickname, "agentRole": None,
+                "source": {"subAgent": {"thread_spawn": {
+                    "parent_thread_id": self.thread, "depth": 1, "agent_path": path,
+                    "agent_nickname": nickname, "agent_role": None}}},
+                "model": self.model, "reasoningEffort": self.reasoning or "low",
+                "status": {"type": "active" if active
+                           else "idle" if thread in self.loaded else "notLoaded"},
+                "canAcceptDirectInput": False}
+
     def observe(self, notification, generations=None):
         """Accept a current frame, updating the history served on reconnection."""
         with self._changed:
@@ -323,7 +364,7 @@ class Scenario:
             return True  # Correlated responses are never cancelled.
         params = notification.get("params", {})
         thread = params.get("threadId")
-        if thread not in (self.thread, self.child):
+        if thread not in self._threads():
             return False
         if generations is not None and generations.get(thread) != self._generations.get(thread):
             return False
@@ -339,6 +380,10 @@ class Scenario:
             return False
         if method in ("turn/started", "turn/completed"):
             turn = copy.deepcopy(params["turn"])
+            if "itemsView" in turn:
+                # A live frame may carry no items; the history this turn
+                # becomes is read with its items in full.
+                turn["itemsView"] = "full"
             if (method == "turn/started" and latest["status"] != "inProgress"
                     or method == "turn/completed" and latest["status"] != "inProgress"
                     and latest != turn):
@@ -464,12 +509,82 @@ class Scenario:
                 *child_started,
                 *started, *([] if quiet else [diff]),
                 {"_sleep": pause if plan is None else plan}, *completed, *settling,
-                # A subAgentActivity item only renders a row. The child needs
+                # The collaboration calls only render rows. The child needs
                 # its own lifecycle receipt, as an actual app-server sends.
                 *child_completed,
                 notify("item/completed", turnId=turn, item=answer),
                 notify("turn/completed", turn={**finished,
                                                "items": [*settled, answer]})]
+
+    def v2_notifications(self, turn, *, pause=PAUSE, user=None):
+        """A turn of the second multi-agent version, in the order Codex 0.172
+        sent fixtures/codex/multi-agent-v2-live.jsonl: each subagent's start
+        is only a subAgentActivity item, then its own turn, a wait, an
+        activity item for each completion and the answer. Codex completes the
+        parent's turn with a summary; this one carries the turn's full record,
+        which is what the fixture's history serves."""
+        def notify(method, thread=None, **params):
+            return {"method": method, "params": {"threadId": thread or self.thread, **params}}
+        now = int(time.time() * 1000)
+
+        def started(id):
+            return {"id": id, "rootTurnId": turn, "items": [], "itemsView": "notLoaded",
+                    "status": "inProgress", "error": None, "startedAt": now // 1000,
+                    "completedAt": None, "durationMs": None}
+
+        def completed(id, items):
+            return {**started(id), "items": items, "itemsView": "full", "status": "completed",
+                    "completedAt": now // 1000, "durationMs": 0}
+        echoed = [] if user is None else [{"id": f"{turn}-user", "type": "userMessage", "content": user}]
+        frames = [notify("turn/started", turn=started(turn)),
+                  *(notify("item/completed", turnId=turn, item=item) for item in echoed)]
+        spawns, reports, completions = [], [], []
+        for index, child in enumerate((self.child, self.second)):
+            _, path, report = V2_CHILDREN[index]
+            child_turn = f"{turn}-child-{index}"
+            spawn = {"id": f"{turn}-spawn-{index}", "type": "subAgentActivity", "kind": "started",
+                     "agentThreadId": child, "agentPath": path, "model": self.model,
+                     "reasoningEffort": self.reasoning or "low", "startedAtMs": now, "completedAtMs": None}
+            spawned = {**spawn, "completedAtMs": now}
+            spawns.append(spawned)
+            frames += [notify("item/started", turnId=turn, item=spawn),
+                       notify("thread/status/changed", child, status={"type": "idle"}),
+                       notify("item/completed", turnId=turn, item=spawned),
+                       notify("thread/status/changed", child, status={"type": "active", "activeFlags": []}),
+                       notify("turn/started", child, turn=started(child_turn))]
+            message = {"id": f"{child_turn}-report", "type": "agentMessage", "text": report,
+                       "phase": "final_answer"}
+            ending = {"id": f"subagent-completed-{child_turn}", "type": "subAgentActivity",
+                      "kind": "completed", "agentThreadId": child, "agentPath": path,
+                      "model": None, "reasoningEffort": None, "startedAtMs": now, "completedAtMs": None}
+            ended = {**ending, "completedAtMs": now}
+            completions.append(ended)
+            reports += [notify("item/started", child, turnId=child_turn, item={**message, "text": ""}),
+                        notify("item/completed", child, turnId=child_turn, item=message),
+                        notify("item/started", turnId=turn, item=ending),
+                        notify("thread/status/changed", child, status={"type": "idle"}),
+                        notify("turn/completed", child, turn=completed(child_turn, [message])),
+                        notify("item/completed", turnId=turn, item=ended)]
+        wait = {"id": f"{turn}-wait", "type": "collabAgentToolCall", "tool": "wait", "status": "inProgress",
+                "senderThreadId": self.thread, "receiverThreadIds": [], "prompt": None, "model": None,
+                "reasoningEffort": None, "agentsStates": {}}
+        waited = {**wait, "status": "completed"}
+        answer = {"id": f"{turn}-answer", "type": "agentMessage", "phase": "final_answer",
+                  "text": "Both reviews are back: the tool rows and the docs links check out."}
+        return [*frames, notify("item/started", turnId=turn, item=wait), {"_sleep": pause}, *reports,
+                notify("item/completed", turnId=turn, item=waited),
+                notify("item/completed", turnId=turn, item=answer),
+                notify("thread/status/changed", status={"type": "idle"}),
+                notify("turn/completed", turn=completed(
+                    turn, [*echoed, *spawns, waited, *completions, answer]))]
+
+    def _large_child_listing(self, params):
+        """List 33 active children in two pages, as a saturated connection sees them."""
+        return {
+            "data": [self.large_children[-1]] if params.get("cursor") == "older"
+                    else self.large_children[:-1],
+            "nextCursor": None if params.get("cursor") == "older" else "older",
+        }
 
     def request(self, frame, codex_home):
         with self._changed:
@@ -484,17 +599,39 @@ class Scenario:
         script = scripted_turn(codex_home)
         if script:
             self.name = script["name"]
+        self.v2 = (Path(codex_home) / "fixture-multi-agent-v2").is_file()
+        large_listing = (Path(codex_home) / "fixture-running-child-past-window").is_file()
+        if large_listing and not hasattr(self, "large_children"):
+            self.large_children = [
+                {"id": f"00000000-0000-4000-8000-{index:012d}",
+                 "parentThreadId": self.thread,
+                 "agentNickname": f"Review {index:02d}" if index < 33 else "Earlier review",
+                 "status": {"type": "active", "activeFlags": []}}
+                for index in range(1, 34)
+            ]
+        large_child = next(
+            (child for child in self.large_children if child["id"] == params.get("threadId")),
+            None,
+        ) if large_listing else None
         if method == "initialize":
             result = {"userAgent": "cagents-offline-tool-rows", "codexHome": codex_home}
+        elif large_child is not None and method in ("thread/resume", "thread/read"):
+            result = {
+                "thread": large_child,
+                "initialTurnsPage": {"data": [], "nextCursor": None},
+                "model": self.model,
+            }
+        elif method == "thread/list" and large_listing and params.get("ancestorThreadId"):
+            result = self._large_child_listing(params)
         elif method in ("thread/start", "thread/resume"):
             thread = params.get("threadId", self.thread)
-            if method == "thread/resume" and thread not in (self.thread, self.child) \
+            if method == "thread/resume" and thread not in self._threads() \
                     and rollout(codex_home, thread) is not None:
                 # An account switch copied this thread's rollout into this
                 # account's home before resuming it here.
                 self.thread, self.latest = thread, None
             nested = thread == self.grandchild and (Path(codex_home) / "fixture-nested-child").is_file()
-            if thread not in (self.thread, self.child) and not nested:
+            if thread not in self._threads() and not nested:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
             parent = self._metadata(thread)["parentThreadId"]
             if parent == self.child and parent not in self.loaded:
@@ -526,6 +663,10 @@ class Scenario:
             # isDefault ignores.
             config = self.config(codex_home)
             result = {"config": {key: config.get(key) for key in ("model", "model_reasoning_effort")}}
+        elif method == "thread/list" and self.v2:
+            # Newest first, each once its turn has started.
+            result = {"data": [self._metadata(thread) for thread in (self.second, self.child)
+                               if self._latest(thread) is not None], "nextCursor": None}
         elif method == "thread/list":
             result = {"data": [] if script or any((Path(codex_home) / marker).is_file()
                                                  for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
@@ -537,7 +678,7 @@ class Scenario:
                 for thread in result["data"]:
                     thread["agentNickname"] = None
         elif method == "thread/turns/list":
-            latest = self.latest if params.get("threadId") == self.thread else self.child_latest
+            latest = self._latest(params.get("threadId"))
             result = {"data": [latest] if latest else [], "nextCursor": None}
         elif method == "thread/prediction/request":
             # Prediction is optional; a successful request can produce no next
@@ -570,6 +711,8 @@ class Scenario:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
             # The turn runs its thread and spawns (or continues) the child.
             self.loaded.update((self.thread, self.child))
+            if self.v2:
+                self.loaded.add(self.second)
             pause = PAUSE
             pause_file = Path(codex_home) / "fixture-turn-pause"
             if pause_file.is_file():
@@ -607,6 +750,13 @@ class Scenario:
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             self.latest = copy.deepcopy(result["turn"])
             self._advance(self.thread)
+            if self.v2:
+                for index, child in enumerate((self.child, self.second)):
+                    self._store(child, {"id": f"{turn}-child-{index}", "status": "inProgress", "items": []})
+                    self._advance(child)
+                return [{"id": identifier, "result": result},
+                        *self.v2_notifications(turn, pause=pause,
+                                               user=params.get("input", []) if echoes(codex_home) else None)]
             web_rows = (Path(codex_home) / "fixture-web-rows").is_file()
             diagnostics = (Path(codex_home) / "fixture-row-diagnostics").is_file()
             starts_child = not (web_rows or diagnostics or script) and (not self.child_latest or self.child_latest["status"] != "inProgress")
@@ -648,7 +798,7 @@ class Scenario:
                              "content": params.get("input", [])}}}]
         elif method == "turn/interrupt":
             thread = params.get("threadId")
-            if thread not in (self.thread, self.child):
+            if thread not in self._threads():
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
             latest = self._latest(thread)
             if (latest is None or params.get("turnId") != latest["id"]
@@ -674,7 +824,11 @@ class Scenario:
     def config(self, codex_home):
         """The home's config.toml, as Codex reads it."""
         config = Path(codex_home) / "config.toml"
-        return tomllib.loads(config.read_text()) if config.is_file() else {}
+        if not config.is_file():
+            return {}
+        import tomllib
+
+        return tomllib.loads(config.read_text())
 
     def models(self, codex_home):
         """Optional recorded model/list result, private to this fixture's home."""

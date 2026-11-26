@@ -2,13 +2,15 @@
 
 - [Building a release](#building-a-release)
 - [Artifacts](#artifacts)
+- [macOS](#macos)
 - [Native platform roadmap](#native-platform-roadmap)
 - [Publishing](#publishing)
 - [Signing](#signing)
 - [Comparing package variants](#comparing-package-variants)
 
-Release builds and publication run **locally**, never in GitHub Actions.
-Pushing a tag does not start a hosted build.
+GitHub Actions builds and signs eligible releases. The release operator
+publishes the draft after rehearsing the update on fw16. Releases that need
+the recovery key are built and signed on the local release path.
 
 ## Building a release
 
@@ -83,6 +85,8 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
+- with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
+  `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
 - `release-metadata-2.json`: the version, source commit, daemon protocol,
   release notes, and every other asset's size and SHA-256 (schema 2)
 - `release-metadata-2.json.sig`: its signature (see [Signing](#signing))
@@ -92,10 +96,125 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 A bundle holds its metadata as `release-metadata.json` and its signature as
 `release-metadata.json.sig`; the publisher gives them their published names.
 
-Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
-supported build and package lane today. Windows and macOS need their own native
-ports, validation, packaging, and signing before their targets can be enabled;
-the release tooling does not publish placeholder binaries for them.
+Artifact selection is explicitly platform-aware. The metadata's `targets` lists
+Linux x86_64 GNU, and `aarch64-apple-darwin` when the release carries the
+macOS build; a release without it is exactly what one was before macOS builds
+existed, and builds that predate them ignore the macOS entry and its assets.
+Windows needs its own native port, validation, packaging, and signing before
+its target can be enabled; the release tooling does not publish placeholder
+binaries.
+
+## macOS
+
+`scripts/package-macos` builds the Apple Silicon release on a Mac:
+`cagents-${VERSION}-aarch64-apple-darwin.tar.gz`, `install-macos.sh` and
+`SHA256SUMS-macos`. It needs Xcode's command line tools and rustup; the
+toolchain comes from `rust-toolchain.toml`. It builds the four executables with
+the release profile for macOS 11 or newer: the CLI, the daemon, the UI with
+the production identity `dev.cagents.Cagents` and without the integrated
+browser, and the dictation helper, linked against the pinned sherpa-onnx static
+libraries. The UI and the helper carry an embedded `Info.plist` section, so the
+microphone permission prompt names cagents and its purpose.
+
+The archive holds one version tree laid out as on Linux, so the install guard
+reads it the same way, as companion lookup and the updater will once they
+support macOS:
+
+```
+cagents-VERSION/bin/{cagents,cagents-ui,cagentsd,cagents-dictate}
+cagents-VERSION/Cagents.app
+cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
+```
+
+`install-macos.sh` installs it under `~/Library/Application Support/cagents-install`
+(`--prefix` overrides it):
+
+- `versions/VERSION/` is the tree, and `current` links to the version that
+  serves. The installer switches it atomically, keeps the version it replaced
+  for rollback (named in `.previous`), and removes older trees that no running
+  process uses, or none when `lsof` cannot tell.
+- `Cagents.app` is a stable launcher bundle. Its executable, a small C program
+  (`packaging/macos/launcher.c`), runs the real path of `current/bin/cagents-ui`.
+  Launch Services and the Dock keep one application across updates, because
+  the bundle they know never moves. `~/Applications/Cagents.app` links
+  to it; Spotlight and Launchpad may not list a link, so open it from
+  `~/Applications` or keep it in the Dock.
+- `~/.local/bin/cagents` links to `current/bin/cagents`.
+- `~/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist` runs
+  `cagents daemon start` once at login. It resolves `current/bin` to the
+  selected version before starting the CLI, so the same login item works
+  after an update. The daemon outlives the job and `cagents daemon stop`
+  stops it.
+
+The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
+the release's members, refuses links in the tree, and checks every signature in
+a private staging directory. Quit all cagents windows and stop the daemon
+before replacing or removing an installation. The installer holds the
+application launch fence while it checks for a running daemon and changes the
+installation. A per-user publication lock also excludes a second installer
+even when it uses another runtime directory. The installer starts the selected
+daemon after releasing both locks, unless `--no-start` is set.
+
+The release tree and bundle are staged on the prefix's volume. The login item
+is staged beside the one it replaces, so it can be published by rename even when
+the prefix is on another volume. The installer checks that each program runs
+from its version tree before it switches `current`, the bundle, the links and
+the login item. Renaming the record of the previous version commits the
+installation. Before that commit, error handling and soft signals roll back
+the publication.
+
+`--uninstall` uses the installed CLI to acquire the fence, then removes the
+installation, its links and its login item. `--purge` also removes saved app
+data. Use an older release's own installer if its CLI predates this command.
+Only installations under the account's own home register `Cagents.app` with
+Launch Services. The installer unloads its previous login job during
+publication. The new job runs at the next login. The package smoke test
+installs under a private `HOME` and starts its isolated daemon directly.
+
+Every executable and the bundle are signed ad hoc (`codesign --sign -`), which
+Apple Silicon requires to run anything. Files that `curl`, `tar` or
+`install-macos.sh` download carry no quarantine attribute, so Gatekeeper does
+not assess them. A browser download is quarantined, and the installer clears
+the attribute on the tree it installs. Gatekeeper blocks an ad hoc signed app
+opened from a quarantined download, as from a disk image, which is why the
+release installs from a terminal.
+
+Notarization, which would let people open a downloaded app without a warning,
+needs an Apple Developer ID Application certificate and an App Store Connect
+API key for `notarytool`. Signing would use `codesign --options runtime
+--timestamp --sign "Developer ID Application: ..."` on each executable and
+then the bundle, with the `com.apple.security.device.audio-input` entitlement
+on the dictation helper, whose microphone the hardened runtime otherwise
+denies. The notary service takes a zip, disk image or package, not a tarball:
+the signed tree would be zipped with `ditto -c -k --keepParent`, submitted
+with `xcrun notarytool submit --wait`, and the ticket stapled to `Cagents.app`
+with `xcrun stapler staple` before the release archive is made. A bare
+executable cannot hold a stapled ticket, so Gatekeeper would look the CLI's up
+online. None of this is set up, and the credentials would stay outside source and build
+artifacts like the release signing key.
+
+To cut a release with the macOS build, give `cut` or `build` the Mac with
+`--macos-host MAC` (or `CAGENTS_RELEASE_MACOS_HOST`). The release exports the
+commit to a private staging directory on the Mac and runs that commit's
+`scripts/package-macos`. The packager builds, signs and installs the package in
+a private home and prefix to check the commands, bundle and login item. Cut
+brings the three files into the bundle before writing and signing the metadata.
+The Mac removes the staged source and keeps the shared Cargo target in
+`~/Library/Caches/cagents-release/target` for later builds. The publisher
+then requires all three files, checks `SHA256SUMS-macos` and the archive's
+members, and adds a macOS section to the release notes. GitHub Actions builds
+no macOS release yet.
+
+To build and smoke-test macOS while fw16 prepares Linux, run
+`scripts/release prepare-macos --commit SHA --macos-host macbook`. Use the
+same SHA and host for `scripts/release cut --commit SHA --macos-host macbook`.
+The prepared assets are under `$CAGENTS_RELEASE_BUNDLES/.prepared-macos`
+and remain available for later cuts. Cut checks the source commit and asset
+digests before using them. If preparation is missing or damaged, cut builds
+and smoke-tests macOS on the selected host. Cut still requires the passing
+fw16 verdict and Linux bundle for that same commit. When cut waits for main's
+tip and the exact tip already has a passing test verdict, it prepares macOS
+while waiting for the Linux bundle.
 
 ## Native platform roadmap
 
@@ -111,7 +230,7 @@ need to be established for each target.
 | Linux x86_64 GNU | Supported local build/package lane | Keep matched full, browserless and editor artifacts and native smoke coverage |
 | Windows x64 | No supported native application or package | Qualify runtime and companion discovery before choosing installer layout |
 | Windows ARM64 | Unqualified; inclusion undecided | Choose support policy and qualify dependencies/toolchains before enabling artifacts |
-| macOS Apple Silicon | No supported native application or bundle | Qualify runtime before implementing `.app` layout and installation |
+| macOS Apple Silicon | Packaging, installer and release lane ([macOS](#macos)); the daemon and UI ports are in progress | Qualify the native runtime, then publish the first release with the macOS build |
 | macOS Intel | Unqualified; inclusion undecided | Explicitly choose support policy; an Apple Silicon build does not validate Intel |
 
 Each new target progresses through the following gates. Passing an isolated
@@ -153,8 +272,8 @@ contract remain Linux-specific until a qualified target has its own contract.
 
 ## Publishing
 
-A release signs and publishes a bundle the build host has already built and
-smoke-tested: fw16 prebuilds main's newest compiled commit in the background
+For the local signing path, fw16 prebuilds and smoke-tests main's newest
+compiled commit in the background
 ([Prebuilding release bundles](development.md#prebuilding-release-bundles)).
 Main always declares the next version: publishing a release opens and lands the
 pull request that starts the next patch version. A release goes out in three
@@ -358,9 +477,13 @@ recovery key, and signs locally whatever Actions may not:
 1. `mise run release -- cut --actions` picks the commit as above and tags it
    `vVERSION` locally. It copies and signs nothing.
 2. `mise run release -- publish VERSION --actions` checks the tag as the
-   workflow's admission will, and pushes it only if Actions would sign it.
-   That starts the workflow, and the command prints the run's page and what
-   to run next. It exits non-zero until the release is published.
+   workflow's admission will. If eligible, it requires the tagged commit's
+   passing test verdict on fw16 and records it as the `cagents/fw16-tests`
+   commit status before pushing the tag. The publishing account needs write
+   access to commit statuses. The push starts the workflow, and the command
+   prints its page and what to run next. It exits non-zero until the release
+   is published. If a pushed tag is missing its passing status, run this
+   command again to record it, then rerun the failed Release workflow.
 3. Once the workflow has left the draft, `mise run release -- rehearse
    VERSION --from-draft` rehearses the in-app update to it, as
    [Publishing](#publishing) describes. It refuses while the tag's workflow
@@ -387,17 +510,16 @@ The workflow's jobs:
 
 - **admit** proceeds only for a tag on a commit on main whose manifests declare
   the tag's version, which is newer than every published release and not
-  published itself. It signs in Actions only when all of these hold:
+  published itself. It admits the tag for signing only when all of these hold:
   - the tag does not begin a trust generation;
   - every published release of its generation trusts the Actions key, as
     `publish-release` requires;
   - the tagged `release-keys.pub` lists exactly the repository variable
-    `RELEASE_TRUSTED_KEYS`.
+    `RELEASE_TRUSTED_KEYS`;
+  - the exact tagged commit has a passing `cagents/fw16-tests` status.
 
-  Otherwise it stops and says why, and the release is cut, signed and
-  published locally as above, under the same tag. That is the case for 0.2.4,
-  for any change of trusted keys or generation, and when no Actions key is
-  configured.
+  The release is cut, signed and published locally for 0.2.4, for any change
+  of trusted keys or generation, and when no Actions key is configured.
 - **build** has no secrets. It builds, packages and smoke-tests the tagged
   source with `scripts/build-release-linux`, as fw16 does.
 - **sign** is the only job that can read the key: the environment secret

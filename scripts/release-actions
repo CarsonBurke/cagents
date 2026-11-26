@@ -12,6 +12,12 @@
 #                 the keys its source trusts are exactly
 #                 RELEASE_TRUSTED_KEYS. Writes version=
 #                 and sign=true|false to $GITHUB_OUTPUT when set.
+#   record-tests COMMIT
+#                 Read the passing fw16 sentinel verdict for COMMIT on
+#                 stdin and publish its commit status on GitHub.
+#   require-tests COMMIT
+#                 Require that passing commit status on GitHub. Exits 3
+#                 when GitHub reports no passing status and 1 on errors.
 #   keygen        Make the Actions signing key in memory, store it as the
 #                 release environment's secret RELEASE_SIGNING_KEY, and its
 #                 public half and the keys releases may then trust as the
@@ -30,7 +36,9 @@ PROGRAM=release-actions
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 REPOSITORY=${CAGENTS_RELEASE_GITHUB_REPOSITORY:-CarsonBurke/cagents}
 VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-MANIFESTS=(Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml crates/cagents-dictate/Cargo.toml)
+FW16_TESTS_CONTEXT=cagents/fw16-tests
+MANIFESTS=(Cargo.toml crates/cagents-host/Cargo.toml crates/cagents-ui/Cargo.toml crates/ceditor/Cargo.toml
+    crates/cagents-dictate/Cargo.toml)
 export LC_ALL=C
 SCRATCH=
 DELETE_KEYGEN_TOKEN=false
@@ -164,6 +172,31 @@ admit() {
     output sign=true
 }
 
+record_tests() {
+    local commit=$1
+    [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail 'record-tests needs a full commit SHA'
+    jq -es --arg commit "$commit" '
+      length == 1 and (.[0] | .sha == $commit and .passed == true and (.outside_code | not))
+    ' >/dev/null || fail "$commit has no passing fw16 sentinel verdict"
+    gh api --silent --method POST "repos/$REPOSITORY/statuses/$commit" \
+        -f "context=$FW16_TESTS_CONTEXT" -f state=success -f 'description=Every sentinel test lane passed on fw16' \
+        || fail "cannot record the fw16 test status for $commit on GitHub"
+}
+
+require_tests() {
+    local commit=$1 status
+    [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail 'require-tests needs a full commit SHA'
+    status=$(gh api "repos/$REPOSITORY/commits/$commit/status?per_page=100" \
+        | jq -er --arg commit "$commit" --arg context "$FW16_TESTS_CONTEXT" '
+            select(.sha == $commit and (.statuses | type) == "array")
+            | [.statuses[] | select(.context == $context)][0].state // "missing"
+        ') || fail "cannot read the fw16 test status for $commit from GitHub"
+    if [[ $status != success ]]; then
+        printf '%s: %s has no passing fw16 test status (%s)\n' "$PROGRAM" "$commit" "$status" >&2
+        return 3
+    fi
+}
+
 sign() {
     local dist=$1 version=$2 commit=$3 private public
     [[ $version =~ $VERSION_PATTERN && $commit =~ ^[0-9a-f]{40}$ ]] || fail 'sign needs DIR VERSION COMMIT'
@@ -217,7 +250,9 @@ keygen() {
 case ${1:-} in
     keygen) (($# == 1)) || fail 'usage: keygen'; keygen ;;
     admit) (($# == 2)) || fail 'usage: admit TAG'; admit "$2" ;;
+    record-tests) (($# == 2)) || fail 'usage: record-tests COMMIT'; record_tests "$2" ;;
+    require-tests) (($# == 2)) || fail 'usage: require-tests COMMIT'; require_tests "$2" ;;
     sign) (($# == 4)) || fail 'usage: sign DIR VERSION COMMIT'; sign "$2" "$3" "$4" ;;
     -h|--help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p;}' "$0" ;;
-    *) fail 'usage: release-actions admit TAG | sign DIR VERSION COMMIT | keygen' ;;
+    *) fail 'use release-actions --help for usage' ;;
 esac

@@ -11,7 +11,7 @@ use std::{
 };
 
 pub(crate) const DAEMON_LEASE_ENV: &str = "CAGENTS_DAEMON_LEASE_FD";
-const DAEMON_LEASE_FD: i32 = 199;
+pub(super) const DAEMON_LEASE_FD: i32 = 199;
 const INSTALLER_LEASE_FD: i32 = 3;
 
 // Validate once at CLI/daemon startup and immediately seal the reserved slot.
@@ -28,7 +28,7 @@ pub(crate) struct LeaseHandoff {
 pub(crate) struct HandoffSource {
     pub(crate) pid: u32,
     pub(crate) proof: HostSessionProof,
-    process: File,
+    process: PinnedProcess,
     // An adopted flock retains the original updater PID, which can differ
     // from the serving daemon pinned above. Compare like identities.
     pub(crate) locker_pid: Option<i32>,
@@ -41,7 +41,7 @@ impl HandoffSource {
     ) -> Result<Self, PlatformError> {
         let lock = open_lock(paths)?;
         let pid = lease_owner(&paths.lock, proof)?;
-        let process = open_validated_pidfd(&lock, pid, Path::new("/proc"))?;
+        let process = open_validated_pidfd(&lock, pid)?;
         let locker_pid = holder_pid(paths)?;
         Ok(Self {
             pid,
@@ -55,35 +55,28 @@ impl HandoffSource {
         self.exited_within(std::time::Duration::ZERO)
     }
 
+    pub(crate) fn executable(&self) -> io::Result<std::path::PathBuf> {
+        self.process.executable()
+    }
+
     /// Whether the pinned process exits within `timeout`. A daemon releases
     /// its lease before its process has finished exiting, so lease ownership
     /// alone does not prove the source has stopped.
     pub(crate) fn exited_within(&self, timeout: std::time::Duration) -> io::Result<bool> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let mut poll = libc::pollfd {
-                fd: self.process.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let milliseconds = c_int::try_from(remaining.as_millis()).unwrap_or(c_int::MAX);
-            // SAFETY: one live initialized pollfd; pidfd pins the original process.
-            if unsafe { libc::poll(&mut poll, 1, milliseconds) } < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            if poll.revents != 0 || remaining.is_zero() {
-                return Ok(poll.revents != 0);
-            }
-        }
+        self.process.wait_for_exit(timeout)
     }
 }
 
 impl LeaseHandoff {
+    #[cfg_attr(
+        target_os = "macos",
+        allow(dead_code, reason = "Darwin updater wiring is separate")
+    )]
+    pub(super) fn descriptor(&self) -> BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.lock.as_fd()
+    }
+
     pub(crate) fn duplicate_for_recovery(&self) -> io::Result<File> {
         self.lock.try_clone()
     }
@@ -207,6 +200,7 @@ fn validate_inode(lock: &File, paths: &RuntimePaths) -> Result<(), PlatformError
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<(), PlatformError> {
     validate_inode(lock, paths)?;
     // fdinfo describes this exact open-file description, including locks
@@ -229,6 +223,13 @@ pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<()
         return Err(io::Error::other("daemon inherited a lease held by another process").into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<(), PlatformError> {
+    validate_inode(lock, paths)?;
+    crate::flock::verify_inherited_exclusive(lock)?;
+    validate_inode(lock, paths)
 }
 
 fn read_inherited() -> io::Result<Option<File>> {
@@ -288,7 +289,7 @@ fn inherited() -> io::Result<Option<(File, bool)>> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn clone_inherited_lease() -> io::Result<Option<File>> {
+pub fn clone_inherited_lease() -> io::Result<Option<File>> {
     inherited().map(|lease| lease.map(|(lock, _)| lock))
 }
 
@@ -321,7 +322,7 @@ pub(crate) fn inherit_target_daemon_lease(command: &mut Command) -> io::Result<(
 /// # Safety
 /// The caller must be the single-threaded daemon entry point.
 #[cfg(feature = "host")]
-pub(crate) unsafe fn take_inherited_lease() -> io::Result<Option<File>> {
+pub unsafe fn take_inherited_lease() -> io::Result<Option<File>> {
     crate::upgrade::recovery::initialize_inherited()?;
     // The cache owns and seals recovery descriptors before any thread or
     // provider child exists. The daemon must not export their marker to its
@@ -383,6 +384,41 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_lease_requires_the_exact_exclusive_description() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            socket: root.path().join("cagentsd.sock"),
+            lock: root.path().join("cagentsd.lock"),
+            directory: root.path().to_owned(),
+        };
+        let original = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        let unrelated = open_lock(&paths).unwrap();
+        assert!(validate_inherited(&original, &paths).is_err());
+        // SAFETY: original is a live regular file, and this call never blocks.
+        assert_eq!(
+            unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let inherited = original.try_clone().unwrap();
+        assert!(validate_inherited(&inherited, &paths).is_ok());
+        assert!(validate_inherited(&unrelated, &paths).is_err());
+        assert!(LeaseHandoff::try_acquire(&paths).unwrap().is_none());
+        drop(original);
+        assert!(validate_inherited(&inherited, &paths).is_ok());
+        assert!(LeaseHandoff::try_acquire(&paths).unwrap().is_none());
+        drop(inherited);
+        assert!(LeaseHandoff::try_acquire(&paths).unwrap().is_some());
+    }
 
     #[test]
     fn lease_handoff_cancelled_waiter_is_joined_before_source_releases_lock() {

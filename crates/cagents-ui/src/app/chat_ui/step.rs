@@ -714,6 +714,12 @@ impl Runtime {
         let glyph = coordinated
             .and_then(Coordinated::glyph)
             .unwrap_or_else(|| kind_glyph(&item.content));
+        // A step still running without the transcript's one activity
+        // indicator is marked as under way all the same, by a still dot.
+        let status = status.or_else(|| {
+            (item.content.status() == Some(ToolStatus::Running))
+                .then_some(disclosure::Status::Working)
+        });
         let mut said = label;
         if let ItemContent::Command {
             exit_code: Some(code),
@@ -722,17 +728,12 @@ impl Runtime {
             && code != 0
         {
             said.push_str(&format!(" · exit {code}"));
-        } else if let Some(word) = item.content.status().and_then(unsettled_word)
-            && item.content.status() != Some(ToolStatus::Running)
+        } else if status.is_none()
+            && let Some(word) = item.content.status().and_then(unsettled_word)
         {
+            // Where the row marks how it stands, its words do not say it
+            // again; only a row left without a mark does.
             said.push_str(&format!(" · {word}"));
-        } else if coordinated.is_some()
-            && item.content.status() == Some(ToolStatus::Running)
-            && status != Some(ToolStatus::Running.into())
-        {
-            // A coordinating step says what it did in the past tense, so
-            // one still working without the spinner says so in words.
-            said.push_str(" · working");
         }
         let label = if verb.is_empty() {
             said.clone()

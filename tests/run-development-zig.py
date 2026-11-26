@@ -1227,7 +1227,7 @@ exit 1
         common = "build --message-format=json --locked --profile dev-runtime"
         self.assertEqual(browserless[:2], [
             f"{common} --no-default-features --features development --bin cagents",
-            f"{common} --no-default-features --features development,host --bin cagentsd",
+            f"{common} --no-default-features -p cagents-host --features development --bin cagentsd",
         ])
         self.assertEqual(integrated[:2], browserless[:2])
         helper = f"{common} -p cagents-dictate --features engine --bin cagents-dictate"

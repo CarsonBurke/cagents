@@ -1106,7 +1106,7 @@ build_products() {
         lane=$1
         shift
         "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features --features development --bin cagents
-        "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
+        "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features -p cagents-host --features development --bin cagentsd
         "$lane" --allow-warnings build --locked --profile dev-runtime $1 --bin cagents-ui
         "$lane" --allow-warnings build --locked --profile dev-runtime -p cagents-dictate --features engine --bin cagents-dictate
         if [ -n "$2" ]; then

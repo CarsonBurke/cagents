@@ -18,9 +18,15 @@
 //! Generation 1, up to 0.2.3, reads `release-metadata.json` and accepts one
 //! signature; 0.2.4 begins generation 2.
 use super::*;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, os::unix::net::UnixStream};
 
-const PUBLIC_FEED: &str = "https://github.com/CarsonBurke/cagents/releases";
+pub(super) struct VerifiedAssets {
+    pub installer: File,
+    pub archive: File,
+    pub checksums: File,
+}
+
+pub(super) const PUBLIC_FEED: &str = "https://github.com/CarsonBurke/cagents/releases";
 /// This build's trust generation. `scripts/publish-release` reads it from
 /// this line; a new generation adds its names to `GENERATIONS`.
 const GENERATION: usize = 2;
@@ -30,10 +36,21 @@ const GENERATIONS: [(&str, &str); GENERATION] = [
     ("release-metadata-2.json", "release-metadata-2.json.sig"),
 ];
 const SCHEMA: u32 = 2;
-const TARGET: &str = "x86_64-unknown-linux-gnu";
 const PRODUCT: &str = "cagents";
+/// The release target this build installs, and the installer and checksum
+/// file its metadata entry names. A release carries each platform's whole.
+#[cfg(not(target_os = "macos"))]
+const TARGET: &str = "x86_64-unknown-linux-gnu";
+#[cfg(not(target_os = "macos"))]
 const INSTALLER: &str = "install.sh";
+#[cfg(not(target_os = "macos"))]
 const CHECKSUMS: &str = "SHA256SUMS";
+#[cfg(target_os = "macos")]
+const TARGET: &str = "aarch64-apple-darwin";
+#[cfg(target_os = "macos")]
+const INSTALLER: &str = "install-macos.sh";
+#[cfg(target_os = "macos")]
+const CHECKSUMS: &str = "SHA256SUMS-macos";
 /// A private feed for rehearsing updates: an `https://` URL or `file://`
 /// directory with the public layout. Only development and rehearsal builds
 /// read it, so the environment cannot redirect a published build's updates.
@@ -110,7 +127,9 @@ impl Feed {
         newer: impl FnOnce(&str) -> Result<bool, UpdateError>,
         cancellation: &CancellationToken,
     ) -> Result<Option<Release>, UpdateError> {
-        let (metadata, _) = self.fetch_metadata("latest/download", cancellation)?;
+        let (metadata, _) = self
+            .fetch_metadata("latest/download", cancellation)?
+            .ok_or(UpdateError::NoPublishedRelease)?;
         #[derive(Deserialize)]
         struct Announced {
             version: String,
@@ -131,7 +150,13 @@ impl Feed {
         cancellation: &CancellationToken,
     ) -> Result<Release, UpdateError> {
         let directory = format!("download/v{version}");
-        let (metadata, signature) = self.fetch_metadata(&directory, cancellation)?;
+        let (metadata, signature) =
+            self.fetch_metadata(&directory, cancellation)?
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "cagents {version} is no longer published. Check for updates again."
+                    ))
+                })?;
         let signature = match self.fetch(
             &format!("{directory}/{signature}"),
             "reading the release's signature",
@@ -142,9 +167,9 @@ impl Feed {
             Ok(file) => read_all(file)?,
             // Its metadata was just read from the same place, so a missing
             // signature is a release published without one.
-            Err(error) if self.missing(&error) => {
+            Err(UpdateError::ReleaseAssetMissing(_)) => {
                 return Err(invalid(format!(
-                    "cagents {version} is not signed, so this build will not install it"
+                    "cagents {version} is not signed, so this build will not install it."
                 )));
             }
             Err(error) => return Err(error),
@@ -168,23 +193,30 @@ impl Feed {
         &self,
         directory: &str,
         cancellation: &CancellationToken,
-    ) -> Result<(Vec<u8>, &'static str), UpdateError> {
-        for (metadata, signature) in GENERATIONS.into_iter().rev() {
-            match self.fetch(
-                &format!("{directory}/{metadata}"),
+    ) -> Result<Option<(Vec<u8>, &'static str)>, UpdateError> {
+        Self::fetch_metadata_with(directory, |path| {
+            self.fetch(
+                path,
                 "checking for a new release",
                 METADATA_LIMIT,
                 Duration::from_secs(60),
                 cancellation,
-            ) {
-                Ok(file) => return Ok((read_all(file)?, signature)),
-                Err(error) if self.missing(&error) => {}
+            )
+        })
+    }
+
+    fn fetch_metadata_with(
+        directory: &str,
+        mut fetch: impl FnMut(&str) -> Result<File, UpdateError>,
+    ) -> Result<Option<(Vec<u8>, &'static str)>, UpdateError> {
+        for (metadata, signature) in GENERATIONS.into_iter().rev() {
+            match fetch(&format!("{directory}/{metadata}")) {
+                Ok(file) => return Ok(Some((read_all(file)?, signature))),
+                Err(UpdateError::ReleaseAssetMissing(_)) => {}
                 Err(error) => return Err(error),
             }
         }
-        Err(invalid(
-            "no published release of cagents offers in-app updates yet",
-        ))
+        Ok(None)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Release, UpdateError> {
@@ -242,6 +274,31 @@ impl Feed {
         })
     }
 
+    /// Download one exact release and check that its installer and the signed
+    /// metadata agree on the archive before returning any installation input.
+    pub(super) fn verified_assets(
+        &self,
+        release: &Release,
+        cancellation: &CancellationToken,
+    ) -> Result<VerifiedAssets, UpdateError> {
+        let mut checksums = self.download(release, &release.checksums, cancellation)?;
+        let mut manifest = String::new();
+        checksums.read_to_string(&mut manifest)?;
+        checksums.seek(SeekFrom::Start(0))?;
+        if checksum_for(&manifest, &release.archive.name)? != release.archive.sha256
+            || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
+        {
+            return Err(invalid(
+                "the release's checksum file disagrees with its signed metadata",
+            ));
+        }
+        Ok(VerifiedAssets {
+            installer: self.download(release, &release.installer, cancellation)?,
+            archive: self.download(release, &release.archive, cancellation)?,
+            checksums,
+        })
+    }
+
     /// One of `release`'s assets, sealed, after its size and SHA-256 match
     /// what the signed metadata says.
     pub(super) fn download(
@@ -279,6 +336,8 @@ impl Feed {
                 "--disable",
                 "--silent",
                 "--fail",
+                "--write-out",
+                "%{stderr}%{http_code}",
                 "--location",
                 "--max-redirs",
                 "10",
@@ -296,45 +355,100 @@ impl Feed {
             .arg("--")
             .arg(format!("{}/{path}", self.base))
             .env_remove("CURL_HOME");
-        bounded_command(&mut command, operation, limit, timeout, cancellation).map_err(|error| {
-            match error {
-                UpdateError::Exited { status, .. } if !self.missing_status(status) => {
-                    curl_failure(operation, status)
-                }
-                error => error,
-            }
-        })
+        self.fetch_command(&mut command, path, operation, limit, timeout, cancellation)
     }
 
-    /// Whether the feed answered that the file does not exist: an HTTP error
-    /// under `--fail`, or an unreadable file in a file feed.
-    fn missing(&self, error: &UpdateError) -> bool {
-        matches!(error, UpdateError::Exited { status, .. } if self.missing_status(*status))
-    }
-
-    fn missing_status(&self, status: std::process::ExitStatus) -> bool {
-        match status.code() {
-            Some(22) => true,
-            Some(37) => self.local,
-            _ => false,
+    fn fetch_command(
+        &self,
+        command: &mut Command,
+        path: &str,
+        operation: &'static str,
+        limit: u64,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<File, UpdateError> {
+        // Curl remains silent except for its three-digit write-out. Keep it
+        // off the streamed body, and bound the read after the child exits.
+        let (read_status, write_status) = UnixStream::pair()?;
+        read_status.set_nonblocking(true)?;
+        let outcome = bounded_command_with_stderr(
+            command,
+            operation,
+            limit,
+            timeout,
+            cancellation,
+            Stdio::from(OwnedFd::from(write_status)),
+        );
+        // Command retains its stderr descriptor for possible reuse.
+        command.stderr(Stdio::null());
+        let Err(UpdateError::Exited { status, .. }) = outcome else {
+            return outcome;
+        };
+        let http_status = (status.code() == Some(22))
+            .then(|| read_http_status(read_status))
+            .flatten();
+        if self.local && status.code() == Some(37) {
+            let absent = url::Url::parse(&format!("{}/{path}", self.base))
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .is_some_and(|file| {
+                    fs::metadata(file).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                });
+            return Err(if absent {
+                UpdateError::ReleaseAssetMissing(path.to_owned())
+            } else {
+                invalid(format!("The local release asset {path} could not be read."))
+            });
         }
+        if !self.local && http_status == Some(404) {
+            return Err(UpdateError::ReleaseAssetMissing(path.to_owned()));
+        }
+        let host = url::Url::parse(&self.base)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "the release server".into());
+        Err(curl_failure(operation, status, http_status, &host))
     }
 }
 
+fn read_http_status(status: UnixStream) -> Option<u16> {
+    let mut response = Vec::new();
+    match status.take(4).read_to_end(&mut response) {
+        Ok(_) => {}
+        // The curl process has exited. A concurrent fork could still hold
+        // a close-on-exec copy of its descriptor without writing to it.
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(_) => return None,
+    }
+    if response.len() != 3 || !response.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(&response).ok()?.parse().ok()
+}
+
 /// curl's failures, in words for the person checking for an update.
-fn curl_failure(operation: &'static str, status: std::process::ExitStatus) -> UpdateError {
-    match status.code() {
-        Some(5..=7) => invalid(format!(
-            "{operation} failed: cannot reach github.com; check the network connection"
+fn curl_failure(
+    operation: &'static str,
+    status: std::process::ExitStatus,
+    http_status: Option<u16>,
+    host: &str,
+) -> UpdateError {
+    match (status.code(), http_status) {
+        (Some(5..=7), _) => invalid(format!(
+            "{host} is unreachable. Check your network connection."
         )),
-        Some(28) => UpdateError::Timeout(operation),
-        Some(35 | 51 | 53 | 54 | 58 | 59 | 60 | 77 | 80 | 83 | 90 | 91) => invalid(format!(
-            "{operation} failed: no secure connection to github.com could be made"
+        (Some(22), Some(code)) => {
+            invalid(format!("{host} returned HTTP {code} while {operation}."))
+        }
+        (Some(28), _) => UpdateError::Timeout(operation),
+        (Some(35 | 51 | 53 | 54 | 58 | 59 | 60 | 77 | 80 | 83 | 90 | 91), _) => invalid(format!(
+            "A secure connection to {host} could not be established."
         )),
-        Some(56 | 52 | 18) => invalid(format!(
-            "{operation} failed: the connection to github.com broke off; try again"
-        )),
-        Some(63) => invalid(format!("{operation} exceeds its size limit")),
+        (Some(56 | 52 | 18), _) => {
+            invalid(format!("The connection to {host} broke off. Try again."))
+        }
+        (Some(63), _) => invalid(format!("{operation} exceeds its size limit")),
         _ => UpdateError::Exited { operation, status },
     }
 }
@@ -401,8 +515,31 @@ mod tests {
         }
     }
 
+    /// Metadata as a release carrying both platforms publishes it.
     fn metadata(version: &str) -> serde_json::Value {
         let digest = |size: u64| serde_json::json!({ "size": size, "sha256": "ab".repeat(32) });
+        let platforms = [
+            ("x86_64-unknown-linux-gnu", "install.sh", "SHA256SUMS"),
+            (
+                "aarch64-apple-darwin",
+                "install-macos.sh",
+                "SHA256SUMS-macos",
+            ),
+        ];
+        let mut assets = serde_json::Map::new();
+        let mut targets = Vec::new();
+        for (target, installer, checksums) in platforms {
+            let archive = format!("cagents-{version}-{target}.tar.gz");
+            assets.insert(archive.clone(), digest(100));
+            assets.insert(checksums.into(), digest(200));
+            assets.insert(installer.into(), digest(300));
+            targets.push(serde_json::json!({
+                "target": target,
+                "products": {
+                    "cagents": { "archive": archive, "installer": installer, "checksums": checksums }
+                }
+            }));
+        }
         serde_json::json!({
             "schema_version": 2,
             "repository": "CarsonBurke/cagents",
@@ -410,22 +547,19 @@ mod tests {
             "source_commit": "0".repeat(40),
             "protocol": 195,
             "notes": "- Updates install with one click",
-            "assets": {
-                format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"): digest(100),
-                "SHA256SUMS": digest(200),
-                "install.sh": digest(300),
-            },
-            "targets": [{
-                "target": "x86_64-unknown-linux-gnu",
-                "products": {
-                    "cagents": {
-                        "archive": format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"),
-                        "installer": "install.sh",
-                        "checksums": "SHA256SUMS",
-                    }
-                }
-            }]
+            "assets": assets,
+            "targets": targets,
         })
+    }
+
+    /// The metadata entry of the platform this build updates.
+    fn this_target(value: &mut serde_json::Value) -> &mut serde_json::Value {
+        value["targets"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|target| target["target"] == TARGET)
+            .unwrap()
     }
 
     fn parse(value: &serde_json::Value) -> Result<Release, UpdateError> {
@@ -440,8 +574,10 @@ mod tests {
         assert_eq!(release.notes, "- Updates install with one click");
         assert_eq!(
             release.archive.name,
-            "cagents-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+            format!("cagents-0.2.0-{TARGET}.tar.gz")
         );
+        assert_eq!(release.installer.name, INSTALLER);
+        assert_eq!(release.checksums.name, CHECKSUMS);
         assert_eq!(release.archive.size, 100);
         assert_eq!(release.installer.size, 300);
         assert_eq!(release.checksums.sha256, [0xab; 32]);
@@ -456,19 +592,16 @@ mod tests {
             }),
             ("prerelease", |value| value["version"] = "0.2.0-rc.1".into()),
             ("target", |value| {
-                value["targets"][0]["target"] = "aarch64-apple-darwin".into()
+                this_target(value)["target"] = "riscv64gc-unknown-linux-gnu".into()
             }),
             ("installer", |value| {
-                value["targets"][0]["products"]["cagents"]["installer"] = "other.sh".into()
+                this_target(value)["products"]["cagents"]["installer"] = "other.sh".into()
             }),
             ("missing digest", |value| {
-                value["assets"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("install.sh");
+                value["assets"].as_object_mut().unwrap().remove(INSTALLER);
             }),
             ("oversized", |value| {
-                value["assets"]["SHA256SUMS"]["size"] = (SMALL_ASSET_LIMIT + 1).into()
+                value["assets"][CHECKSUMS]["size"] = (SMALL_ASSET_LIMIT + 1).into()
             }),
         ];
         for (case, change) in cases {
@@ -478,8 +611,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_release_without_this_platforms_build_is_refused_by_name() {
+        let mut value = metadata("0.2.0");
+        value["targets"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|target| target["target"] != TARGET);
+        let error = parse(&value).unwrap_err().to_string();
+        assert!(error.contains(TARGET), "{error}");
+    }
+
     /// A `file://` feed holding one signed release, read through real curl.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
+    )]
     fn a_signed_release_is_discovered_and_downloaded_and_tampering_is_refused() {
         if !curl_available() {
             eprintln!("skipping: curl is not installed");
@@ -489,11 +637,11 @@ mod tests {
         let version = "0.2.0";
         let files: [(String, &[u8]); 3] = [
             (
-                format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"),
+                format!("cagents-{version}-{TARGET}.tar.gz"),
                 b"archive bytes",
             ),
-            ("SHA256SUMS".into(), b"checksum bytes"),
-            ("install.sh".into(), b"installer bytes"),
+            (CHECKSUMS.into(), b"checksum bytes"),
+            (INSTALLER.into(), b"installer bytes"),
         ];
         let mut value = metadata(version);
         let release_dir = root.path().join(format!("download/v{version}"));
@@ -530,9 +678,19 @@ mod tests {
         let mut downloaded = Vec::new();
         archive.read_to_end(&mut downloaded).unwrap();
         assert_eq!(downloaded, b"archive bytes");
+        // A sealed memfd refuses the write; on Darwin the descriptor is a
+        // read-only one.
+        let sealed = if cfg!(target_os = "macos") {
+            libc::EBADF
+        } else {
+            libc::EPERM
+        };
         assert_eq!(
-            archive.write_all(b"unverified bytes").unwrap_err().kind(),
-            io::ErrorKind::PermissionDenied
+            archive
+                .write_all(b"unverified bytes")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(sealed)
         );
 
         // Same size, different bytes: the signed digests refuse them.
@@ -543,7 +701,7 @@ mod tests {
                 .to_string(),
             "release SHA-256 verification failed; installation was not changed"
         );
-        fs::write(release_dir.join("install.sh"), b"installer bytez").unwrap();
+        fs::write(release_dir.join(INSTALLER), b"installer bytez").unwrap();
         assert!(
             feed.download(&latest, &latest.installer, &cancellation)
                 .is_err()
@@ -562,7 +720,7 @@ mod tests {
         fs::remove_file(release_dir.join(SIGNATURE)).unwrap();
         assert_eq!(
             feed.latest(newer, &cancellation).unwrap_err().to_string(),
-            "cagents 0.2.0 is not signed, so this build will not install it"
+            "cagents 0.2.0 is not signed, so this build will not install it."
         );
         fs::write(release_dir.join(SIGNATURE), &signature).unwrap();
         // Nothing newer is decided from the version alone: a release from
@@ -605,11 +763,11 @@ mod tests {
         let directory = root.join(format!("download/v{version}"));
         fs::create_dir_all(&directory).unwrap();
         let mut value = metadata(version);
-        let archive = format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz");
+        let archive = format!("cagents-{version}-{TARGET}.tar.gz");
         for (name, bytes) in [
             (archive.as_str(), &b"archive"[..]),
-            ("SHA256SUMS", b"sums"),
-            ("install.sh", b"installer"),
+            (CHECKSUMS, b"sums"),
+            (INSTALLER, b"installer"),
         ] {
             fs::write(directory.join(name), bytes).unwrap();
             value["assets"][name] = serde_json::json!({
@@ -641,6 +799,10 @@ mod tests {
     /// `release-metadata-2.json`, and 0.2.4's, signed by the key 0.2.3
     /// trusts, as `release-metadata.json`.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
+    )]
     fn builds_that_trust_only_the_old_key_are_led_to_the_release_that_trusts_the_new_one() {
         if !curl_available() {
             eprintln!("skipping: curl is not installed");
@@ -693,6 +855,10 @@ mod tests {
     /// A feed whose newest release predates `release-metadata-2.json` still
     /// reads, through the name that release carries.
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
+    )]
     fn a_release_from_before_generation_2_metadata_still_reads() {
         if !curl_available() {
             eprintln!("skipping: curl is not installed");
@@ -727,40 +893,129 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_file_reads_as_unpublished_and_other_curl_failures_say_why() {
-        use std::os::unix::process::ExitStatusExt;
-        let status = |code: i32| std::process::ExitStatus::from_raw(code << 8);
-        let exited = |code: i32| UpdateError::Exited {
-            operation: "reading the release's signature",
-            status: status(code),
-        };
-        let public = feed();
-        let local = Feed {
-            local: true,
+    fn only_http_404_falls_back_to_older_metadata() {
+        let feed = Feed {
+            base: "https://updates.example.test/releases".into(),
             ..feed()
         };
-        assert!(public.missing(&exited(22)));
-        assert!(local.missing(&exited(22)) && local.missing(&exited(37)));
-        // A network failure on the signature is not an unsigned release.
-        for code in [6, 7, 35, 37, 56] {
-            assert!(!public.missing(&exited(code)), "curl exit {code}");
+        let cancellation = CancellationToken::new();
+        for status in ["404", "403", "429", "500", "503", "", "404error"] {
+            let mut paths = Vec::new();
+            let result = Feed::fetch_metadata_with("latest/download", |path| {
+                let mut command = Command::new("sh");
+                if paths.is_empty() {
+                    command.args(["-c", "printf %s \"$1\" >&2; exit 22", "curl-stub", status]);
+                } else {
+                    command.args(["-c", "printf %s bridge; printf 200 >&2"]);
+                }
+                paths.push(path.to_owned());
+                feed.fetch_command(
+                    &mut command,
+                    path,
+                    "checking for a new release",
+                    6,
+                    Duration::from_secs(5),
+                    &cancellation,
+                )
+            });
+            assert_eq!(paths[0], format!("latest/download/{METADATA}"));
+            if status == "404" {
+                assert_eq!(paths[1], format!("latest/download/{}", GENERATIONS[0].0));
+                assert_eq!(
+                    result.unwrap(),
+                    Some((b"bridge".to_vec(), GENERATIONS[0].1))
+                );
+            } else {
+                assert_eq!(paths.len(), 1, "{status}");
+                let error = result.unwrap_err();
+                if status.len() == 3 {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("updates.example.test returned HTTP {status}")),
+                        "HTTP {status}: {error}"
+                    );
+                } else {
+                    assert!(matches!(error, UpdateError::Exited { .. }), "{error}");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn missing_latest_metadata_and_a_removed_tag_are_distinct() {
+        if !curl_available() {
+            eprintln!("skipping: curl is not installed");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("latest/download")).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let feed = file_feed(root.path(), &key);
+        let cancellation = CancellationToken::new();
+        assert!(matches!(
+            feed.latest(|_| panic!("no release version to compare"), &cancellation),
+            Err(UpdateError::NoPublishedRelease)
+        ));
         assert_eq!(
-            curl_failure("checking for a new release", status(6)).to_string(),
-            "checking for a new release failed: cannot reach github.com; check the network connection"
+            feed.release("0.2.5", &cancellation)
+                .unwrap_err()
+                .to_string(),
+            "cagents 0.2.5 is no longer published. Check for updates again."
+        );
+    }
+
+    #[test]
+    fn a_file_that_curl_cannot_open_does_not_trigger_metadata_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let local = file_feed(
+            root.path(),
+            &ed25519_dalek::SigningKey::from_bytes(&[23; 32]),
+        );
+        let latest = root.path().join("latest/download");
+        fs::create_dir_all(&latest).unwrap();
+        fs::write(latest.join(METADATA), b"exists").unwrap();
+        let result = Feed::fetch_metadata_with("latest/download", |path| {
+            assert!(
+                path.ends_with(METADATA),
+                "the older generation must not be fetched"
+            );
+            // curl reports exit 37 when it cannot read a file, regardless
+            // of whether it exists. Exercise the status without chmod or UID.
+            local.fetch_command(
+                Command::new("sh").args(["-c", "exit 37"]),
+                path,
+                "checking for a new release",
+                METADATA_LIMIT,
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not be read")
+        );
+    }
+
+    #[test]
+    fn curl_network_errors_use_the_feed_host() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let operation = "checking for a new release";
+        let host = "updates.example.test";
+        assert_eq!(
+            curl_failure(operation, status(6), None, host).to_string(),
+            "updates.example.test is unreachable. Check your network connection."
         );
         assert!(matches!(
-            curl_failure("checking for a new release", status(28)),
+            curl_failure(operation, status(28), None, host),
             UpdateError::Timeout("checking for a new release")
         ));
-        assert!(
-            curl_failure("downloading the release", status(60))
-                .to_string()
-                .contains("no secure connection")
-        );
         assert_eq!(
-            curl_failure("downloading the release", status(99)).to_string(),
-            "downloading the release failed (exit status: 99)"
+            curl_failure(operation, status(60), None, host).to_string(),
+            "A secure connection to updates.example.test could not be established."
         );
     }
 

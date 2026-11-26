@@ -616,7 +616,7 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
         modified_key: keyboard::Key::Character("с".into()),
         physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
         location: keyboard::Location::Standard,
-        modifiers: keyboard::Modifiers::CTRL,
+        modifiers: keyboard::Modifiers::COMMAND,
         text: None,
         repeat,
     };
@@ -19308,6 +19308,67 @@ fn unreachable_unnamed_agent(kept_runtime: bool) -> (Cagents, CardId, chat::Sess
     (app, card, session)
 }
 
+/// #3095: the provider named an agent's thread after the card's descriptor
+/// was written, so the card lacks the ID its open agent holds. Once its
+/// daemon is gone, the card takes that exact ID and reopens the conversation
+/// rather than saying cagents lost track of it. An agent whose descriptor
+/// differs in more than the ID names another conversation, and the card is
+/// refused as before.
+#[test]
+fn an_agents_card_missing_the_thread_its_agent_names_reopens_it() {
+    for same_launch in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let mut session = chat_runtime(&app, card).session.clone();
+        session.reset_owned_codex_listener();
+        let proof = session.proof.clone().expect("a started conversation");
+        assert!(session.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+        assert!(session.launch.session_id.is_none());
+        let mut named = session.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if !same_launch {
+            named.launch.recipe.arguments.push("--model".into());
+        }
+        app.workspace_model.agents = vec![crate::app::channel_ui::close_tests::agent(&named)];
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());
+        let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::fresh("fixture: daemon gone")),
+        );
+        if !same_launch {
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(session.clone())
+            );
+            assert!(app.unnamed_agent(card).is_some());
+            continue;
+        }
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named.clone()),
+            "the card names the agent's thread"
+        );
+        assert!(app.unnamed_agent(card).is_none());
+        assert!(!app.chat_ui.blocked_starts.contains_key(&card));
+        let Some(Phase::Starting(attempt)) = app.chat_ui.phases.get(&card) else {
+            panic!("the card reopens the named conversation");
+        };
+        assert_eq!(attempt.session, named);
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|retiring| retiring.card != card),
+            "nothing gives up the agent's conversation"
+        );
+    }
+}
+
 /// #3095: an agent's Codex conversation whose thread ID was never saved
 /// came back from an abandoned update as a draft, and giving up the old
 /// conversation retired the agent. The card keeps the conversation and says
@@ -24380,6 +24441,27 @@ fn assert_inert_live_recovery_copy(f: &LiveSharedRecovery) {
     assert!(f.app.durable.local_only_cards.contains(&copy));
 }
 
+fn assert_draft_kept_without_copy(f: &mut LiveSharedRecovery, canonical: &chat::Session) {
+    assert!(
+        f.app.durable.local_only_cards.is_empty(),
+        "no copy of the pane is kept"
+    );
+    assert!(!f.app.cards.iter().any(|(card, value)| *card != f.card
+        && matches!(value, CardRuntime::Chat(runtime) if runtime.session == f.source)));
+    assert_eq!(
+        f.app.card_state(f.card).unwrap().kind,
+        CardKind::Chat(canonical.clone())
+    );
+    assert_eq!(
+        f.app
+            .persistent_workspace()
+            .chat_drafts
+            .get(&f.card)
+            .map(String::as_str),
+        Some(f.draft.as_str())
+    );
+}
+
 #[test]
 fn retained_live_model_upgrade_first_identity_and_bound_reset_require_the_same_exact_checkpoint() {
     for first_identity in [true, false] {
@@ -24416,6 +24498,7 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
         "writer refusal",
         "newer canonical before Ready",
         "newer canonical before writer ACK",
+        "pane closed elsewhere before writer ACK",
     ] {
         let mut f = live_shared_recovery_fixture();
         let target = project_live_shared_recovery(&mut f);
@@ -24442,6 +24525,7 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
             unreachable!()
         };
         next.proof.as_mut().unwrap().host_incarnation = "still-newer-daemon".into();
+        let next = next.clone();
         if case == "newer canonical before Ready" {
             drop(f.app.update(Message::WorkspaceModelObserved(
                 super::super::workspace_model_sync::ModelUpdate::Read(newer.clone()),
@@ -24459,7 +24543,9 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
             assert!(!chat_runtime(&f.app, f.card).connected());
         } else if case == "newer canonical before Ready" {
             assert_no_live_upgrade_checkpoint(checkpoint);
-            assert_inert_live_recovery_copy(&f);
+            // Only the proof changed: the same conversation keeps its pane
+            // and draft, and no copy is left beside it.
+            assert_draft_kept_without_copy(&mut f, &next);
         } else {
             let receipt = account_commit_reply(checkpoint);
             if case == "writer refusal" {
@@ -24474,12 +24560,40 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
                     &receipt,
                     Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
                 ));
+                if case == "pane closed elsewhere before writer ACK" {
+                    // The snapshot still lists the pane, but another client
+                    // has closed it, so the draft can't go back to it.
+                    f.app.shared_views.closed.insert(f.card);
+                }
+                // The newer descriptor supersedes the in-flight upgrade as
+                // soon as it is read, before the receipt is handled.
                 drop(f.app.update(Message::WorkspaceModelObserved(
                     super::super::workspace_model_sync::ModelUpdate::Read(newer),
                 )));
             }
             drop(f.app.update(receipt));
-            assert_inert_live_recovery_copy(&f);
+            if case == "pane closed elsewhere before writer ACK" {
+                assert_inert_live_recovery_copy(&f);
+            } else {
+                // The pane still holds the same conversation, so its draft
+                // stays on it and no copy is left beside it.
+                let canonical = if case == "writer refusal" {
+                    f.canonical.clone()
+                } else {
+                    next.clone()
+                };
+                assert_draft_kept_without_copy(&mut f, &canonical);
+            }
+            assert!(
+                !matches!(f.app.cards.get(&f.card), Some(CardRuntime::Chat(runtime)) if runtime.connected()),
+                "{case}: the pane never connects"
+            );
+            if case != "pane closed elsewhere before writer ACK" {
+                assert!(
+                    matches!(f.app.cards.get(&f.card), Some(CardRuntime::Failed(_))),
+                    "{case}: the pane stays detached and offers Retry"
+                );
+            }
         }
         assert!(!f.app.chat_start_pending(f.card));
         assert!(
@@ -26341,4 +26455,33 @@ fn a_skipped_edge_suggests_the_name_of_a_runtime_attached_since_reconciliation()
     drop(app.update(Message::WorkspaceModelObserved(echo)));
     assert_eq!(complete_reconciliations(), before, "the echo skips");
     assert_eq!(app.durable.channels[0].title, "Parser cache work");
+}
+
+/// A turn held open by background commands alone reads as waiting on them,
+/// in the header and in the row that closes the transcript, rather than as
+/// a reply still being written.
+#[test]
+fn a_turn_waiting_on_background_commands_says_so() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.detail = chat::WAITING_ON_BACKGROUND_WORK.into();
+    let waiting = chat::WAITING_ON_BACKGROUND_WORK.to_owned();
+    assert_eq!(
+        runtime.conversation_status(false),
+        (Some(Icon::AgentBackground), waiting.clone())
+    );
+    assert_eq!(
+        runtime.timeline_activity(false, None),
+        Some((Icon::AgentBackground, waiting))
+    );
+    // Back at work, it reads as working again.
+    Arc::make_mut(&mut runtime.snapshot).detail = "Working".into();
+    assert_eq!(
+        runtime.conversation_status(false).0,
+        Some(Icon::AgentWorking)
+    );
 }

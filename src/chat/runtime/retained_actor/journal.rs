@@ -36,8 +36,15 @@ const MAX_FINISHED_ENTRY_BYTES: usize = 6
     + 4096;
 const OVERFLOW_REASON: &str = "Claude holder outcome journal overflowed before the daemon committed its updates; the in-flight run outcome is unconfirmed";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum WaitingAttention {
+    Unknown,
+    Open(u64),
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct OutboxEntry {
+pub struct OutboxEntry {
     pub sequence: u64,
     pub update: Update,
     /// The conversation the helper had confirmed when it journaled this
@@ -50,7 +57,7 @@ pub(crate) struct OutboxEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InputIdentity {
+pub struct InputIdentity {
     pub sequence: u64,
     pub id: uuid::Uuid,
     pub hash: [u8; 32],
@@ -86,7 +93,7 @@ pub(crate) struct InputReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ContinuityLoss {
+pub struct ContinuityLoss {
     pub id: uuid::Uuid,
     pub affected_runs: Vec<crate::model::RunId>,
     pub reason: String,
@@ -105,6 +112,7 @@ pub(super) struct Journal {
     unknown_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
+    pub(super) waiting_attention: Option<WaitingAttention>,
     published_sources: Vec<crate::chat::Session>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
@@ -169,6 +177,7 @@ impl Journal {
             unknown_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
+            waiting_attention: Some(WaitingAttention::Unknown),
             published_sources: Vec::new(),
         })
     }
@@ -281,6 +290,15 @@ impl Journal {
         update: &Update,
         confirmed_session: Option<&str>,
     ) -> Result<(), String> {
+        if matches!(
+            update,
+            Update::Activity {
+                state: crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle,
+                ..
+            }
+        ) {
+            self.waiting_attention = Some(WaitingAttention::Resolved);
+        }
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
@@ -366,6 +384,13 @@ impl Journal {
         }
         tx.commit().map_err(|error| error.to_string())?;
         self.outcome_latest = sequence;
+        if matches!(
+            update,
+            Update::Attention(evidence) | Update::AttentionContext { evidence, .. }
+                if evidence.kind == crate::notifications::Kind::Waiting
+        ) {
+            self.waiting_attention = Some(WaitingAttention::Open(sequence));
+        }
         if let Update::Execution {
             run,
             update: crate::agent_execution::Update::Finished { .. },

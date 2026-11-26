@@ -84,11 +84,17 @@ fn mount_identity(root: &Root) -> io::Result<u64> {
 fn parent_of(root: &Root) -> io::Result<Root> {
     retained_parent_directory(root)
 }
-#[cfg(not(target_os = "linux"))]
-fn mount_identity(_root: &Root) -> io::Result<u64> {
-    Err(unsupported(
-        "Strong recovery placement is unavailable without qualified native mount-identity ancestry inspection.",
-    ))
+/// Darwin's `f_fsid` names the mounted filesystem holding the retained
+/// descriptor. It is not always the inode's device: the sealed system snapshot
+/// at `/` reports the Data volume's device but its own fsid. Darwin has no
+/// bind mounts, so this is the closest analogue of the Linux mount ID.
+#[cfg(target_os = "macos")]
+fn mount_identity(root: &Root) -> io::Result<u64> {
+    // SAFETY: libc's `fsid_t` is the `repr(C)` pair of `int32_t` that Darwin
+    // defines, whose field it keeps private.
+    let [high, low] =
+        unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(filesystem_of(root)?.f_fsid) };
+    Ok((u64::from(high as u32) << 32) | u64::from(low as u32))
 }
 /// Pre-effect qualification of a retained outside candidate. Unlike final
 /// placement this does not claim a private namespace, create anything, or

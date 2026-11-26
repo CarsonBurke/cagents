@@ -783,7 +783,10 @@ mod tests {
         let collapsed = app.chrome_ui.projects_collapsed;
         let before = projections();
         drop(app.update(Message::KeyEvent {
-            event: character("B", keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
+            event: character(
+                "B",
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            ),
             captured: false,
         }));
         assert_ne!(app.chrome_ui.projects_collapsed, collapsed);

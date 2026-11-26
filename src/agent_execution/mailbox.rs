@@ -283,11 +283,15 @@ const OPENING: &str = "[cagents ";
 /// What a retained helper advertises when its [`open`] reads every frame
 /// [`frame`] writes. Raise the number whenever a frame changes in a way an
 /// earlier `open` would not read, as giving the last line its `in a shell`
-/// did: a helper outlives the daemon that started it, and the daemon opens
-/// on its behalf what a helper without the current number shows.
+/// did, and as handing several messages over in one prompt did: a helper
+/// outlives the daemon that started it, and the daemon opens on its behalf
+/// what a helper without the current number shows.
 #[cfg(feature = "host")]
-pub(crate) const FRAMES_CAPABILITY: &str = "mailbox-frames-2";
+pub(crate) const FRAMES_CAPABILITY: &str = "mailbox-frames-3";
 const SEAL: &str = " · seal ";
+/// What separates the sealed frames of a prompt that hands over several
+/// messages at once.
+const BETWEEN_FRAMES: &str = "\n\n";
 /// What the last line of a frame starts with. It says where the command
 /// runs: `[Reply: cagents reply …]` alone read like a call to a tool named
 /// `cagents`, and an agent once made that call.
@@ -354,6 +358,14 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
     if seal.contains(['\n', ' ']) || !verify(framed, seal) {
         return None;
     }
+    parse(framed)
+}
+
+/// What a question says of itself where a window lists it.
+const ASKS: &str = "Asks for a reply";
+
+/// A frame's words before its seal, read as the message they give.
+fn parse(framed: &str) -> Option<Opened> {
     let (heading, rest) = framed.strip_prefix(OPENING)?.split_once("]\n")?;
     // The later of the two is the frame's own last line; the other, if
     // present at all, is the sender's words.
@@ -385,7 +397,7 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
     };
     let summary = match (kind, original) {
         (_, Some(original)) => format!("Reply to {original}"),
-        ("question", _) => "Asks for a reply".to_owned(),
+        ("question", _) => ASKS.to_owned(),
         _ => String::new(),
     };
     Some(Opened {
@@ -396,12 +408,211 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
     })
 }
 
+/// Reads `text` as one or more sealed frames, one after another, each of
+/// which `seals` accepts, as [`Seal::seal_all`] writes them. Anything else,
+/// including a frame followed by words of a person's own, is no delivery.
+///
+/// Each frame ends at the first seal after its start that `seals` accepts: a
+/// seal is a MAC over the frame before it, so neither a seal quoted in a body
+/// nor a whole frame copied into one ends the frame that carries it. The MAC
+/// is carried forward from one possible end to the next, so a body full of
+/// seal-like words costs one pass over the text, not one per word.
+pub fn open_all<S: Seals>(text: &str, seals: &S) -> Option<Vec<Opened>> {
+    let mut rest = text.strip_suffix('\n').unwrap_or(text);
+    let mut opened = Vec::new();
+    loop {
+        if !rest.starts_with(OPENING) {
+            return None;
+        }
+        let mut running = seals.start();
+        let mut read = 0;
+        let mut end = None;
+        for (at, _) in rest.match_indices(SEAL) {
+            let tag = at + SEAL.len();
+            if rest.len() < tag + SEAL_DIGITS {
+                break;
+            }
+            // Not on a character boundary, so no seal.
+            let Some(seal) = rest.get(tag..tag + SEAL_DIGITS) else {
+                continue;
+            };
+            let Some(after) = rest[tag + SEAL_DIGITS..].strip_prefix(']') else {
+                continue;
+            };
+            let next = match after.strip_prefix(BETWEEN_FRAMES) {
+                _ if after.is_empty() => None,
+                Some(next) if next.starts_with(OPENING) => Some(next),
+                _ => continue,
+            };
+            if !seal.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            seals.extend(&mut running, &rest[read..at]);
+            read = at;
+            // A seal judged only by its shape may end a frame that is not one.
+            if seals.accepts(running.clone(), seal)
+                && let Some(message) = parse(&rest[..at])
+            {
+                end = Some((message, next));
+                break;
+            }
+        }
+        let (message, next) = end?;
+        opened.push(message);
+        match next {
+            Some(next) => rest = next,
+            None => return Some(opened),
+        }
+    }
+}
+
+/// How many hexadecimal digits a frame's seal has.
+const SEAL_DIGITS: usize = 32;
+
+/// Judges the seals of the frames [`open_all`] reads, over each frame's
+/// words as it reads them, from the frame's start.
+pub trait Seals {
+    /// What has been read of a frame so far.
+    type Running: Clone;
+    fn start(&self) -> Self::Running;
+    fn extend(&self, running: &mut Self::Running, text: &str);
+    /// Whether `seal` seals what was read.
+    fn accepts(&self, running: Self::Running, seal: &str) -> bool;
+}
+
+/// Accepts any seal of the right shape. It proves nothing, so a window may
+/// use it only to recognize what looks like the courier's prompt.
+pub struct SealShaped;
+
+impl Seals for SealShaped {
+    type Running = ();
+    fn start(&self) {}
+    fn extend(&self, _: &mut (), _: &str) {}
+    fn accepts(&self, (): (), _: &str) -> bool {
+        true
+    }
+}
+
+/// What a window shows for the frames of one prompt: a message as it was
+/// sent, or several as one delivery named by their senders, whose body gives
+/// each message under its sender's name.
+#[cfg(feature = "host")]
+fn delivery(mut opened: Vec<Opened>) -> crate::chat::ItemContent {
+    use crate::chat::{DeliveryKind, ItemContent};
+    if opened.len() == 1 {
+        let opened = opened.remove(0);
+        return ItemContent::Delivery {
+            kind: DeliveryKind::Message,
+            from: opened.from,
+            sender: opened.sender,
+            summary: opened.summary,
+            body: opened.body,
+        };
+    }
+    let mut senders: Vec<&str> = Vec::new();
+    for frame in &opened {
+        if !senders.contains(&frame.from.as_str()) {
+            senders.push(&frame.from);
+        }
+    }
+    let named = match senders.as_slice() {
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        [first, second, third] => format!("{first}, {second} and {third}"),
+        [first, second, rest @ ..] => format!("{first}, {second} and {} others", rest.len()),
+        [] => unreachable!("a delivery holds at least one frame"),
+    };
+    let body = opened
+        .iter()
+        .map(|frame| {
+            let mut heading = format!("**{}**", markdown_literal(&frame.from));
+            if !frame.sender.is_empty() {
+                heading.push_str(&format!(" ({})", frame.sender));
+            }
+            if !frame.summary.is_empty() {
+                heading.push_str(&format!(" · {}", frame.summary));
+            }
+            // A code block one message leaves open would swallow the rest.
+            let body = frame.body.trim_end();
+            match open_fence(body) {
+                Some(fence) => format!("{heading}\n\n{body}\n{fence}"),
+                None => format!("{heading}\n\n{body}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    ItemContent::Delivery {
+        kind: DeliveryKind::Message,
+        from: String::new(),
+        sender: String::new(),
+        // A sender waiting on an answer is worth seeing without opening it.
+        summary: match opened.iter().filter(|frame| frame.summary == ASKS).count() {
+            0 => format!("{} messages from {named}", opened.len()),
+            1 => format!(
+                "{} messages from {named} · 1 asks for a reply",
+                opened.len()
+            ),
+            asking => format!(
+                "{} messages from {named} · {asking} ask for a reply",
+                opened.len()
+            ),
+        },
+        body,
+    }
+}
+
+/// The fence that closes the code block `markdown` leaves open, if it does,
+/// as CommonMark reads fences.
+#[cfg(feature = "host")]
+fn open_fence(markdown: &str) -> Option<String> {
+    let mut open: Option<(char, usize)> = None;
+    for line in markdown.lines() {
+        let indented = line.trim_start_matches(' ');
+        if line.len() - indented.len() > 3 {
+            continue;
+        }
+        let line = indented;
+        let Some(mark @ ('`' | '~')) = line.chars().next() else {
+            continue;
+        };
+        let length = line.chars().take_while(|&c| c == mark).count();
+        if length < 3 {
+            continue;
+        }
+        let info = &line[length..];
+        open = match open {
+            None if mark == '`' && info.contains('`') => None,
+            None => Some((mark, length)),
+            Some((opened, at_least))
+                if mark == opened && length >= at_least && info.trim().is_empty() =>
+            {
+                None
+            }
+            still => still,
+        };
+    }
+    open.map(|(mark, length)| mark.to_string().repeat(length))
+}
+
+/// `text` escaped so that Markdown shows it as written.
+#[cfg(feature = "host")]
+fn markdown_literal(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii_punctuation() {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 /// The daemon-side signer for courier frames. Retained actors receive only a
 /// recognizer API, through authenticated private bootstrap. That recognizer
 /// still holds the registry-wide symmetric MAC material: matched helper code is
 /// inside the daemon's trusted realm, and this is not compromise containment.
 #[cfg(feature = "host")]
-pub(crate) struct Seal([u8; 32]);
+pub struct Seal([u8; 32]);
 
 #[cfg(feature = "host")]
 impl std::fmt::Debug for Seal {
@@ -412,11 +623,11 @@ impl std::fmt::Debug for Seal {
 
 #[cfg(feature = "host")]
 impl Seal {
-    pub(crate) fn new(key: [u8; 32]) -> Self {
+    pub fn new(key: [u8; 32]) -> Self {
         Self(key)
     }
 
-    pub(crate) fn recognizer(&self) -> Recognizer {
+    pub fn recognizer(&self) -> Recognizer {
         Recognizer(self.0)
     }
 
@@ -434,13 +645,29 @@ impl Seal {
     }
 
     /// The prompt that delivers `message` at `now`.
-    pub(crate) fn seal(&self, message: &Message, now: u64) -> String {
+    pub fn seal(&self, message: &Message, now: u64) -> String {
         self.sealed(frame(message, now))
+    }
+
+    /// The one prompt that delivers `messages` at `now`, in order: each
+    /// message's own sealed frame, so that each still says who sent it and
+    /// how to answer it, and a window shows them as messages only when every
+    /// frame is the daemon's.
+    pub fn seal_all<'a>(
+        &self,
+        messages: impl IntoIterator<Item = &'a Message>,
+        now: u64,
+    ) -> String {
+        messages
+            .into_iter()
+            .map(|message| self.seal(message, now))
+            .collect::<Vec<_>>()
+            .join(BETWEEN_FRAMES)
     }
 
     /// The prompt of the agent run that delivers `message`. A run can start
     /// long after it is accepted, so it never says the sender is waiting.
-    pub(crate) fn seal_run(&self, message: &Message) -> String {
+    pub fn seal_run(&self, message: &Message) -> String {
         self.sealed(framed(message, false))
     }
 
@@ -455,7 +682,7 @@ impl Seal {
 /// could recover the shared signing material. Providers never receive it.
 #[cfg(feature = "host")]
 #[derive(Clone)]
-pub(crate) struct Recognizer([u8; 32]);
+pub struct Recognizer([u8; 32]);
 
 #[cfg(feature = "host")]
 impl std::fmt::Debug for Recognizer {
@@ -485,6 +712,27 @@ impl RetainedRecognition {
 }
 
 #[cfg(feature = "host")]
+impl Seals for Recognizer {
+    type Running = hmac::Hmac<sha2::Sha256>;
+
+    fn start(&self) -> Self::Running {
+        use hmac::Mac;
+        hmac::Hmac::new_from_slice(&self.0).expect("HMAC accepts a key of any length")
+    }
+
+    fn extend(&self, running: &mut Self::Running, text: &str) {
+        use hmac::Mac;
+        running.update(text.as_bytes());
+    }
+
+    fn accepts(&self, running: Self::Running, seal: &str) -> bool {
+        use hmac::Mac;
+        decode_hex(seal)
+            .is_some_and(|tag| tag.len() == 16 && running.verify_truncated_left(&tag).is_ok())
+    }
+}
+
+#[cfg(feature = "host")]
 impl Recognizer {
     /// Explicitly delegate recognition to the trusted retained actor, never to
     /// its provider. This is a typed API restriction, not asymmetric crypto.
@@ -492,38 +740,33 @@ impl Recognizer {
         RetainedRecognition(self.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn open(&self, text: &str) -> Option<Opened> {
         open(text, |framed, seal| {
-            use hmac::Mac;
-            let Some(tag) = decode_hex(seal) else {
-                return false;
-            };
-            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.0)
-                .expect("HMAC accepts a key of any length");
-            mac.update(framed.as_bytes());
-            tag.len() == 16 && mac.verify_truncated_left(&tag).is_ok()
+            let mut running = self.start();
+            self.extend(&mut running, framed);
+            self.accepts(running, seal)
         })
+    }
+
+    /// As [`open_all`], for the frames this daemon sealed.
+    pub(crate) fn open_all(&self, text: &str) -> Option<Vec<Opened>> {
+        open_all(text, self)
     }
 
     /// A user prompt the daemon sealed, as the delivery a window shows.
     /// Whether it was one.
-    pub(crate) fn recognize(&self, item: &mut crate::chat::Item) -> bool {
+    pub fn recognize(&self, item: &mut crate::chat::Item) -> bool {
         if !may_be_frame(item) {
             return false;
         }
         let crate::chat::ItemContent::Text { text, .. } = &item.content else {
             return false;
         };
-        let Some(opened) = self.open(text) else {
+        let Some(opened) = self.open_all(text) else {
             return false;
         };
-        item.content = crate::chat::ItemContent::Delivery {
-            kind: crate::chat::DeliveryKind::Message,
-            from: opened.from,
-            sender: opened.sender,
-            summary: opened.summary,
-            body: opened.body,
-        };
+        item.content = delivery(opened);
         true
     }
 
@@ -637,7 +880,7 @@ mod tests {
     #[test]
     fn a_frame_names_its_sender_and_how_to_answer() {
         #[cfg(feature = "host")]
-        assert_eq!(FRAMES_CAPABILITY, "mailbox-frames-2");
+        assert_eq!(FRAMES_CAPABILITY, "mailbox-frames-3");
         let message = message();
         let session = short(message.from.session.unwrap());
         assert_eq!(
@@ -793,6 +1036,201 @@ mod tests {
         let mut quoted = item(Role::Assistant, &text);
         seal.recognizer().recognize(&mut quoted);
         assert!(matches!(quoted.content, ItemContent::Text { .. }));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn messages_handed_over_together_open_in_order_and_show_as_one_delivery() {
+        use crate::chat::{DeliveryKind, Item, ItemContent, Phase, Role};
+        let seal = Seal::new([5; 32]);
+        let recognizer = seal.recognizer();
+        let first = message();
+        let mut second = message();
+        second.from.title = Some("Review *auth*".into());
+        // A body that quotes a seal, or a whole frame, does not end its own.
+        second.body = format!(
+            "Seen this?\n\n{}\n\nand this · seal {}]\n\nSo far so good.",
+            seal.seal(&first, 0),
+            "0".repeat(32)
+        );
+        let mut third = message();
+        third.from = Party::user();
+        third.reply_to = Some(MessageId::new());
+        let sealed = seal.seal_all([&first, &second, &third], 0);
+        assert!(sealed.starts_with(&seal.seal(&first, 0)));
+        assert_eq!(
+            seal.seal_all([&first], 0),
+            seal.seal(&first, 0),
+            "one message is handed over as it always was"
+        );
+
+        let opened = recognizer.open_all(&sealed).unwrap();
+        assert_eq!(
+            opened
+                .iter()
+                .map(|opened| opened.body.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Hold off on src/auth.rs\n[I am refactoring it]",
+                second.body.as_str(),
+                "Hold off on src/auth.rs\n[I am refactoring it]",
+            ]
+        );
+        assert_eq!(opened[1].from, "Review *auth*");
+        assert!(recognizer.open_all(&format!("{sealed}\n")).is_some());
+        assert!(
+            recognizer.open(&sealed).is_none(),
+            "an earlier helper's open reads none of it"
+        );
+
+        // Every frame must be the daemon's, with nothing else around them.
+        let forged = seal.seal_all([&first], 0) + "\n\n" + &frame(&third, 0);
+        assert!(recognizer.open_all(&forged).is_none());
+        let edited = sealed.replacen("So far so good", "Go ahead", 1);
+        assert!(recognizer.open_all(&edited).is_none());
+        assert!(
+            recognizer
+                .open_all(&format!("{sealed}\n\nand my own words"))
+                .is_none()
+        );
+        assert!(recognizer.open_all(&format!("Look:\n\n{sealed}")).is_none());
+        assert!(Seal::new([6; 32]).recognizer().open_all(&sealed).is_none());
+
+        let mut item = Item {
+            id: "item".into(),
+            role: Role::User,
+            content: ItemContent::Text {
+                text: sealed,
+                thinking: false,
+                phase: Phase::default(),
+            },
+            started_at: None,
+            at: None,
+        };
+        assert!(recognizer.recognize(&mut item));
+        let ItemContent::Delivery {
+            kind: DeliveryKind::Message,
+            from,
+            sender,
+            summary,
+            body,
+        } = &item.content
+        else {
+            panic!("{:?}", item.content);
+        };
+        assert_eq!((from.as_str(), sender.as_str()), ("", ""));
+        assert_eq!(
+            summary,
+            "3 messages from Fix login bug, Review *auth* and you"
+        );
+        let sections: Vec<&str> = body.split("\n\n---\n\n").collect();
+        assert_eq!(sections.len(), 3, "{body}");
+        let session = short(first.from.session.unwrap());
+        assert!(
+            sections[0].starts_with(&format!("**Fix login bug** ({session})\n\n")),
+            "{body}"
+        );
+        // A title shows as written, not as Markdown.
+        assert!(sections[1].starts_with("**Review \\*auth\\*** ("), "{body}");
+        assert!(sections[1].ends_with("So far so good."), "{body}");
+        assert!(
+            sections[2].starts_with(&format!(
+                "**you** · Reply to {}\n\n",
+                short(third.reply_to.unwrap())
+            )),
+            "{body}"
+        );
+    }
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_body_full_of_frame_boundaries_ends_only_where_its_seal_does() {
+        let seal = Seal::new([7; 32]);
+        let recognizer = seal.recognizer();
+        // Each of these looks like the end of one frame and the start of the
+        // next, so every one of them is a seal to check.
+        let boundary = format!(
+            "{SEAL}{}]{BETWEEN_FRAMES}{OPENING}",
+            "a".repeat(SEAL_DIGITS)
+        );
+        let mut message = message();
+        message.body = boundary.repeat(MAX_MESSAGE_BYTES / boundary.len() - 1);
+        // Nor does one whose digits would end inside a character.
+        message
+            .body
+            .push_str(&format!("{SEAL}{}🎉]", "a".repeat(SEAL_DIGITS - 1)));
+        assert!(message.body.len() <= MAX_MESSAGE_BYTES);
+        let messages = vec![message; 8];
+        let sealed = seal.seal_all(messages.iter(), 0);
+
+        let opened = recognizer.open_all(&sealed).expect("the daemon's frames");
+        assert_eq!(opened.len(), messages.len());
+        assert!(opened.iter().all(|opened| opened.body == messages[0].body));
+        // A window that reads seals only by their shape still sees a message.
+        let one = open_all(&seal.seal(&messages[0], 0), &SealShaped).expect("frame-shaped");
+        assert_eq!(one.len(), 1);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_delivery_of_several_says_how_many_ask_for_a_reply() {
+        use crate::chat::ItemContent;
+        let opened = |summary: &str| Opened {
+            from: "Review".into(),
+            sender: String::new(),
+            summary: summary.into(),
+            body: "Body".into(),
+        };
+        let summary = |frames| match delivery(frames) {
+            ItemContent::Delivery { summary, .. } => summary,
+            content => panic!("{content:?}"),
+        };
+        assert_eq!(
+            summary(vec![opened(""), opened(ASKS)]),
+            "2 messages from Review · 1 asks for a reply"
+        );
+        assert_eq!(
+            summary(vec![
+                opened(ASKS),
+                opened(ASKS),
+                opened("Reply to 1234abcd")
+            ]),
+            "3 messages from Review · 2 ask for a reply"
+        );
+        assert_eq!(
+            summary(vec![opened(""), opened("")]),
+            "2 messages from Review"
+        );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_code_block_one_message_leaves_open_ends_with_it() {
+        use crate::chat::ItemContent;
+        assert_eq!(open_fence("```rust\nfn main() {"), Some("```".into()));
+        assert_eq!(open_fence("~~~~\n~~~\nstill code"), Some("~~~~".into()));
+        assert_eq!(open_fence("  ```\ncode\n```"), None);
+        assert_eq!(open_fence("```sh\n``` not a close\n````"), None);
+        assert_eq!(open_fence("``` not `a` fence"), None);
+        assert_eq!(open_fence("    ```\nindented code"), None);
+
+        let mut first = message();
+        first.body = "Here is the failing part:\n```rust\nfn main() {".into();
+        let mut second = message();
+        second.body = "# Landed\n\nThe fix is on main.".into();
+        let seal = Seal::new([8; 32]);
+        let opened = seal
+            .recognizer()
+            .open_all(&seal.seal_all([&first, &second], 0))
+            .unwrap();
+        let ItemContent::Delivery { body, .. } = delivery(opened) else {
+            panic!("a delivery");
+        };
+        let sections: Vec<&str> = body.split("\n\n---\n\n").collect();
+        assert!(sections[0].ends_with("fn main() {\n```"), "{body}");
+        assert!(
+            sections[1].ends_with("# Landed\n\nThe fix is on main."),
+            "{body}"
+        );
     }
 
     #[cfg(feature = "host")]

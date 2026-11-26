@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -27,6 +28,8 @@ fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
         );
         return;
     }
+    #[cfg(target_os = "macos")]
+    crate::daemon::adopted_orphans::become_sweeper();
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let cwd = root.path().join("cwd");
     let home = root.path().join("claude");
@@ -106,12 +109,13 @@ IFS= read -r frame || :
         );
         Err(error)
     };
-    let error = Server::start_after_scope_enrollment(startup(0), &control, reject)
+    let error = Server::start_after_scope_enrollment(startup(0), &control, reject, || {})
         .err()
         .unwrap();
     assert!(error.contains("Incompatible retained Claude actor launch"));
     assert!(!marker.exists(), "required startup failures remain fatal");
-    let server = Server::start_after_scope_enrollment(startup(PROTOCOL), &control, reject).unwrap();
+    let server =
+        Server::start_after_scope_enrollment(startup(PROTOCOL), &control, reject, || {}).unwrap();
     let socket = server.socket.clone();
     let record = server.identity.record.clone();
     let record_path = registry::directory(Kind::Native)
@@ -174,6 +178,7 @@ IFS= read -r frame || :
     assert!(!socket.exists() && !record_path.exists());
 }
 
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn serving_actor_reaps_adopted_orphans_as_they_exit_and_sleeps_while_idle() {
     if crate::retained_fixture::run_isolated() {
@@ -289,7 +294,7 @@ while IFS= read -r frame; do :; done
         provider_directory_observed: false,
         recovery_environment: BTreeMap::new(),
     };
-    let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
+    let server = Server::start_after_scope_enrollment(startup, &control, || Ok(()), || {}).unwrap();
     let provider = server.identity.record.root.clone();
     let mut parent = Some(parent);
     let (serving, serving_thread) = std::sync::mpsc::channel();
@@ -379,6 +384,7 @@ while IFS= read -r frame; do :; done
     assert!(!provider.is_current(), "original provider must be reaped");
 }
 
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn an_ordinary_close_leaves_what_the_provider_leaves() {
     if crate::retained_fixture::run_isolated() {
@@ -399,10 +405,10 @@ fn an_ordinary_close_leaves_what_the_provider_leaves() {
     unsafe { libc::kill(-(provider.id() as i32), libc::SIGTERM) };
     provider.wait().unwrap();
     drop(registration);
-    reap_orphans(DetachedWork::Spare).unwrap();
+    reap_orphans(DetachedWork::Spare, false).unwrap();
     assert!(
         children::ends(work.running, || {
-            reap_orphans(DetachedWork::Spare).unwrap();
+            reap_orphans(DetachedWork::Spare, false).unwrap();
         }),
         "the provider stopped its own command as it quit, and it is reaped"
     );
@@ -414,7 +420,7 @@ fn an_ordinary_close_leaves_what_the_provider_leaves() {
     }
     // A close that stops everything, as for an unattended agent, reaps
     // them too.
-    reap_orphans(DetachedWork::Stop).unwrap();
+    reap_orphans(DetachedWork::Stop, false).unwrap();
     assert!(!children::exists(work.detached) && !children::exists(work.left));
 }
 
@@ -524,7 +530,7 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
     let journal_directory = root.path().join("journal");
     std::fs::create_dir(&journal_directory).unwrap();
     let socket = root.path().join("fixture.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let metadata = std::fs::symlink_metadata(&socket).unwrap();
     (
         Server {
@@ -631,6 +637,7 @@ fn continuity_loss_refuses_unchanged_presentation_without_mutating_source_or_cop
     .unwrap();
     assert_eq!(copied, before_page);
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
     if crate::retained_fixture::run_isolated() {
@@ -850,6 +857,7 @@ fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
         assert!(retired.paired_holder.is_none());
     }
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn authenticated_directory_pin_keeps_original_after_replacement_and_epoch_change() {
     if crate::retained_fixture::run_isolated() {
@@ -1043,12 +1051,13 @@ fn helper_control_rejects_regular_files_and_unconnected_listeners() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let file = File::create(root.path().join("ordinary-file")).unwrap();
     assert!(validate_control_descriptor(file.as_raw_fd()).is_err());
-    let listener = UnixListener::bind(root.path().join("listener.sock")).unwrap();
+    let listener = crate::descriptor::bind(root.path().join("listener.sock")).unwrap();
     assert!(validate_control_descriptor(listener.as_raw_fd()).is_err());
     let (client, server) = UnixStream::pair().unwrap();
     assert!(validate_control_descriptor(client.as_raw_fd()).is_ok());
     assert!(validate_control_descriptor(server.as_raw_fd()).is_ok());
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn helper_restores_descriptor_seal_before_any_provider_exec() {
     if crate::retained_fixture::run_isolated() {
@@ -1109,7 +1118,7 @@ fn helper_restores_descriptor_seal_before_any_provider_exec() {
         .unwrap();
     let mut spec = ProcessSpec::from(&source.launch.recipe);
     spec.execution = Some(context.clone());
-    let limit = crate::host::descriptor_limit::tests::raise_with_fixture_limit();
+    let limit = crate::descriptor_limit::tests::raise_with_fixture_limit();
     // This execs the real retained-helper entry and its real provider
     // spawning path. Omitting the entry seal leaks both inherited FDs.
     let actor = RemoteActor::spawn(spec, source, prepared, BTreeMap::new(), |_| {}).unwrap();
@@ -1125,12 +1134,12 @@ fn helper_restores_descriptor_seal_before_any_provider_exec() {
     actor.commit_installation().unwrap();
     let provider = actor.state().provider_process.clone().unwrap();
     assert!(provider.is_current());
-    crate::host::descriptor_limit::tests::assert_process_limit(provider.pid as u32, &limit);
-    crate::host::descriptor_limit::tests::assert_process_limit(
+    crate::descriptor_limit::tests::assert_process_limit(provider.pid as u32, &limit);
+    crate::descriptor_limit::tests::assert_process_limit(
         actor.native_holder_record().holder.pid as u32,
         &limit,
     );
-    crate::host::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
+    crate::descriptor_limit::tests::assert_daemon_limit_remains_raised(&limit);
     let inherited = std::fs::read_dir(format!("/proc/{}/fd", provider.pid))
         .unwrap()
         .filter_map(|entry| {
@@ -1385,6 +1394,33 @@ fn retained_parent_accepts_prompts_while_background_children_keep_working() {
     notify(Update::Presentation);
     assert_eq!(fixture.server.resident().unwrap().prompt_revision, before);
 }
+#[test]
+fn a_retained_helper_reports_what_the_person_queued_with_its_provider() {
+    let fixture = resident_fixture();
+    fixture.server.actor.0.state.lock().unwrap().busy = false;
+    assert!(!fixture.server.resident().unwrap().queued_input);
+    fixture
+        .server
+        .actor
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .queued_messages
+        .push(chat::QueuedMessage::new("person-1".into(), "Next".into()));
+    let resident = fixture.server.resident().unwrap();
+    assert!(resident.queued_input);
+    assert!(resident.idle, "the person may still send it");
+    // A helper from before the field reports nothing queued.
+    let mut older = serde_json::to_value(&resident).unwrap();
+    older.as_object_mut().unwrap().remove("queued_input");
+    assert!(
+        !serde_json::from_value::<Resident>(older)
+            .unwrap()
+            .queued_input
+    );
+}
+
 #[test]
 fn a_helper_that_predates_named_holds_still_reports_its_background_work() {
     let mut resident = serde_json::to_value(RemoteActor::fixture().state().as_ref()).unwrap();
@@ -1771,7 +1807,7 @@ fn source_resolution_refuses_stale_cleanup_pending_and_process_completion() {
 fn source_resolution_uses_one_deadline_and_never_returns_a_cached_final_snapshot() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("resolve.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let mut actor = RemoteActor::fixture();
     Arc::get_mut(&mut actor.0).unwrap().socket = socket;
     let source = actor.0.source.clone();
@@ -1782,7 +1818,7 @@ fn source_resolution_uses_one_deadline_and_never_returns_a_cached_final_snapshot
     }));
     let (release, wait) = crossbeam_channel::bounded(1);
     let peer = thread::spawn(move || {
-        let (control, _) = listener.accept().unwrap();
+        let (control, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&control, TIMEOUT).unwrap();
         assert_eq!(request.method, "resolve_source");
         assert_eq!(request.epoch, Some(epoch));
@@ -1865,6 +1901,238 @@ fn resident_naming_and_notification_projections_do_not_need_a_helper_socket() {
     assert!(!actor.0.socket.exists());
 }
 #[test]
+fn a_delayed_waiting_sample_cannot_undo_an_exact_resolution() {
+    use super::super::journal::WaitingAttention;
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let fixture = resident_fixture();
+    let actor = RemoteActor::fixture();
+    *actor.0.state.lock().unwrap() = Arc::new(fixture.server.resident().unwrap());
+
+    let append = |update| {
+        // Stop at the journal publication, before the notification callback
+        // advances the helper's general revision.
+        fixture
+            .server
+            .journal
+            .lock()
+            .unwrap()
+            .append(&update, None)
+            .unwrap();
+        fixture.server.resident().unwrap()
+    };
+    let open = |key: &str| {
+        append(Update::Attention(crate::notifications::Evidence {
+            key: key.into(),
+            kind: crate::notifications::Kind::Waiting,
+        }))
+    };
+    let working = Update::Activity {
+        state: ActivityState::Working,
+        generation: 0,
+    };
+    let initial = fixture.server.resident().unwrap();
+    assert_eq!(initial.waiting_attention, Some(WaitingAttention::Unknown));
+    assert!(actor.publish_resident(append(working.clone())));
+    assert!(actor.publish_resident(initial));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    let earlier = open("first request");
+    let sequence = earlier.outbox_latest;
+    assert!(actor.publish_resident(earlier.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Current)
+    );
+
+    let settled = append(working);
+    assert_eq!(settled.changed, earlier.changed);
+    assert_eq!(settled.generation, earlier.generation);
+    assert_eq!(settled.outbox_latest, sequence);
+    assert!(actor.publish_resident(settled));
+    assert!(actor.publish_resident(earlier));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    let later = open("next request");
+    let next_sequence = later.outbox_latest;
+    assert!(next_sequence > sequence);
+    assert!(actor.publish_resident(later));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Superseded)
+    );
+    assert_eq!(
+        actor.waiting_resolution(Some(next_sequence)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
+fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let actor = RemoteActor::fixture();
+    let mut older = actor.state().as_ref().clone();
+    older.waiting_attention = None;
+    older.completed = false;
+    older.activity = ActivityState::Waiting;
+    older.waiting = true;
+    older.outbox_latest = 3;
+    assert!(actor.publish_resident(older.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+
+    let mut working = older.clone();
+    working.activity = ActivityState::Working;
+    working.waiting = false;
+    working.changed += 1;
+    assert!(actor.publish_resident(working.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+    assert!(actor.publish_resident_inner(working.clone(), false, Some(&working)));
+    assert!(actor.state().legacy_waiting_settled);
+    assert_eq!(actor.state().waiting_attention, None);
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    // The old transport may have copied Working just before another wait
+    // advanced the journal. That mixed sample cannot clear the new request.
+    working.changed += 1;
+    working.outbox_latest = 4;
+    assert!(actor.publish_resident(working));
+    assert_eq!(
+        actor.waiting_resolution(Some(4)),
+        Some(RetainedWaiting::Current)
+    );
+    older.changed += 3;
+    older.outbox_latest = 4;
+    assert!(actor.publish_resident(older));
+    assert_eq!(
+        actor.waiting_resolution(Some(4)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
+fn older_legacy_replies_cannot_confirm_a_wait_opened_after_they_were_requested() {
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let actor = RemoteActor::fixture();
+    let mut initial = actor.state().as_ref().clone();
+    initial.waiting_attention = None;
+    initial.completed = false;
+    initial.activity = ActivityState::Working;
+    initial.waiting = false;
+    initial.outbox_latest = 2;
+    assert!(actor.publish_resident(initial.clone()));
+
+    let mut newest = initial.clone();
+    newest.activity = ActivityState::Waiting;
+    newest.waiting = true;
+    newest.outbox_latest = 3;
+    assert!(actor.publish_resident(newest.clone()));
+
+    let mut delayed = initial.clone();
+    delayed.outbox_latest = 3;
+    // Two readers copied Working before the outbox received the new wait.
+    for _ in 0..2 {
+        assert!(actor.publish_resident_inner(delayed.clone(), false, Some(&initial)));
+        assert_eq!(
+            actor.waiting_resolution(Some(3)),
+            Some(RetainedWaiting::Current)
+        );
+    }
+    // Re-reading after the first publication sees the current Waiting.
+    assert!(actor.publish_resident_inner(newest, false, Some(&delayed)));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
+fn an_idle_legacy_attachment_fetches_a_full_state_at_the_same_revision() {
+    let mut fixture = resident_fixture();
+    fixture.server.actor.0.state.lock().unwrap().ready = true;
+    fixture.server.journal.lock().unwrap().waiting_attention = None;
+    let revision = fixture.server.revision();
+    let proof = fixture.server.proof.clone();
+    let epoch = fixture.server.epoch;
+    let state = |after| Invocation {
+        proof: proof.clone(),
+        epoch: Some(epoch),
+        method: "state".into(),
+        args: json!([after]),
+    };
+    let ordinary = state(revision);
+    assert!(fixture.server.invoke(ordinary).unwrap().is_null());
+    let actor = RemoteActor::fixture();
+    let mut initial = fixture.server.resident().unwrap();
+    assert!(initial.legacy_activity_is_settled());
+    initial.generation = initial.generation.max(actor.state().generation);
+    initial.changed = initial.changed.max(actor.state().changed);
+    assert!(actor.publish_resident(initial));
+    let before = actor.state();
+    let after = before.waiting_state_cursor();
+    assert_ne!(after, revision);
+    let forced = state(after);
+    let next: Option<Resident> =
+        serde_json::from_value(fixture.server.invoke(forced).unwrap()).unwrap();
+    let mut next = next.expect("unchanged revision still carries the authenticated state");
+    next.generation = actor.state().generation;
+    next.changed = actor.state().changed;
+    assert!(actor.publish_resident_inner(next, false, Some(&before)));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(crate::chat::runtime::RetainedWaiting::Resolved)
+    );
+}
+
+#[test]
+fn a_wait_appended_after_active_metadata_was_sampled_is_still_open() {
+    use super::super::journal::WaitingAttention;
+
+    let fixture = resident_fixture();
+    let open = Update::Attention(crate::notifications::Evidence {
+        key: "wait-after-copy".into(),
+        kind: crate::notifications::Kind::Waiting,
+    });
+    let first = fixture
+        .server
+        .resident_after_copy(|| {
+            let mut journal = fixture.server.journal.lock().unwrap();
+            journal.append(&open, None).unwrap();
+        })
+        .unwrap();
+    assert!(!first.activity.waits_on_user());
+    assert_eq!(
+        first.waiting_attention,
+        Some(WaitingAttention::Open(first.outbox_latest))
+    );
+    let sequence = first.outbox_latest;
+    let proxy = RemoteActor::fixture();
+    *proxy.0.state.lock().unwrap() = Arc::new(first);
+    assert_eq!(
+        proxy.waiting_resolution(Some(sequence)),
+        Some(crate::chat::runtime::RetainedWaiting::Current)
+    );
+}
+#[test]
 fn concurrent_ready_publication_cannot_be_hidden_by_a_new_revision_on_old_metadata() {
     let mut fixture = resident_fixture();
     fixture.server.actor.0.state.lock().unwrap().ready = false;
@@ -1907,17 +2175,11 @@ fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_c
         .capabilities
         .push(CAPABILITY.into());
     let socket = fixture._root.path().join("deadline-inspect.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let (release, wait) = crossbeam_channel::bounded(1);
-    let peer = thread::spawn(move || {
-        let (control, _) = listener.accept().unwrap();
-        let request: Invocation = receive(&control, TIMEOUT).unwrap();
-        assert_eq!(request.method, "inspect");
-        assert!(request.epoch.is_none());
-        // SO_PEERCRED has identified this exact Record.holder process, but
-        // its inspection response stalls until the client has returned.
-        let _ = wait.recv();
-    });
+    let listener = crate::descriptor::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // The listener authenticates as this process and the kernel queues the
+    // connection and request. Leaving them queued stalls the response without
+    // a peer thread that could block forever if the client never connects.
     let epoch = fixture.server.epoch;
     let source = fixture.server.source.clone();
     let proof = fixture.server.proof.clone();
@@ -1927,14 +2189,23 @@ fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_c
             &record,
             proof,
             &socket,
-            Instant::now() + Duration::from_millis(40),
+            Instant::now() + Duration::from_millis(250),
         )
         .err()
         .expect("stalled inspection must time out")
     });
-    let _ = release.send(());
-    peer.join().unwrap();
-    assert!(error.contains("deadline"), "{error}");
+    assert_eq!(
+        error,
+        interrupted_request(
+            "inspect",
+            crate::chat::failure::actor_transport::DEADLINE.into()
+        ),
+    );
+    let (control, _) =
+        crate::descriptor::accept(&listener).expect("inspection must reach the peer");
+    let request: Invocation = receive(&control, TIMEOUT).expect("inspection must send its request");
+    assert_eq!(request.method, "inspect");
+    assert!(request.epoch.is_none());
     assert!(started.elapsed() < TIMEOUT);
     assert_eq!(fixture.server.epoch, epoch);
     assert_eq!(fixture.server.source, source);
@@ -2241,7 +2512,7 @@ fn missing_install_commit_cannot_advertise_durable_continuity() {
 fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("install.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let mut actor = RemoteActor::fixture();
     Arc::get_mut(&mut actor.0).unwrap().socket = socket;
     actor.0.installed.store(false, Ordering::Release);
@@ -2255,7 +2526,7 @@ fn acknowledged_install_cannot_be_reversed_by_an_inflight_precommit_observation(
     let proof = actor.0.proof.clone();
     let epoch = actor.0.epoch;
     let peer = thread::spawn(move || {
-        let (control, _) = listener.accept().unwrap();
+        let (control, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&control, TIMEOUT).unwrap();
         assert_eq!(request.method, "commit");
         assert_eq!(request.proof, proof);
@@ -2366,10 +2637,63 @@ fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
 }
 
 #[test]
+fn confirmed_completion_wakes_settlement_even_with_an_unchanged_wait_and_outbox() {
+    use crate::chat::runtime::RetainedWaiting;
+    let mut actor = RemoteActor::open_waiting_fixture();
+    let (sent, received) = crossbeam_channel::unbounded();
+    Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+        sent.send(update).unwrap();
+    });
+    let mut resident = actor.state().as_ref().clone();
+    resident.outbox_ack = resident.outbox_latest;
+    assert!(actor.publish_resident(resident.clone()));
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    resident.completed = true;
+    resident.owns_work = true;
+    assert!(actor.publish_resident(resident.clone()));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Current)
+    );
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    resident.owns_work = false;
+    assert!(actor.publish_resident(resident.clone()));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Resolved)
+    );
+    assert!(
+        received
+            .try_iter()
+            .any(|update| matches!(update, Update::RetainedOutcomes))
+    );
+    assert!(actor.publish_resident(resident));
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    actor.wake_outcomes();
+    assert!(
+        received
+            .try_iter()
+            .any(|update| matches!(update, Update::RetainedOutcomes))
+    );
+}
+
+#[test]
 fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("refresh.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let fixture = RemoteActor::fixture();
     let mut old = fixture.state().as_ref().clone();
     old.ready = false;
@@ -2430,17 +2754,17 @@ fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_
     let (stop, stopped) = crossbeam_channel::bounded(1);
     let peer = thread::spawn(move || {
         // This ordering fixture models an older helper without readiness.
-        let (watch, _) = listener.accept().unwrap();
+        let (watch, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&watch, TIMEOUT).unwrap();
         assert_eq!(request.method, "watch");
         send(&watch, &Err::<Value, _>(UNKNOWN_METHOD.to_owned()), TIMEOUT).unwrap();
         // Hold the observer's response to force refresh_state to publish
         // the new resident before that observer returns an unchanged poll.
-        let (observer, _) = listener.accept().unwrap();
+        let (observer, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&observer, TIMEOUT).unwrap();
         assert_eq!(request.method, "state");
         observed_poll.send(()).unwrap();
-        let (refresh, _) = listener.accept().unwrap();
+        let (refresh, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&refresh, TIMEOUT).unwrap();
         assert_eq!(request.method, "state");
         send(
@@ -2456,7 +2780,7 @@ fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_
             TIMEOUT,
         )
         .unwrap();
-        let (observer, _) = listener.accept().unwrap();
+        let (observer, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&observer, TIMEOUT).unwrap();
         assert_eq!(request.method, "state");
         send(&observer, &Ok::<Value, String>(Value::Null), TIMEOUT).unwrap();
@@ -2513,7 +2837,7 @@ fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_
 fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("outcome-read.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let actor = RemoteActor::fixture_at(socket);
     let unconfirmed = actor.state().as_ref().clone();
     assert!(unconfirmed.confirmed_session.is_none());
@@ -2537,7 +2861,7 @@ fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
     let peer = thread::spawn(move || {
         let mut published = false;
         for _ in 0..4 {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             let request: Invocation = receive(&stream, TIMEOUT).unwrap();
             let reply = match request.method.as_str() {
                 "state" => {
@@ -2574,7 +2898,7 @@ fn an_outcome_page_is_never_newer_than_the_identity_read_with_it() {
 fn a_closed_refresh_overtaken_by_a_newer_one_is_stale_not_a_failure() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("closed-refresh.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let actor = RemoteActor::fixture_at(socket);
     let mut older = actor.state().as_ref().clone();
     older.completed = true;
@@ -2596,7 +2920,7 @@ fn a_closed_refresh_overtaken_by_a_newer_one_is_stale_not_a_failure() {
     let replies = [older, contradictory];
     let peer = thread::spawn(move || {
         for reply in replies {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             let request: Invocation = receive(&stream, TIMEOUT).unwrap();
             assert_eq!(request.method, "state");
             send(
@@ -2664,18 +2988,18 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
     };
     let (next, delay) = retransmit(&actor).expect("a failed call schedules retransmission");
     assert!(next > Instant::now() && delay > RETRANSMIT_DELAY);
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     actor.resolve_uncertain_input();
     assert_eq!(
-        listener.accept().unwrap_err().kind(),
+        crate::descriptor::accept(&listener).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
         "nothing is retransmitted before its backoff elapses"
     );
     listener.set_nonblocking(false).unwrap();
     let expected = identity.clone();
     let helper = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         let request: Invocation = receive(&stream, TIMEOUT).unwrap();
         assert_eq!(request.method, "input");
         let (identity, payload): (InputIdentity, Value) =
@@ -2729,10 +3053,10 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
         .as_mut()
         .unwrap()
         .acknowledgement_deadline = Instant::now();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let settle =
         |listener: &UnixListener, expected: &InputIdentity, answer: Result<Value, String>| {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(listener).unwrap();
             let request: Invocation = receive(&stream, TIMEOUT).unwrap();
             assert_eq!(request.method, "abandon_input", "never the input itself");
             let (identity, reason): (InputIdentity, String) =
@@ -2790,7 +3114,7 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
         .as_mut()
         .unwrap()
         .acknowledgement_deadline = Instant::now();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     thread::scope(|scope| {
         let helper = scope.spawn(|| settle(&listener, &expected, Err(UNKNOWN_METHOD.into())));
         actor.resolve_uncertain_input();
@@ -2823,7 +3147,7 @@ fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
     // its journal gives for good, as for an input it retired, ends the
     // asking at once, and new input is refused for the conversation.
     std::fs::remove_file(&socket).unwrap();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let refuse = |actor: &RemoteActor, refusal: &str| {
         backdate(actor);
         {
@@ -2923,12 +3247,12 @@ fn new_input_stops_waiting_on_a_helper_that_never_answers() {
         );
     }
     // A wedged helper takes the request and never answers it.
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let accept = |listener: &UnixListener| {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            match listener.accept() {
+            match crate::descriptor::accept(listener) {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false).unwrap();
                     return stream;
@@ -3048,7 +3372,7 @@ impl ServedHelper {
                 while !stop.load(Ordering::Acquire) {
                     let mut fixture = fixture.lock().unwrap();
                     fixture.server.finish_inputs();
-                    let control = match fixture.server.listener.accept() {
+                    let control = match crate::descriptor::accept(&fixture.server.listener) {
                         Ok((control, _)) => control,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             drop(fixture);
@@ -3362,6 +3686,7 @@ fn lost_input_reply_keeps_the_original_envelope_and_fences_new_input() {
     assert!(actor.pending_inputs().is_empty());
     assert_eq!(*actor.0.input_sequence.lock().unwrap(), 2);
 }
+#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn adopted_real_helper_reclaims_prior_acknowledgements_before_more_than_capacity_commands() {
     if crate::retained_fixture::run_isolated() {

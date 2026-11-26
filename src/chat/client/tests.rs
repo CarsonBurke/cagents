@@ -2,6 +2,20 @@ use super::fixture::{host_proof, restore_with_lineage};
 use super::*;
 
 #[test]
+fn chat_read_timeout_reset_preserves_a_closed_peers_buffered_data() {
+    use std::io::{Read as _, Write as _};
+    let (mut client, mut peer) = UnixStream::pair().unwrap();
+    set_chat_timeouts(&client).unwrap();
+    peer.write_all(b"last frame").unwrap();
+    drop(peer);
+
+    crate::descriptor::set_read_timeout_or_hangup(&client, None).unwrap();
+    let mut bytes = Vec::new();
+    client.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"last frame");
+}
+
+#[test]
 fn active_model_sidechannel_survives_snapshots_patches_and_hidden_publications() {
     let publications = Publications::new(Snapshot {
         generation: 4,
@@ -2902,15 +2916,17 @@ fn canonical_upgrade_requires_exact_lineage_before_attach_and_never_starts() {
             live = host_proof("unexpected-live");
         }
         let (client, mut server) = UnixStream::pair().unwrap();
+        // XNU can reject socket options once the client closes. Arm the
+        // fixture's deadlines while both ends are still open.
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let original = source.clone();
         let canonical = expected.clone();
         let worker = thread::spawn(move || {
-            server
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            server
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
             let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
             let mut requests = Vec::new();
             while let Some(request) = codec.read::<ClientEnvelope>(&mut server).unwrap() {
@@ -7023,7 +7039,7 @@ fn starting_a_chat_connects_to_the_daemon_once() {
             .mode(0o700)
             .create(&paths.directory)
             .unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let listener = crate::descriptor::bind(&paths.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let returned = Arc::new(AtomicBool::new(false));
         let chat_returned = returned.clone();
@@ -7031,7 +7047,7 @@ fn starting_a_chat_connects_to_the_daemon_once() {
             // Every connection the chat made, read until it closed each.
             let mut connections: Vec<thread::JoinHandle<_>> = Vec::new();
             loop {
-                match listener.accept() {
+                match crate::descriptor::accept(&listener) {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(false).unwrap();
                         let live = host_proof("current");

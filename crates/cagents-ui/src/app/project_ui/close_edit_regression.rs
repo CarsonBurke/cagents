@@ -100,7 +100,7 @@ fn isolated(name: &str, case: Case) {
         return;
     }
     let directory = tempfile::tempdir().unwrap();
-    for leaf in ["config", "data", "state", "cache", "runtime"] {
+    for leaf in ["home", "config", "data", "state", "cache", "runtime"] {
         use std::os::unix::fs::PermissionsExt;
         let path = directory.path().join(leaf);
         std::fs::create_dir(&path).unwrap();
@@ -115,6 +115,7 @@ fn isolated(name: &str, case: Case) {
         std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env(CHILD, name)
+            .env("HOME", directory.path().join("home"))
             .env("XDG_CONFIG_HOME", directory.path().join("config"))
             .env("XDG_DATA_HOME", directory.path().join("data"))
             .env("XDG_STATE_HOME", directory.path().join("state"))
@@ -340,8 +341,11 @@ fn type_in_mounted_editor(
 }
 
 async fn run(case: Case, renderer: cosmic::Renderer) {
-    // All path-dependent helpers below must remain inside the child's XDG roots.
+    // All path-dependent helpers below stay inside the child's fixture roots.
+    #[cfg(target_os = "linux")]
     let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+    #[cfg(target_os = "macos")]
+    let data = PathBuf::from(std::env::var_os("HOME").unwrap()).join("Library/Application Support");
     let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
     std::fs::create_dir_all(&runtime).unwrap();
     assert!(

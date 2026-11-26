@@ -12,11 +12,14 @@ use crate::agent::Provider;
 
 const MAX_HINT_BYTES: usize = 16 * 1024;
 const MAX_ARGV_BYTES: usize = 8 * 1024;
+#[cfg(feature = "host")]
+const MAX_OBSERVED_ARGV_BYTES: usize =
+    MAX_ARGV_BYTES + crate::chat::protocol::claude::MAX_INLINE_ATTRIBUTION + 16;
 
 /// Host-only activity evidence, separate from normalized recovery authority.
 #[cfg(feature = "host")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentProcess {
+pub struct AgentProcess {
     pub pid: i32,
     pub start: u64,
     pub provider: Provider,
@@ -225,6 +228,133 @@ fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<Launc
     })
 }
 
+#[cfg(feature = "host")]
+pub(crate) const CLAUDE_ATTRIBUTION_OVERLAY: &str = "CAGENTS_CLAUDE_ATTRIBUTION_OVERLAY";
+
+#[cfg(feature = "host")]
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ClaudeAttributionOverlay {
+    pub position: usize,
+    pub argument: String,
+    pub original: Vec<String>,
+}
+
+/// Resolve the managed preference at the spawn boundary and keep it out of
+/// the recipe used for the next restore. Explicit attribution wins.
+#[cfg(feature = "host")]
+pub(crate) fn claude_attribution_overlay(
+    launch: &LaunchRecipe,
+) -> Option<ClaudeAttributionOverlay> {
+    claude_attribution_overlay_with(launch, crate::chat::protocol::claude::managed_attribution)
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn claude_attribution_overlay_with(
+    launch: &LaunchRecipe,
+    attribution: impl FnOnce(&LaunchRecipe, &str) -> Option<serde_json::Value>,
+) -> Option<ClaudeAttributionOverlay> {
+    let provider = Provider::Claude;
+    if Provider::from_program(&launch.program) != Some(provider) {
+        return None;
+    }
+    let recipe = interactive_recipe(launch, Selector::Fresh)
+        .or_else(|| interactive_recipe(launch, Selector::Picker))?;
+    let mut sources = "user,project,local";
+    let mut explicit = None;
+    let mut arguments = launch.arguments.iter().enumerate().peekable();
+    while let Some((position, argument)) = arguments.next() {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(key, value)| (key, Some(value)));
+        if provider.is_identity_option(flag) {
+            if inline.is_none() {
+                arguments.next_if(|(_, value)| !value.starts_with('-'));
+            }
+        } else if provider.is_value_option(flag) || provider.is_cwd_option(flag) {
+            let (value, length) = match inline {
+                Some(value) => (value, 1),
+                None => (arguments.next()?.1.as_str(), 2),
+            };
+            match flag {
+                "--settings" => explicit = Some((position, length, value)),
+                "--setting-sources" => sources = value,
+                _ => {}
+            }
+        }
+    }
+    let (position, original) = explicit.map_or((0, Vec::new()), |(position, length, _)| {
+        (
+            position,
+            launch.arguments[position..position + length].to_vec(),
+        )
+    });
+    if launch_argv_bytes(launch) > MAX_ARGV_BYTES {
+        return None;
+    }
+    let value = crate::chat::protocol::claude::launch_attribution_argument(
+        explicit.map(|(_, _, value)| value),
+        || attribution(&recipe, sources),
+        crate::chat::protocol::claude::prepare_terminal_attribution_directory,
+    )?;
+    Some(ClaudeAttributionOverlay {
+        position,
+        argument: format!("--settings={value}"),
+        original,
+    })
+}
+
+#[cfg(feature = "host")]
+fn launch_argv_bytes(launch: &LaunchRecipe) -> usize {
+    std::iter::once(&launch.program)
+        .chain(&launch.arguments)
+        .map(|argument| argument.len() + 1)
+        .sum()
+}
+
+#[cfg(feature = "host")]
+fn restore_claude_attribution(launch: &mut LaunchRecipe, environment: &[u8]) {
+    let Some((Provider::Claude, arguments)) = Provider::launched(launch) else {
+        return;
+    };
+    let Some(overlay) = environment.split(|byte| *byte == 0).find_map(|entry| {
+        let json = entry
+            .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())?
+            .strip_prefix(b"=")?;
+        serde_json::from_slice::<ClaudeAttributionOverlay>(json).ok()
+    }) else {
+        return;
+    };
+    if arguments.get(overlay.position) != Some(&overlay.argument) {
+        return;
+    }
+    let inline = match overlay.original.as_slice() {
+        [] => None,
+        [joined] => match joined.strip_prefix("--settings=") {
+            Some(value) => Some(value),
+            None => return,
+        },
+        [flag, value] if flag == "--settings" => Some(value.as_str()),
+        _ => return,
+    };
+    let Some(value) = crate::chat::protocol::claude::decode_attribution_argument(&overlay.argument)
+    else {
+        return;
+    };
+    let Some(generated) = serde_json::from_str::<serde_json::Value>(&value)
+        .ok()
+        .and_then(|settings| settings.get("attribution").cloned())
+    else {
+        return;
+    };
+    let expected = crate::chat::protocol::claude::attribution_settings(inline, || Some(generated));
+    if expected.as_deref() == Some(value.as_str()) {
+        // An interpreter, when present, owns argv[1]. The recorded
+        // position is relative to the provider's own arguments.
+        let index = launch.arguments.len() - arguments.len() + overlay.position;
+        launch.arguments.splice(index..=index, overlay.original);
+    }
+}
+
 /// Bind provider-confirmed identity while discarding already-consumed prompts.
 /// Unknown options remain a hard refusal, especially permission/account flags.
 pub fn bind_session(launch: &LaunchRecipe, id: &str) -> Option<LaunchRecipe> {
@@ -331,10 +461,20 @@ fn bounded_read(path: impl AsRef<Path>, limit: usize) -> Option<Vec<u8>> {
 }
 
 pub fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
-    let stat = std::str::from_utf8(stat).ok()?;
-    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let mut fields = process_stat_fields(stat)?;
     let group = fields.nth(2)?.parse().ok()?;
     Some((group, fields.nth(16)?.parse().ok()?))
+}
+
+pub(crate) fn process_stat_fields(stat: &[u8]) -> Option<std::str::SplitAsciiWhitespace<'_>> {
+    // The command name can contain arbitrary bytes. The fields after it
+    // contain the process identity.
+    let name_end = stat.iter().rposition(|&byte| byte == b')')?;
+    Some(
+        std::str::from_utf8(&stat[name_end + 1..])
+            .ok()?
+            .split_ascii_whitespace(),
+    )
 }
 
 /// Cheap liveness check for a previously discovered process. This is not launch
@@ -344,9 +484,170 @@ pub fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
 pub(crate) fn process_in_foreground(process: &AgentProcess, group: i32) -> bool {
     process.pid > 0
         && group > 0
-        && bounded_read(format!("/proc/{}/stat", process.pid), 4096)
-            .and_then(|stat| process_identity(&stat))
-            == Some((group, process.start))
+        && ProcessView::native(process.pid).identity() == Some((group, process.start))
+}
+
+#[cfg(feature = "host")]
+enum ProcessView {
+    #[cfg(any(target_os = "linux", test))]
+    Proc(std::path::PathBuf),
+    #[cfg(target_os = "macos")]
+    Darwin(u32),
+}
+
+#[cfg(feature = "host")]
+impl ProcessView {
+    fn native(pid: i32) -> Self {
+        #[cfg(target_os = "linux")]
+        return Self::Proc(Path::new("/proc").join(pid.to_string()));
+        #[cfg(target_os = "macos")]
+        return Self::Darwin(pid as u32);
+    }
+
+    fn is_darwin(&self) -> bool {
+        match self {
+            #[cfg(any(target_os = "linux", test))]
+            Self::Proc(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::Darwin(_) => true,
+        }
+    }
+
+    fn identity(&self) -> Option<(i32, u64)> {
+        match self {
+            #[cfg(any(target_os = "linux", test))]
+            Self::Proc(root) => process_identity(&bounded_read(root.join("stat"), 4096)?),
+            #[cfg(target_os = "macos")]
+            &Self::Darwin(pid) => {
+                let record = crate::process::table::record(pid as i32).ok()?;
+                (record.bsd.pbsi_status != libc::SZOMB)
+                    .then_some((record.bsd.pbsi_pgid as i32, record.start?))
+            }
+        }
+    }
+
+    fn launch(&self) -> Option<ProcessLaunch> {
+        match self {
+            #[cfg(any(target_os = "linux", test))]
+            Self::Proc(root) => Some(ProcessLaunch {
+                arguments: bounded_read(root.join("cmdline"), MAX_OBSERVED_ARGV_BYTES)?,
+                directory: fs::read_link(root.join("cwd")).ok()?,
+                environment: self.environment(),
+            }),
+            #[cfg(target_os = "macos")]
+            &Self::Darwin(pid) => {
+                let observed = crate::process::inspect::arguments(pid).ok()?;
+                let arguments = observed.command_line();
+                let environment = process_environment(observed);
+                (arguments.len() <= MAX_OBSERVED_ARGV_BYTES).then_some(())?;
+                Some(ProcessLaunch {
+                    arguments,
+                    directory: crate::process::inspect::working_directory(pid).ok()?,
+                    environment,
+                })
+            }
+        }
+    }
+
+    fn environment(&self) -> Option<Vec<u8>> {
+        match self {
+            #[cfg(any(target_os = "linux", test))]
+            Self::Proc(root) => bounded_read(
+                root.join("environ"),
+                MAX_PROCESS_ENVIRONMENT + MAX_ATTRIBUTION_MARKER_BYTES,
+            )
+            .and_then(bounded_process_environment),
+            #[cfg(target_os = "macos")]
+            &Self::Darwin(pid) => {
+                process_environment(crate::process::inspect::arguments(pid).ok()?)
+            }
+        }
+    }
+
+    fn children(&self, pid: i32) -> Option<Vec<i32>> {
+        match self {
+            #[cfg(any(target_os = "linux", test))]
+            Self::Proc(root) => {
+                let bytes = bounded_read(root.join(format!("task/{pid}/children")), 4096)?;
+                std::str::from_utf8(&bytes)
+                    .ok()?
+                    .split_whitespace()
+                    .map(|child| child.parse().ok())
+                    .collect()
+            }
+            #[cfg(target_os = "macos")]
+            &Self::Darwin(_) => crate::pinned_process::children_of(pid as u32)
+                .ok()?
+                .into_iter()
+                .map(|pid| i32::try_from(pid).ok())
+                .collect(),
+        }
+    }
+
+    fn executable(&self, _start: u64) -> Option<std::path::PathBuf> {
+        match self {
+            #[cfg(any(target_os = "linux", test))]
+            Self::Proc(root) => fs::read_link(root.join("exe")).ok(),
+            #[cfg(target_os = "macos")]
+            &Self::Darwin(pid) => crate::pinned_process::PinnedProcess::open_started(pid, _start)
+                .ok()?
+                .executable()
+                .ok(),
+        }
+    }
+}
+
+#[cfg(all(feature = "host", target_os = "macos"))]
+fn process_environment(observed: crate::process::inspect::Arguments) -> Option<Vec<u8>> {
+    // XNU can return valid argv and withhold the entire environment for
+    // restricted executables. Empty bytes cannot establish account settings.
+    if observed.environment.is_empty() {
+        return None;
+    }
+    bounded_process_environment(observed.environ())
+}
+
+#[cfg(feature = "host")]
+const MAX_PROCESS_ENVIRONMENT: usize = 128 * 1024;
+
+#[cfg(feature = "host")]
+const MAX_ATTRIBUTION_MARKER_BYTES: usize = 96 * 1024;
+
+#[cfg(feature = "host")]
+fn bounded_process_environment(environment: Vec<u8>) -> Option<Vec<u8>> {
+    if environment.len() <= MAX_PROCESS_ENVIRONMENT {
+        return Some(environment);
+    }
+    if environment.len() > MAX_PROCESS_ENVIRONMENT + MAX_ATTRIBUTION_MARKER_BYTES {
+        return None;
+    }
+    // Preserve the existing budget for the process's own environment. The
+    // exact generated setting is verified separately before argv is restored.
+    let mut entries = environment
+        .split_inclusive(|byte| *byte == 0)
+        .filter(|entry| {
+            entry
+                .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())
+                .and_then(|value| value.strip_prefix(b"="))
+                .is_some_and(|json| {
+                    serde_json::from_slice::<ClaudeAttributionOverlay>(
+                        json.strip_suffix(&[0]).unwrap_or(json),
+                    )
+                    .is_ok()
+                })
+        });
+    let marker = entries.next()?;
+    if entries.next().is_some() || environment.len() - marker.len() > MAX_PROCESS_ENVIRONMENT {
+        return None;
+    }
+    Some(environment)
+}
+
+#[cfg(feature = "host")]
+struct ProcessLaunch {
+    arguments: Vec<u8>,
+    directory: std::path::PathBuf,
+    environment: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "host")]
@@ -354,38 +655,97 @@ pub(crate) fn process_in_foreground(process: &AgentProcess, group: i32) -> bool 
 enum SessionIdentity {
     Exact(String),
     /// The provider explicitly published a never-materialized session boundary.
+    #[cfg(any(target_os = "linux", test))]
     Fresh(std::path::PathBuf),
     Ambiguous,
 }
 
 #[cfg(feature = "host")]
-fn runtime_identity(
-    root: &Path,
+fn process_runtime_identity(
+    process: &ProcessView,
     pid: i32,
     launch: &LaunchRecipe,
     start: u64,
 ) -> Option<SessionIdentity> {
     let provider = Provider::from_program(&launch.program)?;
-    let session_root = provider.session_root(launch)?;
-    if provider == Provider::Omp
-        && let Some(identity) = omp_terminal_identity(root, launch, start)
-    {
-        return Some(identity);
+    let Some(session_root) = provider.session_root(launch) else {
+        return process.is_darwin().then_some(SessionIdentity::Ambiguous);
+    };
+    match process {
+        #[cfg(any(target_os = "linux", test))]
+        ProcessView::Proc(root) if provider == Provider::Omp => {
+            if let Some(identity) = omp_terminal_identity(root, pid, launch, start) {
+                return Some(identity);
+            }
+        }
+        _ => {}
     }
     if provider == Provider::Claude
         && let Some(identity) = claude_process_identity(&session_root, pid, launch, start)
     {
         return Some(identity);
     }
-    let mut identity = None;
     // The kernel reports open files by their resolved path, and a session root
     // is often a symbolic link, such as a dotfiles checkout linked into HOME.
     let expected = session_root.join(provider.session_directory());
     let expected = fs::canonicalize(&expected).unwrap_or(expected);
+    match process {
+        #[cfg(any(target_os = "linux", test))]
+        ProcessView::Proc(root) => linux_session_file(root, provider, &expected),
+        #[cfg(target_os = "macos")]
+        &ProcessView::Darwin(pid) => darwin_session_file(pid, provider, &expected),
+    }
+}
+
+#[cfg(all(feature = "host", test))]
+fn runtime_identity(
+    root: &Path,
+    pid: i32,
+    launch: &LaunchRecipe,
+    start: u64,
+) -> Option<SessionIdentity> {
+    process_runtime_identity(&ProcessView::Proc(root.to_owned()), pid, launch, start)
+}
+
+#[cfg(all(feature = "host", target_os = "macos"))]
+fn darwin_session_file(pid: u32, provider: Provider, expected: &Path) -> Option<SessionIdentity> {
+    // OMP's Linux controlling-terminal marker has no equivalent here. A
+    // resume argument may refer to an earlier session, so a missing writable
+    // transcript allows recognition but never confirms that argument.
+    let Ok(files) = crate::process::inspect::observed_open_files(pid, 256) else {
+        return Some(SessionIdentity::Ambiguous);
+    };
+    let mut identity = None;
+    for file in files
+        .into_iter()
+        .filter(|file| file.writable && file.regular)
+    {
+        if !file.path.is_absolute() {
+            return Some(SessionIdentity::Ambiguous);
+        }
+        if file.path.starts_with(expected)
+            && let Some(id) = provider.session_file_id(&file.path)
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !fs::metadata(&file.path)
+                .is_ok_and(|metadata| metadata.dev() == file.device && metadata.ino() == file.inode)
+                || identity.as_ref().is_some_and(|previous| previous != &id)
+            {
+                return Some(SessionIdentity::Ambiguous);
+            }
+            identity = Some(id);
+        }
+    }
+    Some(identity.map_or(SessionIdentity::Ambiguous, SessionIdentity::Exact))
+}
+
+#[cfg(all(feature = "host", any(target_os = "linux", test)))]
+fn linux_session_file(root: &Path, provider: Provider, expected: &Path) -> Option<SessionIdentity> {
     let entries = match fs::read_dir(root.join("fd")) {
         Ok(entries) => entries,
         Err(_) => return Some(SessionIdentity::Ambiguous),
     };
+    let mut identity = None;
     for (index, entry) in entries.enumerate() {
         if index == 256 {
             return Some(SessionIdentity::Ambiguous);
@@ -396,7 +756,7 @@ fn runtime_identity(
         let Ok(path) = fs::read_link(entry.path()) else {
             return Some(SessionIdentity::Ambiguous);
         };
-        if !path.starts_with(&expected) {
+        if !path.starts_with(expected) {
             continue;
         }
         let Some(info) = bounded_read(root.join("fdinfo").join(entry.file_name()), 4096) else {
@@ -468,29 +828,10 @@ fn claude_process_identity(
     Some(identity.unwrap_or(SessionIdentity::Ambiguous))
 }
 
-/// When, by the wall clock, a process started that started `start` clock
-/// ticks after boot, as `/proc/<pid>/stat` states it.
-#[cfg(feature = "host")]
-pub(crate) fn process_started(start: u64) -> Option<std::time::SystemTime> {
-    // SAFETY: sysconf has no pointer arguments; CLOCK_BOOTTIME writes to ts.
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if ticks <= 0 || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
-        return None;
-    }
-    let uptime = std::time::Duration::new(ts.tv_sec.try_into().ok()?, ts.tv_nsec.try_into().ok()?);
-    let age = uptime.checked_sub(std::time::Duration::from_secs_f64(
-        start as f64 / ticks as f64,
-    ))?;
-    std::time::SystemTime::now().checked_sub(age)
-}
-
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", any(target_os = "linux", test)))]
 fn omp_terminal_identity(
     root: &Path,
+    pid: i32,
     launch: &LaunchRecipe,
     start: u64,
 ) -> Option<SessionIdentity> {
@@ -505,7 +846,7 @@ fn omp_terminal_identity(
         .join("terminal-sessions")
         .join(format!("pts-{tty}"));
     let modified = fs::metadata(&marker).ok()?.modified().ok()?;
-    if modified < process_started(start)? {
+    if modified < crate::process::clock::started_at(u32::try_from(pid).ok()?, start)? {
         return None;
     }
     let identity = (|| {
@@ -559,8 +900,8 @@ fn omp_terminal_identity(
 
 /// Absence of a saved file alone is never evidence of a fresh conversation.
 /// Only the exact, current controlling-terminal marker can authorize this path.
-#[cfg(feature = "host")]
-pub(crate) fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::PathBuf> {
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::PathBuf> {
     if process.provider != Provider::Omp {
         return None;
     }
@@ -568,10 +909,16 @@ pub(crate) fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::Pat
     if process_identity(&bounded_read(root.join("stat"), 4096)?)?.1 != process.start {
         return None;
     }
-    match omp_terminal_identity(&root, &process.recovery, process.start)? {
+    match omp_terminal_identity(&root, process.pid, &process.recovery, process.start)? {
         SessionIdentity::Fresh(path) => Some(path),
         _ => None,
     }
+}
+
+/// Darwin exposes no matching Linux OMP controlling-terminal receipt.
+#[cfg(all(feature = "host", target_os = "macos"))]
+pub fn fresh_omp_session(_process: &AgentProcess) -> Option<std::path::PathBuf> {
+    None
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
@@ -803,7 +1150,7 @@ fn persistable_environment_entry(name: &str, value: &str) -> bool {
 /// A fresh native process uses the selected provider's configuration, never the
 /// launching harness's tool bridge, artifact scope, or terminal/session identity.
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn fresh_environment_key(
+pub fn fresh_environment_key(
     provider: Provider,
     name: &str,
     value: &str,
@@ -1045,7 +1392,7 @@ fn check_environment_removals(bytes: &[u8], recipe: &LaunchRecipe) -> Result<(),
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn native_environment(
+pub fn native_environment(
     process: &AgentProcess,
     explicit: &std::collections::BTreeMap<String, String>,
     transient: Option<&std::collections::BTreeMap<String, String>>,
@@ -1056,12 +1403,13 @@ pub(crate) fn native_environment(
     ),
     String,
 > {
-    let root = std::path::PathBuf::from(format!("/proc/{}", process.pid));
-    let before = bounded_read(root.join("stat"), 4096)
-        .and_then(|bytes| process_identity(&bytes))
+    let view = ProcessView::native(process.pid);
+    let before = view
+        .identity()
         .filter(|(_, start)| *start == process.start)
         .ok_or("The source process changed before reading its execution environment")?;
-    let bytes = bounded_read(root.join("environ"), 128 * 1024)
+    let bytes = view
+        .environment()
         .ok_or("Cannot read the exact source execution environment; no source was stopped")?;
     check_environment_removals(&bytes, &process.recovery)?;
     let unset_environment = crate::account::launch_credential_overrides(&process.recovery);
@@ -1084,9 +1432,7 @@ pub(crate) fn native_environment(
             .ok_or("Daemon execution configuration is not UTF-8; no source was stopped")?;
         check_return_environment_variable(process.provider, &environment, name, value)?;
     }
-    if bounded_read(root.join("stat"), 4096).and_then(|bytes| process_identity(&bytes))
-        != Some(before)
-    {
+    if view.identity() != Some(before) {
         return Err("The source process changed while reading its execution environment".into());
     }
     Ok((durable, environment))
@@ -1101,6 +1447,10 @@ struct ForegroundLaunch {
     /// when unrequested, or when that environment could not be observed
     /// exactly - which must never be completed from the launcher's.
     exact: Option<LaunchRecipe>,
+    recognized: Option<Provider>,
+    native_agent: bool,
+    forwarding_launcher: bool,
+    runtime_environment: bool,
     start: u64,
     group: i32,
 }
@@ -1110,28 +1460,38 @@ struct ForegroundLaunch {
 /// their environment, so resolving them from separate reads doubled the
 /// largest read in a descent - `environ`, up to 128 KiB - for no new fact.
 #[cfg(feature = "host")]
-fn read_process_launch(root: &Path, request: ForegroundRequest<'_>) -> Option<ForegroundLaunch> {
-    let before = process_identity(&bounded_read(root.join("stat"), 4096)?)?;
-    let bytes = bounded_read(root.join("cmdline"), MAX_ARGV_BYTES)?;
+fn read_process_launch(
+    view: &ProcessView,
+    request: ForegroundRequest<'_>,
+) -> Option<ForegroundLaunch> {
+    let before = view.identity()?;
+    let ProcessLaunch {
+        arguments: bytes,
+        directory: working_directory,
+        environment: environ,
+    } = view.launch()?;
     let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
     let mut argv = bytes
         .split(|byte| *byte == 0)
         .map(|arg| std::str::from_utf8(arg).map(str::to_owned));
     let program = argv.next()?.ok()?;
     let arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
-    let working_directory = fs::read_link(root.join("cwd")).ok()?;
-    let environ = bounded_read(root.join("environ"), 128 * 1024);
     // A recipe saved before parent sessions were withheld may still name one.
     let mut inherited = request.hint.map(|base| {
         let mut environment = base.environment.clone();
         environment.retain(|name, _| !crate::agent::is_session_variable(name));
+        if view.is_darwin() && environ.is_some() {
+            // Preserve the explicit account policy below, but the observed
+            // environment must also own the absence of runtime settings.
+            environment.retain(|name, _| !observation_environment_key(name));
+        }
         environment
     });
     // Recovery retains its existing fallback. Activity requires the actual
     // allowlisted environment: missing keys must not inherit terminal
     // overrides, and an argv that long is not an agent invocation.
-    let mut exact = (request.agent && arguments.len() <= 128 && environ.is_some())
-        .then(std::collections::BTreeMap::new);
+    let mut exact = (request.agent && environ.is_some()).then(std::collections::BTreeMap::new);
+    let mut runtime_environment = !view.is_darwin() || environ.is_some();
     if let Some(bytes) = &environ {
         for entry in bytes.split(|byte| *byte == 0) {
             let Some(index) = entry.iter().position(|byte| *byte == b'=') else {
@@ -1154,7 +1514,10 @@ fn read_process_launch(root: &Path, request: ForegroundRequest<'_>) -> Option<Fo
                 }
                 // A key the process holds but we cannot decode is a gap in
                 // exact evidence, not a value to fall back on.
-                Err(_) => exact = None,
+                Err(_) => {
+                    exact = None;
+                    runtime_environment &= !view.is_darwin();
+                }
             }
         }
     }
@@ -1165,28 +1528,41 @@ fn read_process_launch(root: &Path, request: ForegroundRequest<'_>) -> Option<Fo
         .hint
         .map(|base| base.unset_environment.clone())
         .unwrap_or_default();
-    let inherited = inherited.map(|environment| LaunchRecipe {
-        unset_environment: unset_environment.clone(),
-        program: program.clone(),
-        arguments: arguments.clone(),
-        working_directory: working_directory.clone(),
-        environment,
-    });
-    let exact = exact.map(|environment| LaunchRecipe {
+    let mut raw = LaunchRecipe {
         unset_environment,
         program,
         arguments,
         working_directory,
+        environment: Default::default(),
+    };
+    if let Some(environ) = &environ {
+        restore_claude_attribution(&mut raw, environ);
+    }
+    if launch_argv_bytes(&raw) > MAX_ARGV_BYTES {
+        return None;
+    }
+    if raw.arguments.len() > 128 {
+        exact = None;
+    }
+    let recognized = Provider::recognize_launch(&raw);
+    let native_agent = Provider::from_program(&raw.program).is_some();
+    let forwarding_launcher = Provider::is_interpreter(&raw.program)
+        && recognized.is_some_and(Provider::forwards_to_native_child);
+    let inherited = inherited.map(|environment| LaunchRecipe {
         environment,
+        ..raw.clone()
     });
-    (before == process_identity(&bounded_read(root.join("stat"), 4096)?)?).then_some(
-        ForegroundLaunch {
-            inherited,
-            exact,
-            start: before.1,
-            group: before.0,
-        },
-    )
+    let exact = exact.map(|environment| LaunchRecipe { environment, ..raw });
+    (before == view.identity()?).then_some(ForegroundLaunch {
+        inherited,
+        exact,
+        recognized,
+        native_agent,
+        forwarding_launcher,
+        runtime_environment,
+        start: before.1,
+        group: before.0,
+    })
 }
 
 /// Which halves of a foreground observation a descent must resolve. A half
@@ -1291,7 +1667,7 @@ fn foreground_group(pid: libc::pid_t) -> Option<i32> {
     if pid <= 0 {
         return None;
     }
-    let (group, _) = process_identity(&bounded_read(format!("/proc/{pid}/stat"), 4096)?)?;
+    let (group, _) = ProcessView::native(pid).identity()?;
     Some(group)
 }
 
@@ -1321,7 +1697,7 @@ pub(crate) fn foreground_observation(
         return ForegroundObservation::default();
     };
     let evidence = walk_foreground(
-        Path::new("/proc"),
+        &ProcessView::native,
         pid,
         group,
         &mut 64,
@@ -1343,9 +1719,20 @@ pub(crate) fn foreground_agent(pid: libc::pid_t) -> Option<AgentProcess> {
     #[cfg(test)]
     FOREGROUND_AGENT_OBSERVATIONS.with(|count| count.set(count.get() + 1));
     let group = foreground_group(pid)?;
-    inspect_agent_process(Path::new("/proc"), pid, group, &mut 64)
-        .ok()
-        .flatten()
+    walk_foreground(
+        &ProcessView::native,
+        pid,
+        group,
+        &mut 64,
+        ForegroundRequest {
+            hint: None,
+            agent: true,
+        },
+    )
+    .agent
+    .resolve()
+    .ok()
+    .flatten()
 }
 
 #[cfg(all(test, feature = "host"))]
@@ -1354,7 +1741,7 @@ thread_local! {
     pub(crate) static FOREGROUND_AGENT_OBSERVATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(feature = "host")]
+#[cfg(all(test, feature = "host"))]
 fn inspect_agent_process(
     proc_root: &Path,
     pid: i32,
@@ -1362,7 +1749,7 @@ fn inspect_agent_process(
     remaining: &mut usize,
 ) -> Result<Option<AgentProcess>, ()> {
     walk_foreground(
-        proc_root,
+        &|pid| ProcessView::Proc(proc_root.join(pid.to_string())),
         pid,
         group,
         remaining,
@@ -1386,7 +1773,7 @@ fn inspect_process(
     remaining: &mut usize,
 ) -> Result<Option<String>, ()> {
     walk_foreground(
-        proc_root,
+        &|pid| ProcessView::Proc(proc_root.join(pid.to_string())),
         pid,
         group,
         remaining,
@@ -1401,7 +1788,7 @@ fn inspect_process(
 
 #[cfg(feature = "host")]
 fn agent_observation(
-    root: &Path,
+    view: &ProcessView,
     pid: i32,
     mut launch: LaunchRecipe,
     start: u64,
@@ -1410,8 +1797,9 @@ fn agent_observation(
     let recovery = Provider::normalize_launch(launch.clone()).ok_or(())?;
     // Recognition uses argv, execution uses the actual installation. Native
     // Claude installations can have a version-only exe basename.
-    launch.program = fs::read_link(root.join("exe"))
-        .map_err(|_| ())?
+    launch.program = view
+        .executable(start)
+        .ok_or(())?
         .to_str()
         .ok_or(())?
         .to_owned();
@@ -1426,7 +1814,7 @@ fn agent_observation(
 
 #[cfg(feature = "host")]
 fn walk_foreground(
-    proc_root: &Path,
+    view_process: &impl Fn(i32) -> ProcessView,
     pid: i32,
     group: i32,
     remaining: &mut usize,
@@ -1436,12 +1824,12 @@ fn walk_foreground(
         return ForegroundEvidence::failed();
     };
     *remaining = left;
-    let root = proc_root.join(pid.to_string());
-    let Some(launch) = read_process_launch(&root, request) else {
+    let view = view_process(pid);
+    let Some(launch) = read_process_launch(&view, request) else {
         return ForegroundEvidence::failed();
     };
     let mut evidence = ForegroundEvidence::missing();
-    if request.agent && launch.exact.is_none() {
+    if request.agent && launch.exact.is_none() && !view.is_darwin() {
         // Activity evidence is exact or it is nothing: an environment we
         // cannot read exactly is a gap in this subtree, never an absence.
         evidence.agent = Half::Failed;
@@ -1449,39 +1837,35 @@ fn walk_foreground(
     if launch.group != group {
         return evidence;
     }
-    // Structure decisions read argv, which every view of the launch shares.
-    let Some(raw) = launch.inherited.as_ref().or(launch.exact.as_ref()) else {
+    // System launchers on Darwin may expose argv without their environment.
+    // Inspect their children before requiring exact provider settings.
+    if !view.is_darwin() && launch.inherited.is_none() && launch.exact.is_none() {
         return ForegroundEvidence::failed();
-    };
-    let interpreter = Provider::is_interpreter(&raw.program);
-    let native_agent = Provider::from_program(&raw.program).is_some();
-    let recognized = Provider::recognize_launch(raw);
-    if native_agent && recognized.is_none() {
+    }
+    if launch.native_agent && launch.recognized.is_none() {
         return evidence;
     }
     // Claude and OMP run directly inside their JS interpreters and own their
     // tool children just like native agents. Only Codex's recognized JS
     // launcher forwards ownership to a native child.
-    let forwarding_launcher =
-        interpreter && recognized.is_some_and(Provider::forwards_to_native_child);
-    if forwarding_launcher || recognized.is_none() {
-        let Some(bytes) = bounded_read(root.join(format!("task/{pid}/children")), 4096) else {
+    if launch.forwarding_launcher || launch.recognized.is_none() {
+        let Some(children) = view.children(pid) else {
             return ForegroundEvidence::failed();
         };
-        let Ok(children) = std::str::from_utf8(&bytes) else {
-            return ForegroundEvidence::failed();
-        };
-        for child in children.split_whitespace() {
-            let Ok(child) = child.parse() else {
-                return ForegroundEvidence::failed();
-            };
-            evidence.merge(walk_foreground(proc_root, child, group, remaining, request));
+        for child in children {
+            evidence.merge(walk_foreground(
+                view_process,
+                child,
+                group,
+                remaining,
+                request,
+            ));
             if evidence.settled(request) {
                 return evidence;
             }
         }
     }
-    if recognized.is_none() {
+    if launch.recognized.is_none() {
         return evidence;
     }
     // A half a child already answered is never re-observed here: the deepest
@@ -1495,26 +1879,31 @@ fn walk_foreground(
         inherited,
         exact,
         start,
+        runtime_environment,
         ..
     } = launch;
     if observe_hint {
         evidence.hint = match inherited {
-            Some(launch) => observed_half(recovery_observation(&root, pid, launch, start)),
+            Some(launch) => observed_half(recovery_observation(
+                &view,
+                pid,
+                launch,
+                start,
+                runtime_environment,
+            )),
             None => Half::Failed,
         };
     }
     if observe_agent {
         evidence.agent = match exact {
-            Some(launch) => observed_half(agent_observation(&root, pid, launch, start)),
+            Some(launch) => observed_half(agent_observation(&view, pid, launch, start)),
             None => Half::Failed,
         };
     }
     // An observation is only evidence while it still describes the same
     // process: a reused pid would otherwise donate someone else's identity.
     // Halves a child answered are already settled and stay untouched.
-    if process_identity(&bounded_read(root.join("stat"), 4096).unwrap_or_default())
-        != Some((group, start))
-    {
+    if view.identity() != Some((group, start)) {
         if observe_hint {
             evidence.hint = Half::Failed;
         }
@@ -1527,19 +1916,27 @@ fn walk_foreground(
 
 #[cfg(feature = "host")]
 fn recovery_observation(
-    root: &Path,
+    view: &ProcessView,
     pid: i32,
     raw: LaunchRecipe,
     start: u64,
+    runtime_environment: bool,
 ) -> Result<Option<String>, ()> {
     let launch = Provider::normalize_launch(raw).ok_or(())?;
-    let Some(identity) = runtime_identity(root, pid, &launch, start) else {
+    let identity = if runtime_environment {
+        process_runtime_identity(view, pid, &launch, start)
+    } else {
+        Some(SessionIdentity::Ambiguous)
+    };
+    let Some(identity) = identity else {
         return observed_hint_from_launch(&launch).map(Some).ok_or(());
     };
     // An option the resume cannot carry is no reason to forget the agent.
     let bound = match &identity {
         SessionIdentity::Exact(id) => bind_session(&launch, id),
-        SessionIdentity::Fresh(_) | SessionIdentity::Ambiguous => None,
+        #[cfg(any(target_os = "linux", test))]
+        SessionIdentity::Fresh(_) => None,
+        SessionIdentity::Ambiguous => None,
     };
     if let Some(bound) = bound {
         return observed_hint_from_launch(&bound).map(Some).ok_or(());
@@ -2153,7 +2550,7 @@ mod tests {
         ] {
             fs::write(root.join("environ"), bytes).unwrap();
             let observed = read_process_launch(
-                &root,
+                &ProcessView::Proc(root.clone()),
                 ForegroundRequest {
                     hint: Some(&base),
                     agent: true,
@@ -2165,7 +2562,7 @@ mod tests {
         }
         fs::remove_file(root.join("environ")).unwrap();
         let observed = read_process_launch(
-            &root,
+            &ProcessView::Proc(root),
             ForegroundRequest {
                 hint: Some(&base),
                 agent: true,
@@ -2180,6 +2577,104 @@ mod tests {
             observed.exact.is_none(),
             "unreadable environment cannot authorize a native handoff"
         );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn recovery_discards_only_the_marked_claude_attribution_overlay() {
+        let directory = tempfile::tempdir().unwrap();
+        for original_settings in [
+            vec![],
+            vec![r#"--settings={"theme":"dark"}"#],
+            vec!["--settings", r#"{"theme":"dark"}"#],
+        ] {
+            let mut base = launch(
+                "claude",
+                &["--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
+            );
+            base.arguments
+                .extend(original_settings.into_iter().map(str::to_owned));
+            let overlay =
+                claude_attribution_overlay_with(&base, |_, _| Some(serde_json::Value::Bool(false)))
+                    .unwrap();
+            let mut running = base.clone();
+            running.arguments.splice(
+                overlay.position..overlay.position + overlay.original.len(),
+                [overlay.argument.clone()],
+            );
+            let marker = |overlay: &ClaudeAttributionOverlay| {
+                format!(
+                    "{CLAUDE_ATTRIBUTION_OVERLAY}={}\0",
+                    serde_json::to_string(overlay).unwrap()
+                )
+            };
+            let exact = marker(&overlay);
+            let different = marker(&ClaudeAttributionOverlay {
+                argument: r#"--settings={"attribution":true}"#.into(),
+                ..overlay
+            });
+            for (environment, expected) in [
+                (exact, &base),
+                (different, &running),
+                (String::new(), &running),
+            ] {
+                let fixture = tempfile::tempdir_in(directory.path()).unwrap();
+                process_fixture(fixture.path(), 100, &running, &[]);
+                let root = fixture.path().join("100");
+                fs::write(root.join("environ"), environment).unwrap();
+                let observed = read_process_launch(
+                    &ProcessView::Proc(root),
+                    ForegroundRequest {
+                        hint: Some(&base),
+                        agent: true,
+                    },
+                )
+                .unwrap();
+                assert_eq!(observed.inherited.unwrap().arguments, expected.arguments);
+                assert_eq!(observed.exact.unwrap().arguments, expected.arguments);
+            }
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn recovery_accepts_extra_argv_bytes_only_for_a_matching_attribution_overlay() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut base = launch("claude", &["--model", ""]);
+        base.arguments[1] = "x".repeat(MAX_ARGV_BYTES - launch_argv_bytes(&base));
+        assert_eq!(launch_argv_bytes(&base), MAX_ARGV_BYTES);
+        let overlay =
+            claude_attribution_overlay_with(&base, |_, _| Some(serde_json::json!(false))).unwrap();
+        let mut running = base.clone();
+        running
+            .arguments
+            .insert(overlay.position, overlay.argument.clone());
+        assert!(launch_argv_bytes(&running) > MAX_ARGV_BYTES);
+        process_fixture(fixture.path(), 100, &running, &[]);
+        let root = fixture.path().join("100");
+        let request = ForegroundRequest {
+            hint: Some(&base),
+            agent: true,
+        };
+        assert!(read_process_launch(&ProcessView::Proc(root.clone()), request).is_none());
+        let mut environment = b"UNOBSERVED=".to_vec();
+        environment.resize(MAX_PROCESS_ENVIRONMENT - 1, b'x');
+        environment.push(0);
+        environment.extend_from_slice(
+            format!(
+                "{CLAUDE_ATTRIBUTION_OVERLAY}={}\0",
+                serde_json::to_string(&overlay).unwrap()
+            )
+            .as_bytes(),
+        );
+        fs::write(root.join("environ"), environment).unwrap();
+        let request = ForegroundRequest {
+            hint: Some(&base),
+            agent: true,
+        };
+        let observed = read_process_launch(&ProcessView::Proc(root), request).unwrap();
+        assert_eq!(observed.inherited.unwrap().arguments, base.arguments);
+        assert_eq!(observed.exact.unwrap().arguments, base.arguments);
     }
 
     #[cfg(feature = "host")]
@@ -2202,20 +2697,28 @@ mod tests {
         ]
         .into();
         recipe.unset_environment.insert("ANTHROPIC_API_KEY".into());
-        let mut child = std::process::Command::new("/bin/sleep")
+        #[cfg(target_os = "linux")]
+        let sleep = Path::new("/bin/sleep");
+        #[cfg(target_os = "macos")]
+        let temporary = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let sleep = locally_signed_fixture(temporary.path(), "sleep", "/bin/sleep");
+        let mut child = std::process::Command::new(sleep)
             .arg("10")
             .env_clear()
             .envs(&recipe.environment)
             .spawn()
             .unwrap();
         let pid = child.id() as i32;
-        // `spawn` returns as soon as the child stops sharing this process's
-        // memory. Until its exec completes, `/proc` shows it with this image
-        // and environment, then with the new image and no environment yet.
-        let own = fs::read_link("/proc/self/exe").unwrap();
+        let view = ProcessView::native(pid);
+        let own = crate::process::current_executable().unwrap();
         let executed = || {
-            fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| image != own)
-                && fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| !environ.is_empty())
+            view.identity()
+                .and_then(|(_, start)| view.executable(start))
+                .is_some_and(|image| image != own)
+                && view
+                    .environment()
+                    .is_some_and(|environ| !environ.is_empty())
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !executed() {
@@ -2223,11 +2726,9 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "the fixture never finished exec"
             );
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let start = process_identity(&fs::read(format!("/proc/{pid}/stat")).unwrap())
-            .unwrap()
-            .1;
+        let start = view.identity().unwrap().1;
         let process = AgentProcess {
             pid,
             start,
@@ -2579,7 +3080,9 @@ mod tests {
         assert_eq!(resume_recipe(&claude).unwrap().arguments, ["--resume", id]);
     }
 
-    #[cfg(feature = "host")]
+    // The fixture stands in for /proc, which Darwin lacks; there started_at
+    // asks the live kernel about the fixture's pid instead.
+    #[cfg(all(feature = "host", target_os = "linux"))]
     #[test]
     fn runtime_identity_is_bound_to_this_terminal_not_a_recent_session() {
         use std::os::unix::fs::symlink;
@@ -2725,7 +3228,7 @@ mod tests {
     #[test]
     fn a_linked_session_root_still_identifies_the_open_conversation() {
         use std::os::unix::fs::symlink;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let root = directory.path().join("proc");
         fs::create_dir_all(root.join("fd")).unwrap();
         fs::create_dir_all(root.join("fdinfo")).unwrap();
@@ -2738,7 +3241,10 @@ mod tests {
             .environment
             .insert("HOME".into(), directory.path().to_str().unwrap().into());
         symlink(
-            dotfiles.join(format!("sessions/2026/09/23/rollout-2026-09-23-{id}.jsonl")),
+            dotfiles
+                .canonicalize()
+                .unwrap()
+                .join(format!("sessions/2026/09/23/rollout-2026-09-23-{id}.jsonl")),
             root.join("fd/3"),
         )
         .unwrap();
@@ -3335,6 +3841,20 @@ mod tests {
         assert!(bind_session(&launch("muse", &["--unknown"]), id).is_none());
     }
 
+    #[cfg(all(feature = "host", target_os = "macos"))]
+    fn locally_signed_fixture(directory: &Path, name: &str, original: &str) -> std::path::PathBuf {
+        // Darwin can withhold the environment of restricted system binaries.
+        let executable = directory.join(name);
+        fs::copy(original, &executable).unwrap();
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        executable
+    }
+
     #[cfg(feature = "host")]
     #[test]
     fn foreground_launcher_recovers_the_native_childs_exact_identity() {
@@ -3360,14 +3880,25 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         let id = "a1b2c3d4-1111-4111-8111-123456789abc";
         let native = directory.path().join("codex");
+        #[cfg(target_os = "linux")]
         std::os::unix::fs::symlink("/bin/cat", &native).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            locally_signed_fixture(directory.path(), "codex", "/bin/cat");
+        }
+        let home = directory.path().join("codex-home");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let transcript = sessions.join(format!("rollout-2026-09-09-{id}.jsonl"));
         // cat blocks opening the FIFO, keeping a controlled argv alive without
         // launching a real agent or reading any user session/conversation.
         let child = Reap(
             Command::new("/bin/sh")
-                .args(["-c", "\"$1\" resume \"$2\" & wait", "launcher"])
+                .args(["-c", "\"$1\" resume \"$2\" 3>>\"$3\" & wait", "launcher"])
                 .arg(&native)
                 .arg(id)
+                .arg(transcript)
+                .env("CODEX_HOME", home)
                 .process_group(0)
                 .current_dir(directory.path())
                 .stdout(Stdio::null())
@@ -3378,22 +3909,26 @@ mod tests {
         let base = launch("/bin/sh", &[]);
         let deadline = Instant::now() + Duration::from_secs(2);
         let recipe = loop {
-            if let Some(recipe) = foreground_observation(child.0.id() as libc::pid_t, &base)
-                .hint
-                .as_deref()
-                .and_then(recipe_from_hint)
-            {
+            let pid = child.0.id() as libc::pid_t;
+            let observation = foreground_observation(pid, &base);
+            if let Some(recipe) = observation.hint.as_deref().and_then(recipe_from_hint) {
+                let agent = foreground_agent(pid).expect("the foreground agent is inspectable");
+                assert_eq!(agent.provider, Provider::Codex);
+                assert!(process_in_foreground(&agent, pid));
                 break recipe;
             }
             assert!(
                 Instant::now() < deadline,
                 "child argv never became available"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(Path::new(&recipe.program), native);
         assert_eq!(recipe.arguments, ["resume", id]);
-        assert_eq!(recipe.working_directory, directory.path());
+        assert_eq!(
+            recipe.working_directory,
+            directory.path().canonicalize().unwrap()
+        );
         drop(child);
         assert!(foreground_observation(0, &base).hint.is_none());
     }

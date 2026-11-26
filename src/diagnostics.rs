@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Component, Path, PathBuf},
@@ -479,21 +479,19 @@ fn c_name(name: &std::ffi::OsStr) -> io::Result<CString> {
     CString::new(name.as_bytes()).map_err(|_| unsafe_path())
 }
 fn open_at(parent: &File, name: &std::ffi::OsStr, flags: i32, mode: u32) -> io::Result<File> {
-    let name = c_name(name)?;
-    // SAFETY: owned descriptor and terminated name; the returned fd is uniquely owned.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            mode,
-        )
-    };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
+    crate::descriptor::openat(
+        parent.as_raw_fd(),
+        &c_name(name)?,
+        flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        libc::mode_t::try_from(mode).map_err(|_| unsafe_path())?,
+    )
+    .map(File::from)
+}
+
+fn sealed_system_link(name: &std::ffi::OsStr) -> bool {
+    let component = Path::new("/").join(name);
+    std::fs::symlink_metadata(&component)
+        .is_ok_and(|metadata| crate::secure_file::is_sealed_system_link(&component, &metadata))
 }
 
 /// Hold every ancestor while descending; a renamed ancestor cannot redirect
@@ -521,6 +519,18 @@ fn directory(path: &Path, create: bool) -> io::Result<File> {
                     parent.sync_all()?;
                 }
                 open_at(&parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+            }
+            Err(error) if index == 1 && sealed_system_link(name) => {
+                // Darwin's `/var` and `/tmp` are fixed links to
+                // `private/<name>` on the sealed system volume; descend there.
+                let private = open_at(
+                    &parent,
+                    "private".as_ref(),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )
+                .map_err(|_| error)?;
+                open_at(&private, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
             }
             Err(error) => return Err(error),
         };
@@ -2308,7 +2318,14 @@ mod process_tests {
 
     #[test]
     fn sink_failure_is_nonfatal_and_reported_once_without_recursive_logging() {
-        for mode in ["unsafe_file", "write_failure"] {
+        // The write failure is forced with RLIMIT_FSIZE, which Darwin does not
+        // enforce on these appends.
+        let modes: &[&str] = if cfg!(target_os = "linux") {
+            &["unsafe_file", "write_failure"]
+        } else {
+            &["unsafe_file"]
+        };
+        for &mode in modes {
             let root = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

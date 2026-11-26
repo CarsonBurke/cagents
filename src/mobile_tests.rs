@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 fn hello(api_min: u32, api_max: u32) -> api::Hello {
     api::Hello {

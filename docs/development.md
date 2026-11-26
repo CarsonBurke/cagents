@@ -45,6 +45,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `dev:browser` | Run the development UI with the embedded browser |
 | `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check and lint one [lane](#feature-boundaries), all targets by default |
 | `check:editor` | Type-check and lint ceditor |
+| `check:macos:cli`, `check:macos:host`, `check:macos:ui` | Type-check and lint one lane for Apple Silicon macOS on the build host, without a Mac; see [macOS](#macos) |
 | `check:dictate`, `test:dictate` | Type-check and lint, or test, the [dictation helper](#feature-boundaries) |
 | `check` | `check:isolation`, then `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:isolation` | Check, without compiling, that each lane resolves only its own dependency graph ([feature boundaries](#feature-boundaries)) |
@@ -181,8 +182,12 @@ enabled. See [Daemon and upgrades](daemon.md#development-instance).
 ## Feature boundaries
 
 The CLI, UI client, and terminal host have separate Cargo feature boundaries.
-The root `cagents` package is the shared library with the `cagents` and
-`cagentsd` binaries. The UI's widgets and views (sessions, sidebar, editor,
+The root `cagents` package is the shared library with the `cagents` binary.
+The daemon (`crates/cagents-host/src/host`) and the `cagentsd` binary are the
+`cagents-host` package in `crates/cagents-host`, which depends on the shared
+library's `host` feature; inside it `crate::chat` and the like name the shared
+library's modules, so the daemon's paths read as they did in the root package.
+Editing the daemon recompiles only that package. The UI's widgets and views (sessions, sidebar, editor,
 settings, diff and document rendering, and the rest outside `app`) are the
 `cagents-ui-kit` package in `crates/cagents-ui-kit`, which depends on the shared
 library's `ui` feature. The application (`crates/cagents-ui/src/app`, the
@@ -247,12 +252,16 @@ downloaded or copied there with `env`, and dictates from
 
 Without arguments, `check:cli`, `check:host`, `check:ui` and `check:browser`
 check all targets, tests included, and `check` runs the first three: what a
-change needs before review. The integrated-browser lane compiles the
+change needs before review. A change to code the shared library compiles only
+for tests (`cfg(test)` or its `test-support` feature) should also run
+`mise run check:host -- --lib --bins`, main's `daemon` lane, which lints the
+library as the daemon ships it. The integrated-browser lane compiles the
 application's tests too, so a test that uses a browserless-only fixture must be
 gated like that fixture.
 Each task runs one `scripts/cargo-gate clippy --locked` command with its lane's
-features, `--no-default-features --features host` for the daemon for example;
-`mise.toml` defines the lanes once. The `ui` lane selects both packages,
+features; `mise.toml` defines the lanes once. The `host` lane selects the
+shared library and the daemon,
+`--package cagents --package cagents-host --features cagents/host`. The `ui` lane selects both packages,
 `--package cagents --package cagents-ui --package cagents-ui-kit --features cagents/ui`,
 and `browser` selects `--package cagents-ui --package cagents-ui-kit --features cagents-ui/browser-protocol-fixture`: the
 integrated browser with the Wayland registry test server its tests use, as main's
@@ -319,7 +328,7 @@ targets:
 
 ```sh
 scripts/cargo-gate build --locked --release --no-default-features --bin cagents
-scripts/cargo-gate build --locked --release --no-default-features --features host --bin cagentsd
+scripts/cargo-gate build --locked --release --no-default-features -p cagents-host --bin cagentsd
 scripts/cargo-gate build --locked --release -p cagents-ui --bin cagents-ui
 ```
 
@@ -499,6 +508,13 @@ without `--instance` unless it runs inside a session through
 nested session cannot put a UI on the user's desktop. It requires a session's
 private `nh-*` runtime directory and no `DISPLAY` or `WAYLAND_SOCKET`, which is
 what `niri-harness exec` provides.
+
+An unnamed run inside a harness session has a private runtime directory but
+the shared development storage. While the unnamed development daemon in your
+login session serves that storage, the nested run's daemon refuses to start,
+and its window says which daemon holds the storage; give the nested run an
+`--instance` instead. The same holds for the production storage: a production
+`cagents-ui` launched in a harness session refuses while your own cagents runs.
 
 To fill an instance with a realistic workspace before its first launch, see
 [Fixture workspaces](fixture-workspace.md#a-development-instance).
@@ -722,7 +738,7 @@ a single global lock:
 
 ```sh
 mise run check:ui -- --bin cagents-ui  # scripts/cargo-gate check --locked ... -p cagents-ui
-mise run test:host                     # scripts/cargo-gate test --locked ... --features host
+mise run test:host                     # scripts/cargo-gate test --locked ... -p cagents -p cagents-host --features cagents/host
 ```
 
 On the host that compiles, `scripts/build-host` runs each build. Memory, not
@@ -890,12 +906,18 @@ so a bisection that cannot finish, such as on a dirty checkout or a comment
 GitHub keeps refusing, holds the sentinel until it is fixed. Each tip it checks
 gets separate
 `scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
-CLI, `--features host`, `--features ui`, `-p cagents-ui -p cagents-ui-kit`,
+CLI, `-p cagents -p cagents-host --features cagents/host` (on a commit from
+before the daemon's package, the shared library alone with that feature),
+`--features ui`, `-p cagents-ui -p cagents-ui-kit`,
 the same two packages with `--features cagents-ui/browser-protocol-fixture`, the integrated-browser
 graph with its Wayland registry test server, the dictation helper with its
 engine, and `-p ceditor`, which also lints the kit as it ships: the
 application's tests enable the kit's `test-support` feature, so the two
-application lanes lint the kit with it. After them an `isolation` lane runs the
+application lanes lint the kit with it. A `daemon` lane does the same for the
+daemon, the host lane's packages with `--lib --bins` instead of `--all-targets`:
+the daemon's tests enable the shared library's `test-support`, so the host lane
+lints the library's production paths only with it; `mise run check:host -- --lib --bins`
+runs the same lane before review. After them an `isolation` lane runs the
 commit's `scripts/check-lane-isolation`, which compiles nothing; it fails like a lane and is bisected like one,
 but a commit that fails only it still compiled, so it is built for evidence and
 tested. A commit from before the script skips it. The Cargo lanes use the ordinary shared queue
@@ -914,7 +936,7 @@ Once the newest checked commit compiles, the sentinel starts its release
 prebuild and runs every lane's tests on that commit in the ordinary test
 profile on the sentinel's warm build directory:
 `scripts/cargo-gate test --locked --all-targets --no-fail-fast` for the CLI,
-`--features host`, the shared library and application with `ui`, the same
+the shared library with `host` and the daemon, the shared library and application with `ui`, the same
 with the integrated browser (`cagents-ui/browser-protocol-fixture`, which
 gives the shared library its `full` identity and browser paths), `-p ceditor`
 and the dictation helper: at least what each `mise run test:*` lane runs. The
@@ -934,10 +956,14 @@ failing test with its output and each lane's command, and comments when a later
 commit passes. A lane that stops with a status other than Cargo's 101, such as
 the disk guard's refusal or a kill, says nothing about the code: it keeps no
 verdict, opens no issue, and the commit is tested again 30 minutes later.
-The same goes for a lane whose test fixtures refused their temporary root
-because of a `.git` outside the checkout, such as a stray `/var/tmp/.git`.
-That fails every fixture test in every lane, whatever the commit. The
-sentinel's log names the marker to remove.
+The sentinel also defers a verdict when every test failure is a fixture
+refusal for a `.git` above `TMPDIR`, `/tmp` or `/var/tmp` outside the repository.
+The marker must have been present before the test lanes started and still be
+present after the affected lane exits. The log names the marker. The sentinel
+counts consecutive deferrals for the same marker paths, devices and inodes
+across commits. It records the fourth such failure and names the stray marker
+as a possible cause in the issue. A recorded verdict or a change in the marker
+set starts a new count. Other outside-code stops preserve the count.
 
 After the test lanes finish, the sentinel builds the three executables
 [native evidence](#native-evidence) runs and keeps them under `builds/` for the
@@ -1019,9 +1045,11 @@ and GitHub: `python3 -I -B tests/main_build_sentinel.py -v`. It does not compile
 Rust or change real issues. The sentinel sweeps its logs once a day, removing
 files older than 30 days except evidence for pending reports, active bisections,
 and the check, test, and build results referenced by the watcher, including its
-last passing commits. It also removes abandoned verdict writes after 30 days.
+last passing commits. It also removes abandoned verdict writes and legacy retry
+files after 30 days.
 Published verdicts record release decisions and can still report failed lanes
-after their logs expire. `state.json` holds the checked cursor and issue number.
+after their logs expire. `state.json` holds the checked cursor, issue number and
+marker deferral count.
 
 ### Prebuilding release bundles
 
@@ -1113,7 +1141,7 @@ the detached `.worktrees/.prebuild` checkout. Its offline regression is
 Rust compiles on the build host named by `CAGENTS_BUILD_REMOTE` (default
 `fw16`, reached with `ssh`), never here: `scripts/cargo-gate` sends every Cargo
 command that compiles there through `scripts/cargo-offload`, without taking a
-slot here. Commands that compile nothing, such as `metadata`, `tree` or
+build slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as `scripts/build-ceditor-product`, builds there too,
@@ -1151,6 +1179,30 @@ another) from a clean environment, as sshd would, and only what the caller
 uses comes back. `scripts/native-evidence` builds this way. A gate without
 `scripts/cargo-offload` beside it refuses to build unless
 `CAGENTS_BUILD_REMOTE=local` is set.
+
+Cargo offload and remote native evidence share local sync slots across all
+worktrees for the same Linux user. Source preparation, uploads and artifact
+downloads take a slot and run at CPU nice +10 and best-effort I/O priority 7.
+If all slots are in use, the client prints `waiting for a local sync slot`
+and blocks in the kernel. Remote compilation continues without a local slot.
+
+| Client setting | Default | Effect |
+| --- | --- | --- |
+| `CAGENTS_BUILD_LOCAL_SYNC_SLOTS` | `2` | Concurrent local file phases. Set the same value for every client on the laptop. |
+| `CAGENTS_BUILD_LOCAL_SYNC_LOCK` | `/var/tmp/cagents-offload-local-UID.lock` | Lock file prefix. Clients must use the same prefix to share slots. |
+| `CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS` | `180` | Wall-clock limit for each transfer attempt. A failed connection gets one retry where the transfer can be repeated safely. |
+| `CAGENTS_BUILD_REMOTE_COMMAND_TIMEOUT_SECONDS` | `7200` | Wall-clock limit for a long-lived remote command or lease connection. |
+
+SSH probes the server every 15 seconds and gives up after four unanswered
+probes. The transfer deadline also covers a stuck local SSH proxy, including
+`tailscale nc`. The client stops and reaps the transport tree when its
+invoking process exits. Once a remote command begins, a lost connection
+fails the command so its effects cannot be replayed. Waiting for the build
+host to accept a lease keeps its separate admission budget and retry interval.
+Source and artifact transfers hold the slot on the build host until they exit.
+A delayed channel must still prove its exact lease before it starts. If a
+gate update refuses a command inside an older hold, finish that hold and
+start a new one.
 
 The host has build slots under
 `~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
@@ -1217,9 +1269,10 @@ While the host is unreachable, does not answer within
 leased slot's own build output), the command waits and tries again every
 `CAGENTS_BUILD_REMOTE_RETRY_SECONDS` (default 15), saying why once and then
 once a minute. It never builds here instead. `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS`
-bounds that wait, and the wait for a slot there, as it does a wait here; on
-expiry the command exits 124 naming the cause. The build there has no
-timeout. Set `CAGENTS_BUILD_REMOTE=local` to build here.
+bounds that wait, the wait for a slot there and the initial local sync slot
+wait. On expiry the command exits 124 naming the cause. The transport
+deadlines still apply after admission. Set `CAGENTS_BUILD_REMOTE=local` to
+build here.
 
 Each slot's build output is bounded by its lease. Cargo removes nothing, and
 every feature lane, profile and kind of target of the `cagents` crate keeps
@@ -1682,7 +1735,7 @@ its lane. Cover the boundaries a change touches:
 
 ```sh
 mise run test:cli     # scripts/cargo-gate test --locked --no-default-features --all-targets
-mise run test:host    # ... --features host --all-targets
+mise run test:host    # ... -p cagents -p cagents-host --features cagents/host --all-targets
 mise run test:ui      # ... --features cagents/ui, with both packages, --all-targets
 mise run test         # all three, in order
 ```
@@ -1691,7 +1744,9 @@ mise run test         # all three, in order
 together with the widgets and views. The lane already names the packages, so
 arguments narrow targets, not packages; for the application's tests alone, run
 `scripts/cargo-gate test --locked -p cagents-ui --all-targets`, and for the kit's,
-`-p cagents-ui-kit`.
+`-p cagents-ui-kit`. `test:host` likewise tests the shared library with `host`
+and the daemon's package; for the daemon's tests alone, run
+`scripts/cargo-gate test --locked --no-default-features -p cagents-host --all-targets`.
 
 The cli, host and ui lanes each build the shared library's tests with their
 own features. A test module whose code never branches on a feature would run
@@ -1711,10 +1766,15 @@ An SSH login has a soft limit of 1024 open files, and whatever it starts, with
 `nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
 with `Too many open files`, so run `ulimit -n 65536` first.
 
-The gate prepares HOST fixtures automatically. Before running HOST tests it
-builds `cagentsd` in the same admitted build slot, from the same source copy and
-Cargo environment, then sets `CAGENTS_TEST_RETAINED_ACTOR_HELPER` to Cargo's exact
-executable path. It keeps the test command's profile, target, feature and config
+The gate prepares HOST fixtures automatically. Before running tests of the
+daemon's package it builds `cagentsd`, and the `cagents` CLI beside it, with the
+shared library's `test-support` as the test build has it, so the daemon is built
+once; before the shared library's tests with `host` it builds `cagentsd` alone,
+which their retained-helper cases run. It builds in the same admitted build slot, from the same source copy and Cargo environment, then
+sets `CAGENTS_TEST_RETAINED_ACTOR_HELPER` to Cargo's exact executable path. The
+daemon's integration tests drive that CLI, which Cargo would not otherwise
+build for them because it belongs to another package; built here, it is never
+older than the library under test, even in a run narrowed to one test. It keeps the test command's profile, target, feature and config
 options; with no profile option, the helper uses the test profile. A failed helper
 build stops the command before the tests run. CLI and UI lanes do not build it.
 This also works for narrow HOST library tests. An explicitly supplied helper
@@ -1733,7 +1793,7 @@ the bundled-skill tests below refuse to install.
 The ordinary HOST command needs no environment setup:
 
 ```sh
-scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+scripts/cargo-gate test --locked --no-default-features -p cagents -p cagents-host --features cagents/host --all-targets
 ```
 
 For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
@@ -1762,7 +1822,7 @@ mkdir -p -m 700 /var/tmp/ct
     TMPDIR=$(mktemp -d /var/tmp/ct/tXXXXXX) || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
-    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+    scripts/cargo-gate test --locked --no-default-features -p cagents -p cagents-host --features cagents/host --all-targets
 )
 ```
 
@@ -1797,7 +1857,9 @@ mise run test:ui -- --test session_restore_contract
 
 For focused library tests, `scripts/test-lib` builds one lane's library test
 harness and runs exactly the tests you name, through one `scripts/cargo-gate test`
-command. The `ui` lane runs the application's tests (`-p cagents-ui`), `ui-kit`
+command. The `host` lane runs the daemon's tests (`-p cagents-host`), and
+`shared-host` the shared library's tests under `--features host`. The `ui` lane
+runs the application's tests (`-p cagents-ui`), `ui-kit`
 the widgets' and views' tests (`-p cagents-ui-kit`);
 `shared-ui` runs the shared library's tests under `--features ui`, and `browser`
 runs the application's tests with the integrated browser, which is the only
@@ -1805,7 +1867,8 @@ lane that compiles its `browser::` modules:
 
 ```sh
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
-scripts/test-lib host --prefix terminal:: --test-threads 1
+scripts/test-lib host --prefix host::agent_execution:: --test-threads 1
+scripts/test-lib shared-host --prefix terminal::
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 scripts/test-lib ui-kit --prefix editor::
 scripts/test-lib shared-ui --prefix settings::
@@ -2575,9 +2638,9 @@ tool timeout drops the SSH connection, and that ends the work on the host too.
 TERM, HUP or INT sent to the wrapper alone also ends and reaps its SSH
 connections, Git's and rsync's included, and then the wrapper dies by that
 signal; the host ends the build or comparison they started. A signal its
-caller ignores stays ignored, so `nohup` keeps a run through a closed
-terminal. A session detached by an explicit `start` keeps running until
-`stop`.
+caller ignores stays ignored. If the invoking shell exits, the wrapper ends
+the connections it owns. A session detached by an explicit `start` keeps
+running until `stop`.
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
@@ -2718,11 +2781,14 @@ It builds the three matched executables with the `local` Cargo profile,
 versioned `<version>+local.<short sha>`. That profile keeps release identity
 and optimization but skips link-time optimization and single-unit code
 generation. Each build is incremental, so after the first one only changed
-code is recompiled. The script stages the archive with
-`install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
-affected session and asks before replacing anything. `--stage-only` stops
-after staging; finish later with `cagents daemon upgrade`. The staged build
-always supplies the updater. A source daemon whose protocol live updates do
+code is recompiled. The new build's `cagents daemon upgrade` shows the
+affected sessions and asks before replacing anything. The public `cagents`
+command keeps serving the current installation until the replacement daemon
+is ready. `--stage-only` stops after staging and prints the command to
+finish later. Rerunning the script for the same staged build reuses it. If
+another update changed the source, the installer verifies the archive again
+before staging it over the newer installation.
+A source daemon whose protocol live updates do
 not start from is refused before anything changes; follow the cold
 installation the refusal describes.
 
@@ -2790,8 +2856,8 @@ with `--stop stop`, as a person would type. Extra upgrade flags use
 `--upgrade-arg=--interrupt`; the harness adds no policy automatically. Refusals are measured outcomes: even
 a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
-That staged path is how `scripts/install-local` updates, and NEW's own worker
-runs it. A person updates from the app instead, and there OLD's installed worker
+NEW's own worker runs this staged path, as it does for `scripts/install-local`.
+Update from the app and OLD's installed worker
 runs the whole update, including the checks after NEW starts. Add `--feed DIR`
 to rehearse that path: DIR is a file feed holding NEW's signed bundle
 (`scripts/release feed`), and the feed's archive must match `--new-dir`. OLD's
@@ -3098,3 +3164,16 @@ Cagents installation untouched. Existing private builds remain available to
 running windows and daemons; update Ceditor with its original installer, not the
 Cagents self-updater. Opening an alert for the other application requires that
 application to be installed alongside the daemon or in an absolute PATH directory.
+
+## macOS
+
+The daemon and UI are being ported to Apple Silicon macOS. The plan is in
+issue #4045. `mise run check:macos:LANE` type-checks a lane for
+`aarch64-apple-darwin` on the build host. Rust cross-checks natively, and
+`scripts/darwin-cc` compiles the C that build scripts need using the zig that
+`mise.toml` pins. The build host needs that target once:
+`rustup target add aarch64-apple-darwin --toolchain 1.93.0` (the
+`rust-toolchain.toml` channel). A check cannot link or run
+anything, so behavior, and anything that needs Apple's frameworks, still has
+to be verified on a real Mac.
+

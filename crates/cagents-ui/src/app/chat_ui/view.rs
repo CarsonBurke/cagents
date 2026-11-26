@@ -559,6 +559,23 @@ const QUEUE_LINE_HEIGHT: f32 = 18.0;
 /// it made a caption-height row twice the height of its own text.
 const CONTROL_PADDING: [f32; 2] = [2.0, 6.0];
 
+/// How far inside the composer's sides the footer row is drawn: where its
+/// items' content starts, the composer's glyph inset, less the inset every
+/// item carries.
+const FOOTER_INSET: f32 = COMPOSER_PADDING - CONTROL_PADDING[1];
+
+/// A status-line item that is not a control, inset as a control's content is.
+///
+/// Every footer item then starts and ends `CONTROL_PADDING` inside its slot,
+/// pressable or not, so the footer can be drawn that much further out and
+/// still begin its first glyph beneath the composer's `+`: a picker's hover
+/// background takes the inset rather than pushing its glyph inward, and a
+/// picker that becomes a plain label once the conversation starts keeps its
+/// place.
+fn footer_cell<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    widget::container(content).padding(CONTROL_PADDING).into()
+}
+
 /// The height of one completion row.
 const COMPLETION_ROW: f32 = design::DENSE_ROW_HEIGHT;
 
@@ -668,23 +685,36 @@ enum Trailing {
     Submit { mode: PromptMode, slot: usize },
     /// Cancels the active turn.
     Stop,
+    /// Starts or stops dictating into the draft.
+    Dictate,
 }
 
 /// The composer's trailing controls, leading edge first.
 ///
 /// The submit controls appear only while there is something to send, and
-/// lead the group: whatever follows them - Stop while the agent works - keeps
-/// its place at the trailing edge as a draft is typed or cleared, so a
-/// pointer resting on Stop is never moved onto Send. A disabled Send beside
-/// an empty draft said nothing a reader could act on, and while the agent
-/// works it sat where Stop belonged.
-fn composer_trailing(modes: &[PromptMode], busy: bool, has_draft: bool) -> Vec<Trailing> {
+/// lead the group: whatever follows them - Stop while the agent works, then
+/// the microphone where this copy can dictate - keeps its place as a draft
+/// is typed or cleared, so a pointer resting on Stop is never moved onto
+/// Send. A disabled Send beside an empty draft said nothing a reader could
+/// act on, and while the agent works it sat where Stop belonged.
+///
+/// The microphone holds the very edge because dictation writes into the
+/// draft while it listens: Send appears mid-session, and a microphone ahead
+/// of it would slide away from a pointer about to stop dictating, leaving
+/// Send under it. At the edge it stays put whatever comes and goes beside it.
+fn composer_trailing(
+    modes: &[PromptMode],
+    busy: bool,
+    has_draft: bool,
+    dictation: bool,
+) -> Vec<Trailing> {
     let offered = if has_draft { modes } else { &[] };
     offered
         .iter()
         .enumerate()
         .map(|(slot, &mode)| Trailing::Submit { mode, slot })
         .chain(busy.then_some(Trailing::Stop))
+        .chain(dictation.then_some(Trailing::Dictate))
         .collect()
 }
 
@@ -738,15 +768,21 @@ fn submit_control(
     enter_sends: bool,
     unsendable: Option<blocked_recovery::Unsendable>,
 ) -> (Icon, String) {
-    let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
+    let command = crate::settings::ModifierNames::CURRENT.primary;
+    let primary = if enter_sends {
+        "Enter".to_owned()
+    } else {
+        format!("{command}+Enter")
+    };
+    let alternate = format!("{command}+Shift+Enter");
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
         (PromptMode::Steer, 0) => (Icon::Send, "Steer the active turn", primary),
-        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Steer, _) => (Icon::Send, "Steer the active turn", alternate),
         (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
-        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", "Ctrl+Shift+Enter"),
+        (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", alternate),
     };
-    let tail = unsendable.map_or(chord, |unsendable| unsendable.reason);
+    let tail = unsendable.map_or(chord.as_str(), |unsendable| unsendable.reason);
     (name, format!("{verb} — {tail}"))
 }
 /// The submit mode a composer key press asks for, or `None` when the press is
@@ -807,6 +843,8 @@ const QUEUE_PREVIEW_BYTES: usize = prompt::QUEUE_PREVIEW_BYTES;
 enum QueueTiming {
     NextStep,
     NextTurn,
+    /// Held by a stop or a refusal until the reader sends it.
+    Held,
     /// On its way to the agent, or back to the composer.
     Leaving,
     /// Sent, without the agent confirming it got it, and whether it can be
@@ -854,6 +892,10 @@ fn queue_row<'a>(
         QueueTiming::NextTurn => crate::interaction::tooltip(
             crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
             "Sent when this turn ends",
+        ),
+        QueueTiming::Held => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
+            "Waiting for you: send a message, or Send now",
         ),
         QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -1112,29 +1154,19 @@ fn submit_chord(
 /// The editing binding for a word-wise delete chord, or `None` for any other
 /// press.
 ///
-/// The default bindings map Ctrl+Backspace to deleting one character, so the
-/// chord every other text field on the desktop uses to remove a word silently
-/// did the same thing as Backspace alone. Selecting the word first and then
-/// deleting the selection is how the editor already removes a range, so this
-/// needs no new editing primitive. Ctrl+Delete is included because the two
-/// directions are one habit.
+/// The default bindings map Ctrl+Backspace (Option+Backspace on macOS) to
+/// deleting one character, so the chord every other text field on the
+/// desktop uses to remove a word silently did the same thing as Backspace
+/// alone. Selecting the word first and then deleting the selection is how the
+/// editor already removes a range, so this needs no new editing primitive.
+/// Delete is included because the two directions are one habit, and on macOS
+/// Command deletes to the line's edge, as it does in every Mac text field.
 fn word_delete(press: &text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
-    if !matches!(press.status, text_editor::Status::Focused { .. })
-        || !press.modifiers.command()
-        || press.modifiers.alt()
-        || press.modifiers.shift()
-    {
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
     }
-    let motion = match press.key {
-        keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-            iced::advanced::text::editor::Motion::WordLeft
-        }
-        keyboard::Key::Named(keyboard::key::Named::Delete) => {
-            iced::advanced::text::editor::Motion::WordRight
-        }
-        _ => return None,
-    };
+    let motion =
+        crate::repository_widget::text_editor::deletion_motion(press.modifiers, &press.key)?;
     Some(text_editor::Binding::Sequence(vec![
         text_editor::Binding::Select(motion),
         text_editor::Binding::Backspace,
@@ -1633,11 +1665,8 @@ impl Cagents {
             return done;
         }
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime))
-                if runtime.awaiting_admission()
-                    && self.shared_views.quarantined.contains(&card) =>
-            {
-                runtime.pending_admission_view(trailing_clearance, true)
+            Some(CardRuntime::Chat(runtime)) if runtime.awaiting_admission() => {
+                runtime.pending_admission_view(trailing_clearance, self.pending_pane(card))
             }
             Some(CardRuntime::Chat(runtime)) => {
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory);
@@ -1928,6 +1957,9 @@ fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str,
 /// How `agent` stands, given what it waits on if it waits on work of its
 /// own that its transcript names; see [`Runtime::native_child_status`].
 fn agent_caption<'a>(agent: &chat::Subagent, work: Option<&'a str>) -> &'a str {
+    if agent.last_seen_running() {
+        return chat::UNLOADED_CHILD_RUNNING;
+    }
     match agent.status {
         chat::ToolStatus::Running if agent.waiting => "Waiting",
         chat::ToolStatus::Waiting => work.unwrap_or("Waiting on background work"),
@@ -1937,6 +1969,70 @@ fn agent_caption<'a>(agent: &chat::Subagent, work: Option<&'a str>) -> &'a str {
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
         chat::ToolStatus::Ended => "Ended",
+    }
+}
+
+/// How `agent` stands, as a row's trailing column marks it, with the words
+/// of what it waits on where its transcript names that. A failure has no
+/// mark there: the row's leading glyph tells it.
+pub(super) fn agent_mark(
+    agent: &chat::Subagent,
+    work: Option<&str>,
+) -> (Option<disclosure::Mark>, Option<String>) {
+    use disclosure::Mark;
+    if agent.last_seen_running() {
+        return (None, Some(chat::UNLOADED_CHILD_RUNNING.into()));
+    }
+    let mark = match agent.status {
+        chat::ToolStatus::Running if agent.waiting => Mark::Attention,
+        chat::ToolStatus::Running => Mark::Working,
+        chat::ToolStatus::Waiting => {
+            return (
+                Some(Mark::WaitingOnBackgroundWork),
+                work.map(lowercase_initial),
+            );
+        }
+        chat::ToolStatus::Succeeded => Mark::Finished,
+        chat::ToolStatus::Failed => return (None, None),
+        chat::ToolStatus::Denied => Mark::Denied,
+        chat::ToolStatus::Stopped | chat::ToolStatus::Ended => Mark::Stopped,
+    };
+    (Some(mark), None)
+}
+
+/// How long `agent` has worked: from its first step to its last, or to now
+/// while it has yet to end. `None` where its transcript carries no times.
+pub(super) fn agent_elapsed_ms(agent: &chat::Subagent, now: Option<u64>) -> Option<u64> {
+    if agent.last_seen_running() {
+        return None;
+    }
+    let first = agent.items.first()?;
+    let start = first.started_at.or(first.at)?;
+    let end = if agent.is_live() {
+        now?
+    } else {
+        agent
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| item.at.or(item.started_at))?
+    };
+    Some(end.saturating_sub(start))
+}
+
+/// How a background command's notice marks its outcome: a failure by the
+/// row's leading glyph, with its exit status, where it gave one, as words.
+fn command_mark(outcome: &str) -> (Option<disclosure::Mark>, Option<String>) {
+    match outcome {
+        "finished" => (Some(disclosure::Mark::Finished), None),
+        "stopped" => (Some(disclosure::Mark::Stopped), None),
+        failed => (
+            None,
+            failed
+                .strip_prefix("failed (")
+                .and_then(|status| status.strip_suffix(')'))
+                .map(str::to_owned),
+        ),
     }
 }
 
@@ -1973,6 +2069,10 @@ struct DeliveryOutcome<'a> {
     outcome: Option<Cow<'a, str>>,
     failed: bool,
     glyph: Icon,
+    /// How the outcome is marked beside the row's time, and any words it
+    /// still needs there.
+    mark: Option<disclosure::Mark>,
+    detail: Option<String>,
     heading: String,
     /// Whether it is an agent's report, whose row names the agent.
     report: bool,
@@ -2104,7 +2204,7 @@ impl Runtime {
     /// own state, said on its row, not a question for the person.
     pub(super) fn child_error<'a>(&self, agent: &'a chat::Subagent) -> Option<&'a str> {
         let detail = agent.detail.trim();
-        (agent.status == chat::ToolStatus::Running
+        (agent.is_running()
             && !detail.is_empty()
             && agent.items.last().is_some_and(|item| {
                 chat::failure::provider_error_text(self.session.launch.provider, item).is_some()
@@ -2146,7 +2246,7 @@ impl Runtime {
         // for copying; the tab says what it means. A finished child's detail
         // is its own report, whose prose may merely mention such words.
         let detail = agent.detail.trim();
-        if !detail.is_empty() {
+        if !detail.is_empty() && !agent.last_seen_running() {
             identity.push_str(" · ");
             let failure = (agent.waiting
                 || agent.status == chat::ToolStatus::Failed
@@ -2429,7 +2529,7 @@ impl Runtime {
                     self.native_child_status(agent).to_owned(),
                 ));
             }
-            return (agent.status == chat::ToolStatus::Running).then(|| {
+            return (agent.is_running()).then(|| {
                 if agent.waiting {
                     (Icon::AgentWaiting, "Waiting".to_owned())
                 } else if let Some(error) = self.child_error(agent) {
@@ -2461,6 +2561,8 @@ impl Runtime {
             {
                 Some((glyph, label))
             }
+            // The turn stays open on its background commands alone.
+            Some(Icon::AgentBackground) if snapshot.busy => Some((Icon::AgentBackground, label)),
             // A recent failed task stays actionable even after the lead finishes.
             Some(Icon::Error) if !snapshot.subagent_activity().failed.is_empty() => {
                 Some((Icon::Error, label))
@@ -2485,13 +2587,10 @@ impl Runtime {
     /// card states its own runs in words, so the closing line spins for it.
     fn work_shown(&self, selected: Option<&chat::Subagent>) -> bool {
         match selected {
-            Some(agent) => agent.items.last().is_some_and(|item| {
-                Self::row_live(
-                    &self.child_cache,
-                    item,
-                    agent.status == chat::ToolStatus::Running,
-                )
-            }),
+            Some(agent) => agent
+                .items
+                .last()
+                .is_some_and(|item| Self::row_live(&self.child_cache, item, agent.is_running())),
             None => {
                 let snapshot = &self.snapshot;
                 snapshot.busy
@@ -2547,8 +2646,8 @@ impl Runtime {
     /// newest row; otherwise a newer row or the closing line does. When the
     /// lead is idle, the group with the newest running step, such as a
     /// background command, carries it unless the closing line already
-    /// spins. A strip that does not keeps its kind glyph, and its caption and
-    /// counting time still say it is working.
+    /// spins. A strip that does not is marked as working by a still dot,
+    /// beside its counting time.
     pub(super) fn strip_status(&self, turn: &turn::Turn) -> Option<disclosure::Status> {
         let status = turn.glyph();
         if status != Some(chat::ToolStatus::Running.into()) {
@@ -2564,7 +2663,11 @@ impl Runtime {
         } else {
             turn.newest_running && !self.closing_spins()
         };
-        carries.then_some(chat::ToolStatus::Running.into())
+        Some(if carries {
+            chat::ToolStatus::Running.into()
+        } else {
+            disclosure::Status::Working
+        })
     }
 
     /// The glyph and words of the line that closes a working transcript.
@@ -2641,7 +2744,10 @@ impl Runtime {
     /// their way back to the composer. Messages this app still holds, such
     /// as follow-ups for a provider without a queue, cannot go early.
     pub(super) fn send_now_count(&self) -> usize {
-        if !self.snapshot.capabilities.send_queued_now || !self.snapshot.busy {
+        let caps = &self.snapshot.capabilities;
+        let into_turn = caps.send_queued_now && self.snapshot.busy;
+        let held = caps.queue_holds && !self.snapshot.busy;
+        if !into_turn && !held {
             return 0;
         }
         self.snapshot
@@ -2651,6 +2757,12 @@ impl Runtime {
                 !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
             })
             .count()
+    }
+
+    /// Whether the provider holds what is queued for the reader, as a stop
+    /// or a refusal leaves it: no turn is running to send it when it ends.
+    pub(super) fn queue_held(&self) -> bool {
+        self.snapshot.capabilities.queue_holds && !self.snapshot.busy && self.send_now_count() > 0
     }
 
     /// Whether Send now can be asked for this moment: one already on its way
@@ -2677,6 +2789,7 @@ impl Runtime {
             Some(chat::SendNow::Declined) if send_now > 0 => {
                 format!("Queued · {count} · couldn't send early")
             }
+            _ if self.queue_held() => format!("Queued · {count} · waiting for you"),
             _ => format!("Queued · {count}"),
         }
     }
@@ -2708,23 +2821,29 @@ impl Runtime {
         } else {
             ("them", "they wait")
         };
+        let provider = self.session.launch.provider.label();
         let tooltip: Cow<'_, str> = match self.snapshot.send_now {
             Some(chat::SendNow::Declined) => format!(
-                "Claude couldn't take {it} early, so {they} in the queue. You can try again \
+                "{provider} couldn't take {it} early, so {they} in the queue. You can try again \
                  once the queue changes."
             )
             .into(),
             Some(_) => "Sending now…".into(),
+            None if self.queue_held() => format!(
+                "Send {it} to {provider} now, starting the next turn. A message you send goes \
+                 after {it}."
+            )
+            .into(),
             None => {
-                // Where Stop also ends background subagents, say so: that
+                // Where Stop also ends background work, say so: that
                 // is the difference that makes Send now worth choosing.
                 let stop = if self.snapshot.capabilities.interrupt_stops_background {
-                    " Stop cancels the turn and its background subagents."
+                    " Stop cancels the turn and its background work."
                 } else {
                     ""
                 };
                 format!(
-                    "Send {it} to Claude now. Subagents and background work keep running; the \
+                    "Send {it} to {provider} now. Subagents and background work keep running; the \
                      reply being written may be cut short.{stop}"
                 )
                 .into()
@@ -2845,13 +2964,21 @@ impl Runtime {
             && snapshot
                 .subagents
                 .iter()
-                .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running)
+                .any(|agent| agent.waiting && agent.is_running())
             && !snapshot
                 .subagents
                 .iter()
-                .any(|agent| !agent.waiting && agent.status == chat::ToolStatus::Running)
+                .any(|agent| !agent.waiting && agent.is_running())
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
+        } else if snapshot.busy && snapshot.detail == chat::WAITING_ON_BACKGROUND_WORK {
+            // The turn is open but the agent is idle until its background
+            // commands finish, however long that takes; its last words
+            // would otherwise read as a reply still being written.
+            (
+                Some(Icon::AgentBackground),
+                chat::WAITING_ON_BACKGROUND_WORK,
+            )
         } else if snapshot.is_working() {
             (
                 Some(Icon::AgentWorking),
@@ -2905,9 +3032,7 @@ impl Runtime {
             scope: self.selected_subagent.clone(),
             presentation: self.presentation_revision,
             turns: self.turns.stamp(),
-            busy: selected.map_or(self.snapshot.busy, |agent| {
-                agent.status == chat::ToolStatus::Running
-            }),
+            busy: selected.map_or(self.snapshot.busy, |agent| agent.is_running()),
             expanded: match &self.selected_subagent {
                 Some(child) => self.child_expanded.get(child).map(Revised::stamp),
                 None => Some(self.expanded.stamp()),
@@ -3226,11 +3351,7 @@ impl Runtime {
                 .hash(&mut revision);
         }
         if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
-            let finished = reasoning_finished(
-                &agent.items,
-                agent.status == chat::ToolStatus::Running,
-                index,
-            );
+            let finished = reasoning_finished(&agent.items, agent.is_running(), index);
             (
                 finished,
                 reasoning_elapsed(&agent.items, index, finished, None),
@@ -3300,7 +3421,10 @@ impl Runtime {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
         if self.awaiting_admission() {
-            return self.pending_admission_view(transcript_clearance, false);
+            return self.pending_admission_view(
+                transcript_clearance,
+                super::pending_admission::PendingPane::Waiting { held: None },
+            );
         }
         let target = self.target;
         // Nothing is sent past a first message still waiting to go.
@@ -3364,7 +3488,7 @@ impl Runtime {
             // One waiting on its own background work is still going, and
             // stopping it is how that work ends. The same square as the
             // composer's own Stop, which cancels the conversation's turn.
-            if agent.status.is_live() && snapshot.capabilities.stop_subagent {
+            if agent.is_live() && snapshot.capabilities.stop_subagent {
                 identity.push(
                     crate::ui_controls::icon_button(
                         Icon::Stop,
@@ -4551,38 +4675,46 @@ impl Runtime {
         // permanently present for something used occasionally.
         // Stop is there whenever the conversation works, turn or not: it is
         // the way out of a turn that is slow to begin.
-        let submissions: Vec<Element<'_, Message>> =
-            composer_trailing(modes, snapshot.busy, has_draft)
-                .into_iter()
-                .map(|control| match control {
-                    Trailing::Submit { mode, slot } => {
-                        let shown = match mode {
-                            PromptMode::Steer if !self.turn_running() => PromptMode::Send,
-                            mode => mode,
-                        };
-                        let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
-                        crate::ui_controls::icon_button(name, tooltip)
-                            .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
-                            .selected(slot == 0)
-                            .tone(crate::design::Tone::Themed(if slot == 0 {
-                                design::accent_color
-                            } else {
-                                design::muted_icon_color
-                            }))
-                            .on_press_maybe(
-                                (available
-                                    && !self.start_blocked.is_some()
-                                    && !self.provider_coming_up())
-                                .then(|| action(Action::SubmitControl(target, mode))),
-                            )
-                            .into()
-                    }
-                    Trailing::Stop => self.stop_control(available),
-                })
-                .collect();
-        // One row: `+`, the draft, then what sends or stops it. The controls
-        // hold the row's foot, so a draft that grows keeps them beside its
-        // last line, and the inset centers them on a single line of text.
+        let trailing_controls: Vec<Element<'_, Message>> = composer_trailing(
+            modes,
+            snapshot.busy,
+            has_draft,
+            crate::dictation::available(),
+        )
+        .into_iter()
+        .filter_map(|control| {
+            Some(match control {
+                Trailing::Submit { mode, slot } => {
+                    let shown = match mode {
+                        PromptMode::Steer if !self.turn_running() => PromptMode::Send,
+                        mode => mode,
+                    };
+                    let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
+                    crate::ui_controls::icon_button(name, tooltip)
+                        .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
+                        .selected(slot == 0)
+                        .tone(crate::design::Tone::Themed(if slot == 0 {
+                            design::accent_color
+                        } else {
+                            design::muted_icon_color
+                        }))
+                        .on_press_maybe(
+                            (available
+                                && !self.start_blocked.is_some()
+                                && !self.provider_coming_up())
+                            .then(|| action(Action::SubmitControl(target, mode))),
+                        )
+                        .into()
+                }
+                Trailing::Stop => self.stop_control(available),
+                Trailing::Dictate => self.dictation_control(shortcuts, !read_only)?,
+            })
+        })
+        .collect();
+        // One row: `+`, the draft, then what sends or stops it and the
+        // microphone. The controls hold the row's foot, so a draft that grows
+        // keeps them beside its last line, and the inset centers them on a
+        // single line of text.
         let control = |control: Element<'a, Message>| -> Element<'a, Message> {
             widget::container(control)
                 .padding(iced::Padding::ZERO.bottom(COMPOSER_CONTROL_INSET))
@@ -4594,9 +4726,8 @@ impl Runtime {
         };
         let mut row: Vec<Element<'_, Message>> = Vec::new();
         row.extend(plus.map(control));
-        row.extend(self.dictation_control(shortcuts, !read_only).map(control));
         row.push(editor);
-        row.extend(submissions.into_iter().map(control));
+        row.extend(trailing_controls.into_iter().map(control));
         // The editor and its controls are one object: a single raised
         // surface, so the composer reads as one place to type rather than a
         // field with a toolbar bolted under it. The `+` menu opens above it,
@@ -4645,15 +4776,16 @@ impl Runtime {
             && let Some(branch) = &place.branch
         {
             status.push(bounded(
-                widget::row::with_children(vec![
-                    crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                    crate::ui_controls::FadeText::caption(branch.clone())
-                        .limit(FOOTER_LABEL)
-                        .into(),
-                ])
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .into(),
+                footer_cell(
+                    widget::row::with_children(vec![
+                        crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
+                        crate::ui_controls::FadeText::caption(branch.clone())
+                            .limit(FOOTER_LABEL)
+                            .into(),
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                ),
                 branch,
                 "Branch",
                 FOOTER_LABEL,
@@ -4774,15 +4906,21 @@ impl Runtime {
                 crate::interaction::tooltip_above(caption, tooltip)
             });
         }
-        let spend = widget::row::with_children(spend)
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
-            .into();
+        // A footer with nothing spent yet, as a fresh draft's is, ends on its
+        // last picker rather than on an empty cell's inset.
+        if !spend.is_empty() {
+            engine.push(footer_cell(
+                widget::row::with_children(spend)
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center),
+            ));
+        }
         let mut leading = status;
         leading.extend(notice);
-        engine.push(spend);
+        // Every item carries `CONTROL_PADDING` on each side, so the items
+        // themselves sit only `GAP_XS` apart, as the composer's controls do.
         let trailing: Element<'_, Message> = widget::row::with_children(engine)
-            .spacing(step::GAP_S)
+            .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
             .into();
         let footer_row: Element<'_, Message> = if fit == FooterFit::Wide {
@@ -4793,7 +4931,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 widget::container(
                     widget::flex_row(leading)
-                        .spacing(step::GAP_S as u16)
+                        .spacing(step::GAP_XS as u16)
                         .align_items(Alignment::Center),
                 )
                 .width(Length::Fill)
@@ -4813,7 +4951,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 widget::container(crate::ui_controls::shrinkable(
                     widget::row::with_children(leading)
-                        .spacing(step::GAP_S)
+                        .spacing(step::GAP_XS)
                         .align_y(Alignment::Center),
                 ))
                 .width(Length::Fill)
@@ -4856,11 +4994,11 @@ impl Runtime {
             .height(Length::Fill)
             .width(Length::Fill)
             .into(),
+            // Drawn a control's inset further out than the composer's glyphs,
+            // which every footer item then restores: see `footer_cell`.
             widget::container(footer)
                 .id(card_control_id(target.card, "chat-footer"))
-                .padding(
-                    iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
-                )
+                .padding(iced::Padding::from([0.0, step::GAP_M + FOOTER_INSET]).bottom(step::GAP_M))
                 .into(),
         ))
         .width(Length::Fill)
@@ -5502,9 +5640,10 @@ impl Runtime {
             );
             if transitioning {
                 controls.push(bounded(
-                    crate::ui_controls::FadeText::caption(label.clone())
-                        .limit(fit.label_limit())
-                        .into(),
+                    footer_cell(
+                        crate::ui_controls::FadeText::caption(label.clone())
+                            .limit(fit.label_limit()),
+                    ),
                     &label,
                     "Model",
                     fit.label_limit(),
@@ -5518,12 +5657,11 @@ impl Runtime {
             let chosen = self.chosen_permission_mode();
             let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
-                controls.push(
-                    design::caption(selected.map_or("Permissions", |index| {
+                controls.push(footer_cell(design::caption(
+                    selected.map_or("Permissions", |index| {
                         permission_mode_label(self.session.launch.provider, &modes[index])
-                    }))
-                    .into(),
-                );
+                    }),
+                )));
             } else {
                 let open = self.permission_picker;
                 let anchor = widget::button::custom(
@@ -5619,9 +5757,11 @@ impl Runtime {
                 ),
             };
             return crate::interaction::tooltip_above(
-                widget::row::with_children(std::iter::once(avatar).chain(named.then(label)))
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
+                footer_cell(
+                    widget::row::with_children(std::iter::once(avatar).chain(named.then(label)))
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::Center),
+                ),
                 usage(format!(
                     "This conversation runs on {}. {}",
                     accounts.current,
@@ -6461,7 +6601,7 @@ impl Runtime {
         if coordinating {
             for agent in &self.snapshot.subagents {
                 (&agent.id, &agent.kind, &agent.description, &agent.model).hash(&mut hasher);
-                self.hash_agent_state(agent, &mut hasher);
+                self.hash_agent_state(agent, now, &mut hasher);
             }
             // The client replaces its map whenever it learns an address, and a
             // new handle brings its own.
@@ -6471,9 +6611,24 @@ impl Runtime {
     }
 
     /// What a row saying how `agent` stands draws from it.
-    fn hash_agent_state(&self, agent: &chat::Subagent, hasher: &mut crate::fingerprint::Hasher) {
+    fn hash_agent_state(
+        &self,
+        agent: &chat::Subagent,
+        now: Option<u64>,
+        hasher: &mut crate::fingerprint::Hasher,
+    ) {
         use std::hash::Hash;
-        (agent.status, agent.waiting, self.agent_work.get(&agent.id)).hash(hasher);
+        (
+            agent.status,
+            agent.waiting,
+            agent.last_seen_running(),
+            self.agent_work.get(&agent.id),
+        )
+            .hash(hasher);
+        // Its time counts up while it works, at the second it is shown to.
+        agent_elapsed_ms(agent, now)
+            .map(|millis| millis / 1_000)
+            .hash(hasher);
     }
 
     /// What one item of an exchange, drawn from `cached`, contributes to its
@@ -6568,7 +6723,7 @@ impl Runtime {
         {
             if delivery_names_agent(from, sender, summary) {
                 if let Some(agent) = self.subagent(sender) {
-                    self.hash_agent_state(agent, hasher);
+                    self.hash_agent_state(agent, now, hasher);
                 }
                 std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
             }
@@ -6913,6 +7068,7 @@ impl Runtime {
             })
         };
         let mut rows = Vec::new();
+        let held = self.queue_held();
         for queued in &self.snapshot.queued_messages {
             if self.taken_back.contains(&queued.id) {
                 continue;
@@ -6956,7 +7112,11 @@ impl Runtime {
             if caps.queue_start {
                 controls.push(control(
                     Icon::ChevronUp,
-                    "Send next, ahead of the rest",
+                    if held {
+                        "Send this now"
+                    } else {
+                        "Send next, ahead of the rest"
+                    },
                     available,
                     Action::Command(
                         target,
@@ -6977,6 +7137,7 @@ impl Runtime {
             rows.push(queue_row(
                 match queued.delivery {
                     _ if recalling => QueueTiming::Leaving,
+                    _ if held => QueueTiming::Held,
                     chat::QueueDelivery::NextStep => QueueTiming::NextStep,
                     chat::QueueDelivery::NextTurn => QueueTiming::NextTurn,
                 },
@@ -7632,23 +7793,17 @@ impl Runtime {
                     || report.is_some_and(|(_, outcome)| outcome == "failed")
             }
         };
-        // Where a turn was stopped, and an agent that was stopped or ended
-        // without saying how it went, are marked as other stopped work is,
-        // by a still mark unlike the Stop control, as the agent's row and
-        // tab mark it.
-        let ended = agent.is_some_and(|agent| {
-            matches!(
-                agent.status,
-                chat::ToolStatus::Stopped | chat::ToolStatus::Ended
-            )
-        });
+        // Where a turn was stopped is marked as other stopped work is, by a
+        // still mark unlike the Stop control. A report keeps its kind's
+        // glyph, and says how its agent stands beside its time.
         let glyph = if failed {
             Icon::Error
-        } else if stopped || ended {
+        } else if stopped {
             Icon::Ended
         } else if notice && delivery_command_outcome(heading).is_some() {
             Icon::Terminal
-        } else if kind == chat::DeliveryKind::Notice {
+        } else if kind == chat::DeliveryKind::Notice && report.is_none() {
+            // An agent's notice reads as its report, under a report's glyph.
             Icon::Attention
         } else {
             Icon::Chat
@@ -7663,6 +7818,13 @@ impl Runtime {
             ),
             (None, Some((title, outcome)), None) => (title, Some(Cow::Borrowed(outcome))),
             (None, None, _) => (first, None),
+        };
+        let (mark, detail) = match (command, report, agent) {
+            (Some((_, outcome)), ..) => command_mark(outcome),
+            (None, _, Some(agent)) => agent_mark(agent, self.agent_work.get(&agent.id)),
+            (None, Some((_, "finished")), None) => (Some(disclosure::Mark::Finished), None),
+            (None, Some((_, "was stopped")), None) => (Some(disclosure::Mark::Stopped), None),
+            _ => (None, None),
         };
         // Its tooltip and accessible name say it in the same words, and keep
         // what the report said where the agent has since moved on.
@@ -7686,6 +7848,8 @@ impl Runtime {
             outcome,
             failed,
             glyph,
+            mark,
+            detail,
             heading,
             report: report.is_some(),
         }
@@ -7735,9 +7899,11 @@ impl Runtime {
         let has_body = delivery_has_body(notice, body, remainder);
         let DeliveryOutcome {
             title,
-            outcome,
+            outcome: _,
             failed,
             glyph,
+            mark,
+            detail,
             heading,
             report,
         } = self.delivery_outcome(
@@ -7765,19 +7931,34 @@ impl Runtime {
             monitor,
             notice.is_some_and(|notice| notice.body.long),
         );
+        // An agent's report counts the agent's time, as a step's row does.
+        let elapsed = report
+            .then(|| self.subagent(sender))
+            .flatten()
+            .and_then(|agent| agent_elapsed_ms(agent, self.source_now_ms()))
+            .and_then(disclosure::shown_duration);
+        let named = match &elapsed {
+            Some(elapsed) => format!("{heading} · {elapsed}"),
+            None => heading.clone(),
+        };
+        let trailing = disclosure::Trailing {
+            detail,
+            mark,
+            elapsed,
+        };
         let heading_row = disclosure::row_named(
             headline,
             if disclosure {
                 format!(
-                    "{} delivery details: {heading}",
+                    "{} delivery details: {named}",
                     if expanded { "Hide" } else { "Show" }
                 )
             } else {
-                heading.clone()
+                named
             },
             glyph,
             failed.then_some(chat::ToolStatus::Failed.into()),
-            outcome.map(|outcome| disclosure::Trailing::Outcome(outcome.into_owned())),
+            trailing,
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );
@@ -7936,13 +8117,7 @@ impl Runtime {
                             .finished_at
                             .filter(|_| !self.snapshot.has_later),
                     ),
-                    |agent| {
-                        (
-                            agent.items.as_slice(),
-                            agent.status == chat::ToolStatus::Running,
-                            None,
-                        )
-                    },
+                    |agent| (agent.items.as_slice(), agent.is_running(), None),
                 );
             debug_assert!(
                 items.get(index).is_none_or(|at| at.id == item.id),
@@ -8041,7 +8216,7 @@ fn child_placeholder(agent: &chat::Subagent) -> Option<&'static str> {
         .iter()
         .any(|item| !reasoning::contentless(&item.content));
     let failure = agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty();
-    (!shown && !failure).then_some(if agent.status == chat::ToolStatus::Running {
+    (!shown && !failure).then_some(if agent.is_running() {
         "Waiting for subagent activity…"
     } else {
         "No recent subagent activity is available here."

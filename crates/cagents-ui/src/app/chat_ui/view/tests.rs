@@ -1893,8 +1893,11 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     // newest work, so the strip keeps its glyph and the closing line
     // keeps its place empty.
     assert_eq!(turn.glyph(), Some(chat::ToolStatus::Running.into()));
-    assert!(turn.summary.ends_with(" · working"));
-    assert_eq!(runtime.strip_status(turn), None);
+    assert!(!turn.summary.contains(" · working"));
+    assert_eq!(
+        runtime.strip_status(turn),
+        Some(disclosure::Status::Working)
+    );
     assert!(runtime.work_shown(None));
     assert_eq!(closing(&runtime), blank);
     assert_eq!(
@@ -1945,7 +1948,10 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     assert_eq!(runtime.turns.len(), 2);
     let (older, newer) = (&runtime.turns[0], &runtime.turns[1]);
     assert_eq!(older.glyph(), Some(chat::ToolStatus::Running.into()));
-    assert_eq!(runtime.strip_status(older), None);
+    assert_eq!(
+        runtime.strip_status(older),
+        Some(disclosure::Status::Working)
+    );
     assert_eq!(
         runtime.strip_status(newer),
         Some(chat::ToolStatus::Running.into())
@@ -1985,7 +1991,10 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     // spins for them and the background command's group keeps its glyph.
     Arc::make_mut(&mut runtime.snapshot).subagents = vec![native_child_fixture()];
     assert!(runtime.closing_spins());
-    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(disclosure::Status::Working)
+    );
     Arc::make_mut(&mut runtime.snapshot).subagents.clear();
 
     // A running coordination card states its run in words, so while the
@@ -5606,11 +5615,11 @@ fn drawing_and_regrouping_a_tool_row_do_not_read_its_input_again() {
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
     assert_eq!(
         runtime.turns[0].summary,
-        "Tried to write docs/large-report.md · denied"
+        "Tried to write docs/large-report.md"
     );
     let reads = || crate::app::chat_ui::tool_title::READS.with(std::cell::Cell::get);
     let before = reads();
-    let name = "Tried to write docs/large-report.md · Denied";
+    let name = "Tried to write docs/large-report.md · denied";
     for open in [false, true, false] {
         if open {
             runtime.expanded.edit().insert(item.id.clone());
@@ -5814,11 +5823,11 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
                 .iter()
                 .chain(accessible.children())
                 .collect();
+            // Then what its trailing mark says.
+            let named = format!("{name} · finished");
             assert!(
-                nodes
-                    .iter()
-                    .any(|node| node.node().role() == Role::Button
-                        && node.node().label() == Some(name)),
+                nodes.iter().any(|node| node.node().role() == Role::Button
+                    && node.node().label() == Some(named.as_str())),
                 "row action must name its exact target"
             );
             // RichText has no separate accessible leaf in this pinned
@@ -5826,7 +5835,7 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
             // target, while the preview cache preserves the drawn bytes.
             let row = nodes
                 .iter()
-                .find(|node| node.node().label() == Some(name))
+                .find(|node| node.node().label() == Some(named.as_str()))
                 .unwrap()
                 .id()
                 .clone();
@@ -6491,6 +6500,8 @@ pub(super) struct Laid {
     pub(super) placed_text: Vec<(iced::Rectangle, String)>,
     /// What assistive technology is told inside the footer.
     footer_names: Vec<String>,
+    /// Where each of `footer_names` is drawn.
+    footer_name_bounds: Vec<iced::Rectangle>,
     /// The far edge of whatever the footer draws, text or named glyph.
     footer_drawn_right: f32,
 }
@@ -6500,6 +6511,24 @@ pub(super) fn lay_out(
     width: f32,
     accounts: Option<ChatAccounts>,
     roles: &[&str],
+) -> Laid {
+    lay_out_on(
+        runtime,
+        width,
+        accounts,
+        roles,
+        Some("feature/a-long-branch-name"),
+    )
+}
+
+/// [`lay_out`] on `branch`, or in a place with no branch to show, such as a
+/// detached worktree.
+fn lay_out_on(
+    runtime: &Runtime,
+    width: f32,
+    accounts: Option<ChatAccounts>,
+    roles: &[&str],
+    branch: Option<&str>,
 ) -> Laid {
     use iced::advanced::{
         Layout, layout,
@@ -6545,7 +6574,7 @@ pub(super) fn lay_out(
         width,
         0.0,
         Place {
-            branch: Some("feature/a-long-branch-name".into()),
+            branch: branch.map(Into::into),
         },
         true,
         accounts,
@@ -6616,6 +6645,7 @@ pub(super) fn lay_out(
             .map(|(bounds, _)| bounds.x + bounds.width)
             .fold(f32::MIN, f32::max),
         footer_text: text.into_iter().map(|(_, text)| text).collect(),
+        footer_name_bounds: named.iter().map(|(bounds, _)| *bounds).collect(),
         footer_names: named.into_iter().map(|(_, name)| name).collect(),
     }
 }
@@ -6666,12 +6696,21 @@ fn composer_offers_send_only_for_a_draft_and_keeps_stop_last() {
         mode: PromptMode::Send,
         slot: 0,
     };
-    assert_eq!(composer_trailing(&[PromptMode::Send], false, false), []);
-    assert_eq!(composer_trailing(&[PromptMode::Send], false, true), [send]);
-    let working = [PromptMode::Steer, PromptMode::Queue];
-    assert_eq!(composer_trailing(&working, true, false), [Trailing::Stop]);
     assert_eq!(
-        composer_trailing(&working, true, true),
+        composer_trailing(&[PromptMode::Send], false, false, false),
+        []
+    );
+    assert_eq!(
+        composer_trailing(&[PromptMode::Send], false, true, false),
+        [send]
+    );
+    let working = [PromptMode::Steer, PromptMode::Queue];
+    assert_eq!(
+        composer_trailing(&working, true, false, false),
+        [Trailing::Stop]
+    );
+    assert_eq!(
+        composer_trailing(&working, true, true, false),
         [
             Trailing::Submit {
                 mode: PromptMode::Steer,
@@ -6684,6 +6723,35 @@ fn composer_offers_send_only_for_a_draft_and_keeps_stop_last() {
             Trailing::Stop,
         ]
     );
+}
+
+/// Dictation writes into the draft while it listens, so Send can appear
+/// mid-session. The microphone stays at the trailing edge, and Stop just
+/// before it, whatever the draft and the turn, so neither moves under a
+/// pointer about to press it.
+#[test]
+fn composer_keeps_the_microphone_at_the_trailing_edge() {
+    for modes in [
+        &[PromptMode::Send][..],
+        &[PromptMode::Steer, PromptMode::Queue][..],
+    ] {
+        for busy in [false, true] {
+            for has_draft in [false, true] {
+                let controls = composer_trailing(modes, busy, has_draft, true);
+                assert_eq!(controls.last(), Some(&Trailing::Dictate));
+                let stop = controls
+                    .iter()
+                    .rposition(|control| *control == Trailing::Stop);
+                assert_eq!(
+                    stop,
+                    busy.then(|| controls.len() - 2),
+                    "Stop keeps its place beside the microphone: {controls:?}"
+                );
+                let without = composer_trailing(modes, busy, has_draft, false);
+                assert_eq!(controls[..controls.len() - 1], without[..]);
+            }
+        }
+    }
 }
 
 /// A cancel that also stops background subagents waits for a second
@@ -6899,6 +6967,111 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
             assert!(
                 !text.contains(status),
                 "{status} in footer at {width}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn footer_starts_and_ends_beneath_the_composer_glyphs() {
+    let roles = [
+        "chat-actions",
+        "chat-account-picker",
+        "chat-permission-picker",
+        "chat-submit-0",
+        "chat-dictate",
+    ];
+    let glyph = f32::from(design::ROW_ICON_SIZE);
+    // Where the composer's `+` glyph starts, and where its last control's
+    // glyph ends: the insets the footer's outer glyphs share.
+    let glyph_left = |laid: &Laid| {
+        let plus = laid.controls["chat-actions"];
+        plus.x + (plus.width - glyph) / 2.0
+    };
+    let glyph_right = |laid: &Laid| {
+        let last = ["chat-submit-0", "chat-dictate"]
+            .iter()
+            .filter_map(|role| laid.controls.get(*role))
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .expect("the composer has a trailing control");
+        last.x + (last.width + glyph) / 2.0
+    };
+    // A draft with something to send, so the composer ends on a control,
+    // and nothing spent yet.
+    let draft = || {
+        let (mut runtime, handle) = furnished_runtime();
+        runtime.connection = Connection::Draft;
+        Arc::make_mut(&mut runtime.snapshot).usage = Default::default();
+        runtime
+            .attachments
+            .push(chat::Attachment::file("/project/screenshot.png"));
+        (runtime, handle)
+    };
+    for width in [320.0_f32, 470.0, 900.0] {
+        // A draft's account is a picker. Leading the row, as it does where
+        // there is no branch to show, its glyph starts beneath the `+`,
+        // inside its own padding, and its hover background stays inside
+        // the composer's edge.
+        let (runtime, _handle) = draft();
+        let laid = lay_out_on(&runtime, width, Some(fixture_accounts()), &roles, None);
+        let picker = laid.controls["chat-account-picker"];
+        assert!(
+            (picker.x + CONTROL_PADDING[1] - glyph_left(&laid)).abs() <= 1.0,
+            "account glyph starts beneath `+` at {width}: {picker:?} vs {}",
+            glyph_left(&laid)
+        );
+        assert!(
+            picker.x >= laid.footer.x + step::GAP_M,
+            "hover background stays in the column at {width}: {picker:?}"
+        );
+        // Nothing spent yet: the footer ends on the permission picker,
+        // whose chevron ends beneath the composer's last glyph and whose
+        // hover background stays inside the composer.
+        let permissions = laid.controls["chat-permission-picker"];
+        assert!(
+            (permissions.x + permissions.width - CONTROL_PADDING[1] - glyph_right(&laid)).abs()
+                <= 1.0,
+            "permission chevron ends beneath the composer's last glyph at {width}: \
+             {permissions:?} vs {}",
+            glyph_right(&laid)
+        );
+        assert!(
+            permissions.x + permissions.width <= laid.footer.x + laid.footer.width - step::GAP_M,
+            "hover background stays in the column at {width}: {permissions:?}"
+        );
+        // A branch, where one is shown, leads in the picker's place: its
+        // icon, then its name.
+        let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
+        if FooterFit::for_width(width) == FooterFit::Wide {
+            let branch = laid
+                .placed_text
+                .iter()
+                .find(|(bounds, text)| {
+                    text.starts_with("feature/") && laid.footer.contains(bounds.center())
+                })
+                .unwrap_or_else(|| panic!("branch shown at {width}"))
+                .0;
+            let icon_left = branch.x - 12.0 - step::GAP_XS;
+            assert!(
+                (icon_left - glyph_left(&laid)).abs() <= 1.0,
+                "branch starts beneath `+` at {width}: {icon_left} vs {}",
+                glyph_left(&laid)
+            );
+        } else {
+            // Once the conversation starts the account is a label, its
+            // glyph where the picker's was.
+            let (runtime, _handle) = furnished_runtime();
+            let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
+            let account = laid
+                .footer_names
+                .iter()
+                .zip(&laid.footer_name_bounds)
+                .find(|(name, _)| name.starts_with("Account: "))
+                .unwrap_or_else(|| panic!("account glyph named at {width}"))
+                .1;
+            assert!(
+                (account.x - (picker.x + CONTROL_PADDING[1])).abs() <= 1.0,
+                "account label keeps the picker's place at {width}: {account:?} vs {picker:?}"
             );
         }
     }
@@ -7731,7 +7904,7 @@ fn prompt_notice_and_raw_output_share_transcript_selection() {
                     keyboard::key::NativeCode::Unidentified,
                 ),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat: false,
             }),
@@ -8044,7 +8217,7 @@ fn copy_web_search_native(select_all: bool) {
                     keyboard::key::NativeCode::Unidentified,
                 ),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat: false,
             }),
@@ -8321,6 +8494,16 @@ fn an_agents_report_says_how_the_agent_stands_now() {
             Some("waiting on scripts/restart-check")
         );
         assert!(!waiting.failed);
+        // Beside its time, the mark of waiting on its own work, and what
+        // that is, after the name as every row's words are: lowercase.
+        assert_eq!(
+            waiting.mark,
+            Some(disclosure::Mark::WaitingOnBackgroundWork)
+        );
+        assert_eq!(
+            waiting.detail.as_deref(),
+            Some("waiting on scripts/restart-check")
+        );
         // Its tooltip and accessible name keep what the report said.
         assert_eq!(
             waiting.heading,
@@ -8337,12 +8520,15 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     assert_eq!(failed.outcome.as_deref(), Some("failed"));
     assert!(failed.failed);
     assert_eq!(failed.glyph, Icon::Error);
+    // Marked once, at the leading edge.
+    assert_eq!((failed.mark, failed.detail.as_deref()), (None, None));
     // Run again and finished, its earlier failure no longer reads as its state.
     set(&mut runtime, chat::ToolStatus::Succeeded);
     let finished = read(&runtime, chat::DeliveryKind::Report, "a-review");
     assert_eq!(finished.outcome.as_deref(), Some("finished"));
     assert!(!finished.failed);
     assert_eq!(finished.glyph, Icon::Chat);
+    assert_eq!(finished.mark, Some(disclosure::Mark::Finished));
     // A report agreeing with how the agent stands says it once.
     assert_eq!(
         finished.heading,
@@ -8379,8 +8565,10 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     );
     assert_eq!(stopped.outcome.as_deref(), Some("stopped"));
     assert_eq!(stopped.heading, "Agent \"Review restart safety\" stopped");
-    // Marked as its row and tab mark a stopped agent.
-    assert_eq!(stopped.glyph, Icon::Ended);
+    // A report keeps its kind's glyph, and marks the stop beside its time,
+    // where every row marks how its work stands.
+    assert_eq!(stopped.glyph, Icon::Chat);
+    assert_eq!(stopped.mark, Some(disclosure::Mark::Stopped));
     // Resumed after it was stopped, the notice keeps its own words.
     Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Running;
     runtime.agent_work.observe(&runtime.snapshot.subagents);
@@ -8439,6 +8627,42 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     );
     assert_eq!(notice.outcome.as_deref(), Some("failed (exit 1)"));
     assert!(notice.failed);
+    // Its failure is the leading glyph's to mark; its exit status stays.
+    assert_eq!(
+        (notice.mark, notice.detail.as_deref()),
+        (None, Some("exit 1"))
+    );
+}
+
+/// An agent's time runs from its first step to its last, and to now while
+/// it works or waits on its own work; one without times has none.
+#[test]
+fn an_agents_time_counts_while_it_works_and_stops_when_it_ends() {
+    let step = |started_at, at| {
+        Arc::new(chat::Item {
+            id: format!("step-{at:?}"),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "work".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at,
+            at,
+        })
+    };
+    let mut agent = native_child_fixture();
+    agent.items = vec![step(Some(1_000), Some(2_000)), step(None, Some(65_000))];
+    agent.status = chat::ToolStatus::Succeeded;
+    assert_eq!(agent_elapsed_ms(&agent, Some(900_000)), Some(64_000));
+    for live in [chat::ToolStatus::Running, chat::ToolStatus::Waiting] {
+        agent.status = live;
+        assert_eq!(agent_elapsed_ms(&agent, Some(91_000)), Some(90_000));
+        assert_eq!(agent_elapsed_ms(&agent, None), None);
+    }
+    agent.items = vec![step(None, None)];
+    agent.status = chat::ToolStatus::Succeeded;
+    assert_eq!(agent_elapsed_ms(&agent, Some(91_000)), None);
 }
 
 /// A drawn report is redrawn when its agent's state, or what it waits on,
@@ -8756,7 +8980,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
                     keyboard::key::NativeCode::Unidentified,
                 ),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat: false,
             }),
@@ -9104,7 +9328,7 @@ fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
                             keyboard::key::NativeCode::Unidentified,
                         ),
                         location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::CTRL,
+                        modifiers: keyboard::Modifiers::COMMAND,
                         text: None,
                         repeat: false,
                     }),
@@ -9552,7 +9776,7 @@ fn reasoning_rows_use_the_selected_subagents_completion_and_duration() {
     };
     assert_eq!(
         label(&runtime),
-        "Reasoning: Latest line",
+        "Reasoning: Latest line · working",
         "parent activity cannot finish a child thought"
     );
     Arc::make_mut(&mut runtime.snapshot).subagents[0]
@@ -9767,7 +9991,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
             .iter()
             .chain(accessible.children())
             .any(|node| node.node().role() == Role::Button
-                && node.node().label() == Some("Reasoning: Latest line"))
+                && node.node().label() == Some("Reasoning: Latest line · working"))
     );
 }
 
@@ -9832,6 +10056,25 @@ fn concrete_activity_is_inferred_from_streamed_items() {
         *thinking = false;
     }
     assert_eq!(activity_label(&snapshot), "Responding");
+}
+
+#[test]
+fn following_an_unloaded_child_invalidates_its_coordination_projection() {
+    use std::hash::Hasher;
+
+    let (runtime, _) = prepared_runtime_for_test(&[]);
+    let mut child = native_child_fixture();
+    child.status = chat::ToolStatus::Running;
+    child.detail = chat::UNLOADED_CHILD_RUNNING.into();
+    child.items.clear();
+    let fingerprint = |child: &chat::Subagent| {
+        let mut hash = crate::fingerprint::hasher();
+        runtime.hash_agent_state(child, None, &mut hash);
+        hash.finish()
+    };
+    let before = fingerprint(&child);
+    child.detail.clear();
+    assert_ne!(before, fingerprint(&child));
 }
 
 /// The fingerprint of every exchange on screen, oldest first.
@@ -10008,7 +10251,10 @@ fn a_kept_strip_stops_spinning_when_a_message_follows_its_step() {
             2_000,
         )));
     });
-    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(disclosure::Status::Working)
+    );
     let after = row_fingerprints(&runtime, 0);
     assert_eq!(after[0], before[0], "the prompt keeps its row");
     assert_ne!(strip(&after), strip(&before), "the strip is drawn again");
@@ -10149,7 +10395,7 @@ fn a_lone_file_step_names_its_file_on_the_collapsed_strip() {
     let turn = runtime.turns[0].clone();
     assert_eq!(
         runtime.strip_summary(&turn),
-        "Tried to edit src/platform/a.rs · failed"
+        "Tried to edit src/platform/a.rs"
     );
 }
 
@@ -10954,17 +11200,23 @@ fn a_bare_enter_submits_only_when_the_preference_asks() {
 /// keyboard path stays invisible.
 #[test]
 fn submit_tooltips_name_the_chord_the_preference_bound() {
+    let primary = crate::settings::ModifierNames::CURRENT.primary;
     for (mode, slot, enter_sends, chord) in [
-        (PromptMode::Send, 0, true, "Enter"),
-        (PromptMode::Send, 0, false, "Ctrl+Enter"),
-        (PromptMode::Steer, 0, true, "Enter"),
-        (PromptMode::Queue, 0, false, "Ctrl+Enter"),
-        (PromptMode::Steer, 1, true, "Ctrl+Shift+Enter"),
-        (PromptMode::Queue, 1, false, "Ctrl+Shift+Enter"),
+        (PromptMode::Send, 0, true, "Enter".to_owned()),
+        (PromptMode::Send, 0, false, format!("{primary}+Enter")),
+        (PromptMode::Steer, 0, true, "Enter".to_owned()),
+        (PromptMode::Queue, 0, false, format!("{primary}+Enter")),
+        (PromptMode::Steer, 1, true, format!("{primary}+Shift+Enter")),
+        (
+            PromptMode::Queue,
+            1,
+            false,
+            format!("{primary}+Shift+Enter"),
+        ),
     ] {
         let (_, label) = submit_control(mode, slot, enter_sends, None);
         assert!(
-            label.ends_with(chord),
+            label.ends_with(&chord),
             "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
         );
     }
@@ -13309,20 +13561,13 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             }
         }
         let outcomes = |word: &str| probe.texts.iter().filter(|(text, _)| text == word).count();
-        if scenario.starts_with("agents reporting") {
-            assert_eq!(
-                outcomes("finished"),
-                if narrow { 0 } else { 2 },
-                "{scenario}: the reports' outcome"
-            );
-        }
-        if narrow {
-            assert_eq!(
-                outcomes("Finished"),
-                0,
-                "{scenario}: the started agents' state"
-            );
-        }
+        // A report's outcome, and a started agent's state, are marked
+        // beside the time rather than said, however wide the pane.
+        assert_eq!(
+            outcomes("finished") + outcomes("Finished"),
+            0,
+            "{scenario}: the outcome is a mark"
+        );
         let tops: Vec<f32> = rows.iter().map(|(_, bounds)| bounds.y).collect();
         for pair in tops.windows(2) {
             pitches.push((scenario, pair[1] - pair[0]));
@@ -13599,7 +13844,8 @@ fn a_run_of_messages_opens_over_the_message_the_reader_opened() {
     let texts = turn_texts(runtime);
     assert_eq!(
         texts[..4],
-        ["Messaged", "2 agents", "Main is green again.", "Delivered"],
+        // How they stand reads on from the row's words, muted.
+        ["Messaged", "2 agents", "Main is green again.", "delivered"],
         "{texts:?}"
     );
     let first = texts.iter().position(|text| text == "docs-review");
@@ -13649,12 +13895,15 @@ fn a_lone_coordinating_step_still_running_says_so() {
     runtime.refresh();
     preparation::drain_fixture(&mut runtime);
     assert!(runtime.cache["toolu_sessions"].coordination.is_some());
-    assert_eq!(runtime.strip_status(&runtime.turns[0]), None);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(disclosure::Status::Working)
+    );
     let texts = turn_texts(&runtime);
     assert!(
         texts
             .iter()
-            .any(|text| text.contains("live sessions · working")),
+            .any(|text| text.contains("live sessions") && !text.contains("· working")),
         "{texts:?}"
     );
 }
@@ -13911,7 +14160,30 @@ fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
     snapshot.busy = false;
     assert_eq!(runtime.send_now_count(), 0);
     assert!(!runtime.can_send_now());
-    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    assert!(!runtime.queue_held());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+    // Unless the provider holds it, as an ACP agent does after a stop or a
+    // refusal: then nothing would send it but the reader, and the heading
+    // says so beside Send now.
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .queue_holds = true;
+    assert!(runtime.queue_held());
+    assert_eq!(runtime.send_now_count(), 2);
+    assert!(runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2 · waiting for you");
+    assert!(runtime.queue_view().is_some());
+    // Without a turn running Send now needs no say-so to steer.
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .send_queued_now = false;
+    assert!(runtime.can_send_now());
+    // A turn running sends the queue when it ends, so it is not held.
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.send_queued_now = true;
+    snapshot.busy = true;
+    assert!(!runtime.queue_held());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
     runtime.disconnected = true;
     assert!(!runtime.can_send_now());
     runtime.disconnected = false;

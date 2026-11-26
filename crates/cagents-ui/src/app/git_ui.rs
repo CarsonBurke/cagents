@@ -1917,8 +1917,9 @@ mod tests {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first");
-        let second = directory.path().join("second");
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
         let mut snapshot = fixture(&first);
         git(
             &first,
@@ -2275,10 +2276,11 @@ mod tests {
     #[test]
     fn a_worktree_gone_from_the_listing_is_closed_unless_the_application_deleted_it() {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first");
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.as_path().join("first");
         let snapshot = fixture(&first);
         for name in ["outside", "inside"] {
-            let path = directory.path().join(name);
+            let path = root.as_path().join(name);
             git(
                 &first,
                 &["worktree", "add", "-b", name, path.to_str().unwrap()],
@@ -2319,7 +2321,7 @@ mod tests {
         let closed = records_removed_outside(project, &state.entries[&project].snapshot, &listed);
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].project_id, project);
-        assert_eq!(closed[0].path, directory.path().join("outside"));
+        assert_eq!(closed[0].path, root.as_path().join("outside"));
         assert_eq!(closed[0].branch.as_deref(), Some("outside"));
         assert!(!closed[0].existence.is_open());
     }
@@ -2828,8 +2830,9 @@ mod tests {
     #[test]
     fn a_removed_worktree_leaves_without_failing_its_siblings() {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first");
-        let second = directory.path().join("second");
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.as_path().join("first");
+        let second = root.as_path().join("second");
         let snapshot = fixture(&first);
         git(
             &first,
@@ -2881,7 +2884,7 @@ mod tests {
         );
         // `git worktree remove` takes `.git` first; a large checkout is still
         // on disk, and still listed, while its files go.
-        let third = directory.path().join("third");
+        let third = root.as_path().join("third");
         git(
             &first,
             &["worktree", "add", "-b", "third", third.to_str().unwrap()],
@@ -3843,7 +3846,8 @@ mod tests {
             .plan
             .clone()
             .unwrap();
-        let same_plan = catalog_plan(project.id, &snapshot);
+        let mut same_plan = catalog_plan(project.id, &snapshot);
+        same_plan.set_baseline_generation(1);
         assert_eq!(old_plan.as_ref(), &same_plan);
         drop(app.update_git(Action::Read {
             project: project.id,
@@ -4168,7 +4172,11 @@ mod tests {
         assert_eq!(staged.as_ref().unwrap().dirty.staged, 1);
         git(&linked, &["restore", "--staged", "tracked.txt"]);
         let linked_read = baseline.status_reads[&linked_id].completed_at;
-        let clean_read = baseline.status_reads[&clean_id].completed_at;
+        let clean_status = &baseline.status_reads[&clean_id];
+        let clean_read = clean_status.completed_at;
+        // When filesystem metadata cannot prove this index stayed the same,
+        // the overflow must refresh its status too.
+        let clean_requires_check = clean_status.metadata_changed(&clean);
         // In a later overflow, only the content-watched checkout might
         // have lost a file event. The linked ones compare their metadata.
         initial.worktrees.remove(&linked_id);
@@ -4190,7 +4198,12 @@ mod tests {
         assert_eq!(status.as_ref().unwrap().dirty.staged, 0);
         assert_eq!(status.as_ref().unwrap().dirty.unstaged, 1);
         assert!(recovered.status_reads[&linked_id].completed_at > linked_read);
-        assert_eq!(recovered.status_reads[&clean_id].completed_at, clean_read);
+        let recovered_clean = recovered.status_reads[&clean_id].completed_at;
+        if clean_requires_check {
+            assert!(recovered_clean > clean_read);
+        } else {
+            assert_eq!(recovered_clean, clean_read);
+        }
     }
 
     #[test]

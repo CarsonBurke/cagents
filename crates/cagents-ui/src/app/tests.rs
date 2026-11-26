@@ -889,8 +889,9 @@ fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
 
 #[test]
 fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
-    // A free right edge keeps `WINDOW_RESIZE_BORDER` of the window from the
-    // content, so the third case sits exactly at the narrow threshold.
+    // The cases below specify window widths with a client resize border.
+    // Adjust the native window width so each platform tests the same content
+    // width, including the exact threshold in the third case.
     // Each pane carries its own inspector, so an open one takes nothing
     // from the window's width.
     for (window, seed, with_project, expected, measured) in [
@@ -902,6 +903,12 @@ fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
         (2000.0, 600.0, true, 0.5, 1360.0),
         (900.0, 1340.0, true, 1.0, 640.0),
     ] {
+        let border = if cfg!(target_os = "macos") {
+            0.0
+        } else {
+            design::WINDOW_RESIZE_BORDER
+        };
+        let window = window - design::WINDOW_RESIZE_BORDER + border;
         let mut app = context_inspector_test_app(false);
         app.settings.default_native_pane_fraction = 0.5;
         if with_project {
@@ -4909,7 +4916,11 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
     }
 
     let width = 1500.0;
-    let border = design::WINDOW_RESIZE_BORDER;
+    let border = if cfg!(target_os = "macos") {
+        0.0
+    } else {
+        design::WINDOW_RESIZE_BORDER
+    };
     for inspector in [false, true] {
         let mut app = context_inspector_test_app(true);
         app.settings.ui_scale = 1.0;
@@ -4983,6 +4994,8 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
     }
 }
 
+// Window states are Wayland events.
+#[cfg(target_os = "linux")]
 #[test]
 fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
@@ -5040,6 +5053,8 @@ fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
     assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
 }
 
+// Window states are Wayland events.
+#[cfg(target_os = "linux")]
 #[test]
 fn resizes_query_the_window_state_only_until_wayland_reports_it() {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
@@ -6150,7 +6165,10 @@ fn the_inspector_shortcut_toggles_the_focused_pane_and_honors_bindings_and_modal
         text: None,
         repeat,
     };
-    let default = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    let default = match settings::ShortcutPlatform::CURRENT {
+        settings::ShortcutPlatform::Linux => keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        settings::ShortcutPlatform::MacOs => keyboard::Modifiers::LOGO | keyboard::Modifiers::ALT,
+    };
     for captured in [false, true] {
         for custom in [false, true] {
             let mut app = context_inspector_test_app(true);
@@ -7451,7 +7469,7 @@ fn workspace_switcher_tab_steers_a_compositor_safe_fallback_hold() {
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Code(physical),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
             text: None,
             repeat: false,
         },
@@ -12279,6 +12297,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         window_filled: false,
         window_state_observed: false,
         right_edge_tiled: false,
+        window_controls_points: None,
         core,
         settings_path: None,
         uncertain_terminal_proofs: HashMap::new(),
@@ -14911,7 +14930,7 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
             modified_key: keyboard::Key::Character("S".into()),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
             text: None,
             repeat: false,
         },
@@ -14925,7 +14944,10 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     );
     assert!(!app.palette.is_open());
     app.source_control_mutations.clear();
-    app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
+    app.settings.keyboard_shortcuts.command_palette = settings::parse_chords(&format!(
+        "{}+Shift+S",
+        settings::ModifierNames::CURRENT.primary
+    ));
     drop(app.update(key()));
     assert!(app.palette.is_open());
     assert!(app.source_control_mutations.is_empty(), "nothing is staged");
@@ -16370,4 +16392,44 @@ fn notice_detail_ellipsis_preserves_ordinary_word_wrap_geometry() {
     assert_eq!(actual.start, expected.start);
     assert_eq!(actual.x, expected.x);
     assert!(!text[actual.start..actual.end].starts_with(' '));
+}
+
+/// The traffic lights' room is measured in AppKit points and laid out in
+/// interface units; the header gives up only what the projects pane beside
+/// them does not already cover, or their whole width at the trailing edge.
+#[test]
+fn the_header_leaves_the_window_controls_only_what_the_projects_pane_does_not() {
+    use crate::sidebar::{WindowControls, WindowControlsEdge};
+    let mut app = context_inspector_test_app(false);
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+
+    let rail = design::NAVIGATION_RAIL_WIDTH;
+    app.settings.ui_scale = 2.0;
+    app.window_controls_points = Some(WindowControls {
+        width: 2.0 * (rail + 20.0),
+        height: 60.0,
+        edge: WindowControlsEdge::Leading,
+    });
+    app.chrome_ui.projects_collapsed = true;
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 20.0);
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Trailing), 0.0);
+    app.chrome_ui.projects_collapsed = false;
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+
+    app.window_controls_points = Some(WindowControls {
+        width: 140.0,
+        height: 60.0,
+        edge: WindowControlsEdge::Trailing,
+    });
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+    assert_eq!(
+        app.window_controls_reach(WindowControlsEdge::Trailing),
+        70.0
+    );
+    // The sidebar keeps its leading-edge layout; the trailing lights are
+    // the header's to avoid.
+    assert!(
+        app.window_controls()
+            .is_some_and(|controls| controls.edge == WindowControlsEdge::Trailing)
+    );
 }

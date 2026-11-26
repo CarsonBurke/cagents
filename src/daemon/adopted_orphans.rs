@@ -53,9 +53,10 @@ impl Drop for Registration {
 /// exclusively, so even a child that exits immediately is never reaped by
 /// [`reap_exited`].
 pub(crate) fn spawn_owned(command: &mut Command) -> io::Result<(Child, Registration)> {
-    // A sweeper waits for orphans on a signalfd, so its threads block
-    // SIGCHLD. Its children must not inherit that: a provider would never
-    // hear that its own tools exited.
+    // On Linux a sweeper waits for orphans on a signalfd, so its threads
+    // block SIGCHLD. Its children must not inherit that: a provider would
+    // never hear that its own tools exited. Darwin's kqueue blocks nothing,
+    // so there the calling thread has nothing to undo.
     if super::child_events::calling_thread_blocks_sigchld() {
         // SAFETY: the hook runs only async-signal-safe sigprocmask.
         unsafe {
@@ -67,11 +68,27 @@ pub(crate) fn spawn_owned(command: &mut Command) -> io::Result<(Child, Registrat
     }
     let _gate = GATE.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     let child = command.spawn()?;
+    let registration = register(&child);
+    Ok((child, registration))
+}
+
+/// Start a watched provider under the same sole-reaper registration gate.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_tracked(
+    command: Command,
+) -> io::Result<(Child, Registration, super::descendants::Tracker)> {
+    let _gate = GATE.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (child, tracker) = super::descendants::Tracker::spawn(command)?;
+    let registration = register(&child);
+    Ok((child, registration, tracker))
+}
+
+fn register(child: &Child) -> Registration {
     let pid = child.id();
     #[cfg(test)]
     tests::after_spawn(pid);
     *owned().entry(pid).or_default() += 1;
-    Ok((child, Registration(pid)))
+    Registration(pid)
 }
 
 /// Whether this process reaps unregistered children. A process that does must
@@ -150,16 +167,19 @@ pub(crate) fn reap_exited(limit: usize) -> io::Result<Sweep> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::{
         os::unix::process::ExitStatusExt,
         time::{Duration, Instant},
     };
 
+    #[cfg(target_os = "linux")]
     fn child_state(pid: i32) -> Option<char> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         stat[stat.rfind(')')? + 2..].chars().next()
     }
 
+    #[cfg(target_os = "linux")]
     fn zombie_children() -> Vec<i32> {
         super::super::owned_children::direct_children()
             .unwrap()
@@ -170,6 +190,7 @@ mod tests {
 
     /// Every case runs in a re-executed, single-test process that is its own
     /// subreaper, so neither the harness nor other tests share its children.
+    #[cfg(target_os = "linux")]
     fn isolated(stage: &str, body: impl FnOnce()) {
         if std::env::var_os(stage).is_none() {
             let test = std::thread::current().name().unwrap().to_owned();
@@ -190,6 +211,7 @@ mod tests {
         body();
     }
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn sweep_reaps_burst_orphans_and_preserves_owned_and_live_children() {
         isolated("CAGENTS_ADOPTED_ORPHANS_BURST_TEST", || {
@@ -279,6 +301,7 @@ exit 7"#,
         });
     }
 
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn a_sweep_cannot_reap_an_owned_child_that_exits_before_registration() {
         isolated("CAGENTS_ADOPTED_ORPHANS_RACE_TEST", || {
@@ -322,7 +345,7 @@ exit 7"#,
 
     #[test]
     fn a_stale_registration_never_releases_a_recycled_pid() {
-        let (mut first, stale) = spawn_owned(&mut Command::new("/bin/true")).unwrap();
+        let (mut first, stale) = spawn_owned(&mut Command::new("true")).unwrap();
         first.wait().unwrap();
         // Model the pid's reuse by a new owner before the stale drop.
         let pid = first.id();

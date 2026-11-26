@@ -1908,9 +1908,15 @@ fn an_agent_notice_reads_as_its_report() {
     let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&notice));
     let surface = report_surface(&runtime, "quiet-notice");
     assert!(
-        surface.text.contains(&"Quiet".to_owned()) && surface.text.contains(&"finished".to_owned()),
+        surface.text.contains(&"Quiet".to_owned()),
         "{:?}",
         surface.text
+    );
+    // Its outcome is the mark beside its time, which names it in words.
+    assert!(
+        surface.accessible.contains(&"finished".to_owned()),
+        "{:?}",
+        surface.accessible
     );
     assert!(
         !surface.text.iter().any(|text| text.contains("Agent \"")),
@@ -1997,13 +2003,16 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
                 1,
                 "expansion retains one title rather than repeating the full heading"
             );
-            assert_eq!(
+            // The outcome is marked beside the time, and named in words to
+            // assistive technology, never repeated as text.
+            assert!(!surface.text.iter().any(|text| text == "finished"));
+            assert!(
                 surface
-                    .text
+                    .accessible
                     .iter()
-                    .filter(|text| text.as_str() == "finished")
-                    .count(),
-                1
+                    .any(|label| label.contains("finished")),
+                "{:?}",
+                surface.accessible
             );
             // Open, the report carries the message's actions, whose Copy is
             // the only one: no button of its own repeats it in the body, and

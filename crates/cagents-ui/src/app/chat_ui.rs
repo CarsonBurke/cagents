@@ -120,6 +120,9 @@ mod monospace;
 mod opening_name;
 mod patch_view;
 mod pending_admission;
+#[cfg(test)]
+pub(in crate::app) use pending_admission::RETAINED_COPY_TITLE;
+pub(in crate::app) use pending_admission::same_conversation;
 mod permissions;
 mod preparation;
 mod prompt;
@@ -381,7 +384,7 @@ pub enum Action {
     /// What the opening of a pane's conversation names its channel, read
     /// once because the chat's loaded window starts after it.
     OpeningName(CardId, String, Option<String>),
-    UpdatesAcknowledged(Target, Result<(), String>),
+    UpdatesAcknowledged(Target, Result<(), String>, bool),
     Reconnect(Target),
     DraftStartCheckpointed(
         Target,
@@ -5493,7 +5496,7 @@ impl Runtime {
         runtime
     }
     /// The live connection, once the conversation has started.
-    fn handle(&self) -> Option<&Arc<ClientHandle>> {
+    pub(super) fn handle(&self) -> Option<&Arc<ClientHandle>> {
         match &self.connection {
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
             Connection::Live(handle) => Some(handle),
@@ -6138,10 +6141,7 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy), |agent| {
-            (
-                agent.items.as_slice(),
-                agent.status == chat::ToolStatus::Running,
-            )
+            (agent.items.as_slice(), agent.is_running())
         });
         if resume.is_none()
             && self.preparation.context(
@@ -7466,7 +7466,11 @@ impl Runtime {
                 let result = if frozen {
                     handle.hand_off_source_body()
                 } else {
-                    handle.set_interest(interested, retain_body)
+                    // The daemon's courier waits while the person has
+                    // follow-ups lined up here, so they go before its messages.
+                    handle
+                        .set_holds_followups(!self.followups.is_empty())
+                        .and_then(|()| handle.set_interest(interested, retain_body))
                 };
                 match result {
                     // The connection can drop between the check and the call, and
@@ -10511,9 +10515,13 @@ impl Cagents {
         }) {
             subscriptions.push(preparation::availability());
         }
+        // A turn's time counts while it runs, and an agent's while it works
+        // or waits on its own work after the turn that started it ended.
         if self.cards.values().any(|card| {
             matches!(card, CardRuntime::Chat(runtime)
-            if runtime.snapshot.busy && runtime.visible.load(Ordering::Relaxed))
+            if runtime.visible.load(Ordering::Relaxed)
+                && (runtime.snapshot.busy
+                    || runtime.snapshot.subagents.iter().any(chat::Subagent::is_live)))
         }) {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),
@@ -10631,16 +10639,16 @@ impl Cagents {
         };
         // A model or effort pick is not unsaved work: it does not keep a pane
         // another window closed, or hold back a shared identity change.
+        // Neither is whitespace, such as a stray space left in a composer.
         runtime.is_some_and(|runtime| {
             runtime.closed_elsewhere
-                || runtime.has_unsent_text()
-                || !runtime.unsent_attachments().is_empty()
+                || runtime.has_unsent_words_or_attachments()
                 || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
             .drafts
             .get(&card)
-            .is_some_and(|draft| !draft.is_empty())
+            .is_some_and(|draft| !draft.trim().is_empty())
             || self
                 .chat_ui
                 .draft_attachments
@@ -10700,6 +10708,49 @@ impl Cagents {
             self.chat_ui.draft_models.insert(canonical, model);
         }
         true
+    }
+
+    /// Whether chat `card` has more under way than a draft: a start, a
+    /// parked runtime, a send, or a close from another window.
+    pub(super) fn chat_alias_busy(&self, card: CardId) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        self.chat_ui.phases.contains_key(&card)
+            || self.chat_ui.parked.contains_key(&card)
+            || runtime.is_some_and(|runtime| {
+                runtime.closed_elsewhere || runtime.transition_blocker().is_some()
+            })
+    }
+
+    /// Drops the saved text and attachments of chat `card`, which is going.
+    pub(super) fn forget_saved_chat_draft(&mut self, card: CardId) {
+        self.chat_ui.drafts.remove(&card);
+        self.chat_ui.draft_attachments.remove(&card);
+    }
+
+    /// Moves the unsent text and attachments of chat `from`, about to be
+    /// retired, to chat `to`, whose own draft is empty.
+    pub(super) fn move_unsent_chat(&mut self, from: CardId, to: CardId) {
+        self.stash_unsent_chat(from);
+        let text = self.chat_ui.drafts.remove(&from);
+        let attachments = self.chat_ui.draft_attachments.remove(&from);
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&to) {
+            if let Some(text) = text {
+                runtime.replace_draft(text_editor::Content::with_text(&text));
+            }
+            if let Some(attachments) = attachments {
+                runtime.replace_attachments(attachments);
+            }
+            return;
+        }
+        if let Some(text) = text {
+            self.chat_ui.drafts.insert(to, text);
+        }
+        if let Some(attachments) = attachments {
+            self.chat_ui.draft_attachments.insert(to, attachments);
+        }
     }
 
     pub(super) fn shared_chat_detach(&mut self, card: CardId) {
@@ -11042,6 +11093,35 @@ impl Cagents {
                         .is_some_and(|owner| owner.id() == source.id))
         })
     }
+    /// The conversation `source`, card `card`'s descriptor, is when its open
+    /// agent holds the ID the card lacks and nothing else of the two differs:
+    /// the same chat, proof, launch and owned listener
+    /// ([`chat::is_first_codex_identity_update`]). Nothing is inferred from
+    /// the provider's saved conversations.
+    fn open_agent_conversation(
+        &self,
+        card: CardId,
+        source: &chat::Session,
+    ) -> Option<chat::Session> {
+        if source.launch.session_id.is_some() {
+            return None;
+        }
+        let managed = crate::model::AgentId::from_uuid(card.as_uuid());
+        self.workspace_model
+            .agents
+            .iter()
+            .find_map(|agent| match &agent.session {
+                Some(crate::agent_execution::HostedSession::Chat(saved))
+                    if !agent.closed
+                        && (agent.id == managed || saved.id == source.id)
+                        && chat::is_first_codex_identity_update(source, saved) =>
+                {
+                    Some(saved.clone())
+                }
+                _ => None,
+            })
+    }
+
     pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return None;
@@ -11837,6 +11917,16 @@ impl Cagents {
         })
     }
     pub(super) fn acknowledge_chat_updates(&mut self, card: CardId) -> Task<Message> {
+        self.acknowledge_chat_updates_inner(card, true)
+    }
+
+    /// A lineage read from the visible pane should not replace its diagnostic
+    /// if the connection drops between the dwell check and the broker call.
+    pub(super) fn acknowledge_visible_chat_lineage(&mut self, card: CardId) -> Task<Message> {
+        self.acknowledge_chat_updates_inner(card, false)
+    }
+
+    fn acknowledge_chat_updates_inner(&self, card: CardId, report_error: bool) -> Task<Message> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
         };
@@ -11856,7 +11946,7 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-            Message::ChatUi(Action::UpdatesAcknowledged(target, result))
+            Message::ChatUi(Action::UpdatesAcknowledged(target, result, report_error))
         })
     }
     /// Hands what a conversation's provider reported about the account it
@@ -14002,6 +14092,23 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                // The card never learned its conversation, but its open agent
+                // did: the provider named the thread after the card's
+                // descriptor was written. The card takes that exact ID and
+                // reopens the conversation instead of reporting it lost. An
+                // account recovery's own start is not redirected.
+                if let Err(failure) = &result
+                    && account_source.is_none()
+                    && failure.recovery == chat::Recovery::Fresh
+                    && let Some(named) = self.open_agent_conversation(target.card, &attempt.session)
+                {
+                    tracing::info!(card = %target.card, "reopening the conversation the card's agent names");
+                    if let Some(state) = self.card_state_mut(target.card) {
+                        state.kind = CardKind::Chat(named.clone());
+                    }
+                    self.persist();
+                    return self.start_chat(target.card, named, attempt.intent, None, false);
+                }
                 match result {
                     Ok(handle) => {
                         if attempt.upgrade_admission.as_ref().is_some_and(|canonical| {
@@ -14731,8 +14838,9 @@ impl Cagents {
                     .unwrap_or_else(Task::none);
                 return Task::batch([retry, removal]);
             }
-            Action::UpdatesAcknowledged(target, result) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
+            Action::UpdatesAcknowledged(target, result, report_error) => {
+                if report_error
+                    && let Some(runtime) = self.chat_runtime_mut(target)
                     && let Err(error) = result
                 {
                     runtime.error = Some(error);

@@ -24,6 +24,8 @@ loader.exec_module(hot)
 
 # Bounds only a hang: a passing sandboxed run returns long before it.
 HANG_GUARD = 60
+# The daemon is its own package; the CLI is the root package's.
+DAEMON_PACKAGE = {"cagentsd": ["-p", "cagents-host"]}
 
 
 class HotRunner(unittest.TestCase):
@@ -99,12 +101,13 @@ class HotRunner(unittest.TestCase):
                 self.assertIsNone(hot.main())
                 state.prerequisites.assert_called_once_with()
                 self.assertEqual([call[0] for call in state.calls], ["build", "build", "metadata", "stage", "stage"])
-                for call, name, features in zip(state.calls, ("cagents", "cagentsd"), ("development", "development,host")):
+                for call, name in zip(state.calls, ("cagents", "cagentsd")):
                     command = self.assert_locked_sandbox(call[1], state.root)
                     self.assertEqual(command, [
                         "cargo", "build", "--locked", "--profile", "dev-runtime",
                         "--target", "x86_64-unknown-linux-gnu", "--no-default-features",
-                        "--features", features, "--bin", name, "--message-format", "json-render-diagnostics",
+                        *DAEMON_PACKAGE.get(name, []), "--features", "development",
+                        "--bin", name, "--message-format", "json-render-diagnostics",
                     ])
                     self.assertNotIn("CARGO_NET_OFFLINE", call[1])
                 ui_features = "hot-reload" if browserless else "hot-reload,integrated-browser"
@@ -160,7 +163,7 @@ class HotRunner(unittest.TestCase):
                     self.assertEqual(command, [
                         "cargo", "build", "--locked", "--profile", "dev-runtime",
                         "--target", "x86_64-unknown-linux-gnu", "--no-default-features",
-                        "--features", "development" + (",host" if name == "cagentsd" else ""),
+                        *DAEMON_PACKAGE.get(name, []), "--features", "development",
                         "--bin", name, "--message-format", "json-render-diagnostics",
                     ])
                 state.metadata.assert_called_once_with(["rustc", "-vV"], text=True)
