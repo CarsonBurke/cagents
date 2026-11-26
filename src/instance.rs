@@ -183,7 +183,25 @@ pub fn window_slot() -> &'static str {
         .unwrap_or(PRIMARY_WINDOW)
 }
 
+// Earlier clients reject the dot. Only clients that recheck the named inode
+// after locking can ever acquire or reopen a slot in this namespace.
+const FRESH_DEVICE_WINDOW_SUFFIX: &str = ".fresh";
+
+fn fresh_device_window_slot(slot: &str) -> bool {
+    slot.strip_prefix("device-")
+        .and_then(|slot| slot.strip_suffix(FRESH_DEVICE_WINDOW_SUFFIX))
+        .is_some_and(|key| {
+            key.len() == 16
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 pub fn validate_window_slot(slot: &str) -> io::Result<()> {
+    if fresh_device_window_slot(slot) {
+        return Ok(());
+    }
     if slot == "update"
         || slot.is_empty()
         || slot.len() > 40
@@ -563,21 +581,35 @@ impl WindowLease {
         if let Some(slot) = requested {
             validate_window_slot(slot)?;
         }
+        let fresh_device = device.filter(|_| new_window && requested.is_none());
+        if let Some(claims) = claims {
+            state_claim::prepare_claim_directory(claims, state_claim::Claimant::Window)?;
+            if fresh_device.is_some() {
+                state_claim::prune_fresh_device_claims(claims);
+            }
+        }
         for index in 1..=1024 {
-            let slot = requested.map(str::to_owned).unwrap_or_else(|| {
+            let slot = if let Some(slot) = requested {
+                slot.to_owned()
+            } else if let Some(device) = fresh_device {
+                // A new device window has no old layout. In particular, a
+                // source window must seed it even when other windows closed.
+                let key = uuid::Uuid::new_v4().to_string();
+                format!(
+                    "{}{FRESH_DEVICE_WINDOW_SUFFIX}",
+                    crate::device::scoped_window_slot(device, &key)
+                )
+            } else {
                 let slot = if new_window {
                     format!("window-{}", index + 1)
                 } else {
                     PRIMARY_WINDOW.into()
                 };
-                // Reuse device slots after their leases end. The shared
-                // claim inode stays named, so older windows can still lock
-                // the same file even across a rolling upgrade.
                 match device {
                     Some(device) => crate::device::scoped_window_slot(device, &slot),
                     None => slot,
                 }
-            });
+            };
             match owned_lock(
                 &runtime.join(slot_lock_name(&slot)),
                 libc::LOCK_EX | libc::LOCK_NB,
@@ -593,7 +625,11 @@ impl WindowLease {
                             // Another session has this saved window open; a
                             // new window takes the next free one instead.
                             Err(error) if state_claim::state_in_use(&error).is_some() => {
-                                if new_window && requested.is_none() {
+                                if new_window
+                                    && requested.is_none()
+                                    && state_claim::state_in_use(&error)
+                                        .is_some_and(|reason| !reason.unreadable())
+                                {
                                     continue;
                                 }
                                 return Err(error);
@@ -5726,9 +5762,7 @@ mod startup_update_tests {
     }
 
     #[test]
-    fn remote_new_windows_reuse_the_same_shared_claim_after_release() {
-        use std::os::unix::fs::MetadataExt;
-
+    fn remote_new_window_claims_leave_distinct_layouts_and_release_their_files() {
         let claims = tempfile::tempdir().unwrap();
         let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
         for runtime in &runtimes {
@@ -5747,21 +5781,52 @@ mod startup_update_tests {
             )
         };
         let (first, slot) = open(0, None).unwrap();
+        assert!(fresh_device_window_slot(&slot));
         let file = claims.path().join(format!("window.{slot}.lock"));
-        let old_reader = fs::File::open(&file).unwrap();
-        let inode = old_reader.metadata().unwrap().ino();
+        let earlier_reader = fs::File::open(&file).unwrap();
         let error = open(1, Some(&slot))
             .err()
             .expect("the remote layout is held");
         assert!(state_claim::state_in_use(&error).is_some());
         let (second, different) = open(1, None).unwrap();
         assert_ne!(slot, different);
+        assert!(file.exists());
         drop(first);
-        let (_reopened, reused) = open(0, None).unwrap();
-        assert_eq!(reused, slot);
-        assert_eq!(fs::metadata(file).unwrap().ino(), inode);
+        assert!(!file.exists());
+        assert_eq!(earlier_reader.metadata().unwrap().nlink(), 0);
+        let (_next, next_slot) = open(0, None).unwrap();
+        assert_ne!(next_slot, slot);
+        assert_ne!(next_slot, different);
+        let (reopened, same_slot) = open(0, Some(&slot)).unwrap();
+        assert_eq!(same_slot, slot);
+        drop(reopened);
+        assert!(!file.exists());
         drop(second);
-        assert_eq!(fs::read_dir(claims.path()).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(claims.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn new_window_reports_an_unreadable_claim_directory_before_allocating_a_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let claims = root.path().join("claims");
+        fs::write(&claims, "directory has been replaced by a file").unwrap();
+        let error = WindowLease::acquire_waiting_in(
+            &runtime,
+            Some(&claims),
+            false,
+            true,
+            None,
+            None,
+            Duration::ZERO,
+            &mut |_| {},
+        )
+        .err()
+        .expect("a broken claims directory must refuse window startup");
+        assert!(state_claim::state_in_use(&error).unwrap().unreadable());
+        assert!(!runtime.join(slot_lock_name("window-2")).exists());
     }
 
     #[test]

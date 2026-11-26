@@ -93,6 +93,10 @@ pub struct StateInUse {
 }
 
 impl StateInUse {
+    pub(crate) fn unreadable(&self) -> bool {
+        self.unreadable
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -198,7 +202,25 @@ pub fn state_in_use<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<
 /// already free.
 #[derive(Debug)]
 pub struct StateClaim {
-    _lock: OwnedLock,
+    lock: OwnedLock,
+    remove_on_release: Option<PathBuf>,
+}
+
+impl StateClaim {
+    fn held(lock: OwnedLock) -> Self {
+        Self {
+            lock,
+            remove_on_release: None,
+        }
+    }
+}
+
+impl Drop for StateClaim {
+    fn drop(&mut self) {
+        if let Some(path) = &self.remove_on_release {
+            remove_fresh_device_claim(path, &self.lock);
+        }
+    }
 }
 
 /// This instance's claims, beside its saved state.
@@ -326,15 +348,72 @@ pub(crate) fn claim_window_state_in(
 ) -> io::Result<StateClaim> {
     validate_window_slot(slot)?;
     prepare_claim_directory(claims, Claimant::Window)?;
-    acquire(
-        &claims.join(format!("window.{slot}.lock")),
+    let path = claims.join(format!("window.{slot}.lock"));
+    let mut claim = acquire(
+        &path,
         record(slot_lock, None)?,
         Claimant::Window,
         WINDOW_PATIENCE,
-    )
+    )?;
+    if fresh_device_window_slot(slot) {
+        claim.remove_on_release = Some(path);
+    }
+    Ok(claim)
 }
 
-fn prepare_claim_directory(path: &Path, claimant: Claimant) -> io::Result<()> {
+// A process can exit without dropping its lease. Touch only the fresh
+// namespace and keep every claim for which ownership remains uncertain.
+pub(super) fn prune_fresh_device_claims(claims: &Path) {
+    let Ok(entries) = fs::read_dir(claims) else {
+        return;
+    };
+    let boot = local_boot();
+    let mut handoff_checks = 0;
+    for entry in entries.take(1024).flatten() {
+        let name = entry.file_name();
+        let Some(slot) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("window."))
+            .and_then(|name| name.strip_suffix(".lock"))
+            .filter(|slot| fresh_device_window_slot(slot))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(lock) = open_claim(&path, true)
+            .and_then(|file| owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB))
+        else {
+            continue;
+        };
+        let Ok(last) = read(&lock) else {
+            continue;
+        };
+        if last.guard.file_name() != Some(std::ffi::OsStr::new(&slot_lock_name(slot))) {
+            continue;
+        }
+        if !other_boot(&last, boot.as_deref()) {
+            // At most one grace interval on the window's startup path.
+            if handoff_checks != 0 || guard_held(&last.guard) {
+                continue;
+            }
+            handoff_checks += 1;
+            if taken_within(&last.guard, HANDOFF) {
+                continue;
+            }
+        }
+        remove_fresh_device_claim(&path, &lock);
+    }
+}
+
+fn remove_fresh_device_claim(path: &Path, lock: &OwnedLock) {
+    if matches!(same_named_claim(path, lock), Ok(true))
+        && let Err(error) = fs::remove_file(path)
+    {
+        tracing::debug!(claim = %path.display(), %error, "could not remove a released window claim");
+    }
+}
+
+pub(super) fn prepare_claim_directory(path: &Path, claimant: Claimant) -> io::Result<()> {
     crate::secure_file::prepare_private_directory(path).map_err(|error| {
         tracing::debug!(directory = %path.display(), %error, "could not verify the saved-data claim directory");
         io::Error::other(unreadable(claimant))
@@ -463,7 +542,7 @@ fn acquire(
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match create_claim(path, &ours) {
-                    Ok(lock) => return Ok(StateClaim { _lock: lock }),
+                    Ok(lock) => return Ok(StateClaim::held(lock)),
                     Err(error)
                         if error.kind() == io::ErrorKind::AlreadyExists
                             && started.elapsed() < patience =>
@@ -501,7 +580,7 @@ fn acquire(
                     return Err(io::Error::other(refusal(claimant, Some(&last), false)));
                 }
                 write(lock.file_mut(), &ours).map_err(|_| unreadable())?;
-                return Ok(StateClaim { _lock: lock });
+                return Ok(StateClaim::held(lock));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => match read_path(path) {
                 Ok(found) => found,
@@ -743,6 +822,29 @@ mod tests {
     fn refusal_of(result: io::Result<StateClaim>) -> StateInUse {
         let error = result.expect_err("the claim is refused");
         state_in_use(&error).cloned().expect("a state refusal")
+    }
+
+    #[test]
+    fn prune_removes_released_fresh_claims_and_keeps_legacy_and_live_claims() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let stale = "device-0123456789abcdef.fresh";
+        let live = "device-fedcba9876543210.fresh";
+        let legacy = "device-001122334455aabb";
+        let path = |slot| claims.path().join(format!("window.{slot}.lock"));
+        let claim = |slot| {
+            let ours = record(&runtime.path().join(slot_lock_name(slot)), None).unwrap();
+            acquire(&path(slot), ours, Claimant::Window, Duration::ZERO).unwrap()
+        };
+        drop(claim(stale));
+        drop(claim(legacy));
+        let _live = claim(live);
+        let stale_file = fs::File::open(path(stale)).unwrap();
+        prune_fresh_device_claims(claims.path());
+        assert!(!path(stale).exists());
+        assert!(!same_named_claim(&path(stale), &stale_file).unwrap());
+        assert!(path(legacy).exists());
+        assert!(path(live).exists());
     }
 
     #[test]
