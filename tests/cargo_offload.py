@@ -2405,6 +2405,31 @@ class RemoteRun(unittest.TestCase):
                 self.assertEqual(agent.wait(timeout=HANG_GUARD), 130)
             self.assertFalse(marker.exists())
 
+    def test_late_prune_cannot_remove_the_next_held_builds_sources(self):
+        with FixtureDirectory() as scope:
+            slot = Path(scope.name, "slot-0")
+            source = slot / "src"
+            source.mkdir(parents=True)
+            with (slot / "lease-live").open("w") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX)
+                lease.write("still-held")
+                lease.flush()
+
+                def begin(operation):
+                    agent = self.agent(scope, "begin", str(slot), "still-held", operation)
+                    return agent.wait(timeout=HANG_GUARD)
+
+                self.assertEqual(begin("1"), 0)
+                self.assertEqual(begin("2"), 0)
+                added = source / "new-source"
+                added.touch()
+                self.assertEqual(begin("1"), 255)
+                old = self.agent(scope, "prune", str(slot), "1", "still-held", "1",
+                                 stdin=subprocess.PIPE)
+                old.communicate(b"\0", timeout=HANG_GUARD)
+                self.assertEqual(old.returncode, 255)
+                self.assertTrue(added.is_file())
+
     def test_the_build_host_uses_the_fixtures_private_gate(self):
         for override in (False, True):
             with self.subTest(override=override), FixtureDirectory() as scope:

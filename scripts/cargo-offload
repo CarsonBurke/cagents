@@ -636,15 +636,20 @@ OPTIONAL_TOOLS = ("cargo-host-test-helper.py", "cargo_artifacts.py")
 
 
 LEASE_PROOF = r'''
-def require_generation(slot, generation=None):
+def require_generation(slot, generation=None, operation=None):
     if generation is None:
         return
     try:
         with open(os.path.join(slot, "lease-live")) as proof:
             if proof.read() == generation:
-                fcntl.flock(proof, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return
+                try:
+                    fcntl.flock(proof, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if operation is None:
+                        return
+                    with open(os.path.join(slot, "operation")) as active:
+                        if active.read() == f"{generation} {operation}":
+                            return
     except OSError:
         pass
     sys.exit(255)
@@ -1627,6 +1632,28 @@ if command == "lease":
     while True:
         time.sleep(3600)
 
+elif command == "begin":
+    # A hold preserves one lease across builds. Fence all commands from the
+    # previous build, even channels SSH delivered after the new child began.
+    generation, operation = sys.argv[3:5]
+    running = open(os.path.join(base, "running"), "a")
+    fcntl.flock(running, fcntl.LOCK_EX)
+    require_generation(base, generation)
+    path = os.path.join(base, "operation")
+    try:
+        with open(path) as active:
+            previous_generation, previous = active.read().split()
+    except FileNotFoundError:
+        previous_generation = None
+    if previous_generation == generation:
+        if int(previous) > int(operation):
+            sys.exit(255)
+        if previous == operation:
+            sys.exit(0)
+    with open(path + ".new", "w") as active:
+        active.write(f"{generation} {operation}")
+    os.replace(path + ".new", path)
+
 elif command == "prune":
     # Removes the slot checkout's files that are not in the list on standard
     # input, keeping Cargo's target directory.
@@ -1759,7 +1786,7 @@ elif command in ("run", "run-client"):
         resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
-    require_generation(base, request.get("generation"))
+    require_generation(base, request.get("generation"), request.get("operation"))
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
     # Temporary files go in a directory of this slot's own, rather than in
@@ -1991,8 +2018,8 @@ def install(staged, path, expected):
 
 
 RSYNC_SERVER = "import fcntl, os, sys\n" + LEASE_PROOF + """
-require_generation(sys.argv[1], sys.argv[2])
-os.execvp("rsync", ["rsync", *sys.argv[3:]])
+require_generation(sys.argv[1], sys.argv[2], sys.argv[3] or None)
+os.execvp("rsync", ["rsync", *sys.argv[4:]])
 """
 
 
@@ -2038,6 +2065,7 @@ class Offload:
         self.command = None
         self.lease = None
         self.slot_generation = None
+        self.held_operation = None
         self.local_sync_fd = None
         self.held_builds_fd = None
         self.cancelled = 0
@@ -2300,7 +2328,12 @@ class Offload:
             self.control = control
             self.slot_generation = generation
             self.held_builds_fd = builds.fileno()
+            # Ordered under the local builds lock, on the hold owner's clock.
+            self.held_operation = str(time.monotonic_ns())
             try:
+                begun = self.transfer(self.remote("begin", slot, *self.generation_arguments()))
+                if begun.returncode:
+                    return 128 + self.cancelled if self.cancelled else begun.returncode
                 return self.build(slot, top, workspace, cwd, metadata)
             except Refusal as refusal:
                 if self.cancelled:
@@ -2309,6 +2342,7 @@ class Offload:
             finally:
                 self.control = None
                 self.slot_generation = None
+                self.held_operation = None
                 self.held_builds_fd = None
 
     def tests_there(self):
@@ -2641,6 +2675,7 @@ class Offload:
                 *directories.values()]}.items(), key=lambda pair: -len(pair[0]))
         mappings = mapped()
         request = {"environment": environment, "generation": self.slot_generation,
+                   "operation": self.held_operation,
                    "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1",
                    "metadata": [[plan.toolchain] if plan.toolchain else [], metadata_options],
                    "target_dir": remote_target if "--target-dir" in directories else None,
@@ -2740,7 +2775,7 @@ class Offload:
             say(f"could not copy the sources to {self.host} (rsync exited {status})")
         if not status and not self.cancelled:
             status = self.transfer(
-                self.remote("prune", slot, len(listing), *self.generation_argument()), data=listing
+                self.remote("prune", slot, len(listing), *self.generation_arguments()), data=listing
             ).returncode
             if status and not self.cancelled:
                 say(f"could not remove stale sources on {self.host} (status {status})")
@@ -2821,8 +2856,8 @@ class Offload:
             mapped[name] = os.path.join(destination, relative)
         return mapped
 
-    def generation_argument(self):
-        return [] if self.slot_generation is None else [self.slot_generation]
+    def generation_arguments(self):
+        return [value for value in (self.slot_generation, self.held_operation) if value is not None]
 
     def rsync_path(self, slot):
         # The next lease waits for this hold before reusing the checkout.
@@ -2832,7 +2867,8 @@ class Offload:
         if self.slot_generation is None:
             command.append("rsync")
         else:
-            command += ["/usr/bin/python3", "-c", RSYNC_SERVER, slot, self.slot_generation]
+            command += ["/usr/bin/python3", "-c", RSYNC_SERVER, slot, self.slot_generation,
+                        self.held_operation or ""]
         return "--rsync-path=" + shlex.join(command)
 
     def fetch(self, slot, remote, local, shell, *, files=None, delete=False, missing_ok=False):
@@ -2861,7 +2897,7 @@ class Offload:
         updated lockfile. A file here that changed after it was sent, or a new
         one that appears here meanwhile, is newer and is kept; a new file this
         checkout ignores is left there."""
-        found = self.transfer(self.remote("written", slot, *self.generation_argument()), stdout=subprocess.PIPE)
+        found = self.transfer(self.remote("written", slot, *self.generation_arguments()), stdout=subprocess.PIPE)
         if found.returncode:
             return found.returncode
         written = [(base64.b64decode(name), new) for name, new in json.loads(found.stdout)]
