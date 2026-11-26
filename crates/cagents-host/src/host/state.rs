@@ -404,6 +404,7 @@ pub(crate) struct HostState {
     /// Its terminal may be the final startup owner blocking ordinary exit.
     checked_close_replies: BTreeSet<ClientId>,
     pub(super) inventory_generation: u64,
+    pub(super) tally_updates: Arc<tokio::sync::Notify>,
     published_terminal_workers: removal::PublishedWorkers,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) native_chat_capacity: usize,
@@ -571,6 +572,7 @@ impl HostState {
             ordinary_exit_registration_closed: false,
             checked_close_replies: BTreeSet::new(),
             inventory_generation: 0,
+            tally_updates: Arc::new(tokio::sync::Notify::new()),
             published_terminal_workers: Default::default(),
             shutdown_capabilities: VecDeque::new(),
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
@@ -716,6 +718,11 @@ impl HostState {
                 }
                 tally
             })
+    }
+
+    pub(super) fn inventory_changed(&mut self) {
+        self.inventory_generation += 1;
+        self.tally_updates.notify_one();
     }
 
     pub(super) fn notification_snapshot(&self) -> crate::notifications::Snapshot {
@@ -1588,7 +1595,7 @@ impl HostState {
         for client in clients {
             self.subscriptions.detach(client, terminal_id);
         }
-        self.inventory_generation += 1;
+        self.inventory_changed();
         Some(record)
     }
 
@@ -1738,7 +1745,7 @@ impl HostState {
         if let Some(spawned) = spawned {
             self.spawning_terminals.insert(terminal_id, spawned.clone());
         }
-        self.inventory_generation += 1;
+        self.inventory_changed();
         Ok(())
     }
 
@@ -1790,7 +1797,7 @@ impl HostState {
         self.spawning_transcripts.remove(&terminal_id);
         self.spawning_terminals.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
-            self.inventory_generation += 1;
+            self.inventory_changed();
         }
     }
 
@@ -1924,7 +1931,7 @@ impl HostState {
         }
         session.resume_hint =
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
-        self.inventory_generation += 1;
+        self.inventory_changed();
         self.notification_closed.remove(&terminal_id);
         self.terminals.insert(
             terminal_id,
@@ -2200,13 +2207,14 @@ impl HostState {
 
     fn inventory_count(&mut self) -> u64 {
         let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
+        let mut completed = 0;
         for record in self.chats.values_mut() {
             if !record.completion_observed
                 && !record.handle.owns_work()
                 && !record.returning_terminal
             {
                 record.completion_observed = true;
-                self.inventory_generation += 1;
+                completed += 1;
             }
             if !record.completion_observed {
                 count += 1;
@@ -2215,11 +2223,15 @@ impl HostState {
         for record in self.terminals.values_mut() {
             if !record.completion_observed && record.handle.is_completed() {
                 record.completion_observed = true;
-                self.inventory_generation += 1;
+                completed += 1;
             }
             if !record.completion_observed {
                 count += 1;
             }
+        }
+        if completed != 0 {
+            self.inventory_generation += completed;
+            self.tally_updates.notify_one();
         }
         count
     }
@@ -6267,6 +6279,12 @@ fn record_event_from(
         let wake_exit = state.ordinary_exit_cleanup_pending
             && worker.is_some()
             && matches!(wire_event, WireTerminalEvent::Completed { .. });
+        if matches!(
+            wire_event,
+            WireTerminalEvent::AgentActivityChanged { .. } | WireTerminalEvent::Exited { .. }
+        ) {
+            state.tally_updates.notify_one();
+        }
         (proof, sequence, deliveries, wake_exit)
     };
     if wake_exit {
