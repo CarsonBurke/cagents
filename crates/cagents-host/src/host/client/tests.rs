@@ -2654,7 +2654,7 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
         }
     }
 
-    fn wait_file(path: &std::path::Path, root: Option<u32>) {
+    fn wait_file(path: &std::path::Path, terminal: Option<&crate::terminal::TerminalHandle>) {
         #[cfg(target_os = "linux")]
         let timeout = Duration::from_secs(2);
         #[cfg(target_os = "macos")]
@@ -2662,14 +2662,20 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
         let deadline = Instant::now() + timeout;
         while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             if Instant::now() >= deadline {
-                let image = root.map(|pid| {
-                    crate::daemon::holder_registry::Process::read(pid as i32)
-                        .and_then(|process| process.executable())
-                });
-                panic!(
-                    "fixture did not start: {}; terminal image {image:?}",
-                    path.display()
-                );
+                #[cfg(target_os = "macos")]
+                {
+                    let image = terminal
+                        .map(crate::terminal::TerminalHandle::original_root_executable_for_test);
+                    panic!(
+                        "fixture did not start: {}; terminal image {image:?}",
+                        path.display()
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = terminal;
+                    panic!("fixture did not start: {}", path.display());
+                }
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -2812,11 +2818,7 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
     cleanup.handle = Some(host.lock().unwrap().handle(1, terminal_id).unwrap());
     wait_file(
         &directory.path().join("terminal-ready"),
-        cleanup
-            .handle
-            .as_ref()
-            .unwrap()
-            .original_root_pid_for_test(),
+        cleanup.handle.as_ref(),
     );
     // The daemon samples without any refresh request. Process discovery is
     // separately owned by the PTY; force its initial tick for this fixture.

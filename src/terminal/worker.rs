@@ -1321,6 +1321,17 @@ impl TerminalHandle {
             .map(PinnedProcess::pid)
     }
 
+    /// The original test terminal's executable while its retained pin is live.
+    #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+    pub fn original_root_executable_for_test(&self) -> std::io::Result<PathBuf> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .ok_or_else(|| std::io::Error::other("original root pin was not captured"))?
+            .executable()
+    }
+
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
     /// these atomic worker checks do not make a source mutation atomic.
