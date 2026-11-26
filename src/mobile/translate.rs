@@ -105,6 +105,7 @@ pub fn conversation_state(snapshot: &chat::Snapshot) -> api::ConversationState {
         activity: activity(snapshot.activity()),
         busy: snapshot.busy,
         ready: snapshot.ready,
+        can_attach_image: snapshot.capabilities.attachments,
         exited: snapshot.exited,
         error: snapshot.error.clone(),
         read_only: snapshot.read_only_reason.clone(),
@@ -261,15 +262,17 @@ pub fn item(item: &chat::Item) -> api::Item {
                 input: input.into(),
                 output: output.into(),
                 clipped: input_clipped || output_clipped,
+                output_clipped,
                 status: tool_status(*status),
             }
         }
         chat::ItemContent::Image {
-            path: _,
             description,
-            reference: _,
+            reference,
+            ..
         } => api::ItemBody::Image {
             description: description.clone(),
+            available: reference.is_some(),
         },
         chat::ItemContent::Delivery {
             kind,

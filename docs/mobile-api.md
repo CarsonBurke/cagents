@@ -15,8 +15,9 @@ API version 1 covers:
 - sending, steering or queueing a message, interrupting a turn, and answering
   approvals and questions.
 
-Terminal-surface sessions are listed but can't be followed, and attachments,
-full diffs and full tool output stay on the computer.
+Terminal-surface sessions are listed. On computers that advertise
+`conversation_details`, a client can also read saved command and tool output,
+reported file diffs and stored images, and send an image with a message.
 
 ## Connecting
 
@@ -178,8 +179,8 @@ The error `message` is written for the person and can be shown as is. The
 
 An `error` without an `id` answers a line that couldn't be read as a request.
 
-Data arrives as events, not in replies. A watch's `ok` is sent before its
-first event.
+Watch data arrives as events. A watch's `ok` is sent before its first event.
+Detail requests return one page in the request's `ok` reply.
 
 | Op | Params | Effect |
 | --- | --- | --- |
@@ -193,6 +194,10 @@ first event.
 | `conversation.unwatch` | `session` | Stops following it. |
 | `conversation.load_earlier` | `session` | Extends the window to older items. |
 | `conversation.send` | `session`, `text`, `mode` | Sends a message. `mode` is `send` (default), `steer` (into the running turn) or `queue` (after it). |
+| `conversation.output` | `session`, `item`, `cursor` | Reads saved command or tool output. |
+| `conversation.diff` | `session`, `item`, `path`, `cursor` | Reads the conversation's saved patches for a file listed in that edit item. |
+| `conversation.image` | `session`, `item`, `cursor` | Reads a stored image when the item has `available` set. |
+| `conversation.send_image` | `session`, `text`, `mode`, `name`, `png_base64` | Sends one PNG with a message when the conversation has `can_attach_image` set. |
 | `conversation.interrupt` | `session` | Stops the running turn. |
 | `conversation.answer` | `session`, `request`, `action`, `answers` | Answers a pending request. |
 
@@ -269,7 +274,8 @@ An item has a `role` (`user`, `assistant` or `system`), `started_at` and `at`
 times, and a `kind` with its own fields: `text`, `command`, `changes`,
 `web_search`, `tool`, `image` or `delivery`. Command and tool output is
 clipped to its last 4 KiB and tool input to its first 2 KiB, with `clipped`
-set. File changes carry the paths and line counts, not the diff.
+set. A tool can additionally set `output_clipped` when its output preview
+was clipped. File changes carry paths and line counts.
 
 On a slow connection, updates are combined: the bridge holds back while
 the phone is behind and then sends everything that changed since the last
@@ -278,6 +284,46 @@ update it sent.
 `state.requests` holds what the conversation waits for the person to decide.
 Each request has a `kind` (`approval`, `question` or `consent`), a `title` and
 `description`, its `fields` and its `actions`.
+
+### Transcript details and images
+
+A Welcome with `conversation_details: true` advertises these operations.
+The transcript keeps sending compact previews. Request detail when the person
+opens a row, using an item ID from the current watch. A diff's path must be
+one of the files in that item. It selects reported edits in transcript order,
+including failed or pending edits that have recorded patches.
+
+The first request omits `cursor`. For another page, echo `page.next` as
+`cursor` with the same operation, item and path on the same watch. An absent
+`next` marks the last page. If the saved content changes or the watch ends,
+restart from the first page. The bridge accepts one detail request at a time
+per connection. Item IDs, paths and cursors may be at most 64 KiB, 4 KiB and
+512 bytes respectively.
+
+```json
+{"type":"ok","id":20,"page":{"kind":"output","text":"Build completed.\n","next":"…"}}
+```
+
+- An `output` page carries up to 128 KiB of UTF-8 text. Concatenate it with
+  the previous pages. The bridge can serve up to 32 MiB of saved output per
+  item. It reads the computer's cached source and can only show the output
+  the provider supplied and the computer retained.
+- A `diff` page carries up to 256 KiB of patch data. Each `patches` entry
+  contains `item`, `offset` in UTF-8 bytes and `text`. An offset of zero
+  starts another reported patch. Other offsets continue the preceding patch.
+- An `image` page carries up to 192 KiB of raw bytes encoded in `base64`.
+  Decode each page separately and concatenate its bytes. Images up to 8 MiB
+  can be read from the computer's owned image receipts. Other image rows
+  show a description. Each connection holds one image transfer at a time.
+  Requesting a different image starts a new transfer.
+
+For `conversation.send_image`, encode a non-animated PNG up to 512 KiB and
+2048 pixels per side in standard padded base64. `name` is a display name of
+up to 256 UTF-8 bytes, and `text` is up to 64 KiB of UTF-8 text or empty.
+The ordinary client line limit still applies. The image is stored on the
+conversation's computer and goes through the same send or queue as a desktop
+attachment. Use `conversation.send_image` so an older server refuses the
+whole request with `unknown_op`.
 
 ## Compatibility
 

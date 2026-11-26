@@ -148,6 +148,8 @@ libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 notify = "=9.0.0-rc.8"
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
+# The mobile bridge validates PNG bytes before staging an attachment.
+png = "0.18"
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
 # binary payload; a self-describing text format costs ~24x more bytes and one
 # heap allocation per character cell on both sides. postcard is already in the
