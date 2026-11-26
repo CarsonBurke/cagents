@@ -1,5 +1,7 @@
 package dev.cagents.mobile.android.ssh
 
+import android.system.ErrnoException
+import android.system.OsConstants
 import com.hierynomus.sshj.key.KeyAlgorithms
 import com.hierynomus.sshj.userauth.certificate.Certificate
 import dev.cagents.mobile.android.data.ConnectionSettings
@@ -221,10 +223,10 @@ private suspend fun connect(target: SshTarget, host: String): SSHClient {
         throw e
     } catch (e: TransportException) {
         client.disconnectQuietly()
-        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, isRefusal(e))
+        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, host.takeIf { isRefusal(e) })
     } catch (e: Exception) {
         client.disconnectQuietly()
-        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, isRefusal(e))
+        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, host.takeIf { isRefusal(e) })
     }
     return client
 }
@@ -267,7 +269,9 @@ internal fun describeConnectFailure(e: Throwable, host: String, port: Int): Stri
  * when nothing listens on the port, rather than not answering at all.
  */
 internal fun isRefusal(e: Throwable): Boolean = generateSequence(e) { it.cause }.any { cause ->
-    cause is ConnectException && cause.message.orEmpty().let { "ECONNREFUSED" in it || "Connection refused" in it }
+    (cause is ErrnoException && cause.errno == OsConstants.ECONNREFUSED) ||
+        // The JVM says so only in words.
+        (cause is ConnectException && cause.message.orEmpty().let { "ECONNREFUSED" in it || "Connection refused" in it })
 }
 
 private fun describeKnown(known: Throwable?, e: Throwable, host: String, address: String): String {

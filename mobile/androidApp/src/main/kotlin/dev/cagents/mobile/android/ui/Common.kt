@@ -83,7 +83,8 @@ fun ConnectionBanner(
                 Banner(
                     Icons.Outlined.CloudOff,
                     "${connection.message} Trying again…",
-                    actions = listOf("Settings" to onSettings, "Retry now" to onRetry),
+                    // Settings stays at the right edge, where the attempt shows it too.
+                    actions = listOf("Retry now" to onRetry, "Settings" to onSettings),
                     actionsBelow = true,
                 )
             is ConnectionState.NeedsAction -> when (val failure = connection.failure) {

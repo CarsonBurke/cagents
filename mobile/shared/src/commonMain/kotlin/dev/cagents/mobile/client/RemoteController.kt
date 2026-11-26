@@ -389,8 +389,8 @@ class RemoteController(
             ?: run {
                 opened?.close()
                 throw ConnectFailure.Network(
-                "The computer didn't answer within ${config.connectTimeout.inWholeSeconds} seconds. " +
-                    "Is it awake, and is this phone on its network or on Tailscale?",
+                    "The computer didn't answer within ${config.connectTimeout.inWholeSeconds} seconds. " +
+                        "Is it awake, and is this phone on its network or on Tailscale?",
                 )
             }
         val bridge = BridgeSession(channel, config.clientName, config.clientVersion)

@@ -30,13 +30,25 @@ fun mostTelling(failures: List<Throwable>, name: String, hosts: List<String>, pa
     return failures.firstOrNull { it is ConnectFailure.UnknownHostKey }
         ?: failures.firstOrNull { it is ConnectFailure && it !is ConnectFailure.Network }
         ?: failures.singleOrNull()
-        // The computer is there but nothing takes SSH on that port: a wrong port, not a sleeping computer.
-        ?: failures.firstOrNull { it is ConnectFailure.Network && it.answered }
+        ?: refusal(failures, paired)
         ?: ConnectFailure.Network(
             "Couldn't reach $name at any of its ${hosts.size} addresses. " +
                 "Is it awake, and is this phone on its network or on Tailscale?",
             failures.firstOrNull(),
         )
+}
+
+/**
+ * The computer is there but nothing takes SSH on that port: a wrong port,
+ * not a sleeping computer. For a paired computer, a local address may be
+ * another machine on whatever network the phone is on, so its refusal counts
+ * only when every address refused, or a Tailscale address did.
+ */
+private fun refusal(failures: List<Throwable>, paired: Boolean): Throwable? {
+    val refused = failures.filter { it is ConnectFailure.Network && it.refusedBy != null }
+    if (refused.isEmpty()) return null
+    if (!paired || refused.size == failures.size) return refused.first()
+    return refused.firstOrNull { isTailscale((it as ConnectFailure.Network).refusedBy!!) }
 }
 
 /** A Tailscale MagicDNS name, or an address in Tailscale's IPv4 (100.64.0.0/10) or IPv6 (fd7a:115c:a1e0::/48) range. */
