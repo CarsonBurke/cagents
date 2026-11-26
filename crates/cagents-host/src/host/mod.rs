@@ -705,6 +705,18 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             "sessions will name this version's CLI directory, which a later update does not follow"
         );
     }
+    #[cfg(target_os = "macos")]
+    {
+        // Capture the login shell's PATH before admitting native provider
+        // launches. The bounded shell probe imports only PATH and is cached.
+        // LaunchServices and launchd can both start with a shorter PATH.
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            let _ = runtime.block_on(crate::account::probe::search_path());
+        }
+    }
     let mut initial = HostState::new(proof);
     initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
