@@ -212,7 +212,9 @@ The prepared assets are under `$CAGENTS_RELEASE_BUNDLES/.prepared-macos`
 and remain available for later cuts. Cut checks the source commit and asset
 digests before using them. If preparation is missing or damaged, cut builds
 and smoke-tests macOS on the selected host. Cut still requires the passing
-fw16 verdict and Linux bundle for that same commit.
+fw16 verdict and Linux bundle for that same commit. When cut waits for main's
+tip and the exact tip already has a passing test verdict, it prepares macOS
+while waiting for the Linux bundle.
 
 ## Native platform roadmap
 
