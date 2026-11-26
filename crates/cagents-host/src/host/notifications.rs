@@ -268,6 +268,21 @@ impl Handle {
         &self,
         event: Event,
     ) -> Result<CommitAcknowledgement, String> {
+        self.admit_committed(event, false)
+    }
+
+    pub(in crate::host) fn record_resolved_waiting(
+        &self,
+        event: Event,
+    ) -> Result<CommitAcknowledgement, String> {
+        self.admit_committed(event, true)
+    }
+
+    fn admit_committed(
+        &self,
+        event: Event,
+        resolved: bool,
+    ) -> Result<CommitAcknowledgement, String> {
         event.validate()?;
         let (receipt, result) = std::sync::mpsc::channel();
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -277,9 +292,20 @@ impl Handle {
         if pending.committed_events.len() >= MAX_PENDING {
             return Err("Notification commit queue is full; outcome remains unacknowledged".into());
         }
-        pending
-            .committed_events
-            .push_back((event, CommitReceipt::new(receipt)));
+        if resolved {
+            let target = event.target();
+            if pending.cleared_waiting.len() >= MAX_PENDING
+                && !pending.cleared_waiting.contains(&target)
+            {
+                return Err(
+                    "Waiting settlement queue is full; outcome remains unacknowledged".into(),
+                );
+            }
+            pending.clear_waiting(target);
+        }
+        let mut receipt = CommitReceipt::new(receipt);
+        receipt.resolved = resolved;
+        pending.committed_events.push_back((event, receipt));
         drop(pending);
         let _ = self.0.wake.try_send(());
         Ok(result)
@@ -1151,10 +1177,18 @@ impl JournalTestBridge {
         })
     }
 
+    pub(in crate::host) fn flush_waiting_clears(&mut self) -> Result<(), String> {
+        let mut pending = self.handle.0.pending.lock().unwrap();
+        commit_waiting_clears(&mut self.journal, &pending.cleared_waiting, |_, _| {})?;
+        pending.cleared_waiting.clear();
+        Ok(())
+    }
+
     fn commit_next_with(
         &mut self,
         commit: impl FnOnce(&mut Journal, Event, CommitReceipt) -> Result<Option<Notice>, String>,
     ) -> Result<Option<Notice>, String> {
+        self.flush_waiting_clears()?;
         let next = self
             .handle
             .0
@@ -1261,23 +1295,24 @@ async fn run(
     publish(&shared, &host, snapshot.clone());
     while wait_for_work(
         &mut receiver,
-        if proxy.is_none() {
-            if !withdrawals.is_empty() {
-                Some(next_attempt)
+        store.retry_at().or_else(|| {
+            if proxy.is_none() {
+                if !withdrawals.is_empty() {
+                    Some(next_attempt)
+                } else {
+                    delivery_schedule
+                        .deadline()
+                        .map(|due| due.max(next_attempt))
+                }
             } else {
-                delivery_schedule
-                    .deadline()
-                    .map(|due| due.max(next_attempt))
+                delivery_schedule.deadline()
             }
-        } else {
-            delivery_schedule.deadline()
-        }
-        .into_iter()
-        .chain(store.retry_at())
-        .chain(predecessor_retry.as_ref().map(|(due, _)| *due))
-        .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
-        .chain(automation_retry.deadline())
-        .min(),
+            .into_iter()
+            .chain(predecessor_retry.as_ref().map(|(due, _)| *due))
+            .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
+            .chain(automation_retry.deadline())
+            .min()
+        }),
     )
     .await
     {

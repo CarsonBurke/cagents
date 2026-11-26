@@ -926,7 +926,11 @@ fn reconcile_waiting(
     through: Option<u64>,
 ) -> Result<bool, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    waiting_resolution(&state, target, through).map(|state| state == RetainedWaiting::Resolved)
+    let resolved = waiting_resolution(&state, target, through)? == RetainedWaiting::Resolved;
+    if resolved && let Some(notifications) = &state.notifications {
+        notifications.clear_session_waiting(target.source.id);
+    }
+    Ok(resolved)
 }
 
 fn waiting_resolution(
@@ -940,16 +944,10 @@ fn waiting_resolution(
     }) {
         return Err("Retained actor ownership changed before notification admission".into());
     }
-    let resolution = target
+    target
         .handle
         .retained_waiting_resolution(through)
-        .ok_or("The latest retained outcome is awaiting its actor publication")?;
-    if resolution == RetainedWaiting::Resolved
-        && let Some(notifications) = &state.notifications
-    {
-        notifications.clear_session_waiting(target.source.id);
-    }
-    Ok(resolution)
+        .ok_or_else(|| "The latest retained outcome is awaiting its actor publication".into())
 }
 
 fn queue_attention(
@@ -959,22 +957,29 @@ fn queue_attention(
     sequence: u64,
 ) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if event.evidence.kind == crate::notifications::Kind::Waiting {
-        if waiting_resolution(&state, target, Some(sequence))? != RetainedWaiting::Current {
-            return Ok(None);
+    let resolution = if event.evidence.kind == crate::notifications::Kind::Waiting {
+        waiting_resolution(&state, target, Some(sequence))?
+    } else {
+        if state.chats.get(&target.source.id).is_none_or(|record| {
+            record.execution_instance != target.identity.instance
+                || !record.handle.same_attachment(&target.handle)
+        }) {
+            return Err("Retained actor ownership changed before notification admission".into());
         }
-    } else if state.chats.get(&target.source.id).is_none_or(|record| {
-        record.execution_instance != target.identity.instance
-            || !record.handle.same_attachment(&target.handle)
-    }) {
-        return Err("Retained actor ownership changed before notification admission".into());
+        RetainedWaiting::Current
+    };
+    if resolution == RetainedWaiting::Superseded {
+        return Ok(None);
     }
-    target
+    let notifications = target
         .notifications
         .as_ref()
-        .ok_or("The notification journal is unavailable; attention remains retained")?
-        .record_committed(event)
-        .map(Some)
+        .ok_or("The notification journal is unavailable; attention remains retained")?;
+    if resolution == RetainedWaiting::Resolved {
+        notifications.record_resolved_waiting(event).map(Some)
+    } else {
+        notifications.record_committed(event).map(Some)
+    }
 }
 
 /// The broker and synchronous Answer boundary share the same semantic writes,
@@ -1529,7 +1534,7 @@ mod startup_retryability_tests {
             };
             let identity = handle.actor_identity().unwrap();
             source.id = identity.record.terminal;
-            let (notifications, journal) =
+            let (notifications, mut journal) =
                 super::super::super::notifications::JournalTestBridge::new(
                     &root.path().join("notifications.sqlite3"),
                 )
@@ -1572,7 +1577,30 @@ mod startup_retryability_tests {
             assert!(!journal.waiting_clear_pending(source.id));
             assert_eq!(reconcile_waiting(&host, &target, None).unwrap(), proved);
             assert_eq!(journal.waiting_clear_pending(source.id), proved);
-            if proved || newer_waiting {
+            if proved {
+                journal.flush_waiting_clears().unwrap();
+                let existing = target
+                    .notifications
+                    .as_ref()
+                    .unwrap()
+                    .record_committed(waiting.clone())
+                    .unwrap();
+                journal
+                    .commit_next(&crate::notifications::Preferences::default(), false)
+                    .unwrap()
+                    .unwrap();
+                existing.try_recv().unwrap().unwrap();
+                let receipt = queue_attention(&host, &target, waiting, 1)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(receipt.try_recv(), Err(mpsc::TryRecvError::Empty));
+                assert!(!journal.list().unwrap()[0].acknowledged);
+                journal
+                    .commit_next(&crate::notifications::Preferences::default(), false)
+                    .unwrap();
+                receipt.try_recv().unwrap().unwrap();
+                assert!(journal.list().unwrap()[0].acknowledged);
+            } else if newer_waiting {
                 assert!(
                     queue_attention(&host, &target, waiting, 1)
                         .unwrap()
