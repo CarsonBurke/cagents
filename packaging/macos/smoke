@@ -4,9 +4,8 @@
 #
 #   packaging/macos/smoke DIST VERSION PROTOCOL
 #
-# The login item is written but never loaded (--no-start), and the private
-# XDG_RUNTIME_DIR keeps the installer's daemon checks away from any daemon
-# this user runs.
+# The installer leaves the private login item unloaded. The separate HOME and
+# XDG_RUNTIME_DIR isolate the daemon and publication checks from the account's.
 set -eu
 
 PROGRAM=smoke
@@ -28,12 +27,17 @@ mkdir -p "$ROOT/home" "$ROOT/runtime"
 chmod 0700 "$ROOT/runtime"
 # A path with a space, as the default under Application Support has.
 PREFIX="$ROOT/home/Library/Application Support/cagents-install"
+publisher_pid=
 
 private_runtime() {
     env -u CAGENTS_AGENT_AUTHORITY HOME="$ROOT/home" XDG_RUNTIME_DIR="$ROOT/runtime" "$@"
 }
 
 cleanup() {
+    if [ -n "$publisher_pid" ]; then
+        touch "$ROOT/repair-release" "$ROOT/removal-release"
+        wait "$publisher_pid" 2>/dev/null || :
+    fi
     # The selector may still point to the stand-in if the login test failed.
     installed_cli="$PREFIX/versions/$VERSION/bin/cagents"
     if [ -x "$installed_cli" ]; then
@@ -44,14 +48,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-install_release() {
-    env -u CAGENTS_AGENT_AUTHORITY HOME="$ROOT/home" XDG_RUNTIME_DIR="$ROOT/runtime" \
+private_installer() {
+    private_runtime env \
         CAGENTS_REPOSITORY=CarsonBurke/cagents \
         CAGENTS_ARCHIVE="$ARCHIVE" CAGENTS_CHECKSUMS="$DIST/SHA256SUMS-macos" \
-        sh "$DIST/install-macos.sh" --prefix "$PREFIX" "$@"
+        /bin/sh "$@"
 }
 
-install_release --no-start > "$ROOT/install.log" 2>&1 || { cat "$ROOT/install.log" >&2; fail 'install failed'; }
+install_release() {
+    private_installer "$DIST/install-macos.sh" --prefix "$PREFIX" "$@"
+}
+
+# Read the installer from standard input, as the release's curl command does.
+private_installer -s -- --prefix "$PREFIX" --no-start < "$DIST/install-macos.sh" > "$ROOT/install.log" 2>&1 \
+    || { cat "$ROOT/install.log" >&2; fail 'streamed install failed'; }
 [ "$(readlink "$PREFIX/current")" = "versions/$VERSION" ] || fail 'current does not name the release'
 [ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] || fail 'the install root marker is missing'
 [ "$(readlink "$ROOT/home/.local/bin/cagents")" = "$PREFIX/current/bin/cagents" ] || fail 'the cagents command link is wrong'
@@ -102,7 +112,22 @@ cli daemon start > "$ROOT/daemon.log" 2>&1 \
     && cli --no-start daemon status --json > "$ROOT/status.json" 2>> "$ROOT/daemon.log" \
     && grep -q '"running": *true' "$ROOT/status.json" \
     || { cli --no-start daemon stop > /dev/null 2>&1 || :; cat "$ROOT/daemon.log" >&2; fail 'the daemon does not start through the command link'; }
+if install_release --no-start > "$ROOT/running-repair.log" 2>&1; then
+    fail 'repair replaced a version with its daemon running'
+fi
+grep -q 'daemon .* is running' "$ROOT/running-repair.log" \
+    || { cat "$ROOT/running-repair.log" >&2; fail 'repair refused without reporting the running daemon'; }
 cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started through the link'
+
+# An older installer may have made its lock directory before writing its PID.
+mkdir "$PREFIX/.lock"
+if install_release --uninstall > "$ROOT/legacy-lock.log" 2>&1; then
+    fail 'removal reused an incomplete older installer lock'
+fi
+[ -d "$PREFIX/.lock" ] && [ ! -L "$PREFIX/.lock" ] \
+    && grep -q 'cannot confirm who owns' "$ROOT/legacy-lock.log" \
+    || { cat "$ROOT/legacy-lock.log" >&2; fail 'removal did not preserve the incomplete lock'; }
+rmdir "$PREFIX/.lock"
 
 # Running the launcher registered the private bundle with Launch Services,
 # which is per account; take it back so the account's own stays the one.
@@ -112,9 +137,89 @@ unregister() {
 }
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 unregister
-install_release --no-start > "$ROOT/reinstall.log" 2>&1 || { cat "$ROOT/reinstall.log" >&2; fail 'reinstalling the same release failed'; }
-install_release --uninstall > "$ROOT/uninstall.log" 2>&1 || { cat "$ROOT/uninstall.log" >&2; fail 'uninstall failed'; }
+
+# Pause the real publisher at the selector rename and at removal of the login
+# item. A second publisher must be refused even though the daemon is stopped.
+mkdir "$ROOT/hooks"
+cat > "$ROOT/hooks/pause" <<'EOF'
+#!/bin/sh
+set -eu
+command=${0##*/}
+case $SMOKE_PHASE:$command in
+    repair:mv) [ "$#" -eq 3 ] && [ "$1" = -fh ] && [ "$3" = "$SMOKE_PREFIX/current" ] || exec /bin/mv "$@" ;;
+    removal:rm) [ "$#" -eq 2 ] && [ "$1" = -f ] && [ "$2" = "$SMOKE_AGENT" ] || exec /bin/rm "$@" ;;
+    *) exec "/bin/$command" "$@" ;;
+esac
+printf '%s\n' "$PPID" > "$SMOKE_ROOT/$SMOKE_PHASE-ready"
+remaining=30
+until [ -f "$SMOKE_ROOT/$SMOKE_PHASE-release" ]; do
+    [ "$remaining" -gt 0 ] || exit 1
+    sleep 1
+    remaining=$((remaining - 1))
+done
+exec "/bin/$command" "$@"
+EOF
+chmod +x "$ROOT/hooks/pause"
+ln -s pause "$ROOT/hooks/mv"
+ln -s pause "$ROOT/hooks/rm"
+cat > "$ROOT/contender.sh" <<'EOF'
+#!/bin/sh
+touch "$1"
+EOF
+
+pause_publication() {
+    publication=$1
+    shift
+    SMOKE_PHASE=$publication SMOKE_ROOT=$ROOT SMOKE_PREFIX=$PREFIX SMOKE_AGENT=$AGENT \
+        PATH="$ROOT/hooks:$PATH" install_release "$@" > "$ROOT/$publication.log" 2>&1 &
+    publisher_pid=$!
+    remaining=30
+    until [ -s "$ROOT/$publication-ready" ]; do
+        if [ "$remaining" -le 0 ] || ! kill -0 "$publisher_pid" 2>/dev/null; then
+            cat "$ROOT/$publication.log" >&2
+            fail "$publication did not reach the publication step"
+        fi
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+    if cli --no-start coordinate-install --prefix "$PREFIX" --installer "$ROOT/contender.sh" \
+        --publish-only -- "$ROOT/contender-ran" > "$ROOT/contender.log" 2>&1; then
+        fail "the second publisher entered during $publication"
+    fi
+    [ ! -e "$ROOT/contender-ran" ] && grep -qi 'temporarily unavailable' "$ROOT/contender.log" \
+        || { cat "$ROOT/contender.log" >&2; fail "the second publisher was not refused by the fence during $publication"; }
+    [ "$(cat "$PREFIX/.lock/pid")" = "$(cat "$ROOT/$publication-ready")" ] \
+        || fail "the older installer would see no live publisher during $publication"
+}
+
+finish_publication() {
+    touch "$ROOT/$publication-release"
+    if ! wait "$publisher_pid"; then
+        cat "$ROOT/$publication.log" >&2
+        fail "$publication failed"
+    fi
+    publisher_pid=
+}
+
+touch "$PREFIX/versions/$VERSION/.smoke-damaged-member"
+pause_publication repair
+finish_publication
+[ ! -e "$PREFIX/versions/$VERSION/.smoke-damaged-member" ] || fail 'repair retained the damaged release tree'
+cli --no-start daemon status --json > "$ROOT/status.json"
+grep -q '"running": *true' "$ROOT/status.json" || fail 'repair did not start the daemon after publication'
+cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started after publication'
+
+# Purge only isolated data, while retaining the runtime lock files.
+mkdir -p "$ROOT/home/Library/Application Support/dev.cagents.cagents" "$ROOT/runtime/cagents"
+touch "$ROOT/runtime/cagents/smoke-data"
+pause_publication removal --purge
+[ -f "$ROOT/runtime/cagents/smoke-data" ] || fail 'purge removed data before publication'
+kill -TERM "$(cat "$ROOT/removal-ready")"
+finish_publication
+[ ! -e "$ROOT/home/Library/Application Support/dev.cagents.cagents" ] && [ ! -e "$ROOT/runtime/cagents" ] \
+    || fail 'purge left private app data behind'
+[ -f "$ROOT/runtime/cagents-ui.lock.update" ] || fail 'purge removed the application launch fence'
 [ ! -e "$PREFIX" ] || fail 'uninstall left the prefix behind'
 [ ! -L "$ROOT/home/.local/bin/cagents" ] && [ ! -L "$ROOT/home/Applications/Cagents.app" ] && [ ! -e "$AGENT" ] \
     || fail 'uninstall left a link or the login item behind'
-printf 'macOS smoke: installed, reinstalled and removed cagents %s\n' "$VERSION"
+printf 'macOS smoke: installed, repaired and removed cagents %s with exclusive publication\n' "$VERSION"
