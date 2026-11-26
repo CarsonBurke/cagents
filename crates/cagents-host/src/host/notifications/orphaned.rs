@@ -63,7 +63,7 @@ pub(in crate::host) fn collect(host: &SharedHost, model: &Registry) -> Result<us
 
     let terminals = holder_registry::directory(Kind::Terminal)?;
     let native = holder_registry::directory(Kind::Native)?;
-    let released = without_recovery(candidates, &saved, &terminals, &native)?;
+    let released = without_recovery(candidates, &saved, &terminals, &native);
 
     // A shared pane may be saved without changing resident inventory. Keep
     // the workspace writer held from its final sequence check through enqueue.
@@ -128,17 +128,22 @@ fn without_recovery(
     saved: &std::collections::BTreeSet<TerminalId>,
     terminals: &std::path::Path,
     native: &std::path::Path,
-) -> Result<Vec<(TerminalId, uuid::Uuid)>, String> {
+) -> Vec<(TerminalId, uuid::Uuid)> {
     let mut released = Vec::new();
     for (session, id) in candidates {
-        if !saved.contains(&session)
-            && no_holder(terminals, session)?
-            && no_holder(native, session)?
-        {
-            released.push((session, id));
+        if saved.contains(&session) {
+            continue;
+        }
+        let absent = (|| -> Result<bool, String> {
+            Ok(no_holder(terminals, session)? && no_holder(native, session)?)
+        })();
+        match absent {
+            Ok(true) => released.push((session, id)),
+            Ok(false) => {}
+            Err(error) => tracing::debug!(%error, %session, "cannot inspect this session's holder"),
         }
     }
-    Ok(released)
+    released
 }
 
 fn no_holder(directory: &std::path::Path, id: TerminalId) -> Result<bool, String> {
@@ -212,7 +217,7 @@ mod tests {
         let release = uuid::Uuid::new_v4();
         let candidates = vec![(archived, uuid::Uuid::new_v4()), (unrelated, release)];
         assert_eq!(
-            without_recovery(candidates, &saved, root.path(), root.path()).unwrap(),
+            without_recovery(candidates, &saved, root.path(), root.path()),
             [(unrelated, release)]
         );
     }
@@ -227,5 +232,16 @@ mod tests {
         assert!(!no_holder(directory.path(), id).unwrap());
         std::fs::write(socket.with_extension("json"), b"{").unwrap();
         assert!(no_holder(directory.path(), id).is_err());
+        let unrelated = TerminalId::new();
+        let notice = uuid::Uuid::new_v4();
+        assert_eq!(
+            without_recovery(
+                vec![(id, uuid::Uuid::new_v4()), (unrelated, notice)],
+                &Default::default(),
+                directory.path(),
+                directory.path(),
+            ),
+            [(unrelated, notice)],
+        );
     }
 }
