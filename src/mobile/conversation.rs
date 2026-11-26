@@ -41,7 +41,10 @@ use crate::{
 /// What the phone asked of a watched conversation.
 pub enum Command {
     /// A chat command, answered on the phone's request `id`.
-    Chat { id: u64, command: chat::Command },
+    Chat {
+        id: u64,
+        command: chat::Command,
+    },
     Detail {
         id: u64,
         request: details::Request,
@@ -54,6 +57,13 @@ pub enum Command {
         png_base64: String,
         mode: api::SendMode,
         slot: Arc<()>,
+    },
+    RefreshReadCheckpoint {
+        id: u64,
+    },
+    Read {
+        id: u64,
+        checkpoint: uuid::Uuid,
     },
     /// End the watch.
     Stop,
@@ -100,6 +110,7 @@ impl Current {
 
 struct Opening {
     session: chat::Session,
+    notice: Option<uuid::Uuid>,
     stream: UnixStream,
     proof: HostSessionProof,
     next_request_id: u64,
@@ -143,9 +154,17 @@ impl Watch {
                             "Only a running native chat can be followed from the phone.",
                         ))
                     })?;
+                // Capture the exact old notice before attaching and reading
+                // the snapshot the phone will display. Later notices keep
+                // their own identities, even for this same conversation.
+                let notice = control
+                    .read_notifications()
+                    .ok()
+                    .and_then(|snapshot| unread_session_notice(snapshot, chat_id));
                 let (stream, proof, next_request_id) = control.into_unsubscribed_stream();
                 Ok(Opening {
                     session,
+                    notice,
                     stream,
                     proof,
                     next_request_id,
@@ -174,6 +193,7 @@ impl Watch {
             .spawn(move || {
                 let Opening {
                     session,
+                    notice,
                     stream,
                     proof,
                     next_request_id,
@@ -209,8 +229,9 @@ impl Watch {
                     detail,
                     inputs,
                     pending: HashMap::new(),
+                    read_checkpoint_ready: None,
                 };
-                let end = connection.run(id, session, feed);
+                let end = connection.run(id, session, notice, feed);
                 worker_stop.stop();
                 // Only a live watch can report an unexpected daemon loss.
                 // An unwatch also shuts down this stream to interrupt setup.
@@ -269,6 +290,14 @@ enum Input {
 enum Pending {
     Read {
         final_read: bool,
+        refresh: Option<ReadCheckpoint>,
+    },
+    ReadCheckpoint {
+        id: u64,
+    },
+    AcknowledgeChat {
+        id: u64,
+        notice: Option<uuid::Uuid>,
     },
     Chat {
         id: u64,
@@ -279,6 +308,12 @@ enum Pending {
         read: details::Read,
         slot: Arc<()>,
     },
+}
+
+struct ReadCheckpoint {
+    id: u64,
+    notification_request: u64,
+    notice: Option<uuid::Uuid>,
 }
 
 struct Connection {
@@ -292,6 +327,8 @@ struct Connection {
     inputs: Receiver<Input>,
     /// What each daemon request in flight was for.
     pending: HashMap<u64, Pending>,
+    /// Attention captured before the next full presentation read.
+    read_checkpoint_ready: Option<ReadCheckpoint>,
 }
 
 /// What a watch holds of its conversation between daemon messages.
@@ -304,6 +341,10 @@ struct Followed {
     changed: bool,
     /// A publication read is in flight; one at a time keeps them in order.
     reading: bool,
+    read_epoch: u64,
+    read_checkpoint: uuid::Uuid,
+    read_checkpoint_request: Option<u64>,
+    read_notice: Option<uuid::Uuid>,
     /// The daemon removed the chat or its provider completed. Try one
     /// final presentation read before ending the watch.
     ending: bool,
@@ -312,7 +353,13 @@ struct Followed {
 impl Connection {
     /// Follow the chat until the phone, the conversation or the daemon ends
     /// the watch.
-    fn run(&mut self, id: u64, session: chat::Session, feed: Sender<Input>) -> End {
+    fn run(
+        &mut self,
+        id: u64,
+        session: chat::Session,
+        notice: Option<uuid::Uuid>,
+        feed: Sender<Input>,
+    ) -> End {
         let snapshot = match self.attach(session) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -334,17 +381,24 @@ impl Connection {
             // so read once to begin with.
             changed: true,
             reading: false,
+            read_epoch: 0,
+            read_checkpoint: uuid::Uuid::new_v4(),
+            read_checkpoint_request: None,
+            read_notice: notice,
             ending: false,
         };
         // The phone may have stopped or replaced this watch while it was
         // attaching; then neither the answer nor the conversation is wanted.
         let opened = self.current.send(|| {
             self.outbox.ok(id);
-            if let Some(update) =
+            if let Some(mut update) =
                 followed
                     .mirror
                     .update(&followed.session, &followed.snapshot, true)
             {
+                if update.reset {
+                    update.read_checkpoint = Some(followed.read_checkpoint.to_string());
+                }
                 self.outbox
                     .event(api::Event::Conversation(Box::new(update)));
             }
@@ -382,8 +436,9 @@ impl Connection {
             // it catches up, rather than every publication on the way.
             let held_back = followed.changed && !followed.reading && self.outbox.congested();
             if followed.changed && !followed.reading && !held_back {
-                let after_generation =
-                    (followed.snapshot.generation != 0).then_some(followed.snapshot.generation);
+                let after_generation = (self.read_checkpoint_ready.is_none()
+                    && followed.snapshot.generation != 0)
+                    .then_some(followed.snapshot.generation);
                 match self.request(ClientRequest::ChatRead {
                     chat_id: self.chat_id,
                     after_generation,
@@ -393,6 +448,7 @@ impl Connection {
                             request_id,
                             Pending::Read {
                                 final_read: followed.ending,
+                                refresh: self.read_checkpoint_ready.take(),
                             },
                         );
                         followed.reading = true;
@@ -432,6 +488,12 @@ impl Connection {
                         Ok(())
                     }
                 },
+                Ok(Input::Command(Command::RefreshReadCheckpoint { id })) => {
+                    self.refresh_read_checkpoint(&mut followed, id)
+                }
+                Ok(Input::Command(Command::Read { id, checkpoint })) => {
+                    self.acknowledge_view(&mut followed, id, checkpoint)
+                }
                 Ok(Input::Frame(frame)) => match *frame {
                     Ok(Some(envelope)) => self.envelope(&mut followed, envelope),
                     Ok(None) => Err(End::Daemon("The computer's cagents daemon stopped.".into())),
@@ -445,17 +507,28 @@ impl Connection {
     }
 
     /// Send the phone what changed since it was last sent anything.
-    fn publish(&self, followed: &mut Followed) {
-        self.current.send(|| {
-            if let Some(update) =
+    fn publish(&self, followed: &mut Followed, refresh: Option<ReadCheckpoint>) {
+        let publication = self.current.send(|| {
+            if let Some(refresh) = &refresh {
+                followed.read_checkpoint = uuid::Uuid::new_v4();
+                followed.read_notice = refresh.notice;
+                self.outbox.ok(refresh.id);
+            }
+            if let Some(mut update) =
                 followed
                     .mirror
-                    .update(&followed.session, &followed.snapshot, false)
+                    .update(&followed.session, &followed.snapshot, refresh.is_some())
             {
+                if update.reset {
+                    update.read_checkpoint = Some(followed.read_checkpoint.to_string());
+                }
                 self.outbox
                     .event(api::Event::Conversation(Box::new(update)));
             }
         });
+        if !publication && let Some(refresh) = refresh {
+            self.outbox.error(Some(refresh.id), stopped_during_attach());
+        }
     }
 
     /// Answer every phone request the watch is ending without finishing:
@@ -470,11 +543,70 @@ impl Connection {
         let requests = pending
             .into_values()
             .filter_map(|pending| match pending {
-                Pending::Chat { id, .. } | Pending::Detail { id, .. } => Some(id),
-                Pending::Read { .. } => None,
+                Pending::Chat { id, .. }
+                | Pending::ReadCheckpoint { id }
+                | Pending::AcknowledgeChat { id, .. }
+                | Pending::Detail { id, .. } => Some(id),
+                Pending::Read { refresh, .. } => refresh.map(|refresh| refresh.id),
             })
+            .chain(self.read_checkpoint_ready.take().map(|refresh| refresh.id))
             .chain(waiting_requests(&self.inputs));
         fail_requests(requests, &self.outbox, message);
+    }
+
+    fn refresh_read_checkpoint(&mut self, followed: &mut Followed, id: u64) -> Result<(), End> {
+        match self.request(ClientRequest::ReadNotifications) {
+            Ok(request) => {
+                followed.read_checkpoint_request = Some(request);
+                self.pending.insert(request, Pending::ReadCheckpoint { id });
+                if let Some(previous) = self.read_checkpoint_ready.take() {
+                    self.outbox.ok(previous.id);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.outbox.error(Some(id), unavailable(&error));
+                Err(End::Daemon(lost(&error)))
+            }
+        }
+    }
+
+    fn acknowledge_view(
+        &mut self,
+        followed: &mut Followed,
+        id: u64,
+        checkpoint: uuid::Uuid,
+    ) -> Result<(), End> {
+        if checkpoint != followed.read_checkpoint {
+            self.outbox.error(
+                Some(id),
+                api_error(
+                    api::ErrorCode::NotWatching,
+                    "That conversation presentation has been replaced.",
+                ),
+            );
+            return Ok(());
+        }
+        followed.read_epoch = followed.read_epoch.saturating_add(1);
+        match self.request(ClientRequest::ChatAcknowledge {
+            chat_id: self.chat_id,
+            epoch: followed.read_epoch,
+        }) {
+            Ok(request) => {
+                self.pending.insert(
+                    request,
+                    Pending::AcknowledgeChat {
+                        id,
+                        notice: followed.read_notice,
+                    },
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.outbox.error(Some(id), unavailable(&error));
+                Err(End::Daemon(lost(&error)))
+            }
+        }
     }
 
     fn command(
@@ -610,19 +742,68 @@ impl Connection {
             };
         };
         match self.pending.remove(&request_id) {
-            Some(Pending::Read { final_read }) => {
+            Some(Pending::Read {
+                final_read,
+                refresh,
+            }) => {
                 followed.reading = false;
+                let mut refresh = refresh.filter(|refresh| {
+                    if followed.read_checkpoint_request != Some(refresh.notification_request) {
+                        self.outbox.ok(refresh.id);
+                        return false;
+                    }
+                    true
+                });
+                if !followed.ending
+                    && matches!(
+                        &envelope.message,
+                        ServerMessage::Error(error)
+                            if error.retryable && error.code != ProtocolErrorCode::TerminalNotFound
+                    )
+                    && let Some(refresh) = refresh.take()
+                {
+                    // A retained actor schedules its own reread signal after
+                    // a transient failure. Keep the exact capture for that
+                    // next full read without retrying on our own timer.
+                    self.read_checkpoint_ready = Some(refresh);
+                    return Ok(());
+                }
+                if refresh.is_some() {
+                    followed.read_checkpoint_request = None;
+                }
+                if let Some(presentation) = &refresh
+                    && !matches!(
+                        &envelope.message,
+                        ServerMessage::Response {
+                            response: ServerResponse::ChatSnapshot {
+                                chat_id,
+                                snapshot: Some(snapshot),
+                            },
+                        } if *chat_id == self.chat_id && snapshot.generation >= followed.snapshot.generation
+                    )
+                {
+                    let error = match &envelope.message {
+                        ServerMessage::Error(error) => refused(error),
+                        _ => {
+                            internal("The daemon did not return a fresh conversation presentation.")
+                        }
+                    };
+                    self.outbox.error(Some(presentation.id), error);
+                    refresh = None;
+                }
                 match envelope.message {
                     ServerMessage::Response {
-                        response: ServerResponse::ChatSnapshot { snapshot, .. },
-                    } => {
-                        if let Some(snapshot) = snapshot {
+                        response: ServerResponse::ChatSnapshot { chat_id, snapshot },
+                    } if chat_id == self.chat_id => {
+                        if let Some(snapshot) = snapshot
+                            && snapshot.generation >= followed.snapshot.generation
+                        {
                             followed.snapshot = snapshot;
                         }
                     }
                     ServerMessage::Response {
-                        response: ServerResponse::ChatUpdate { update, .. },
-                    } => match update.apply(&followed.snapshot) {
+                        response: ServerResponse::ChatUpdate { chat_id, update },
+                    } if chat_id == self.chat_id => match update.apply(&followed.snapshot) {
                         Ok(snapshot) => followed.snapshot = snapshot,
                         // A delta that doesn't fit what is held: read the
                         // whole snapshot again.
@@ -659,11 +840,70 @@ impl Connection {
                         ));
                     }
                 }
-                self.publish(followed);
+                self.publish(followed, refresh);
                 if final_read && !followed.changed {
                     return Err(End::Conversation("The conversation ended.".into()));
                 }
             }
+            Some(Pending::ReadCheckpoint { id }) => {
+                if followed.read_checkpoint_request != Some(request_id) {
+                    self.outbox.ok(id);
+                    return Ok(());
+                }
+                match envelope.message {
+                    ServerMessage::Response {
+                        response: ServerResponse::Notifications { snapshot },
+                    } => {
+                        self.read_checkpoint_ready = Some(ReadCheckpoint {
+                            id,
+                            notification_request: request_id,
+                            notice: unread_session_notice(snapshot, self.chat_id),
+                        });
+                        followed.changed = true;
+                    }
+                    ServerMessage::Error(error) => {
+                        followed.read_checkpoint_request = None;
+                        self.outbox.error(Some(id), refused(&error));
+                    }
+                    _ => {
+                        followed.read_checkpoint_request = None;
+                        self.outbox.error(
+                            Some(id),
+                            internal("The daemon answered a read checkpoint unexpectedly."),
+                        );
+                    }
+                }
+            }
+            Some(Pending::AcknowledgeChat { id, notice }) => match envelope.message {
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                } => {
+                    if let Some(notice) = notice {
+                        match self.request(ClientRequest::AcknowledgeNotification { id: notice }) {
+                            Ok(request) => {
+                                self.pending.insert(
+                                    request,
+                                    Pending::Chat {
+                                        id,
+                                        _upload_slot: None,
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                self.outbox.error(Some(id), unavailable(&error));
+                                return Err(End::Daemon(lost(&error)));
+                            }
+                        }
+                    } else {
+                        self.outbox.ok(id);
+                    }
+                }
+                ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),
+                _ => self.outbox.error(
+                    Some(id),
+                    internal("The daemon answered a read unexpectedly."),
+                ),
+            },
             Some(Pending::Chat { id, _upload_slot }) => match envelope.message {
                 ServerMessage::Response { .. } => self.outbox.ok(id),
                 ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),
@@ -765,10 +1005,28 @@ impl Connection {
     }
 }
 
+fn unread_session_notice(
+    snapshot: crate::notifications::Snapshot,
+    chat_id: TerminalId,
+) -> Option<uuid::Uuid> {
+    snapshot
+        .notices
+        .into_iter()
+        .find(|notice| {
+            !notice.acknowledged
+                && notice.event.target == crate::notifications::Target::Session(chat_id)
+        })
+        .map(|notice| notice.id)
+}
+
 fn waiting_requests(inputs: &Receiver<Input>) -> impl Iterator<Item = u64> + '_ {
     inputs.try_iter().filter_map(|input| match input {
         Input::Command(
-            Command::Chat { id, .. } | Command::Detail { id, .. } | Command::ImagePrompt { id, .. },
+            Command::Chat { id, .. }
+            | Command::Detail { id, .. }
+            | Command::ImagePrompt { id, .. }
+            | Command::RefreshReadCheckpoint { id }
+            | Command::Read { id, .. },
         ) => Some(id),
         _ => None,
     })

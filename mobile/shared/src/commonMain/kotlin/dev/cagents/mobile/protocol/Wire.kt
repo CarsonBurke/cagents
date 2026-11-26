@@ -176,6 +176,13 @@ sealed class Call(val op: String) {
     data class UnwatchConversation(override val session: String) : OnSession("conversation.unwatch")
     data class WatchTerminal(override val session: String) : OnSession("terminal.watch")
     data class UnwatchTerminal(override val session: String) : OnSession("terminal.unwatch")
+    data class RefreshReadCheckpoint(override val session: String) : OnSession("conversation.read_checkpoint")
+    data class ReadConversation(override val session: String, val checkpoint: String) : OnSession("conversation.read") {
+        override fun params(): JsonObject = buildJsonObject {
+            put("session", session)
+            put("checkpoint", checkpoint)
+        }
+    }
     data class LoadEarlier(override val session: String) : OnSession("conversation.load_earlier")
     data class Interrupt(override val session: String) : OnSession("conversation.interrupt")
 

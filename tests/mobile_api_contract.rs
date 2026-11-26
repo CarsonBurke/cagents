@@ -18,6 +18,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use cagents_mobile_api::*;
 use serde_json::{Value, json};
 
+const READ_CHECKPOINT: &str = "1d79da8a-cd02-454c-a74e-411012875f33";
 const RECORD: &str = "CAGENTS_RECORD_MOBILE_API";
 
 fn recordings_path() -> PathBuf {
@@ -184,6 +185,20 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
         (
             "terminal.unwatch",
             request(25, Call::UnwatchTerminal { session: session() }),
+        ),
+        (
+            "conversation.read_checkpoint",
+            request(26, Call::RefreshReadCheckpoint { session: session() }),
+        ),
+        (
+            "conversation.read",
+            request(
+                27,
+                Call::ReadConversation {
+                    session: session(),
+                    checkpoint: READ_CHECKPOINT.into(),
+                },
+            ),
         ),
         (
             "conversation.load_earlier",
@@ -377,6 +392,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: true,
+                read_checkpoint: Some(READ_CHECKPOINT.into()),
                 state: state(),
                 order: Some(vec!["i1".into(), "i2".into()]),
                 items: vec![
@@ -417,6 +433,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: false,
+                read_checkpoint: None,
                 state: state(),
                 order: None,
                 items: vec![
@@ -486,6 +503,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: false,
+                read_checkpoint: None,
                 state: state(),
                 order: None,
                 items: vec![item(

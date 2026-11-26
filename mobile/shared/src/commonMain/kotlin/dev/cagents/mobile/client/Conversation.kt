@@ -18,6 +18,8 @@ data class Conversation(
     val loaded: Boolean = false,
     /** Why the conversation can no longer be followed, when it can't. */
     val ended: String? = null,
+    /** The presentation this watch permits a visible reader to acknowledge. */
+    val readCheckpoint: String? = null,
 ) {
     /** The result of applying an update: the next conversation, and whether it fell out of step. */
     data class Applied(val conversation: Conversation, val desynced: Boolean)
@@ -57,7 +59,13 @@ data class Conversation(
             placed += byId[id] ?: if (update.reset) continue else return Applied(this, desynced = true)
         }
         return Applied(
-            Conversation(session = session, state = update.state, items = placed, loaded = true, ended = null),
+            copy(
+                state = update.state,
+                items = placed,
+                loaded = true,
+                ended = null,
+                readCheckpoint = if (update.reset) update.readCheckpoint else readCheckpoint,
+            ),
             desynced = false,
         )
     }
@@ -82,7 +90,7 @@ data class Conversation(
             next[at] = appended(next[at], append) ?: return Applied(this, desynced = true)
         }
         return Applied(
-            Conversation(session = session, state = update.state, items = next, loaded = true, ended = null),
+            copy(state = update.state, items = next, loaded = true, ended = null),
             desynced = false,
         )
     }

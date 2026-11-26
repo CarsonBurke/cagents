@@ -195,6 +195,8 @@ Detail requests return one page in the request's `ok` reply.
 | `conversation.unwatch` | `session` | Stops following it. |
 | `terminal.watch` | `session` | Follows a listed terminal agent's live screen. Starting a watch replaces the previous terminal watch on this connection. |
 | `terminal.unwatch` | `session` | Stops following that terminal if it is the current watch. |
+| `conversation.read_checkpoint` | `session` | Captures attention for the current watch and sends a fresh `conversation` reset with its checkpoint. Commands on the watch can continue. |
+| `conversation.read` | `session`, `checkpoint` | Acknowledges attention after the phone displays the conversation. The checkpoint comes from its reset or a refresh on that watch. Older presentations and background watches leave attention unread. |
 | `conversation.load_earlier` | `session` | Extends the window to older items. |
 | `conversation.send` | `session`, `text`, `mode` | Sends a message. `mode` is `send` (default), `steer` (into the running turn) or `queue` (after it). |
 | `conversation.output` | `session`, `item`, `cursor` | Reads saved command or tool output. |

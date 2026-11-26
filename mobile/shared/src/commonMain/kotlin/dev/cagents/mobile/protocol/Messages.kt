@@ -148,6 +148,7 @@ data class ConversationUpdate(
     val order: List<String>? = null,
     val items: List<Item> = emptyList(),
     val appends: List<TextAppend> = emptyList(),
+    @SerialName("read_checkpoint") val readCheckpoint: String? = null,
 )
 
 @Serializable

@@ -1804,14 +1804,21 @@ fn process_admitted_request(
             }
         }
         ClientRequest::ReadNotifications => {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            state.mobile_snapshot_started(
-                client_id,
-                crate::terminal_ipc::MobileWatch::Notifications,
-            );
+            let (published, service_available) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.mobile_snapshot_started(
+                    client_id,
+                    crate::terminal_ipc::MobileWatch::Notifications,
+                );
+                (state.notification_snapshot(), state.notifications.is_some())
+            };
             Ok((
                 ServerResponse::Notifications {
-                    snapshot: state.notification_snapshot(),
+                    snapshot: if service_available {
+                        super::notifications::committed_snapshot(published)
+                    } else {
+                        published
+                    },
                 },
                 Vec::new(),
                 false,

@@ -74,7 +74,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.cagents.mobile.client.Conversation
@@ -115,6 +117,25 @@ fun ConversationScreen(
         vm.remote.map { ConversationView.of(it, session) }.distinctUntilChanged()
     }.collectAsStateWithLifecycle(remember(session) { ConversationView.of(vm.remote.value, session) })
     val conversation = view.conversation
+    val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsStateWithLifecycle()
+    val visible = lifecycleState == Lifecycle.State.RESUMED
+    val checkpoint = conversation?.readCheckpoint
+    val previouslyDisplayed = remember(session, visible) {
+        vm.remote.value.conversations[session]?.readCheckpoint
+    }
+    // A back-stack watch can stay open while Settings covers this route.
+    // Get a fresh checkpoint from the same watch before reporting a read.
+    LaunchedEffect(session, visible, previouslyDisplayed) {
+        if (visible && previouslyDisplayed != null) vm.refreshConversationForRead(session)
+    }
+    LaunchedEffect(session, visible, checkpoint) {
+        if (visible && checkpoint != null && checkpoint != previouslyDisplayed &&
+            view.connection == ConnectionState.Connected
+        ) {
+            vm.readConversation(session, checkpoint)
+        }
+    }
+
     val state = conversation?.state ?: ConversationState()
     val title = state.title ?: view.listedTitle ?: "Conversation"
     // Whether the transcript keeps to the newest item as items arrive. Only

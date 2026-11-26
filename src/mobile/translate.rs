@@ -490,6 +490,7 @@ impl Mirror {
         Some(api::ConversationUpdate {
             session: session.into(),
             reset,
+            read_checkpoint: None,
             state,
             order: order_changed.then_some(order),
             items,

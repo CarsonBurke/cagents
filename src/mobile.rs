@@ -523,6 +523,19 @@ impl Bridge {
                 }
                 Ok(Answered::Now)
             }
+            api::Call::RefreshReadCheckpoint { session } => self.to_conversation(
+                &session,
+                conversation::Command::RefreshReadCheckpoint { id },
+            ),
+            api::Call::ReadConversation {
+                session,
+                checkpoint,
+            } => {
+                let checkpoint = uuid::Uuid::parse_str(&checkpoint).map_err(|_| {
+                    Failure::Refused(bad_request("Invalid conversation read checkpoint."))
+                })?;
+                self.to_conversation(&session, conversation::Command::Read { id, checkpoint })
+            }
             api::Call::LoadEarlier { session } => {
                 self.command(id, &session, chat::Command::LoadEarlier)
             }

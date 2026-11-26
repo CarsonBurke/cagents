@@ -138,6 +138,12 @@ pub enum Call {
     WatchTerminal { session: String },
     #[serde(rename = "terminal.unwatch")]
     UnwatchTerminal { session: String },
+    /// Send a fresh presentation and its checkpoint without reopening the watch.
+    #[serde(rename = "conversation.read_checkpoint")]
+    RefreshReadCheckpoint { session: String },
+    /// The phone displayed a watched conversation to the person.
+    #[serde(rename = "conversation.read")]
+    ReadConversation { session: String, checkpoint: String },
     /// Extend a watched conversation's window with older items, when its
     /// state says `has_earlier`.
     #[serde(rename = "conversation.load_earlier")]
@@ -217,6 +223,8 @@ impl Call {
         "conversation.unwatch",
         "terminal.watch",
         "terminal.unwatch",
+        "conversation.read_checkpoint",
+        "conversation.read",
         "conversation.load_earlier",
         "conversation.output",
         "conversation.diff",
@@ -516,6 +524,9 @@ pub struct ConversationUpdate {
     /// Replace everything held for this conversation: `items` is the whole
     /// window and `order` is present.
     pub reset: bool,
+    /// An exact presentation that may acknowledge attention after it is displayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_checkpoint: Option<String>,
     /// The conversation's current state, sent whole with every update.
     pub state: ConversationState,
     /// Every item's ID in display order, when it changed.

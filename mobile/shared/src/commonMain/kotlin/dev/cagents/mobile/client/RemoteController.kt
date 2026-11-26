@@ -349,6 +349,27 @@ class RemoteController(
     suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) =
         call(Call.Answer(session, request, action, answers))
 
+    /** Refresh the read checkpoint without replacing the existing watch. */
+    suspend fun refreshConversationForRead(session: String) {
+        if (session in _state.value.conversations) {
+            callForVisibleConversation(Call.RefreshReadCheckpoint(session))
+        }
+    }
+
+    suspend fun readConversation(session: String, checkpoint: String) =
+        callForVisibleConversation(Call.ReadConversation(session, checkpoint))
+
+    private suspend fun callForVisibleConversation(request: Call.OnSession) {
+        if (!foreground.value) return
+        try {
+            call(request)
+        } catch (_: RequestFailed) {
+            // Older bridges and a watch that was just closed can refuse this.
+        } catch (_: ConnectionLost) {
+            // A newly visible reset on the next connection can acknowledge it.
+        }
+    }
+
     suspend fun acknowledge(notice: String) {
         call(Call.AcknowledgeNotification(notice))
         _state.update { state -> state.copy(notices = state.notices.filterNot { it.id == notice }) }
