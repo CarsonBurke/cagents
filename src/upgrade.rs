@@ -1961,16 +1961,40 @@ pub mod handoff {
             }
         }
 
+        /// Observe existing authority without repairing its permissions.
+        /// A holder making a release decision must not promote previously
+        /// untrusted storage into private evidence.
+        #[cfg(all(target_os = "macos", feature = "host"))]
+        pub(crate) fn observe_existing() -> Result<Option<Self>, String> {
+            let directory = Self::directory()?;
+            crate::secure_file::reject_symlink_components(&directory)
+                .map_err(|error| error.to_string())?;
+            let root = match fs_safety::Root::open(&directory) {
+                Ok(root) => root,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            let metadata = root.metadata().map_err(|error| error.to_string())?;
+            if metadata.uid() != crate::daemon::current_uid() || metadata.mode() & 0o077 != 0 {
+                return Err("Upgrade evidence directory is not privately owned".into());
+            }
+            Ok(Some(Self::from_root(root)))
+        }
+
         pub fn open(directory: &Path) -> Result<Self, String> {
             crate::secure_file::prepare_private_directory(directory)
                 .map_err(|error| error.to_string())?;
             let root = fs_safety::Root::open(directory).map_err(|error| error.to_string())?;
-            Ok(Self {
+            Ok(Self::from_root(root))
+        }
+
+        fn from_root(root: fs_safety::Root) -> Self {
+            Self {
+                path: root.path().join(FILE),
                 root,
-                path: directory.join(FILE),
                 #[cfg(any(feature = "host", test))]
                 unattached: Default::default(),
-            })
+            }
         }
 
         /// Predict the source prepare's refusal to overwrite another update.
