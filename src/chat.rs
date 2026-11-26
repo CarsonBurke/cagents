@@ -5157,9 +5157,13 @@ fn claude_configured_default_mode_in(
         return None;
     }
     let (user_home, root) = claude_launch_homes(recipe)?;
-    if claude_project_setting(recipe, user_home.as_deref(), &root, |path| {
-        setting(path).ok().flatten().is_some()
-    }) {
+    if claude_project_setting(
+        recipe,
+        user_home.as_deref(),
+        &root,
+        &["settings.local.json", "settings.json"],
+        |path| setting(path).ok().flatten().is_some(),
+    ) {
         return None;
     }
 
@@ -5231,12 +5235,14 @@ fn claude_project_setting(
     recipe: &LaunchRecipe,
     user_home: Option<&std::path::Path>,
     root: &std::path::Path,
+    files: &[&str],
     has_setting: impl Fn(&std::path::Path) -> bool,
 ) -> bool {
     let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
     for directory in recipe.working_directory.ancestors() {
         if user_home == Some(directory) {
             if recipe.working_directory == directory
+                && files.contains(&"settings.local.json")
                 && has_setting(&directory.join(".claude/settings.local.json"))
             {
                 // HOME itself can be a project cwd. Its local setting then
@@ -5245,18 +5251,13 @@ fn claude_project_setting(
             }
             break;
         }
-        if ["settings.local.json", "settings.json"]
-            .into_iter()
-            .any(|name| {
-                let path = directory.join(".claude").join(name);
-                if account_settings.is_some()
-                    && std::fs::canonicalize(&path).ok() == account_settings
-                {
-                    return false;
-                }
-                has_setting(&path)
-            })
-        {
+        if files.iter().any(|name| {
+            let path = directory.join(".claude").join(name);
+            if account_settings.is_some() && std::fs::canonicalize(&path).ok() == account_settings {
+                return false;
+            }
+            has_setting(&path)
+        }) {
             return true;
         }
     }
@@ -5269,6 +5270,7 @@ fn managed_claude_attribution(
     recipe: &LaunchRecipe,
     homes: &crate::account::home::Homes,
     system_home: &std::path::Path,
+    sources: &str,
 ) -> Option<serde_json::Value> {
     fn attribution(path: &std::path::Path) -> Option<serde_json::Value> {
         let settings: serde_json::Value =
@@ -5276,15 +5278,50 @@ fn managed_claude_attribution(
         settings.get("attribution").cloned()
     }
 
+    let enabled = |name| sources.split(',').any(|source| source.trim() == name);
+    if !enabled("user") {
+        return None;
+    }
+    let local = enabled("local");
+    let files: &[&str] = match (enabled("project"), local) {
+        (true, true) => &["settings.local.json", "settings.json"],
+        (true, false) => &["settings.json"],
+        (false, true) => &["settings.local.json"],
+        (false, false) => &[],
+    };
     let (user_home, root) = claude_launch_homes(recipe)?;
     if !homes
         .managed_identity(&root)
         .is_some_and(|(provider, _)| provider == Provider::Claude)
-        || claude_project_setting(recipe, user_home.as_deref(), &root, |path| {
-            attribution(path).is_some()
-        })
+        || (!files.is_empty()
+            && claude_project_setting(recipe, user_home.as_deref(), &root, files, |path| {
+                attribution(path).is_some()
+            }))
+        || (local
+            && claude_linked_primary_checkout(&recipe.working_directory).is_some_and(|primary| {
+                attribution(&primary.join(".claude/settings.local.json")).is_some()
+            }))
     {
         return None;
     }
     attribution(&system_home.join("settings.json"))
+}
+
+/// Claude's local settings are shared with the primary checkout of a linked
+/// worktree. Ordinary repositories can locate it from the common .git path.
+#[cfg(feature = "host")]
+fn claude_linked_primary_checkout(directory: &std::path::Path) -> Option<std::path::PathBuf> {
+    let git = directory
+        .ancestors()
+        .find_map(crate::project_location::git_directories)?;
+    if git.private == git.common {
+        return None;
+    }
+    if git.common.file_name().is_some_and(|name| name == ".git") {
+        return git.common.parent().map(std::path::Path::to_path_buf);
+    }
+    crate::repository::RepositoryService::system("git")
+        .managed_primary_checkout(directory, &crate::repository::CancellationToken::new())
+        .ok()
+        .flatten()
 }

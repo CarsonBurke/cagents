@@ -15760,8 +15760,8 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
         draft_model: None,
     };
     let settings = |launch: &Launch| {
-        arguments_with_attribution(launch, |recipe| {
-            chat::managed_claude_attribution(recipe, &homes, &system)
+        arguments_with_attribution(launch, |recipe, sources| {
+            chat::managed_claude_attribution(recipe, &homes, &system, sources)
         })
         .unwrap()
         .windows(2)
@@ -15771,6 +15771,15 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
 
     std::fs::write(&system_settings, r#"{"attribution":false,"theme":"dark"}"#).unwrap();
     assert_eq!(settings(&launch), Some(json!({"attribution": false})));
+    let terminal_overlay = |recipe: &crate::model::LaunchRecipe| {
+        crate::agent_recovery::claude_attribution_overlay_with(recipe, |recipe, sources| {
+            chat::managed_claude_attribution(recipe, &homes, &system, sources)
+        })
+    };
+    assert_eq!(
+        terminal_overlay(&launch.recipe).as_deref(),
+        Some(r#"--settings={"attribution":false}"#)
+    );
     launch.session_id = Some(uuid::Uuid::new_v4().to_string());
     std::fs::write(
         &system_settings,
@@ -15781,16 +15790,55 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
         settings(&launch),
         Some(json!({"attribution": {"commit": "", "pr": "custom"}}))
     );
+    let mut recovered = launch.recipe.clone();
+    recovered.arguments = vec![
+        "--resume".into(),
+        "a1b2c3d4-1111-4111-8111-123456789abc".into(),
+    ];
+    assert_eq!(
+        terminal_overlay(&recovered).as_deref(),
+        Some(r#"--settings={"attribution":{"commit":"","pr":"custom"}}"#)
+    );
 
     for name in ["settings.json", "settings.local.json"] {
         let path = project.join(".claude").join(name);
         std::fs::write(&path, r#"{"attribution":false}"#).unwrap();
         assert_eq!(settings(&launch), None, "{name}");
+        launch.recipe.arguments = vec!["--setting-sources=user".into()];
+        assert_eq!(
+            settings(&launch),
+            Some(json!({"attribution": {"commit": "", "pr": "custom"}})),
+            "Claude ignores the excluded {name} source"
+        );
+        launch.recipe.arguments.clear();
         std::fs::remove_file(path).unwrap();
     }
 
+    // This linked checkout has a different parent directory from its primary
+    // checkout. Its personal local settings come from the primary root.
+    let checkout = directory.path().join("primary");
+    let git = checkout.join(".git/worktrees/linked");
+    std::fs::create_dir_all(&git).unwrap();
+    std::fs::write(git.join("commondir"), "../..\n").unwrap();
+    std::fs::write(project.join(".git"), format!("gitdir: {}\n", git.display())).unwrap();
+    std::fs::create_dir(checkout.join(".claude")).unwrap();
+    let shared_local = checkout.join(".claude/settings.local.json");
+    std::fs::write(&shared_local, r#"{"attribution":{"commit":"local"}}"#).unwrap();
+    assert_eq!(settings(&launch), None);
+    launch.recipe.arguments = vec!["--setting-sources=user,project".into()];
+    assert_eq!(
+        settings(&launch),
+        Some(json!({"attribution": {"commit": "", "pr": "custom"}}))
+    );
+    std::fs::remove_file(shared_local).unwrap();
+
     launch.recipe.arguments = vec![r#"--settings={"attribution":true}"#.into()];
     assert_eq!(settings(&launch), Some(json!({"attribution": true})));
+    launch.recipe.arguments = vec![r#"--settings={"theme":"dark"}"#.into()];
+    assert_eq!(
+        settings(&launch),
+        Some(json!({"attribution": {"commit": "", "pr": "custom"}, "theme": "dark"}))
+    );
     launch.recipe.arguments = vec!["--setting-sources=project,local".into()];
     assert_eq!(settings(&launch), None);
     launch.recipe.arguments.clear();

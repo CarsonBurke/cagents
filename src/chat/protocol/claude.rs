@@ -322,13 +322,16 @@ pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), S
     Ok(())
 }
 
-fn managed_attribution(recipe: &crate::model::LaunchRecipe) -> Option<Value> {
+pub(crate) fn managed_attribution(
+    recipe: &crate::model::LaunchRecipe,
+    sources: &str,
+) -> Option<Value> {
     if crate::device::is_remote() {
         return None;
     }
     let homes = account::home::Homes::installation()?;
     let system = account::Account::system(Provider::Claude).resolved_home()?;
-    chat::managed_claude_attribution(recipe, &homes, &system)
+    chat::managed_claude_attribution(recipe, &homes, &system, sources)
 }
 
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
@@ -337,7 +340,7 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
 
 fn arguments_with_attribution(
     launch: &Launch,
-    attribution: impl FnOnce(&crate::model::LaunchRecipe) -> Option<Value>,
+    attribution: impl FnOnce(&crate::model::LaunchRecipe, &str) -> Option<Value>,
 ) -> Result<Vec<String>, String> {
     if launch.recipe.arguments.len() > 128
         || launch
@@ -357,7 +360,8 @@ fn arguments_with_attribution(
         validate_id(id)?;
     }
     let mut result = Vec::new();
-    let mut use_managed_attribution = true;
+    let mut settings_value = None;
+    let mut setting_sources = "user,project,local";
     let mut args = launch.recipe.arguments.iter().peekable();
     while let Some(arg) = args.next() {
         let (flag, inline) = arg
@@ -413,11 +417,10 @@ fn arguments_with_attribution(
             {
                 return Err(format!("Unknown Claude launch permission mode {value}"));
             }
-            if flag == "--settings"
-                || (flag == "--setting-sources"
-                    && !value.split(',').any(|source| source.trim() == "user"))
-            {
-                use_managed_attribution = false;
+            match flag {
+                "--settings" => settings_value = Some(result.len() + 1),
+                "--setting-sources" => setting_sources = value,
+                _ => {}
             }
             result.extend([flag.into(), value.into()]);
         } else if crate::chat::fresh::claude_arity(flag)
@@ -450,11 +453,23 @@ fn arguments_with_attribution(
     }
     // Resolve at process launch so fresh, resumed and recovered chats all
     // read the current preference, without saving a flag into their recipe.
-    if use_managed_attribution && let Some(attribution) = attribution(&launch.recipe) {
-        result.extend([
-            "--settings".into(),
-            json!({ "attribution": attribution }).to_string(),
-        ]);
+    // Inline settings already live in argv and can share the same overlay.
+    // Leave a file argument intact so its contents stay out of argv.
+    let settings: Option<serde_json::Map<String, Value>> = match settings_value {
+        Some(index) => serde_json::from_str(&result[index]).ok(),
+        None => Some(serde_json::Map::new()),
+    };
+    if let Some(mut settings) = settings
+        && !settings.contains_key("attribution")
+        && let Some(attribution) = attribution(&launch.recipe, setting_sources)
+    {
+        settings.insert("attribution".into(), attribution);
+        let value = Value::Object(settings).to_string();
+        if let Some(index) = settings_value {
+            result[index] = value;
+        } else {
+            result.extend(["--settings".into(), value]);
+        }
     }
     // Older stored chats and terminal conversions may predate native launch
     // defaults. Apply the account choice at the final transport boundary too.

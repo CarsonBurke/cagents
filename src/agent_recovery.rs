@@ -225,6 +225,46 @@ fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<Launc
     })
 }
 
+#[cfg(feature = "host")]
+pub(crate) const CLAUDE_ATTRIBUTION_OVERLAY: &str = "CAGENTS_CLAUDE_ATTRIBUTION_OVERLAY";
+
+/// Resolve the managed preference at the spawn boundary and keep it out of
+/// the recipe used for the next restore. Explicit terminal settings win.
+#[cfg(feature = "host")]
+pub(crate) fn claude_attribution_overlay(launch: &LaunchRecipe) -> Option<String> {
+    claude_attribution_overlay_with(launch, crate::chat::protocol::claude::managed_attribution)
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn claude_attribution_overlay_with(
+    launch: &LaunchRecipe,
+    attribution: impl FnOnce(&LaunchRecipe, &str) -> Option<serde_json::Value>,
+) -> Option<String> {
+    if Provider::from_program(&launch.program) != Some(Provider::Claude) {
+        return None;
+    }
+    let recipe = interactive_recipe(launch, Selector::Fresh)
+        .or_else(|| interactive_recipe(launch, Selector::Picker))?;
+    let mut sources = "user,project,local";
+    let mut arguments = recipe.arguments.iter();
+    while let Some(flag) = arguments.next() {
+        if flag == "--settings" {
+            return None;
+        }
+        if Provider::Claude.is_value_option(flag)
+            && let Some(value) = arguments.next()
+            && flag == "--setting-sources"
+        {
+            sources = value;
+        }
+    }
+    let attribution = attribution(&recipe, sources)?;
+    Some(format!(
+        "--settings={}",
+        serde_json::json!({"attribution": attribution})
+    ))
+}
+
 /// Bind provider-confirmed identity while discarding already-consumed prompts.
 /// Unknown options remain a hard refusal, especially permission/account flags.
 pub fn bind_session(launch: &LaunchRecipe, id: &str) -> Option<LaunchRecipe> {
@@ -1299,7 +1339,23 @@ fn read_process_launch(
         .split(|byte| *byte == 0)
         .map(|arg| std::str::from_utf8(arg).map(str::to_owned));
     let program = argv.next()?.ok()?;
-    let arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
+    let mut arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
+    if Provider::from_program(&program) == Some(Provider::Claude)
+        && let Some(first) = arguments.first()
+        && let Some(value) = first.strip_prefix("--settings=")
+        && environ.as_ref().is_some_and(|bytes| {
+            bytes.split(|byte| *byte == 0).any(|entry| {
+                entry
+                    .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())
+                    .and_then(|entry| entry.strip_prefix(b"="))
+                    == Some(first.as_bytes())
+            })
+        })
+        && serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+            .is_ok_and(|settings| settings.len() == 1 && settings.contains_key("attribution"))
+    {
+        arguments.remove(0);
+    }
     // A recipe saved before parent sessions were withheld may still name one.
     let mut inherited = request.hint.map(|base| {
         let mut environment = base.environment.clone();
@@ -2393,6 +2449,41 @@ mod tests {
             observed.exact.is_none(),
             "unreadable environment cannot authorize a native handoff"
         );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn recovery_discards_only_the_marked_claude_attribution_overlay() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = launch(
+            "claude",
+            &["--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
+        );
+        let mut running = base.clone();
+        let overlay = r#"--settings={"attribution":false}"#;
+        running.arguments.insert(0, overlay.into());
+        process_fixture(directory.path(), 100, &running, &[]);
+        let root = directory.path().join("100");
+        for (environment, expected) in [
+            (format!("{CLAUDE_ATTRIBUTION_OVERLAY}={overlay}\0"), &base),
+            (
+                format!(r#"{CLAUDE_ATTRIBUTION_OVERLAY}=--settings={{"attribution":{{}}}}"#),
+                &running,
+            ),
+            (String::new(), &running),
+        ] {
+            fs::write(root.join("environ"), environment).unwrap();
+            let observed = read_process_launch(
+                &ProcessView::Proc(root.clone()),
+                ForegroundRequest {
+                    hint: Some(&base),
+                    agent: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(observed.inherited.unwrap().arguments, expected.arguments);
+            assert_eq!(observed.exact.unwrap().arguments, expected.arguments);
+        }
     }
 
     #[cfg(feature = "host")]

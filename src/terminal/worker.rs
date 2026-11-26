@@ -3217,6 +3217,24 @@ impl Worker {
         for name in crate::account::launch_credential_overrides(&execution) {
             command.env_remove(name);
         }
+        command.env_remove(crate::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY);
+        if crate::agent::Provider::from_program(&execution.program)
+            == Some(crate::agent::Provider::Claude)
+        {
+            let mut launch = execution.clone();
+            for name in ["HOME", "CLAUDE_CONFIG_DIR"] {
+                if let Some(value) = command.get_env(name).and_then(|value| value.to_str()) {
+                    launch.unset_environment.remove(name);
+                    launch.environment.insert(name.into(), value.into());
+                } else {
+                    launch.unset_environment.insert(name.into());
+                }
+            }
+            if let Some(overlay) = crate::agent_recovery::claude_attribution_overlay(&launch) {
+                command.get_argv_mut().insert(1, overlay.as_str().into());
+                command.env(crate::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY, overlay);
+            }
+        }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
         match crate::instance::development_instance() {
             Some(instance) => command.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance),
