@@ -143,6 +143,14 @@ fn persist(state: &Path, target: &Path, bytes: &[u8], exclusive: bool) -> Result
     saved
 }
 
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn persist_ready_activation_claim(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
+    let state = path
+        .parent()
+        .ok_or_else(|| invalid("Ready claim has no update directory"))?;
+    persist(state, path, bytes, true)
+}
+
 fn has_witness(state: &Path, job: &str) -> Result<bool, UpdateError> {
     match fs::symlink_metadata(inventory_path(state, job)) {
         Ok(_) => Ok(true),

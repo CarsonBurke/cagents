@@ -133,6 +133,42 @@ fn standby_retry_requires_the_original_ready_inode_even_with_identical_bytes() {
     assert!(!receipt.ready_before_restore().unwrap());
 }
 
+#[cfg(all(target_os = "macos", feature = "host"))]
+#[test]
+fn ready_activation_claim_prevents_a_recipe_retry_before_checkpoint_mutation() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let mut preparation = preparation(directory.path());
+    let bytes = checkpoint(&preparation, "Ready");
+    let canonical = preparation.authority.checkpoint_path.clone();
+    save(&canonical, &bytes);
+    preparation.authority.checkpoint_hash = digest(&bytes);
+    let receipt = Receipt {
+        checkpoint: StandbyCheckpoint::Ready(open_checkpoint(&canonical).unwrap().unwrap()),
+        worker: preparation.worker,
+        fence: preparation.fence,
+        legacy: preparation.legacy,
+        daemon: None,
+        authority: preparation.authority,
+    };
+    assert!(receipt.ready_before_restore().unwrap());
+    let claim = ready_claim_path(&receipt.authority).unwrap();
+    let capture_digest = digest(b"test capture");
+    claim_ready_activation(&receipt.authority, &capture_digest).unwrap();
+    let original = fs::read(&claim).unwrap();
+    assert!(claim_ready_activation(&receipt.authority, &digest(b"other capture")).is_err());
+    assert_eq!(fs::read(&claim).unwrap(), original);
+    let saved: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(saved["job"], receipt.authority.job);
+    assert_eq!(
+        saved["checkpoint_digest"],
+        receipt.authority.checkpoint_hash
+    );
+    assert_eq!(saved["capture_digest"], capture_digest);
+    assert_eq!(saved["successor"]["pid"], std::process::id());
+    assert_eq!(fs::read(canonical).unwrap(), bytes);
+    assert!(!receipt.ready_before_restore().unwrap());
+}
+
 fn checkpoint(preparation: &Preparation, phase: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "version": 2, "phase": phase, "proof": preparation.authority.source,

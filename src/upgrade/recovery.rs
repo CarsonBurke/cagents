@@ -1750,6 +1750,14 @@ impl Receipt {
         let StandbyCheckpoint::Ready(original) = &self.checkpoint else {
             return Ok(false);
         };
+        // The successor can open or migrate the saved store before changing
+        // Ready to Restoring. Untouched checkpoint bytes alone cannot prove
+        // that no successor started using the store.
+        match fs::symlink_metadata(ready_claim_path(&self.authority)?) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.to_string()),
+        }
         let Some(current) = open_checkpoint(&self.authority.checkpoint_path)? else {
             return Ok(false);
         };
@@ -4346,17 +4354,14 @@ impl Inherited {
         if !same_authority_path(&authority.daemon_path, &paths.lock) {
             return Err("Recovery inherited a different daemon namespace".into());
         }
-        validate_received_checkpoint(authority, phase)?;
-        #[cfg(target_os = "macos")]
-        validate_acknowledged_capture(authority)?;
-        Ok(())
+        validate_received_checkpoint(authority, phase)
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
-fn validate_acknowledged_capture(authority: &Authority) -> Result<(), String> {
+fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>, String> {
     if !matches!(authority.origin, Origin::AcknowledgedPrepare) {
-        return Ok(());
+        return Ok(None);
     }
     let path = bound_capture_path(&authority.checkpoint_path, &authority.checkpoint_hash);
     let bytes = read_checkpoint(&path)?
@@ -4374,7 +4379,7 @@ fn validate_acknowledged_capture(authority: &Authority) -> Result<(), String> {
             "Prepared authority changed its acknowledged inventory or saved windows".into(),
         );
     }
-    Ok(())
+    Ok(Some(digest(&bytes)))
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
@@ -4397,6 +4402,7 @@ pub(crate) fn accept_standby_authority(
     };
     received
         .validate_received(&authority, Phase::Prepared)
+        .and_then(|()| validate_acknowledged_capture(&authority))
         .map_err(io::Error::other)?;
     received.authority = Some(authority);
     INHERITED
@@ -4466,6 +4472,55 @@ impl ReadyAdmission {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn ready_claim_path(authority: &Authority) -> Result<PathBuf, String> {
+    let job = uuid::Uuid::parse_str(&authority.job).map_err(|error| error.to_string())?;
+    if job.to_string() != authority.job {
+        return Err("Invalid installed Ready activation job".into());
+    }
+    let state = authority
+        .worker_path
+        .parent()
+        .ok_or("Installed Ready activation has no update directory")?;
+    Ok(state.join(format!("{job}.ready-claim.json")))
+}
+
+/// Exact evidence that an installed standby obtained admission to modify the
+/// saved store. A process may never clear or replace it to replay recipes.
+#[cfg(all(target_os = "macos", feature = "host"))]
+#[derive(Serialize)]
+struct ReadyClaim<'a> {
+    version: u16,
+    job: &'a str,
+    request_digest: &'a str,
+    reviewed_digest: &'a str,
+    checkpoint_digest: &'a str,
+    capture_digest: &'a str,
+    source: &'a HostSessionProof,
+    target: &'a Path,
+    target_digest: &'a str,
+    successor: crate::daemon::holder_registry::Process,
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn claim_ready_activation(authority: &Authority, capture_digest: &str) -> io::Result<()> {
+    let path = ready_claim_path(authority).map_err(io::Error::other)?;
+    let claim = ReadyClaim {
+        version: 1,
+        job: &authority.job,
+        request_digest: &authority.job_request_hash,
+        reviewed_digest: &authority.request_identity,
+        checkpoint_digest: &authority.checkpoint_hash,
+        capture_digest,
+        source: &authority.source,
+        target: &authority.target,
+        target_digest: &authority.target_hash,
+        successor: crate::daemon::holder_registry::Process::read(std::process::id() as i32)?,
+    };
+    crate::update::persist_ready_activation_claim(&path, &serde_json::to_vec(&claim)?)
+        .map_err(io::Error::other)
+}
+
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) fn accept_ready_authority(
     authority: Authority,
@@ -4487,11 +4542,29 @@ pub(crate) fn accept_ready_authority(
     custody
         .validate_received(&authority, Phase::Ready)
         .map_err(io::Error::other)?;
+    let capture_digest = validate_acknowledged_capture(&authority)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("Installed Ready activation has no original capture"))?;
+    // This precedes runtime publication, saved-state admission and every
+    // startup path that can act on the original provider or its database.
+    claim_ready_activation(&authority, &capture_digest)?;
     Ok(ReadyAdmission { authority, custody })
 }
 
 #[cfg(feature = "host")]
 fn validate_received_checkpoint(authority: &Authority, phase: Phase) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let checkpoint = {
+        let store =
+            super::handoff::Store::observe_existing()?.ok_or("Recovery checkpoint disappeared")?;
+        if store.path != authority.checkpoint_path {
+            return Err("Recovery checkpoint belongs to another application".into());
+        }
+        store
+            .read_bytes()?
+            .ok_or("Recovery checkpoint disappeared")?
+    };
+    #[cfg(not(target_os = "macos"))]
     let checkpoint =
         read_checkpoint(&authority.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
     super::handoff::validate_checkpoint_bytes(&checkpoint)?;
@@ -4502,6 +4575,7 @@ fn validate_received_checkpoint(authority: &Authority, phase: Phase) -> Result<(
             "Recovery receipt does not identify these exact {phase:?} checkpoint bytes"
         ));
     }
+    #[cfg(not(target_os = "macos"))]
     if super::handoff::Store::discover()?.path != authority.checkpoint_path {
         return Err("Recovery checkpoint belongs to another application".into());
     }
