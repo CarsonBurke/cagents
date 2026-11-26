@@ -2,7 +2,7 @@
 # Installs a macOS release archive into a private HOME and prefix with
 # install-macos.sh, checks what it installed, reinstalls it, and removes it.
 #
-#   packaging/macos/smoke DIST VERSION PROTOCOL
+#   packaging/macos/smoke DIST VERSION PROTOCOL [--extraction]
 #
 # The installer leaves the private login item unloaded. The separate HOME and
 # XDG_RUNTIME_DIR isolate daemon and window state from the account's.
@@ -13,8 +13,9 @@ fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
     exit 1
 }
-[ "$#" = 3 ] || fail 'usage: smoke DIST VERSION PROTOCOL'
-DIST=$1 VERSION=$2 PROTOCOL=$3
+[ "$#" = 3 ] || { [ "$#" = 4 ] && [ "$4" = --extraction ]; } \
+    || fail 'usage: smoke DIST VERSION PROTOCOL [--extraction]'
+DIST=$1 VERSION=$2 PROTOCOL=$3 SMOKE_MODE=${4:-}
 ARCHIVE=$DIST/cagents-$VERSION-aarch64-apple-darwin.tar.gz
 
 # Darwin's socket paths have a short limit. Use a private directory under
@@ -65,6 +66,95 @@ private_installer() {
 install_release() {
     private_installer "$DIST/install-macos.sh" --prefix "$PREFIX" "$@"
 }
+
+# The daemon starts through the command link in the private runtime. The CLI
+# locates its matched daemon beside its real path, as process::current_executable does.
+cli() {
+    private_runtime "$ROOT/home/.local/bin/cagents" "$@"
+}
+start_daemon() {
+    cli daemon start > "$ROOT/daemon.log" 2>&1 \
+        && cli --no-start daemon status --json > "$ROOT/status.json" 2>> "$ROOT/daemon.log" \
+        && grep -q '"running": *true' "$ROOT/status.json" \
+        || { cli --no-start daemon stop > /dev/null 2>&1 || :; cat "$ROOT/daemon.log" >&2; fail 'the daemon does not start through the command link'; }
+}
+
+refuses_extraction() {
+    message=$1
+    shift
+    if install_release "$@" > "$ROOT/extract.log" 2>&1; then
+        fail "extraction accepted: $*"
+    fi
+    grep -q "$message" "$ROOT/extract.log" \
+        || { cat "$ROOT/extract.log" >&2; fail "wrong extraction refusal: $*"; }
+}
+
+check_extraction() {
+    # The updater stages the entire release while the source daemon serves.
+    mkdir -p -m 0700 "$PREFIX/.update"
+    mkdir -m 0700 "$PREFIX/.update/candidate"
+    candidate=$PREFIX/.update/candidate
+    shasum -a 256 "$AGENT" "$PREFIX/Cagents.app/Contents/MacOS/Cagents" > "$ROOT/launcher-before"
+    daemon_before=$(cli --no-start daemon status --json)
+    # The updater supplies already verified, inherited read-only inputs.
+    (
+        exec 6<"$ARCHIVE" 7<"$DIST/SHA256SUMS-macos"
+        private_runtime env CAGENTS_REPOSITORY=invalid CAGENTS_ARCHIVE=/dev/fd/6 CAGENTS_CHECKSUMS=/dev/fd/7 \
+            /bin/sh "$DIST/install-macos.sh" --prefix "$PREFIX" --version "$VERSION" --extract-update "$candidate"
+    ) > "$ROOT/extract.log" 2>&1 \
+        || { cat "$ROOT/extract.log" >&2; fail 'cannot extract the release while the daemon serves'; }
+    [ "$(find "$candidate" -mindepth 1 -maxdepth 1 -print)" = "$candidate/cagents-$VERSION" ] \
+        && diff -rq "$candidate/cagents-$VERSION" "$PREFIX/versions/$VERSION" \
+        && [ "$(readlink "$PREFIX/current")" = "versions/$VERSION" ] \
+        && shasum -a 256 -c "$ROOT/launcher-before" >/dev/null \
+        && [ "$(cli --no-start daemon status --json)" = "$daemon_before" ] \
+        || fail 'extraction changed the release, selection, launcher or serving daemon'
+
+    refuses_extraction 'must be empty' --version "$VERSION" --extract-update "$candidate"
+    ln -s "$candidate" "$PREFIX/.update/alias"
+    refuses_extraction 'physical directory' --version "$VERSION" --extract-update "$PREFIX/.update/alias"
+    mkdir -m 0755 "$PREFIX/.update/public"
+    refuses_extraction 'must be private' --version "$VERSION" --extract-update "$PREFIX/.update/public"
+    refuses_extraction 'needs --prefix and --version' --extract-update "$PREFIX/.update/public"
+    if private_runtime env CAGENTS_ARCHIVE="$ARCHIVE" CAGENTS_CHECKSUMS= /bin/sh "$DIST/install-macos.sh" \
+        --prefix "$PREFIX" --version "$VERSION" --extract-update "$PREFIX/.update/public" > "$ROOT/extract.log" 2>&1; then
+        fail 'extraction accepted a missing local checksum manifest'
+    fi
+    grep -q 'needs an absolute CAGENTS_CHECKSUMS file path' "$ROOT/extract.log" \
+        || { cat "$ROOT/extract.log" >&2; fail 'extraction tried to fetch the missing checksum manifest'; }
+
+    # Keep the whitelist names and replace a required file with a hard link.
+    mkdir -m 0700 "$PREFIX/.update/invalid"
+    stub=$ROOT/stub/cagents-$VERSION
+    (cd "$candidate/cagents-$VERSION" && find . -print) | while IFS= read -r member; do
+        if [ -d "$candidate/cagents-$VERSION/$member" ]; then
+            mkdir -p "$stub/$member"
+        else
+            touch "$stub/$member"
+        fi
+    done
+    rm "$stub/share/doc/cagents/LICENSE"
+    ln "$stub/bin/cagents" "$stub/share/doc/cagents/LICENSE"
+    stub_archive=$ROOT/${ARCHIVE##*/}
+    COPYFILE_DISABLE=1 tar -czf "$stub_archive" -C "$ROOT/stub" "cagents-$VERSION"
+    (cd "$ROOT" && shasum -a 256 "${ARCHIVE##*/}") > "$ROOT/bad-checksums"
+    if private_runtime env CAGENTS_ARCHIVE="$stub_archive" CAGENTS_CHECKSUMS="$ROOT/bad-checksums" \
+        /bin/sh "$DIST/install-macos.sh" --prefix "$PREFIX" --version "$VERSION" \
+        --extract-update "$PREFIX/.update/invalid" > "$ROOT/extract.log" 2>&1; then
+        fail 'extraction accepted a hard-linked file'
+    fi
+    grep -q 'regular, unlinked file' "$ROOT/extract.log" \
+        && [ -z "$(find "$PREFIX/.update/invalid" -mindepth 1 -maxdepth 1 -print)" ] \
+        || { cat "$ROOT/extract.log" >&2; fail 'invalid extraction left a candidate or reported the wrong refusal'; }
+}
+
+if [ "$SMOKE_MODE" = --extraction ]; then
+    install_release --no-start
+    start_daemon
+    check_extraction
+    printf 'Extracted the authenticated package while the installed daemon kept serving.\n'
+    exit 0
+fi
 
 # Pause the real publisher at the initial copy, the repair's selector rename,
 # and removal of the login item.
@@ -217,17 +307,9 @@ ln -s "versions/$VERSION" "$PREFIX/.smoke-next"
 mv -fh "$PREFIX/.smoke-next" "$PREFIX/current"
 rm -r "$PREFIX/versions/smoke-successor"
 
-# The daemon, started and stopped through the command link as a person
-# would, in the private runtime directory. On macOS an executable sees the
-# path it was started by, so this needs the CLI to find its companions by
-# its real path, as process::current_executable does.
-cli() {
-    private_runtime "$ROOT/home/.local/bin/cagents" "$@"
-}
-cli daemon start > "$ROOT/daemon.log" 2>&1 \
-    && cli --no-start daemon status --json > "$ROOT/status.json" 2>> "$ROOT/daemon.log" \
-    && grep -q '"running": *true' "$ROOT/status.json" \
-    || { cli --no-start daemon stop > /dev/null 2>&1 || :; cat "$ROOT/daemon.log" >&2; fail 'the daemon does not start through the command link'; }
+start_daemon
+check_extraction
+
 if install_release --no-start > "$ROOT/running-repair.log" 2>&1; then
     fail 'repair replaced a version with its daemon running'
 fi
