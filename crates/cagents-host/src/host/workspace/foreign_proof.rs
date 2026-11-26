@@ -5,7 +5,6 @@
 //! and edits can't put another daemon's proof on a pane.
 
 use super::*;
-use crate::model::HostSessionProof;
 
 /// Gives each chat this daemon serves back the pane another daemon stamped
 /// with its own proof, as [`Registry::adopt_foreign_chat_pane`] allows. Runs
@@ -46,86 +45,12 @@ pub(in crate::host) fn adopt_foreign_panes(host: &SharedHost) {
     }
 }
 
-/// Refuses an edit that would leave a chat pane naming a different proof than
-/// the complete one it has, unless it is this daemon's own. Only a daemon
-/// stamps a pane with its proof as it serves the chat; a window that writes
-/// another's is writing back a pane from before that daemon took it over.
-/// Only pane updates can change a stored pane's chat, so only they are read.
-pub(super) fn refuse_foreign_proof(
-    host: &SharedHost,
-    registry: &Registry,
-    edit: &ModelEdit,
-) -> Result<(), ProtocolError> {
-    let ModelEdit::ChangeView {
-        scope,
-        expected_revision,
-        change:
-            change @ (Change::Update { before, pane }
-            | Change::UpdateTerminalSource { before, pane, .. }),
-        ..
-    } = edit
-    else {
-        return Ok(());
-    };
-    let CardKind::Chat(written) = &pane.kind else {
-        return Ok(());
-    };
-    let serving = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .proof()
-        .clone();
-    // The write can leave only the stored proof or this one.
-    if written.proof.as_ref().is_none_or(|proof| *proof == serving) {
-        return Ok(());
-    }
-    let Some(mut view) = registry.pane_view(pane.id).map_err(unavailable)? else {
-        return Ok(());
-    };
-    // A write against another view, an older revision or a changed source is
-    // the store's to refuse as a conflict the window rebases and retries.
-    if view.scope != *scope
-        || view.revision != *expected_revision
-        || view.source_update_conflicts(before, pane)
-    {
-        return Ok(());
-    }
-    let proof = |view: &crate::workspace_model::views::View| {
-        view.panes
-            .iter()
-            .find(|candidate| candidate.id == pane.id)
-            .and_then(|candidate| match &candidate.kind {
-                CardKind::Chat(session) => session.proof.clone(),
-                _ => None,
-            })
-    };
-    let Some(stored) = proof(&view).filter(HostSessionProof::is_complete) else {
-        return Ok(());
-    };
-    // What the write leaves, merged with the stored pane as the store merges
-    // it. An edit the store would refuse anyway is its to refuse.
-    if view.apply(change).is_err() {
-        return Ok(());
-    }
-    match proof(&view) {
-        Some(left) if left != stored && left != serving => Err(ProtocolError::new(
-            ProtocolErrorCode::InvalidRequest,
-            format!(
-                "pane {} shows its chat as this daemon serves it; a copy from another daemon can't replace it",
-                pane.id
-            ),
-            false,
-        )),
-        _ => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         host::state::{HostLock, HostState},
-        model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
+        model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe},
     };
 
     fn proof(host_session: &str) -> HostSessionProof {
@@ -144,6 +69,7 @@ mod tests {
         state.register_client(1);
         let host: SharedHost = Arc::new(HostLock::new(state));
         let channel = crate::model::ChannelId::new();
+        let empty_channel = crate::model::ChannelId::new();
         let chat = crate::chat::Session {
             id: TerminalId::new(),
             launch: crate::chat::Launch {
@@ -185,6 +111,13 @@ mod tests {
                     id: channel,
                     repository: directory.path().to_owned(),
                     title: "view".into(),
+                    title_source: Default::default(),
+                    checkout: None,
+                },
+                ModelEdit::CreateChannel {
+                    id: empty_channel,
+                    repository: directory.path().to_owned(),
+                    title: "empty".into(),
                     title_source: Default::default(),
                     checkout: None,
                 },
@@ -238,6 +171,106 @@ mod tests {
             }),
             ..stored.clone()
         };
+
+        let draft_session = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: None,
+            launch: crate::chat::Launch {
+                session_id: None,
+                ..chat.launch.clone()
+            },
+            ..chat.clone()
+        };
+        let draft = Pane {
+            id: CardId::new(),
+            kind: CardKind::Chat(draft_session.clone()),
+            ..stored.clone()
+        };
+        let new_foreign = Pane {
+            kind: CardKind::Chat(crate::chat::Session {
+                id: draft_session.id,
+                proof: Some(proof("second")),
+                ..chat.clone()
+            }),
+            ..draft.clone()
+        };
+        let edit_empty = |change| {
+            let scope = Scope::Channel(empty_channel);
+            let expected_revision = writer(&host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .view_revision(&scope)
+                .unwrap();
+            edit_delta(
+                &host,
+                1,
+                ModelEdit::ChangeView {
+                    scope,
+                    expected_revision,
+                    operation: uuid::Uuid::new_v4(),
+                    change,
+                },
+            )
+        };
+        let assert_foreign = |error: ProtocolError| {
+            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert_eq!(error.message, Registry::VIEW_FOREIGN_CHAT_PROOF);
+            assert!(!error.retryable);
+        };
+        let seeded_foreign = Pane {
+            id: CardId::new(),
+            kind: CardKind::Chat(crate::chat::Session {
+                id: TerminalId::new(),
+                proof: Some(proof("second")),
+                ..draft_session.clone()
+            }),
+            ..draft.clone()
+        };
+        assert_foreign(
+            edit_delta(
+                &host,
+                1,
+                ModelEdit::SeedView {
+                    scope: Scope::Channel(empty_channel),
+                    panes: vec![draft.clone(), seeded_foreign],
+                    closed: vec![],
+                },
+            )
+            .expect_err("foreign seed must refuse the whole batch"),
+        );
+        assert_foreign(
+            edit_empty(Change::Insert {
+                pane: new_foreign.clone(),
+                before: None,
+            })
+            .expect_err("foreign insert must be refused"),
+        );
+        assert_foreign(
+            edit_empty(Change::InsertIfEmpty {
+                pane: new_foreign.clone(),
+            })
+            .expect_err("foreign conditional insert must be refused"),
+        );
+        edit_empty(Change::InsertIfEmpty {
+            pane: draft.clone(),
+        })
+        .expect("refusals leave the channel empty");
+        assert_foreign(
+            edit_empty(Change::Update {
+                before: draft.clone(),
+                pane: new_foreign,
+            })
+            .expect_err("draft cannot acquire another daemon's proof"),
+        );
+        let persisted = writer(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pane_view(draft.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.panes, [draft]);
 
         let refused =
             update(&stored, foreign.clone()).expect_err("another daemon's proof is refused");
