@@ -2096,6 +2096,23 @@ impl Cagents {
     /// Asks the service to prepare the conversation the pane `card` is
     /// reopening, for its current attempt.
     fn prepare_reopening(&mut self, card: CardId) -> Task<Message> {
+        self.prepare_reopening_at(card, || {
+            let socket = crate::terminal::ipc::daemon_socket_path()?;
+            let local = (!crate::device::is_remote())
+                .then(crate::daemon::RuntimePaths::discover)
+                .and_then(Result::ok)
+                .filter(|paths| paths.socket == socket);
+            Ok((socket, local))
+        })
+    }
+
+    fn prepare_reopening_at(
+        &mut self,
+        card: CardId,
+        locate: impl FnOnce() -> std::io::Result<(PathBuf, Option<crate::daemon::RuntimePaths>)>
+        + Send
+        + 'static,
+    ) -> Task<Message> {
         let Some(reopening) = self.resume_ui.reopening.get(&card) else {
             return Task::none();
         };
@@ -2107,13 +2124,30 @@ impl Cagents {
         let unstarted = unstarted_successor(&source);
         cosmic::task::future(async move {
             let response = tokio::task::spawn_blocking(move || {
-                let socket = crate::terminal::ipc::daemon_socket_path()
-                    .map_err(|error| error.to_string())?;
+                let (socket, local) = locate().map_err(|error| error.to_string())?;
                 let mut client = match crate::control::ControlClient::connect(&socket) {
                     Ok(client) => client,
                     // Nothing runs to vouch for it, or to refuse it.
                     Err(crate::control::ControlError::Connect(_)) if unstarted => {
                         return Ok((None, Ok(None)));
+                    }
+                    Err(crate::control::ControlError::Connect(error))
+                        if direct_history
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                            ) =>
+                    {
+                        if let Some(paths) = &local
+                            && !crate::daemon::HostLease::is_held(paths)
+                                .map_err(|error| error.to_string())?
+                        {
+                            // With no listening socket or inventory owner,
+                            // this daemon's anonymous archive is already
+                            // gone. The ordinary successor may start it.
+                            return Ok((None, Ok(None)));
+                        }
+                        return Err(crate::control::ControlError::Connect(error).to_string());
                     }
                     Err(error) => return Err(error.to_string()),
                 };
@@ -4537,6 +4571,86 @@ mod tests {
         assert_eq!(saved.chat_drafts[&inert].lines().count(), 2);
         assert!(!saved.kept_chat_drafts.contains_key(&entry.card));
         assert_eq!(saved.returned_chat_queues[&entry.card].len(), 1);
+    }
+
+    #[test]
+    fn direct_history_resume_starts_an_ordinary_successor_when_the_local_daemon_is_stopped() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::net::UnixListener;
+
+        for (case, stale_socket, held_lease, local, starts) in [
+            ("missing socket", false, false, true, true),
+            ("refused socket", true, false, true, true),
+            ("shutdown lease", true, true, true, false),
+            ("remote socket", false, false, false, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = crate::daemon::RuntimePaths {
+                directory: directory.path().into(),
+                socket: directory.path().join("daemon.sock"),
+                lock: directory.path().join("cagentsd.lock"),
+            };
+            if stale_socket {
+                drop(UnixListener::bind(&paths.socket).unwrap());
+            }
+            let _lease = held_lease.then(|| {
+                let file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&paths.lock)
+                    .unwrap();
+                file.lock().unwrap();
+                file
+            });
+
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let entry = saved(directory.path());
+            let source = entry.session.clone();
+            let (writer, _) = SessionRuntime::open(
+                &directory.path().join("resume.sqlite3"),
+                crate::model::BootId::new("stopped-history-daemon"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            drop(app.resume_saved_conversation(entry));
+            let (card, _) = reopening(&app);
+            assert!(app.resume_ui.reopening[&card].direct_history);
+
+            let task = app.prepare_reopening_at(card, move || {
+                Ok((paths.socket.clone(), local.then_some(paths)))
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut output = iced::runtime::task::into_stream(task).unwrap();
+            let message = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), output.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+            let iced::runtime::Action::Output(cosmic::Action::App(Message::ResumeConversation(
+                action,
+            ))) = message
+            else {
+                panic!("expected the result of the stopped-daemon lookup");
+            };
+            drop(app.update_resume(action));
+            if starts {
+                assert!(app.chat_start_began(card), "{case}");
+                let CardKind::Chat(successor) = &app.card_state(card).unwrap().kind else {
+                    panic!("{case}: expected the ordinary history successor");
+                };
+                assert_ne!(successor.id, source.id, "{case}");
+                assert_eq!(successor.launch, source.launch, "{case}");
+                assert!(successor.proof.is_none(), "{case}");
+            } else {
+                assert!(app.reopen_failed(card), "{case}");
+                assert!(!app.chat_start_began(card), "{case}");
+            }
+        }
     }
 
     #[test]
