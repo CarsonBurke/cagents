@@ -1078,6 +1078,8 @@ fn dispatch(
             .recipe
             .arguments
             .extend(launch_options(&accepted.agent.spec));
+        #[cfg(target_os = "macos")]
+        super::chat::record_agent_login_path(&mut session.launch).map_err(|e| before(e.message))?;
         let (proof, listeners) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             (state.proof().clone(), state.codex_listeners.clone())
