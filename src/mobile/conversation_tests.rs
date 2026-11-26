@@ -100,14 +100,12 @@ fn start_scripted(
     stream: UnixStream,
     proof: HostSessionProof,
     outbox: Outbox,
-    unread: Vec<uuid::Uuid>,
     ended: impl FnOnce(TerminalId, Option<String>) + Send + 'static,
 ) -> std::io::Result<Watch> {
     Watch::start(
         id,
         session.id,
         outbox,
-        unread,
         move |stop| {
             stop.register(&stream)
                 .map_err(|error| Failure::DaemonLost(error.to_string()))?;
@@ -149,14 +147,12 @@ fn finish_watch(removed: bool) {
     let (ended, ending) = mpsc::channel();
     let session = session();
     let chat_id = session.id;
-    let expected_ack = uuid::Uuid::new_v4();
     let watch = start_scripted(
         1,
         session.clone(),
         bridge,
         proof(),
         outbox,
-        vec![expected_ack],
         move |chat, unfollowable| ended.send((chat, unfollowable)).unwrap(),
     )
     .unwrap();
@@ -186,18 +182,6 @@ fn finish_watch(removed: bool) {
         api::ServerLine::Event(api::Event::Conversation(update)) if update.reset
     ));
 
-    let acknowledge = daemon.receive();
-    assert!(matches!(
-        acknowledge.request,
-        ClientRequest::ChatAcknowledge { chat_id: id, epoch: 1 } if id == chat_id
-    ));
-    daemon.respond(&acknowledge, ServerResponse::Accepted);
-    let dismiss = daemon.receive();
-    assert!(matches!(
-        dismiss.request,
-        ClientRequest::AcknowledgeNotification { id } if id == expected_ack
-    ));
-    daemon.respond(&dismiss, ServerResponse::Accepted);
     let read = daemon.receive();
     assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
     assert!(watch.send(Command::Chat {
@@ -270,15 +254,9 @@ fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands(
     let (outbox, lines) = Outbox::new();
     let (ended, ending) = mpsc::channel();
     let chat_id = TerminalId::new();
-    let watch = Watch::connect(
-        1,
-        chat_id,
-        path,
-        proof(),
-        outbox,
-        Vec::new(),
-        move |chat, why| ended.send((chat, why)).unwrap(),
-    )
+    let watch = Watch::connect(1, chat_id, path, proof(), outbox, move |chat, why| {
+        ended.send((chat, why)).unwrap()
+    })
     .unwrap();
     let (stream, _) = listener.accept().unwrap();
     stream.set_read_timeout(Some(WAIT)).unwrap();
@@ -327,7 +305,6 @@ fn a_watch_stopped_while_attaching_answers_once_and_sends_no_conversation() {
         bridge,
         proof(),
         outbox,
-        Vec::new(),
         move |chat, unfollowable| ended.send((chat, unfollowable)).unwrap(),
     )
     .unwrap();

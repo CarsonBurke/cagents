@@ -540,18 +540,12 @@ impl Bridge {
         drop(watching.remove(&session));
         let conversations = Arc::downgrade(&self.conversations);
         let outbox = self.outbox.clone();
-        let unread = self
-            .notifications
-            .as_ref()
-            .map(|watch| watch.session_notices(session))
-            .unwrap_or_default();
         let watch = conversation::Watch::connect(
             id,
             session,
             self.socket.clone(),
             self.control.proof().clone(),
             self.outbox.clone(),
-            unread,
             move |chat_id, unfollowable| {
                 // Forget the watch, unless the phone has already replaced or
                 // stopped it. Telling the phone under the same lock keeps the
