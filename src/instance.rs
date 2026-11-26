@@ -716,6 +716,8 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_os = "macos", feature = "ui"))]
+static UI_RESTORATION_READY: AtomicBool = AtomicBool::new(false);
 
 /// Records that the UI's main window is on screen. A failure after this ends
 /// a running window, not its startup.
@@ -740,6 +742,8 @@ pub fn report_ui_startup_with_pane_notes(notes: &str) -> io::Result<()> {
 fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
+        #[cfg(all(target_os = "macos", feature = "ui"))]
+        UI_RESTORATION_READY.store(true, Ordering::Release);
         crate::diagnostics::record(crate::diagnostics::Event::Ready);
     }
     if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -2267,6 +2271,33 @@ impl UiUpdateGuard {
         self.relaunch_windows(&missing, executable)
     }
 
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
+        let windows = self.verified_windows()?;
+        for slot in slots {
+            let lease = self.runtime.join(slot_lock_name(slot));
+            let owner = windows
+                .iter()
+                .find(|window| window.lease_path == lease && window.executable == image)
+                .ok_or_else(|| io::Error::other("A saved window has no matching restored owner"))?;
+            let mut stream =
+                crate::descriptor::connect_settled(self.runtime.join(slot_socket_name(slot)))?;
+            let peer = crate::pinned_process::peer_credentials(&stream)?;
+            if peer.uid != current_uid() || peer.pid != owner.pid {
+                return Err(io::Error::other(
+                    "A saved window changed its restored owner",
+                ));
+            }
+            stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+            stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+            writeln!(&mut stream, "update-ready")?;
+            if read_capped_line(&stream)? != "ready" || !owner.still_owns_lease()? {
+                return Err(io::Error::other("A saved window is still reopening"));
+            }
+        }
+        Ok(())
+    }
+
     fn relaunch_windows_with_notes(
         mut self,
         slots: &[String],
@@ -3128,6 +3159,15 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
         let _ = stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT));
         match read_activation_request(&stream) {
             Ok(ActivationRequest::Shutdown) => break,
+            #[cfg(target_os = "macos")]
+            Ok(ActivationRequest::UpdateReady) => {
+                let response = if UI_RESTORATION_READY.load(Ordering::Acquire) {
+                    "ready"
+                } else {
+                    "pending"
+                };
+                let _ = writeln!(&stream, "{response}");
+            }
             Ok(ActivationRequest::Activate(token)) => {
                 // The acknowledgement is the launcher's proof that a window
                 // will be raised: `cagents ui` reports "already running" and
@@ -3190,6 +3230,8 @@ enum ActivationRequest {
     Activate(Option<String>),
     Session(crate::model::TerminalId, Option<String>),
     Shutdown,
+    #[cfg(target_os = "macos")]
+    UpdateReady,
     Update(UiUpdateAction),
 }
 
@@ -3222,6 +3264,8 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     match line.split_once(' ') {
         None if line == "activate" => Ok(ActivationRequest::Activate(None)),
         None if line == "shutdown" => Ok(ActivationRequest::Shutdown),
+        #[cfg(target_os = "macos")]
+        None if line == "update-ready" => Ok(ActivationRequest::UpdateReady),
         None if line == "update-prepare" => Ok(ActivationRequest::Update(UiUpdateAction::Prepare)),
         None if line == "update-cancel" => Ok(ActivationRequest::Update(UiUpdateAction::Cancel)),
         None if line == "update-commit" => Ok(ActivationRequest::Update(UiUpdateAction::Commit)),
@@ -5527,6 +5571,14 @@ mod tests {
         ));
         assert!(parse_activation_request("open").is_err());
         assert!(parse_activation_request("activate ").is_err());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(matches!(
+                parse_activation_request("update-ready").unwrap(),
+                ActivationRequest::UpdateReady
+            ));
+            assert!(parse_activation_request("update-ready extra").is_err());
+        }
     }
 
     #[cfg(feature = "ui")]

@@ -84,6 +84,7 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "census.json"
             | "recovery.json"
             | "settled.json"
+            | "cutover.json"
             | "cancel-nonce"
             | "decisions.lock"
     ) || suffix
