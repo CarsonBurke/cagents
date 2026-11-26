@@ -457,19 +457,17 @@ pub(super) fn perform(
     }
     announce_primary_failure(&result);
     #[cfg(target_os = "macos")]
-    if parks_successor
-        && recovery.shutdown_requested
-        && let Err(failure) = result
-    {
-        let previous_running = previous.as_ref().is_some_and(|previous| {
-            crate::daemon::running_executable()
+    if parks_successor && let Err(failure) = result {
+        let previous = previous.as_ref().unwrap_or(&selection.current);
+        if selected_candidate(&layout.prefix, previous).is_ok()
+            && crate::daemon::running_executable()
                 .is_ok_and(|exe| exe == Some(previous.join("bin/cagentsd")))
-        });
-        if !previous_running {
+        {
+            guard.set_fallback_executable(previous.join("bin/cagents-ui"));
+        } else {
             guard.defer_reopening_to_recovery();
-            return Err(failure);
         }
-        result = Err(failure);
+        return Err(failure);
     }
     let mut restored_previous = false;
     if result.is_err()
