@@ -229,6 +229,7 @@ impl Watch {
                     detail,
                     inputs,
                     pending: HashMap::new(),
+                    read_checkpoint_ready: None,
                 };
                 let end = connection.run(id, session, notice, feed);
                 worker_stop.stop();
@@ -289,6 +290,7 @@ enum Input {
 enum Pending {
     Read {
         final_read: bool,
+        refresh: Option<ReadCheckpoint>,
     },
     ReadCheckpoint {
         id: u64,
@@ -308,6 +310,12 @@ enum Pending {
     },
 }
 
+struct ReadCheckpoint {
+    id: u64,
+    notification_request: u64,
+    notice: Option<uuid::Uuid>,
+}
+
 struct Connection {
     stream: UnixStream,
     proof: HostSessionProof,
@@ -319,6 +327,8 @@ struct Connection {
     inputs: Receiver<Input>,
     /// What each daemon request in flight was for.
     pending: HashMap<u64, Pending>,
+    /// Attention captured before the next full presentation read.
+    read_checkpoint_ready: Option<ReadCheckpoint>,
 }
 
 /// What a watch holds of its conversation between daemon messages.
@@ -424,10 +434,12 @@ impl Connection {
         loop {
             // A phone that is behind gets the conversation as it stands once
             // it catches up, rather than every publication on the way.
-            let held_back = followed.changed && !followed.reading && self.outbox.congested();
-            if followed.changed && !followed.reading && !held_back {
-                let after_generation =
-                    (followed.snapshot.generation != 0).then_some(followed.snapshot.generation);
+            let needs_read = followed.changed || self.read_checkpoint_ready.is_some();
+            let held_back = needs_read && !followed.reading && self.outbox.congested();
+            if needs_read && !followed.reading && !held_back {
+                let after_generation = (self.read_checkpoint_ready.is_none()
+                    && followed.snapshot.generation != 0)
+                    .then_some(followed.snapshot.generation);
                 match self.request(ClientRequest::ChatRead {
                     chat_id: self.chat_id,
                     after_generation,
@@ -437,6 +449,7 @@ impl Connection {
                             request_id,
                             Pending::Read {
                                 final_read: followed.ending,
+                                refresh: self.read_checkpoint_ready.take(),
                             },
                         );
                         followed.reading = true;
@@ -495,12 +508,17 @@ impl Connection {
     }
 
     /// Send the phone what changed since it was last sent anything.
-    fn publish(&self, followed: &mut Followed) {
-        self.current.send(|| {
+    fn publish(&self, followed: &mut Followed, refresh: Option<ReadCheckpoint>) {
+        let publication = self.current.send(|| {
+            if let Some(refresh) = &refresh {
+                followed.read_checkpoint = uuid::Uuid::new_v4();
+                followed.read_notice = refresh.notice;
+                self.outbox.ok(refresh.id);
+            }
             if let Some(mut update) =
                 followed
                     .mirror
-                    .update(&followed.session, &followed.snapshot, false)
+                    .update(&followed.session, &followed.snapshot, refresh.is_some())
             {
                 if update.reset {
                     update.read_checkpoint = Some(followed.read_checkpoint.to_string());
@@ -509,6 +527,9 @@ impl Connection {
                     .event(api::Event::Conversation(Box::new(update)));
             }
         });
+        if !publication && let Some(refresh) = refresh {
+            self.outbox.error(Some(refresh.id), stopped_during_attach());
+        }
     }
 
     /// Answer every phone request the watch is ending without finishing:
@@ -527,8 +548,9 @@ impl Connection {
                 | Pending::ReadCheckpoint { id }
                 | Pending::AcknowledgeChat { id, .. }
                 | Pending::Detail { id, .. } => Some(id),
-                Pending::Read { .. } => None,
+                Pending::Read { refresh, .. } => refresh.map(|refresh| refresh.id),
             })
+            .chain(self.read_checkpoint_ready.take().map(|refresh| refresh.id))
             .chain(waiting_requests(&self.inputs));
         fail_requests(requests, &self.outbox, message);
     }
@@ -538,6 +560,9 @@ impl Connection {
             Ok(request) => {
                 followed.read_checkpoint_request = Some(request);
                 self.pending.insert(request, Pending::ReadCheckpoint { id });
+                if let Some(previous) = self.read_checkpoint_ready.take() {
+                    self.outbox.ok(previous.id);
+                }
                 Ok(())
             }
             Err(error) => {
@@ -718,19 +743,52 @@ impl Connection {
             };
         };
         match self.pending.remove(&request_id) {
-            Some(Pending::Read { final_read }) => {
+            Some(Pending::Read {
+                final_read,
+                refresh,
+            }) => {
                 followed.reading = false;
+                let mut refresh = refresh.filter(|refresh| {
+                    if followed.read_checkpoint_request != Some(refresh.notification_request) {
+                        self.outbox.ok(refresh.id);
+                        return false;
+                    }
+                    followed.read_checkpoint_request = None;
+                    true
+                });
+                if let Some(presentation) = &refresh
+                    && !matches!(
+                        &envelope.message,
+                        ServerMessage::Response {
+                            response: ServerResponse::ChatSnapshot {
+                                chat_id,
+                                snapshot: Some(snapshot),
+                            },
+                        } if *chat_id == self.chat_id && snapshot.generation >= followed.snapshot.generation
+                    )
+                {
+                    let error = match &envelope.message {
+                        ServerMessage::Error(error) => refused(error),
+                        _ => {
+                            internal("The daemon did not return a fresh conversation presentation.")
+                        }
+                    };
+                    self.outbox.error(Some(presentation.id), error);
+                    refresh = None;
+                }
                 match envelope.message {
                     ServerMessage::Response {
-                        response: ServerResponse::ChatSnapshot { snapshot, .. },
-                    } => {
-                        if let Some(snapshot) = snapshot {
+                        response: ServerResponse::ChatSnapshot { chat_id, snapshot },
+                    } if chat_id == self.chat_id => {
+                        if let Some(snapshot) = snapshot
+                            && snapshot.generation >= followed.snapshot.generation
+                        {
                             followed.snapshot = snapshot;
                         }
                     }
                     ServerMessage::Response {
-                        response: ServerResponse::ChatUpdate { update, .. },
-                    } => match update.apply(&followed.snapshot) {
+                        response: ServerResponse::ChatUpdate { chat_id, update },
+                    } if chat_id == self.chat_id => match update.apply(&followed.snapshot) {
                         Ok(snapshot) => followed.snapshot = snapshot,
                         // A delta that doesn't fit what is held: read the
                         // whole snapshot again.
@@ -767,7 +825,7 @@ impl Connection {
                         ));
                     }
                 }
-                self.publish(followed);
+                self.publish(followed, refresh);
                 if final_read && !followed.changed {
                     return Err(End::Conversation("The conversation ended.".into()));
                 }
@@ -775,29 +833,28 @@ impl Connection {
             Some(Pending::ReadCheckpoint { id }) => {
                 if followed.read_checkpoint_request != Some(request_id) {
                     self.outbox.ok(id);
-                } else {
-                    followed.read_checkpoint_request = None;
-                    match envelope.message {
-                        ServerMessage::Response {
-                            response: ServerResponse::Notifications { snapshot },
-                        } => {
-                            followed.read_checkpoint = uuid::Uuid::new_v4();
-                            followed.read_notice = unread_session_notice(snapshot, self.chat_id);
-                            if !self.current.send(|| {
-                                self.outbox.ok(id);
-                                self.outbox.event(api::Event::ConversationReadCheckpoint {
-                                    session: followed.session.clone(),
-                                    checkpoint: followed.read_checkpoint.to_string(),
-                                });
-                            }) {
-                                self.outbox.error(Some(id), stopped_during_attach());
-                            }
-                        }
-                        ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),
-                        _ => self.outbox.error(
+                    return Ok(());
+                }
+                match envelope.message {
+                    ServerMessage::Response {
+                        response: ServerResponse::Notifications { snapshot },
+                    } => {
+                        self.read_checkpoint_ready = Some(ReadCheckpoint {
+                            id,
+                            notification_request: request_id,
+                            notice: unread_session_notice(snapshot, self.chat_id),
+                        });
+                    }
+                    ServerMessage::Error(error) => {
+                        followed.read_checkpoint_request = None;
+                        self.outbox.error(Some(id), refused(&error));
+                    }
+                    _ => {
+                        followed.read_checkpoint_request = None;
+                        self.outbox.error(
                             Some(id),
                             internal("The daemon answered a read checkpoint unexpectedly."),
-                        ),
+                        );
                     }
                 }
             }

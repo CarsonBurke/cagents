@@ -41,8 +41,16 @@ private const val S = "8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"
 private fun sessionsEvent(activity: String) =
     """{"type":"event","event":"sessions","data":{"sessions":[{"id":"$S","lineage":"$S","surface":"chat","title":"Fix the build","activity":"$activity","exited":false,"watchable":true,"new_field":{"x":1}}]}}"""
 
-private fun conversation(reset: Boolean, order: String?, items: String, appends: String = "[]", busy: Boolean = true) =
+private fun conversation(
+    reset: Boolean,
+    order: String?,
+    items: String,
+    appends: String = "[]",
+    busy: Boolean = true,
+    checkpoint: String? = null,
+) =
     """{"type":"event","event":"conversation","data":{"session":"$S","reset":$reset,""" +
+        (checkpoint?.let { """"read_checkpoint":"$it",""" } ?: "") +
         """"state":{"activity":"working","busy":$busy,"ready":true,"exited":false,"has_earlier":false,"loading_earlier":false},""" +
         (order?.let { """"order":$it,""" } ?: "") +
         """"items":$items,"appends":$appends}}"""
@@ -765,9 +773,17 @@ class RemoteControllerTest {
         assertEquals("conversation.read_checkpoint", request.op)
         assertEquals(S, request.params["session"]!!.jsonPrimitive.content)
         connection.ok(request)
-        connection.send("""{"type":"event","event":"conversation_read_checkpoint","data":{"session":"$S","checkpoint":"fresh"}}""")
         refresh.await()
-        controller.await { it.conversations[S]?.readCheckpoint == "fresh" }
+        assertNull(controller.state.value.conversations[S]?.readCheckpoint)
+
+        connection.send(conversation(
+            reset = true,
+            order = """["b"]""",
+            items = "[${text("b", "Ready for review")}]",
+            checkpoint = "fresh",
+        ))
+        val displayed = controller.await { it.conversations[S]?.readCheckpoint == "fresh" }.conversations[S]
+        assertEquals(listOf("b"), displayed?.items?.map { it.id })
         assertEquals(false, sent.isCompleted)
 
         val read = async { controller.readConversation(S, "fresh") }

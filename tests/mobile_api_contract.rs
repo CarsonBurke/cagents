@@ -392,7 +392,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             event(Event::Conversation(Box::new(ConversationUpdate {
                 session: session(),
                 reset: true,
-                read_checkpoint: None,
+                read_checkpoint: Some(READ_CHECKPOINT.into()),
                 state: state(),
                 order: Some(vec!["i1".into(), "i2".into()]),
                 items: vec![
@@ -520,13 +520,6 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                 )],
                 appends: Vec::new(),
             }))),
-        ),
-        (
-            "event conversation_read_checkpoint",
-            event(Event::ConversationReadCheckpoint {
-                session: session(),
-                checkpoint: READ_CHECKPOINT.into(),
-            }),
         ),
         (
             "event conversation_ended",

@@ -350,16 +350,47 @@ fn refreshing_a_read_checkpoint_keeps_pending_commands_on_the_same_watch() {
             },
         },
     );
+    daemon.respond(
+        &initial_read,
+        ServerResponse::ChatSnapshot {
+            chat_id,
+            snapshot: None,
+        },
+    );
+    let presentation = daemon.receive();
+    assert_eq!(
+        presentation.request,
+        ClientRequest::ChatRead {
+            chat_id,
+            after_generation: None
+        },
+    );
+    assert!(
+        lines.outgoing.try_recv().is_err(),
+        "a journal receipt alone is not a presentation"
+    );
+    daemon.respond(
+        &presentation,
+        ServerResponse::ChatSnapshot {
+            chat_id,
+            snapshot: Some(chat::Snapshot {
+                generation: 2,
+                title: Some("The refreshed conversation".into()),
+                ..chat::Snapshot::default()
+            }),
+        },
+    );
     assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 3, page: None });
-    let api::ServerLine::Event(api::Event::ConversationReadCheckpoint {
-        session,
-        checkpoint,
-    }) = next_line(&lines)
-    else {
-        panic!("the watch did not publish its new read checkpoint");
+    let api::ServerLine::Event(api::Event::Conversation(fresh)) = next_line(&lines) else {
+        panic!("the watch did not publish a refreshed presentation");
     };
-    assert_eq!(session, chat_id.to_string());
-    let checkpoint = checkpoint.parse().unwrap();
+    assert_eq!(fresh.session, chat_id.to_string());
+    assert!(fresh.reset);
+    assert_eq!(
+        fresh.state.title.as_deref(),
+        Some("The refreshed conversation")
+    );
+    let checkpoint = fresh.read_checkpoint.unwrap().parse().unwrap();
     assert_ne!(old_checkpoint, checkpoint);
 
     assert!(watch.send(Command::Read {

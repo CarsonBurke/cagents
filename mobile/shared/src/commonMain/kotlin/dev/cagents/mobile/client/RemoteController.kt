@@ -624,13 +624,6 @@ class RemoteController(
                     else -> resync(session, UNREADABLE)
                 }
             }
-            is Event.ConversationReadCheckpoint -> _state.update { state ->
-                val held = state.conversations[event.session] ?: return@update state
-                if (held.ended != null) return@update state
-                state.copy(conversations = state.conversations + (
-                    event.session to held.copy(readCheckpoint = event.checkpoint)
-                ))
-            }
             is Event.ConversationEnded -> markEnded(event.session, event.message)
             is Event.TerminalScreenUpdated, is Event.TerminalWatchEnded,
             is Event.Closing, is Event.Unknown -> Unit
