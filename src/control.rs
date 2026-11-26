@@ -3299,6 +3299,8 @@ impl ControlClient {
             | ServerMessage::ChatAgentAddresses { chat_id, .. }
             | ServerMessage::ChatActiveModel { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
+            ServerMessage::ChatQueueEnded { source, .. }
+                if self.attached_chats.contains(&source.id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
             | ServerMessage::TerminalObserved { terminal_id, .. }
@@ -10761,6 +10763,14 @@ mod tests {
                 None,
                 activity(closed, ActivityState::Working),
             );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::ChatQueueEnded {
+                    source: session.clone(),
+                    execution: uuid::Uuid::new_v4(),
+                },
+            );
             respond(
                 &mut server_stream,
                 attach.request_id,
@@ -10899,6 +10909,11 @@ mod tests {
             })
         ));
         assert!(client.attached_chats.is_empty());
+        let foreign_queue = ServerMessage::ChatQueueEnded {
+            source: session(elsewhere),
+            execution: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(client.absorb(foreign_queue.clone()), Some(foreign_queue));
         assert!(client.list_chats().unwrap().is_empty());
         assert!(matches!(
             client.list_chats(),
