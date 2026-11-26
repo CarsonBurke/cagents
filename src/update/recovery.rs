@@ -560,6 +560,15 @@ impl Receipt {
     pub fn usable(&self) -> bool {
         matches!(self.outcome, Outcome::Usable { .. })
     }
+    pub(super) fn verifies_replacement(
+        &self,
+        original: &HostSessionProof,
+        observed: &HostSessionProof,
+    ) -> bool {
+        observed != original
+            && observed.is_complete()
+            && matches!(&self.outcome, Outcome::Usable { serving, .. } if serving == observed)
+    }
     pub(crate) fn has_listener(&self) -> bool {
         matches!(
             self.outcome,
@@ -1157,15 +1166,7 @@ fn serving_prepared(
                 Ok(None) | Err(_) => return Ok(None),
             };
         classified = true;
-        if settled.source != pending.source
-            || settled.census != pending.census
-            || settled.witness.checkpoint_hash != pending.checkpoint_hash
-            || settled.witness.target != target
-        {
-            return Err(invalid(
-                "The settled record differs from the retained original source",
-            ));
-        }
+        require_prepared_scope(pending, &settled, target)?;
         Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?
             .verify(busy)
             .map(Some)
@@ -1206,11 +1207,7 @@ fn prepared_service_outcome(
             PreparedService::Unresolved
         };
     };
-    if observed != *source
-        && observed.is_complete()
-        && readiness == StartupState::Ready
-        && matches!(&receipt.outcome, Outcome::Usable { serving, .. } if *serving == observed)
-    {
+    if readiness == StartupState::Ready && receipt.verifies_replacement(source, &observed) {
         PreparedService::HandledVerified { serving: observed }
     } else {
         PreparedService::RetainedUnverified(if receipt.usable() {
@@ -1219,6 +1216,23 @@ fn prepared_service_outcome(
             receipt.failure().to_string()
         })
     }
+}
+
+pub(super) fn require_prepared_scope(
+    pending: &crate::upgrade::recovery::PendingRecovery,
+    settled: &crate::upgrade::recovery::AlreadyRecovered,
+    target: &Path,
+) -> Result<(), UpdateError> {
+    if settled.source != pending.source
+        || settled.census != pending.census
+        || settled.witness.checkpoint_hash != pending.checkpoint_hash
+        || settled.witness.target != target
+    {
+        return Err(invalid(
+            "The settled record differs from the retained checkpoint, inventory or target",
+        ));
+    }
+    Ok(())
 }
 
 fn require_captured_owner(
@@ -2306,8 +2320,11 @@ mod tests {
                 ),
                 PreparedService::HandledVerified { serving: accepted } if accepted == serving
             ));
+            let mut other_replacement = serving.clone();
+            other_replacement.host_incarnation = "other-replacement".into();
             for (observed, readiness, receipt) in [
                 (proof(), StartupState::Ready, verified.clone()),
+                (other_replacement, StartupState::Ready, verified.clone()),
                 (
                     serving.clone(),
                     StartupState::Retained {

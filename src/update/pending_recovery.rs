@@ -1,7 +1,11 @@
 //! Explicitly authorized recovery of an immutable incomplete preparation.
 //! This coordinates the shared recovery owner; it never replays providers.
 use super::*;
-use crate::{daemon::lease_handoff::LeaseHandoff, upgrade::recovery::PendingRecovery};
+use crate::{
+    daemon::lease_handoff::LeaseHandoff,
+    model::HostSessionProof,
+    upgrade::recovery::{PendingRecovery, classify_retained_prepared},
+};
 
 /// Run only through the exact retained candidate named in the recovery command.
 /// `--yes` authorizes this hash, rather than pretending a disk artifact is ACK.
@@ -60,7 +64,7 @@ pub(crate) fn run(
         .and_then(installed::Selection::previous_link);
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
-    let settled = match verify(&pending, &daemon) {
+    let settled = match verify_settled(&pending, &daemon) {
         Ok(_) => true,
         // A daemon is serving but would not answer the check. Nothing has
         // been closed or started yet, so this recovery can simply be repeated.
@@ -89,7 +93,7 @@ pub(crate) fn run(
             verify(&pending, &daemon)
         });
         return match outcome {
-            Ok(outcome) => Ok(report(&outcome)),
+            Ok((_, outcome)) => Ok(report(&outcome)),
             Err(error @ UpdateError::SourceBusy { .. }) => Err(invalid(format!(
                 "Recovery could not be verified: {error}. The serving daemon was kept and its windows were reopened; repeat this recovery once the daemon finishes"
             ))),
@@ -209,7 +213,8 @@ pub(crate) fn run(
         let pending = PendingRecovery::inspect()
             .map_err(invalid)?
             .ok_or_else(|| invalid("The Prepared evidence disappeared after recovery"))?;
-        verify(&pending, &daemon)?;
+        let (serving, _) = verify(&pending, &daemon)?;
+        receipt.verify_successor(&serving).map_err(invalid)?;
         receipt.release_daemon_reservation();
         Ok::<_, UpdateError>(windows)
     })();
@@ -227,7 +232,7 @@ pub(crate) fn run(
         verify(&pending, &daemon)
     });
     match result {
-        Ok(outcome) => {
+        Ok((_, outcome)) => {
             job.phase = UpdatePhase::Complete;
             job.message = report(&outcome);
             write_job(&state, &job)?;
@@ -265,10 +270,24 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
     windows
 }
 
+fn verify_settled(pending: &PendingRecovery, daemon: &Path) -> Result<(), UpdateError> {
+    verify(pending, daemon)?;
+    let store = crate::upgrade::handoff::Store::existing()
+        .map_err(invalid)?
+        .ok_or_else(|| invalid("The retained checkpoint disappeared during recovery"))?;
+    let settled = classify_retained_prepared(&store.path, daemon)
+        .map_err(invalid)?
+        .ok_or_else(|| invalid("The installed recovery has no settled Prepared record"))?;
+    recovery::require_prepared_scope(pending, &settled, daemon)
+}
+
 /// One recovery check. Its fences and census share one busy patience, so a
 /// busy daemon delays the check, and the windows it may keep closed, at most
 /// that long.
-fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt, UpdateError> {
+fn verify(
+    pending: &PendingRecovery,
+    daemon: &Path,
+) -> Result<(HostSessionProof, recovery::Receipt), UpdateError> {
     let busy = source::BusyPatience::for_one_run();
     let socket = crate::terminal_ipc::daemon_socket_path()?;
     let mut client = source::Client::connect(&socket)
@@ -294,6 +313,11 @@ fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt,
             receipt.outcome
         )));
     }
+    if !receipt.verifies_replacement(&pending.source, client.proof()) {
+        return Err(invalid(
+            "The verified inventory belongs to a different recovery service",
+        ));
+    }
     if client.inventory_generation()? != generation {
         return Err(invalid(
             "Recovery inventory changed during verification; no success was reported",
@@ -307,7 +331,7 @@ fn verify(pending: &PendingRecovery, daemon: &Path) -> Result<recovery::Receipt,
     if client.serving_executable()? != daemon {
         return Err(invalid("The serving recovery executable changed"));
     }
-    Ok(receipt)
+    Ok((client.proof().clone(), receipt))
 }
 
 fn report(receipt: &recovery::Receipt) -> String {
