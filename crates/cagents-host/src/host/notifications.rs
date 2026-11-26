@@ -902,6 +902,7 @@ async fn run(
     let mut withdrawals = Withdrawals::default();
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
+    let mut withdrawal_retry = None;
     let mut snapshot = Snapshot {
         diagnostic: settings_error.clone(),
         ..Default::default()
@@ -929,6 +930,7 @@ async fn run(
         }
         .into_iter()
         .chain(store.retry_at())
+        .chain(withdrawal_retry)
         .min(),
     )
     .await
@@ -1162,10 +1164,27 @@ async fn run(
         restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, false);
         let persisted_withdrawals = match reserve_withdrawals(journal, &snapshot, &mut withdrawals)
         {
-            Ok(groups) => groups,
+            Ok(groups) => {
+                withdrawal_retry = None;
+                groups
+            }
             Err(error) => {
-                snapshot.diagnostic = Some(error);
-                BTreeSet::new()
+                // The same stable desktop group may still have an older
+                // withdrawal in the journal. Wait before publishing or
+                // activating another notice on that group.
+                snapshot.diagnostic = Some(error.clone());
+                if !policy.message_previews {
+                    for notice in &mut snapshot.notices {
+                        notice.event.content = None;
+                    }
+                }
+                publish(&shared, &host, snapshot.clone());
+                answer_tests(&pending.tests, &TestOutcome::Unavailable(error));
+                proxy = None;
+                next_attempt = Instant::now() + retry_delay;
+                withdrawal_retry = Some(next_attempt);
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                continue;
             }
         };
         pending
