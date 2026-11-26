@@ -334,6 +334,7 @@ pub(super) fn perform(
             &mut guard,
         )?;
         if previous.is_some()
+            && (!cfg!(target_os = "macos") || !parks_successor)
             && let Some(lease) = handoff.as_ref()
         {
             original_schema = Some(stopped_store_schema(root, &guard, lease)?);
@@ -452,15 +453,19 @@ pub(super) fn perform(
     }
     announce_primary_failure(&result);
     #[cfg(target_os = "macos")]
-    if result.is_err() && parks_successor && recovery.shutdown_requested {
+    if parks_successor
+        && recovery.shutdown_requested
+        && let Err(failure) = result
+    {
         let previous_running = previous.as_ref().is_some_and(|previous| {
             crate::daemon::running_executable()
                 .is_ok_and(|exe| exe == Some(previous.join("bin/cagentsd")))
         });
         if !previous_running {
             guard.defer_reopening_to_recovery();
-            return Err(result.unwrap_err());
+            return Err(failure);
         }
+        result = Err(failure);
     }
     let mut restored_previous = false;
     if result.is_err()
