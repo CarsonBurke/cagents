@@ -732,12 +732,13 @@ impl RemoteActor {
         if through.is_some_and(|sequence| sequence > state.outbox_latest) {
             return None;
         }
-        Some(
-            matches!(
-                state.activity,
-                crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle
-            ) || (state.completed && !state.owns_work),
-        )
+        if state.completed {
+            return Some(!state.owns_work);
+        }
+        Some(matches!(
+            state.activity,
+            crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle
+        ))
     }
     pub fn close_proved(
         identity: &ActorIdentity,
