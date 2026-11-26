@@ -433,15 +433,30 @@ fn startup_recovery_and_exit_pending_keep_exact_close_available_until_foreign_ow
     }
     let (originals, mut pins) = foreign_originals(&root, NAME, 1);
     let original = &originals[0];
-    // Real SQLite layout damage makes the actual successor's model admission
-    // unavailable; orphan adoption has already installed its exact live owner
-    // before execution-authority restoration refuses. No fake error seam.
-    let fault = AuthoritySchemaFault::inject();
+    // Ordinary startup can adopt terminals with the shared model unavailable.
+    // Admit the real model and make authority restoration fail after adoption
+    // by storing an issuing capability from a different holder lineage.
+    let mut unrelated = original.session.clone();
+    let proof = unrelated.continuity.live_proof().unwrap();
+    unrelated.continuity = TerminalContinuity::Live {
+        host_session_id: proof.host_session_id,
+        boot_id: proof.boot_id,
+        host_incarnation: HostIncarnation::new("unrelated-authority"),
+    };
+    let unrelated = crate::agent_execution::HostedSession::Terminal(unrelated);
+    model::Registry::open()
+        .unwrap()
+        .register_agent_authority(&unrelated)
+        .unwrap();
     let paths = RuntimePaths::discover().unwrap();
     let (host, completed, running) = run_host();
     let handle = same_original(&host, original);
     assert!(host.lock().unwrap().startup_blocks_shutdown());
-    assert!(host.lock().unwrap().startup_recovery().is_some());
+    let detail = host.lock().unwrap().startup_recovery().unwrap().to_owned();
+    assert!(
+        detail.contains("The issuing capability belongs to another session lineage"),
+        "{detail}"
+    );
     let drain = begin_ordinary_exit(&host).expect("ordinary, not committed successor transfer");
     daemon::wake();
     wait_for(|| host.lock().unwrap().ordinary_exit_cleanup_pending());
@@ -457,6 +472,11 @@ fn startup_recovery_and_exit_pending_keep_exact_close_available_until_foreign_ow
     let mut rpc = Rpc::connect(&paths.socket);
     inspect_and_refuse_mutation(&mut rpc, original, &root);
     stale_close_is_refused(&paths, original);
+    model::Registry::open()
+        .unwrap()
+        .retire_agent_authority(&unrelated)
+        .unwrap();
+    let fault = AuthoritySchemaFault::inject();
     unknown_pin_close_retains_original(&mut rpc, &host, original, &handle);
     fault.restore(&host);
     assert!(
