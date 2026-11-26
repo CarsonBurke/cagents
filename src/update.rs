@@ -2402,23 +2402,12 @@ fn perform_update(
         UpdatePhase::Downloading,
         "Downloading the release",
     )?;
-    // The signed metadata names every digest. The checksum file the installer
-    // reads again must agree with it, or the two would vouch for different
-    // bytes.
-    let mut checksums = feed.download(&release, &release.checksums, &cancellation)?;
-    let mut manifest = String::new();
-    checksums.read_to_string(&mut manifest)?;
-    checksums.seek(SeekFrom::Start(0))?;
+    let feed::VerifiedAssets {
+        installer,
+        archive,
+        checksums,
+    } = feed.verified_assets(&release, &cancellation)?;
     let archive_hash = release.archive.sha256;
-    if checksum_for(&manifest, &release.archive.name)? != archive_hash
-        || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
-    {
-        return Err(invalid(
-            "the release's checksum file disagrees with its signed metadata",
-        ));
-    }
-    let installer = feed.download(&release, &release.installer, &cancellation)?;
-    let archive = feed.download(&release, &release.archive, &cancellation)?;
     set_phase(
         state,
         job,

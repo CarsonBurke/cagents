@@ -20,6 +20,12 @@
 use super::*;
 use std::collections::BTreeMap;
 
+pub(super) struct VerifiedAssets {
+    pub installer: File,
+    pub archive: File,
+    pub checksums: File,
+}
+
 pub(super) const PUBLIC_FEED: &str = "https://github.com/CarsonBurke/cagents/releases";
 /// This build's trust generation. `scripts/publish-release` reads it from
 /// this line; a new generation adds its names to `GENERATIONS`.
@@ -250,6 +256,31 @@ impl Feed {
             checksums: asset(CHECKSUMS, SMALL_ASSET_LIMIT)?,
             installer: asset(INSTALLER, SMALL_ASSET_LIMIT)?,
             version,
+        })
+    }
+
+    /// Download one exact release and check that its installer and the signed
+    /// metadata agree on the archive before returning any installation input.
+    pub(super) fn verified_assets(
+        &self,
+        release: &Release,
+        cancellation: &CancellationToken,
+    ) -> Result<VerifiedAssets, UpdateError> {
+        let mut checksums = self.download(release, &release.checksums, cancellation)?;
+        let mut manifest = String::new();
+        checksums.read_to_string(&mut manifest)?;
+        checksums.seek(SeekFrom::Start(0))?;
+        if checksum_for(&manifest, &release.archive.name)? != release.archive.sha256
+            || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
+        {
+            return Err(invalid(
+                "the release's checksum file disagrees with its signed metadata",
+            ));
+        }
+        Ok(VerifiedAssets {
+            installer: self.download(release, &release.installer, cancellation)?,
+            archive: self.download(release, &release.archive, cancellation)?,
+            checksums,
         })
     }
 
