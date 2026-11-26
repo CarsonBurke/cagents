@@ -2386,7 +2386,7 @@ fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::
     use std::os::fd::AsFd;
 
     let path = runtime.join(slot_socket_name(slot));
-    if let Ok(stream) = crate::descriptor::connect_settled(&path) {
+    if let Ok(stream) = connect_activation_socket(&path) {
         return Ok(stream);
     }
     let directory = File::open(runtime)?;
@@ -2396,7 +2396,7 @@ fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::
         let watch = watches
             .watch(&directory)
             .ok_or_else(|| io::Error::other("Cannot follow saved window startup"))?;
-        match crate::descriptor::connect_settled(&path) {
+        match connect_activation_socket(&path) {
             Ok(stream) => return Ok(stream),
             Err(error)
                 if matches!(
