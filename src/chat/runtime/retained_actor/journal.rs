@@ -38,6 +38,7 @@ const OVERFLOW_REASON: &str = "Claude holder outcome journal overflowed before t
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum WaitingAttention {
+    Unknown,
     Open(u64),
     Resolved,
 }
@@ -176,7 +177,7 @@ impl Journal {
             unknown_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
-            waiting_attention: None,
+            waiting_attention: Some(WaitingAttention::Unknown),
             published_sources: Vec::new(),
         })
     }

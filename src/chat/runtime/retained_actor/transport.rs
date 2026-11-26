@@ -235,9 +235,21 @@ pub struct Resident {
     pub outbox_latest: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     waiting_attention: Option<super::journal::WaitingAttention>,
+    /// Local compatibility evidence from successive authenticated old-helper
+    /// publications. A helper never sets this bit.
+    #[serde(skip)]
+    legacy_waiting_settled: bool,
     changed: u64,
 }
 impl Resident {
+    fn legacy_activity_is_settled(&self) -> bool {
+        use crate::agent::ActivityState;
+        self.waiting_attention.is_none()
+            && !self.waiting
+            && self.requests.is_empty()
+            && matches!(self.activity, ActivityState::Idle | ActivityState::Working)
+    }
+
     fn has_retirable_inputs(&self) -> bool {
         self.terminal_input_count
             .unwrap_or(self.acknowledged_input_count)
@@ -582,6 +594,7 @@ impl RemoteActor {
             outbox_ack: 0,
             outbox_latest: 0,
             waiting_attention: None,
+            legacy_waiting_settled: false,
             changed: 1,
         };
         Self(Arc::new(Remote {
@@ -767,6 +780,7 @@ impl RemoteActor {
         // journal lock. The earlier activity projection may predate them.
         Some(match state.waiting_attention {
             Some(WaitingAttention::Resolved) => RetainedWaiting::Resolved,
+            None if state.legacy_waiting_settled => RetainedWaiting::Resolved,
             Some(WaitingAttention::Open(current))
                 if through.is_some_and(|sequence| sequence < current) =>
             {
@@ -841,6 +855,7 @@ impl RemoteActor {
     pub fn wake_outcomes(&self) {
         let state = self.state();
         if state.waiting_attention == Some(super::journal::WaitingAttention::Resolved)
+            || state.legacy_activity_is_settled()
             || state.outbox_latest > state.outbox_ack
             || state
                 .continuity_loss
@@ -1596,7 +1611,7 @@ impl RemoteActor {
     fn publish_resident(&self, resident: Resident) -> bool {
         self.publish_resident_inner(resident, false)
     }
-    fn publish_resident_inner(&self, resident: Resident, allow_closed: bool) -> bool {
+    fn publish_resident_inner(&self, mut resident: Resident, allow_closed: bool) -> bool {
         // Serialize metadata admission and all notifications together. Notify
         // callbacks enqueue host updates; the resident lock is never held
         // while invoking them, so consumers may read the accepted projection.
@@ -1624,6 +1639,13 @@ impl RemoteActor {
             {
                 return false;
             }
+            // A legacy helper copied activity before taking the journal lock.
+            // A sample that advanced its outbox may pair stale Working with a
+            // newly opened request. A second covered sample must confirm it.
+            resident.legacy_waiting_settled = resident.legacy_activity_is_settled()
+                && state.waiting_attention.is_none()
+                && resident.close.actor_id == state.close.actor_id
+                && resident.outbox_latest == state.outbox_latest;
             let mut updates = Vec::new();
             let generation = resident.generation;
             let identity_changed = resident.confirmed_session != state.confirmed_session;
@@ -1664,6 +1686,7 @@ impl RemoteActor {
                 || (resident.outbox_latest > resident.outbox_ack
                     && resident.outbox_latest != state.outbox_latest)
                 || resident.waiting_attention != state.waiting_attention
+                || resident.legacy_waiting_settled != state.legacy_waiting_settled
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -3268,6 +3291,7 @@ impl Server {
             outbox_ack: journal.acknowledged()?,
             outbox_latest: journal.latest()?,
             waiting_attention: journal.waiting_attention,
+            legacy_waiting_settled: false,
             changed,
         })
     }

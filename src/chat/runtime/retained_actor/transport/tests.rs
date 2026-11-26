@@ -1901,6 +1901,52 @@ fn resident_naming_and_notification_projections_do_not_need_a_helper_socket() {
     assert!(!actor.0.socket.exists());
 }
 #[test]
+fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let actor = RemoteActor::fixture();
+    let mut older = actor.state().as_ref().clone();
+    older.waiting_attention = None;
+    older.completed = false;
+    older.activity = ActivityState::Waiting;
+    older.waiting = true;
+    older.outbox_latest = 3;
+    assert!(actor.publish_resident(older.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+
+    let mut working = older.clone();
+    working.activity = ActivityState::Working;
+    working.waiting = false;
+    working.changed += 1;
+    assert!(actor.publish_resident(working.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    // The old transport may have copied Working just before another wait
+    // advanced the journal. That mixed sample cannot clear the new request.
+    working.changed += 1;
+    working.outbox_latest = 4;
+    assert!(actor.publish_resident(working));
+    assert_eq!(
+        actor.waiting_resolution(Some(4)),
+        Some(RetainedWaiting::Current)
+    );
+    older.changed += 3;
+    older.outbox_latest = 4;
+    assert!(actor.publish_resident(older));
+    assert_eq!(
+        actor.waiting_resolution(Some(4)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
 fn a_wait_appended_after_active_metadata_was_sampled_is_still_open() {
     use super::super::journal::WaitingAttention;
 
