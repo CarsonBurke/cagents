@@ -891,12 +891,9 @@ impl Cagents {
         if let Some(warning) = warning {
             rows.push(design::body(warning).into());
         }
-        rows.push(design::caption(format!("Code: {}", details.code)).into());
-        rows.push(design::caption(format!("Terminal: {}", details.terminal)).into());
+        // The failure's code and the terminal's and worktree's IDs are for a
+        // report, so Copy details carries them; the pane shows where it ran.
         rows.push(design::caption(format!("Directory: {}", details.cwd)).into());
-        if let Some(worktree) = details.worktree {
-            rows.push(design::caption(format!("Worktree: {worktree}")).into());
-        }
         widget::column::with_children(rows)
             .spacing(space::XS)
             .into()

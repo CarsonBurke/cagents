@@ -2881,6 +2881,9 @@ mod tests {
                 super::super::messages::message_lines(&messages[0])
                     .contains("Receipt not confirmed; this message may appear again.")
             );
+            // Darwin clears the receive timeout when the retired socket's
+            // read side is shut down; nothing can read it after that.
+            #[cfg(target_os = "linux")]
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert!(
                 client
@@ -3578,8 +3581,8 @@ mod tests {
         let server_socket = socket.clone();
         let server = thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
-            let listener = std::os::unix::net::UnixListener::bind(server_socket).unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
+            let listener = crate::descriptor::bind(&server_socket).unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             thread::sleep(Duration::from_millis(30));
             let proof = crate::model::HostSessionProof {
@@ -3644,7 +3647,7 @@ mod tests {
             host_incarnation: crate::model::HostIncarnation::new("slow-startup"),
         };
         let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let listener = crate::descriptor::bind(&paths.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let peer = proof.clone();
         let server = thread::spawn(move || {
@@ -3657,7 +3660,7 @@ mod tests {
                     Instant::now() < deadline,
                     "the startup console never reconnected"
                 );
-                let (mut stream, _) = match listener.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&listener) {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));

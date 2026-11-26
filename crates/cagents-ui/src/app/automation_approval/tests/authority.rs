@@ -101,6 +101,7 @@ fn accept_request(listener: &UnixListener) -> (UnixStream, ClientEnvelope) {
             Err(error) => panic!("private listener: {error}"),
         }
     };
+    peer.set_nonblocking(false).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     peer.set_write_timeout(Some(Duration::from_secs(3)))
         .unwrap();

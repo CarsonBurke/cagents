@@ -293,8 +293,8 @@ impl Cagents {
                 // Restored pull request cards could not name their
                 // pull request until this project's GitHub state and
                 // sidebar entry both existed.
+                self.observe_git_repository(&loaded, generation);
                 let pending = Task::batch([
-                    self.observe_git_repository(&loaded, generation),
                     self.open_pending_pull_requests(project_id),
                     self.prune_pull_request_refs(project_id),
                     self.update_review_requests(review_request_ui::Action::Tick),

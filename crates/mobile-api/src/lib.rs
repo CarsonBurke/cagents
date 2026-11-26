@@ -31,12 +31,17 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 
 use serde::{Deserialize, Serialize};
 
+pub mod pairing;
+
 /// The newest API version this build speaks.
 pub const API_VERSION: u32 = 1;
 /// The oldest API version this build still serves.
 pub const MIN_API_VERSION: u32 = 1;
 /// The longest line a client may send, newline excluded.
 pub const MAX_CLIENT_LINE_BYTES: usize = 1024 * 1024;
+/// A PNG and a prompt fit together in one client line, including base64.
+pub const MAX_UPLOAD_IMAGE_BYTES: usize = 512 * 1024;
+pub const MAX_DOWNLOAD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Client to server
@@ -128,10 +133,57 @@ pub enum Call {
     WatchConversation { session: String },
     #[serde(rename = "conversation.unwatch")]
     UnwatchConversation { session: String },
+    /// Follow one listed terminal agent's read-only screen.
+    #[serde(rename = "terminal.watch")]
+    WatchTerminal { session: String },
+    #[serde(rename = "terminal.unwatch")]
+    UnwatchTerminal { session: String },
+    /// Send a fresh presentation and its checkpoint without reopening the watch.
+    #[serde(rename = "conversation.read_checkpoint")]
+    RefreshReadCheckpoint { session: String },
+    /// The phone displayed a watched conversation to the person.
+    #[serde(rename = "conversation.read")]
+    ReadConversation { session: String, checkpoint: String },
     /// Extend a watched conversation's window with older items, when its
     /// state says `has_earlier`.
     #[serde(rename = "conversation.load_earlier")]
     LoadEarlier { session: String },
+    /// Read the saved output of an item in the watched transcript.
+    #[serde(rename = "conversation.output")]
+    ReadOutput {
+        session: String,
+        item: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Read the reported patches for a file named by a watched edit item.
+    #[serde(rename = "conversation.diff")]
+    ReadDiff {
+        session: String,
+        item: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Read a stored image named by an item in the watched transcript.
+    #[serde(rename = "conversation.image")]
+    ReadImage {
+        session: String,
+        item: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Send a message with one PNG. A distinct op keeps old servers from
+    /// sending the message while discarding an unknown attachment field.
+    #[serde(rename = "conversation.send_image")]
+    SendImage {
+        session: String,
+        text: String,
+        name: String,
+        png_base64: String,
+        #[serde(default)]
+        mode: SendMode,
+    },
     /// Send the user's message to a watched conversation.
     #[serde(rename = "conversation.send")]
     Send {
@@ -169,7 +221,15 @@ impl Call {
         "notification.acknowledge",
         "conversation.watch",
         "conversation.unwatch",
+        "terminal.watch",
+        "terminal.unwatch",
+        "conversation.read_checkpoint",
+        "conversation.read",
         "conversation.load_earlier",
+        "conversation.output",
+        "conversation.diff",
+        "conversation.image",
+        "conversation.send_image",
         "conversation.send",
         "conversation.interrupt",
         "conversation.answer",
@@ -211,6 +271,8 @@ pub enum ServerLine {
     Welcome(Welcome),
     Ok {
         id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<DetailPage>,
     },
     /// `id` is absent for an error that answers no request, such as a line
     /// that isn't JSON or a refused `hello`.
@@ -231,6 +293,35 @@ pub struct Welcome {
     /// The computer's host name, for telling paired computers apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The server supports the transcript detail and image attachment ops.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conversation_details: bool,
+}
+
+/// One bounded detail page. Omit `cursor` for the first request and echo
+/// `next` on the next request for the same detail. When absent, the page
+/// completes the read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetailPage {
+    #[serde(flatten)]
+    pub body: DetailBody,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DetailBody {
+    Output { text: String },
+    Diff { patches: Vec<DiffPart> },
+    Image { base64: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffPart {
+    pub item: String,
+    pub text: String,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +367,8 @@ pub enum Event {
         message: String,
     },
     Notifications(Notifications),
+    TerminalScreen(TerminalScreen),
+    TerminalEnded(TerminalEnded),
     /// The bridge is about to exit, such as when the daemon stops or is
     /// updated. Reconnecting starts a bridge of the new version.
     Closing {
@@ -328,6 +421,9 @@ pub struct Session {
     pub agent: Option<Agent>,
     /// Whether `conversation.watch` can follow it.
     pub watchable: bool,
+    /// Whether `terminal.watch` can follow this session's screen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_watchable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +486,33 @@ pub enum RunState {
 }
 
 // ---------------------------------------------------------------------------
+// Terminals
+// ---------------------------------------------------------------------------
+
+/// One read-only terminal viewport. Each event replaces the previous screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalScreen {
+    pub session: String,
+    pub activity: Activity,
+    /// Unix milliseconds of the last observed output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
+    /// The host's terminal dimensions, even if the payload was clipped.
+    pub columns: u16,
+    pub rows: u16,
+    /// Visible text rows from top to bottom, retaining the newest rows when capped.
+    pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalEnded {
+    pub session: String,
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
 // Conversations
 // ---------------------------------------------------------------------------
 
@@ -401,6 +524,9 @@ pub struct ConversationUpdate {
     /// Replace everything held for this conversation: `items` is the whole
     /// window and `order` is present.
     pub reset: bool,
+    /// An exact presentation that may acknowledge attention after it is displayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_checkpoint: Option<String>,
     /// The conversation's current state, sent whole with every update.
     pub state: ConversationState,
     /// Every item's ID in display order, when it changed.
@@ -436,6 +562,8 @@ pub struct ConversationState {
     pub busy: bool,
     /// The provider takes messages now.
     pub ready: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_attach_image: bool,
     pub exited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -569,8 +697,8 @@ pub enum Role {
     Unknown,
 }
 
-/// What an item holds. Long tool output is clipped to its end, with
-/// `clipped` set; the full text stays on the computer.
+/// What an item previews. `clipped` marks shortened content, and
+/// `conversation.output` reads saved output on demand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ItemBody {
@@ -610,10 +738,15 @@ pub enum ItemBody {
         input: String,
         output: String,
         clipped: bool,
+        /// Whether the output preview is clipped independently of the input.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        output_clipped: bool,
         status: ToolStatus,
     },
     Image {
         description: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        available: bool,
     },
     /// Something delivered to the conversation that the person didn't write:
     /// an agent's report, another session's message, or a notice.
@@ -621,6 +754,11 @@ pub enum ItemBody {
         delivery: DeliveryKind,
         /// The sender's name; may be empty.
         from: String,
+        /// What tells two senders of one name apart, never for display: a
+        /// message's sending session as its short ID, or a report's task ID.
+        /// Empty when there is none, and absent from older servers.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sender: String,
         summary: String,
         body: String,
         clipped: bool,
@@ -713,6 +851,9 @@ pub struct Notifications {
 pub struct Notice {
     pub id: String,
     pub kind: NoticeKind,
+    /// Whether the notice asks something of the person reading it.
+    #[serde(default)]
+    pub asks: bool,
     /// A short heading, such as `Agent needs your attention`.
     pub title: String,
     /// The session it is about, when it is about one.

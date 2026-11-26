@@ -1,4 +1,5 @@
-#![cfg(any(feature = "host", feature = "ui"))]
+// The contract runs beneath a private subreaper, which only Linux has.
+#![cfg(all(any(feature = "host", feature = "ui"), target_os = "linux"))]
 
 //! Large real-Git pathspec coverage, kept in `--all-targets` without making every
 //! library-suite run create and mutate 40,000 files. Run this target explicitly

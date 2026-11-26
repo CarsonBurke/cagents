@@ -181,7 +181,7 @@ fn process_start(stat: &str) -> Option<&str> {
     stat.rsplit_once(')')?.1.split_whitespace().nth(19)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};

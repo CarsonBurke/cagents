@@ -1,7 +1,7 @@
 //! Read-only evidence for one settled Prepared recovery. This module never
 //! reconstructs a receipt or adopts, attaches, resumes or starts a provider.
-pub(crate) mod cold;
-pub(crate) mod ready;
+pub mod cold;
+pub mod ready;
 use super::*;
 use crate::terminal_ipc::TerminalDescriptor;
 
@@ -450,7 +450,7 @@ pub(super) mod tests {
                     title: String::new(),
                     identity: "exact fixture actor".into(),
                     disposition: crate::update::impact::Disposition::Continues,
-                    reason: String::new(),
+                    reason: "".into(),
                     interrupted_subagents: vec![],
                 }],
                 blockers: vec![],
@@ -468,7 +468,7 @@ pub(super) mod tests {
                         title: String::new(),
                         identity: "exact additional fixture owner".into(),
                         disposition: crate::update::impact::Disposition::Continues,
-                        reason: String::new(),
+                        reason: "".into(),
                         interrupted_subagents: vec![],
                     });
             }

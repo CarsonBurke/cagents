@@ -38,13 +38,20 @@ fn create_in(
     protected: &[(PathBuf, &'static str)],
 ) -> io::Result<tempfile::TempDir> {
     validate_root(root, protected)?;
+    // Native cwd and repository queries spell Darwin's sealed system links
+    // through their targets. Use the same spelling, while still validating
+    // the original path and checking protections on the translated path.
+    let actual = crate::secure_file::sealed_system_path(root);
+    if actual != root {
+        validate_root(&actual, protected)?;
+    }
     if prefix.chars().any(|part| matches!(part, '/' | '\\' | '\0')) {
         return Err(refusal(root, "fixture prefix must be a filename prefix"));
     }
     let directory = tempfile::Builder::new()
         .prefix(prefix)
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(root)
+        .tempdir_in(&actual)
         .map_err(|error| refusal(root, format!("cannot create a private directory: {error}")))?;
     let metadata = fs::symlink_metadata(directory.path())
         .map_err(|error| refusal(root, format!("cannot verify private directory: {error}")))?;
@@ -84,7 +91,9 @@ fn validate_root(root: &Path, protected: &[(PathBuf, &'static str)]) -> io::Resu
                 format!("cannot inspect {}: {error}", ancestor.display()),
             )
         })?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        let sealed = metadata.file_type().is_symlink()
+            && crate::secure_file::is_sealed_system_link(&ancestor, &metadata);
+        if !sealed && (!metadata.is_dir() || metadata.file_type().is_symlink()) {
             return Err(refusal(
                 root,
                 format!(
@@ -94,14 +103,14 @@ fn validate_root(root: &Path, protected: &[(PathBuf, &'static str)]) -> io::Resu
             ));
         }
         let git = ancestor.join(".git");
-        match fs::symlink_metadata(&git) {
-            Ok(_) => {
+        match crate::git_marker::present(&git) {
+            Ok(true) => {
                 return Err(refusal(
                     root,
                     format!("enclosing Git marker {} exists", git.display()),
                 ));
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(false) => {}
             Err(error) => {
                 return Err(refusal(
                     root,
@@ -244,6 +253,31 @@ mod tests {
         assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uses_the_resolved_name_of_a_sealed_system_root() {
+        let fixture = fixture();
+        let resolved = fixture.path().canonicalize().unwrap();
+        let Ok(relative) = resolved.strip_prefix("/private") else {
+            return; // TMPDIR is outside Darwin's sealed system links.
+        };
+        let Some(Component::Normal(name)) = relative.components().next() else {
+            return;
+        };
+        let link = Path::new("/").join(name);
+        if !fs::symlink_metadata(&link)
+            .is_ok_and(|metadata| crate::secure_file::is_sealed_system_link(&link, &metadata))
+        {
+            return;
+        }
+        let root = Path::new("/").join(relative);
+        let child = try_tempdir_in(&root, "sealed-").unwrap();
+        assert_eq!(child.path().parent(), Some(resolved.as_path()));
+        assert_eq!(child.path(), child.path().canonicalize().unwrap());
+        let protected = [(resolved, "the protected fixture")];
+        assert!(create_in(&root, "forbidden-", &protected).is_err());
+    }
+
     #[test]
     fn refuses_relative_parent_and_file_roots() {
         let fixture = fixture();
@@ -290,7 +324,11 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             let marker = parent.join(".git");
             match kind {
-                "directory" => fs::create_dir(&marker).unwrap(),
+                "directory" => {
+                    fs::create_dir(&marker).unwrap();
+                    drop(create_in(&root, "case-", &[]).unwrap());
+                    fs::write(marker.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+                }
                 "file" => fs::write(&marker, b"gitdir: owned sentinel").unwrap(),
                 _ => symlink("owned-missing-target", &marker).unwrap(),
             }
@@ -337,7 +375,12 @@ mod tests {
         let link = fixture.path().join("link");
         symlink(&actual, &link).unwrap();
         let protected = resolve_protected(&link.join("missing/home")).unwrap();
-        assert_eq!(protected, actual.join("missing/home"));
+        // Resolution is canonical, as is the macOS temporary directory only
+        // once its /var link is resolved.
+        assert_eq!(
+            protected,
+            fs::canonicalize(&actual).unwrap().join("missing/home")
+        );
         fs::create_dir_all(&protected).unwrap();
         assert!(create_in(&protected, "case-", &[(protected.clone(), "HOME")]).is_err());
     }
@@ -350,7 +393,10 @@ mod tests {
         let link = fixture.path().join("link");
         symlink(destination.join("child"), &link).unwrap();
         let protected = resolve_protected(&link.join("../missing-home")).unwrap();
-        assert_eq!(protected, destination.join("missing-home"));
+        assert_eq!(
+            protected,
+            fs::canonicalize(&destination).unwrap().join("missing-home")
+        );
     }
 
     #[test]

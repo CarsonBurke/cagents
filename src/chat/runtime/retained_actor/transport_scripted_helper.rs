@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 
 /// What the scripted helper reports and what the daemon asked of it.
 #[derive(Default)]
-pub(crate) struct Script {
+pub struct Script {
     pub confirmed_session: Option<String>,
     pub continuity_loss: Option<ContinuityLoss>,
     pub retained_runs: Vec<crate::model::RunId>,
@@ -19,12 +19,12 @@ pub(crate) struct Script {
 }
 
 impl Script {
-    pub(crate) fn calls_of(&self, method: &str) -> usize {
+    pub fn calls_of(&self, method: &str) -> usize {
         self.calls.iter().filter(|call| *call == method).count()
     }
 }
 
-pub(crate) struct ScriptedHelper {
+pub struct ScriptedHelper {
     pub script: Arc<Mutex<Script>>,
     socket: PathBuf,
     stop: Arc<AtomicBool>,
@@ -40,7 +40,7 @@ impl ScriptedHelper {
     ) -> (RemoteActor, Self) {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = root.path().join("scripted-helper.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let actor = RemoteActor::scripted_fixture(socket.clone(), source.clone(), scope);
         let template = actor.state().as_ref().clone();
         let script = Arc::new(Mutex::new(Script::default()));

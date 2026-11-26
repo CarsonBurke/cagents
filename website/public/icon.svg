@@ -1,12 +1,81 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="cagents">
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cagents" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="background" x1="16" y1="16" x2="112" y2="112" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#635BFF"/>
-      <stop offset="1" stop-color="#2F80ED"/>
+    <linearGradient id="coral" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FF8A55"/>
+      <stop offset="1" stop-color="#EE5A24"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2A3043"/>
+      <stop offset="1" stop-color="#181C28"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".45"/>
+      <stop offset=".3" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0B0D14" flood-opacity=".35"/>
+    </filter>
+    <linearGradient id="obs" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B4660"/>
+      <stop offset=".5" stop-color="#2A3245"/>
+      <stop offset="1" stop-color="#222939"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".34"/>
+      <stop offset=".3" stop-color="#fff" stop-opacity=".06"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=".1"/>
+    </linearGradient>
+    <filter id="sh-r" x="-20%" y="-20%" width="150%" height="150%">
+      <feDropShadow dx="3.5" dy="2" stdDeviation="2.4" flood-color="#05070C" flood-opacity=".6"/>
+    </filter>
+    <linearGradient id="obs-back" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#303A50"/>
+      <stop offset="1" stop-color="#1C2230"/>
     </linearGradient>
   </defs>
-  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#background)"/>
-  <path d="M82 40a30 30 0 1 0 0 48" fill="none" stroke="#fff" stroke-width="14" stroke-linecap="round"/>
-  <circle cx="88" cy="40" r="7" fill="#9EF0FF"/>
-  <circle cx="88" cy="88" r="7" fill="#9EF0FF"/>
+  <!-- Square panes scaled to the 120 px live area COSMIC icons use, shadows included.
+       Short coloured title bars name each pane without outweighing the robot. -->
+  <g transform="translate(64 64) scale(1.111) translate(-53.0 -53.0)">
+    <!-- Background session pane -->
+    <clipPath id="clip-back"><rect x="24" y="0" width="80" height="80" rx="7.2"/></clipPath>
+    <g filter="url(#sh)">
+      <rect x="24" y="5" width="80" height="80" rx="7.2" fill="#11151F"/>
+      <rect x="24" y="0" width="80" height="80" rx="7.2" fill="url(#obs-back)"/>
+      <rect x="24" y="0" width="80" height="10.0" fill="#6CC2B3" clip-path="url(#clip-back)"/>
+      <rect x="24" y="0" width="80" height="10.0" fill="url(#gloss)" clip-path="url(#clip-back)"/>
+      <rect x="24" y="9.4" width="80" height=".9" fill="#0B0E16" opacity=".55"/>
+      <rect x="24.8" y="0.8" width="78.4" height="78.4" rx="6.4" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+      <rect x="78" y="20.0" width="18" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+      <rect x="78" y="29.0" width="12" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.5"/>
+      <rect x="78" y="38.0" width="15" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+    </g>
+    <!-- Active session pane with its agent, centred below the title bar -->
+    <clipPath id="clip-front"><rect x="0" y="16" width="80" height="80" rx="7.2"/></clipPath>
+    <g filter="url(#sh-r)">
+      <rect x="0" y="21" width="80" height="80" rx="7.2" fill="#11151F"/>
+      <rect x="0" y="16" width="80" height="80" rx="7.2" fill="url(#obs)"/>
+      <rect x="0" y="16" width="80" height="10.0" fill="#FF7A48" clip-path="url(#clip-front)"/>
+      <rect x="0" y="16" width="80" height="10.0" fill="url(#gloss)" clip-path="url(#clip-front)"/>
+      <rect x="0" y="25.4" width="80" height=".9" fill="#0B0E16" opacity=".55"/>
+      <rect x="0.8" y="16.8" width="78.4" height="78.4" rx="6.4" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+      <g transform="translate(40.0 70.2) scale(1.15)">
+        <rect x="-1.5" y="-27" width="3" height="10" rx="1.5" fill="#8EA4C8"/>
+        <circle cx="0" cy="-27" r="4" fill="#B83D16"/>
+        <circle cx="0" cy="-27.6" r="3.4" fill="url(#coral)"/>
+        <rect x="-21" y="-7" width="5" height="13" rx="2" fill="#5A6B8C"/>
+        <rect x="16" y="-7" width="5" height="13" rx="2" fill="#5A6B8C"/>
+        <rect x="-17" y="-15" width="34" height="30" rx="9" fill="#B83D16"/>
+        <rect x="-17" y="-18" width="34" height="30" rx="9" fill="url(#coral)"/>
+        <rect x="-17" y="-18" width="34" height="30" rx="9" fill="url(#gloss)"/>
+        <rect x="-12.5" y="-12.5" width="25" height="15" rx="5" fill="url(#screen)"/>
+        <circle cx="-5.5" cy="-5" r="2.8" fill="#6CC2B3"/>
+        <circle cx="5.5" cy="-5" r="2.8" fill="#6CC2B3"/>
+        <circle cx="-6.3" cy="-5.8" r=".9" fill="#fff" opacity=".8"/>
+        <circle cx="4.7" cy="-5.8" r=".9" fill="#fff" opacity=".8"/>
+        <circle cx="-5" cy="7" r="1.6" fill="#FFF1EA" opacity=".9"/>
+        <circle cx="0" cy="7" r="1.6" fill="#FFF1EA" opacity=".9"/>
+        <circle cx="5" cy="7" r="1.6" fill="#FFF1EA" opacity=".9"/>
+      </g>
+    </g>
+  </g>
 </svg>

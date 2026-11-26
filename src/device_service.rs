@@ -196,7 +196,7 @@ mod wire_json {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
+pub fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
@@ -1479,6 +1479,11 @@ mod tests {
         for mode in [0o755, 0o664, 0o4755, 0o2755] {
             std::fs::write(&path, "before").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let original_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            #[cfg(target_os = "linux")]
+            assert_eq!(original_mode, mode);
+            #[cfg(target_os = "macos")]
+            assert_eq!(original_mode & 0o777, mode & 0o777);
             execute(Operation::Write {
                 root: directory.path().to_owned(),
                 path: "file".into(),
@@ -1489,11 +1494,13 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
-                mode
+                original_mode
             );
         }
     }
 
+    // The fixture writes Linux's POSIX ACL extended attribute.
+    #[cfg(target_os = "linux")]
     #[test]
     fn device_save_preserves_access_acl() {
         use std::os::fd::AsRawFd;
@@ -1871,7 +1878,7 @@ fn accounts() -> Result<Reply, String> {
 /// Chooses the default account for `provider`, as
 /// [`Operation::AccountDefault`] asks, under the daemon's shared admission.
 #[cfg(feature = "host")]
-pub(crate) fn account_default(
+pub fn account_default(
     expected_revision: u64,
     provider: crate::agent::Provider,
     selection: &crate::account::preferences::DefaultSelection,
@@ -1898,7 +1905,7 @@ pub(crate) fn account_default(
 /// [`Operation::AccountsUpdate`] asks, under the daemon's shared admission:
 /// a held account list refuses at once rather than wait, retryably.
 #[cfg(feature = "host")]
-pub(crate) fn update_accounts(
+pub fn update_accounts(
     expected_revision: u64,
     proposal: serde_json::Value,
 ) -> Result<Reply, crate::account::remote::LifecycleError> {

@@ -138,6 +138,53 @@ struct Document {
     inputs: BTreeMap<String, Inputs>,
 }
 
+impl Document {
+    fn record_entry(
+        &mut self,
+        key: &str,
+        entry: Entry,
+        fingerprint: Option<String>,
+        now: u64,
+    ) -> bool {
+        if self.entries.get(key).is_some_and(|existing| {
+            supersedes(
+                existing.snapshot.observed_at,
+                entry.snapshot.observed_at,
+                now,
+            )
+        }) {
+            return false;
+        }
+        match fingerprint {
+            Some(fingerprint) => {
+                self.inputs.insert(
+                    key.to_owned(),
+                    Inputs {
+                        fingerprint,
+                        observed_at: entry.snapshot.observed_at,
+                    },
+                );
+            }
+            None => {
+                self.inputs.remove(key);
+            }
+        }
+        self.entries.insert(key.to_owned(), entry);
+        true
+    }
+
+    fn record_catalog(&mut self, provider: Provider, mut catalog: Catalog, now: u64) -> bool {
+        if let Some(previous) = self.catalogs.get(&provider) {
+            if supersedes(previous.observed_at, catalog.observed_at, now) {
+                return false;
+            }
+            catalog.inherit_defaults(previous);
+        }
+        self.catalogs.insert(provider, catalog);
+        true
+    }
+}
+
 /// A fingerprint of what an entry's answer depended on, and the observation
 /// it belongs to: an entry since replaced by another observation is not the
 /// one it describes.
@@ -341,40 +388,33 @@ impl Cache {
         entry: Entry,
         fingerprint: Option<String>,
     ) -> io::Result<()> {
-        crate::secure_file::prepare_private_directory(&self.directory)?;
-        let _lock = self.lock(libc::LOCK_EX)?;
-        let path = self.path();
-        let mut document = read_document(&path).unwrap_or_default();
-        document.version = VERSION;
-        // Read after acquiring the lock: even waiting to publish can outlast
-        // CLOCK_SLACK, without a clock rollback having occurred.
-        let now = crate::chat::now_ms()
-            .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
-        if document.entries.get(key).is_some_and(|existing| {
-            supersedes(
-                existing.snapshot.observed_at,
-                entry.snapshot.observed_at,
-                now,
-            )
-        }) {
-            return Ok(());
+        self.publish(|document, now| document.record_entry(key, entry, fingerprint, now))
+    }
+
+    /// Publishes the figures and models from one probe. On a write failure,
+    /// try each observation on its own so an oversized one cannot discard
+    /// the other.
+    pub(crate) fn store_probe(
+        &self,
+        key: &str,
+        entry: Entry,
+        fingerprint: Option<String>,
+        provider: Provider,
+        catalog: Option<Catalog>,
+    ) {
+        let Some(catalog) = catalog else {
+            let _ = self.store_observed(key, entry, fingerprint);
+            return;
+        };
+        let result = self.publish(|document, now| {
+            let entry_changed = document.record_entry(key, entry.clone(), fingerprint.clone(), now);
+            let catalog_changed = document.record_catalog(provider, catalog.clone(), now);
+            entry_changed || catalog_changed
+        });
+        if result.is_err() {
+            let _ = self.store_observed(key, entry, fingerprint);
+            let _ = self.store_catalog(provider, catalog);
         }
-        match fingerprint {
-            Some(fingerprint) => {
-                document.inputs.insert(
-                    key.to_owned(),
-                    Inputs {
-                        fingerprint,
-                        observed_at: entry.snapshot.observed_at,
-                    },
-                );
-            }
-            None => {
-                document.inputs.remove(key);
-            }
-        }
-        document.entries.insert(key.to_owned(), entry);
-        self.write(&document)
     }
 
     /// The entry for `key`, if it was observed less than `within` before
@@ -416,26 +456,23 @@ impl Cache {
 
     /// Remembers what `provider` listed, unless another window has written
     /// a newer list meanwhile - the same rule [`Cache::store`] keeps.
-    pub fn store_catalog(&self, provider: Provider, mut catalog: Catalog) -> io::Result<()> {
+    pub fn store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
+        self.publish(|document, now| document.record_catalog(provider, catalog, now))
+    }
+
+    fn publish(&self, record: impl FnOnce(&mut Document, u64) -> bool) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
-        let path = self.path();
-        let mut document = read_document(&path).unwrap_or_default();
-        document.version = VERSION;
+        let mut document = read_document(&self.path()).unwrap_or_default();
+        // Read after acquiring the lock: waiting to publish can outlast
+        // CLOCK_SLACK without a clock rollback having occurred.
         let now = crate::chat::now_ms()
             .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
-        if document
-            .catalogs
-            .get(&provider)
-            .is_some_and(|existing| supersedes(existing.observed_at, catalog.observed_at, now))
-        {
-            return Ok(());
+        if record(&mut document, now) {
+            document.version = VERSION;
+            self.write(&document)?;
         }
-        if let Some(previous) = document.catalogs.get(&provider) {
-            catalog.inherit_defaults(previous);
-        }
-        document.catalogs.insert(provider, catalog);
-        self.write(&document)
+        Ok(())
     }
 
     /// Serializes just this account's profile lookup across windows. This is
@@ -1111,6 +1148,98 @@ mod tests {
             default_model: None,
             reasoning_defaults: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn a_probe_publishes_the_same_observations_as_independent_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let separate = Cache::at(directory.path().join("separate"));
+        let combined = Cache::at(directory.path().join("combined"));
+        let key = "codex:/fixture";
+        let usage = entry(10, "usage");
+        let models = catalog(20, "model");
+        let fingerprint = Some("inputs".into());
+
+        separate
+            .store_observed(key, usage.clone(), fingerprint.clone())
+            .unwrap();
+        separate
+            .store_catalog(Provider::Codex, models.clone())
+            .unwrap();
+        combined.store_probe(key, usage, fingerprint, Provider::Codex, Some(models));
+
+        assert_eq!(
+            fs::read(separate.path()).unwrap(),
+            fs::read(combined.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_probe_uses_independent_usage_and_catalog_stamps() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "codex:/fixture";
+        let usage = entry(30, "current usage");
+        let mut known = catalog(10, "model");
+        known.default_model = Some("model".into());
+        known
+            .reasoning_defaults
+            .insert("model".into(), "high".into());
+        cache.store_probe(
+            key,
+            usage.clone(),
+            Some("current".into()),
+            Provider::Codex,
+            Some(known),
+        );
+        cache.store_probe(
+            key,
+            entry(20, "older usage"),
+            Some("older".into()),
+            Provider::Codex,
+            Some(catalog(40, "model")),
+        );
+
+        assert_eq!(cache.unchanged(key, "current", 100, 100), Some(usage));
+        let models = cache.catalogs(100).remove(&Provider::Codex).unwrap();
+        assert_eq!(models.observed_at, 40);
+        assert_eq!(models.default_effort(None), Some("high"));
+
+        let usage = entry(50, "newer usage");
+        cache.store_probe(
+            key,
+            usage.clone(),
+            Some("newer".into()),
+            Provider::Codex,
+            Some(catalog(20, "older model")),
+        );
+        assert_eq!(cache.unchanged(key, "newer", 100, 100), Some(usage));
+        assert_eq!(cache.catalogs(100)[&Provider::Codex], models);
+    }
+
+    #[test]
+    fn an_oversized_probe_observation_does_not_discard_the_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "codex:/fixture";
+        let usage = entry(10, "usage");
+        let oversized = "x".repeat(MAX_BYTES as usize);
+        let mut models = catalog(20, "model");
+        models.models[0].label.clone_from(&oversized);
+        cache.store_probe(key, usage.clone(), None, Provider::Codex, Some(models));
+        assert_eq!(cache.load(100)[key], usage);
+        assert!(cache.catalogs(100).is_empty());
+
+        let models = catalog(30, "model");
+        cache.store_probe(
+            key,
+            entry(20, &oversized),
+            None,
+            Provider::Codex,
+            Some(models.clone()),
+        );
+        assert_eq!(cache.load(100)[key], usage);
+        assert_eq!(cache.catalogs(100)[&Provider::Codex], models);
     }
 
     #[test]

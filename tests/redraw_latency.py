@@ -137,7 +137,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         expected = []
         for name, selection in (
                 ("cagents", ["--no-default-features", "--features", "development"]),
-                ("cagentsd", ["--no-default-features", "--features", "development,host"]),
+                ("cagentsd", ["--no-default-features", "-p", "cagents-host", "--features", "development"]),
                 ("cagents-ui", ["-p", "cagents-ui", "--features", "development,latency-harness"])):
             expected.append(["build", "--locked", "--release", *selection, "--bin", name,
                              "--message-format=json-render-diagnostics"])

@@ -34,6 +34,7 @@ fn job(phase: UpdatePhase, in_flight: Vec<Outcome>) -> UpdateJob {
         confirmation: None,
         refusal: None,
         in_flight,
+        recorded_by: None,
     }
 }
 

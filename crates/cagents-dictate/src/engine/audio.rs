@@ -88,8 +88,7 @@ impl Microphone {
         let config = supported.config();
         let channels = usize::from(config.channels).max(1);
         let sample_rate = config.sample_rate;
-        let (producer, samples) =
-            rtrb::RingBuffer::new(sample_rate as usize * BUFFERED_SECONDS);
+        let (producer, samples) = rtrb::RingBuffer::new(sample_rate as usize * BUFFERED_SECONDS);
         let failure = Arc::new(Mutex::new(None));
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => {
@@ -175,7 +174,12 @@ impl Source for Microphone {
     }
 
     fn read(&mut self, out: &mut Vec<f32>) -> Result<bool, CaptureError> {
-        if let Some(error) = self.failure.lock().ok().and_then(|mut failure| failure.take()) {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .ok()
+            .and_then(|mut failure| failure.take())
+        {
             match error.kind() {
                 // The stream followed the system to another default input,
                 // briefly ran behind, or the sound server was slow to answer
@@ -250,9 +254,10 @@ impl WavFile {
         Ok(Self {
             samples,
             sample_rate: spec.sample_rate,
-            name: path
-                .file_name()
-                .map_or_else(|| "WAV file".to_owned(), |name| name.to_string_lossy().into()),
+            name: path.file_name().map_or_else(
+                || "WAV file".to_owned(),
+                |name| name.to_string_lossy().into(),
+            ),
             paced: paced.then(Instant::now),
             position: 0,
         })
@@ -304,10 +309,7 @@ pub fn open_session_source() -> Result<Box<dyn Source>, CaptureError> {
             let path = input.strip_prefix("wav:").ok_or_else(|| {
                 CaptureError::new(
                     ErrorKind::InputUnavailable,
-                    format!(
-                        "{} must be wav:PATH, not {input}",
-                        super::INPUT_VARIABLE
-                    ),
+                    format!("{} must be wav:PATH, not {input}", super::INPUT_VARIABLE),
                 )
             })?;
             Ok(Box::new(WavFile::open(Path::new(path), true)?))
@@ -363,7 +365,11 @@ mod tests {
         }
         // Never ahead of the clock, and silence after the file.
         let elapsed = started.elapsed().as_millis() as usize;
-        assert!(out.len() <= elapsed + 5, "{} samples in {elapsed} ms", out.len());
+        assert!(
+            out.len() <= elapsed + 5,
+            "{} samples in {elapsed} ms",
+            out.len()
+        );
         assert!(out.len() >= 50);
         assert!(out[..10].iter().all(|&sample| sample > 0.0));
         assert!(out[10..].iter().all(|&sample| sample == 0.0));

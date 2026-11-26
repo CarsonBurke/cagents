@@ -54,25 +54,54 @@ if sys.argv[1] == 'test':
     if Path('refused-' + lane).exists():
         print('build-disk-guard: not enough space')
         sys.exit(2)
+    failures = {}
+    fixture_root_file = Path('fixture-root-' + lane)
+    if fixture_root_file.exists():
+        root = Path(fixture_root_file.read_text().strip())
+        new_marker_file = Path('create-git-marker-' + lane)
+        if new_marker_file.exists():
+            Path(new_marker_file.read_text().strip()).mkdir(exist_ok=True)
+        # Model validate_root's outermost-marker walk within the disposable tree.
+        # An enclosing checkout on the runner must not change the fake refusal.
+        fixture_tree = Path(os.environ['SENTINEL_TESTS']).parent
+        ancestors = [path for path in reversed(root.parents) if path.is_relative_to(fixture_tree)]
+        for ancestor in [*ancestors, root]:
+            marker = ancestor / '.git'
+            try:
+                marker.lstat()
+            except FileNotFoundError:
+                continue
+            refusal = (f'unsafe test fixture root {root}: enclosing Git marker {marker} exists; '
+                       'set TMPDIR to an existing writable directory outside account HOME, '
+                       'inherited HOME/CODEX_HOME, and Git checkouts, with no symlink components')
+            failures['fixture_test'] = ('called `Result::unwrap()` on an `Err` value: '
+                                        f'Custom {{ kind: Other, error: "{refusal}" }}')
+            break
+    if Path('failing-' + lane).exists():
+        failures['lane_breaks'] = 'the reason it broke'
     print('     Running unittests src/lib.rs')
-    print('running 400 tests')
+    print(f'running {400 + len(failures)} tests')
     for index in range(400):
         print(f'test passing_number_{index} ... ok')
-    if Path('failing-' + lane).exists():
-        print('test lane_breaks ... FAILED')
+    if failures:
+        for name in failures:
+            print(f'test {name} ... FAILED')
         print('')
         print('failures:')
-        print('')
-        print('---- lane_breaks stdout ----')
-        print('')
-        print("thread 'lane_breaks' panicked at src/lib.rs:1:1:")
-        print('the reason it broke')
+        for name, error in failures.items():
+            print('')
+            print(f'---- {name} stdout ----')
+            print('')
+            print(f"thread '{name}' ({os.getpid()}) panicked at src/lib.rs:1:1:")
+            print(error)
         print('')
         print('')
         print('failures:')
-        print('    lane_breaks')
+        for name in failures:
+            print(f'    {name}')
         print('')
-        print('test result: FAILED. 400 passed; 1 failed')
+        print(f'test result: FAILED. 400 passed; {len(failures)} failed; '
+              '0 ignored; 0 measured; 0 filtered out; finished in 0.00s')
         print('error: test failed, to rerun pass `--lib`')
         print('     Running tests/later.rs')
         for index in range(400):
@@ -82,9 +111,10 @@ if sys.argv[1] == 'test':
         sys.exit(101)
     sys.exit(0)
 assert sys.argv[-1] == '--message-format=json', sys.argv
-selection = sys.argv[sys.argv.index('--all-targets') + 1:-1]
+arguments = sys.argv[sys.argv.index('--no-default-features') + 1:-1]
+targets = json.loads(os.environ['SENTINEL_LANE_TARGETS'])
 lane = next(name for name, value in json.loads(os.environ['SENTINEL_LANES']).items()
-            if value == selection)
+            if arguments == [*targets.get(name, ['--all-targets']), *value])
 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 with open(os.environ['SENTINEL_CALLS'], 'a') as out:
     out.write(json.dumps([sha, lane, sys.argv[1:], os.environ.get('CAGENTS_BUILD_REMOTE')]) + '\\n')
@@ -117,6 +147,9 @@ if Path('broken-' + lane).exists():
         kit = self.origin / "crates/cagents-ui-kit/Cargo.toml"
         kit.parent.mkdir(parents=True)
         kit.write_text('[package]\nname = "cagents-ui-kit"\n')
+        daemon = self.origin / "crates/cagents-host/Cargo.toml"
+        daemon.parent.mkdir(parents=True)
+        daemon.write_text('[package]\nname = "cagents-host"\n')
         dictation = self.origin / "crates/cagents-dictate/Cargo.toml"
         dictation.parent.mkdir(parents=True)
         dictation.write_text('[package]\nname = "cagents-dictate"\n')
@@ -157,6 +190,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
                                       SENTINEL_SYSTEMCTL=str(self.root / "systemctl"),
                                       SENTINEL_CALLS=str(self.calls),
                                       SENTINEL_LANES=json.dumps(sentinel.LANES),
+                                      SENTINEL_LANE_TARGETS=json.dumps(sentinel.LANE_TARGETS),
                                       SENTINEL_TESTS=str(self.root / "tests"),
                                       SENTINEL_TEST_LANES=json.dumps(sentinel.TEST_LANES))
         self.environment.start()
@@ -195,7 +229,9 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertEqual([(entry[0], entry[1]) for entry in records],
                          [(sha, lane) for sha in (self.first, third) for lane in sentinel.LANES])
         for entry in records:
-            self.assertEqual(entry[2][:4], ['clippy', '--locked', '--no-default-features', '--all-targets'])
+            targets = sentinel.LANE_TARGETS.get(entry[1], ['--all-targets'])
+            self.assertEqual(entry[2][:3 + len(targets)],
+                             ['clippy', '--locked', '--no-default-features', *targets])
             self.assertEqual(entry[2][-1], '--message-format=json')
             self.assertEqual(entry[3], 'fw16')
 
@@ -206,7 +242,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.now += 120
         self.tick()
         self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
-                         ["cli", "host", "ui", "dictate", "editor"])
+                         ["cli", "host", "daemon", "ui", "dictate", "editor"])
 
     def test_commit_before_the_dictation_helper_skips_only_its_lane(self):
         self.tick()
@@ -215,7 +251,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.now += 120
         self.tick()
         self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
-                         ["cli", "host", "ui", "app", "browser", "editor"])
+                         ["cli", "host", "daemon", "ui", "app", "browser", "editor"])
 
     def test_failure_is_reported_and_closed_issue_reopened_then_recovery_reported(self):
         self.tick()
@@ -582,19 +618,27 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and fixed in str(entry)
                             for entry in self.recorded()))
 
-    def test_a_failed_test_report_is_retried_without_testing_again(self):
+    def test_a_failed_test_report_leaves_evidence_and_bisection_complete(self):
+        self.with_evidence_tool()
         self.tick()
+        warned = self.commit("break a check", warning="host")
         (self.origin / "failing-cli").touch()
-        self.commit("break a test")
+        tip = self.commit("break a test too")
         self.now += 120
-        with patch.object(sentinel, "report_tests", side_effect=RuntimeError("network unavailable")):
-            with self.assertRaisesRegex(RuntimeError, "network"):
+        with patch.object(sentinel, "report_tests", side_effect=RuntimeError("API rate limit exceeded")):
+            with self.assertRaisesRegex(RuntimeError, "rate limit"):
                 self.tick()
+        self.assertTrue((self.state / "builds" / tip).is_dir())
+        self.assertTrue(any(entry[:2] == [warned, "host"] for entry in self.recorded()))
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertNotIn("bisect", state)
+        self.assertEqual(state["tests_pending"], tip)
         before = self.tested()
         self.now += 120
         self.tick()
         self.assertEqual(self.tested(), before)
-        self.assertTrue(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+        self.assertTrue(any(entry[:4] == ["issue", "create", "--title", sentinel.TEST_TITLE]
+                            for entry in self.recorded()))
         self.assertNotIn("tests_pending", json.loads((self.state / "state.json").read_text()))
 
     def test_a_required_commit_is_tested_once_and_its_verdict_returned(self):
@@ -660,6 +704,144 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertEqual(verdict["outside_code"], ["host"])
         self.assertFalse((self.state / "verdicts" / f"{refused}.json").exists())
 
+    def stray_fixture_root(self, marker_exists=True):
+        root = self.root / "scratch-repo" / "tmp"
+        root.mkdir(parents=True)
+        marker = root.parent / ".git"
+        if marker_exists:
+            marker.symlink_to("missing-gitdir")
+        (self.origin / "fixture-root-host").write_text(f"{root}\n")
+        return root, marker
+
+    def test_fixtures_refusing_a_preexisting_marker_above_tmpdir_defer_the_verdict(self):
+        self.tick()
+        root, marker = self.stray_fixture_root()
+        refused = self.commit("merge while a stray marker exists")
+        self.now += 120
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            self.tick()
+            verdict = sentinel.require_tests(self.repo, self.state, refused)
+        self.assertEqual(verdict["outside_code"], ["host"])
+        self.assertFalse((self.state / "verdicts" / f"{refused}.json").exists())
+        self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+        log = (self.state / "logs" / f"{refused}-test-host.log").read_text()
+        self.assertIn(f"enclosing Git marker {marker} exists;", next(
+            line for line in log.splitlines() if "unsafe test fixture root" in line))
+
+    def test_a_fixture_inside_the_checkout_reports_the_outer_repository_marker_as_a_failure(self):
+        checkout = self.repo / ".worktrees" / "main-build-sentinel"
+        (self.origin / "fixture-root-host").write_text(f"{checkout}\n")
+        failing = self.commit("a test that uses a checkout as its fixture root")
+        with patch.dict(os.environ, TMPDIR=str(checkout)):
+            verdict = sentinel.require_tests(self.repo, self.state, failing)
+        self.assertNotIn("outside_code", verdict)
+        self.assertFalse(verdict["passed"])
+        log = (self.state / "logs" / f"{failing}-test-host.log").read_text()
+        self.assertIn(f"enclosing Git marker {self.repo / '.git'} exists;", next(
+            line for line in log.splitlines() if "unsafe test fixture root" in line))
+
+    def test_a_marker_created_during_the_lane_stays_a_failure(self):
+        root, marker = self.stray_fixture_root(marker_exists=False)
+        (self.origin / "create-git-marker-host").write_text(f"{marker}\n")
+        failing = self.commit("a test that creates a marker above TMPDIR")
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            verdict = sentinel.require_tests(self.repo, self.state, failing)
+        self.assertNotIn("outside_code", verdict)
+        self.assertFalse(verdict["passed"])
+        self.assertTrue(marker.is_dir())
+
+    def test_an_environmental_refusal_alongside_another_test_failure_keeps_a_failed_verdict(self):
+        root, marker = self.stray_fixture_root()
+        (self.origin / "failing-host").touch()
+        failing = self.commit("a test fails while a stray marker exists")
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            self.tick()
+        verdict = json.loads((self.state / "verdicts" / f"{failing}.json").read_text())
+        self.assertFalse(verdict["passed"])
+        self.assertNotIn("outside_code", verdict)
+        body = (self.state / "test-issue.md").read_text()
+        self.assertIn(f"enclosing Git marker {marker} exists;", body)
+        self.assertIn("test lane_breaks ... FAILED", body)
+        self.assertIn("the reason it broke", body)
+
+    def test_repeated_environmental_refusals_across_main_commits_keep_a_failed_verdict(self):
+        root, marker = self.stray_fixture_root()
+        verdicts = self.state / "verdicts"
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            for attempt in range(3):
+                deferred = self.commit(f"merge during stray marker deferral {attempt + 1}")
+                self.tick()
+                self.assertIn([deferred, "host"], self.tested())
+                self.assertFalse((verdicts / f"{deferred}.json").exists())
+                self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+                self.now += 1800
+
+            # An infrastructure stop with the same marker still present preserves the streak.
+            stop = self.origin / "refused-host"
+            stop.touch()
+            refused = self.commit("merge while the build host is full")
+            self.tick()
+            self.assertIn([refused, "host"], self.tested())
+            self.assertFalse((verdicts / f"{refused}.json").exists())
+            self.assertFalse(any(entry[:2] == ["issue", "create"] for entry in self.recorded()))
+            self.now += 1800
+
+            stop.unlink()
+            failing = self.commit("merge after the build host recovers")
+            self.tick()
+        verdict = json.loads((verdicts / f"{failing}.json").read_text())
+        self.assertFalse(verdict["passed"])
+        self.assertNotIn("outside_code", verdict)
+        body = (self.state / "test-issue.md").read_text()
+        self.assertIn(str(marker), body)
+        self.assertRegex(body, r"(?i)stray \.git")
+
+    def test_a_marker_only_lane_and_an_ordinary_failing_lane_keep_a_failed_verdict(self):
+        root, marker = self.stray_fixture_root()
+        deferred = self.commit("merge while a stray marker exists")
+        failure = self.origin / "failing-ui"
+        verdicts = self.state / "verdicts"
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            # Leave one deferral in reserve so the mixed failure must record its own verdict.
+            for _ in range(2):
+                self.tick()
+                self.assertFalse((verdicts / f"{deferred}.json").exists())
+                self.now += 1800
+
+            failure.touch()
+            failing = self.commit("a UI test fails while host fixtures refuse the marker")
+            self.tick()
+            verdict = json.loads((verdicts / f"{failing}.json").read_text())
+            self.assertFalse(verdict["passed"])
+            self.assertNotIn("outside_code", verdict)
+            self.assertEqual(verdict["lanes"]["host"]["stray_git_markers"], [str(marker)])
+            self.assertEqual(verdict["lanes"]["ui"]["status"], sentinel.CODE_FAILURE)
+            body = (self.state / "test-issue.md").read_text()
+            self.assertIn(f"enclosing Git marker {marker} exists;", body)
+            self.assertIn("the reason it broke", body)
+
+            failure.unlink()
+            recovered = self.commit("fix the UI test while the marker persists")
+            for _ in range(3):
+                self.now += 1800
+                self.tick()
+                self.assertFalse((verdicts / f"{recovered}.json").exists())
+            self.assertEqual(self.tested().count([recovered, "host"]), 3)
+
+    def test_replacing_a_marker_at_the_same_path_restarts_deferrals(self):
+        root, marker = self.stray_fixture_root()
+        failing = self.commit("merge while a stray marker exists")
+        with patch.dict(os.environ, TMPDIR=str(root)):
+            for _ in range(3):
+                verdict = sentinel.require_tests(self.repo, self.state, failing)
+                self.assertEqual(verdict["outside_code"], ["host"])
+            replacement = marker.with_name(".git-replacement")
+            replacement.symlink_to("different-missing-gitdir")
+            replacement.replace(marker)
+            verdict = sentinel.require_tests(self.repo, self.state, failing)
+        self.assertEqual(verdict["outside_code"], ["host"])
+        self.assertFalse((self.state / "verdicts" / f"{failing}.json").exists())
+
     def test_a_removed_verdict_is_tested_again_by_the_watcher(self):
         self.tick()
         tip = json.loads((self.state / "state.json").read_text())["tested"]
@@ -699,6 +881,26 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
             fcntl.flock(checkout_lock, fcntl.LOCK_EX)
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertTrue(sentinel.require_tests(self.repo, self.state, tip)["passed"])
+
+    def test_a_new_verdict_is_returned_before_the_watcher_releases_its_locks(self):
+        self.tick()
+        tip = self.first
+        verdict = self.state / "verdicts" / f"{tip}.json"
+        saved = verdict.read_text()
+        verdict.unlink()
+        with ((self.repo / ".worktrees" / ".main-build-sentinel.lock").open("a") as checkout_lock,
+              (self.state / "lock").open("a") as lock):
+            fcntl.flock(checkout_lock, fcntl.LOCK_EX)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+
+            def publish(seconds):
+                self.assertEqual(seconds, 1)
+                self.assertFalse(verdict.exists())
+                verdict.write_text(saved)
+
+            with patch.object(sentinel.time, "sleep", side_effect=publish) as sleep:
+                self.assertTrue(sentinel.require_tests(self.repo, self.state, tip)["passed"])
+                sleep.assert_called_once()
 
     def with_isolation_check(self):
         """Commits a lane-isolation check that records its runs and fails
@@ -807,7 +1009,14 @@ for name in BINS:
 
     def test_the_newest_passing_commit_is_kept_built_for_evidence(self):
         sha = self.with_evidence_tool()
-        self.tick()
+        keep_build = sentinel.keep_main_build
+
+        def keep_after_tests(repo, directory, state):
+            self.assertTrue(sentinel.read_verdict(directory, sha)["passed"])
+            keep_build(repo, directory, state)
+
+        with patch.object(sentinel, "keep_main_build", side_effect=keep_after_tests):
+            self.tick()
         build = self.state / "builds" / sha
         self.assertEqual((build / "cagents-ui").read_text(), sha)
         self.assertEqual((build / "arguments").read_text().splitlines()[-1], "--profile dev-runtime --bin cagents-ui")
@@ -876,6 +1085,15 @@ class LaneSelectionTests(unittest.TestCase):
         self.assertEqual(command[command.index("--no-fail-fast") + 1:],
                          ["--no-default-features", "-p", "cagents", "-p", "cagents-ui", "--features", "cagents/ui"])
         self.assertIn("cagents-ui-kit", sentinel.test_command("ui", {"cagents", "cagents-ui", "cagents-ui-kit"}))
+
+    def test_a_commit_from_before_the_daemon_was_split_out_builds_it_from_the_library(self):
+        # The host feature alone, as that commit's own lane selected it.
+        self.assertEqual(sentinel.present(sentinel.LANES["host"], {"cagents", "cagents-ui"}),
+                         ["-p", "cagents", "--features", "cagents/host"])
+        command = sentinel.test_command("host", {"cagents", "cagents-ui"})
+        self.assertEqual(command[command.index("--no-fail-fast") + 1:],
+                         ["--no-default-features", "-p", "cagents", "--features", "cagents/host"])
+        self.assertIn("cagents-host", sentinel.test_command("host", {"cagents", "cagents-host"}))
 
 
 if __name__ == "__main__":

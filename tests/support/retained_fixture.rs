@@ -2,27 +2,36 @@
 //! helper calls setsid and moves into its own systemd scope, so process-group
 //! and cgroup cleanup miss it; ancestry does not. Never make the parallel test
 //! harness itself a subreaper.
+use std::time::Duration;
+#[cfg(target_os = "linux")]
 use std::{
     collections::BTreeSet,
     io::{self, Read, Seek, Write},
     os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus},
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 /// Same-test reexecs that clear their environment must preserve this, so they
 /// run the body instead of nesting another supervisor. The library's test
 /// wrapper offers it as `retained_fixture::owner_env()`.
+// Darwin's fail-closed supervisor never reads it; the library's reexecs do.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub const OWNER_ENV: &str = "CAGENTS_TEST_RETAINED_FIXTURE_OWNER";
+#[cfg(target_os = "linux")]
 const PARENT_ENV: &str = "CAGENTS_TEST_RETAINED_FIXTURE_PARENT";
+#[cfg(target_os = "linux")]
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
 pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 extern "C" fn interrupted(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn shutdown_on_signal() -> io::Result<()> {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = interrupted as *const () as usize;
@@ -43,6 +52,7 @@ pub fn run_isolated() -> bool {
 
 /// Give a measured multi-hop fixture its complete bounded execution budget,
 /// while retaining the same private subreaper and mandatory descendant cleanup.
+#[cfg(target_os = "linux")]
 pub fn run_isolated_with_timeout(timeout: Duration) -> bool {
     let thread = std::thread::current();
     let test = thread.name().expect("named libtest fixture");
@@ -115,6 +125,17 @@ pub fn run_isolated_with_timeout(timeout: Duration) -> bool {
     }
 }
 
+/// Darwin has no subreaper (#4045), so no supervisor could adopt and reap what
+/// a fixture's helpers leave behind. Fail closed rather than run the body
+/// unsupervised; the tests that need this are ignored there.
+#[cfg(target_os = "macos")]
+pub fn run_isolated_with_timeout(_timeout: Duration) -> bool {
+    panic!(
+        "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn killed_report(test: &str) -> String {
     format!("retained fixture {test}: killed ")
 }
@@ -123,8 +144,9 @@ fn killed_report(test: &str) -> String {
 /// order they were written, and returns its status and that output. A file,
 /// not a pipe: a descendant that outlives a killed supervisor would hold a
 /// pipe open and stall this test until it exited.
+#[cfg(target_os = "linux")]
 fn supervise(mut command: Command) -> io::Result<(ExitStatus, String)> {
-    let mut output = tempfile::tempfile_in("/var/tmp")?;
+    let mut output = tempfile::tempfile()?;
     let status = command
         .stdout(output.try_clone()?)
         .stderr(output.try_clone()?)
@@ -135,6 +157,7 @@ fn supervise(mut command: Command) -> io::Result<(ExitStatus, String)> {
     Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
+#[cfg(target_os = "linux")]
 fn test_command(test: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args([
@@ -147,11 +170,13 @@ fn test_command(test: &str) -> Command {
     command
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct Family {
     pub(crate) child: Child,
     settled: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl Family {
     pub(crate) fn spawn(mut command: Command) -> io::Result<Self> {
         command.process_group(0);
@@ -222,6 +247,7 @@ impl Family {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Family {
     fn drop(&mut self) {
         if !self.settled
@@ -234,6 +260,7 @@ impl Drop for Family {
 
 /// Reaps every exited match for `pid` without blocking. Returns true once no
 /// such child remains.
+#[cfg(target_os = "linux")]
 fn reap(pid: i32) -> io::Result<bool> {
     loop {
         match unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } {
@@ -249,6 +276,7 @@ fn reap(pid: i32) -> io::Result<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn direct_children() -> io::Result<BTreeSet<i32>> {
     let mut children = BTreeSet::new();
     for task in std::fs::read_dir("/proc/self/task")? {

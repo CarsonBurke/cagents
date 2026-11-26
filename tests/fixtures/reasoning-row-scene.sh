@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking|tool-cards}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking|tool-cards) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking|tool-cards|narration}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking|tool-cards|narration) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -508,6 +508,29 @@ print("{},{}".format(round(r["x"]+r["width"]/2),round(r["y"]+r["height"]/2)))
     sleep 1
     shot tool-cards-denial
     printf '%s\n' 'Captured the tool cards closed and open, and the denied call.'
+    exit 0
+fi
+
+# Progress prose between tool calls, which the server sends as thinking
+# blocks whose signature names them narration, beside an empty thought and
+# two commands. The first narration's frame also lists it in
+# narration_block_indexes; the second is known only by its signature.
+if [ "$scene" = narration ]; then
+    cp "$here/reasoning-row-scene/narration.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: find where the startup warning comes from.' \
+        "$fixture/state/reasoning-narration-spawn.json" 'Startup warning'
+    finished=false
+    for _ in $(seq 30); do
+        if rg -q '"uuid":"narration-answer-1"' "$config/projects"; then finished=true; break; fi
+        sleep 1
+    done
+    [ "$finished" = true ] || { printf '%s\n' 'reasoning-row-scene: the narration turn did not finish' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot narration-finished
+    printf '%s\n' 'Captured a finished turn with narration between its commands.'
     exit 0
 fi
 

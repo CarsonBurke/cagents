@@ -11,6 +11,12 @@
 /// [`version`](crate::version) first. Standard library initialization uses
 /// priority 99; this runs just after it.
 ///
+/// Mach-O initializers have no priorities. dyld runs an image's initializers
+/// in link order, where the executable's own objects precede the libraries it
+/// links, so this one, expanded in the executable, still runs first there; a
+/// read that ever came first would make the stamp panic rather than misreport.
+/// Darwin's standard library needs no initializer to read its arguments.
+///
 /// The metadata is read where this expands, so only the executable's own
 /// compilation depends on it: a new commit relinks the executables and leaves
 /// the library compiled. See `build.rs` for where the metadata comes from.
@@ -25,7 +31,8 @@ macro_rules! stamp_version {
                 )
             }
             #[used]
-            #[unsafe(link_section = ".init_array.00100")]
+            #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array.00100"))]
+            #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
             static STAMP_VERSION: extern "C" fn() = stamp_version;
         };
     };

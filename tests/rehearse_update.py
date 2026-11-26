@@ -445,7 +445,15 @@ class Comparison(unittest.TestCase):
         rollback_after = copy.deepcopy(after)
         rollback_after['agents']['agent']['agent']['console']['launch']['environment'] = {'TOKEN':'value'}
         self.assertTrue(records.console_relaunch(rollback_before,rollback_after,'terminal'))
+        # In the app an older worker records Failed when it does not know NEW's
+        # protocol (#3877); NEW's usable recovery still decides.
+        old_worker = copy.deepcopy(after)
+        old_worker['update_status'].update(phase='Failed',message='could not configure the daemon connection: '
+                                           'The running cagents service uses protocol 203; live updates support only 198.')
+        self.assertTrue(records.console_relaunch(before,old_worker,'terminal'))
         mutations = {
+            'refused-old-worker':lambda a:a['update_status'].update(
+                phase='Failed',message='uses protocol 203; live updates support only 198',refusal={'kind':'busy'}),
             'wrong-target':lambda a:a['target'].update(version='other'),
             'failed-update':lambda a:a['update_status'].update(phase='Failed'),
             'new-run':lambda a:a['agents']['agent'].update(run='new-run'),
@@ -1195,6 +1203,244 @@ class ChatViews(unittest.TestCase):
                     rehearsal.capture_chats('before')
 
 
+class UpdateCompleted(unittest.TestCase):
+    def test_only_a_complete_status_for_the_target_without_refusal_passes(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "home/.local/share/cagents-install/.update"
+            self.assertIn("no readable status", run.update_completed(directory, "2.0.0")[0])
+            state.mkdir(parents=True)
+            status = state / "status.json"
+            for phase, version, refusal, failures in (("Complete", "2.0.0", None, 0),
+                                                      ("Failed", "2.0.0", None, 1),
+                                                      ("Complete", "1.0.0", None, 1),
+                                                      ("Complete", "2.0.0", {"reason": "x"}, 1)):
+                with self.subTest(phase=phase, version=version, refusal=refusal):
+                    status.write_text(json.dumps({"phase": phase, "version": version, "refusal": refusal,
+                                                  "message": "could not configure the daemon connection"}))
+                    self.assertEqual(len(run.update_completed(directory, "2.0.0")), failures)
+
+
+class ShownUpdateOutcome(unittest.TestCase):
+    def observation(self, *texts):
+        return {"runs": [{"text": text} for text in texts]}
+
+    def test_a_window_showing_a_failure_or_refusal_fails_and_a_confirmation_is_read(self):
+        import rehearse_update_run as run
+        failed, updated = run.shown_update_outcome({
+            "main": self.observation("Update failed: the running cagents service uses protocol 203."),
+            "second": self.observation("Updated", "to cagents", "2.0.0"),
+            "empty": self.observation("Update not installed: 1 agent is working"),
+            "quiet": self.observation("Channels", "New chat"),
+        }, "2.0.0")
+        self.assertEqual(failed, {"main": "Update failed", "empty": "Update not installed"})
+        self.assertEqual(updated, ["second"])
+
+    def test_a_confirmation_for_another_version_is_not_this_update(self):
+        import rehearse_update_run as run
+        self.assertEqual(run.shown_update_outcome({"main": self.observation("Updated to cagents 1.9.0")}, "2.0.0"),
+                         ({}, []))
+
+    def test_a_notices_control_fails_on_an_error_or_an_update_warning_only(self):
+        import rehearse_update_run as run
+        self.assertEqual(run.notices_problem("Application errors", "Could not open a file", "2.0.0"),
+                         "Application errors")
+        self.assertIsNone(run.notices_problem("Application notices: success", "Updated to cagents 2.0.0", "2.0.0"))
+        self.assertEqual(run.notices_problem("Application notices",
+                                             "The update couldn't reopen every saved session, so", "2.0.0"),
+                         "Application notices")
+        self.assertIsNone(run.notices_problem("Application notices", "Provider login expires soon", "2.0.0"))
+        # After a deliberate restart, only errors about the update count.
+        self.assertIsNone(run.notices_problem("Application errors", "3 saved panes could not reconnect", "2.0.0",
+                                              any_error=False))
+        self.assertEqual(run.notices_problem("Application errors", "Update failed: protocol 203", "2.0.0",
+                                             any_error=False), "Application errors")
+        self.assertEqual(run.shown_update_outcome({"main": self.observation("Updated to cagents 2.0.41")}, "2.0.4"),
+                         ({}, []))
+
+    def rehearsal(self, root, status, tooltips, shown=None):
+        """A rehearsal whose one window shows SHOWN while watched, then TOOLTIPS[x] when its header is hovered at x."""
+        import rehearse_update_run as run
+        state = root / "home/.local/share/cagents-install/.update"
+        state.mkdir(parents=True)
+        (state / "status.json").write_text(json.dumps(status))
+        rehearsal = run.Rehearsal.__new__(run.Rehearsal)
+        rehearsal.root, rehearsal.errors = root, []
+        rehearsal.update_worker_running = lambda: False
+        rehearsal.mapped = lambda: {"main": {"id": 1}}
+        rehearsal.actions = []
+        pointer = {"x": None, "popover": False}
+        def call(*args, **_):
+            rehearsal.actions.append(args)
+            if args[:2] == ("drive", "hover"):
+                pointer["x"] = int(args[2].split(",")[0])
+            elif args[:2] == ("drive", "click"):
+                pointer["popover"] = tooltips.get("opens", True)
+            elif args[:2] == ("drive", "key"):
+                pointer["popover"] = False
+            elif args[:2] == ("drive", "--json"):
+                text = tooltips.get(pointer["x"], shown or "Channels")
+                if pointer["popover"]:
+                    text = "Application notices " + tooltips.get("popover", "")
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": text}]})
+            return 0, ""
+        rehearsal.call = call
+        return rehearsal
+
+    def test_a_failure_only_in_a_header_tooltip_fails_the_rehearsal(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Failed", "version": "2.0.0"},
+                                       {1136: "Update failed: protocol 203. Check again"})
+            with patch.object(run.time, "sleep"):
+                failed, _ = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual(failed, {"main": "Update failed"})
+            self.assertIn('main window shows "Update failed"', rehearsal.errors[0])
+            self.assertIn(("drive", "hover", "1136,21"), rehearsal.actions)
+
+    def test_a_success_notice_is_opened_read_and_closed_and_does_not_fail(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"},
+                                       {1136: "Application notices: success",
+                                        "popover": "Updated to cagents 2.0.0"})
+            with patch.object(run.time, "sleep"):
+                failed, updated = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual((failed, updated, rehearsal.errors), ({}, ["main"], []))
+            self.assertIn(("drive", "key", "Escape"), rehearsal.actions)
+
+    def test_the_header_scan_must_find_the_offered_update_before_it_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Starting", "version": "2.0.0"},
+                                       {1112: "Update to 2.0.0 (saves and restarts application windows)"})
+            self.assertIn("Update to 2.0.0", rehearsal.header_offers_update("2.0.0"))
+            self.assertEqual(rehearsal.errors, [])
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Starting", "version": "2.0.0"}, {})
+            self.assertIsNone(rehearsal.header_offers_update("2.0.0"))
+            self.assertIn("would prove nothing", rehearsal.errors[0])
+
+    def test_a_notices_popover_that_does_not_open_is_an_unknown_outcome(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"},
+                                       {1136: "Application notices", "opens": False})
+            with patch.object(run.time, "sleep"):
+                rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertIn("main window could not be observed", rehearsal.errors[0])
+
+    def test_a_window_never_observed_is_an_unknown_outcome(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal = self.rehearsal(Path(directory), {"phase": "Complete", "version": "2.0.0"}, {})
+            rehearsal.mapped = lambda: {"main": {"id": 2}}
+            with patch.object(run.time, "sleep"):
+                rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertIn("main window could not be observed", rehearsal.errors[0])
+
+    def test_watching_waits_for_the_worker_to_exit_before_settling(self):
+        import rehearse_update_run as run
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "home/.local/share/cagents-install/.update"
+            state.mkdir(parents=True)
+            (state / "status.json").write_text(json.dumps({"phase": "Failed", "version": "2.0.0"}))
+            rehearsal = run.Rehearsal.__new__(run.Rehearsal)
+            rehearsal.root, rehearsal.errors = root, []
+            # OLD's worker records Failed early, then verifies the reopened windows.
+            working = iter([True, True, False])
+            rehearsal.update_worker_running = lambda: next(working, False)
+            rehearsal.mapped = lambda: {"main": {"id": 1}, "ceditor": {"id": 9}}
+            shown = iter(["Channels", "Channels", "Update failed: protocol 203"])
+            def call(*args, **_):
+                if args[:2] == ("drive", "--json"):
+                    return 0, json.dumps({"window": {"id": 1}, "runs": [{"text": next(shown, "Channels")}]})
+                return 0, ""
+            rehearsal.call = call
+            with patch.object(run.time, "sleep"):
+                failed, updated = rehearsal.watch_shown_update("2.0.0", settle=0)
+            self.assertEqual((failed, updated), ({"main": "Update failed"}, []))
+            self.assertIn('main window shows "Update failed"', rehearsal.errors[0])
+            evidence = json.loads((root / "records/after/update-shown.json").read_text())
+            self.assertEqual([row["worker"] for row in evidence["rounds"]], [True, True, False])
+
+
+    def restarted(self, root, before, after, shown="Channels", *, same_window=False, same_daemon=False, tooltips=None):
+        """Runs restart_after_update on a desktop whose one window and daemon are
+        replaced, unless SAME_*, and whose status reads BEFORE then AFTER."""
+        import rehearse_update_run as run
+        rehearsal = self.rehearsal(root, {"phase": before, "version": "2.0.0"}, tooltips or {})
+        rehearsal.notes, rehearsal.steps, order = [], [], []
+        status = root / "home/.local/share/cagents-install/.update/status.json"
+        live = {"window": (10, 1), "daemon": (20, 1)}
+        windows = {"main": {"id": 1, "pid": 10}}
+        rehearsal.mapped = lambda: dict(windows)
+        watched = rehearsal.call
+        def call(*args, **kwargs):
+            if args[:3] == ("wm", "action", "close-window"):
+                order.append("close")
+                windows.clear()
+                live["window"] = (10, 1) if same_window else None
+            elif args == ("stop-daemon",):
+                order.append("stop")
+                status.write_text(json.dumps({"phase": after, "version": "2.0.0"}))
+                live["daemon"] = (20, 1) if same_daemon else (21, 1)
+            elif args[:1] == ("launch",):
+                order.append("launch")
+                windows["main"] = {"id": 1, "pid": 10 if same_window else 11}
+            elif args[:2] == ("drive", "--json") and tooltips is None:
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": shown}]})
+            return watched(*args, **kwargs)
+        rehearsal.call = call
+        rehearsal.open_windows = lambda slots: [call("launch", slot) for slot in slots]
+        rehearsal.wait_windows = lambda *_, **__: dict(windows)
+        rehearsal.cli = lambda *_, **__: (0, {"data": {"running": True, "daemon_version": "2.0.0"}})
+        identity = lambda pid: {10: live["window"] if not windows else (10, 1), 11: (11, 1)}.get(pid)
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(run.time, "sleep", sleep), patch.object(run.time, "monotonic", lambda: clock[0]), \
+                patch.object(run, "process_identity", identity), \
+                patch.object(run, "daemon_owner", lambda _: live["daemon"]):
+            rehearsal.restart_after_update("2.0.0", ["main"], settle=0)
+        self.assertEqual(order, ["close", "stop", "launch"])
+        return rehearsal, [error.split(";")[0] for error in rehearsal.errors]
+
+    def test_a_restart_after_the_update_must_keep_it_complete_and_unshown(self):
+        stale = "after the restart following the update, the update status is Failed for 2.0.0, not Complete for 2.0.0: None"
+        for before, after, shown, errors in (
+                ("Complete", "Complete", "Channels", []),
+                # OLD's worker recorded Failed and NEW settles it (#3877).
+                ("Failed", "Complete", "Channels", []),
+                ("Complete", "Failed", "Channels", [stale]),
+                # A window whose words miss the failure still fails on the record.
+                ("Failed", "Failed", "Channels", [stale]),
+                ("Failed", "Failed", "Update failed: protocol 203", ['the reopened main window shows "Update failed"', stale])):
+            with self.subTest(before=before, after=after), tempfile.TemporaryDirectory() as directory:
+                rehearsal, found = self.restarted(Path(directory), before, after, shown)
+                self.assertEqual(found, errors)
+                self.assertEqual(rehearsal.steps[-1]["exit"], int(bool(errors)))
+                self.assertEqual(rehearsal.notes, [f"update status across the restart after the update: {before} -> {after}"])
+                self.assertTrue((Path(directory) / "records/after/update-shown-after-restart.json").exists())
+
+    def test_after_a_restart_only_errors_about_the_update_count(self):
+        for popover, errors in (("3 saved panes could not reconnect", []),
+                                ("Update failed: protocol 203", ['the reopened main window shows "Application errors"'])):
+            with self.subTest(popover=popover), tempfile.TemporaryDirectory() as directory:
+                rehearsal, found = self.restarted(Path(directory), "Complete", "Complete",
+                                                  tooltips={1136: "Application errors", "popover": popover})
+                self.assertEqual(found, errors)
+                self.assertEqual(any("errors not about the update" in note for note in rehearsal.notes), not errors)
+
+    def test_a_restart_needs_fresh_window_processes_and_a_fresh_daemon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rehearsal, found = self.restarted(Path(directory), "Complete", "Complete", same_daemon=True)
+            self.assertEqual(found, ["a fresh NEW 2.0.0 daemon is not serving after the restart following the update"])
+            self.assertEqual(rehearsal.steps[-1]["exit"], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "did not close"):
+                self.restarted(Path(directory), "Complete", "Complete", same_window=True)
+
 class CandidateNamespace(unittest.TestCase):
     def module(self):
         spec=importlib.util.spec_from_file_location('candidate_namespace_rehearsal',REPOSITORY/'scripts/rehearse_update_run.py')
@@ -1226,6 +1472,17 @@ class CandidateNamespace(unittest.TestCase):
                 changed['candidate_status']['payload']['data'][field]=value
                 with self.assertRaisesRegex(RuntimeError,'disagrees'):
                     scenario.candidate_namespace_contract(changed,'old','new')
+
+    def test_a_refused_probe_names_what_it_found(self):
+        scenario=self.module()
+        evidence=self.evidence()
+        evidence['candidate_version']='cagents new+local.0123abc\n'
+        with self.assertRaisesRegex(RuntimeError,"reports 'cagents new\\+local.0123abc', not 'cagents new'"):
+            scenario.candidate_namespace_contract(evidence,'old','new')
+        evidence=self.evidence()
+        evidence['receipt']['outcome']['state']='unverified'
+        with self.assertRaisesRegex(RuntimeError,'does not bind that serving proof'):
+            scenario.candidate_namespace_contract(evidence,'old','new')
 
     def test_protocol_rejected_status_requires_exact_ready_source_and_kernel_owner(self):
         scenario=self.module()
@@ -2267,13 +2524,38 @@ class Arguments(unittest.TestCase):
                  "harness actions require a genuine user shell; never strip authority")
 class PrivateRoot(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="ru-contract-", dir="/var/tmp")
+        # A sandbox that masks .git in /var/tmp leaves an empty /var/tmp/.git,
+        # which init rightly refuses; REHEARSE_UPDATE_TEST_PARENT=/dev/shm moves the roots.
+        parent = os.environ.get("REHEARSE_UPDATE_TEST_PARENT", "/var/tmp")
+        self.temporary = tempfile.TemporaryDirectory(prefix="ru-contract-", dir=parent)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
     def call(self, *args, **kwargs):
         return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
                               capture_output=True, text=True, timeout=HANG_GUARD, **kwargs)
+
+    def test_init_skips_empty_git_ancestors_and_refuses_gitfiles(self):
+        marker = self.root / ".git"
+        marker.mkdir()
+        initial = self.root / "first"
+        initialized = subprocess.run(
+            [str(SCRIPT), "--root", str(initial), "init"],
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        self.assertTrue((initial / ".rehearse-update").is_file())
+
+        marker.rmdir()
+        marker.write_text("gitdir: /elsewhere/worktrees/rehearsal\n")
+        second = self.root / "second"
+        refused = subprocess.run(
+            [str(SCRIPT), "--root", str(second), "init"],
+            capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn(f"root must be outside Git ancestry; found {marker}", refused.stderr)
+        self.assertFalse(second.exists())
 
     def test_counted_daemon_stop_is_private_and_leaves_other_private_processes_alive(self):
         self.assertEqual(self.call('init').returncode,0)
@@ -2341,6 +2623,117 @@ else:sys.exit(2)
         result = self.call("update", "/missing", "new", "/missing/install.sh")
         self.assertIn("already current; skipping staging", result.stdout)
         self.assertNotIn("exists but is not current", result.stderr)
+
+    def feed(self, version="2.0.0"):
+        """A file feed serving VERSION's archive, as scripts/release feed lays it out."""
+        # `ROOT/feed` is where the harness records the feed it serves.
+        feed = self.root / "releases"
+        (feed / "latest/download").mkdir(parents=True)
+        (feed / "latest/download/release-metadata.json").write_text('{"version":"%s"}' % version)
+        release = feed / f"download/v{version}"
+        release.mkdir(parents=True)
+        name = f"cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"
+        (release / name).write_bytes(b"archive")
+        (release / "SHA256SUMS").write_text(f"{'0' * 64}  {name}\n{'1' * 64}  install.sh\n")
+        self.assertEqual(self.call("feed", str(feed)).returncode, 0)
+        return feed, name
+
+    def test_feed_refuses_a_release_whose_checksums_omit_the_installer(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        feed, _ = self.feed()
+        sums = feed / "download/v2.0.0/SHA256SUMS"
+        sums.write_text(sums.read_text().splitlines()[0] + "\n")
+        refused = self.call("feed", str(feed))
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("does not cover install.sh", refused.stderr)
+        # Only the release the feed offers matters; an older archive-only one is fine.
+        (feed / "latest/download/release-metadata.json").write_text('{"version":"3.0.0"}')
+        (feed / "download/v3.0.0").mkdir()
+        refused = self.call("feed", str(feed))
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("latest release 3.0.0 has no SHA256SUMS", refused.stderr)
+        (feed / "download/v3.0.0/SHA256SUMS").write_text(f"{'1' * 64}  install.sh\n")
+        self.assertEqual(self.call("feed", str(feed)).returncode, 0)
+
+    def test_feed_offers_the_generation_2_release_over_the_bridge_release(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        feed, _ = self.feed("0.2.4")
+        # After 0.2.4 the old name keeps 0.2.4's metadata for 0.2.3; the
+        # release the feed offers is the one release-metadata-2.json names.
+        (feed / "latest/download/release-metadata-2.json").write_text('{"version":"0.2.5"}')
+        (feed / "download/v0.2.5").mkdir()
+        refused = self.call("feed", str(feed))
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("latest release 0.2.5 has no SHA256SUMS", refused.stderr)
+
+    def test_feed_answers_a_published_builds_github_requests_from_the_feed(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        feed, name = self.feed()
+        curl = self.root / "bin/curl"
+        github = "https://github.com/CarsonBurke/cagents/releases"
+        # The exact request a published build's updater makes.
+        published = ["--disable", "--silent", "--fail", "--location", "--max-redirs", "10",
+                     "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "30",
+                     "--user-agent", "cagents-updater", "--max-filesize", "1000", "--"]
+        fetched = subprocess.run([curl, *published, f"{github}/latest/download/release-metadata.json"],
+                                 capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual((fetched.returncode, fetched.stdout), (0, '{"version":"2.0.0"}'), fetched.stderr)
+        fetched = subprocess.run([curl, *published, f"{github}/download/v2.0.0/{name}"],
+                                 capture_output=True, timeout=HANG_GUARD)
+        self.assertEqual((fetched.returncode, fetched.stdout), (0, b"archive"))
+        # A missing asset reads as GitHub's 404, which the updater treats as absent.
+        missing = subprocess.run([curl, *published, f"{github}/download/v9.0.0/{name}"],
+                                 capture_output=True, timeout=HANG_GUARD)
+        self.assertEqual(missing.returncode, 22)
+        local = [argument if argument != "=https" else "=file" for argument in published]
+        fetched = subprocess.run([curl, *local, f"file://{feed}/download/v2.0.0/{name}"],
+                                 capture_output=True, timeout=HANG_GUARD)
+        self.assertEqual((fetched.returncode, fetched.stdout), (0, b"archive"))
+        for url in ("https://github.com/someone/else/releases/x", "https://example.com/x",
+                    f"{github}/download/../../etc/passwd", "file:///etc/passwd",
+                    # curl decodes these in a file path, which would leave the feed.
+                    f"{github}/download/%2e%2e/%2e%2e/etc/passwd", f"file://{feed}/%2e%2e/x",
+                    f"{github}/download/v2.0.0/{name}?x=1", f"{github}/download/v2.0.0/{name}#x"):
+            with self.subTest(url=url):
+                refused = subprocess.run([curl, *published, url], capture_output=True, text=True,
+                                         timeout=HANG_GUARD)
+                self.assertEqual(refused.returncode, 7, refused.stderr)
+
+    def test_in_app_update_runs_the_installed_builds_upgrade_to_the_feeds_release(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        prefix = self.root / "home/.local/share/cagents-install"
+        cli = prefix / "versions/1.0.0/bin/cagents"
+        cli.parent.mkdir(parents=True)
+        cli.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >"$CAGENTS_REHEARSAL_ROOT/logs/upgrade-argv"\n')
+        cli.chmod(0o755)
+        (prefix / "current").symlink_to("versions/1.0.0")
+        (self.root / "home/.local/bin/cagents").symlink_to(prefix / "current/bin/cagents")
+        archives = self.root / "archives"
+        archives.mkdir()
+        refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("run feed DIR first", refused.stderr)
+        feed, name = self.feed()
+        (archives / name).write_bytes(b"another archive")
+        refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("serves a different", refused.stderr)
+        (archives / name).write_bytes(b"archive")
+        for extra, reason in ((["--use-staged"], "cannot combine"), (["--fail-new-daemon"], "cannot combine"),
+                              (["--version", "3.0.0"], "already selects VERSION")):
+            with self.subTest(extra=extra):
+                refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app", *extra)
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn(reason, refused.stderr)
+        (prefix / "versions/2.0.0").symlink_to("missing")
+        refused = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("the in-app update installs it", refused.stderr)
+        (prefix / "versions/2.0.0").unlink()
+        result = self.call("update", str(archives), "2.0.0", "/missing/install.sh", "--in-app", "--yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "logs/upgrade-argv").read_text(), "daemon upgrade --version 2.0.0 --yes\n")
+        self.assertFalse((prefix / "versions/2.0.0").exists(), "the in-app update stages nothing itself")
 
     def test_existing_only_launch_executes_the_ui_directly_with_private_environment(self):
         self.assertEqual(self.call('init').returncode,0)

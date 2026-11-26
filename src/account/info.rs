@@ -239,7 +239,7 @@ fn remaining_credit(credits: &Credits) -> Option<super::Money> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     #[test]

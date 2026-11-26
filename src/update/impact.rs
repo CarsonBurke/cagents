@@ -20,8 +20,11 @@ pub enum SessionKind {
     NativeChat,
 }
 
-/// A conversation has messages accepted for it but not yet delivered. They
-/// cannot be carried through an update, so it waits under either policy.
+/// A conversation has a delivery in flight: a run its dispatcher claimed but
+/// the provider hasn't started, which is never redispatched after a restart,
+/// so it waits under either policy. Daemons before the line that carries
+/// unsent runs also send it for runs still queued. The words stay as they are
+/// because those daemons send them; the review shows its own.
 pub const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
 /// A source refuses to carry a conversation whose provider stopped without
 /// confirming its work settled, and asks for it to be closed. Every source
@@ -37,6 +40,126 @@ pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may stil
 /// must never change.
 pub const PROVIDER_ENDED: &str =
     "Its provider already stopped. The saved conversation will reopen with a new provider process.";
+
+const BACKGROUND_WORK: &str = "Its turn finished, but background agents are still running. Review stopping them to continue the update.";
+const RETURNING_TO_TERMINAL: &str =
+    "Finish the pending return to terminal or close this conversation.";
+const PROVIDER_STARTING: &str = "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.";
+const UNRECORDED_CONVERSATION: &str = "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.";
+const TERMINAL_CANNOT_CARRY: &str = "This terminal cannot preserve its live process through this update; finish it or close it before updating.";
+const PAIRED_TERMINAL_CANNOT_CARRY: &str =
+    "The paired console cannot preserve its live process through this update.";
+
+// These two values are encoded in the existing string slot. Reviews use
+// their own wording so they can describe either update choice.
+const AGENT_RUN_UNCONFIRMED: &str = "Updating now ends this agent's run with an unknown outcome.";
+const AGENT_RUN_UNCONFIRMED_WITH_QUEUE: &str =
+    "Updating now ends this agent's run with an unknown outcome and leaves queued prompts unsent.";
+
+/// The reason for an update disposition. The existing wire and on-disk review
+/// records store text, so their fixed messages are decoded at this boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
+pub enum SessionCause {
+    PendingDelivery,
+    ProviderEnded,
+    UnsettledProvider,
+    BackgroundWork,
+    ReturningToTerminal,
+    ProviderStarting,
+    UnrecordedConversation,
+    TerminalCannotCarry,
+    PairedTerminalCannotCarry,
+    AgentRunUnconfirmed { queued_prompts: bool },
+    Detail(String),
+}
+
+impl SessionCause {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PendingDelivery => QUEUED_MESSAGES,
+            Self::ProviderEnded => PROVIDER_ENDED,
+            Self::UnsettledProvider => STOPPED_WITH_UNSETTLED_WORK,
+            Self::BackgroundWork => BACKGROUND_WORK,
+            Self::ReturningToTerminal => RETURNING_TO_TERMINAL,
+            Self::ProviderStarting => PROVIDER_STARTING,
+            Self::UnrecordedConversation => UNRECORDED_CONVERSATION,
+            Self::TerminalCannotCarry => TERMINAL_CANNOT_CARRY,
+            Self::PairedTerminalCannotCarry => PAIRED_TERMINAL_CANNOT_CARRY,
+            Self::AgentRunUnconfirmed {
+                queued_prompts: false,
+            } => AGENT_RUN_UNCONFIRMED,
+            Self::AgentRunUnconfirmed {
+                queued_prompts: true,
+            } => AGENT_RUN_UNCONFIRMED_WITH_QUEUE,
+            Self::Detail(text) => text,
+        }
+    }
+
+    pub fn unconfirmed_agent_run(&self) -> bool {
+        matches!(self, Self::AgentRunUnconfirmed { .. })
+    }
+
+    fn permits_agent_run_warning(&self, observed: &Self) -> bool {
+        match observed {
+            Self::AgentRunUnconfirmed {
+                queued_prompts: true,
+            } => {
+                matches!(
+                    self,
+                    Self::AgentRunUnconfirmed {
+                        queued_prompts: true
+                    }
+                )
+            }
+            Self::AgentRunUnconfirmed {
+                queued_prompts: false,
+            } => self.unconfirmed_agent_run(),
+            _ => true,
+        }
+    }
+}
+
+impl From<String> for SessionCause {
+    fn from(text: String) -> Self {
+        match text.as_str() {
+            QUEUED_MESSAGES => Self::PendingDelivery,
+            PROVIDER_ENDED => Self::ProviderEnded,
+            STOPPED_WITH_UNSETTLED_WORK => Self::UnsettledProvider,
+            BACKGROUND_WORK => Self::BackgroundWork,
+            RETURNING_TO_TERMINAL => Self::ReturningToTerminal,
+            PROVIDER_STARTING => Self::ProviderStarting,
+            UNRECORDED_CONVERSATION => Self::UnrecordedConversation,
+            TERMINAL_CANNOT_CARRY => Self::TerminalCannotCarry,
+            PAIRED_TERMINAL_CANNOT_CARRY => Self::PairedTerminalCannotCarry,
+            AGENT_RUN_UNCONFIRMED => Self::AgentRunUnconfirmed {
+                queued_prompts: false,
+            },
+            AGENT_RUN_UNCONFIRMED_WITH_QUEUE => Self::AgentRunUnconfirmed {
+                queued_prompts: true,
+            },
+            _ => Self::Detail(text),
+        }
+    }
+}
+
+impl From<&str> for SessionCause {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl Serialize for SessionCause {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for SessionCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,7 +181,7 @@ pub struct SessionImpact {
     /// Recipes and credentials never belong in an impact preview.
     pub identity: String,
     pub disposition: Disposition,
-    pub reason: String,
+    pub reason: SessionCause,
     /// Exact background tasks this interruption would stop. An idle wait or
     /// live process carry never authorizes terminating these tasks.
     pub interrupted_subagents: Vec<String>,
@@ -73,28 +196,51 @@ pub struct SessionReview {
     pub title: String,
     pub disposition: Disposition,
     pub reason: String,
+    pub warns_about_agent_run: bool,
 }
 
 impl SessionImpact {
+    fn permits_agent_run_warning(&self, observed: &Self, policy: Policy) -> bool {
+        match (policy, self.disposition, observed.disposition) {
+            // This risk is disclosed as a consequence of updating sooner.
+            (Policy::WhenIdle, _, Disposition::WaitsForIdle) => true,
+            // A wait never accepted this risk for the handoff itself.
+            (Policy::WhenIdle, Disposition::WaitsForIdle, _) => {
+                !observed.reason.unconfirmed_agent_run()
+            }
+            _ => self.reason.permits_agent_run_warning(&observed.reason),
+        }
+    }
+
     /// Whether the source's checkpoint must carry this owner. Only a
     /// conversation whose provider already ended is reviewed without one.
     pub fn checkpointed(&self) -> bool {
         !(self.kind == SessionKind::NativeChat
             && self.disposition == Disposition::Resumes
-            && self.reason == PROVIDER_ENDED)
+            && self.reason == SessionCause::ProviderEnded)
     }
 
     pub fn review(&self) -> SessionReview {
-        let reason = match self.disposition {
+        let warns_about_agent_run = self.kind == SessionKind::NativeChat
+            && matches!(
+                self.disposition,
+                Disposition::Continues
+                    | Disposition::Resumes
+                    | Disposition::WaitsForIdle
+                    | Disposition::Interrupted
+            )
+            && self.reason.unconfirmed_agent_run();
+        let mut reason: String = match self.disposition {
             Disposition::Continues => match self.kind {
                 SessionKind::Terminal => "The terminal and its running processes stay alive.".into(),
+                SessionKind::NativeChat if warns_about_agent_run => "Its conversation keeps running.".into(),
                 SessionKind::NativeChat => "The conversation and its running work stay alive.".into(),
             },
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
             Disposition::WaitsForIdle => {
                 let tasks = self.interrupted_subagents.len();
-                if self.reason == QUEUED_MESSAGES {
-                    "Messages sent to it are still waiting to be delivered; the update waits for them.".into()
+                if self.reason == SessionCause::PendingDelivery {
+                    "Messages sent to it are still being delivered; the update waits for them.".into()
                 } else if tasks == 0 {
                     "Finishing its turn; the update waits.".into()
                 } else {
@@ -112,26 +258,41 @@ impl SessionImpact {
                 }
             }
             Disposition::ResumePicker => "Its conversation cannot reopen automatically.".into(),
-            Disposition::Blocked => match self.reason.as_str() {
-                "Its turn finished, but background agents are still running. Review stopping them to continue the update." => "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into(),
-                STOPPED_WITH_UNSETTLED_WORK => "Its provider stopped with unfinished work. Close this conversation before updating.".into(),
-                "Finish the pending return to terminal or close this conversation." => "Finish returning to the terminal or close this conversation before updating.".into(),
-                "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not." => "Its provider is still starting. Wait for it to finish, then try the update again.".into(),
-                "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it." => "Its conversation has not been recorded yet. Send it a message or close it before updating.".into(),
-                "This terminal cannot preserve its live process through this update; finish it or close it before updating." => "Its running processes cannot be preserved through this update. Finish their work or close this terminal before updating.".into(),
-                "The paired console cannot preserve its live process through this update." => "Its terminal cannot keep running through this update. Finish its work or close it before updating.".into(),
+            Disposition::Blocked => match &self.reason {
+                SessionCause::BackgroundWork => BACKGROUND_WORK.into(),
+                SessionCause::UnsettledProvider => "Its provider stopped with unfinished work. Close this conversation before updating.".into(),
+                SessionCause::ReturningToTerminal => "Finish returning to the terminal or close this conversation before updating.".into(),
+                SessionCause::ProviderStarting => "Its provider is still starting. Wait for it to finish, then try the update again.".into(),
+                SessionCause::UnrecordedConversation => "Its conversation has not been recorded yet. Send it a message or close it before updating.".into(),
+                SessionCause::TerminalCannotCarry => "Its running processes cannot be preserved through this update. Finish their work or close this terminal before updating.".into(),
+                SessionCause::PairedTerminalCannotCarry => "Its terminal cannot keep running through this update. Finish its work or close it before updating.".into(),
                 _ => match self.kind {
                     SessionKind::Terminal => "Its terminal could not be prepared for this update. Let its work finish, then try again; close the terminal if the problem continues.".into(),
                     SessionKind::NativeChat => "Its conversation could not be prepared for this update. Let its work finish, then try again; close the conversation if the problem continues.".into(),
                 },
             },
         };
+        if warns_about_agent_run
+            && let SessionCause::AgentRunUnconfirmed { queued_prompts } = self.reason
+        {
+            reason.push_str(if self.disposition == Disposition::WaitsForIdle {
+                " Updating now"
+            } else {
+                " Updating"
+            });
+            reason.push_str(" can leave this agent’s run without a confirmed result. The agent may then stop taking new work");
+            if queued_prompts {
+                reason.push_str(", leaving its queued prompts unsent");
+            }
+            reason.push_str(". Messages can still reach the conversation.");
+        }
         SessionReview {
             id: self.id,
             kind: self.kind,
             title: self.title.clone(),
             disposition: self.disposition,
             reason,
+            warns_about_agent_run,
         }
     }
 }
@@ -211,6 +372,20 @@ impl DaemonImpact {
             })
     }
 
+    /// An idle approval can outlive new warnings about interrupting a turn.
+    /// A separate choice to interrupt still has to show those warnings.
+    pub(super) fn expands_interruption_warning(&self, observed: &Self) -> bool {
+        observed.sessions.iter().any(|current| {
+            current.disposition == Disposition::WaitsForIdle
+                && current.reason.unconfirmed_agent_run()
+                && !self.sessions.iter().any(|previous| {
+                    previous.id == current.id
+                        && previous.kind == current.kind
+                        && previous.reason.permits_agent_run_warning(&current.reason)
+                })
+        })
+    }
+
     /// A renewed short-lived capability may retain consent only for the same
     /// daemon and exact session owners. Waiting authorizes the observed busy
     /// conversations to become idle; it never authorizes an extra interruption.
@@ -239,6 +414,7 @@ impl DaemonImpact {
                         .map(String::as_str)
                         .collect();
                     previous.identity == current.identity
+                        && previous.permits_agent_run_warning(current, self.policy)
                         && current
                             .interrupted_subagents
                             .iter()
@@ -348,6 +524,45 @@ impl Refusal {
 pub(super) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
+
+    #[test]
+    fn session_causes_read_and_write_the_legacy_string_in_reviews_and_on_the_wire() {
+        for (text, cause) in [
+            (QUEUED_MESSAGES, SessionCause::PendingDelivery),
+            (PROVIDER_ENDED, SessionCause::ProviderEnded),
+            (STOPPED_WITH_UNSETTLED_WORK, SessionCause::UnsettledProvider),
+            (
+                AGENT_RUN_UNCONFIRMED,
+                SessionCause::AgentRunUnconfirmed {
+                    queued_prompts: false,
+                },
+            ),
+            (
+                AGENT_RUN_UNCONFIRMED_WITH_QUEUE,
+                SessionCause::AgentRunUnconfirmed {
+                    queued_prompts: true,
+                },
+            ),
+            (
+                "an old diagnostic",
+                SessionCause::Detail("an old diagnostic".into()),
+            ),
+        ] {
+            let legacy_wire = postcard::to_allocvec(text).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<SessionCause>(&legacy_wire).unwrap(),
+                cause
+            );
+            assert_eq!(postcard::to_allocvec(&cause).unwrap(), legacy_wire);
+
+            let legacy_json = serde_json::to_string(text).unwrap();
+            assert_eq!(
+                serde_json::from_str::<SessionCause>(&legacy_json).unwrap(),
+                cause
+            );
+            assert_eq!(serde_json::to_string(&cause).unwrap(), legacy_json);
+        }
+    }
 
     pub(in crate::update) fn waiting() -> DaemonImpact {
         DaemonImpact {
@@ -460,6 +675,49 @@ pub(super) mod tests {
         );
         settled.sessions[0].identity.push_str(" replacement owner");
         assert!(!confirmed.preserves_consent(&settled));
+    }
+
+    #[test]
+    fn consent_covers_only_the_agent_run_warning_shown_for_update_now() {
+        let mut ordinary = waiting();
+        ordinary.policy = Policy::Interrupt;
+        ordinary.sessions[0].disposition = Disposition::Interrupted;
+        let mut run = ordinary.clone();
+        run.sessions[0].reason = SessionCause::AgentRunUnconfirmed {
+            queued_prompts: false,
+        };
+        let mut queued = run.clone();
+        queued.sessions[0].reason = SessionCause::AgentRunUnconfirmed {
+            queued_prompts: true,
+        };
+
+        let ordinary = preview_with_daemon(ordinary);
+        let run = preview_with_daemon(run);
+        let mut queued = preview_with_daemon(queued);
+        assert!(!ordinary.preserves_consent(&run));
+        assert!(!run.preserves_consent(&queued));
+        assert!(queued.preserves_consent(&run));
+        assert!(run.preserves_consent(&ordinary));
+
+        // A person who chose to wait can keep waiting after a prompt queues.
+        let mut still_working = run;
+        for preview in [&mut still_working, &mut queued] {
+            let daemon = preview.daemon.as_mut().unwrap();
+            daemon.policy = Policy::WhenIdle;
+            daemon.sessions[0].disposition = Disposition::WaitsForIdle;
+        }
+        assert!(still_working.preserves_consent(&queued));
+
+        // The warning shown on a waiting row was about updating sooner.
+        let waiting_with_queue = queued.clone();
+
+        // Carrying the conversation does not guarantee the agent's result.
+        for preview in [&mut still_working, &mut queued] {
+            preview.daemon.as_mut().unwrap().sessions[0].disposition = Disposition::Continues;
+        }
+        assert!(!still_working.preserves_consent(&queued));
+        assert!(!waiting_with_queue.preserves_consent(&queued));
+        assert!(queued.preserves_consent(&still_working));
     }
 
     fn preview_with_daemon(daemon: DaemonImpact) -> Preview {
@@ -847,6 +1105,26 @@ impl Preview {
         })
     }
 
+    /// The conversations an idle wait still waits for, each named as the
+    /// review names it, in the review's order.
+    pub fn waiting_for_idle(&self) -> Vec<(TerminalId, String)> {
+        self.daemon
+            .iter()
+            .flat_map(|daemon| &daemon.sessions)
+            .filter(|session| session.disposition == Disposition::WaitsForIdle)
+            .map(|session| {
+                (
+                    session.id,
+                    self.labels
+                        .names
+                        .get(&session.id)
+                        .unwrap_or(&session.title)
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
     pub(super) fn with_inspection(
         mut self,
         inspection: &super::source_inspection::SourceInspection,
@@ -904,9 +1182,17 @@ impl Preview {
                 };
                 // The daemon comparison above proved these are the same owners
                 // and only permitted activity settlement or shrinking task sets.
-                // Keep all titles, source reasons, saved outcomes and notices so
-                // settling work cannot conceal any other change to the review.
+                // Keep titles, other source reasons, saved outcomes and notices
+                // so settling work cannot conceal any other change to the review.
                 session.disposition = now.disposition;
+                // A wait doesn't approve interruption. For work that will
+                // cross the handoff now, the daemon already rejected a wider warning.
+                if now.reason.unconfirmed_agent_run()
+                    || (session.reason.unconfirmed_agent_run()
+                        && now.reason != SessionCause::PendingDelivery)
+                {
+                    session.reason.clone_from(&now.reason);
+                }
                 session
                     .interrupted_subagents
                     .clone_from(&now.interrupted_subagents);

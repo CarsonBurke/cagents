@@ -328,7 +328,21 @@ use crate::{
 /// request to one is written without it.
 ///
 /// Version 203 appends the provider CLI inventory query and reply.
-pub const PROTOCOL_VERSION: u16 = 203;
+///
+/// Version 205 appends `Capabilities::send_queued_now`, `Snapshot::send_now`
+/// and `Command::SendQueuedNow`, which hand what is queued to a turn blocked
+/// on long work without stopping its subagents. An older client is sent
+/// snapshots without both fields; one read from an older update source has
+/// neither.
+///
+/// Version 206 appends `ChatHoldsFollowups`: whether a window holds messages
+/// the person wrote for a conversation's next turn, which go before the
+/// courier's. An older client never sends it.
+///
+/// Version 207 appends `queue_holds` to chat capabilities. Earlier clients
+/// receive the capabilities they know, and earlier update sources omit it.
+/// Version 208 appends connection-scoped mobile watch invalidations.
+pub const PROTOCOL_VERSION: u16 = 208;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -356,10 +370,11 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
-pub(crate) use older_clients::{
+pub use older_clients::{
     ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH, ENDED_TOOL_STATUS,
-    PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, USAGE_COMPACT_LIMIT, WAIT_KINDS,
-    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before, encoding_for,
+    PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, QUEUE_HOLDS, SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT,
+    WAIT_KINDS, WAITING_TOOL_STATUS, WithoutTrailing, before_queue_holds, before_send_queued_now,
+    decoding_before, decoding_from, encoding_before, encoding_for,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -397,15 +412,12 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
 
 /// This computer's daemon socket, even while another device is selected.
 pub fn local_daemon_socket_path() -> io::Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "XDG_RUNTIME_DIR is not set to an absolute path",
-            )
-        })?;
+    let runtime = instance::runtime_base()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR is not set to an absolute path",
+        )
+    })?;
     Ok(runtime
         .join(instance::runtime_subdirectory())
         .join(SOCKET_FILE_NAME))
@@ -559,6 +571,8 @@ pub enum ClientRequest {
     },
     ChatList,
     /// Acknowledge activity without enabling or reading presentation.
+    /// Explicit read of an attached conversation. Terminal-output observation
+    /// and its replay on reconnect use `TerminalAcknowledge`.
     ChatAcknowledge {
         chat_id: TerminalId,
         epoch: u64,
@@ -864,6 +878,27 @@ pub enum ClientRequest {
         nonce: [u8; crate::device_trust::SECRET_BYTES],
     },
     ProviderStatus,
+    /// Whether this attached window holds follow-ups the person wrote for
+    /// the chat's next turn, which its provider has no queue to take. The
+    /// courier starts no turn ahead of them for a short while once the turn
+    /// ends. Detaching or disconnecting withdraws it.
+    ChatHoldsFollowups {
+        chat_id: TerminalId,
+        held: bool,
+    },
+    /// Watch one mobile projection until this connection disconnects.
+    WatchMobile {
+        topic: MobileWatch,
+    },
+}
+
+/// Read-only invalidations for the SSH bridge. They do not confer window
+/// presence, assign notification destinations or make a surface visible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum MobileWatch {
+    Sessions,
+    Notifications,
+    Conversation(TerminalId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -986,7 +1021,7 @@ pub struct ServerEnvelope {
 // Never stored: delivery unpacks each reply at once, so boxing would only add an allocation.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub(crate) enum PreparedResponse {
+pub enum PreparedResponse {
     Decoded(ServerResponse),
     EncodedChat { chat_id: TerminalId, bytes: Vec<u8> },
 }
@@ -998,7 +1033,7 @@ impl From<ServerResponse> for PreparedResponse {
 }
 #[cfg(feature = "host")]
 impl PreparedResponse {
-    pub(crate) fn decode(self) -> Result<ServerResponse, String> {
+    pub fn decode(self) -> Result<ServerResponse, String> {
         match self {
             Self::Decoded(response) => Ok(response),
             Self::EncodedChat { bytes, .. } => {
@@ -1179,6 +1214,10 @@ pub enum ServerMessage {
     TerminalWorker {
         terminal_id: TerminalId,
         instance: uuid::Uuid,
+    },
+    /// Reread the projection, or end a conversation watch on removal.
+    MobileChanged {
+        topic: MobileWatch,
     },
 }
 
@@ -2328,6 +2367,8 @@ pub enum FrameError {
 /// perform for cold paths and tests. The buffer also lets a write emit its
 /// length prefix and payload in one `write_all`.
 pub struct FrameCodec {
+    // Already initialized through the largest recent frame. Only the current
+    // frame's declared length is read or decoded.
     read_buffer: Vec<u8>,
     write_buffer: Vec<u8>,
     prefix: [u8; LENGTH_PREFIX_BYTES],
@@ -2354,12 +2395,16 @@ fn next_memory_codec_id() -> u64 {
 // hot capacity. Hidden chat transports explicitly release their spare buffers.
 const FRAME_REUSE_FLOOR: usize = 256 * 1024;
 
+fn shrink_frame_buffer(buffer: &mut Vec<u8>) {
+    buffer.truncate(FRAME_REUSE_FLOOR);
+    buffer.shrink_to(FRAME_REUSE_FLOOR);
+}
+
 fn recycle_frame_buffer(buffer: &mut Vec<u8>, completed_bytes: usize, small_frames: &mut u8) {
-    buffer.clear();
     if buffer.capacity() > FRAME_REUSE_FLOOR.max(completed_bytes.saturating_mul(4)) {
         *small_frames = small_frames.saturating_add(1);
         if *small_frames >= 8 {
-            buffer.shrink_to(FRAME_REUSE_FLOOR);
+            shrink_frame_buffer(buffer);
             *small_frames = 0;
         }
     } else {
@@ -2392,8 +2437,7 @@ impl FrameCodec {
     /// A timed-out partial frame remains intact until it is decoded.
     pub fn release_spare(&mut self) {
         if self.payload_length.is_none() && self.prefix_read == 0 {
-            self.read_buffer.clear();
-            self.read_buffer.shrink_to(FRAME_REUSE_FLOOR);
+            shrink_frame_buffer(&mut self.read_buffer);
             self.small_reads = 0;
         }
         self.write_buffer.clear();
@@ -2431,13 +2475,13 @@ impl FrameCodec {
                 self.read_buffer
                     .try_reserve(length - self.read_buffer.len())
                     .map_err(|_| FrameError::Allocation { requested: length })?;
+                self.read_buffer.resize(length, 0);
             }
-            self.read_buffer.resize(length, 0);
             self.payload_length = Some(length);
             length
         };
         while self.payload_read < length {
-            match reader.read(&mut self.read_buffer[self.payload_read..]) {
+            match reader.read(&mut self.read_buffer[self.payload_read..length]) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -2467,7 +2511,7 @@ impl FrameCodec {
 
     /// Append an already encoded response after the ordinary envelope header.
     #[cfg(feature = "host")]
-    pub(crate) fn write_encoded_response(
+    pub fn write_encoded_response(
         &mut self,
         writer: &mut impl Write,
         version: u16,
@@ -2497,6 +2541,7 @@ impl FrameCodec {
         self.write_buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&(length as u32).to_be_bytes());
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        self.write_buffer.clear();
         recycle_frame_buffer(&mut self.write_buffer, length, &mut self.small_writes);
         Ok(())
     }
@@ -2517,6 +2562,7 @@ impl FrameCodec {
         }
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        self.write_buffer.clear();
         recycle_frame_buffer(
             &mut self.write_buffer,
             payload_length,
@@ -2540,7 +2586,7 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<Option<
     read_frame_with_limit(reader, MAX_FRAME_BYTES)
 }
 
-pub(crate) fn read_frame_with_limit<T: DeserializeOwned>(
+pub fn read_frame_with_limit<T: DeserializeOwned>(
     reader: &mut impl Read,
     maximum: usize,
 ) -> Result<Option<T>, FrameError> {
@@ -2879,6 +2925,28 @@ mod tests {
             );
         }
         assert!(codec.read_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
+    fn frame_codec_keeps_initialized_read_bytes_for_smaller_frames() {
+        let mut frames = Vec::new();
+        write_frame(&mut frames, &"first frame").unwrap();
+        let initialized = frames.len() - LENGTH_PREFIX_BYTES;
+        write_frame(&mut frames, &"short").unwrap();
+        write_frame(&mut frames, &"third frame").unwrap();
+
+        let mut reader = Cursor::new(frames);
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        for expected in ["first frame", "short", "third frame"] {
+            assert_eq!(
+                codec.read::<String>(&mut reader).unwrap().as_deref(),
+                Some(expected)
+            );
+            assert_eq!(codec.read_buffer.len(), initialized);
+            codec.release_spare();
+            assert_eq!(codec.read_buffer.len(), initialized);
+        }
+        assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
     }
 
     #[test]

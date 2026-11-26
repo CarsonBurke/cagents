@@ -10,7 +10,12 @@ use std::collections::BTreeSet;
 
 const VERSION: u8 = 1;
 /// How long the update lets `verify-update-census` run before stopping it.
-const VERIFIER_LIMIT: Duration = Duration::from_secs(20);
+pub(super) const VERIFIER_LIMIT: Duration = Duration::from_secs(20);
+/// The detail of the receipt a coordinator saves before it runs the target's
+/// verifier, so a stale usable receipt cannot stand in for that run. Every
+/// release since 0.2.3 writes exactly this text; a window that reads it knows
+/// a verifier is, or was, running.
+const PENDING_VERIFICATION: &str = "Fresh readiness verification is pending";
 /// The deadline, from the start of one verifier run, that every inventory
 /// fence of that run shares. No fence is sent unless its admission wait and a
 /// prompt reply fit before this deadline, so a daemon that is busy, steadily
@@ -23,7 +28,7 @@ pub(crate) const OUTCOME_ENV: &str = "CAGENTS_INSTALL_OUTCOME_PATH";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Census {
+pub struct Census {
     version: u8,
     pub transaction: String,
     pub source: Option<HostSessionProof>,
@@ -35,7 +40,7 @@ pub(crate) struct Census {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     Usable {
         serving: HostSessionProof,
         terminals: usize,
@@ -67,7 +72,7 @@ pub(crate) enum Outcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Receipt {
+pub struct Receipt {
     version: u8,
     pub transaction: String,
     pub census_digest: String,
@@ -104,6 +109,17 @@ impl std::fmt::Display for TargetRecoveryRequired {
 impl std::error::Error for TargetRecoveryRequired {}
 
 impl Census {
+    pub(super) fn has_recorded_chat(&self, id: crate::model::TerminalId) -> bool {
+        self.chats.iter().any(|chat| {
+            chat.id == id
+                && chat
+                    .launch
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|identity| !identity.trim().is_empty())
+        })
+    }
+
     fn from_recovered(
         transaction: String,
         recovered: &crate::upgrade::recovery::AlreadyRecovered,
@@ -144,7 +160,7 @@ impl Census {
         Ok(census)
     }
 
-    pub(crate) fn capture(transaction: String, busy: BusyPatience) -> Result<Self, UpdateError> {
+    pub fn capture(transaction: String, busy: BusyPatience) -> Result<Self, UpdateError> {
         Self::capture_with_candidate(transaction, None, busy)
     }
 
@@ -213,7 +229,7 @@ impl Census {
                 let paths =
                     crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
                 if !crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
-                    && std::os::unix::net::UnixStream::connect(&paths.socket).is_err_and(|e| {
+                    && crate::descriptor::connect_settled(&paths.socket).is_err_and(|e| {
                         matches!(
                             e.kind(),
                             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -264,12 +280,12 @@ impl Census {
     pub(crate) fn digest(&self) -> Result<String, UpdateError> {
         Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
     }
-    pub(crate) fn load(path: &Path) -> Result<Self, UpdateError> {
+    pub fn load(path: &Path) -> Result<Self, UpdateError> {
         let census: Self = serde_json::from_slice(&read_private(path, JOB_STATE_LIMIT)?)?;
         census.validate()?;
         Ok(census)
     }
-    pub(crate) fn save(&self, path: &Path) -> Result<(), UpdateError> {
+    pub fn save(&self, path: &Path) -> Result<(), UpdateError> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
         if bytes.len() as u64 > JOB_STATE_LIMIT {
@@ -327,7 +343,7 @@ impl Census {
         })
     }
     /// Reads the serving inventory, asking a busy daemon again within `busy`.
-    pub(crate) fn verify(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
+    pub fn verify(&self, busy: BusyPatience) -> Result<Receipt, UpdateError> {
         match observe_with(busy, |proof, terminals, chats, target| {
             // Evidence failure must not discard the independently observed
             // serving owner or skip the closing readiness/inventory fences.
@@ -457,7 +473,7 @@ impl Census {
         }
         let receipt_path = outcome_path(state, job);
         // A stale usable receipt must never substitute for this probe.
-        self.unverified("Fresh readiness verification is pending".into())?
+        self.unverified(PENDING_VERIFICATION.into())?
             .save(&receipt_path)?;
         let mut command = Command::new(&executable);
         command
@@ -541,8 +557,17 @@ impl Receipt {
             _ => None,
         }
     }
-    pub(crate) fn usable(&self) -> bool {
+    pub fn usable(&self) -> bool {
         matches!(self.outcome, Outcome::Usable { .. })
+    }
+    pub(super) fn verifies_replacement(
+        &self,
+        original: &HostSessionProof,
+        observed: &HostSessionProof,
+    ) -> bool {
+        observed != original
+            && observed.is_complete()
+            && matches!(&self.outcome, Outcome::Usable { serving, .. } if serving == observed)
     }
     pub(crate) fn has_listener(&self) -> bool {
         matches!(
@@ -941,6 +966,35 @@ pub(crate) fn compare_with_recovery(
         }
     }
 }
+
+#[cfg(any(test, all(target_os = "macos", feature = "host")))]
+pub(crate) fn verify_ready_inventory(
+    transaction: &str,
+    source: &HostSessionProof,
+    original: &crate::upgrade::recovery::Census,
+    serving: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+    chats: &[crate::chat::Session],
+    lineage: &crate::upgrade::handoff::RecoveredChats,
+) -> Result<(), String> {
+    if source == serving || source.boot_id != serving.boot_id {
+        return Err("The replacement does not identify an exact new same-boot daemon".into());
+    }
+    let census = Census {
+        version: VERSION,
+        transaction: transaction.to_owned(),
+        source: Some(source.clone()),
+        terminals: original.terminals.clone(),
+        chats: original.chats.clone(),
+        checkpoint_before: None,
+    };
+    census.validate().map_err(|error| error.to_string())?;
+    match compare_with_recovery(&census, serving, terminals, chats, lineage, None, None) {
+        Outcome::Usable { .. } => Ok(()),
+        Outcome::Unverified { detail, .. } => Err(detail),
+        _ => Err("The Ready replacement did not verify its original inventory".into()),
+    }
+}
 fn same_owner_chat_matches(
     expected: &crate::chat::Session,
     current: &crate::chat::Session,
@@ -995,12 +1049,14 @@ fn inspect_capture_source(
 ) -> Result<Option<HostSessionProof>, UpdateError> {
     match candidate_cli {
         Some(candidate) => inspect_pending_source_inner(candidate, None, false, busy),
-        None => inspect_pending_source_inner(&std::env::current_exe()?, None, true, busy),
+        None => {
+            inspect_pending_source_inner(&crate::process::current_executable()?, None, true, busy)
+        }
     }
 }
 
 pub(super) fn inspect_pending_current() -> Result<(), UpdateError> {
-    inspect_pending_caller(&std::env::current_exe()?)
+    inspect_pending_caller(&crate::process::current_executable()?)
 }
 
 pub(super) fn inspect_pending_caller(caller: &Path) -> Result<(), UpdateError> {
@@ -1139,15 +1195,7 @@ fn serving_prepared(
                 Ok(None) | Err(_) => return Ok(None),
             };
         classified = true;
-        if settled.source != pending.source
-            || settled.census != pending.census
-            || settled.witness.checkpoint_hash != pending.checkpoint_hash
-            || settled.witness.target != target
-        {
-            return Err(invalid(
-                "The settled record differs from the retained original source",
-            ));
-        }
+        require_prepared_scope(pending, &settled, target)?;
         Census::from_pending(uuid::Uuid::new_v4().to_string(), pending)?
             .verify(busy)
             .map(Some)
@@ -1188,11 +1236,7 @@ fn prepared_service_outcome(
             PreparedService::Unresolved
         };
     };
-    if observed != *source
-        && observed.is_complete()
-        && readiness == StartupState::Ready
-        && matches!(&receipt.outcome, Outcome::Usable { serving, .. } if *serving == observed)
-    {
+    if readiness == StartupState::Ready && receipt.verifies_replacement(source, &observed) {
         PreparedService::HandledVerified { serving: observed }
     } else {
         PreparedService::RetainedUnverified(if receipt.usable() {
@@ -1201,6 +1245,23 @@ fn prepared_service_outcome(
             receipt.failure().to_string()
         })
     }
+}
+
+pub(super) fn require_prepared_scope(
+    pending: &crate::upgrade::recovery::PendingRecovery,
+    settled: &crate::upgrade::recovery::AlreadyRecovered,
+    target: &Path,
+) -> Result<(), UpdateError> {
+    if settled.source != pending.source
+        || settled.census != pending.census
+        || settled.witness.checkpoint_hash != pending.checkpoint_hash
+        || settled.witness.target != target
+    {
+        return Err(invalid(
+            "The settled record differs from the retained checkpoint, inventory or target",
+        ));
+    }
+    Ok(())
 }
 
 fn require_captured_owner(
@@ -1219,7 +1280,7 @@ fn require_captured_owner(
 /// verifier proves a fresh Ready socket and its complete live/paused inventory.
 /// This never starts, stops, attaches or replays any owner. A daemon busy
 /// finishing another operation is asked again within `busy`.
-pub(crate) fn retire_current_service(busy: BusyPatience) -> Result<RetirementStatus, UpdateError> {
+pub fn retire_current_service(busy: BusyPatience) -> Result<RetirementStatus, UpdateError> {
     retire_service(RetirementTrigger::CurrentJob, busy)
 }
 
@@ -1228,13 +1289,13 @@ pub(crate) fn retire_current_service(busy: BusyPatience) -> Result<RetirementSta
 /// would only hold those clients back, and this optional completion is
 /// attempted again by the next update, so it is asked once.
 #[cfg(feature = "host")]
-pub(crate) fn refresh_completed_service() -> Result<RetirementStatus, UpdateError> {
+pub fn refresh_completed_service() -> Result<RetirementStatus, UpdateError> {
     retire_service(RetirementTrigger::ColdStart, BusyPatience::ONCE)
 }
 
 /// Mechanical evidence status, not another daemon usability outcome.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RetirementStatus {
+pub enum RetirementStatus {
     /// Another helper owns the evidence transaction; no completion is claimed.
     Busy,
     NotRequired,
@@ -1286,7 +1347,7 @@ fn retire_service(
             // This is local mechanical evidence only. No socket self-query,
             // old census reconstruction, pause inspection or live-owner claim
             // is needed once the exact archive transaction has completed.
-            let target = std::env::current_exe()?;
+            let target = crate::process::current_executable()?;
             if let Some(status) = completed_cold_retirement(&store.path, &target)? {
                 return Ok(status);
             }
@@ -1778,7 +1839,7 @@ impl Census {
         // source handshake against a daemon the installer may have started.
         if !self.had_no_source()
             || crate::daemon::HostLease::is_held(&paths).map_err(|e| invalid(e.to_string()))?
-            || !std::os::unix::net::UnixStream::connect(&paths.socket).is_err_and(|e| {
+            || !crate::descriptor::connect_settled(&paths.socket).is_err_and(|e| {
                 matches!(
                     e.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
@@ -1821,18 +1882,45 @@ pub(super) fn outcome_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.recovery.json"))
 }
 
+/// What `job`'s recovery receipt says, read against its saved census.
+#[cfg(any(feature = "ui", feature = "host", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Reading {
+    /// The target's verifier found the service usable, served by `0`.
+    Usable(HostSessionProof),
+    /// The placeholder saved just before a verifier run, at `since`. Until
+    /// that run ends it says nothing about the service.
+    Pending { since: std::time::SystemTime },
+    /// Anything else: the verifier did not find the service usable.
+    Unusable,
+}
+
+#[cfg(any(feature = "ui", feature = "host", test))]
+pub(super) fn read_receipt(state: &Path, job: &str) -> Result<Reading, UpdateError> {
+    let census = Census::load(&census_path(state, job))?;
+    let path = outcome_path(state, job);
+    let bytes = read_private(&path, JOB_STATE_LIMIT)?;
+    // Each save renames a new file into place, so this is when it was written.
+    let since = fs::symlink_metadata(&path)?.modified()?;
+    let receipt: Receipt = serde_json::from_slice(&bytes)?;
+    receipt.matches(&census)?;
+    if receipt == census.unverified(PENDING_VERIFICATION.into())? {
+        return Ok(Reading::Pending { since });
+    }
+    Ok(match receipt.outcome {
+        Outcome::Usable { serving, .. } => Reading::Usable(serving),
+        _ => Reading::Unusable,
+    })
+}
+
 /// The daemon `job`'s recovery receipt found usable against its saved census.
-#[cfg(any(feature = "ui", test))]
+#[cfg(test)]
 pub(super) fn verified_serving(
     state: &Path,
     job: &str,
 ) -> Result<Option<HostSessionProof>, UpdateError> {
-    let census = Census::load(&census_path(state, job))?;
-    let receipt: Receipt =
-        serde_json::from_slice(&read_private(&outcome_path(state, job), JOB_STATE_LIMIT)?)?;
-    receipt.matches(&census)?;
-    Ok(match receipt.outcome {
-        Outcome::Usable { serving, .. } => Some(serving),
+    Ok(match read_receipt(state, job)? {
+        Reading::Usable(serving) => Some(serving),
         _ => None,
     })
 }
@@ -1886,6 +1974,44 @@ mod tests {
             chats: vec![],
             checkpoint_before: None,
         }
+    }
+
+    #[test]
+    fn ready_selection_requires_a_new_same_boot_owner_with_original_live_lineage() {
+        let original = terminal();
+        let transaction = uuid::Uuid::new_v4().to_string();
+        let source = proof();
+        let mut serving = proof();
+        serving.host_session_id = crate::model::HostSessionId::new("successor");
+        serving.host_incarnation = crate::model::HostIncarnation::new("new daemon");
+        let captured = crate::upgrade::recovery::Census {
+            terminals: vec![original.session.clone()],
+            ..Default::default()
+        };
+        let mut live = original.clone();
+        live.session.continuity = TerminalContinuity::Live {
+            host_session_id: serving.host_session_id.clone(),
+            boot_id: serving.boot_id.clone(),
+            host_incarnation: serving.host_incarnation.clone(),
+        };
+        let verify = |serving: &HostSessionProof, terminals: &[TerminalDescriptor]| {
+            verify_ready_inventory(
+                &transaction,
+                &source,
+                &captured,
+                serving,
+                terminals,
+                &[],
+                &Default::default(),
+            )
+        };
+        assert!(verify(&source, std::slice::from_ref(&original)).is_err());
+        assert!(verify(&serving, &[]).is_err());
+        assert!(verify(&serving, std::slice::from_ref(&live)).is_err());
+        live.upgrade_sources.push(original.session);
+        assert!(verify(&serving, std::slice::from_ref(&live)).is_ok());
+        serving.boot_id = crate::model::BootId::new("another boot");
+        assert!(verify(&serving, &[live]).is_err());
     }
     #[test]
     fn a_census_takes_as_many_chats_as_a_daemon_may_host() {
@@ -2261,8 +2387,11 @@ mod tests {
                 ),
                 PreparedService::HandledVerified { serving: accepted } if accepted == serving
             ));
+            let mut other_replacement = serving.clone();
+            other_replacement.host_incarnation = "other-replacement".into();
             for (observed, readiness, receipt) in [
                 (proof(), StartupState::Ready, verified.clone()),
+                (other_replacement, StartupState::Ready, verified.clone()),
                 (
                     serving.clone(),
                     StartupState::Retained {
@@ -2631,6 +2760,62 @@ mod tests {
         assert!(!error.failure().to_string().contains("daemon start"));
     }
 
+    /// The placeholder a coordinator saves just before the target's verifier
+    /// runs, exactly as 0.2.3 writes it for the e8bbb84f2 census, reads as a
+    /// verification still under way rather than as an unusable service.
+    #[test]
+    fn the_pending_verification_placeholder_is_not_a_verdict() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/update-e8bbb84f2-reached-target");
+        let job = "467204f6-b633-4600-b92d-afd4a95547f8";
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path();
+        let write = |path: PathBuf, bytes: &[u8]| {
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(
+            census_path(state, job),
+            &fs::read(fixture.join("census.json")).unwrap(),
+        );
+        let pending = fs::read_to_string(fixture.join("pending.json")).unwrap();
+        let census = Census::load(&census_path(state, job)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&census.unverified(PENDING_VERIFICATION.into()).unwrap())
+                .unwrap(),
+            pending,
+            "this build saves the same placeholder 0.2.3 does"
+        );
+        write(outcome_path(state, job), pending.as_bytes());
+        let Reading::Pending { since } = read_receipt(state, job).unwrap() else {
+            panic!("the placeholder must read as pending");
+        };
+        assert_eq!(
+            since,
+            fs::metadata(outcome_path(state, job))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+
+        // The same shape with any other detail is the verifier's verdict.
+        let failed = pending.replace(
+            PENDING_VERIFICATION,
+            "The verifier did not finish successfully; its partial receipt is not readiness proof",
+        );
+        write(outcome_path(state, job), failed.as_bytes());
+        assert_eq!(read_receipt(state, job).unwrap(), Reading::Unusable);
+
+        write(
+            outcome_path(state, job),
+            &fs::read(fixture.join("recovery.json")).unwrap(),
+        );
+        assert!(matches!(
+            read_receipt(state, job).unwrap(),
+            Reading::Usable(_)
+        ));
+    }
+
     /// The census and receipt an e8bbb84f2 worker wrote after its successor
     /// check failed against a newer protocol: the target's verifier had found
     /// every session usable. Paths and user names are anonymized; the digest is
@@ -2680,10 +2865,10 @@ mod tests {
             let mut live = serving;
             live.boot_id = crate::daemon::read_boot_id().unwrap();
             let _lease = crate::daemon::HostLease::acquire(&paths, &live).unwrap();
-            let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let listener = crate::descriptor::bind(&paths.socket).unwrap();
             let executable = std::env::current_exe().unwrap();
             source::Peer::confirm_serving(&paths.socket, &executable, &live).unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             let mut frames = Vec::new();
             stream.read_to_end(&mut frames).unwrap();
             assert!(frames.is_empty(), "the worker sent a protocol request");
@@ -2699,6 +2884,7 @@ mod tests {
             confirmation: None,
             refusal: None,
             in_flight: Vec::new(),
+            recorded_by: None,
         };
         let completion = finish_reopening_windows(
             state,

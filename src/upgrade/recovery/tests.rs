@@ -34,7 +34,7 @@ fn reviewed(proof: &HostSessionProof, terminal: TerminalId) -> DaemonImpact {
             title: String::new(),
             identity: "exact-owner".into(),
             disposition: crate::update::impact::Disposition::Resumes,
-            reason: String::new(),
+            reason: "".into(),
             interrupted_subagents: Vec::new(),
         }],
         blockers: Vec::new(),
@@ -220,6 +220,43 @@ fn pending_recovery_rejects_reduced_index_with_missing_host_options_without_muta
 }
 
 #[test]
+fn recovery_retries_carry_slots_closed_before_the_previous_claim() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let authority = preparation(root.path()).authority;
+    let request = ManualRequest {
+        version: 1,
+        job: uuid::Uuid::new_v4().to_string(),
+        checkpoint: "a".repeat(64),
+        source: authority.source,
+        target: PathBuf::from("/candidate/bin/cagentsd"),
+        target_hash: "b".repeat(64),
+        census_hash: digest(&serde_json::to_vec(&authority.census).unwrap()),
+        windows: vec!["primary".into()],
+    };
+    let mut earlier: ManualRequest =
+        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    earlier.job = uuid::Uuid::new_v4().to_string();
+    earlier.windows.push("closed-before-claim".into());
+    let old_path = root.path().join(format!("{}.request", earlier.job));
+    let old_bytes = serde_json::to_vec(&earlier).unwrap();
+    save(&old_path, &old_bytes);
+
+    earlier.job = uuid::Uuid::new_v4().to_string();
+    earlier.target_hash = "c".repeat(64);
+    earlier.windows = vec!["other-build".into()];
+    save(
+        &root.path().join(format!("{}.request", earlier.job)),
+        &serde_json::to_vec(&earlier).unwrap(),
+    );
+
+    assert_eq!(
+        request.carried_windows(root.path()).unwrap(),
+        BTreeSet::from(["closed-before-claim".into()])
+    );
+    assert_eq!(fs::read(old_path).unwrap(), old_bytes);
+}
+
+#[test]
 fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
     let root = crate::test_fixture::tempdir().unwrap();
     let mut authority = preparation(root.path()).authority;
@@ -261,6 +298,10 @@ fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn pending_prepared_keeps_original_census_and_exact_window_slots_for_retry() {
     let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
@@ -383,13 +424,30 @@ fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
 }
 
 #[test]
+fn checkpoint_discovery_requires_a_known_string_phase() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    let path = &preparation.authority.checkpoint_path;
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&checkpoint(&preparation, "Prepared")).unwrap();
+    for phase in [
+        serde_json::json!({ "Ready": null }),
+        serde_json::json!("Future"),
+    ] {
+        checkpoint["phase"] = phase;
+        save(path, &serde_json::to_vec(&checkpoint).unwrap());
+        assert!(PendingRecovery::inspect_at(path).is_err());
+    }
+}
+
+#[test]
 fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let bytes = checkpoint(&preparation, "Prepared");
     assert_eq!(
         validate_checkpoint(&preparation.authority, &bytes).unwrap(),
-        "Prepared"
+        Phase::Prepared
     );
     let mut foreign: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     foreign["proof"]["host_incarnation"] = "unrelated-daemon".into();
@@ -445,7 +503,7 @@ fn a_reviewed_conversation_whose_provider_ended_need_not_be_checkpointed() {
     // window restarts the saved conversation.
     assert_eq!(
         check(&mut preparation, chat(PROVIDER_ENDED)).unwrap(),
-        "Prepared"
+        Phase::Prepared
     );
     // Any other reviewed conversation must still be in the checkpoint.
     assert_eq!(
@@ -800,6 +858,10 @@ fn captured_pane_aliases_and_presentations_bind_the_exact_confirmed_allocation()
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issued_alias() {
     for original_id in [None, Some(uuid::Uuid::new_v4().to_string())] {
         let root = crate::test_fixture::tempdir().unwrap();
@@ -860,7 +922,7 @@ fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issue
                 &serde_json::to_vec(&checkpoint).unwrap()
             )
             .unwrap(),
-            "Ready"
+            Phase::Ready
         );
         checkpoint["chats"][0]["launch"]["session_id"] = uuid::Uuid::new_v4().to_string().into();
         assert!(
@@ -1044,7 +1106,7 @@ fn scale_census(
             title: format!("chat {index}"),
             identity: "0".repeat(64),
             disposition: crate::update::impact::Disposition::Resumes,
-            reason: String::new(),
+            reason: "".into(),
             interrupted_subagents: Vec::new(),
         });
         captured.push(source.clone(), snapshot).unwrap();
@@ -1495,9 +1557,48 @@ fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
         released, 0,
         "the daemon lease was not released: {released_error}"
     );
-    assert!(receipt.inherit(&mut Command::new("/bin/true")).is_err());
+    assert!(receipt.inherit(&mut Command::new("true")).is_err());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn prepared_standby_proof_is_bound_to_the_target_and_locked_descriptions() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    save(
+        &preparation.authority.checkpoint_path,
+        &checkpoint(&preparation, "Prepared"),
+    );
+    let target = fs::canonicalize("/bin/sh").unwrap();
+    let lease = handoff(root.path());
+    let receipt = preparation
+        .acknowledged()
+        .unwrap()
+        .receipt(&target, &lease)
+        .unwrap()
+        .unwrap();
+    assert!(receipt.standby_proof(&target).is_ok());
+    let different = root.path().join("sh");
+    fs::copy(&target, &different).unwrap();
+    assert!(receipt.standby_proof(&different).is_err());
+
+    let unheld = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&receipt.authority.daemon_path)
+        .unwrap();
+    assert!(validate_lock(&unheld, &receipt.authority.daemon_path).is_err());
+    let unheld_legacy = OpenOptions::new()
+        .read(true)
+        .open(&receipt.authority.legacy_path)
+        .unwrap();
+    assert!(validate_lock_mode(&unheld_legacy, &receipt.authority.legacy_path, "READ").is_err());
+    let mut modified = receipt.authority.clone();
+    modified.target_hash = "0".repeat(64);
+    assert!(validate_authority_target(&target, &modified).is_err());
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn recovery_receipt_is_immutable_after_its_causal_identity_is_sealed() {
     let root = crate::test_fixture::tempdir().unwrap();
@@ -1516,6 +1617,7 @@ fn recovery_receipt_is_immutable_after_its_causal_identity_is_sealed() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn mutable_files_and_invalid_descriptors_cannot_pass_the_receipt_seal_check() {
     let file = tempfile::tempfile().unwrap();
@@ -2192,7 +2294,7 @@ fn reviewed_payload_budget_is_rejected_before_source_preparation() {
     let mut preparation = preparation(root.path());
     preflight_preparation_size(&preparation.authority).unwrap();
     preparation.authority.reviewed.as_mut().unwrap().sessions[0].reason =
-        "x".repeat(LIMIT as usize);
+        "x".repeat(LIMIT as usize).into();
     let error = preflight_preparation_size(&preparation.authority).unwrap_err();
     assert!(error.contains("byte limit"), "{error}");
     assert!(!preparation.authority.checkpoint_path.exists());
@@ -2712,6 +2814,43 @@ fn complete_files(files: &SettledFiles) {
             &[],
         )
         .unwrap();
+}
+
+#[test]
+fn explicit_retry_reads_only_the_exact_completed_archive() {
+    let files = settled_files();
+    let hash = &files.record.checkpoint_hash;
+    let capture = CapturedCensus {
+        producer: Some(CaptureProducer::Acknowledged {
+            job: files.record.job.clone(),
+            request_hash: files.record.job_request_hash.clone(),
+        }),
+        source: files.record.source.clone(),
+        checkpoint_hash: Some(hash.clone()),
+        census: files.record.census.clone(),
+        windows: files.record.windows.clone(),
+    };
+    persist_bound_capture(&files.checkpoint, &capture).unwrap();
+    let inspect =
+        |hash: &str| PendingRecovery::inspect_archived_at(&files.checkpoint, hash, &files.target);
+    assert!(inspect(hash).unwrap().is_none());
+
+    complete_files(&files);
+    let pending = inspect(hash).unwrap().unwrap();
+    assert!(pending.original_census_complete);
+    assert_eq!(pending.census, capture.census);
+    assert_eq!(pending.windows, capture.windows);
+    assert!(inspect(&"0".repeat(64)).unwrap().is_none());
+
+    let archived = pending.checkpoint_path;
+    let hidden = archived.with_extension("hidden");
+    fs::rename(&archived, &hidden).unwrap();
+    assert!(inspect(hash).is_err());
+    fs::rename(&hidden, &archived).unwrap();
+    save(&files.checkpoint, br#"{"phase":"Ready"}"#);
+    assert!(inspect(hash).unwrap().is_none());
+    assert_eq!(fs::read(&archived).unwrap(), files.checkpoint_bytes);
+    assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
 }
 
 #[test]
@@ -3352,6 +3491,10 @@ fn verified_new_canonical_quarantines_unsafe_history_without_losing_evidence() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn retirement_sweeps_only_closed_private_metadata_temporaries() {
     let files = settled_files();
     let active = OpenOptions::new()
@@ -3454,6 +3597,7 @@ fn retained_checkpoint_without_prepared_phase_has_no_settled_classification() {
     );
 }
 
+#[cfg(target_os = "linux")]
 mod forwarding_tests {
     use super::*;
     use std::process::Stdio;

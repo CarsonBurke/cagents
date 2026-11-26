@@ -176,6 +176,8 @@ pub struct PaneMove {
 }
 
 mod conversation_titles;
+#[cfg(feature = "host")]
+pub use conversation_titles::image_placeholder_prompt;
 pub use conversation_titles::{channel_title, channel_title_from_prompt};
 
 /// The identity of a registry that has never been created.
@@ -765,7 +767,9 @@ pub fn canonical_checkout(repository: &Path, checkout: &Path) -> Result<Option<P
 pub fn checkout_branch(repository: &Path, checkout: &Path) -> Option<String> {
     let dot_git = checkout.join(".git");
     let administrative = if dot_git.is_dir() {
-        Some(dot_git.clone())
+        crate::git_marker::present(&dot_git)
+            .unwrap_or(true)
+            .then(|| dot_git.clone())
     } else {
         gitdir_line(&dot_git)
     }
@@ -834,8 +838,8 @@ pub fn repository_display_name(repository: &Path) -> String {
 }
 
 /// A Git repository with one linked worktree, for tests of checkouts.
-#[cfg(test)]
-pub(crate) struct CheckoutFixture {
+#[cfg(any(test, feature = "test-support"))]
+pub struct CheckoutFixture {
     pub directory: tempfile::TempDir,
     /// The repository key: the common Git directory, canonical.
     pub repository: PathBuf,
@@ -843,9 +847,13 @@ pub(crate) struct CheckoutFixture {
     pub linked: PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl CheckoutFixture {
-    pub(crate) fn new() -> Self {
+    #[allow(
+        clippy::new_without_default,
+        reason = "it creates repositories on disk, which is no default value"
+    )]
+    pub fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let main = directory.path().join("repo");
         std::fs::create_dir(&main).unwrap();
@@ -935,6 +943,18 @@ mod tests {
         let folder = std::fs::canonicalize(&plain).unwrap();
         assert_eq!(canonical_checkout(&folder, &folder), Ok(None));
         assert!(canonical_checkout(&folder, &fixture.linked).is_err());
+    }
+
+    #[test]
+    fn an_empty_git_directory_does_not_hide_a_registered_worktree_branch() {
+        let fixture = CheckoutFixture::new();
+        let marker = fixture.linked.join(".git");
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert_eq!(
+            checkout_branch(&fixture.repository, &fixture.linked).as_deref(),
+            Some("feature")
+        );
     }
 
     /// Postcard is positional: a carried older CLI's channel creation has no

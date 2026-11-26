@@ -21,10 +21,13 @@ pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::fro
 
 #[cfg(feature = "host")]
 pub(crate) mod claude_metadata;
-#[cfg(any(feature = "ui", all(test, feature = "host")))]
+#[cfg(any(
+    feature = "ui",
+    all(any(test, feature = "test-support"), feature = "host")
+))]
 pub mod client;
 #[cfg(feature = "host")]
-pub(crate) mod native_holder;
+pub mod native_holder;
 #[cfg(feature = "host")]
 pub mod protocol;
 #[cfg(feature = "host")]
@@ -924,6 +927,12 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 /// The largest image an ACP prompt carries inline.
 pub const ACP_MAX_IMAGE_BYTES: u64 = 16 * MIB;
 
+/// A provider's [`Event::Status`] detail while its turn waits only on
+/// commands the agent left running in the background, having said all it
+/// will until they finish. The turn is still open, and a message sent now
+/// waits for it.
+pub const WAITING_ON_BACKGROUND_WORK: &str = "Waiting on background work";
+
 /// Inline tool images are spooled to private files before entering a snapshot.
 pub const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
@@ -1176,6 +1185,67 @@ pub fn is_retained_resume_commit(source: &Session, started: &Session) -> bool {
         && started.has_valid_native_continuity()
 }
 
+/// An identity-only projection: `replacement` is `source` with nothing changed
+/// but the conversation ID and native continuity its provider confirmed. It
+/// covers retained Claude helpers and daemon-hosted Codex threads on their own
+/// listener, the two actors whose first identity arrives after the descriptor
+/// was saved. This shape grants no authority: callers must authenticate the
+/// exact source lineage (the hosted actor, the helper's census, or the
+/// daemon's own saved agent record) before updating a saved agent or pane.
+pub fn is_confirmed_identity_update(source: &Session, replacement: &Session) -> bool {
+    let learns = match source.launch.provider {
+        Provider::Claude => matches!(
+            source.native_continuity,
+            NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ),
+        // A begun Codex thread never changes identity, and only a thread on
+        // its own listener belongs to this one hosted conversation.
+        Provider::Codex => {
+            source.launch.session_id.is_none()
+                && source.owns_codex_listener()
+                && source.native_continuity == NativeContinuity::ReconnectOnly
+        }
+        _ => false,
+    };
+    if !learns
+        || !source.has_valid_native_continuity()
+        || !replacement.has_valid_native_continuity()
+        || !source
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.is_complete())
+        || replacement
+            .launch
+            .session_id
+            .as_ref()
+            .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+    {
+        return false;
+    }
+    let mut projected = source.clone();
+    projected.launch.session_id = replacement.launch.session_id.clone();
+    if source.launch.provider == Provider::Codex
+        && matches!(
+            replacement.native_continuity,
+            NativeContinuity::Durable { .. }
+        )
+    {
+        projected.native_continuity = replacement.native_continuity.clone();
+    }
+    projected == *replacement
+}
+
+/// [`is_confirmed_identity_update`] for a daemon-hosted Codex thread only: the
+/// first ID its provider confirmed for a thread that had none. A Codex thread
+/// never changes identity once begun, so a saved copy holding this ID is never
+/// outdated by the copy without it, and either may be restored from the other.
+/// A Claude conversation can be cleared or replaced under the same process, so
+/// copying a saved Claude ID onto a descriptor that lacks one could revive a
+/// conversation the person left; callers that restore an ID use this instead.
+pub fn is_first_codex_identity_update(source: &Session, replacement: &Session) -> bool {
+    source.launch.provider == Provider::Codex && is_confirmed_identity_update(source, replacement)
+}
+
 /// A formerly hosted pane may never have observed its first provider identity.
 /// This narrow transition is usable only after authenticated upgrade resolution,
 /// exact attachment and snapshot confirmation, followed by a writer receipt.
@@ -1310,7 +1380,7 @@ fn set_codex_remote(arguments: &mut [String], index: usize, address: String) {
 
 /// The local endpoint recorded by a Codex launch recipe. This is execution
 /// evidence only; ownership and replacement admission are checked separately.
-pub(crate) fn recorded_codex_socket(recipe: &LaunchRecipe) -> Option<std::path::PathBuf> {
+pub fn recorded_codex_socket(recipe: &LaunchRecipe) -> Option<std::path::PathBuf> {
     let (_, address) = codex_remote_argument(&recipe.arguments)?;
     let path = address
         .strip_prefix("unix://")
@@ -1348,7 +1418,7 @@ impl Session {
 
     /// The endpoint in the saved launch, including panes predating allocator
     /// records. Reading it grants no authority to replace an external server.
-    pub(crate) fn recorded_codex_socket(&self) -> Option<std::path::PathBuf> {
+    pub fn recorded_codex_socket(&self) -> Option<std::path::PathBuf> {
         if self.launch.provider != Provider::Codex {
             return None;
         }
@@ -1357,7 +1427,7 @@ impl Session {
 
     /// A typed descriptor shape, never proof of an authenticated live helper.
     /// Adoption and persistence callers must also resolve its exact actor owner.
-    pub(crate) fn has_unnamed_retained_claude_actor(&self) -> bool {
+    pub fn has_unnamed_retained_claude_actor(&self) -> bool {
         self.launch.session_id.is_none()
             && matches!(
                 self.native_continuity,
@@ -1661,6 +1731,7 @@ impl PromptSuggestion {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Snapshot {
     /// Resident live-turn excerpt; never transcript serialization or wire state.
     #[serde(skip)]
@@ -1715,6 +1786,14 @@ pub struct Snapshot {
     #[serde(default)]
     pub native_continuity: NativeContinuity,
     pub title: Option<String>,
+    /// Whether the current conversation's provider explicitly cleared its name.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    pub provider_title_cleared: bool,
+    /// The first meaningful user prompt, kept independently of loaded pages.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    pub opening_title: Option<OpeningTitle>,
     pub error: Option<String>,
     /// Why this snapshot shows saved history without an executable provider.
     /// Carried over IPC so every client explains the same read-only state.
@@ -1771,6 +1850,58 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// How a request to hand the queued messages to the running turn stands.
+    /// Last, so that a client or source from before it reads the rest.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
+    )]
+    pub send_now: Option<SendNow>,
+}
+
+/// As derived, except that a client from before [`SendNow`] is sent the
+/// fields it decodes: see [`Snapshot::send_now`].
+impl Serialize for Snapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// As derived, except that one from a source before [`SendNow`] has no
+/// request to read and stands for none.
+impl<'de> Deserialize<'de> for Snapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
+        }
+        Self::deserialize(deserializer)
+    }
+}
+
+/// What became of a request to hand the queued messages to the running turn
+/// ([`Command::SendQueuedNow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendNow {
+    /// Asked for. The provider has not yet said how the turn will make way,
+    /// or is still admitting a queued message the request has to name.
+    Requested,
+    /// The turn takes the messages in without being stopped: whatever it was
+    /// waiting on carries on out of its way.
+    Delivering,
+    /// The turn could not take them in, so it was stopped and the messages
+    /// start the next one.
+    Stopped,
+    /// Nothing was waiting that could go early; what is queued goes when the
+    /// turn reaches it.
+    Declined,
+}
+
+impl SendNow {
+    /// Whether the request is still being carried out, so asking again would
+    /// only repeat it.
+    pub fn in_flight(self) -> bool {
+        self != Self::Declined
+    }
 }
 
 /// When a provider takes a message it is holding.
@@ -1888,13 +2019,52 @@ pub struct AgentAddress {
     pub subagent: String,
 }
 
+/// The task a Codex agent was given, in words, as its agent path names it:
+/// `/root/descendants_design` reads as Descendants design. Codex's second
+/// multi-agent version gives each agent a path from the root agent, whose
+/// last part is the name its parent chose for the task.
+pub fn codex_agent_task(path: &str) -> Option<String> {
+    // The root agent is the conversation itself, not a task.
+    if path.trim_matches('/') == "root" {
+        return None;
+    }
+    let task = path
+        .rsplit('/')
+        .find(|part| !part.trim().is_empty())?
+        .split(['_', '-', ' '])
+        .filter(|word| !word.is_empty())
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut letters = task.chars();
+    let first = letters.next()?;
+    Some(first.to_uppercase().chain(letters).take(120).collect())
+}
+
+/// A thread-listing observation for a child whose transcript and later
+/// status changes aren't subscribed. It travels in the existing detail field.
+pub const UNLOADED_CHILD_RUNNING: &str = "Last seen running · transcript not loaded";
+
 impl Subagent {
+    pub fn last_seen_running(&self) -> bool {
+        self.status == ToolStatus::Running && self.detail == UNLOADED_CHILD_RUNNING
+    }
+
+    /// Live work that this connection can still observe and act on.
+    pub fn is_live(&self) -> bool {
+        self.status.is_live() && !self.last_seen_running()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status == ToolStatus::Running && !self.last_seen_running()
+    }
+
     /// Delegated work, running or waiting on its own background work, that
     /// cancelling the parent's turn would also stop, where the provider's
     /// interrupt does not spare it. Claude Code's interrupt kills a waiting
     /// agent and its own background work as it does a running one.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
-        self.status.is_live() && self.background && capabilities.interrupt_stops_background
+        self.is_live() && self.background && capabilities.interrupt_stops_background
     }
 }
 
@@ -1958,6 +2128,7 @@ impl Snapshot {
         let mut activity = SubagentActivity::default();
         for agent in &self.subagents {
             match agent.status {
+                ToolStatus::Running if agent.last_seen_running() => {}
                 ToolStatus::Running if agent.waiting => activity.waiting += 1,
                 ToolStatus::Running => activity.working += 1,
                 ToolStatus::Waiting => activity.on_background_work += 1,
@@ -1971,7 +2142,10 @@ impl Snapshot {
     /// Drop renderable history while retaining provider continuity, controls,
     /// activity and pending interactions. Only the UI client's disposable copy
     /// uses this: the daemon still owns paging and the authoritative transcript.
-    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    #[cfg(any(
+        feature = "ui",
+        all(any(test, feature = "test-support"), feature = "host")
+    ))]
     pub fn evict_transcript(&mut self) {
         self.items = Vec::new();
         for child in &mut self.subagents {
@@ -1981,7 +2155,10 @@ impl Snapshot {
 
     /// Logical body bytes referenced by this owner, not unique heap bytes:
     /// immutable items can be Arc-shared with other snapshots and caches.
-    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    #[cfg(any(
+        feature = "ui",
+        all(any(test, feature = "test-support"), feature = "host")
+    ))]
     pub fn transcript_bytes(&self) -> usize {
         self.items
             .iter()
@@ -2001,15 +2178,11 @@ impl Snapshot {
     /// its turn, a question to the user, or a subagent working or waiting on
     /// its own background work.
     pub fn holds_work(&self) -> bool {
-        self.turn_accepted() || self.subagents.iter().any(|agent| agent.status.is_live())
+        self.turn_accepted() || self.subagents.iter().any(Subagent::is_live)
     }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
-        self.busy
-            || self
-                .subagents
-                .iter()
-                .any(|agent| agent.status == ToolStatus::Running)
+        self.busy || self.subagents.iter().any(Subagent::is_running)
     }
     pub fn activity(&self) -> ActivityState {
         if self.exited {
@@ -2029,7 +2202,7 @@ impl Snapshot {
             || self
                 .subagents
                 .iter()
-                .any(|agent| agent.waiting && agent.status == ToolStatus::Running)
+                .any(|agent| agent.waiting && agent.is_running())
         {
             ActivityState::Waiting
         } else if self.is_working() {
@@ -2223,7 +2396,10 @@ impl Command {
             | Self::LoadLater
             | Self::LoadFileChanges { .. }
             | Self::LoadFileChangePatches { .. }
-            | Self::ReadTextCopy { .. } => false,
+            | Self::ReadTextCopy { .. }
+            // The messages it hurries gave their work when they were queued,
+            // and asking twice changes nothing.
+            | Self::SendQueuedNow => false,
         }
     }
 
@@ -2255,7 +2431,8 @@ impl Command {
             | Self::SetInterruptMode { .. }
             | Self::ListBranches
             | Self::LoadLater
-            | Self::ReadTextCopy { .. } => false,
+            | Self::ReadTextCopy { .. }
+            | Self::SendQueuedNow => false,
         }
     }
 }
@@ -2344,6 +2521,11 @@ pub enum Command {
         source: TextCopySource,
         offset: u64,
     },
+    /// Hand everything queued to the running turn now, without stopping its
+    /// subagents or background work. Carried only where
+    /// [`Capabilities::send_queued_now`] says so; [`Snapshot::send_now`]
+    /// says how it went.
+    SendQueuedNow,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -2508,7 +2690,7 @@ impl Subagent {
     /// Whether it holds its conversation apart from the turn: it runs in the
     /// background, or waits on background work of its own.
     pub fn outlives_turn(&self) -> bool {
-        self.status == ToolStatus::Waiting || self.background && self.status.is_live()
+        self.status == ToolStatus::Waiting || self.background && self.is_live()
     }
 }
 
@@ -3060,7 +3242,7 @@ impl Item {
     /// Whether this is a later part of an item too long for one, which is still
     /// a single thing the provider did or said.
     #[cfg(feature = "host")]
-    pub(crate) fn continues_paged_item(&self) -> bool {
+    pub fn continues_paged_item(&self) -> bool {
         TranscriptPart::parse(&self.id).is_some()
     }
 
@@ -3316,6 +3498,7 @@ pub struct Skill {
     pub invocation: String,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Capabilities {
     pub steer: bool,
     pub queue: bool,
@@ -3342,6 +3525,42 @@ pub struct Capabilities {
     /// background, rather than only the turn and the work inside it.
     #[serde(default)]
     pub interrupt_stops_background: bool,
+    /// Whether [`Command::SendQueuedNow`] is carried: the provider can hand
+    /// what is queued to a turn blocked on long work without stopping the
+    /// work.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
+    )]
+    pub send_queued_now: bool,
+    /// Whether what is queued when a turn is stopped or refused waits for
+    /// the reader, who can send it with [`Command::SendQueuedNow`] or start
+    /// one message of it, rather than starting the next turn by itself.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_queue_holds"
+    )]
+    pub queue_holds: bool,
+}
+
+/// Omit capabilities appended after the recipient's protocol version.
+impl Serialize for Capabilities {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// Default capabilities the source's protocol cannot report.
+impl<'de> Deserialize<'de> for Capabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 2));
+        }
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::QUEUE_HOLDS) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
+        }
+        Self::deserialize(deserializer)
+    }
 }
 /// Provider-confirmed speed setting, independent of model reasoning effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3675,6 +3894,9 @@ pub enum Event {
     },
     QueueChanged(Vec<QueuedMessage>),
     QueueRemoval(QueueRemoval),
+    /// How a request to send what is queued now stands, or `None` once it is
+    /// over: the messages it named left the queue or the turn ended.
+    SendNow(Option<SendNow>),
     /// Published until the provider has answered the asynchronous history
     /// request, independently of the command acknowledgement.
     HistoryLoading(bool),
@@ -3701,6 +3923,90 @@ pub enum Event {
     /// Live evidence about the main conversation's prompt cache. The
     /// runtime keeps it beside the transcript, never in it.
     PromptCache(prompt_cache::Evidence),
+    /// A prompt-derived title from the exact conversation's opening.
+    #[cfg(feature = "host")]
+    OpeningTitle(OpeningTitle),
+    /// The provider has established that no older messages can supply a name.
+    #[cfg(feature = "host")]
+    OpeningHistoryComplete,
+    /// An explicit removal of the provider name for this exact conversation.
+    #[cfg(feature = "host")]
+    ProviderTitleCleared {
+        id: String,
+    },
+}
+
+#[cfg(feature = "host")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A provider-independent title inferred from user content on the daemon.
+pub enum OpeningTitle {
+    Conversation,
+    Image,
+    Prompt(String),
+}
+
+#[cfg(feature = "host")]
+impl OpeningTitle {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Image => "Image conversation",
+            Self::Prompt(title) => title,
+        }
+    }
+
+    pub fn provisional(&self) -> bool {
+        !matches!(self, Self::Prompt(_))
+    }
+
+    pub(crate) fn from_text(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() || mailbox_prompt(text) {
+            return None;
+        }
+        let title = crate::workspace_model::channel_title_from_prompt(text)
+            .map(Self::Prompt)
+            .unwrap_or_else(|| {
+                if crate::workspace_model::image_placeholder_prompt(text) {
+                    Self::Image
+                } else {
+                    Self::Conversation
+                }
+            });
+        Some(title)
+    }
+
+    pub(crate) fn observe(current: &mut Option<Self>, item: &Item) {
+        if item.role != Role::User || current.as_ref().is_some_and(|title| !title.provisional()) {
+            return;
+        }
+        let candidate = match &item.content {
+            ItemContent::Text {
+                text,
+                thinking: false,
+                ..
+            } => Self::from_text(text),
+            ItemContent::Image { .. } => Some(Self::Image),
+            _ => None,
+        };
+        if let Some(candidate) = candidate
+            && (current.is_none() || !candidate.provisional())
+        {
+            *current = Some(candidate);
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn mailbox_prompt(text: &str) -> bool {
+    // This filters title candidates on replay. A seal grants no authority
+    // here. Only the daemon's recognizer can turn a prompt into a delivery.
+    text.starts_with("[cagents ")
+        && crate::agent_execution::mailbox::open_all(
+            text,
+            &crate::agent_execution::mailbox::SealShaped,
+        )
+        .is_some()
 }
 
 #[cfg(test)]
@@ -4864,68 +5170,19 @@ fn claude_configured_default_mode_in(
         .ok_or(())
     }
 
-    let environment = |name: &str| {
-        (!recipe.unset_environment.contains(name))
-            .then(|| {
-                recipe
-                    .environment
-                    .get(name)
-                    .cloned()
-                    .or_else(|| std::env::var(name).ok())
-            })
-            .flatten()
-            .filter(|value| !value.is_empty())
-    };
-    if environment("CLAUDE_CODE_PERMISSION_MODE").is_some() {
-        // This explicit choice outranks settings; do not pin a CLI default
-        // during fresh creation or when converting an older launch.
+    if claude_launch_variable(recipe, "CLAUDE_CODE_PERMISSION_MODE").is_some() {
+        // An explicit environment choice outranks settings.
         return None;
     }
-    let resolve = |path: std::path::PathBuf| {
-        if path.is_absolute() {
-            path
-        } else {
-            recipe.working_directory.join(path)
-        }
-    };
-    let user_home = environment("HOME")
-        .map(std::path::PathBuf::from)
-        .map(resolve);
-    let root = environment("CLAUDE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .map(resolve)
-        .or_else(|| user_home.as_ref().map(|home| home.join(".claude")))?;
-    let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
-    for directory in recipe.working_directory.ancestors() {
-        if user_home.as_deref() == Some(directory) {
-            if recipe.working_directory == directory
-                && setting(&directory.join(".claude/settings.local.json"))
-                    .ok()
-                    .flatten()
-                    .is_some()
-            {
-                // HOME itself can be a project cwd. Its local setting then
-                // belongs to that session, but never to descendant projects.
-                return None;
-            }
-            break;
-        }
-        if ["settings.local.json", "settings.json"]
-            .into_iter()
-            .any(|name| {
-                let path = directory.join(".claude").join(name);
-                if account_settings.is_some()
-                    && std::fs::canonicalize(&path).ok() == account_settings
-                {
-                    return false;
-                }
-                setting(&path).ok().flatten().is_some()
-            })
-        {
-            // A project-specific choice belongs to Claude's own settings
-            // handling, not to a command-line override from another account.
-            return None;
-        }
+    let (user_home, root) = claude_launch_homes(recipe)?;
+    if claude_project_setting(
+        recipe,
+        user_home.as_deref(),
+        &root,
+        &["settings.local.json", "settings.json"],
+        |path| setting(path).ok().flatten().is_some(),
+    ) {
+        return None;
     }
 
     // A managed home isolates a login, not the user's permission preference.
@@ -4954,4 +5211,182 @@ fn claude_configured_default_mode_in(
     setting(&root.join("settings.json"))
         .ok()?
         .filter(|mode| mode != "default")
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_launch_variable(recipe: &LaunchRecipe, name: &str) -> Option<String> {
+    (!recipe.unset_environment.contains(name))
+        .then(|| {
+            recipe
+                .environment
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        })
+        .flatten()
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_launch_homes(
+    recipe: &LaunchRecipe,
+) -> Option<(Option<std::path::PathBuf>, std::path::PathBuf)> {
+    let resolve = |path: std::path::PathBuf| {
+        if path.is_absolute() {
+            path
+        } else {
+            recipe.working_directory.join(path)
+        }
+    };
+    let user_home = claude_launch_variable(recipe, "HOME")
+        .map(std::path::PathBuf::from)
+        .map(resolve);
+    let root = claude_launch_variable(recipe, "CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .map(resolve)
+        .or_else(|| user_home.as_ref().map(|home| home.join(".claude")))?;
+    Some((user_home, root))
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_project_setting(
+    recipe: &LaunchRecipe,
+    user_home: Option<&std::path::Path>,
+    root: &std::path::Path,
+    files: &[&str],
+    has_setting: impl Fn(&std::path::Path) -> bool,
+) -> bool {
+    let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
+    for directory in recipe.working_directory.ancestors() {
+        if user_home == Some(directory) {
+            if recipe.working_directory == directory
+                && files.contains(&"settings.local.json")
+                && has_setting(&directory.join(".claude/settings.local.json"))
+            {
+                // HOME itself can be a project cwd. Its local setting then
+                // belongs to that session, but never to descendant projects.
+                return true;
+            }
+            break;
+        }
+        if files.iter().any(|name| {
+            let path = directory.join(".claude").join(name);
+            if account_settings.is_some() && std::fs::canonicalize(&path).ok() == account_settings {
+                return false;
+            }
+            has_setting(&path)
+        }) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(feature = "host")]
+fn managed_claude_attribution(
+    recipe: &LaunchRecipe,
+    homes: &crate::account::home::Homes,
+    system_home: &std::path::Path,
+    sources: &str,
+) -> Option<serde_json::Value> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn attribution(path: &std::path::Path) -> Option<serde_json::Value> {
+        const MAX_SETTINGS: u64 = 1024 * 1024;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let bytes = crate::fs_safety::read_bounded(&mut file, MAX_SETTINGS).ok()?;
+        if bytes.len() as u64 > MAX_SETTINGS {
+            return None;
+        }
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        settings
+            .get("attribution")
+            .filter(|value| {
+                value.as_bool() == Some(false)
+                    || value.as_object().is_some_and(|fields| {
+                        fields
+                            .get("commit")
+                            .is_none_or(serde_json::Value::is_string)
+                            && fields.get("pr").is_none_or(serde_json::Value::is_string)
+                            && fields
+                                .get("sessionUrl")
+                                .is_none_or(serde_json::Value::is_boolean)
+                    })
+            })
+            .cloned()
+    }
+
+    let enabled = |name| sources.split(',').any(|source| source.trim() == name);
+    if !enabled("user") {
+        return None;
+    }
+    let (user_home, root) = claude_launch_homes(recipe)?;
+    if !homes
+        .managed_identity(&root)
+        .is_some_and(|(provider, _)| provider == Provider::Claude)
+    {
+        return None;
+    }
+    let cwd = &recipe.working_directory;
+    let shared = cwd.join(".claude/settings.json");
+    if enabled("project")
+        && attribution(&shared).is_some()
+        && shared.canonicalize().ok() != root.join("settings.json").canonicalize().ok()
+    {
+        return None;
+    }
+    if enabled("local") {
+        // Current Claude reads personal settings from the primary checkout
+        // and continues to read a legacy local file from the starting cwd.
+        let from_cwd = attribution(&cwd.join(".claude/settings.local.json")).is_some();
+        let from_checkout = || {
+            let primary = claude_local_checkout(cwd)?;
+            if &primary == cwd || user_home.as_ref() == Some(&primary) {
+                return None;
+            }
+            let uid = unsafe { libc::geteuid() };
+            for path in [
+                primary.clone(),
+                primary.join(".git"),
+                primary.join(".claude"),
+            ] {
+                match std::fs::metadata(path) {
+                    Ok(metadata) if metadata.uid() == uid => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return None,
+                }
+            }
+            attribution(&primary.join(".claude/settings.local.json"))
+        };
+        if from_cwd || from_checkout().is_some() {
+            return None;
+        }
+    }
+    attribution(&system_home.join("settings.json"))
+}
+
+/// Find the checkout whose personal settings apply to this Claude session.
+#[cfg(feature = "host")]
+fn claude_local_checkout(directory: &std::path::Path) -> Option<std::path::PathBuf> {
+    let (checkout, git) = directory.ancestors().find_map(|checkout| {
+        crate::project_location::git_directories(checkout).map(|git| (checkout, git))
+    })?;
+    if git.private == git.common {
+        return Some(checkout.to_path_buf());
+    }
+    if git.common.file_name().is_some_and(|name| name == ".git") {
+        return git.common.parent().map(std::path::Path::to_path_buf);
+    }
+    crate::repository::RepositoryService::system("git")
+        .managed_primary_checkout(directory, &crate::repository::CancellationToken::new())
+        .ok()
+        .flatten()
 }

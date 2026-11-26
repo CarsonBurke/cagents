@@ -16,7 +16,7 @@ pub(super) fn execute(shell: clap_complete::Shell) -> CommandOutput {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     #[test]

@@ -16,12 +16,12 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
-    os::fd::AsRawFd,
     os::unix::{
         ffi::OsStringExt,
         fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 const CONFIG_PATH: &str = ".cagents/worktree.toml";
@@ -255,19 +255,9 @@ impl SetupCheckout {
         self.check()?;
         index.check(&self.admin)?;
         check_cancel(cancel)?;
-        let spec = RepositoryService::system("git")
-            .git_base(&self.target.process_path(), true)
-            .arg(format!("--git-dir={}", self.admin.process_path().display()))
-            .arg(format!(
-                "--work-tree={}",
-                self.target.process_path().display()
-            ))
+        let spec = self
+            .git(index)?
             .args(["-c", "core.hooksPath=/dev/null"])
-            .env("GIT_COMMON_DIR", self.common.process_path())
-            .env(
-                "GIT_INDEX_FILE",
-                format!("/proc/{}/fd/{}", std::process::id(), index.file.as_raw_fd()),
-            )
             .args(args);
         let result = SystemProcessExecutor
             .execute(&spec, cancel)
@@ -276,10 +266,53 @@ impl SetupCheckout {
         index.check(&self.admin)?;
         Ok(result)
     }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unnecessary_wraps)] // The Darwin backend prepares retained descriptors.
+    fn git(&self, index: &SetupIndex) -> Result<crate::process::CommandSpec, SetupError> {
+        let target = self.target.process_path();
+        Ok(RepositoryService::system("git")
+            .git_base(&target, true)
+            .arg(format!("--git-dir={}", self.admin.process_path().display()))
+            .arg(format!("--work-tree={}", target.display()))
+            .env("GIT_COMMON_DIR", self.common.process_path())
+            .env("GIT_INDEX_FILE", index.child_path()))
+    }
+
+    /// Start Git in the retained worktree and give it the open index. Darwin
+    /// cannot traverse a directory through /dev/fd, so Git still reaches the
+    /// admin and common directories, including shared index files, by path.
+    /// Check these paths before and after Git runs and disable subprocesses
+    /// that repository configuration could otherwise choose.
+    #[cfg(target_os = "macos")]
+    fn git(&self, index: &SetupIndex) -> Result<crate::process::CommandSpec, SetupError> {
+        use std::os::fd::AsRawFd;
+        let mut git_dir = OsString::from("--git-dir=");
+        git_dir.push(self.admin.path());
+        let directory = Arc::new(self.target.retained_directory().map_err(error)?);
+        // Resolve lookup in the parent's cwd. A relative PATH entry after
+        // fchdir would let a checkout supply the Git that inspects it.
+        let executable =
+            crate::repository::resolved_git_executable(Path::new("git")).map_err(error)?;
+        RepositoryService::system(executable)
+            .git_base(Path::new("."), true)
+            .cwd_held(directory)
+            .map_err(error)?
+            .arg(git_dir)
+            .arg("--work-tree=.")
+            .env("GIT_COMMON_DIR", self.common.path())
+            .env(
+                "GIT_INDEX_FILE",
+                format!("/dev/fd/{}", index.file.as_raw_fd()),
+            )
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .inherit_file(Arc::clone(&index.file))
+            .map_err(error)
+    }
 }
 
 struct SetupIndex {
-    file: fs::File,
+    file: Arc<fs::File>,
     fingerprint: SourceFingerprint,
 }
 
@@ -291,11 +324,22 @@ impl SetupIndex {
             return Err(error("setup index must be a regular file"));
         }
         let result = Self {
-            file,
+            file: Arc::new(file),
             fingerprint: source_fingerprint(&metadata),
         };
         result.check(admin)?;
         Ok(result)
+    }
+
+    /// How Git, run while this index is held, names it.
+    #[cfg(target_os = "linux")]
+    fn child_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.file.as_raw_fd()
+        ))
     }
 
     fn check(&self, admin: &fs_safety::Root) -> Result<(), SetupError> {
@@ -554,12 +598,10 @@ fn matches(
         // A primary checkout may physically contain managed worktrees.
         // Never recurse into another Git checkout, including the destination
         // itself, when a broad glob such as **/.env is configured.
-        if metadata.is_dir() {
-            match fs_safety::metadata_beneath(root, &child.join(".git")) {
-                Ok(_) => continue,
-                Err(err) if err.is_not_found() => {}
-                Err(err) => return Err(error(err)),
-            }
+        if metadata.is_dir()
+            && crate::git_marker::present_beneath(root, &child.join(".git")).map_err(error)?
+        {
+            continue;
         }
         if parts[0] == "**" {
             if metadata.is_dir() {
@@ -733,8 +775,9 @@ fn prepare_with_checkpoints(
             )));
         }
         // Establish anonymous-file support before creating copy directories.
-        // Its inode stays unnamed until exact-FD no-replace publication; a
-        // shared parent cannot replace a temporary source or cleanup target.
+        // Its inode stays out of other users' reach until exact no-replace
+        // publication; a shared parent cannot replace a temporary source or
+        // cleanup target.
         let mut output = fs_safety::create_anonymous_in(target, 0o600).map_err(error)?;
         let parent = fs_safety::create_directories_beneath(
             target,
@@ -776,7 +819,7 @@ fn prepare_with_checkpoints(
             before_copy_publication(&parent, &output, &path);
             fs_safety::link_anonymous_new(
                 &parent,
-                &output,
+                &mut output,
                 path.file_name().expect("matched file has a name"),
             )
             .map_err(SetupError::Filesystem)
@@ -818,7 +861,7 @@ fn prepare_with_checkpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::symlink, process::Command};
+    use std::{os::fd::AsRawFd, os::unix::fs::symlink, process::Command};
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -1083,6 +1126,43 @@ mod tests {
         assert!(!fixture.destination.join(".env").exists());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn setup_git_starts_in_the_retained_worktree_and_reads_the_retained_index() {
+        let fixture = Fixture::new();
+        let cancel = CancellationToken::new();
+        let service = RepositoryService::system("git");
+        let common = service.common_dir(&fixture.primary, &cancel).unwrap();
+        let checkout = SetupCheckout::capture(&fixture.destination, &common).unwrap();
+        let index = SetupIndex::capture(&checkout.admin).unwrap();
+        let git = checkout.git(&index).unwrap().env("PATH", ".");
+        assert!(git.program.is_absolute());
+
+        let moved = fixture.destination.with_file_name("moved");
+        fs::rename(&fixture.destination, &moved).unwrap();
+        fs::create_dir(&fixture.destination).unwrap();
+        let index_path = checkout.admin.path().join("index");
+        fs::rename(&index_path, index_path.with_file_name("old-index")).unwrap();
+        fs::write(&index_path, "replacement").unwrap();
+
+        let show_root = SystemProcessExecutor
+            .execute(&git.clone().args(["rev-parse", "--show-toplevel"]), &cancel)
+            .unwrap();
+        assert!(show_root.success, "{show_root:?}");
+        assert_eq!(
+            show_root.stdout.strip_suffix(b"\n").unwrap(),
+            moved.canonicalize().unwrap().as_os_str().as_encoded_bytes()
+        );
+        let listed = SystemProcessExecutor
+            .execute(
+                &git.args(["ls-files", "--cached", "-z", "--", "tracked"]),
+                &cancel,
+            )
+            .unwrap();
+        assert!(listed.success, "{listed:?}");
+        assert_eq!(listed.stdout, b"tracked\0");
+    }
+
     #[test]
     fn literal_copy_works_without_enumerating_primary_directory() {
         let fixture = Fixture::new();
@@ -1096,6 +1176,62 @@ mod tests {
             fs::read(fixture.destination.join(".env")).unwrap(),
             b"secret"
         );
+    }
+
+    /// Linux keeps the output unnamed until publication, so no entry in the
+    /// destination can stand in for it.
+    #[cfg(target_os = "linux")]
+    fn assert_unreachable_before_publication(parent: &fs_safety::Root, output: &fs::File) {
+        assert_eq!(output.metadata().unwrap().nlink(), 0);
+        assert!(
+            !fs::read_dir(parent.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".cagents-tmp-")
+            }),
+            "the copied output must have no replaceable source entry"
+        );
+    }
+
+    /// Darwin names the output once, inside a staging directory only this
+    /// user can enter or change, and nowhere in the destination itself.
+    #[cfg(target_os = "macos")]
+    fn assert_unreachable_before_publication(parent: &fs_safety::Root, output: &fs::File) {
+        let held = output.metadata().unwrap();
+        assert_eq!(held.nlink(), 1);
+        let mut staging = Vec::new();
+        for entry in fs::read_dir(parent.path()).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            assert_ne!(
+                (metadata.dev(), metadata.ino()),
+                (held.dev(), held.ino()),
+                "the copied output must have no replaceable source entry"
+            );
+            if metadata.is_dir()
+                && entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".cagents-tmp-")
+            {
+                assert_eq!(metadata.mode() & 0o7777, 0o700);
+                staging.push(entry.path());
+            }
+        }
+        let [staging] = staging.as_slice() else {
+            panic!("expected one staging directory, found {staging:?}");
+        };
+        let names: Vec<_> = fs::read_dir(staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let [named] = names.as_slice() else {
+            panic!("expected the staged output alone, found {names:?}");
+        };
+        let named = fs::symlink_metadata(named).unwrap();
+        assert_eq!((named.dev(), named.ino()), (held.dev(), held.ino()));
     }
 
     #[test]
@@ -1119,17 +1255,7 @@ mod tests {
                 || {},
                 |parent, output, path| {
                     assert_eq!(path, Path::new(".env"));
-                    assert_eq!(output.metadata().unwrap().nlink(), 0);
-                    assert!(
-                        !fs::read_dir(parent.path()).unwrap().any(|entry| {
-                            entry
-                                .unwrap()
-                                .file_name()
-                                .as_encoded_bytes()
-                                .starts_with(b".cagents-tmp-")
-                        }),
-                        "the copied output must have no replaceable source entry"
-                    );
+                    assert_unreachable_before_publication(parent, output);
                     retained = Some(output.try_clone().unwrap());
                     fs::write(&foreign, "foreign temporary lookalike").unwrap();
                     if collision {
@@ -1301,6 +1427,9 @@ mod tests {
         assert!(!fixture.destination.join(".env").exists());
     }
 
+    // POSIX ACLs are Linux's `system.posix_acl_*` extended attributes; Darwin
+    // keeps ACLs outside xattrs, and its xattr calls take a position argument.
+    #[cfg(target_os = "linux")]
     #[test]
     fn copy_preserves_restrictive_access_acl_and_removes_inherited_acl() {
         use std::os::fd::AsRawFd;
@@ -1582,9 +1711,19 @@ mod tests {
         fixture.git(&["worktree", "add", "--detach", other.to_str().unwrap()]);
         fs::write(fixture.primary.join(".env"), "primary secret").unwrap();
         fs::write(other.join(".env"), "other agent secret").unwrap();
+        let config = fixture.primary.join("config");
+        fs::create_dir_all(config.join(".git")).unwrap();
+        fs::write(config.join(".env"), "nested config").unwrap();
         let plan = fixture.config("copy = ['**/.env']");
         let result = fixture.prepare(&plan).unwrap();
-        assert_eq!(result.copied, [PathBuf::from(".env")]);
+        assert_eq!(
+            result.copied,
+            [PathBuf::from(".env"), PathBuf::from("config/.env")]
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join("config/.env")).unwrap(),
+            b"nested config"
+        );
         assert_eq!(
             fs::read(fixture.destination.join(".env")).unwrap(),
             b"primary secret"

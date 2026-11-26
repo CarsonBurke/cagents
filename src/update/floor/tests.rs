@@ -12,7 +12,24 @@ use std::{
 
 type Record = crate::upgrade::floor::Record;
 
+#[test]
+fn inherited_checkpoint_input_opens_at_the_start_in_the_child() {
+    let expected = br#"{"checkpoint":"private update input"}"#;
+    let mut file = anonymous_file().unwrap();
+    file.write_all(expected).unwrap();
+    let mut file = seal_file(file).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let fd = file.as_raw_fd();
+    let mut command = Command::new("cat");
+    command.arg(crate::descriptor::inherited_file_path(fd));
+    candidate::inherit(&mut command, fd);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, expected);
+}
+
 struct FakeSource {
+    preparation_mode: PreparationMode,
     preview: impact::Preview,
     inventory: Inventory,
     events: Arc<Mutex<Vec<String>>>,
@@ -27,6 +44,8 @@ struct FakeSource {
     predicted_service: bool,
     fail_inventory: bool,
     existing_checkpoint: bool,
+    window_close_refused: bool,
+    windows_drained: bool,
     close_attempts: usize,
     fail_close_at: Option<usize>,
     change_on_first_close: bool,
@@ -72,6 +91,9 @@ impl FakeSource {
 }
 
 impl FloorSource for FakeSource {
+    fn preparation_mode(&self) -> PreparationMode {
+        self.preparation_mode
+    }
     fn observe(&mut self) -> Result<impact::Preview, UpdateError> {
         self.observations.fetch_add(1, Ordering::Release);
         if self.settled.load(Ordering::Acquire) {
@@ -116,6 +138,13 @@ impl FloorSource for FakeSource {
             ));
         }
         Ok(())
+    }
+    fn close_saved_windows(&mut self) -> Result<bool, UpdateError> {
+        if self.window_close_refused {
+            self.event("window close refused");
+            return Err(invalid("A saved window kept its lease"));
+        }
+        Ok(self.windows_drained)
     }
     fn prepare(&mut self, _: &impact::DaemonImpact) -> Result<(), source::PrepareError> {
         if self.lose_prepare_ack {
@@ -394,12 +423,13 @@ fn fixture() -> FakeSource {
             title: "build".into(),
             identity: "exact terminal owner".into(),
             disposition: impact::Disposition::Continues,
-            reason: String::new(),
+            reason: "".into(),
             interrupted_subagents: Vec::new(),
         }],
         blockers: Vec::new(),
     };
     FakeSource {
+        preparation_mode: PreparationMode::AllowsReviewedStops,
         preview: impact::Preview {
             editors: Vec::new(),
             candidate: impact::Candidate {
@@ -431,6 +461,8 @@ fn fixture() -> FakeSource {
         predicted_service: false,
         fail_inventory: false,
         existing_checkpoint: false,
+        window_close_refused: false,
+        windows_drained: false,
         close_attempts: 0,
         fail_close_at: None,
         change_on_first_close: false,
@@ -446,6 +478,42 @@ fn fixture() -> FakeSource {
         interrupt_pending: Vec::new(),
         change_after_interrupt: false,
         cancel_on_interrupt: None,
+    }
+}
+
+#[test]
+fn acknowledged_only_leaves_the_source_running_if_preparation_is_unavailable() {
+    for blocked in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let mut source = fixture();
+        source.preparation_mode = PreparationMode::AcknowledgedOnly;
+        source.windows_drained = false;
+        if blocked {
+            source.preview.daemon.as_mut().unwrap().sessions[0].disposition =
+                impact::Disposition::Blocked;
+        }
+        let preview = source.preview.clone();
+        let mut job = job(path);
+        let error = quiesce_source(path, &mut job, &preview, true, &mut source)
+            .unwrap_err()
+            .to_string();
+        let events = source.events.lock().unwrap();
+        assert_eq!(
+            events.as_slice(),
+            if blocked {
+                vec![]
+            } else {
+                vec!["PrepareConfirmedUpgrade refused"]
+            },
+            "{error}"
+        );
+        assert!(
+            job.confirmation
+                .as_ref()
+                .and_then(|item| item.stop.as_ref())
+                .is_none()
+        );
     }
 }
 
@@ -506,6 +574,7 @@ fn job(directory: &Path) -> UpdateJob {
         confirmation: None,
         refusal: None,
         in_flight: Vec::new(),
+        recorded_by: None,
     };
     let file = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
     serde_json::to_writer(
@@ -643,13 +712,6 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
     let unrecorded = add_chat(&mut source, impact::Disposition::Resumes, false);
     let mut survivors = Survivors::default();
     survivors.record_prepared(&source.preview, source.preview.daemon.as_ref().unwrap());
-    survivors.prepared_source = Some(PreparationEvidence {
-        daemon: source.preview.daemon.clone().unwrap(),
-        census: crate::upgrade::recovery::Census {
-            chats: source.inventory.chats.clone(),
-            ..Default::default()
-        },
-    });
     let terminal = TerminalId::new();
     survivors
         .labels
@@ -660,10 +722,25 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
     survivors
         .labels
         .insert(unrecorded, "Unrecorded chat · alpha".into());
-    survivors.recovery_outcome = Some(crate::upgrade::recovery::RecoveryOutcome {
-        paused_chats: vec![chat, unrecorded],
-        paused_terminals: vec![terminal],
-    });
+    let before_verification = survivors.prepared_report();
+    assert!(survivors.paused_report().is_empty());
+    survivors.record_verified_pauses(
+        &recovery::Outcome::Usable {
+            serving: source
+                .preview
+                .daemon
+                .as_ref()
+                .unwrap()
+                .capability
+                .proof
+                .clone(),
+            terminals: 0,
+            chats: 0,
+            paused_chats: vec![chat, unrecorded],
+            paused_terminals: vec![terminal],
+        },
+        |id| *id == chat,
+    );
     let report = survivors.paused_report();
     assert!(
         report.contains("Offline tool rows · alpha: open its tab to continue"),
@@ -682,19 +759,23 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
         !report.contains("Unrecorded chat · alpha: choose Resume"),
         "{report}"
     );
-    assert!(
-        survivors
-            .prepared_report()
-            .contains("its conversation is paused after recovery")
-    );
+    assert_eq!(survivors.prepared_report(), before_verification);
+
+    let list = stop_list(&source.preview, &source.inventory, true).unwrap();
+    let stopped = list.items.into_iter().find(|item| item.id == chat).unwrap();
+    survivors.ended.insert((stopped.kind, stopped.id), stopped);
     assert!(
         !survivors
-            .prepared_report()
-            .contains("resumes after the update")
+            .paused_report()
+            .contains("Offline tool rows · alpha")
     );
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+)]
 fn zombie_source_metadata_does_not_mask_prepared_failure_or_start_another_daemon() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -816,7 +897,7 @@ listener.bind(sys.argv[2]);listener.listen()
         &installation,
         &state,
         &mut job,
-        &Err(invalid(original)),
+        &mut Err(invalid(original)),
         &mut handoff,
         &recovery,
         &mut survivors,
@@ -950,7 +1031,7 @@ fn partial_interruption_effects_are_reported_without_claiming_daemon_preparation
     survivors.late_turns.insert(first);
     let report = survivors.prepared_report();
     assert!(
-        report.contains("Offline tool rows · alpha: current turn interrupted"),
+        report.contains("Current turns interrupted:\n  Offline tool rows · alpha\n"),
         "{report}"
     );
     assert!(
@@ -2087,6 +2168,46 @@ fn recovery_report_keeps_completed_floor_actions_for_failures_after_quiescence()
 }
 
 #[test]
+fn a_window_close_refusal_does_not_request_source_preparation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut job = job(directory.path());
+    let mut source = fixture();
+    source.window_close_refused = true;
+    let preview = source.preview.clone();
+
+    let error =
+        quiesce_source(directory.path(), &mut job, &preview, false, &mut source).unwrap_err();
+
+    assert!(error.to_string().contains("A saved window kept its lease"));
+    assert_eq!(*source.events.lock().unwrap(), ["window close refused"]);
+    source.assert_running_panes_are_unmarked();
+}
+
+#[test]
+fn draining_windows_does_not_authorize_a_new_stop_review() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut job = job(directory.path());
+    let mut source = fixture();
+    source.windows_drained = true;
+    source.prepare_refusals = 1;
+    let preview = source.preview.clone();
+
+    let error =
+        quiesce_source(directory.path(), &mut job, &preview, true, &mut source).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("No exact resumable conversation")
+    );
+    assert_eq!(
+        *source.events.lock().unwrap(),
+        ["PrepareConfirmedUpgrade refused"]
+    );
+    source.assert_running_panes_are_unmarked();
+}
+
+#[test]
 fn ordinary_prepare_reads_no_floor_inventory() {
     let directory = tempfile::tempdir().unwrap();
     let mut source = fixture();
@@ -2361,7 +2482,7 @@ fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
         fn interrupted(&self) -> bool {
             false
         }
-        fn pause(&mut self) {
+        fn pause(&mut self, _deadline: Instant) {
             assert!(
                 Instant::now() < self.deadline,
                 "the full terminal update stalled"
@@ -2534,7 +2655,7 @@ fn completed_service_stop_reports_background_tasks_and_their_recovery() {
 }
 
 #[test]
-fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery() {
+fn accepted_prepare_reports_interrupted_turns_without_forecasting_recovery() {
     let mut source = fixture();
     let unchanged = add_chat(&mut source, impact::Disposition::Resumes, true);
     let resumes = add_chat(&mut source, impact::Disposition::Interrupted, true);
@@ -2570,13 +2691,12 @@ fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery(
     let daemon = source.preview.daemon.as_ref().unwrap();
     survivors.record_prepared(&source.preview, daemon);
     let report = survivors.prepared_report();
+    assert!(report.contains("  Reviewed automatic resume\n"), "{report}");
     assert!(
-        report.contains(
-            "Reviewed automatic resume: current turn interrupted; its saved conversation was kept"
-        ),
+        report.contains("  Reviewed paused conversation\n"),
         "{report}"
     );
-    assert!(report.contains("Reviewed paused conversation: current turn interrupted; after the update: its conversation could not be confirmed. Open its tab; if the conversation doesn't reopen, the tab says what to do"), "{report}");
+    assert!(!report.contains("could not be confirmed"), "{report}");
     assert!(
         report.contains("3 background tasks stopped; they do not resume automatically."),
         "{report}"

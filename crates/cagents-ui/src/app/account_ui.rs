@@ -6592,7 +6592,13 @@ impl Cagents {
                     .align_y(Alignment::Center)
                     .into(),
                 iced::widget::Space::new().width(Length::Fill).into(),
-                self.device_status_control(),
+                widget::row::with_children(vec![
+                    self.phone_status_control(),
+                    self.device_status_control(),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Center)
+                .into(),
             ])
             .align_y(Alignment::Center),
         )
@@ -13898,6 +13904,7 @@ mod app_tests {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         std::fs::create_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
         let link = |registry: &mut Registry, key| {
             registry.link(Provider::Codex, key, home.clone(), None, None, 1)
         };

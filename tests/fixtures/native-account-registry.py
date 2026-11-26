@@ -19,6 +19,9 @@ import sys
 import tomllib
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from git_ancestry import enclosing_checkout
+
 VERSION = 1
 NAMESPACE = "55555555-6666-4777-8888-999999999999"
 FAULT = b"[fixture-account-registry\n"
@@ -55,7 +58,7 @@ def fixture_root(operand):
     owned(root, directory=True)
     owned(root.parent, directory=True)
     owned(root.parent / ".native-evidence")
-    if any((p / ".git").exists() or (p / ".git").is_symlink() for p in root.parents):
+    if enclosing_checkout(root):
         raise ValueError("Native evidence must be outside Git ancestry")
     if "CAGENTS_EVIDENCE_FIXTURE" in os.environ and os.environ["CAGENTS_EVIDENCE_FIXTURE"] != str(root):
         raise ValueError("The selected fixture environment names another task")

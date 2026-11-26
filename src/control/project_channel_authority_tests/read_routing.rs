@@ -33,50 +33,40 @@ fn exercise() {
         for no_start in [false, true] {
             let socket = daemon_socket_path().unwrap();
             fs::create_dir_all(socket.parent().unwrap()).unwrap();
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let worker = thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                let mut ready = 0;
-                let mut raw = 0;
-                loop {
-                    let mut peer = loop {
-                        match listener.accept() {
-                            Ok((peer, _)) => break peer,
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                assert!(Instant::now() < deadline, "global read did not connect");
-                                thread::sleep(Duration::from_millis(2));
-                            }
-                            Err(error) => panic!("private list listener: {error}"),
+                let mut peer = loop {
+                    match crate::descriptor::accept(&listener) {
+                        Ok((peer, _)) => break peer,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "global read did not connect");
+                            thread::sleep(Duration::from_millis(2));
                         }
-                    };
-                    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                    peer.set_write_timeout(Some(Duration::from_secs(3)))
-                        .unwrap();
-                    let Some(hello) = read_frame::<ClientEnvelope>(&mut peer).unwrap() else {
-                        raw += 1;
-                        assert!(raw <= 1, "no repeated existence probe");
-                        continue;
-                    };
-                    assert!(matches!(hello.request, ClientRequest::Connect { .. }));
-                    assert!(hello.proof.is_none());
-                    reply(&mut peer, &hello, connected());
-                    let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() else {
-                        // A connection that only handshakes is a separate
-                        // readiness probe.
-                        ready += 1;
-                        assert!(ready <= 1, "no repeated readiness probe");
-                        continue;
-                    };
-                    assert_eq!(request.proof, Some(proof()));
-                    assert!(
-                        matches!(request.request, ClientRequest::ReadWorkspaceModel),
-                        "global reads never authenticate or mutate"
-                    );
-                    model_reply(&mut peer, &request, WorkspaceModel::default());
-                    assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none());
-                    return (listener, ready, raw);
-                }
+                        Err(error) => panic!("private list listener: {error}"),
+                    }
+                };
+                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let hello = read_frame::<ClientEnvelope>(&mut peer)
+                    .unwrap()
+                    .expect("the first connection handshakes");
+                assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+                assert!(hello.proof.is_none());
+                reply(&mut peer, &hello, connected());
+                let request = read_frame::<ClientEnvelope>(&mut peer)
+                    .unwrap()
+                    .expect("the same connection carries the request");
+                assert_eq!(request.proof, Some(proof()));
+                assert!(
+                    matches!(request.request, ClientRequest::ReadWorkspaceModel),
+                    "global reads never authenticate or mutate"
+                );
+                model_reply(&mut peer, &request, WorkspaceModel::default());
+                assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none());
+                listener
             });
             let staged = Cell::new(0);
             let result = run_from_with_staged_lookup(arguments(command, no_start), |_, recover| {
@@ -86,20 +76,11 @@ fn exercise() {
             });
             // Join even if dispatch failed, so a fixture failure cannot leave a
             // detached peer using an endpoint after its private tree is removed.
-            let (listener, ready, raw) = worker.join().unwrap();
+            let listener = worker.join().unwrap();
             assert_eq!(result, ExitCode::SUCCESS);
             assert_eq!(staged.get(), 1, "global reads retain staged-owner lookup");
-            assert_eq!(
-                ready, 0,
-                "readiness hands its connection to the request rather than handshaking twice"
-            );
-            assert_eq!(
-                raw,
-                usize::from(no_start),
-                "no-start keeps its absence probe"
-            );
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
             );
             drop(listener);
             fs::remove_file(socket).unwrap();

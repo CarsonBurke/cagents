@@ -1,6 +1,7 @@
 //! Each case of the startup environment contracts starts a real executable
-//! inside a planted parent session. The library's executables are checked in
-//! `tests/startup_environment_contract.rs`, the window in the UI crate's.
+//! inside a planted parent session. The command line is checked in
+//! `tests/startup_environment_contract.rs`, the daemon in the daemon crate's
+//! and the window in the UI crate's.
 
 use std::{
     collections::HashMap,
@@ -98,8 +99,7 @@ pub struct Installation {
 }
 
 impl Installation {
-    pub fn new(built: &str, companion: &str, then: &str) -> Self {
-        let built = Path::new(built);
+    pub fn new(built: &Path, companion: &str, then: &str) -> Self {
         let bin = tempfile::Builder::new()
             .prefix(".startup-environment-")
             .tempdir_in(built.parent().unwrap())

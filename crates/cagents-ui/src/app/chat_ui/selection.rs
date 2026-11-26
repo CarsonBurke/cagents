@@ -3473,7 +3473,7 @@ mod tests {
                 keyboard::key::NativeCode::Unidentified,
             ),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL,
+            modifiers: keyboard::Modifiers::COMMAND,
             text: None,
             repeat: false,
         })

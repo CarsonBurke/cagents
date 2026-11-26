@@ -230,9 +230,7 @@ pub(super) async fn codex_consume(
     key: &str,
     expected: &Identity,
 ) -> Result<ConsumeStatus, String> {
-    let mut command = command_with_path(account, program, search);
-    command.arg("app-server");
-    let mut session = Session::spawn(command).await?;
+    let mut session = Session::spawn_codex(account, program, search).await?;
     let result = async {
         session.send(&json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"cagents","version":env!("CARGO_PKG_VERSION")}}})).await?;
         codex_response(&mut session, 1).await?.map_err(|_| "Codex refused to start")?;

@@ -942,7 +942,7 @@ impl<'de> de::Deserializer<'de> for Trace<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

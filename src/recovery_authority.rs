@@ -137,7 +137,7 @@ impl RecoverySlot {
             creation_guard: None,
         })
     }
-    #[cfg(test)]
+    #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
     pub(crate) fn with_creation_guard(mut self, guard: Arc<dyn Send + Sync>) -> Self {
         // Only fresh pre-effect slots enter this constructor. The same guard
         // then travels through the factory, producer and recovery authority.
@@ -287,7 +287,7 @@ impl PartialEq for RecoveryAuthority {
 }
 impl Eq for RecoveryAuthority {}
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     #[test]

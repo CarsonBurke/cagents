@@ -125,7 +125,7 @@ impl UpdateResumeStore {
 fn open(path: &Path) -> Result<Connection> {
     prepare_private_database(path)?;
     let connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX

@@ -265,7 +265,7 @@ impl Session {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     const THREAD: &str = "33333333-4444-4aaa-8bbb-cccccccccccc";

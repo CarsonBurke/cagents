@@ -1,15 +1,16 @@
 //! Exact children preserved for a successor remain children of this daemon.
 //! Reserve before spawning, then transfer the original Child and its existing
-//! pidfd here if the holder is relinquished. One event-driven worker retains
+//! pin here if the holder is relinquished. One event-driven worker retains
 //! them until exit; it neither signals them nor reaps any unrelated child.
 use std::{
-    fs::{self, File},
     io,
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::AsRawFd,
     process::Child,
     sync::{Arc, Condvar, Mutex, OnceLock},
     thread::{self, JoinHandle},
 };
+
+pub use crate::pinned_process::PinnedChild;
 
 #[cfg(test)]
 pub(crate) use tests::TestService;
@@ -75,16 +76,16 @@ impl ServiceInitializer {
 /// may still publish late custody; only new spawn admission is closed. Dropping
 /// or cloning this observer never reopens admission or discards an owner.
 #[derive(Clone)]
-pub(crate) struct ExitDrain {
+pub struct ExitDrain {
     service: Option<Arc<Service>>,
 }
 
-pub(crate) fn begin_exit_drain() -> ExitDrain {
+pub fn begin_exit_drain() -> ExitDrain {
     SERVICE.begin_exit_drain()
 }
 
 impl ExitDrain {
-    pub(crate) fn try_seal_absence(&self) -> bool {
+    pub fn try_seal_absence(&self) -> bool {
         let Some(service) = &self.service else {
             return true;
         };
@@ -95,7 +96,7 @@ impl ExitDrain {
         state.exit_sealed
     }
 
-    pub(crate) fn pending_description(&self) -> String {
+    pub fn pending_description(&self) -> String {
         let Some(service) = &self.service else {
             return "Exact-child spawn admission closed; no service ownership".into();
         };
@@ -121,7 +122,7 @@ impl ExitDrain {
 
     /// Read BEFORE checking absence. Used only if the host listener is unusable;
     /// normal drain progress uses the existing daemon wake/listener path.
-    pub(crate) fn progress_epoch(&self) -> u64 {
+    pub fn progress_epoch(&self) -> u64 {
         self.service.as_ref().map_or(0, |service| {
             service
                 .state
@@ -133,7 +134,7 @@ impl ExitDrain {
 
     /// Lost-wake safe: a settlement between the caller's absence check and this
     /// wait changes the epoch under the SAME mutex. No retry timer or new worker.
-    pub(crate) fn wait_for_progress(&self, observed: u64) {
+    pub fn wait_for_progress(&self, observed: u64) {
         let Some(service) = &self.service else {
             return;
         };
@@ -149,7 +150,7 @@ impl ExitDrain {
 
 /// A spawn-time credit. Hold this alongside the original Child until normal
 /// reaping or transfer. Dropping an unused reservation returns its credit.
-pub(crate) struct Reservation {
+pub struct Reservation {
     service: Arc<Service>,
     slot: Option<usize>,
     ticket: u64,
@@ -163,7 +164,7 @@ impl std::fmt::Debug for Reservation {
     }
 }
 
-pub(crate) fn reserve() -> io::Result<Reservation> {
+pub fn reserve() -> io::Result<Reservation> {
     let service =
         SERVICE.get_or_start(|| Service::start(CAPACITY).map(|(service, _worker)| service))?;
     service.reserve()
@@ -171,13 +172,13 @@ pub(crate) fn reserve() -> io::Result<Reservation> {
 
 /// The daemon's lifecycle retries every RETENTION_RETRY while an entry is
 /// suspended, using only retained original ownership; it never opens a new
-/// pidfd by a remembered numeric PID.
+/// pin by a remembered numeric PID.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RetryReport {
-    pub(crate) rearmed: usize,
-    pub(crate) retained: usize,
+pub struct RetryReport {
+    pub rearmed: usize,
+    pub retained: usize,
 }
-pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
+pub fn retry_preserved() -> io::Result<RetryReport> {
     match SERVICE.get() {
         None => Ok(RetryReport {
             rearmed: 0,
@@ -187,7 +188,7 @@ pub(crate) fn retry_preserved() -> io::Result<RetryReport> {
     }
 }
 
-pub(crate) fn has_suspended_custody() -> bool {
+pub fn has_suspended_custody() -> bool {
     SERVICE
         .get()
         .is_some_and(|service| service.has_suspended_custody())
@@ -196,7 +197,7 @@ pub(crate) fn has_suspended_custody() -> bool {
 /// Pending spawn credits and retained original children are ownership even
 /// before a helper publishes its registry record. Empty-daemon cleanup must
 /// not discard them just because filesystem discovery found no helper.
-pub(crate) fn has_outstanding_ownership() -> bool {
+pub fn has_outstanding_ownership() -> bool {
     match SERVICE.get() {
         Some(service) => service.has_outstanding_ownership(),
         // Initialization failure cannot have handed out a spawn credit.
@@ -207,7 +208,7 @@ pub(crate) fn has_outstanding_ownership() -> bool {
 /// Preserved originals can outlive their former terminal record. This excludes
 /// ordinary caller-held spawn reservations, which remain covered by the normal
 /// terminal inventory and its explicit shutdown confirmation contract.
-pub(crate) fn has_retained_ownership() -> bool {
+pub fn has_retained_ownership() -> bool {
     match SERVICE.get() {
         Some(service) => service.has_retained_ownership(),
         None => false,
@@ -217,19 +218,19 @@ pub(crate) fn has_retained_ownership() -> bool {
 /// Report only retained ownership faults. This observes an existing service;
 /// healthy preservation and initialization failures with no children are not
 /// shutdown errors, and this query never initializes, retries or waits.
-pub(crate) fn retained_custody_error() -> Option<String> {
+pub fn retained_custody_error() -> Option<String> {
     match SERVICE.get() {
         Some(service) => service.retained_custody_error(),
         None => None,
     }
 }
 
-pub(crate) type RetainError = (io::Error, Child, File, Reservation);
+pub(crate) type RetainError = (io::Error, Child, PinnedChild, Reservation);
 impl Reservation {
     /// Final cleanup may hold the original Child outside this service's map.
     /// Mark that ownership before publishing the handoff or cancelling the
     /// spawn reservation. Its preallocated slot stays fenced through rollback.
-    pub(crate) fn quarantine(&self) {
+    pub fn quarantine(&self) {
         let slot = self.slot.expect("a live reservation owns one credit");
         let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
         debug_assert!(state.quarantined[slot].is_none_or(|ticket| ticket == self.ticket));
@@ -239,39 +240,43 @@ impl Reservation {
 
     /// Failure returns every ownership object intact. Insertion and wakeup are
     /// atomic to the worker: it cannot observe a transfer that is rolled back.
-    pub(crate) fn retain(self, child: Child, pidfd: File) -> Result<(), RetainError> {
-        self.retain_with_recovery(child, pidfd, false)
+    pub fn retain(self, child: Child, pin: PinnedChild) -> Result<(), RetainError> {
+        self.retain_with_recovery(child, pin, false)
     }
 
     /// Only a registered terminal holder retained after unconfirmed ordinary
     /// shutdown may outlive this daemon without blocking its exit. Its recovery
     /// record remains authoritative; the reaper still owns the exact child.
-    pub(crate) fn retain_recoverable(self, child: Child, pidfd: File) -> Result<(), RetainError> {
-        self.retain_with_recovery(child, pidfd, true)
+    pub(crate) fn retain_recoverable(
+        self,
+        child: Child,
+        pin: PinnedChild,
+    ) -> Result<(), RetainError> {
+        self.retain_with_recovery(child, pin, true)
     }
 
     fn retain_with_recovery(
         mut self,
         child: Child,
-        pidfd: File,
+        pin: PinnedChild,
         recoverable: bool,
     ) -> Result<(), RetainError> {
-        if let Err(error) = validate_pidfd(&child, &pidfd) {
-            return Err((error, child, pidfd, self));
+        if let Err(error) = validate(&child, &pin) {
+            return Err((error, child, pin, self));
         }
         let service = self.service.clone();
         let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(error) = state.failure.as_ref() {
             let error = io::Error::other(error.clone());
             drop(state);
-            return Err((error, child, pidfd, self));
+            return Err((error, child, pin, self));
         }
         if state.stopping {
             drop(state);
             return Err((
                 io::Error::other("Exact-child reaper is stopping"),
                 child,
-                pidfd,
+                pin,
                 self,
             ));
         }
@@ -279,10 +284,11 @@ impl Reservation {
         debug_assert!(state.entries[slot].is_none());
         state.entries[slot] = Some(Entry {
             child,
-            pidfd: Some(pidfd),
+            pin: Some(pin),
             ticket: self.ticket,
             suspended: false,
             recoverable,
+            exit_announced: None,
         });
         if let Err(error) = service.wake() {
             let entry = state.entries[slot]
@@ -292,7 +298,7 @@ impl Reservation {
             return Err((
                 error,
                 entry.child,
-                entry.pidfd.expect("normal transfer retains a pidfd"),
+                entry.pin.expect("normal transfer retains a pin"),
                 self,
             ));
         }
@@ -310,12 +316,12 @@ impl Reservation {
         Ok(())
     }
 
-    /// Final-drop fallback when normal transfer or spawn-time pidfd capture
+    /// Final-drop fallback when normal transfer or spawn-time pin capture
     /// fails. The existing credit guarantees storage without allocation or a
-    /// successful wake. No descriptor in this suspended entry authorizes a
-    /// wait or signal. Admission stops until this ownership fault is repaired;
+    /// successful wake. No pin in this suspended entry authorizes a wait or
+    /// signal. Admission stops until this ownership fault is repaired;
     /// the original Child and credit remain owned even if the worker stopped.
-    pub(crate) fn preserve_suspended(mut self, child: Child, pidfd: Option<File>, reason: &str) {
+    pub fn preserve_suspended(mut self, child: Child, pin: Option<PinnedChild>, reason: &str) {
         let service = self.service.clone();
         let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
         let slot = self
@@ -326,10 +332,11 @@ impl Reservation {
         let pid = child.id();
         state.entries[slot] = Some(Entry {
             child,
-            pidfd,
+            pin,
             ticket: self.ticket,
             suspended: true,
             recoverable: false,
+            exit_announced: None,
         });
         if state.failure.is_none() {
             state.failure = Some(format!("Exact child {pid} remains suspended: {reason}"));
@@ -363,16 +370,26 @@ impl Drop for Reservation {
 
 struct Entry {
     child: Child,
-    pidfd: Option<File>,
+    pin: Option<PinnedChild>,
     ticket: u64,
     suspended: bool,
     recoverable: bool,
+    /// When its pin first reported an exit that the child could not yet be
+    /// reaped for; see [`EXIT_SETTLE`].
+    exit_announced: Option<std::time::Instant>,
 }
+
+/// How long a child may stay unreapable after its pin reports its exit.
+/// Darwin announces an exit while it tears the process down, a moment before
+/// the child becomes a zombie that can be reaped; Linux makes the two one.
+const EXIT_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
 struct State {
     entries: Vec<Option<Entry>>,
     quarantined: Vec<Option<u64>>,
     free: Vec<usize>,
     next_ticket: u64,
+    // Every suspended entry has a recorded fault until recovery rearms it.
     failure: Option<String>,
     fatal: bool,
     worker_alive: bool,
@@ -383,6 +400,9 @@ struct State {
 }
 impl State {
     fn can_seal_exit(&self) -> bool {
+        if !self.admission_closed {
+            return false;
+        }
         ExitReadiness {
             capacity: self.entries.len(),
             free: self.free.len(),
@@ -390,13 +410,12 @@ impl State {
             fatal: self.fatal,
             worker_alive: self.worker_alive,
             stopping: self.stopping,
-            admission_closed: self.admission_closed,
             quarantined: self.quarantined.iter().any(Option::is_some),
         }
         .can_seal_exit(self.entries.iter().flatten().map(|entry| ExitCustody {
             recoverable: entry.recoverable,
             suspended: entry.suspended,
-            has_pidfd: entry.pidfd.is_some(),
+            has_pin: entry.pin.is_some(),
         }))
     }
 }
@@ -405,7 +424,7 @@ impl State {
 struct ExitCustody {
     recoverable: bool,
     suspended: bool,
-    has_pidfd: bool,
+    has_pin: bool,
 }
 
 struct ExitReadiness {
@@ -415,7 +434,6 @@ struct ExitReadiness {
     fatal: bool,
     worker_alive: bool,
     stopping: bool,
-    admission_closed: bool,
     quarantined: bool,
 }
 
@@ -424,13 +442,13 @@ impl ExitReadiness {
         let (retained, all_recoverable) = entries.fold((0, true), |(count, all), entry| {
             (
                 count + 1,
-                all && entry.recoverable && !entry.suspended && entry.has_pidfd,
+                all && entry.recoverable && !entry.suspended && entry.has_pin,
             )
         });
         let absent = self.free == self.capacity && retained == 0;
         // A registered terminal holder whose cleanup could not be confirmed
         // remains the recoverable owner after daemon exit. Keep its original
-        // Child and pidfd here until then, but do not wait indefinitely for a
+        // Child and pin here until then, but do not wait indefinitely for a
         // successor to release it. Every outstanding credit must already have
         // transferred into this explicit category; unpublished, suspended or
         // otherwise faulted ownership cannot authorize exit.
@@ -440,11 +458,11 @@ impl ExitReadiness {
             && !self.stopping
             && self.free + retained == self.capacity
             && all_recoverable;
-        self.admission_closed && (absent || recoverable) && !self.quarantined
+        (absent || recoverable) && !self.quarantined
     }
 }
 struct Service {
-    event: File,
+    event: crate::descriptor::Wake,
     state: Mutex<State>,
     progress: Condvar,
     #[cfg(test)]
@@ -509,12 +527,8 @@ impl Service {
         let mut free = Vec::new();
         free.try_reserve_exact(capacity).map_err(io::Error::other)?;
         free.extend((0..capacity).rev());
-        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         let service = Arc::new(Self {
-            event: unsafe { File::from_raw_fd(fd) },
+            event: crate::descriptor::wake()?,
             state: Mutex::new(State {
                 entries,
                 quarantined,
@@ -568,7 +582,8 @@ impl Service {
     }
     fn has_suspended_custody(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.worker_alive
+        state.failure.is_some()
+            && state.worker_alive
             && !state.fatal
             && !state.stopping
             && state.entries.iter().flatten().any(|entry| entry.suspended)
@@ -587,9 +602,9 @@ impl Service {
                 continue;
             };
             if entry
-                .pidfd
+                .pin
                 .as_ref()
-                .is_some_and(|pidfd| validate_pidfd(&entry.child, pidfd).is_ok())
+                .is_some_and(|pin| validate(&entry.child, pin).is_ok())
             {
                 entry.suspended = false;
                 rearmed.push(slot);
@@ -640,15 +655,22 @@ impl Service {
         }
         let value = 1_u64;
         loop {
-            let written =
-                unsafe { libc::write(self.event.as_raw_fd(), (&value as *const u64).cast(), 8) };
+            // SAFETY: eight readable bytes, written to the owned, nonblocking
+            // notify end of the wake.
+            let written = unsafe {
+                libc::write(
+                    self.event.notify.as_raw_fd(),
+                    (&value as *const u64).cast(),
+                    8,
+                )
+            };
             if written == 8 {
                 return Ok(());
             }
             if written >= 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
-                    "Incomplete exact-child eventfd wake",
+                    "Incomplete exact-child wake",
                 ));
             }
             let error = io::Error::last_os_error();
@@ -660,18 +682,27 @@ impl Service {
             }
         }
     }
+    /// Takes every pending wake: an eventfd's counter in one read, a pipe's
+    /// coalesced notifications in as many reads as they fill.
     fn drain_wake(&self) -> io::Result<()> {
-        let mut value = 0_u64;
+        let mut value = [0_u64; 8];
         loop {
-            let read =
-                unsafe { libc::read(self.event.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
-            if read == 8 {
-                return Ok(());
+            // SAFETY: the buffer is writable for its whole size, and the watch
+            // end of the wake is owned and nonblocking.
+            let read = unsafe {
+                libc::read(
+                    self.event.watch.as_raw_fd(),
+                    value.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&value),
+                )
+            };
+            if read > 0 && read % 8 == 0 {
+                continue;
             }
             if read >= 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "Incomplete exact-child eventfd read",
+                    "Incomplete exact-child wake read",
                 ));
             }
             let error = io::Error::last_os_error();
@@ -725,13 +756,14 @@ impl Service {
                     .enumerate()
                     .filter_map(|(slot, entry)| {
                         let entry = entry.as_ref().filter(|entry| !entry.suspended)?;
-                        Some((slot, entry.ticket, entry.pidfd.as_ref()?.as_raw_fd()))
+                        let readiness = entry.pin.as_ref()?.exit_readiness().as_raw_fd();
+                        Some((slot, entry.ticket, readiness))
                     })
                     .collect::<Vec<_>>()
             };
             let mut poll = Vec::with_capacity(snapshot.len() + 1);
             poll.push(libc::pollfd {
-                fd: self.event.as_raw_fd(),
+                fd: self.event.watch.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -740,6 +772,10 @@ impl Service {
                 events: libc::POLLIN,
                 revents: 0,
             }));
+            // SAFETY: `poll` is an initialized, exclusively borrowed array of
+            // `poll.len()` pollfds, and poll touches nothing else. A
+            // descriptor whose entry left meanwhile can only report
+            // readiness, which the ticket check below discards.
             let result = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as _, -1) };
             if result < 0 {
                 let error = io::Error::last_os_error();
@@ -755,6 +791,7 @@ impl Service {
                 self.fail(error);
                 return;
             }
+            let mut settling = false;
             for ((slot, ticket, _), ready) in snapshot.iter().zip(&poll[1..]) {
                 if ready.revents == 0 {
                     continue;
@@ -766,7 +803,7 @@ impl Service {
                 else {
                     continue;
                 };
-                // Only this original Child is queried after its pinned pidfd
+                // Only this original Child is queried after its pin
                 // became ready. No process-wide wait or numeric PID signal.
                 let reaped = match entry.child.try_wait() {
                     Ok(Some(_)) => {
@@ -778,11 +815,22 @@ impl Service {
                         true
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Ok(None)
+                        if cfg!(target_os = "macos")
+                            && entry
+                                .exit_announced
+                                .get_or_insert_with(std::time::Instant::now)
+                                .elapsed()
+                                < EXIT_SETTLE =>
+                    {
+                        settling = true;
+                        continue;
+                    }
                     result => {
                         entry.suspended = true;
                         let error = match result {
                             Ok(None) => {
-                                "pidfd readiness did not confirm the exact child's exit".into()
+                                "exit readiness did not confirm the exact child's exit".into()
                             }
                             Err(error) => format!("exact child could not be reaped: {error}"),
                             _ => unreachable!(),
@@ -792,35 +840,30 @@ impl Service {
                         false
                     }
                 };
-                let empty = reaped && state.free.len() == state.entries.len();
-                let exit_ready = reaped && state.can_seal_exit();
+                let should_wake_daemon =
+                    !reaped || state.free.len() == state.entries.len() || state.can_seal_exit();
                 self.progress(&mut state);
                 drop(state);
-                if empty || exit_ready || !reaped {
+                if should_wake_daemon {
                     crate::daemon::wake();
                 }
+            }
+            if settling {
+                // Its pin stays ready, so wait a moment rather than spin.
+                thread::sleep(std::time::Duration::from_millis(1));
             }
         }
     }
 }
 
-fn validate_pidfd(child: &Child, pidfd: &File) -> io::Result<()> {
-    let fd = pidfd.as_raw_fd();
-    if fs::read_link(format!("/proc/self/fd/{fd}"))? != std::path::Path::new("anon_inode:[pidfd]") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Child reaping requires its original pidfd",
-        ));
-    }
-    let info = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
-    let actual = info.lines().find_map(|line| {
-        line.strip_prefix("Pid:")
-            .and_then(|pid| pid.trim().parse::<u32>().ok())
-    });
-    if actual != Some(child.id()) {
+/// A pin is taken from a child of this process, so the type proves it is a
+/// child's pin; the pid proves it is this child's, which, unreaped, still
+/// holds it.
+fn validate(child: &Child, pin: &PinnedChild) -> io::Result<()> {
+    if pin.pid() != child.id() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "The retained pidfd does not identify this exact Child",
+            "The retained pin does not identify this exact Child",
         ));
     }
     Ok(())
@@ -921,16 +964,7 @@ mod tests {
                 // Suspended entries may contain an absent or untrusted fd.
                 // Test teardown owns the original Child and may kill it here.
                 if !entry.suspended {
-                    let pidfd = entry.pidfd.as_ref().unwrap();
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            pidfd.as_raw_fd(),
-                            libc::SIGKILL,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                    }
+                    let _ = entry.pin.as_ref().unwrap().signal(libc::SIGKILL);
                 } else {
                     let _ = entry.child.kill();
                 }
@@ -941,7 +975,7 @@ mod tests {
 
     struct Probe {
         child: Option<Child>,
-        pidfd: File,
+        pin: PinnedChild,
     }
     impl Probe {
         fn spawn(arguments: &[&str]) -> Self {
@@ -954,62 +988,46 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as i32 };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
+            let pin = PinnedChild::of(&child).unwrap_or_else(|error| {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("fixture pidfd capture failed: {error}");
-            }
+                panic!("fixture pin capture failed: {error}");
+            });
             Self {
                 child: Some(child),
-                pidfd: unsafe { File::from_raw_fd(fd) },
+                pin,
             }
         }
-        fn take_with_pidfd(&mut self, pidfd: io::Result<File>) -> io::Result<(Child, File)> {
+        fn take_with_pin(
+            &mut self,
+            pin: io::Result<PinnedChild>,
+        ) -> io::Result<(Child, PinnedChild)> {
             // Descriptor duplication may fail. Keep the original Child in its
             // cleanup owner until every fallible preparation step succeeds.
-            let pidfd = pidfd?;
-            Ok((self.child.take().unwrap(), pidfd))
+            let pin = pin?;
+            Ok((self.child.take().unwrap(), pin))
         }
         fn handoff(&mut self, reservation: Reservation) {
-            let (child, pidfd) = self.take_with_pidfd(self.pidfd.try_clone()).unwrap();
-            match reservation.retain(child, pidfd) {
+            let (child, pin) = self.take_with_pin(self.pin.try_clone()).unwrap();
+            match reservation.retain(child, pin) {
                 Ok(()) => {}
-                Err((error, child, pidfd, reservation)) => {
+                Err((error, child, pin, reservation)) => {
                     self.child = Some(child);
-                    drop(pidfd);
+                    drop(pin);
                     drop(reservation);
                     panic!("fixture child transfer failed: {error}");
                 }
             }
         }
         fn signal(&self, signal: i32) {
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    self.pidfd.as_raw_fd(),
-                    signal,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            assert!(result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+            self.pin.signal(signal).unwrap();
         }
     }
     impl Drop for Probe {
         fn drop(&mut self) {
             // Only this fixture's pinned exact child is signalled, including
             // panic cleanup after the original Child moved into the service.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    self.pidfd.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                );
-            }
+            let _ = self.pin.signal(libc::SIGKILL);
             if let Some(child) = self.child.as_mut() {
                 let _ = child.wait();
             }
@@ -1017,11 +1035,11 @@ mod tests {
     }
 
     /// Only new drain tests use this owner: successful natural EOF/reaping does
-    /// not send a cleanup signal. A failing test still owns the exact pidfd.
+    /// not send a cleanup signal. A failing test still owns the exact pin.
     struct DrainChild {
         child: Option<Child>,
         stdin: Option<std::process::ChildStdin>,
-        pidfd: File,
+        pin: PinnedChild,
         armed: bool,
     }
     impl DrainChild {
@@ -1032,36 +1050,21 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) as i32 };
-            if fd < 0 {
-                let error = io::Error::last_os_error();
+            let pin = PinnedChild::of(&child).unwrap_or_else(|error| {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("fixture original pidfd capture failed: {error}");
-            }
+                panic!("fixture original pin capture failed: {error}");
+            });
             let stdin = child.stdin.take();
             Self {
                 child: Some(child),
                 stdin,
-                pidfd: unsafe { File::from_raw_fd(fd) },
+                pin,
                 armed: true,
             }
         }
         fn assert_original_reaped(&self) {
-            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.pidfd.as_raw_fd() as libc::id_t,
-                    &mut status,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            assert_eq!(result, -1);
-            assert_eq!(
-                io::Error::last_os_error().raw_os_error(),
-                Some(libc::ECHILD)
-            );
+            assert_reaped(&self.pin);
         }
     }
     impl Drop for DrainChild {
@@ -1070,29 +1073,22 @@ mod tests {
                 return;
             }
             self.stdin.take();
-            let mut poll = libc::pollfd {
-                fd: self.pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut poll, 1, 0) };
-            if ready <= 0 || poll.revents == 0 {
-                // Failure-only cleanup by the original capability, never a
+            if !self.pin.exited().unwrap_or(true) {
+                // Failure-only cleanup by the original pin, never a
                 // remembered PID. Normal test completion has already reaped.
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        self.pidfd.as_raw_fd(),
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    );
-                }
+                let _ = self.pin.signal(libc::SIGKILL);
             }
             if let Some(child) = self.child.as_mut() {
                 let _ = child.wait();
             }
         }
+    }
+
+    /// WNOWAIT never consumes a status, and the pin cannot name a reused
+    /// PID: ECHILD proves the exact original was already reaped.
+    fn assert_reaped(pin: &PinnedChild) {
+        let observed = pin.exit_status(libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
+        assert_eq!(observed.unwrap_err().raw_os_error(), Some(libc::ECHILD));
     }
 
     fn recoverable_exit_readiness(capacity: usize) -> ExitReadiness {
@@ -1103,7 +1099,6 @@ mod tests {
             fatal: false,
             worker_alive: true,
             stopping: false,
-            admission_closed: true,
             quarantined: false,
         }
     }
@@ -1111,7 +1106,7 @@ mod tests {
     const RECOVERABLE_CUSTODY: ExitCustody = ExitCustody {
         recoverable: true,
         suspended: false,
-        has_pidfd: true,
+        has_pin: true,
     };
 
     #[test]
@@ -1151,7 +1146,7 @@ mod tests {
                 .can_seal_exit([RECOVERABLE_CUSTODY, suspended].into_iter())
         );
         let unvalidated = ExitCustody {
-            has_pidfd: false,
+            has_pin: false,
             ..RECOVERABLE_CUSTODY
         };
         assert!(
@@ -1238,11 +1233,11 @@ mod tests {
         assert!(!reaper.service.has_retained_ownership());
         assert!(reaper.service.has_outstanding_ownership());
         let (publish, publish_rx) = mpsc::channel();
-        let pidfd = original.pidfd.try_clone().unwrap();
+        let pin = original.pin.try_clone().unwrap();
         let mut late_original = DrainChild {
             child: original.child.take(),
             stdin: None,
-            pidfd,
+            pin,
             armed: true,
         };
         let drain = thread::scope(|scope| {
@@ -1253,8 +1248,8 @@ mod tests {
                     return Err(io::Error::other(error));
                 }
                 reservation.quarantine();
-                let pidfd = match late_original.pidfd.try_clone() {
-                    Ok(pidfd) => pidfd,
+                let pin = match late_original.pin.try_clone() {
+                    Ok(pin) => pin,
                     Err(error) => {
                         drop(late_original);
                         drop(reservation);
@@ -1262,7 +1257,7 @@ mod tests {
                     }
                 };
                 let child = late_original.child.take().unwrap();
-                match reservation.retain(child, pidfd) {
+                match reservation.retain(child, pin) {
                     Ok(()) => {
                         // The reaper now owns the child; disarm the fixture's
                         // failure-only cleanup so its drop leaves it running.
@@ -1322,8 +1317,8 @@ mod tests {
         let reaper = TestService::new(1);
         let reservation = reaper.reserve().unwrap();
         let mut original = DrainChild::spawn();
-        let pidfd = original.pidfd.try_clone().unwrap();
-        reservation.preserve_suspended(original.child.take().unwrap(), Some(pidfd), "fixture");
+        let pin = original.pin.try_clone().unwrap();
+        reservation.preserve_suspended(original.child.take().unwrap(), Some(pin), "fixture");
         assert!(reaper.has_suspended_custody());
         assert_eq!(
             reaper.retry_preserved().unwrap(),
@@ -1357,7 +1352,7 @@ mod tests {
         let reaper = TestService::new(1);
         let reservation = reaper.reserve().unwrap();
         let mut original = DrainChild::spawn();
-        let pidfd = original.pidfd.try_clone().unwrap();
+        let pin = original.pin.try_clone().unwrap();
         reaper.service.close_admission();
         let drain = ExitDrain {
             service: Some(reaper.service.clone()),
@@ -1365,7 +1360,7 @@ mod tests {
         let observed = drain.progress_epoch();
         reservation.preserve_suspended(
             original.child.take().unwrap(),
-            Some(pidfd),
+            Some(pin),
             "fixture suspended original",
         );
         drain.wait_for_progress(observed);
@@ -1373,7 +1368,7 @@ mod tests {
         assert!(drain.pending_description().contains("1 suspended"));
         original.stdin.take();
         let mut poll = libc::pollfd {
-            fd: original.pidfd.as_raw_fd(),
+            fd: original.pin.exit_readiness().as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -1483,22 +1478,7 @@ mod tests {
         child.handoff(reservation);
         reaper.await_free(1);
         assert!(child.child.is_none());
-        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // WNOWAIT never consumes a status, and this fd cannot name a reused
-        // PID. ECHILD proves the service already reaped its exact original.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PIDFD,
-                child.pidfd.as_raw_fd() as libc::id_t,
-                &mut status,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        assert_eq!(result, -1);
-        assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::ECHILD)
-        );
+        assert_reaped(&child.pin);
         assert!(!service.has_outstanding_ownership());
         assert!(!service.has_retained_ownership());
     }
@@ -1621,7 +1601,7 @@ mod tests {
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let pid = owned.child.as_ref().unwrap().id();
         let error = owned
-            .take_with_pidfd(Err(io::Error::from_raw_os_error(libc::EMFILE)))
+            .take_with_pin(Err(io::Error::from_raw_os_error(libc::EMFILE)))
             .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
         assert_eq!(owned.child.as_ref().unwrap().id(), pid);
@@ -1707,8 +1687,8 @@ mod tests {
             "the final-cleanup queue must not hide this original child"
         );
         reaper.service.fail_wake.store(true, Ordering::Release);
-        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
-        let (error, child, pidfd, reservation) = reservation.retain(child, pidfd).unwrap_err();
+        let (child, pin) = owned.take_with_pin(owned.pin.try_clone()).unwrap();
+        let (error, child, pin, reservation) = reservation.retain(child, pin).unwrap_err();
         owned.child = Some(child);
         assert!(error.to_string().contains("injected"));
         assert!(
@@ -1719,7 +1699,7 @@ mod tests {
             reaper.service.state.lock().unwrap().quarantined[0],
             Some(ticket)
         );
-        drop(pidfd);
+        drop(pin);
         reaper.service.fail_wake.store(false, Ordering::Release);
         owned.handoff(reservation);
         assert!(reaper.service.has_retained_ownership());
@@ -1772,19 +1752,19 @@ mod tests {
     }
 
     #[test]
-    fn wrong_pidfd_returns_original_child_descriptor_and_reservation_without_transfer() {
+    fn wrong_pin_returns_original_child_descriptor_and_reservation_without_transfer() {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let mut unrelated = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let (child, wrong) = owned.take_with_pidfd(unrelated.pidfd.try_clone()).unwrap();
+        let (child, wrong) = owned.take_with_pin(unrelated.pin.try_clone()).unwrap();
         let pid = child.id();
-        let fd = wrong.as_raw_fd();
+        let fd = wrong.exit_readiness().as_raw_fd();
         let (error, child, returned, reservation) = reservation.retain(child, wrong).unwrap_err();
         owned.child = Some(child);
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(owned.child.as_ref().unwrap().id(), pid);
-        assert_eq!(returned.as_raw_fd(), fd);
+        assert_eq!(returned.exit_readiness().as_raw_fd(), fd);
         assert_eq!(reaper.free(), 0);
         assert!(
             unrelated
@@ -1806,15 +1786,15 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         let ticket = reservation.ticket;
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
+        let (child, pin) = owned.take_with_pin(owned.pin.try_clone()).unwrap();
         let pid = child.id();
-        let fd = pidfd.as_raw_fd();
+        let fd = pin.exit_readiness().as_raw_fd();
         reaper.service.fail_wake.store(true, Ordering::Release);
-        let (error, child, returned, reservation) = reservation.retain(child, pidfd).unwrap_err();
+        let (error, child, returned, reservation) = reservation.retain(child, pin).unwrap_err();
         owned.child = Some(child);
         assert!(error.to_string().contains("injected"));
         assert_eq!(owned.child.as_ref().unwrap().id(), pid);
-        assert_eq!(returned.as_raw_fd(), fd);
+        assert_eq!(returned.exit_readiness().as_raw_fd(), fd);
         assert_eq!(reservation.ticket, ticket);
         assert_eq!(reaper.free(), 0);
         assert!(
@@ -1837,15 +1817,15 @@ mod tests {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
+        let (child, pin) = owned.take_with_pin(owned.pin.try_clone()).unwrap();
         let pid = child.id();
         reaper.service.fail_wake.store(true, Ordering::Release);
-        let (error, child, pidfd, reservation) = reservation.retain(child, pidfd).unwrap_err();
-        reservation.preserve_suspended(child, Some(pidfd), &error.to_string());
+        let (error, child, pin, reservation) = reservation.retain(child, pin).unwrap_err();
+        reservation.preserve_suspended(child, Some(pin), &error.to_string());
         let state = reaper.service.state.lock().unwrap();
         let entry = state.entries[0].as_ref().unwrap();
         assert_eq!(entry.child.id(), pid);
-        assert!(entry.suspended && entry.pidfd.is_some());
+        assert!(entry.suspended && entry.pin.is_some());
         assert!(state.free.is_empty());
         assert!(state.failure.as_ref().unwrap().contains("injected"));
         drop(state);
@@ -1856,39 +1836,39 @@ mod tests {
     }
 
     #[test]
-    fn failed_pidfd_capture_preserves_original_child_without_inventing_reaping_authority() {
+    fn failed_pin_capture_preserves_original_child_without_inventing_reaping_authority() {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let child = owned.child.take().unwrap();
         let pid = child.id();
-        reservation.preserve_suspended(child, None, "spawn-time pidfd capture failed");
+        reservation.preserve_suspended(child, None, "spawn-time pin capture failed");
         assert!(
             reaper.service.has_outstanding_ownership(),
-            "missing registry/pidfd cannot make an owned child disappear from the idle census"
+            "missing registry/pin cannot make an owned child disappear from the idle census"
         );
         assert!(reaper.service.has_retained_ownership());
         let state = reaper.service.state.lock().unwrap();
         let entry = state.entries[0].as_ref().unwrap();
         assert_eq!(entry.child.id(), pid);
-        assert!(entry.suspended && entry.pidfd.is_none());
+        assert!(entry.suspended && entry.pin.is_none());
         assert!(state.free.is_empty());
         drop(state);
         assert!(reaper.service.reserve().is_err());
         assert!(
-            owned.pidfd.metadata().is_ok(),
+            owned.pin.exited().is_ok_and(|exited| !exited),
             "the fixture retains its own independent cleanup authority"
         );
     }
 
     #[test]
-    fn explicit_retry_rearms_only_retained_valid_pidfds_and_reaps_after_exit() {
+    fn explicit_retry_rearms_only_retained_valid_pins_and_reaps_after_exit() {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
+        let (child, pin) = owned.take_with_pin(owned.pin.try_clone()).unwrap();
         reservation.quarantine();
-        reservation.preserve_suspended(child, Some(pidfd), "fixture transfer failure");
+        reservation.preserve_suspended(child, Some(pin), "fixture transfer failure");
         reaper.service.fail_wake.store(true, Ordering::Release);
         assert!(reaper.service.retry_preserved().is_err());
         assert!(
@@ -1917,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_retry_keeps_missing_and_wrong_pidfds_suspended_without_new_admission() {
+    fn explicit_retry_keeps_missing_and_wrong_pins_suspended_without_new_admission() {
         let reaper = TestService::new(2);
         let mut unrelated = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let mut missing = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
@@ -1926,8 +1906,8 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         missing_reservation.preserve_suspended(missing.child.take().unwrap(), None, "missing fd");
         reaper.service.reserve().unwrap_err();
-        let (child, pidfd) = wrong.take_with_pidfd(unrelated.pidfd.try_clone()).unwrap();
-        reservation.preserve_suspended(child, Some(pidfd), "wrong fd");
+        let (child, pin) = wrong.take_with_pin(unrelated.pin.try_clone()).unwrap();
+        reservation.preserve_suspended(child, Some(pin), "wrong fd");
         assert_eq!(
             reaper.service.retry_preserved().unwrap(),
             RetryReport {
@@ -1959,12 +1939,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_retry_refuses_a_stopped_worker_even_with_a_valid_retained_pidfd() {
+    fn explicit_retry_refuses_a_stopped_worker_even_with_a_valid_retained_pin() {
         let mut reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
-        let (child, pidfd) = owned.take_with_pidfd(owned.pidfd.try_clone()).unwrap();
-        reservation.preserve_suspended(child, Some(pidfd), "fixture failure");
+        let (child, pin) = owned.take_with_pin(owned.pin.try_clone()).unwrap();
+        reservation.preserve_suspended(child, Some(pin), "fixture failure");
         reaper.service.state.lock().unwrap().stopping = true;
         reaper.service.wake().unwrap();
         reaper.worker.take().unwrap().join().unwrap();

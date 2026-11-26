@@ -21,6 +21,17 @@ pub struct StoppedPane {
     pub recovery: String,
 }
 
+impl StoppedPane {
+    pub fn recovery_notice(&self) -> String {
+        let detail = super::review::recovery_detail(&self.reason, &self.recovery);
+        let mut chars = detail.chars();
+        match chars.next() {
+            Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+            None => detail,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoppedWindow {
     pub window: usize,
@@ -149,7 +160,7 @@ impl SourceInspection {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn record_console_outcome(
+    pub fn record_console_outcome(
         &mut self,
         pane: TerminalId,
         kind: super::impact::SessionKind,
@@ -180,13 +191,7 @@ impl SourceInspection {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn stop(
-        &mut self,
-        pane: TerminalId,
-        kind: StoppedKind,
-        reason: &str,
-        recovery: &str,
-    ) {
+    pub fn stop(&mut self, pane: TerminalId, kind: StoppedKind, reason: &str, recovery: &str) {
         if self
             .stopped
             .iter()

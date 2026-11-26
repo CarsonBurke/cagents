@@ -187,6 +187,13 @@ const LISTENER_LIMITS: ListenerLimits = ListenerLimits {
 
 /// A process of the launched server blocked waiting for a file lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    target_os = "macos",
+    allow(
+        dead_code,
+        reason = "Darwin never observes a lock wait; see `launched_lock_wait`"
+    )
+)]
 struct LockWait {
     /// The process holding the lock, when the kernel reports one.
     holder: Option<i32>,
@@ -195,6 +202,7 @@ struct LockWait {
 /// Find a process of `group` that `locks`, in the format of `/proc/locks`,
 /// shows blocked behind another lock. Each blocked request follows the lock
 /// blocking it, marked `->`.
+#[cfg(target_os = "linux")]
 fn lock_wait_in(locks: &str, mut in_group: impl FnMut(i32) -> bool) -> Option<LockWait> {
     let mut holder = None;
     for line in locks.lines() {
@@ -212,6 +220,7 @@ fn lock_wait_in(locks: &str, mut in_group: impl FnMut(i32) -> bool) -> Option<Lo
 
 /// Whether a process of the launched server whose process group is `group`
 /// is blocked on a file lock another process holds.
+#[cfg(target_os = "linux")]
 fn launched_lock_wait(group: i32) -> Option<LockWait> {
     let locks = std::fs::read_to_string("/proc/locks").ok()?;
     lock_wait_in(&locks, |pid| {
@@ -220,6 +229,18 @@ fn launched_lock_wait(group: i32) -> Option<LockWait> {
             .and_then(|stat| crate::model::agent_recovery::process_identity(&stat))
             .is_some_and(|(actual, _)| actual == group)
     })
+}
+
+/// Darwin publishes no table of lock requests, so a process blocked on a
+/// file lock cannot be told from one doing its own work: neither the
+/// recorded lock owner nor `holds_open` on the lock file says who is waiting.
+/// No wait is ever proved, so the server's whole startup is charged to its
+/// own limit. That fails closed, never letting an unproved wait extend it,
+/// but a server queued behind many other Codex startups on one `CODEX_HOME`
+/// can run out of time where Linux would have waited for it.
+#[cfg(target_os = "macos")]
+fn launched_lock_wait(_group: i32) -> Option<LockWait> {
+    None
 }
 
 /// Join the endpoint of a server this conversation launched, once it accepts.
@@ -236,11 +257,31 @@ fn join_launched(
     path: &Path,
     limits: ListenerLimits,
     queued: &AtomicU64,
+    lock_wait: impl FnMut() -> Option<LockWait>,
+    halted: impl FnMut() -> Option<&'static str>,
+) -> Result<UnixStream, String> {
+    join_launched_with_clock(
+        path,
+        limits,
+        queued,
+        lock_wait,
+        halted,
+        Instant::now,
+        || thread::sleep(Duration::from_millis(20)),
+    )
+}
+
+fn join_launched_with_clock(
+    path: &Path,
+    limits: ListenerLimits,
+    queued: &AtomicU64,
     mut lock_wait: impl FnMut() -> Option<LockWait>,
     mut halted: impl FnMut() -> Option<&'static str>,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(),
 ) -> Result<UnixStream, String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let started = Instant::now();
+    let started = now();
     let mut sampled = started;
     let mut waited = Duration::ZERO;
     loop {
@@ -256,10 +297,10 @@ fn join_launched(
         if let Some(reason) = halted() {
             return Err(reason.into());
         }
-        let now = Instant::now();
-        if now.duration_since(sampled) >= limits.sample {
+        let current = now();
+        if current.duration_since(sampled) >= limits.sample {
             if let Some(wait) = lock_wait() {
-                waited += now.duration_since(sampled);
+                waited += current.duration_since(sampled);
                 queued.store(
                     u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
                     Ordering::Release,
@@ -275,15 +316,15 @@ fn join_launched(
                     ));
                 }
             }
-            sampled = now;
+            sampled = current;
         }
-        if now.duration_since(started).saturating_sub(waited) >= limits.own {
+        if current.duration_since(started).saturating_sub(waited) >= limits.own {
             return Err(format!(
                 "Codex server did not open its local socket within {} seconds",
                 limits.own.as_secs()
             ));
         }
-        thread::sleep(Duration::from_millis(20));
+        pause();
     }
 }
 
@@ -296,22 +337,6 @@ fn startup_halt_reason(child: Option<&ChildGuard>, cancelled: bool) -> Option<&'
         Some(Err(_)) => Some("Cannot verify Codex server process identity during startup"),
         Some(Ok(None)) | None => None,
     }
-}
-
-/// Whether the server a native holder launched is gone or a zombie its holder
-/// has not reaped yet.
-fn held_server_exited(server: &crate::daemon::holder_registry::Process) -> bool {
-    let Ok(stat) = std::fs::read(format!("/proc/{}/stat", server.pid)) else {
-        return true;
-    };
-    let zombie = std::str::from_utf8(&stat)
-        .ok()
-        .and_then(|stat| stat.rsplit_once(')'))
-        .and_then(|(_, fields)| fields.split_whitespace().next())
-        .is_some_and(|state| state == "Z");
-    zombie
-        || crate::model::agent_recovery::process_identity(&stat)
-            .is_none_or(|(_, start)| start != server.start)
 }
 
 impl Actor {
@@ -337,7 +362,7 @@ impl Actor {
                 startup_halt_reason(self.child.as_ref(), self.stop.load(Ordering::Acquire)).or_else(
                     || {
                         held.as_ref()
-                            .is_some_and(held_server_exited)
+                            .is_some_and(crate::daemon::holder_registry::Process::exited)
                             .then_some("Codex server exited before opening its local socket")
                     },
                 )
@@ -359,22 +384,14 @@ impl Actor {
 
     fn serve_websocket(&mut self, initial: Step, socket: UnixStream) -> Result<(), String> {
         if self.native_holder.is_some() {
-            let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-            let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-            if unsafe {
-                libc::getsockopt(
-                    socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_PEERCRED,
-                    (&mut credentials as *mut libc::ucred).cast(),
-                    &mut length,
-                )
-            } != 0
-                || length as usize != std::mem::size_of::<libc::ucred>()
-            {
-                return Err("Cannot verify owned app-server peer".into());
-            }
-            let peer = crate::daemon::holder_registry::Process::read(credentials.pid)
+            // The peer is only a candidate: an adopted server must match the
+            // identity its holder recorded, and the holder proves a new one
+            // descends from it before confirming it.
+            let pid = crate::pinned_process::peer_credentials(&socket)
+                .ok()
+                .and_then(|credentials| i32::try_from(credentials.pid).ok())
+                .ok_or("Cannot verify owned app-server peer")?;
+            let peer = crate::daemon::holder_registry::Process::read(pid)
                 .map_err(|error| error.to_string())?;
             if self
                 .expected_native_peer
@@ -478,7 +495,7 @@ impl Actor {
             }
             if !flushing && !close_sent && !peer_closed {
                 self.drain_commands(closing.is_some())?;
-                if let Some(bytes) = self.pending.pop_front() {
+                if let Some(super::QueuedWrite { bytes, .. }) = self.pending.pop_front() {
                     self.queued -= bytes.len();
                     let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
                     // WouldBlock means tungstenite has accepted and buffered this
@@ -619,7 +636,6 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
 
     /// Join without lock waits, under the production limits.
     fn join(
@@ -672,10 +688,10 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("late-response.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -766,10 +782,10 @@ mod tests {
     fn replaced_socket_is_not_joined() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("codex.sock");
-        let original = UnixListener::bind(&path).unwrap();
+        let original = crate::descriptor::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        let replacement = UnixListener::bind(&path).unwrap();
+        let replacement = crate::descriptor::bind(&path).unwrap();
         replacement.set_nonblocking(true).unwrap();
         assert!(connect(&path, metadata.dev(), metadata.ino()).is_err());
         assert_eq!(
@@ -782,7 +798,6 @@ mod tests {
     /// A socket bound at `path` that accepts nothing until it is told to
     /// listen, which is how a starting server first leaves its endpoint.
     fn bound(path: &Path) -> std::os::fd::OwnedFd {
-        use std::os::fd::{FromRawFd, OwnedFd};
         let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         address.sun_family = libc::AF_UNIX as _;
         let bytes = path.as_os_str().as_encoded_bytes();
@@ -790,10 +805,7 @@ mod tests {
         for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
             *target = *byte as _;
         }
-        let socket =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        assert!(socket >= 0, "{}", io::Error::last_os_error());
-        let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+        let socket = crate::descriptor::unix_socket(libc::SOCK_STREAM, false).unwrap();
         let result = unsafe {
             libc::bind(
                 socket.as_raw_fd(),
@@ -849,7 +861,7 @@ mod tests {
         provider.terminate().unwrap();
         assert_eq!(provider.child.try_wait().unwrap().unwrap().code(), Some(7));
 
-        let mut provider = ChildGuard::spawn(Process::new("/bin/true").process_group(0));
+        let mut provider = ChildGuard::spawn(Process::new("true").process_group(0));
         provider.child.wait().unwrap();
         assert_eq!(
             join(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
@@ -879,6 +891,8 @@ mod tests {
         );
     }
 
+    // Darwin publishes no lock-request table, so no wait is ever observed.
+    #[cfg(target_os = "linux")]
     #[test]
     fn lock_waits_are_found_only_for_the_launched_servers_group() {
         let locks = "\
@@ -904,6 +918,8 @@ mod tests {
         assert_eq!(lock_wait_in("", |_| true), None);
     }
 
+    // Darwin publishes no lock-request table, so no wait is ever observed.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_launched_server_blocked_on_a_held_lock_is_observed() {
         let directory = tempfile::tempdir().unwrap();
@@ -957,47 +973,53 @@ mod tests {
     #[test]
     fn time_queued_behind_another_lock_holder_is_not_charged_to_startup() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("codex.sock");
+        let second = Duration::from_secs(1);
         let limits = ListenerLimits {
-            own: Duration::from_millis(300),
-            queued: Duration::from_secs(5),
-            sample: Duration::from_millis(20),
+            own: 3 * second,
+            queued: 50 * second,
+            sample: second,
         };
-        let queued = AtomicU64::new(0);
-        let started = Instant::now();
-        let mut server = None;
-        let joined = join_launched(
-            &path,
-            limits,
-            &queued,
-            || {
-                (started.elapsed() < Duration::from_millis(900))
-                    .then_some(LockWait { holder: Some(7) })
-            },
-            || {
-                if started.elapsed() >= Duration::from_millis(1000) && server.is_none() {
-                    let bound = bound(&path);
-                    assert_eq!(unsafe { libc::listen(bound.as_raw_fd(), 1) }, 0);
-                    server = Some(bound);
-                }
-                None
-            },
-        );
+        let attempt = |path: &Path, lock_until: Duration| {
+            let queued = AtomicU64::new(0);
+            let origin = Instant::now();
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let mut server = None;
+            let joined = join_launched_with_clock(
+                path,
+                limits,
+                &queued,
+                || (elapsed.get() < lock_until).then_some(LockWait { holder: Some(7) }),
+                || None,
+                || origin + elapsed.get(),
+                || {
+                    elapsed.set(elapsed.get() + second);
+                    if elapsed.get() == 10 * second {
+                        let bound = bound(path);
+                        assert_eq!(unsafe { libc::listen(bound.as_raw_fd(), 1) }, 0);
+                        server = Some(bound);
+                    }
+                },
+            );
+            drop(server);
+            (
+                joined,
+                elapsed.get(),
+                Duration::from_millis(queued.load(Ordering::Acquire)),
+            )
+        };
+        let (joined, elapsed, queued) = attempt(&directory.path().join("queued.sock"), 9 * second);
         assert!(joined.is_ok(), "{joined:?}");
-        // Three times the startup budget passed, nearly all of it queued.
-        assert!(started.elapsed() >= Duration::from_millis(1000));
-        assert!(
-            Duration::from_millis(queued.load(Ordering::Acquire)) >= Duration::from_millis(700)
-        );
+        assert_eq!(elapsed, 10 * second);
+        assert_eq!(queued, 8 * second);
 
-        // Without the queue the same wait exceeds the server's own budget.
-        let absent = directory.path().join("absent.sock");
-        let error = join_launched(&absent, limits, &AtomicU64::new(0), || None, || None);
-        assert!(
-            error
-                .unwrap_err()
-                .starts_with("Codex server did not open its local socket within")
+        let (joined, elapsed, queued) =
+            attempt(&directory.path().join("unqueued.sock"), Duration::ZERO);
+        assert_eq!(
+            joined.unwrap_err(),
+            "Codex server did not open its local socket within 3 seconds",
         );
+        assert_eq!(elapsed, limits.own);
+        assert_eq!(queued, Duration::ZERO);
     }
 
     #[test]

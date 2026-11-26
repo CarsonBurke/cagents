@@ -15,7 +15,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
 mod images;
-pub(crate) mod rollout;
+pub mod rollout;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
@@ -201,7 +201,7 @@ fn account_home(spec: &ProcessSpec) -> Result<PathBuf, &'static str> {
 /// A bare `unix://` remote, without a socket named after it, selects the
 /// shared daemon of the account home the launch runs under. Any named
 /// endpoint is a request for that exact server, so none is reported.
-pub(crate) fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
+pub fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
     let mut shared = false;
     let mut named = false;
     let mut args = launch.recipe.arguments.iter();
@@ -235,7 +235,7 @@ pub(crate) fn shared_daemon_socket(launch: &Launch) -> Option<PathBuf> {
 
 /// The lock file whose holder Codex makes the one writer of `thread` in the
 /// account home `launch` runs under. Codex holds it while the thread is loaded.
-pub(crate) fn thread_writer_lock(launch: &Launch, thread: &str) -> Option<PathBuf> {
+pub fn thread_writer_lock(launch: &Launch, thread: &str) -> Option<PathBuf> {
     let home = account_home(&ProcessSpec::from(&launch.recipe)).ok()?;
     Some(
         home.join("thread-writer-locks")
@@ -247,7 +247,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     create_for_start(launch).map_err(|error| error.to_string())
 }
 
-pub(crate) fn create_for_start(
+pub fn create_for_start(
     launch: &Launch,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, None)
@@ -261,23 +261,27 @@ pub(crate) fn create_with_listener(
     create_with_listener_for_start(launch, socket).map_err(|error| error.to_string())
 }
 
-pub(crate) fn create_with_listener_for_start(
+// All sockaddr_un fields are integers, so its all-zero value is valid.
+pub const OWNED_LISTENER_PATH_CAPACITY: usize = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+    .sun_path
+    .len();
+
+/// Whether Codex can pass this listener path as a Unix socket address.
+pub fn owned_listener_path_fits(socket: &std::path::Path) -> bool {
+    let bytes = socket.as_os_str().as_encoded_bytes();
+    socket.to_str().is_some()
+        && !bytes.is_empty()
+        && !bytes.contains(&0)
+        && bytes.len() < OWNED_LISTENER_PATH_CAPACITY
+}
+
+pub fn create_with_listener_for_start(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
-    let bytes = socket.as_os_str().as_encoded_bytes();
-    // Match the actual platform Unix address before any provider can start.
-    // All sockaddr_un fields are integers, so its all-zero value is valid.
-    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
-        .sun_path
-        .len();
-    if socket.to_str().is_none()
-        || bytes.is_empty()
-        || bytes.contains(&0)
-        || bytes.len() >= capacity
-    {
+    if !owned_listener_path_fits(&socket) {
         return Err(super::SetupError::Invalid(format!(
-            "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter UTF-8 temporary directory"
+            "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {OWNED_LISTENER_PATH_CAPACITY} bytes; use a shorter UTF-8 temporary directory"
         )));
     }
     create_inner(launch, Some(socket), None)
@@ -285,7 +289,7 @@ pub(crate) fn create_with_listener_for_start(
 
 /// Only authenticated holder recovery supplies this identity. The runtime
 /// additionally verifies the exact retained app-server peer before initialize.
-pub(crate) fn create_restored_for_start(
+pub fn create_restored_for_start(
     recovery: &crate::chat::native_holder::Recovery,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     let confirmed = recovery
@@ -492,6 +496,7 @@ fn create_inner(
             server_identity: None,
             retained_identity,
             thread: launch.session_id.clone(),
+            name_revision: 0,
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
@@ -533,6 +538,7 @@ fn create_inner(
             subagent_status: None,
             subagent_waiting: false,
             subagent_detail: String::new(),
+            unloaded_notice_pending: false,
             ready: false,
             attached: false,
             direct_input: false,
@@ -555,6 +561,10 @@ fn create_inner(
             child_failure: None,
             child_buffer: BTreeMap::new(),
             waiting_child_resumes: BTreeMap::new(),
+            listing_generation: 0,
+            parent_child: None,
+            listed_unloaded: BTreeMap::new(),
+            spawn_calls: std::collections::BTreeSet::new(),
             turn_diffs: BTreeMap::new(),
             repo_root: None,
         }),
@@ -569,7 +579,13 @@ enum Pending {
         revision: u64,
     },
     Initialize,
-    Attach,
+    Attach {
+        /// A verified connection may set or clear the name before resume answers.
+        renamed: Option<Option<String>>,
+    },
+    ReadThread {
+        name_revision: u64,
+    },
     Models,
     Skills,
     History {
@@ -611,7 +627,15 @@ enum Pending {
         child: String,
         original_id: Value,
     },
-    ChildList,
+    /// A page of the conversation's subagent threads: how many earlier
+    /// pages listed, and the nested children they listed before the parent
+    /// child that a later page may list. A page of a listing an attachment
+    /// since has restarted, by its `generation`, is ignored.
+    ChildList {
+        listed: usize,
+        deferred: Vec<Value>,
+        generation: u64,
+    },
     /// Interrupting one child's turn, which leaves the parent and the other
     /// children running.
     StopChild,
@@ -698,6 +722,8 @@ struct Codex {
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
+    /// A rename notification can arrive while a metadata request is in flight.
+    name_revision: u64,
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
@@ -751,6 +777,8 @@ struct Codex {
     subagent_status: Option<ToolStatus>,
     subagent_waiting: bool,
     subagent_detail: String,
+    /// A catalog notice is still in the projection after promoting this child.
+    unloaded_notice_pending: bool,
     ready: bool,
     attached: bool,
     direct_input: bool,
@@ -783,6 +811,18 @@ struct Codex {
     child_buffer: BTreeMap<String, Vec<Value>>,
     /// Children whose thread read waits for their parent child's, by parent.
     waiting_child_resumes: BTreeMap<String, Vec<String>>,
+    /// The children a subagent listing published without reading them,
+    /// because the conversation already had all the children it keeps live,
+    /// until one is loaded: a child they started is published the same way,
+    /// and a loaded one's notice that its transcript isn't loaded goes.
+    listed_unloaded: BTreeMap<String, bool>,
+    /// Which subagent listing is current: each attachment starts another.
+    listing_generation: u64,
+    /// For a child, the thread that started it, as its discovery reported.
+    parent_child: Option<String>,
+    /// The subagents a first-version spawnAgent call named, by turn and
+    /// child, so an activity item reporting the same start adds no row.
+    spawn_calls: std::collections::BTreeSet<(String, String)>,
     /// Each running turn's latest cumulative diff and the files its own
     /// file-change items edited. The part of the diff no item shows, such as
     /// a file a shell command rewrote, is shown as the turn's own change.
@@ -805,6 +845,14 @@ enum ChildName {
     /// From a live notification or the child's own thread read.
     Current,
 }
+
+/// The most children a conversation keeps live: subscribed, read and routed.
+const MAX_LIVE_CHILDREN: usize = 32;
+
+/// How many subagent threads one listing publishes, across its pages. The
+/// listing is newest first, so the newest children are the ones read and
+/// kept live; the rest are published by name and status alone.
+const MAX_LISTED_CHILDREN: usize = 256;
 
 /// The most children whose nickname origin is remembered; beyond it, a new
 /// child's historical name is published as if nothing were known of it.
@@ -895,7 +943,7 @@ impl Codex {
             .get_or_insert_with(|| {
                 self.cwd
                     .ancestors()
-                    .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+                    .find(|dir| crate::git_marker::present(&dir.join(".git")).unwrap_or(false))
                     .map(std::path::Path::to_path_buf)
             })
             .clone()
@@ -972,6 +1020,52 @@ impl Codex {
             .map(drop)
     }
 
+    /// Discover the child a `subAgentActivity` item of thread `parent`
+    /// reports. Codex's second multi-agent version announces a spawn with
+    /// this item alone: no collaboration call names the child and no
+    /// `thread/started` reaches the connection. Every kind names the child,
+    /// so one whose start is on a page not read yet is still found, but
+    /// only `started` carries its model. The kind is a sparse hint, taken
+    /// only while nothing else has said how a live child stands: the child's
+    /// own thread reports that, and an old record of it, read from history,
+    /// says nothing about now. Returns whether a nickname was published.
+    fn discover_activity_child(
+        &mut self,
+        value: &Value,
+        parent: &str,
+        origin: ChildName,
+        advance: bool,
+        step: &mut Step,
+    ) -> Result<bool, String> {
+        let Some(id) = value["agentThreadId"].as_str() else {
+            return Ok(false);
+        };
+        let known = self.children.get(id);
+        let mut metadata = json!({
+            "parentThreadId": parent,
+            "agentNickname": value["agentNickname"],
+            "agentPath": value["agentPath"],
+        });
+        if origin == ChildName::Current || known.is_none() {
+            metadata["model"] = value["model"].clone();
+        }
+        let hint = match value["kind"].as_str() {
+            Some("started" | "interacted") => Some("running"),
+            Some(kind @ ("completed" | "interrupted")) => Some(kind),
+            _ => None,
+        };
+        if origin == ChildName::Current
+            && known.is_none_or(|child| {
+                child.subagent_status.is_none()
+                    || child.subagent_detail == chat::UNLOADED_CHILD_RUNNING
+            })
+            && let Some(hint) = hint
+        {
+            metadata["status"] = hint.into();
+        }
+        self.discover_child_named(id, &metadata, origin, advance, step)
+    }
+
     /// Discover or refresh a child, publishing the nickname in `metadata`
     /// only where its `origin` may replace what is already known: a newer
     /// source replaces an older one, and a recorded call replaces another
@@ -985,17 +1079,50 @@ impl Codex {
         advance: bool,
         step: &mut Step,
     ) -> Result<bool, String> {
+        self.discover_child_as(id, metadata, origin, advance, true, step)
+    }
+    /// Discover or refresh a child as [`Self::discover_child_named`] does.
+    /// A child it doesn't `load` is published by name and status alone,
+    /// with a notice in place of its transcript: it is not read, subscribed
+    /// or routed, and makes no room among the live children.
+    fn discover_child_as(
+        &mut self,
+        id: &str,
+        metadata: &Value,
+        origin: ChildName,
+        advance: bool,
+        load: bool,
+        step: &mut Step,
+    ) -> Result<bool, String> {
         if self.is_child || id.is_empty() || id.len() > 256 || self.thread.as_deref() == Some(id) {
             return Ok(false);
         }
         let discovered = !self.children.contains_key(id);
-        if discovered {
-            if self.children.len() >= 32 {
+        let status = agent_status(&metadata["status"]);
+        let only_listed_running =
+            origin == ChildName::Listed && status == Some(ToolStatus::Running);
+        let mut newly_loaded = false;
+        if discovered && load {
+            if self.children.len() >= MAX_LIVE_CHILDREN {
+                // Codex reads a nested child only through its loaded parent,
+                // so the child's ancestors never make room for it.
+                let mut ancestors = std::collections::BTreeSet::new();
+                let mut ancestor = parent_thread(metadata);
+                while let Some(parent) = ancestor
+                    && ancestors.len() < MAX_LIVE_CHILDREN
+                    && ancestors.insert(parent)
+                {
+                    ancestor = self
+                        .children
+                        .get(parent)
+                        .and_then(|child| child.parent_child.as_deref());
+                }
                 let completed = self
                     .children
                     .iter()
                     .find(|(child_id, child)| {
-                        child.ready
+                        !ancestors.contains(child_id.as_str())
+                            && child.ready
                             && !child.busy
                             && !self.child_buffer.contains_key(*child_id)
                             && !self.requests.values().any(|request| {
@@ -1005,7 +1132,13 @@ impl Codex {
                     })
                     .map(|(id, _)| id.clone());
                 if let Some(completed) = completed {
-                    self.children.remove(&completed);
+                    let unloaded_running = self
+                        .children
+                        .remove(&completed)
+                        .is_some_and(|child| child.subagent_detail == chat::UNLOADED_CHILD_RUNNING);
+                    if unloaded_running && self.listed_unloaded.len() < MAX_CHILD_NAMES {
+                        self.listed_unloaded.insert(completed.clone(), true);
+                    }
                     self.call(
                         step,
                         "thread/unsubscribe",
@@ -1019,7 +1152,9 @@ impl Codex {
                 .values()
                 .map(Vec::len)
                 .sum::<usize>();
-            if self.children.len() >= 32 || self.pending.len() + waiting >= MAX_PENDING {
+            if self.children.len() >= MAX_LIVE_CHILDREN
+                || self.pending.len() + waiting >= MAX_PENDING
+            {
                 return Ok(false);
             }
             let mut child = Codex::default();
@@ -1027,7 +1162,17 @@ impl Codex {
             child.cwd = self.cwd.clone();
             child.expected_home = self.expected_home.clone();
             child.is_child = true;
+            child.parent_child = parent_thread(metadata).map(str::to_owned);
+            let previous = self.listed_unloaded.remove(id);
+            let awaiting_observation =
+                only_listed_running || (previous == Some(true) && status.is_none());
+            if awaiting_observation {
+                child.subagent_status = Some(ToolStatus::Running);
+                child.subagent_detail = chat::UNLOADED_CHILD_RUNNING.into();
+            }
+            child.unloaded_notice_pending = previous.is_some();
             self.children.insert(id.into(), Box::new(child));
+            newly_loaded = previous.is_some() && !awaiting_observation;
             self.child_buffer.insert(id.into(), Vec::new());
             // Codex resumes a nested child only through its loaded parent and
             // refuses it while that parent's own read is still outstanding,
@@ -1050,13 +1195,28 @@ impl Codex {
         {
             child.selected = Some(model.clone());
         }
-        let status = agent_status(&metadata["status"]);
         if let Some(status) = status
             && let Some(child) = self.children.get_mut(id)
         {
             // Sparse collab metadata must not reset a known terminal outcome.
             child.subagent_status = Some(status);
+            if child.subagent_detail == chat::UNLOADED_CHILD_RUNNING && !only_listed_running {
+                child.subagent_detail.clear();
+                newly_loaded = true;
+            }
         }
+        if let Some(child) = self.children.get_mut(id) {
+            child.remove_unloaded_notice(id, step);
+        }
+        let projecting_unloaded = self
+            .children
+            .get(id)
+            .is_some_and(|child| child.subagent_detail == chat::UNLOADED_CHILD_RUNNING);
+        let detail = if projecting_unloaded || (!load && status == Some(ToolStatus::Running)) {
+            Some(chat::UNLOADED_CHILD_RUNNING.into())
+        } else {
+            newly_loaded.then(String::new)
+        };
         let nickname = agent_nickname(metadata).filter(|_| {
             self.child_names.get(id).is_none_or(|known| {
                 origin > *known || origin == *known && (advance || origin != ChildName::Recorded)
@@ -1068,7 +1228,7 @@ impl Codex {
         step.events.push(Event::Subagent {
             model,
             waiting: None,
-            detail: None,
+            detail,
             id: id.into(),
             // A role says what an agent can do, not who it is. Sparse,
             // role-only or superseded metadata publishes no name, so the
@@ -1078,12 +1238,32 @@ impl Codex {
             description: metadata["message"]
                 .as_str()
                 .or_else(|| metadata["preview"].as_str())
-                .unwrap_or_default()
-                .into(),
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .or_else(|| agent_task(metadata))
+                .unwrap_or_default(),
             status,
             // A child is a thread of its own, not work inside the parent's turn.
             background: Some(true),
         });
+        if discovered && !load {
+            step.events.extend(chat::child_events(
+                id,
+                vec![Event::Item(Item {
+                    id: unloaded_notice_id(id),
+                    role: Role::System,
+                    content: ItemContent::Text {
+                        text: format!(
+                            "This subagent's transcript isn't loaded: a conversation shows the transcripts of its {MAX_LIVE_CHILDREN} most recent subagents."
+                        ),
+                        thinking: false,
+                        phase: Phase::Commentary,
+                    },
+                    started_at: None,
+                    at: None,
+                })],
+            ));
+        }
         Ok(nickname.is_some())
     }
     fn resume_child(&mut self, id: &str, step: &mut Step) -> Result<(), String> {
@@ -1092,6 +1272,30 @@ impl Codex {
             "thread/resume",
             json!({"threadId":id,"excludeTurns":true,"initialTurnsPage":{"limit":4,"sortDirection":"desc","itemsView":"full"}}),
             Pending::ChildResume(id.into()),
+        )
+    }
+    /// Request a page of the conversation's subagent threads.
+    fn list_children(
+        &mut self,
+        step: &mut Step,
+        cursor: Option<String>,
+        listed: usize,
+        deferred: Vec<Value>,
+    ) -> Result<(), String> {
+        let mut params = json!({"ancestorThreadId":self.thread,"sourceKinds":["subAgentThreadSpawn"],"limit":32});
+        if let Some(cursor) = cursor {
+            params["cursor"] = cursor.into();
+        }
+        let generation = self.listing_generation;
+        self.call(
+            step,
+            "thread/list",
+            params,
+            Pending::ChildList {
+                listed,
+                deferred,
+                generation,
+            },
         )
     }
     fn child_resume_pending(&self, id: &str) -> bool {
@@ -1151,6 +1355,7 @@ impl Codex {
         if quiet
             && let Some(child) = self.children.get_mut(id)
             && !child.busy
+            && child.subagent_detail != chat::UNLOADED_CHILD_RUNNING
         {
             child.settle_idle_child(id, step);
         }
@@ -1204,6 +1409,38 @@ impl Codex {
             self.child_names.insert(id.into(), origin);
         }
     }
+    /// Whether item `value` of `turn` repeats a spawn the turn already
+    /// shows. A turn shows one spawn row per subagent: Codex's first
+    /// multi-agent version names a spawned child in its spawnAgent call, the
+    /// second reports the start only as a subAgentActivity item. Neither
+    /// version sends both, but were a turn to, the activity would repeat the
+    /// call's row. The call names its children only as it completes, so an
+    /// activity reported before it keeps its row.
+    fn repeats_spawn(&mut self, turn: &str, value: &Value) -> bool {
+        match (value["type"].as_str(), value["tool"].as_str()) {
+            (Some("collabAgentToolCall"), Some("spawnAgent" | "spawn_agent")) => {
+                for child in value["receiverThreadIds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(32)
+                {
+                    if self.spawn_calls.len() >= MAX_CHILD_NAMES {
+                        // Codex's turn IDs are UUIDv7, which sort by time:
+                        // the first is the oldest turn's.
+                        self.spawn_calls.pop_first();
+                    }
+                    self.spawn_calls.insert((turn.into(), child.into()));
+                }
+                false
+            }
+            (Some("subAgentActivity"), _) => value["agentThreadId"]
+                .as_str()
+                .is_some_and(|child| self.spawn_calls.contains(&(turn.into(), child.into()))),
+            _ => false,
+        }
+    }
     // Child parsers share a server connection, so their local RPC IDs must
     // never escape into the parent's ID space. Keep the original correlation
     // inside the child and allocate every wire request through the parent.
@@ -1217,19 +1454,17 @@ impl Codex {
                     | Event::TurnFinished { .. }
                     | Event::Ready(false)
             )
-        }) {
-            let child = self.children.get(id);
+        }) && let Some(child) = self.children.get_mut(id)
+        {
+            child.remove_unloaded_notice(id, step);
             step.events.push(Event::Subagent {
-                model: child.and_then(|child| child.selected.clone()),
-                waiting: child.map(|child| child.subagent_waiting),
-                detail: child.map(|child| child.subagent_detail.clone()),
+                model: child.selected.clone(),
+                waiting: Some(child.subagent_waiting),
+                detail: Some(child.subagent_detail.clone()),
                 id: id.into(),
                 kind: String::new(),
                 description: String::new(),
-                status: self
-                    .children
-                    .get(id)
-                    .and_then(|child| child.subagent_status),
+                status: child.subagent_status,
                 background: None,
             });
         }
@@ -1259,6 +1494,16 @@ impl Codex {
             }
         }
         Ok(())
+    }
+    fn remove_unloaded_notice(&mut self, id: &str, step: &mut Step) {
+        if self.subagent_detail != chat::UNLOADED_CHILD_RUNNING
+            && std::mem::take(&mut self.unloaded_notice_pending)
+        {
+            step.events.push(Event::SubagentItemsRemoved {
+                id: id.into(),
+                ids: vec![unloaded_notice_id(id)],
+            });
+        }
     }
     fn finish_execution(
         &mut self,
@@ -1300,6 +1545,9 @@ impl Codex {
         // execution binding. Ordinary completed frames already publish it.
         if publish_content {
             for value in array(turn, "items")? {
+                if self.repeats_spawn(id, value) {
+                    continue;
+                }
                 step.events
                     .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
             }
@@ -1648,7 +1896,9 @@ impl Codex {
             step,
             "thread/read",
             json!({"threadId":self.thread,"includeTurns":false}),
-            Pending::Other,
+            Pending::ReadThread {
+                name_revision: self.name_revision,
+            },
         )?;
         self.history(step, None)
     }
@@ -1706,7 +1956,7 @@ impl Codex {
     /// Recover that outcome from the latest page, never an older page or while
     /// live work is running. Buffered live notifications are replayed afterward.
     fn child_history_outcome(&mut self, turn: Option<&Value>, step: &mut Step) {
-        if !self.is_child || self.busy {
+        if !self.is_child || self.busy || self.subagent_detail == chat::UNLOADED_CHILD_RUNNING {
             return;
         }
         let Some(status) = turn.and_then(|turn| agent_status(&turn["status"])) else {
@@ -1780,7 +2030,7 @@ impl Codex {
                         // History describes the child at the time of this call.
                         // A live subscription or prior hydration owns its current
                         // outcome; paging an old spawn must not restart it.
-                        if self.children.contains_key(id)
+                        if (self.children.contains_key(id) || self.listed_unloaded.contains_key(id))
                             && let Some(metadata) = metadata.as_object_mut()
                         {
                             metadata.remove("status");
@@ -1797,15 +2047,33 @@ impl Codex {
                         }
                     }
                 }
+                if value["type"] == "subAgentActivity"
+                    && let Some(parent) = self.thread.clone()
+                {
+                    let child = value["agentThreadId"].as_str().unwrap_or_default();
+                    if self.discover_activity_child(
+                        value,
+                        &parent,
+                        ChildName::Recorded,
+                        named.contains(child),
+                        step,
+                    )? {
+                        named.insert(child.to_owned());
+                    }
+                }
                 if active {
                     // A turn still running when this conversation attached:
                     // its later diffs must not show again what these did.
                     self.note_file_change(turn_id, value, step);
                 }
                 let mut windows = BTreeMap::new();
-                let parsed = parse_item_with_windows(value, !active, turn_id, |id, window| {
-                    windows.insert(id.to_owned(), window);
-                })?;
+                let parsed = if self.repeats_spawn(turn_id, value) {
+                    Vec::new()
+                } else {
+                    parse_item_with_windows(value, !active, turn_id, |id, window| {
+                        windows.insert(id.to_owned(), window);
+                    })?
+                };
                 for item in parsed {
                     if active && self.busy {
                         // Completed history releases an unseen completion;
@@ -1825,6 +2093,15 @@ impl Codex {
         // Refreshing the live end must not rewind the older-history traversal
         // through pages already cached. Commit only after validating the page;
         // a failed decode must preserve the cursor the reader can retry.
+        if !earlier
+            && !self.history_initialized
+            && !self.is_child
+            && page["nextCursor"].is_string()
+            && let Some(id) = &self.thread
+            && let Some(title) = rollout::opening_title(&self.expected_home, id)
+        {
+            step.events.push(Event::OpeningTitle(title));
+        }
         if earlier || !self.history_initialized {
             self.cursor = page["nextCursor"].as_str().map(str::to_owned);
             self.history_initialized = true;
@@ -2189,6 +2466,11 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    #[cfg(feature = "host")]
+    fn needs_private_temp(&self) -> bool {
+        true
+    }
+
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;
@@ -2308,13 +2590,16 @@ impl Adapter for Codex {
             // the parent nor its siblings. Unlike input, this is not refused
             // for a child the server keeps from direct use.
             Command::StopSubagent { id } => {
-                let child = self.children.get_mut(&id).ok_or("This Codex subagent is no longer followed")?;
+                let child = self.children.get(&id).ok_or("This Codex subagent is no longer followed")?;
                 match child.turn.clone() {
                     Some(turn) => self.call(&mut step, "turn/interrupt", json!({"threadId":id,"turnId":turn}), Pending::StopChild)?,
                     // Working, but Codex hasn't named the turn a stop must target.
-                    None if child.busy || child.starting_turn() => return Err("This Codex subagent's current turn isn't known yet; stop it again in a moment".into()),
+                    None if child.busy || child.starting_turn()
+                        || child.subagent_detail == chat::UNLOADED_CHILD_RUNNING
+                        || self.child_resume_pending(&id)
+                        => return Err("This Codex subagent's current turn isn't known yet; stop it again in a moment".into()),
                     // Nothing runs: settle whatever still showed it working.
-                    None => child.settle_idle_child(&id, &mut step),
+                    None => self.children.get_mut(&id).expect("the child is still followed").settle_idle_child(&id, &mut step),
                 }
             }
             operation @ (Command::RemoveQueued { .. } | Command::StartQueued { .. }) => {
@@ -2327,6 +2612,7 @@ impl Adapter for Codex {
                 self.call(&mut step, method, json!({"threadId":self.thread,"queuedSubmissionId":id}), pending)?;
             }
             Command::SetInterruptMode { .. } => return Err("Codex uses explicit steer and queue operations".into()),
+            Command::SendQueuedNow => return Err("Codex cannot hand its queue to the running turn".into()),
             Command::ListBranches => self.history(&mut step, None)?,
             Command::Branch { id } => {
                 if self.busy || !self.direct_input { return Err("Fork requires an idle writable Codex conversation".into()); }
@@ -2524,7 +2810,7 @@ impl Codex {
                 }
                 // A server without the read compacts where its model's
                 // default says, which the usage reading still gives.
-                if matches!(pending, Pending::ChildList | Pending::Config) {
+                if matches!(pending, Pending::ChildList { .. } | Pending::Config) {
                     return Ok(step);
                 }
                 if matches!(pending, Pending::QueueList) && error["code"].as_i64() == Some(-32601) {
@@ -2582,7 +2868,7 @@ impl Codex {
                         detail: "Turn failed".into(),
                     });
                 }
-                let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
+                let fatal = matches!(pending, Pending::Initialize | Pending::Attach { .. });
                 let message = format!(
                     "{}: {}",
                     if matches!(pending, Pending::StopChild) {
@@ -2665,15 +2951,11 @@ impl Codex {
                     self.server_identity = identity;
                     step.writes
                         .push(json!({"method":"initialized","params":{}}));
+                    let pending = Pending::Attach { renamed: None };
                     if self.thread.is_some() {
-                        self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+                        self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), pending)?;
                     } else {
-                        self.call(
-                            &mut step,
-                            "thread/start",
-                            self.start.clone(),
-                            Pending::Attach,
-                        )?;
+                        self.call(&mut step, "thread/start", self.start.clone(), pending)?;
                     }
                     self.call(
                         &mut step,
@@ -2691,7 +2973,7 @@ impl Codex {
                     )?;
                     self.skills(&mut step)?;
                 }
-                Pending::Attach => {
+                Pending::Attach { renamed } => {
                     let thread = &result["thread"];
                     let id = string(thread, "id")?;
                     if self.thread.as_ref().is_some_and(|expected| expected != id) {
@@ -2700,7 +2982,8 @@ impl Codex {
                                 .into(),
                         );
                     }
-                    if self.thread.is_none() {
+                    let fresh = self.thread.is_none();
+                    if fresh {
                         self.cursor = None;
                         self.history_initialized = false;
                     }
@@ -2723,22 +3006,33 @@ impl Codex {
                     ));
                     step.events
                         .push(Event::Waiting(waiting_on_user(&thread["status"])));
+                    let cleared = matches!(renamed, Some(None));
+                    let title = match renamed {
+                        Some(title) => {
+                            self.name_revision = self.name_revision.wrapping_add(1);
+                            title
+                        }
+                        None => thread_name(&thread["name"]),
+                    };
                     step.events.push(Event::Session {
                         id: id.into(),
-                        title: thread["name"].as_str().map(str::to_owned),
+                        title,
                     });
+                    if fresh {
+                        step.events.push(Event::OpeningHistoryComplete);
+                    }
+                    if cleared {
+                        step.events
+                            .push(Event::ProviderTitleCleared { id: id.into() });
+                    }
                     step.events.push(Event::Status {
                         busy: self.busy,
                         detail: "Connected to Codex".into(),
                     });
                     step.events.push(Event::Commands(Vec::new()));
                     self.model_events(&mut step);
-                    self.call(
-                        &mut step,
-                        "thread/list",
-                        json!({"ancestorThreadId":self.thread,"sourceKinds":["subAgentThreadSpawn"],"limit":32}),
-                        Pending::ChildList,
-                    )?;
+                    self.listing_generation += 1;
+                    self.list_children(&mut step, None, 0, Vec::new())?;
                     if result["initialTurnsPage"].is_object() {
                         let turn = self.page(&result["initialTurnsPage"], &mut step, false)?;
                         if self.busy && self.turn.is_none() {
@@ -3187,13 +3481,19 @@ impl Codex {
                     )?;
                     step.events.push(Event::Forked(id.into()));
                 }
-                Pending::ChildList => {
-                    let mut remaining = result["data"]
+                Pending::ChildList { generation, .. } if generation != self.listing_generation => {}
+                Pending::ChildList {
+                    listed, deferred, ..
+                } => {
+                    let page = result["data"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .take(32)
+                        .cloned()
                         .collect::<Vec<_>>();
+                    let listed = listed + page.len();
+                    let mut remaining = page.iter().chain(&deferred).collect::<Vec<_>>();
                     while !remaining.is_empty() {
                         let before = remaining.len();
                         let mut deferred = Vec::new();
@@ -3204,28 +3504,79 @@ impl Codex {
                             let Some(parent) = thread["parentThreadId"].as_str() else {
                                 continue;
                             };
+                            let unloaded = self.listed_unloaded.contains_key(parent);
                             if self.thread.as_deref() != Some(parent)
                                 && !self.children.contains_key(parent)
+                                && !unloaded
                             {
                                 deferred.push(thread);
                                 continue;
                             }
                             if let Some(id) = thread["id"].as_str() {
+                                // Newest first, so the live children are the
+                                // newest: one past them is published unread,
+                                // rather than evicting a newer one, unless it
+                                // is still running and a settled one can make
+                                // room. A child of an unread one is unread
+                                // too: Codex reads it only through its loaded
+                                // parent.
+                                let running =
+                                    agent_status(&thread["status"]) == Some(ToolStatus::Running);
                                 // The listing may have been taken before a
                                 // live notification that renamed the child.
-                                self.discover_child_named(
-                                    id,
-                                    thread,
-                                    ChildName::Listed,
-                                    false,
-                                    &mut step,
-                                )?;
+                                if !unloaded
+                                    && (self.children.contains_key(id)
+                                        || self.children.len() < MAX_LIVE_CHILDREN
+                                        || running)
+                                {
+                                    self.discover_child_as(
+                                        id,
+                                        thread,
+                                        ChildName::Listed,
+                                        false,
+                                        true,
+                                        &mut step,
+                                    )?;
+                                }
+                                if !self.children.contains_key(id)
+                                    && (self.listed_unloaded.contains_key(id)
+                                        || self.listed_unloaded.len() < MAX_CHILD_NAMES)
+                                {
+                                    let listed =
+                                        self.listed_unloaded.entry(id.to_owned()).or_default();
+                                    if agent_status(&thread["status"]).is_some() {
+                                        *listed = running;
+                                    }
+                                    self.discover_child_as(
+                                        id,
+                                        thread,
+                                        ChildName::Listed,
+                                        false,
+                                        false,
+                                        &mut step,
+                                    )?;
+                                }
                             }
                         }
                         if deferred.len() == before {
+                            remaining = deferred;
                             break;
                         }
                         remaining = deferred;
+                    }
+                    // Newest first: a nested child can come a page before
+                    // the child that started it.
+                    if let Some(cursor) = result["nextCursor"].as_str()
+                        && !page.is_empty()
+                        && listed < MAX_LISTED_CHILDREN
+                    {
+                        let deferred = remaining.into_iter().cloned().collect();
+                        self.list_children(&mut step, Some(cursor.into()), listed, deferred)?;
+                    } else if !remaining.is_empty() {
+                        tracing::debug!(
+                            threads = remaining.len(),
+                            "Codex listed subagent threads whose parent the listing never named"
+                        );
                     }
                 }
                 Pending::ChildResume(id) => {
@@ -3248,7 +3599,7 @@ impl Codex {
                             .filter(|model| !model.is_empty())
                             .map(str::to_owned)
                             .or_else(|| child.selected.clone());
-                        child.thread_state(&result["thread"], &mut content)?;
+                        child.thread_state(&result["thread"], true, &mut content)?;
                         child.ready = true;
                         child.materialized = true;
                         if result["initialTurnsPage"].is_object() {
@@ -3274,6 +3625,9 @@ impl Codex {
                                 // A turn still under way leaves its work running.
                                 let done = turn["status"] != "inProgress";
                                 for value in turn["items"].as_array().into_iter().flatten() {
+                                    if child.repeats_spawn(string(turn, "id")?, value) {
+                                        continue;
+                                    }
                                     for item in parse_item(value, done, string(turn, "id")?)? {
                                         content.events.push(Event::Item(item));
                                     }
@@ -3322,9 +3676,18 @@ impl Codex {
                 Pending::ChildRpc { .. } => unreachable!("child responses routed above"),
                 // The child's own turn completion reports how it ended.
                 Pending::StopChild | Pending::Prediction => {}
+                Pending::ReadThread { name_revision } => {
+                    if result["thread"].is_object() {
+                        self.thread_state(
+                            &result["thread"],
+                            name_revision == self.name_revision,
+                            &mut step,
+                        )?;
+                    }
+                }
                 Pending::Other => {
                     if result["thread"].is_object() {
-                        self.thread_state(&result["thread"], &mut step)?;
+                        self.thread_state(&result["thread"], true, &mut step)?;
                     }
                 }
             }
@@ -3392,6 +3755,17 @@ impl Codex {
                         )?;
                     }
                 }
+                if params["item"]["type"] == "subAgentActivity"
+                    && matches!(method, "item/started" | "item/completed")
+                {
+                    self.discover_activity_child(
+                        &params["item"],
+                        id,
+                        ChildName::Current,
+                        false,
+                        &mut step,
+                    )?;
+                }
                 if let Some(buffer) = self.child_buffer.get_mut(id) {
                     if buffer.len() < 128
                         && buffer
@@ -3428,7 +3802,7 @@ impl Codex {
         match method {
             "thread/started" => {
                 if self.ready {
-                    self.thread_state(&params["thread"], &mut step)?;
+                    self.thread_state(&params["thread"], self.name_revision == 0, &mut step)?;
                 }
             }
             "thread/status/changed" => {
@@ -3461,10 +3835,35 @@ impl Codex {
                     }
                 }
             }
-            "thread/name/updated" => step.events.push(Event::Session {
-                id: self.thread.clone().ok_or("Missing Codex thread")?,
-                title: params["threadName"].as_str().map(str::to_owned),
-            }),
+            "thread/name/updated" => {
+                if let Some(id) = params["threadId"].as_str()
+                    && self.thread.as_deref() == Some(id)
+                {
+                    let title = thread_name(&params["threadName"]);
+                    let cleared = params.get("threadName").is_some_and(Value::is_null);
+                    let changed = title.is_some() || cleared;
+                    if self.attached || self.is_child {
+                        if changed {
+                            self.name_revision = self.name_revision.wrapping_add(1);
+                        }
+                        step.events.push(if cleared {
+                            Event::ProviderTitleCleared { id: id.into() }
+                        } else {
+                            Event::Session {
+                                id: id.into(),
+                                title,
+                            }
+                        });
+                    } else if changed
+                        && let Some(Pending::Attach { renamed }) = self
+                            .pending
+                            .values_mut()
+                            .find(|pending| matches!(pending, Pending::Attach { .. }))
+                    {
+                        *renamed = Some(title);
+                    }
+                }
+            }
             "thread/settings/updated" => {
                 let settings = &params["threadSettings"];
                 if settings.get("model").is_some() {
@@ -3642,14 +4041,18 @@ impl Codex {
                 for value in array(turn, "items")? {
                     self.note_file_change(turn_id, value, &mut step);
                     let mut windows = BTreeMap::new();
-                    let parsed = parse_item_with_windows(
-                        value,
-                        method == "turn/completed",
-                        turn_id,
-                        |id, window| {
-                            windows.insert(id.to_owned(), window);
-                        },
-                    )?;
+                    let parsed = if self.repeats_spawn(turn_id, value) {
+                        Vec::new()
+                    } else {
+                        parse_item_with_windows(
+                            value,
+                            method == "turn/completed",
+                            turn_id,
+                            |id, window| {
+                                windows.insert(id.to_owned(), window);
+                            },
+                        )?
+                    };
                     for item in parsed {
                         if method == "turn/started" {
                             self.track_snapshot_item(value, &item, windows.remove(&item.id), true);
@@ -3747,15 +4150,30 @@ impl Codex {
                         self.discover_child(id, &value["agentsStates"][id], &mut step)?;
                     }
                 }
+                if params["item"]["type"] == "subAgentActivity"
+                    && let Some(parent) = self.thread.clone()
+                {
+                    self.discover_activity_child(
+                        &params["item"],
+                        &parent,
+                        ChildName::Current,
+                        false,
+                        &mut step,
+                    )?;
+                }
                 let mut windows = BTreeMap::new();
-                let parsed = parse_item_with_windows(
-                    &params["item"],
-                    done,
-                    string(params, "turnId")?,
-                    |id, window| {
-                        windows.insert(id.to_owned(), window);
-                    },
-                )?;
+                let parsed = if self.repeats_spawn(string(params, "turnId")?, &params["item"]) {
+                    Vec::new()
+                } else {
+                    parse_item_with_windows(
+                        &params["item"],
+                        done,
+                        string(params, "turnId")?,
+                        |id, window| {
+                            windows.insert(id.to_owned(), window);
+                        },
+                    )?
+                };
                 if done {
                     self.note_file_change(string(params, "turnId")?, &params["item"], &mut step);
                 }
@@ -4067,6 +4485,12 @@ impl Codex {
     }
 }
 
+/// The ID of the notice a child published without its transcript shows in
+/// its place: one per child, however often a listing names it.
+fn unloaded_notice_id(child: &str) -> String {
+    format!("codex-notice:unloaded:{child}")
+}
+
 /// Advisory provider messages belong to the transcript, at their arrival
 /// position. Each occurrence has its own identity so later work and retries
 /// cannot move an old notice to the end or overwrite a previous one.
@@ -4096,6 +4520,14 @@ fn provider_error_notice(text: String) -> Event {
 
 impl Codex {
     fn observe_thread_status(&mut self, status: &Value) {
+        if self.subagent_detail == chat::UNLOADED_CHILD_RUNNING
+            && !matches!(
+                status["type"].as_str(),
+                Some("active" | "idle" | "notLoaded" | "systemError")
+            )
+        {
+            return;
+        }
         if matches!(status["type"].as_str(), Some("active" | "systemError")) {
             for pending in self.pending.values_mut() {
                 if let Pending::Turn { early, .. } = pending {
@@ -4112,7 +4544,7 @@ impl Codex {
         match status["type"].as_str() {
             Some("active") => self.subagent_status = Some(ToolStatus::Running),
             Some("systemError") => self.subagent_status = Some(ToolStatus::Failed),
-            Some("idle")
+            Some("idle" | "notLoaded")
                 if self
                     .subagent_status
                     .is_none_or(|value| value == ToolStatus::Running) =>
@@ -4122,7 +4554,12 @@ impl Codex {
             _ => {}
         }
     }
-    fn thread_state(&mut self, thread: &Value, step: &mut Step) -> Result<(), String> {
+    fn thread_state(
+        &mut self,
+        thread: &Value,
+        read_name: bool,
+        step: &mut Step,
+    ) -> Result<(), String> {
         let id = string(thread, "id")?;
         if self.thread.as_deref() != Some(id) {
             return Err("Codex metadata belongs to a different thread".into());
@@ -4138,7 +4575,7 @@ impl Codex {
             .push(Event::Waiting(waiting_on_user(&thread["status"])));
         step.events.push(Event::Session {
             id: id.into(),
-            title: thread["name"].as_str().map(str::to_owned),
+            title: read_name.then(|| thread_name(&thread["name"])).flatten(),
         });
         step.events.push(Event::Status {
             busy: self.busy,
@@ -4148,11 +4585,26 @@ impl Codex {
         Ok(())
     }
 }
+
+fn thread_name(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+}
 /// The thread that spawned a subagent's thread, as its metadata names it.
 fn parent_thread(metadata: &Value) -> Option<&str> {
     metadata["parentThreadId"]
         .as_str()
         .or_else(|| metadata["source"]["subAgent"]["thread_spawn"]["parent_thread_id"].as_str())
+}
+
+/// The task a child was given, as its agent path names it.
+fn agent_task(metadata: &Value) -> Option<String> {
+    metadata["agentPath"]
+        .as_str()
+        .or_else(|| metadata["source"]["subAgent"]["thread_spawn"]["agent_path"].as_str())
+        .and_then(crate::chat::codex_agent_task)
 }
 
 /// The nickname Codex reported for a child, if it reported a real one.
@@ -4962,10 +5414,34 @@ fn parse_item_with_windows(
             };
             tool_call(format!("Wait {duration}"), String::new(), String::new())
         }
-        // A subagent's lifecycle is reported on the subagent itself, as its
-        // collaboration calls and thread status discover it; a row per
-        // transition would repeat that for every agent a turn coordinates.
-        "subAgentActivity" => Vec::new(),
+        // Codex's second multi-agent version records a spawn only as this
+        // item, so its start is the turn's one row for the agent, where the
+        // turn started it: a spawn call addressed to the agent's thread, as
+        // the first version's collaboration call reads. How the agent goes on
+        // is reported on the agent itself; a row per later transition would
+        // repeat that for every agent a turn coordinates. The start is done
+        // once it is reported, whatever the turn is still doing: a history
+        // page of a running turn must not show it as still under way.
+        "subAgentActivity" => match (value["kind"].as_str(), value["agentThreadId"].as_str()) {
+            (Some("started"), Some(child)) if !child.is_empty() => vec![Item {
+                id: id.into(),
+                role: Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "spawnAgent".into(),
+                    input: String::new(),
+                    output: json!({child: {
+                        "agentPath": value["agentPath"],
+                        "model": value["model"],
+                        "reasoningEffort": value["reasoningEffort"],
+                    }})
+                    .to_string(),
+                    status: ToolStatus::Succeeded,
+                },
+                started_at: None,
+                at: None,
+            }],
+            _ => Vec::new(),
+        },
         // Any other auxiliary item, and any item type a later Codex
         // introduces, still belongs to the
         // turn. The tool disclosure exists to keep an unrecognized item

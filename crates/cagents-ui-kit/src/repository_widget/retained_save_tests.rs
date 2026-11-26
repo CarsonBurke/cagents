@@ -370,6 +370,7 @@ async fn rejected_sticky_candidate_does_not_hide_a_safe_outside_ancestor() {
     let mut shared = enclosing.clone();
     std::fs::create_dir(&enclosing).unwrap();
     std::fs::create_dir(enclosing.join(".git")).unwrap();
+    std::fs::write(enclosing.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     // More sticky candidates than the bootstrap allowance must not consume
     // the preexisting protected-parent discovery allowance.
     for index in 0..10 {
@@ -509,9 +510,10 @@ async fn root_scope_saves_owned_private_and_sticky_parent_files() {
     };
     let euid = unsafe { libc::geteuid() };
     for parent in ["/tmp", "/var/tmp"] {
+        let parent = Path::new(parent).canonicalize().unwrap();
         let directory = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(parent)
+            .tempdir_in(&parent)
             .unwrap();
         let private_metadata = std::fs::metadata(directory.path()).unwrap();
         assert_eq!(private_metadata.uid(), euid);
@@ -521,6 +523,7 @@ async fn root_scope_saves_owned_private_and_sticky_parent_files() {
         // The marker exercises nested checkout ancestor cleanup leasing; no
         // Git subprocess or host repository discovery is involved.
         std::fs::create_dir(inner.join(".git")).unwrap();
+        std::fs::write(inner.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let path = inner.join("file.txt");
         std::fs::write(&path, "baseline").unwrap();
         root_scope_owned_file_round_trip(&path).await;
@@ -620,7 +623,7 @@ async fn root_scope_can_publish_to_a_write_search_only_parent() {
         return;
     }
     use std::os::unix::fs::PermissionsExt;
-    let owner = tempfile::tempdir_in("/tmp").unwrap();
+    let owner = tempfile::tempdir_in(Path::new("/tmp").canonicalize().unwrap()).unwrap();
     let parent = owner.path().join("write-search-only");
     std::fs::create_dir(&parent).unwrap();
     let path = parent.join("file.txt");

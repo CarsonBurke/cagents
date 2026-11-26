@@ -860,13 +860,15 @@ impl StateStore {
             .tempfile_in(parent)?;
         // VACUUM INTO accepts an existing empty file; tempfile keeps it private.
         let connection = Connection::open_with_flags(
-            source,
+            crate::secure_file::sqlite_path(source),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         connection.execute(
             "VACUUM INTO ?1",
-            [temporary.path().to_string_lossy().as_ref()],
+            [crate::secure_file::sqlite_path(temporary.path())
+                .to_string_lossy()
+                .as_ref()],
         )?;
         temporary.as_file().sync_all()?;
         temporary
@@ -936,7 +938,8 @@ impl StateStore {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let mut connection = Connection::open_with_flags(path, flags)?;
+        let mut connection =
+            Connection::open_with_flags(crate::secure_file::sqlite_path(path), flags)?;
         configure_connection(&connection, options.busy_timeout)?;
         enforce_sqlite_sidecars(path)?;
         migrate(&mut connection)?;
@@ -1074,7 +1077,7 @@ impl StateStore {
             return Err(invalid_state!("invalid canonical pane repair"));
         }
         let mut connection = Connection::open_with_flags(
-            path,
+            crate::secure_file::sqlite_path(path.as_ref()),
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -2825,7 +2828,7 @@ pub fn transcript_name(path: &Path) -> Option<&str> {
 /// writes to a database another window owns.
 pub fn read_claimed_transcript_names(path: &Path) -> Result<HashSet<String>> {
     let connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
@@ -2838,7 +2841,7 @@ pub fn read_claimed_transcript_names(path: &Path) -> Result<HashSet<String>> {
 /// writer. Closed chats remain navigable through the conversation resume path.
 pub fn read_navigable_session_ids(path: &Path) -> Result<Vec<TerminalId>> {
     let mut connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
@@ -2902,7 +2905,7 @@ pub enum SavedSessionOwner {
 /// One budget spans all source windows. Per-row bounds alone would allow
 /// thousands of individually valid descriptors to exhaust updater memory.
 #[cfg(any(feature = "host", test))]
-pub(crate) struct MigrationInspectionBudget {
+pub struct MigrationInspectionBudget {
     remaining_rows: usize,
     remaining_bytes: u64,
     deadline: Instant,
@@ -2910,7 +2913,7 @@ pub(crate) struct MigrationInspectionBudget {
 
 #[cfg(any(feature = "host", test))]
 impl MigrationInspectionBudget {
-    pub(crate) fn new(deadline: Instant) -> Self {
+    pub fn new(deadline: Instant) -> Self {
         Self {
             remaining_rows: crate::upgrade::handoff::MAX_SESSIONS,
             remaining_bytes: 64 * 1024 * 1024,
@@ -2975,11 +2978,11 @@ pub(crate) fn read_open_migration_sessions_with_budget(
 
 /// The saved presentation and exact descriptor share one read-only snapshot.
 #[cfg(any(feature = "host", test))]
-pub(crate) struct MigrationPane {
-    pub(crate) card: CardId,
-    pub(crate) kind: CardKind,
-    pub(crate) label: crate::update::source_inspection::PaneLabel,
-    pub(crate) inert: bool,
+pub struct MigrationPane {
+    pub card: CardId,
+    pub kind: CardKind,
+    pub label: crate::update::source_inspection::PaneLabel,
+    pub inert: bool,
 }
 
 /// Persisted sidebar roots, bounded independently of the saved pane inventory.
@@ -3041,7 +3044,7 @@ fn migration_project_roots(
 }
 
 #[cfg(any(feature = "host", test))]
-pub(crate) fn read_labeled_migration_sessions_with_budget(
+pub fn read_labeled_migration_sessions_with_budget(
     path: &Path,
     budget: &mut MigrationInspectionBudget,
 ) -> Result<Vec<MigrationPane>> {
@@ -3085,7 +3088,7 @@ pub(crate) fn read_labeled_migration_sessions_with_budget(
 
     budget.check_deadline()?;
     let mut connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(Duration::from_millis(100))?;
@@ -3378,7 +3381,7 @@ pub(crate) fn read_migration_session_at(
 /// database. Only open cards with explicit navigation ownership contribute.
 pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, SavedSessionOwner)>> {
     let mut connection = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
@@ -4518,15 +4521,7 @@ fn save_workspace_transaction(
     )?;
     let next = next_generation(base.workspace, "workspace", state.id)?;
     let timestamp = now_unix_ms();
-    let focused = state
-        .focused
-        .filter(|focused| {
-            state
-                .cards
-                .iter()
-                .any(|card| card.id == *focused && card.existence.is_open())
-        })
-        .map(|id| id.to_string());
+    let focused = state.focused.map(|id| id.to_string());
 
     transaction
         .prepare_cached(UPSERT_WORKSPACE)?
@@ -6031,7 +6026,7 @@ fn replace_terminal_identity_transaction(
 
 /// What every workspace snapshot has to satisfy before any of it is written.
 pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
-    let mut ids = BTreeSet::new();
+    let mut cards = HashMap::with_capacity(state.cards.len());
     for card in &state.cards {
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {
             return Err(invalid_state!(
@@ -6040,7 +6035,7 @@ pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
                 card.width_fraction
             ));
         }
-        if !ids.insert(card.id) {
+        if cards.insert(card.id, (card, None)).is_some() {
             return Err(invalid_state!(
                 "workspace {} contains duplicate card {}",
                 state.id,
@@ -6049,10 +6044,9 @@ pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
         }
     }
     if let Some(focused) = state.focused
-        && !state
-            .cards
-            .iter()
-            .any(|card| card.id == focused && card.existence.is_open())
+        && !cards
+            .get(&focused)
+            .is_some_and(|(card, _)| card.existence.is_open())
     {
         return Err(invalid_state!(
             "workspace {} focuses missing or closed card {}",
@@ -6061,25 +6055,25 @@ pub fn validate_workspace(state: &WorkspaceState) -> Result<()> {
         ));
     }
     let mut channel_ids = BTreeSet::new();
-    let mut owned = BTreeSet::new();
     for channel in &state.channels {
         if !channel_ids.insert(channel.id) {
             return Err(invalid_state!("duplicate channel {}", channel.id));
         }
         for id in &channel.cards {
-            if !ids.contains(id) || !owned.insert(*id) {
-                return Err(invalid_state!(
-                    "channel {} references missing or multiply owned card {id}",
-                    channel.id
-                ));
+            match cards.get_mut(id) {
+                Some((_, owner)) if owner.is_none() => *owner = Some(channel.id),
+                _ => {
+                    return Err(invalid_state!(
+                        "channel {} references missing or multiply owned card {id}",
+                        channel.id
+                    ));
+                }
             }
         }
         if channel.focused.is_some_and(|id| {
-            !channel.cards.contains(&id)
-                || !state
-                    .cards
-                    .iter()
-                    .any(|card| card.id == id && card.existence.is_open())
+            !cards
+                .get(&id)
+                .is_some_and(|(card, owner)| *owner == Some(channel.id) && card.existence.is_open())
         }) {
             return Err(invalid_state!("channel {} has invalid focus", channel.id));
         }
@@ -7018,6 +7012,7 @@ mod tests {
         BootId::new(value)
     }
 
+    #[cfg(target_os = "linux")]
     const VISITOR_TEST: &str = "persistence::tests::another_process_visits_the_store";
     const VISITOR_ENV: &str = "CAGENTS_STORE_VISITOR_DATABASE";
 
@@ -7415,7 +7410,7 @@ mod tests {
             matches!(StateStore::open(&path, boot("different-boot")), Err(StoreError::UnsupportedSchema { found, supported }) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
         );
         let connection = Connection::open_with_flags(
-            &path,
+            crate::secure_file::sqlite_path(&path),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .unwrap();
@@ -10227,6 +10222,7 @@ mod tests {
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.channels, workspace.channels);
         assert_eq!(restored.active_channel, Some(id));
+        assert_eq!(restored.focused, Some(card));
         assert_eq!(restored.workspace_model_identity, Some(identity));
         assert_eq!(
             restored
@@ -10248,10 +10244,33 @@ mod tests {
             checkout: None,
         });
         workspace.active_channel = None;
-        assert!(matches!(
-            lane.save(&store, &workspace),
-            Err(StoreError::InvalidState(_))
-        ));
+        let refuses = |lane: &mut SaveLane, workspace: &WorkspaceState, check| {
+            let error = lane.save(&store, workspace).unwrap_err();
+            assert!(
+                matches!(&error, StoreError::InvalidState(violation) if violation.check() == check),
+                "{error}"
+            );
+        };
+        refuses(
+            &mut lane,
+            &workspace,
+            "channel {} references missing or multiply owned card {id}",
+        );
+        workspace.channels[1].cards = vec![unrelated_id];
+        refuses(&mut lane, &workspace, "channel {} has invalid focus");
+
+        workspace.channels[1].focused = Some(unrelated_id);
+        workspace.cards[1].existence = Existence::Closing {
+            operation_id: OperationId::new(),
+        };
+        refuses(&mut lane, &workspace, "channel {} has invalid focus");
+
+        workspace.focused = Some(unrelated_id);
+        refuses(
+            &mut lane,
+            &workspace,
+            "workspace {} focuses missing or closed card {}",
+        );
         let after = store
             .load_workspace_manifest(workspace.id)
             .unwrap()

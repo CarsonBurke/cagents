@@ -325,6 +325,7 @@ impl Cagents {
                 open && self.settings.show_status_bar && !self.modal_is_open();
             if self.device_ui.menu_open {
                 self.dismiss_chat_picker();
+                self.phone_ui.open = false;
                 match crate::device::list() {
                     Ok(devices) => {
                         self.device_ui.set_devices(devices);

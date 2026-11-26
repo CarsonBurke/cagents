@@ -33,7 +33,7 @@ pub struct RemovedWorktree {
 }
 
 #[cfg(feature = "host")]
-pub(crate) struct PreparedRemoval {
+pub struct PreparedRemoval {
     request: RemovalRequest,
     target: FencedTarget,
 }
@@ -41,7 +41,7 @@ pub(crate) struct PreparedRemoval {
 /// A worktree identified before a fenced removal takes its fences, which the
 /// removal confirms again once it holds them.
 #[cfg(feature = "host")]
-pub(crate) struct FencedTarget {
+pub struct FencedTarget {
     pub(crate) repository: PathBuf,
     pub(crate) path: PathBuf,
     /// The checked-out branch's short name; `None` when detached.
@@ -55,11 +55,7 @@ pub(crate) struct FencedTarget {
 impl FencedTarget {
     /// Identifies the worktree at `path`, a canonical directory registered
     /// with `repository`, as it is now.
-    pub(crate) fn capture(
-        repository: &Path,
-        path: &Path,
-        branch: Option<String>,
-    ) -> Result<Self, String> {
+    pub fn capture(repository: &Path, path: &Path, branch: Option<String>) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
         let cancellation = crate::process::CancellationToken::new();
         let service = crate::repository::RepositoryService::system("git");
@@ -232,7 +228,7 @@ fn cleanup_removal_command(
 impl PreparedRemoval {
     /// GitHub is read afresh before taking exclusive lifecycle fences. Sidebar
     /// branch badges and cached archived PRs never authorize removal.
-    pub(crate) fn prepare(request: RemovalRequest) -> Result<Self, String> {
+    pub fn prepare(request: RemovalRequest) -> Result<Self, String> {
         checked_record(&request)?;
         let cancellation = crate::process::CancellationToken::new();
         let pr = crate::github::GitHubService::system("gh")
@@ -254,7 +250,7 @@ impl PreparedRemoval {
     /// Caller retains the daemon's exclusive admission gate through this call.
     /// Advisory leases cannot fence later writes by unrelated programs.
     /// Automatic cleanup retains the checkout for explicit confirmation.
-    pub(crate) fn remove(
+    pub fn remove(
         self,
         _check_quiescence: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
     ) -> Result<crate::repository::RemovedWorktree, String> {
@@ -270,7 +266,7 @@ impl PreparedRemoval {
 /// established directory protection, so none can show the worktree unfenced.
 #[cfg(feature = "host")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WindowPolicy {
+pub enum WindowPolicy {
     /// At least one window, as for a removal a window asked for.
     RequireOne,
     /// Any number, none included, as for the command line.
@@ -292,7 +288,7 @@ pub(crate) enum WindowPolicy {
 /// reservation fences holds no control admission, so a long inspection and
 /// deletion hold off no other request.
 #[cfg(feature = "host")]
-pub(crate) fn remove_fenced(
+pub fn remove_fenced(
     target: FencedTarget,
     windows: WindowPolicy,
     admit: impl FnOnce(&[crate::instance::VerifiedWindow]) -> Result<(), String>,
@@ -452,18 +448,10 @@ impl Protection {
     #[cfg(any(feature = "host", feature = "ui", test))]
     pub(crate) fn retained_child_files(&self) -> io::Result<Vec<std::sync::Arc<std::fs::File>>> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
         let mut files = Vec::new();
         for lock in &self._locks {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
-            let old = lock.metadata()?;
-            let new = file.metadata()?;
-            if (old.dev(), old.ino()) != (new.dev(), new.ino()) {
-                return Err(io::Error::other("directory protection inode changed"));
-            }
+            // A new open description, so its shared lock is the child's own.
+            let file = crate::descriptor::reopen(lock, 0)?;
             // SAFETY: file owns this independent open description. It only
             // closes on drop; an inherited child keeps its SH lock alive.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
@@ -531,10 +519,8 @@ fn acquire_with_directory_pin(
     let mut roots = vec![directory.clone()];
     if !exclusive {
         for ancestor in directory.ancestors().skip(1) {
-            match ancestor.join(".git").symlink_metadata() {
-                Ok(_) => roots.push(ancestor.to_owned()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+            if crate::git_marker::present(&ancestor.join(".git"))? {
+                roots.push(ancestor.to_owned());
             }
         }
     }
@@ -1078,7 +1064,8 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn fresh_git_eligibility_preserves_dirty_untracked_locked_changed_and_primary_worktrees() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let parent = Path::new("/var/tmp").canonicalize().unwrap();
+        let directory = tempfile::tempdir_in(parent).unwrap();
         let repository = directory.path().join("repository");
         let worktree = directory.path().join("worktree");
         std::fs::create_dir(&repository).unwrap();
@@ -1300,6 +1287,7 @@ mod tests {
         for pin in &protection._directories {
             let flags = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) };
             assert!(flags >= 0);
+            #[cfg(target_os = "linux")]
             assert_ne!(flags & libc::O_PATH, 0);
         }
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1704,9 +1692,15 @@ mod tests {
     fn nested_editors_protect_containing_worktrees() {
         let runtime = fixture_directory();
         let directory = fixture_directory();
-        std::fs::write(directory.path().join(".git"), "gitdir: ignored").unwrap();
+        let marker = directory.path().join(".git");
+        std::fs::create_dir(&marker).unwrap();
         let nested = directory.path().join("nested/folder");
         std::fs::create_dir_all(&nested).unwrap();
+        let editor = acquire(runtime.path(), &nested, false).unwrap();
+        drop(acquire(runtime.path(), directory.path(), true).unwrap());
+        drop(editor);
+
+        std::fs::write(marker.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let editor = acquire(runtime.path(), &nested, false).unwrap();
         assert_eq!(
             acquire(runtime.path(), directory.path(), true)
