@@ -1417,18 +1417,6 @@ fn sign_fixture_program(program: &std::path::Path) {
     );
 }
 
-#[cfg(target_os = "macos")]
-fn assert_retirement_unproved(failure: ProtocolError) {
-    assert!(failure.retryable, "{failure:?}");
-    assert!(
-        failure
-            .message
-            .contains("No exact retirement proves the prior Darwin Codex writer is gone"),
-        "{}",
-        failure.message
-    );
-}
-
 impl CodexProcess {
     fn new(root: &std::path::Path, arguments: &[&str]) -> Self {
         use std::io::Read;
@@ -1861,13 +1849,11 @@ fn codex_picker_resume_refuses_the_old_panes_surviving_marked_process() {
             source: fixture.source.clone(),
         },
     );
-    #[cfg(target_os = "linux")]
-    assert!(matches!(
-        retry.unwrap(),
-        ServerResponse::ChatResumePrepared { .. }
-    ));
-    #[cfg(target_os = "macos")]
-    assert_retirement_unproved(retry.unwrap_err());
+    let ServerResponse::ChatResumePrepared { session } = retry.unwrap() else {
+        panic!("the old allocation was not prepared after its writer exited");
+    };
+    assert_ne!(session.id, fixture.source.id);
+    assert_eq!(session.launch.session_id, fixture.source.launch.session_id);
     assert!(!root.join("started-argv").exists());
 }
 
@@ -2065,6 +2051,20 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
         stale_failure.message
     );
     assert!(!root.join("started-argv").exists());
+    assert!(fixture.socket().parent().unwrap().is_dir());
+    assert!(
+        registry::execution_record(&registry::socket(
+            &registry::directory(Kind::Native).unwrap(),
+            id
+        ))
+        .unwrap()
+        .is_none()
+    );
+    {
+        let state = fixture.host.lock().unwrap();
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats.is_empty());
+    }
     handle.shutdown().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !handle.is_completed() {
@@ -2072,43 +2072,7 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
         thread::sleep(Duration::from_millis(10));
     }
     fixture.host.lock().unwrap().terminals.remove(&id);
-    #[cfg(target_os = "linux")]
     assert_codex_started(&fixture, &root);
-    #[cfg(target_os = "macos")]
-    {
-        let failure = codex_start(&fixture).unwrap_err();
-        assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
-        assert!(failure.retryable, "{failure:?}");
-        assert!(
-            failure
-                .message
-                .contains("This conversation was not restarted"),
-            "{failure:?}"
-        );
-        assert!(
-            failure
-                .message
-                .contains("No exact retirement proves the prior Darwin Codex writer is gone")
-                || failure
-                    .message
-                    .contains("Cannot inspect possible Codex writer"),
-            "{}",
-            failure.message
-        );
-        assert!(!root.join("started-argv").exists());
-        assert!(fixture.socket().parent().unwrap().is_dir());
-        assert!(
-            registry::execution_record(&registry::socket(
-                &registry::directory(Kind::Native).unwrap(),
-                id
-            ))
-            .unwrap()
-            .is_none()
-        );
-        let state = fixture.host.lock().unwrap();
-        assert!(state.chat_spawning.is_empty());
-        assert!(state.chats.is_empty());
-    }
 }
 
 #[test]
