@@ -107,6 +107,8 @@ case $PREFIX in
     *) fail '--prefix must be an absolute path' ;;
 esac
 PREFIX=${PREFIX%/}
+MARKER=$PREFIX/.cagents-install-root
+PENDING_MARKER=$MARKER.pending
 APP=$PREFIX/Cagents.app
 APP_LINK=$HOME/Applications/Cagents.app
 BIN_LINK=$HOME/.local/bin/cagents
@@ -133,8 +135,7 @@ register_app() {
 
 # The installation this script made, or nothing at PREFIX at all.
 owned_prefix() {
-    [ -f "$PREFIX/.cagents-install-root" ] && [ ! -L "$PREFIX/.cagents-install-root" ] \
-        && [ "$(cat "$PREFIX/.cagents-install-root")" = "$MARKER_TEXT" ]
+    [ -f "$MARKER" ] && [ ! -L "$MARKER" ] && [ "$(cat "$MARKER")" = "$MARKER_TEXT" ]
 }
 
 # Removes LINK when it is a symbolic link to TARGET, and only then.
@@ -172,12 +173,13 @@ installed_daemon() {
 }
 
 require_publication_fence() {
-    "$1" --no-start verify-install-guard >/dev/null \
-        || fail 'the installer could not verify the application launch fence; no installation files were changed'
+    "$1" --no-start verify-install-guard --publish-only >/dev/null \
+        || fail 'the installer could not verify publication ownership; no installation files were changed'
 }
 
 can_coordinate_publication() {
-    "$1" coordinate-install --help 2>/dev/null | grep -q -- '--publish-only'
+    "$1" coordinate-install --help 2>/dev/null | grep -q -- '--publish-only' \
+        && "$1" verify-install-guard --help 2>/dev/null | grep -q -- '--publish-only'
 }
 
 # Recognize this installation's stable login item and its older versioned form.
@@ -194,48 +196,6 @@ owned_agent() {
             ;;
         *) return 1 ;;
     esac
-}
-
-# Keep the prefix lock for older installers that use it. Current installers
-# also own the application launch fence for their entire publication.
-LOCK=
-LOCK_OWNER=
-refuse_existing_lock() {
-    holder=$(cat "$LOCK/pid" 2>/dev/null || :)
-    case $holder in
-        ''|0|*[!0-9]*) ;;
-        *)
-            if kill -0 "$holder" 2>/dev/null; then
-                fail "another cagents installer (process $holder) is changing $PREFIX; wait for it to finish"
-            fi
-            ;;
-    esac
-    fail "cannot confirm who owns $LOCK; if every other installer has exited, remove this lock and try again"
-}
-acquire_lock() {
-    LOCK=$PREFIX/.lock
-    if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
-        refuse_existing_lock
-    fi
-    LOCK_OWNER=$(mktemp -d "$PREFIX/.lock-owner.XXXXXX")
-    printf '%s\n' "$$" > "$LOCK_OWNER/pid"
-    if ln -sh "$LOCK_OWNER" "$LOCK" 2>/dev/null; then
-        [ -L "$LOCK" ] && [ "$(readlink "$LOCK")" = "$LOCK_OWNER" ] && return
-        # If an older installer made a real directory in the meantime,
-        # ln places our link inside it. Remove that link only.
-        nested=$LOCK/${LOCK_OWNER##*/}
-        [ ! -L "$nested" ] || [ "$(readlink "$nested")" != "$LOCK_OWNER" ] || rm -f "$nested"
-    fi
-    if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
-        refuse_existing_lock
-    fi
-    fail "cannot lock $PREFIX"
-}
-release_lock() {
-    [ -n "$LOCK_OWNER" ] || return 0
-    [ ! -L "$LOCK" ] || [ "$(readlink "$LOCK")" != "$LOCK_OWNER" ] || rm -f "$LOCK"
-    rm -rf "$LOCK_OWNER"
-    LOCK_OWNER=
 }
 
 stop_instructions() {
@@ -269,9 +229,6 @@ if [ "$UNINSTALL" -eq 1 ]; then
             exec "$current_cli" --no-start coordinate-install --prefix "$PREFIX" --installer "$0" --publish-only -- "$@"
         fi
         require_publication_fence "$current_cli"
-        trap release_lock EXIT
-        trap 'exit 1' HUP INT TERM
-        acquire_lock
         daemon=$(running_daemon "$current_cli") \
             || fail 'cannot tell whether the cagents daemon is running; nothing was removed'
         if [ -n "$daemon" ]; then
@@ -310,8 +267,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
         esac
     fi
     rm -rf "$PREFIX/versions" "$PREFIX/current"
-    rm -f "$PREFIX/.cagents-install-root"
-    release_lock
+    rm -f "$MARKER"
     rmdir "$PREFIX" 2>/dev/null || note "kept $PREFIX, which holds files this installer did not make"
     if [ "$PURGE" -eq 1 ]; then
         printf 'Removed cagents and its data.\n'
@@ -410,38 +366,20 @@ if [ -z "$PUBLISH_TREE" ]; then
             || fail 'use the release installer published with this archive'
     fi
     set -- --prefix "$PREFIX" --version "$VERSION" --publish-tree "$NEW" --publisher "$publisher"
-    [ "$START" -eq 1 ] || set -- "$@" --no-start
     "$publisher" --no-start coordinate-install --prefix "$PREFIX" \
         --installer "$0" --publish-only -- "$@"
 
-    # The coordinator and publication shell have released the launch fence.
+    # Start the selected version through normal daemon admission after the
+    # coordinator and publisher have released both fences. The plist is for
+    # the next login.
     DAEMON_STARTED=0
     if [ "$START" -eq 1 ]; then
-        # launchd runs a job in the account's own environment, so the login item
-        # of a private HOME would start a daemon serving the account's data, and
-        # its label is the account's. Such an installation starts its daemon
-        # here, in this environment, and leaves the login item unloaded.
-        attempt=20
-        if ! own_home; then
-            if "$PREFIX/current/bin/cagents" daemon start >/dev/null 2>&1; then
-                attempt=0
-            else
-                note 'could not start the daemon; it will start when you open cagents'
-            fi
-        elif launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" 2>/dev/null; then
-            attempt=0
+        if selected_bin=$(CDPATH= cd -P "$PREFIX/current/bin" && pwd -P) \
+            && "$selected_bin/cagents" daemon start >/dev/null; then
+            DAEMON_STARTED=1
         else
-            note 'could not load the login item now; the daemon will start at your next login'
+            note 'could not start the daemon; it will start when you open cagents'
         fi
-        # RunAtLoad starts the daemon now; wait briefly to report it.
-        while [ "$attempt" -lt 20 ]; do
-            if [ -n "$(running_daemon "$PREFIX/current/bin/cagents" 2>/dev/null)" ]; then
-                DAEMON_STARTED=1
-                break
-            fi
-            attempt=$((attempt + 1))
-            sleep 1
-        done
     fi
 
     if [ "$DAEMON_STARTED" -eq 1 ]; then
@@ -474,7 +412,17 @@ require_publication_fence "$PUBLISHER"
 if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
     [ -d "$PREFIX" ] && [ ! -L "$PREFIX" ] || fail "$PREFIX is not a directory"
     if ! owned_prefix; then
-        [ -z "$(ls -A "$PREFIX")" ] || fail "$PREFIX holds files this installer did not make; choose another --prefix"
+        entries=$(ls -A "$PREFIX") || fail "cannot inspect $PREFIX"
+        case $entries in
+            '') ;;
+            "${PENDING_MARKER##*/}")
+                # An interrupted first install can leave this one file.
+                [ -f "$PENDING_MARKER" ] && [ ! -L "$PENDING_MARKER" ] \
+                    && [ "$(stat -f %u "$PENDING_MARKER")" = "$(id -u)" ] \
+                    || fail "$PENDING_MARKER is not an installation marker"
+                ;;
+            *) fail "$PREFIX holds files this installer did not make; choose another --prefix" ;;
+        esac
     fi
 fi
 mkdir -p "$PREFIX"
@@ -500,13 +448,10 @@ cleanup() {
         rm -f "$AGENT_STAGE/new"
         [ "$STAGE_KEPT" -eq 1 ] && exists "$AGENT_STAGE/prior" || rm -rf "$AGENT_STAGE"
     fi
-    release_lock
 }
 exists() { [ -e "$1" ] || [ -L "$1" ]; }
 trap cleanup EXIT
 trap 'trap "" HUP INT TERM; exit 1' HUP INT TERM
-
-acquire_lock
 
 # Check the selected installation and daemon while new launches are fenced.
 CURRENT_VERSION=
@@ -522,6 +467,13 @@ if [ -n "$daemon" ]; then
     exit 1
 fi
 
+# Commit ownership before staging under a fresh prefix, so an interrupted copy
+# cannot leave a directory that the next installer refuses to use.
+if ! owned_prefix; then
+    rm -f "$PENDING_MARKER"
+    (set -C; printf '%s\n' "$MARKER_TEXT" > "$PENDING_MARKER")
+    mv -f "$PENDING_MARKER" "$MARKER"
+fi
 STAGE=$(mktemp -d "$PREFIX/.stage.XXXXXX")
 NEW=$STAGE/candidate
 # Rollback and publication use a child-owned stage on the prefix's volume.
@@ -530,7 +482,6 @@ ditto "$PUBLISH_TREE" "$NEW" || fail 'could not stage the verified release on th
 
 mkdir -p "$PREFIX/versions"
 chmod 0755 "$PREFIX"
-owned_prefix || printf '%s\n' "$MARKER_TEXT" > "$PREFIX/.cagents-install-root"
 TARGET_DIR=$PREFIX/versions/$VERSION
 mkdir -p "$HOME/Applications" "$HOME/.local/bin" "$HOME/Library/LaunchAgents" \
     || fail 'cannot create the folders the installation links from; the installation was not changed'
@@ -750,8 +701,9 @@ if [ "$in_use" != unknown ]; then
         rm -rf "$tree"
     done
 fi
-# Booting launchd or starting a daemon must happen outside the launch fence.
-[ "$START" -eq 0 ] || unload_agent
+# Retire this installation's previous login job during publication, so a
+# concurrent removal cannot be followed by loading a stale job.
+unload_agent
 CAGENTS_INSTALLER
 
 /bin/sh "$installer_dir/install.sh" "$@"

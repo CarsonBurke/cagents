@@ -151,7 +151,9 @@ the release's members, refuses links in the tree, and checks every signature in
 a private staging directory. Quit all cagents windows and stop the daemon
 before replacing or removing an installation. The installer holds the
 application launch fence while it checks for a running daemon and changes the
-installation. The daemon can start again after the installer releases the fence.
+installation. A per-user publication lock also excludes a second installer
+even when it uses another runtime directory. The installer starts the selected
+daemon after releasing both locks, unless `--no-start` is set.
 
 The release tree and bundle are staged on the prefix's volume. The login item
 is staged beside the one it replaces, so it can be published by rename even when
@@ -165,7 +167,8 @@ installation.
 installation, its links and its login item. `--purge` also removes saved app
 data. Use an older release's own installer if its CLI predates this command.
 Only installations under the account's own home register `Cagents.app` with
-Launch Services and load and unload the login item. The package smoke test
+Launch Services. The installer unloads its previous login job during
+publication. The new job runs at the next login. The package smoke test
 installs under a private `HOME` and starts its isolated daemon directly.
 
 Every executable and the bundle are signed ad hoc (`codesign --sign -`), which

@@ -5,7 +5,7 @@
 #   packaging/macos/smoke DIST VERSION PROTOCOL
 #
 # The installer leaves the private login item unloaded. The separate HOME and
-# XDG_RUNTIME_DIR isolate the daemon and publication checks from the account's.
+# XDG_RUNTIME_DIR isolate daemon and window state from the account's.
 set -eu
 
 PROGRAM=smoke
@@ -23,19 +23,28 @@ ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cagents-macos-smoke.XXXXXX")
 # directory reached through one, so the private home gets its real path.
 ROOT=$(cd "$ROOT" && pwd -P)
 trap 'exit 1' HUP INT TERM
-mkdir -p "$ROOT/home" "$ROOT/runtime"
-chmod 0700 "$ROOT/runtime"
+mkdir -p "$ROOT/home" "$ROOT/runtime" "$ROOT/other-runtime"
+chmod 0700 "$ROOT/runtime" "$ROOT/other-runtime"
 # A path with a space, as the default under Application Support has.
 PREFIX="$ROOT/home/Library/Application Support/cagents-install"
+AGENT="$ROOT/home/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist"
 publisher_pid=
 
 private_runtime() {
-    env -u CAGENTS_AGENT_AUTHORITY HOME="$ROOT/home" XDG_RUNTIME_DIR="$ROOT/runtime" "$@"
+    env HOME="$ROOT/home" XDG_RUNTIME_DIR="$ROOT/runtime" "$@"
+}
+
+# Running the launcher can register the private bundle with Launch Services,
+# which is per account. Remove only the private paths.
+unregister() {
+    lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+    "$lsregister" -u "$PREFIX/Cagents.app" >/dev/null 2>&1 || :
+    for copy in "$PREFIX"/versions/*/Cagents.app; do "$lsregister" -u "$copy" >/dev/null 2>&1 || :; done
 }
 
 cleanup() {
     if [ -n "$publisher_pid" ]; then
-        touch "$ROOT/repair-release" "$ROOT/removal-release"
+        touch "$ROOT/$publication-release"
         wait "$publisher_pid" 2>/dev/null || :
     fi
     # The selector may still point to the stand-in if the login test failed.
@@ -59,6 +68,102 @@ install_release() {
     private_installer "$DIST/install-macos.sh" --prefix "$PREFIX" "$@"
 }
 
+# Pause the real publisher at the initial copy, the repair's selector rename,
+# and removal of the login item.
+mkdir "$ROOT/hooks"
+cat > "$ROOT/hooks/pause" <<'EOF'
+#!/bin/sh
+set -eu
+command=${0##*/}
+case $command in
+    ditto) real=/usr/bin/ditto ;;
+    *) real=/bin/$command ;;
+esac
+case $SMOKE_PHASE:$command in
+    first-install:ditto)
+        case $2 in
+            "$SMOKE_PREFIX"/.stage.*/candidate) mkdir "$2"; touch "$2/partial" ;;
+            *) exec "$real" "$@" ;;
+        esac
+        ;;
+    repair:mv) [ "$#" -eq 3 ] && [ "$1" = -fh ] && [ "$3" = "$SMOKE_PREFIX/current" ] || exec "$real" "$@" ;;
+    removal:rm) [ "$#" -eq 2 ] && [ "$1" = -f ] && [ "$2" = "$SMOKE_AGENT" ] || exec "$real" "$@" ;;
+    *) exec "$real" "$@" ;;
+esac
+printf '%s %s\n' "$PPID" "$$" > "$SMOKE_ROOT/$SMOKE_PHASE-ready"
+remaining=30
+until [ -f "$SMOKE_ROOT/$SMOKE_PHASE-release" ]; do
+    [ "$remaining" -gt 0 ] || exit 1
+    sleep 1
+    remaining=$((remaining - 1))
+done
+[ "$SMOKE_PHASE" != first-install ] || exit 1
+exec "$real" "$@"
+EOF
+chmod +x "$ROOT/hooks/pause"
+for command in ditto mv rm; do ln -s pause "$ROOT/hooks/$command"; done
+cat > "$ROOT/contender.sh" <<'EOF'
+#!/bin/sh
+touch "$1"
+EOF
+
+pause_publication() {
+    publication=$1
+    shift
+    SMOKE_PHASE=$publication SMOKE_ROOT=$ROOT SMOKE_PREFIX=$PREFIX SMOKE_AGENT=$AGENT \
+        PATH="$ROOT/hooks:$PATH" install_release "$@" > "$ROOT/$publication.log" 2>&1 &
+    publisher_pid=$!
+    remaining=30
+    until [ -s "$ROOT/$publication-ready" ]; do
+        if [ "$remaining" -le 0 ] || ! kill -0 "$publisher_pid" 2>/dev/null; then
+            cat "$ROOT/$publication.log" >&2
+            fail "$publication did not reach the publication step"
+        fi
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+    read -r publisher_shell publication_hook < "$ROOT/$publication-ready"
+}
+
+refuse_contender() {
+    runtime=$1
+    if private_runtime env XDG_RUNTIME_DIR="$runtime" "$ROOT/home/.local/bin/cagents" --no-start \
+        coordinate-install --prefix "$PREFIX" --installer "$ROOT/contender.sh" \
+        --publish-only -- "$ROOT/contender-ran" > "$ROOT/contender.log" 2>&1; then
+        fail "a second publisher entered during $publication"
+    fi
+    [ ! -e "$ROOT/contender-ran" ] && grep -qiE 'temporarily unavailable|another .*install' "$ROOT/contender.log" \
+        || { cat "$ROOT/contender.log" >&2; fail "the second publisher was not refused during $publication"; }
+}
+
+finish_publication() {
+    touch "$ROOT/$publication-release"
+    if ! wait "$publisher_pid"; then
+        cat "$ROOT/$publication.log" >&2
+        fail "$publication failed"
+    fi
+    publisher_pid=
+}
+
+# Simulate interruption while writing the initial marker, then really kill
+# the publisher during the first copy. Both leave an installable prefix.
+mkdir -p "$PREFIX"
+touch "$PREFIX/.cagents-install-root.pending"
+pause_publication first-install --no-start
+[ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] \
+    && [ ! -e "$PREFIX/current" ] && [ ! -e "$AGENT" ] \
+    || fail 'the first publisher started copying before establishing ownership'
+kill -KILL "$publisher_shell"
+touch "$ROOT/$publication-release"
+if wait "$publisher_pid"; then fail 'the interrupted first install reported success'; fi
+publisher_pid=
+remaining=30
+while kill -0 "$publication_hook" 2>/dev/null; do
+    [ "$remaining" -gt 0 ] || fail 'the first install copy did not exit'
+    sleep 1
+    remaining=$((remaining - 1))
+done
+
 # Read the installer from standard input, as the release's curl command does.
 private_installer -s -- --prefix "$PREFIX" --no-start < "$DIST/install-macos.sh" > "$ROOT/install.log" 2>&1 \
     || { cat "$ROOT/install.log" >&2; fail 'streamed install failed'; }
@@ -73,7 +178,6 @@ codesign --verify --strict "$PREFIX/Cagents.app" || fail 'the installed Cagents.
 # answers --version without opening a window.
 [ "$("$PREFIX/Cagents.app/Contents/MacOS/Cagents" --version)" = "cagents-ui $VERSION" ] \
     || fail 'the Cagents.app launcher does not reach the installed cagents-ui'
-AGENT="$ROOT/home/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist"
 plutil -lint -s "$AGENT" || fail 'the login item is not a valid property list'
 [ "$(/usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$AGENT")" = true ] || fail 'the login item does not run at load'
 [ -z "$(find "$PREFIX" -xattrname com.apple.quarantine -print 2>/dev/null)" ] || fail 'installed files carry quarantine'
@@ -119,90 +223,12 @@ grep -q 'daemon .* is running' "$ROOT/running-repair.log" \
     || { cat "$ROOT/running-repair.log" >&2; fail 'repair refused without reporting the running daemon'; }
 cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started through the link'
 
-# An older installer may have made its lock directory before writing its PID.
-mkdir "$PREFIX/.lock"
-if install_release --uninstall > "$ROOT/legacy-lock.log" 2>&1; then
-    fail 'removal reused an incomplete older installer lock'
-fi
-[ -d "$PREFIX/.lock" ] && [ ! -L "$PREFIX/.lock" ] \
-    && grep -q 'cannot confirm who owns' "$ROOT/legacy-lock.log" \
-    || { cat "$ROOT/legacy-lock.log" >&2; fail 'removal did not preserve the incomplete lock'; }
-rmdir "$PREFIX/.lock"
-
-# Running the launcher registered the private bundle with Launch Services,
-# which is per account; take it back so the account's own stays the one.
-unregister() {
-    "$LSREGISTER" -u "$PREFIX/Cagents.app" >/dev/null 2>&1 || :
-    for copy in "$PREFIX"/versions/*/Cagents.app; do "$LSREGISTER" -u "$copy" >/dev/null 2>&1 || :; done
-}
-LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 unregister
-
-# Pause the real publisher at the selector rename and at removal of the login
-# item. A second publisher must be refused even though the daemon is stopped.
-mkdir "$ROOT/hooks"
-cat > "$ROOT/hooks/pause" <<'EOF'
-#!/bin/sh
-set -eu
-command=${0##*/}
-case $SMOKE_PHASE:$command in
-    repair:mv) [ "$#" -eq 3 ] && [ "$1" = -fh ] && [ "$3" = "$SMOKE_PREFIX/current" ] || exec /bin/mv "$@" ;;
-    removal:rm) [ "$#" -eq 2 ] && [ "$1" = -f ] && [ "$2" = "$SMOKE_AGENT" ] || exec /bin/rm "$@" ;;
-    *) exec "/bin/$command" "$@" ;;
-esac
-printf '%s\n' "$PPID" > "$SMOKE_ROOT/$SMOKE_PHASE-ready"
-remaining=30
-until [ -f "$SMOKE_ROOT/$SMOKE_PHASE-release" ]; do
-    [ "$remaining" -gt 0 ] || exit 1
-    sleep 1
-    remaining=$((remaining - 1))
-done
-exec "/bin/$command" "$@"
-EOF
-chmod +x "$ROOT/hooks/pause"
-ln -s pause "$ROOT/hooks/mv"
-ln -s pause "$ROOT/hooks/rm"
-cat > "$ROOT/contender.sh" <<'EOF'
-#!/bin/sh
-touch "$1"
-EOF
-
-pause_publication() {
-    publication=$1
-    shift
-    SMOKE_PHASE=$publication SMOKE_ROOT=$ROOT SMOKE_PREFIX=$PREFIX SMOKE_AGENT=$AGENT \
-        PATH="$ROOT/hooks:$PATH" install_release "$@" > "$ROOT/$publication.log" 2>&1 &
-    publisher_pid=$!
-    remaining=30
-    until [ -s "$ROOT/$publication-ready" ]; do
-        if [ "$remaining" -le 0 ] || ! kill -0 "$publisher_pid" 2>/dev/null; then
-            cat "$ROOT/$publication.log" >&2
-            fail "$publication did not reach the publication step"
-        fi
-        sleep 1
-        remaining=$((remaining - 1))
-    done
-    if cli --no-start coordinate-install --prefix "$PREFIX" --installer "$ROOT/contender.sh" \
-        --publish-only -- "$ROOT/contender-ran" > "$ROOT/contender.log" 2>&1; then
-        fail "the second publisher entered during $publication"
-    fi
-    [ ! -e "$ROOT/contender-ran" ] && grep -qi 'temporarily unavailable' "$ROOT/contender.log" \
-        || { cat "$ROOT/contender.log" >&2; fail "the second publisher was not refused by the fence during $publication"; }
-    [ "$(cat "$PREFIX/.lock/pid")" = "$(cat "$ROOT/$publication-ready")" ] \
-        || fail "the older installer would see no live publisher during $publication"
-}
-
-finish_publication() {
-    touch "$ROOT/$publication-release"
-    if ! wait "$publisher_pid"; then
-        cat "$ROOT/$publication.log" >&2
-        fail "$publication failed"
-    fi
-    publisher_pid=
-}
 
 touch "$PREFIX/versions/$VERSION/.smoke-damaged-member"
 pause_publication repair
+refuse_contender "$ROOT/runtime"
+refuse_contender "$ROOT/other-runtime"
 finish_publication
 [ ! -e "$PREFIX/versions/$VERSION/.smoke-damaged-member" ] || fail 'repair retained the damaged release tree'
 cli --no-start daemon status --json > "$ROOT/status.json"
@@ -213,8 +239,10 @@ cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop th
 mkdir -p "$ROOT/home/Library/Application Support/dev.cagents.cagents" "$ROOT/runtime/cagents"
 touch "$ROOT/runtime/cagents/smoke-data"
 pause_publication removal --purge
+refuse_contender "$ROOT/runtime"
+refuse_contender "$ROOT/other-runtime"
 [ -f "$ROOT/runtime/cagents/smoke-data" ] || fail 'purge removed data before publication'
-kill -TERM "$(cat "$ROOT/removal-ready")"
+kill -TERM "$publisher_shell"
 finish_publication
 [ ! -e "$ROOT/home/Library/Application Support/dev.cagents.cagents" ] && [ ! -e "$ROOT/runtime/cagents" ] \
     || fail 'purge left private app data behind'
