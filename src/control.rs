@@ -10769,6 +10769,7 @@ mod tests {
                 ServerMessage::ChatQueueEnded {
                     source: session.clone(),
                     execution: uuid::Uuid::new_v4(),
+                    current: true,
                 },
             );
             respond(
@@ -10912,6 +10913,7 @@ mod tests {
         let foreign_queue = ServerMessage::ChatQueueEnded {
             source: session(elsewhere),
             execution: uuid::Uuid::new_v4(),
+            current: true,
         };
         assert_eq!(client.absorb(foreign_queue.clone()), Some(foreign_queue));
         assert!(client.list_chats().unwrap().is_empty());

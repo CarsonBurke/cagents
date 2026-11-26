@@ -1261,6 +1261,9 @@ pub enum ServerMessage {
     ChatQueueEnded {
         source: crate::chat::Session,
         execution: uuid::Uuid,
+        /// This is the subscriber's attached execution, rather than an
+        /// earlier archived execution with the same pane ID.
+        current: bool,
     },
 }
 
