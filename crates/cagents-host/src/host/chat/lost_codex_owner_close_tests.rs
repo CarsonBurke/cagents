@@ -399,21 +399,55 @@ fn a_provider_that_outlived_its_holder_keeps_the_refusal() {
 /// and every Close of the pane waits on the dead holder until it times out.
 #[test]
 fn a_provider_inherits_nothing_from_its_holder() {
+    const READY: &str = "CAGENTS_TEST_PROVIDER_DESCRIPTORS_READY";
+    if let Some(ready) = std::env::var_os(READY) {
+        // mkdir publishes readiness without opening a descriptor. Leave
+        // the table alone so the parent can inspect it after exec and startup.
+        std::fs::create_dir(ready).unwrap();
+        thread::sleep(Duration::from_secs(60));
+        return;
+    }
     let Some(root) = isolated("a_provider_inherits_nothing_from_its_holder") else {
         return;
     };
     let fixture = Fixture::new(&root);
-    let _spawned = Spawned::new(&fixture.source);
+    let ready = root.join("provider-ready");
+    let executable = std::env::current_exe().unwrap();
+    let _spawned = Spawned::running(
+        &fixture.source,
+        "/usr/bin/env",
+        &[
+            &format!("{READY}={}", ready.display()),
+            executable.to_str().unwrap(),
+            "--exact",
+            "host::chat::lost_codex_owner_close_tests::a_provider_inherits_nothing_from_its_holder",
+        ],
+    );
     let record = Spawned::record(&fixture.source);
+    // The holder reports successful exec before the dynamic loader has
+    // necessarily closed its own files. Wait for the provider's test body.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.is_dir() {
+        assert!(record.root.is_current(), "the descriptor probe exited");
+        assert!(
+            Instant::now() < deadline,
+            "the descriptor probe never started"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(record.root.is_current());
     #[cfg(target_os = "linux")]
     let descriptors = std::fs::read_dir(format!("/proc/{}/fd", record.root.pid))
         .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|fd| !["0", "1", "2"].contains(&fd.as_str()))
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let fd = entry.file_name().into_string().unwrap();
+            (!["0", "1", "2"].contains(&fd.as_str()))
+                .then(|| (fd, entry.path().read_link().unwrap()))
+        })
         .collect::<Vec<_>>();
     #[cfg(target_os = "macos")]
     let descriptors = {
-        assert!(record.root.is_current());
         // SAFETY: the kernel record contains only integers.
         let mut entries: [libc::proc_fdinfo; 64] = unsafe { std::mem::zeroed() };
         let bytes = std::mem::size_of_val(&entries) as libc::c_int;
@@ -429,13 +463,13 @@ fn a_provider_inherits_nothing_from_its_holder() {
         };
         let entry = std::mem::size_of::<libc::proc_fdinfo>();
         assert!(written > 0 && written < bytes && (written as usize).is_multiple_of(entry));
-        assert!(record.root.is_current());
         entries[..written as usize / entry]
             .iter()
             .filter(|fd| fd.proc_fd > 2)
             .map(|fd| fd.proc_fd)
             .collect::<Vec<_>>()
     };
+    assert!(record.root.is_current());
     assert!(descriptors.is_empty(), "inherited {descriptors:?}");
 }
 
