@@ -397,17 +397,18 @@ fn reserve_worker_descriptor(worker: &File) -> Result<File, UpdateError> {
     )?))
 }
 
-#[cfg(all(test, target_os = "linux", not(any(feature = "host", feature = "ui"))))]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
-    use super::*;
-    use crate::{
-        daemon::RuntimePaths,
-        model::{HostIncarnation, HostSessionId, HostSessionProof},
-        upgrade::handoff::{Checkpoint, Store},
-    };
-
+    #[cfg(target_os = "linux")]
     #[test]
     fn refused_start_transport_keeps_current() {
+        use super::*;
+        use crate::{
+            daemon::RuntimePaths,
+            model::{HostIncarnation, HostSessionId, HostSessionProof},
+            upgrade::handoff::{Checkpoint, Store},
+        };
+
         const TEST: &str = "update::pending_recovery::tests::refused_start_transport_keeps_current";
         const FIXTURE: &str = "CAGENTS_TEST_RECOVERY_START_PREFIX";
         if let Some(prefix) = std::env::var_os(FIXTURE) {
