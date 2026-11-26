@@ -148,12 +148,13 @@ libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 notify = "=9.0.0-rc.8"
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
+# The mobile bridge validates PNG bytes before staging an attachment.
+png = "0.18"
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
 # binary payload; a self-describing text format costs ~24x more bytes and one
 # heap allocation per character cell on both sides. postcard is already in the
 # resolved dependency graph, needs no additional crates, and its externally
 # tagged enum encoding is why the wire enums below carry no `serde(tag)`.
-png = "0.18"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # Shared bounded notification excerpts use the same CommonMark parser as the UI.
 pulldown-cmark = { version = "0.12.2", default-features = false }

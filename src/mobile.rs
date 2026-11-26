@@ -9,10 +9,10 @@
 //! translation has to keep the mobile API's promises.
 //!
 //! The bridge acts for the person, like the CLI in their own terminal, and
-//! refuses to run in an agent's shell. It exposes only what the mobile API
-//! names: watching sessions, notices and conversations, and messaging,
-//! interrupting and answering conversations. Nothing reaches accounts, the
-//! daemon's lifecycle or files.
+//! refuses to run in an agent's shell. The API can watch sessions, notices
+//! and conversations, and read their saved output, patches and images. It
+//! can send messages and image attachments, interrupt turns and answer
+//! requests.
 //!
 //! When the daemon stops, is replaced or is updated, the bridge says so and
 //! exits; reconnecting starts the bridge that matches the daemon then running.

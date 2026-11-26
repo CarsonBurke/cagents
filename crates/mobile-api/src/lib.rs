@@ -647,8 +647,8 @@ pub enum Role {
     Unknown,
 }
 
-/// What an item holds. Long tool output is clipped to its end, with
-/// `clipped` set; the full text stays on the computer.
+/// What an item previews. `clipped` marks shortened content, and
+/// `conversation.output` reads saved output on demand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ItemBody {
