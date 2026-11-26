@@ -7126,8 +7126,10 @@ fn project_identity_row(
 
 /// The primary action for a project row, shared by pointer and keyboard
 /// activation: it folds the project, a folder as a repository, whose root
-/// opens from its row in the Worktrees pane. An unreadable project offers
-/// retry rather than navigation.
+/// opens from its row in the Worktrees pane. A folder with nothing under its
+/// heading has nothing to fold, so pressing it opens the folder instead of
+/// doing nothing visible. An unreadable project offers retry rather than
+/// navigation.
 pub fn project_primary_action(project: &SidebarProject) -> Option<SidebarAction> {
     if project.unreachable.is_some() {
         return (!project.reloading).then(|| SidebarAction::RefreshProject {
@@ -7135,7 +7137,16 @@ pub fn project_primary_action(project: &SidebarProject) -> Option<SidebarAction>
             repository: project.repository.clone(),
         });
     }
-    Some(SidebarAction::ToggleProject(project.id))
+    let nothing_to_fold =
+        project.worktrees.is_empty() && project.channels.is_empty() && project.panes.is_empty();
+    Some(if project.kind == ProjectKind::Folder && nothing_to_fold {
+        SidebarAction::OpenRepository {
+            project_id: project.id,
+            repository: project.repository.clone(),
+        }
+    } else {
+        SidebarAction::ToggleProject(project.id)
+    })
 }
 
 /// The project's name, on one line, fading rather than wrapping so a long
@@ -7641,7 +7652,7 @@ fn project_view<'a>(
     // list gives every pane and channel it counts a row of its own, so an
     // expanded header there repeats none of it. Otherwise an expanded header
     // says only what none of the rows drawn under it does: a Folder root,
-    // which is its own destination with no row, whatever the checkout
+    // which has no row in the sidebar, whatever the checkout
     // display, and for hidden checkouts news of a pane a search leaves out
     // or of no pane at all.
     let header_attention = if !expanded {

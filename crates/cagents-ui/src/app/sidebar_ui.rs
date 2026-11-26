@@ -118,16 +118,6 @@ impl Cagents {
                 let rows = self.visible_sidebar_rows();
                 let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
                     .or_else(|| rows.first()).copied();
-                // A search that finds only a folder goes into it, as one that
-                // finds a pane does, rather than folding it.
-                if let Some(sidebar::SelectionRow::Project(id)) = row
-                    && let Some(project) = self.sidebar_model.project(id)
-                    && project.kind == ProjectKind::Folder
-                    && project.unreachable.is_none()
-                {
-                    let repository = project.repository.clone();
-                    return ControlFlow::Break(self.dispatch(Message::Sidebar(SidebarAction::OpenRepository { project_id: id, repository })));
-                }
                 row.map_or_else(Task::none, |row| self.open_sidebar_navigation_row(row))
             }
             SidebarAction::FocusFirstSearchResult => {

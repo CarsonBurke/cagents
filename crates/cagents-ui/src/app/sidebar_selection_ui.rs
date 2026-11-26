@@ -151,8 +151,9 @@ pub(in crate::app) mod tests {
         assert_eq!(app.sidebar_navigation_action(row), None);
     }
 
-    /// Enter on a search that finds only a folder goes into the folder, as a
-    /// search finding a pane goes to the pane: it does not fold the folder.
+    /// Enter on a search that finds only an empty folder goes into the
+    /// folder, as a search finding a pane goes to the pane: with nothing
+    /// under its heading, there is nothing to fold.
     #[test]
     fn entering_a_search_that_finds_only_a_folder_opens_it() {
         let mut app = super::super::tests::context_inspector_test_app(true);
