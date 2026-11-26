@@ -678,6 +678,10 @@ impl ExecutionEvidence {
             .filter(|(pane, _)| *pane == source.id)
             .map(|(_, owner)| owner)
             .collect::<Vec<_>>();
+        #[cfg(target_os = "macos")]
+        if self.processes == Path::new("/proc") {
+            return self.running_darwin_pid(source, &owners);
+        }
         for owner in &owners {
             for expected in [&owner.root, &owner.holder] {
                 let stat = self.processes.join(expected.pid.to_string()).join("stat");
@@ -733,6 +737,60 @@ impl ExecutionEvidence {
                 && arguments
                     .windows(marker.len())
                     .any(|window| window == marker.as_bytes())
+            {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn running_darwin_pid(
+        &self,
+        source: &Session,
+        owners: &[&crate::daemon::holder_registry::Record],
+    ) -> Option<i32> {
+        if source.launch.provider == crate::agent::Provider::Codex {
+            return match self.codex_execution(source) {
+                CodexExecution::Running { pid: Some(pid), .. } => i32::try_from(pid).ok(),
+                _ => None,
+            };
+        }
+        let check = || self.deadline.map_or(Ok(()), check_deadline).ok();
+        let live_pid = |expected: &crate::daemon::holder_registry::Process| {
+            let pid = u32::try_from(expected.pid).ok()?;
+            let pin = crate::daemon::PinnedProcess::open(pid).ok()?;
+            (expected.is_current() && matches!(pin.exited(), Ok(false))).then_some(expected.pid)
+        };
+        let discovered = self.native_holders.as_ref().ok().and_then(|directory| {
+            use crate::daemon::holder_registry::{self, Kind};
+            holder_registry::recovery_candidate(
+                &holder_registry::socket(directory, source.id),
+                Kind::Native,
+            )
+            .ok()
+            .flatten()
+        });
+        let owners = owners.iter().copied().chain(discovered.as_ref());
+        for owner in owners.filter(|owner| owner.boot == self.boot) {
+            check()?;
+            if let Some(pid) = live_pid(&owner.root).or_else(|| live_pid(&owner.holder)) {
+                return Some(pid);
+            }
+            let Ok(members) = crate::daemon::lost_processes::census(&owner.holder, &owner.root)
+            else {
+                continue;
+            };
+            check()?;
+            if let Some(pid) = members
+                .iter()
+                .filter(|member| !member.zombie && member.proved)
+                .find_map(|member| {
+                    live_pid(&crate::daemon::holder_registry::Process {
+                        pid: member.pid,
+                        start: member.start,
+                    })
+                })
             {
                 return Some(pid);
             }
@@ -847,7 +905,14 @@ impl ExecutionEvidence {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
+                #[cfg(target_os = "linux")]
                 Err(_) => return SavedExecution::Unchecked,
+                #[cfg(target_os = "macos")]
+                Err(_) => {
+                    if execution != SavedExecution::Running {
+                        execution = SavedExecution::Unchecked;
+                    }
+                }
             }
             match &self.retired {
                 Ok(retired) => unrecorded |= unnamed && !retired.contains(owner),
@@ -901,6 +966,8 @@ impl ExecutionEvidence {
         };
         owners.extend(&discovered);
         let mut execution = SavedExecution::Ended;
+        #[cfg(target_os = "macos")]
+        let mut missing_retirement = false;
         for owner in owners {
             if self
                 .deadline
@@ -909,7 +976,12 @@ impl ExecutionEvidence {
                 return SavedExecution::Unchecked;
             }
             if !retired.contains(owner) {
+                #[cfg(target_os = "linux")]
                 return SavedExecution::Unproved;
+                #[cfg(target_os = "macos")]
+                {
+                    missing_retirement = true;
+                }
             }
             if owner.boot != self.boot {
                 continue;
@@ -917,8 +989,19 @@ impl ExecutionEvidence {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
+                #[cfg(target_os = "linux")]
                 Err(_) => return SavedExecution::Unchecked,
+                #[cfg(target_os = "macos")]
+                Err(_) => {
+                    if execution != SavedExecution::Running {
+                        execution = SavedExecution::Unchecked;
+                    }
+                }
             }
+        }
+        #[cfg(target_os = "macos")]
+        if execution != SavedExecution::Running && missing_retirement {
+            return SavedExecution::Unproved;
         }
         execution
     }
@@ -2899,6 +2982,14 @@ mod tests {
         }
     }
 
+    // Those fixtures record an ended PID and a database row. The Darwin
+    // read-only source inspection cannot authenticate detached cleanup from
+    // either. The lease-holding destination inspects the retirement receipt.
+    #[cfg(target_os = "linux")]
+    const ABSENT_WITHOUT_RECEIPT: SavedExecution = SavedExecution::Ended;
+    #[cfg(target_os = "macos")]
+    const ABSENT_WITHOUT_RECEIPT: SavedExecution = SavedExecution::Unchecked;
+
     fn evidence(
         holders: &Path,
         census: Vec<(TerminalId, crate::daemon::holder_registry::Record)>,
@@ -2915,25 +3006,32 @@ mod tests {
         }
     }
 
-    /// Real kernel process and socket data, restricted to this fixture's
-    /// explicitly owned processes. An unrelated exec is not part of its input.
+    /// The proc parser's fixture, scoped to this test's explicitly owned
+    /// Linux processes and sockets, or an empty synthetic table on Darwin.
     struct LiveProcesses(tempfile::TempDir);
 
     impl LiveProcesses {
         fn new() -> Self {
             let processes = Self(tempfile::tempdir_in("/var/tmp").unwrap());
             std::fs::create_dir(processes.0.path().join("net")).unwrap();
-            std::os::unix::fs::symlink("/proc/net/unix", processes.0.path().join("net/unix"))
-                .unwrap();
-            processes.include(std::process::id());
+            let sockets = processes.0.path().join("net/unix");
+            #[cfg(target_os = "linux")]
+            {
+                std::os::unix::fs::symlink("/proc/net/unix", sockets).unwrap();
+                processes.include(std::process::id());
+            }
+            #[cfg(target_os = "macos")]
+            std::fs::write(sockets, "Num RefCount Protocol Flags Type St Inode Path\n").unwrap();
             processes
         }
 
+        #[cfg(target_os = "linux")]
         fn include(&self, pid: u32) {
             std::os::unix::fs::symlink(format!("/proc/{pid}"), self.0.path().join(pid.to_string()))
                 .unwrap();
         }
 
+        #[cfg(target_os = "linux")]
         fn remove(&self, pid: u32) {
             std::fs::remove_file(self.0.path().join(pid.to_string())).unwrap();
         }
@@ -3019,18 +3117,22 @@ mod tests {
         // Verified retirement removed the discovery record.
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let mut evidence = evidence(holders.path(), census);
-        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        assert_eq!(evidence.classify(&card), ABSENT_WITHOUT_RECEIPT);
         assert_eq!(
             evidence.classify(&issued),
-            SavedExecution::Unrecorded,
+            if cfg!(target_os = "macos") {
+                SavedExecution::Unchecked
+            } else {
+                SavedExecution::Unrecorded
+            },
             "a pre-ID card reopens only what a recorded retirement confirmed"
         );
         evidence.retired = read_retired_owners(&path);
         assert_eq!(evidence.retired, Ok(vec![retired.clone()]));
         assert_eq!(
             evidence.classify(&issued),
-            SavedExecution::Ended,
-            "a pre-ID card whose actor retired holds no live work either"
+            ABSENT_WITHOUT_RECEIPT,
+            "a registry row alone cannot confirm Darwin detached cleanup"
         );
         drop(registry);
         assert!(read_census(&root.path().join("absent.sqlite3")).is_err());
@@ -3069,7 +3171,7 @@ mod tests {
         let census = vec![(card.id, abandoned.clone()), (card.id, older_boot)];
         assert_eq!(
             evidence(holders.path(), census).classify(&card),
-            SavedExecution::Ended
+            ABSENT_WITHOUT_RECEIPT
         );
         for (holder, root) in [
             (running_process(), ended_process()),
@@ -3095,10 +3197,10 @@ mod tests {
             .create(holders.path())
             .unwrap();
         let census = vec![(card.id, owner(&card, ended_process(), ended_process()))];
-        assert_eq!(
-            evidence(holders.path(), census).classify(&card),
-            SavedExecution::Running
-        );
+        let evidence = evidence(holders.path(), census);
+        assert_eq!(evidence.classify(&card), SavedExecution::Running);
+        #[cfg(target_os = "macos")]
+        assert_eq!(evidence.running_pid(&card), Some(std::process::id() as i32));
     }
 
     #[test]
@@ -3172,7 +3274,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
-                SavedExecution::Ended
+                ABSENT_WITHOUT_RECEIPT
             );
             // A prior-boot record cannot name a surviving holder, even when
             // its PID and start time happen to match a process of this boot.
@@ -3539,10 +3641,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-    )]
+    // The fixture checks bound sockets through Linux's /proc/net/unix.
+    #[cfg(target_os = "linux")]
     fn codex_pane_with_a_surviving_server_or_holder_is_live_work() {
         use std::io::Read;
         // Other tests must not fork while this test owns a listener whose
@@ -3748,10 +3848,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-    )]
+    // The fixture checks bound sockets through Linux's /proc/net/unix.
+    #[cfg(target_os = "linux")]
     fn codex_long_holder_socket_alias_blocks_until_listener_exits() {
         // A concurrent fork can retain a listener until its child execs. Keep
         // final-close assertions in a child where other tests cannot fork it.
@@ -4462,7 +4560,10 @@ mod tests {
     #[test]
     fn ended_panes_stay_unchanged_and_live_unlisted_panes_report_recovery() {
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        #[cfg(target_os = "linux")]
         let retired = retained_card(current_boot());
+        #[cfg(target_os = "macos")]
+        let retired = retained_card(BootId::new("prior-retirement-boot"));
         let previous = retained_card(BootId::new("previous-boot"));
         let live = retained_card(current_boot());
         let held = retained_card(current_boot());
@@ -4543,40 +4644,53 @@ mod tests {
             ),
         ];
         let mut evidence = evidence(holders.path(), census);
-        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unrecorded);
         assert_eq!(evidence.classify(&running), SavedExecution::Running);
-        let (reason, recovery) = saved_chat_problem(&unrecorded, &[], &evidence, || {
-            panic!("an ended unrecorded pane needs no qualification")
-        })
-        .unwrap();
-        let mut inspection = SourceInspection::default();
-        inspection.stop(unrecorded.id, StoppedKind::Chat, &reason, recovery);
-        assert_eq!(
-            inspection.stopped[0].reason,
-            "ended before it recorded its conversation"
-        );
-        assert_eq!(
-            inspection.stopped[0].recovery,
-            "Choose Resume conversation in the new tab (+) menu to find a saved conversation, or start a new conversation"
-        );
-        assert!(
-            saved_chat_problem(&running, &[], &evidence, || Err("unqualified".into())).is_some()
-        );
-        assert_eq!(
-            saved_chat_problem(
-                &unrecorded,
-                std::slice::from_ref(&unrecorded),
-                &evidence,
-                || Err("unqualified".into())
-            )
-            .unwrap()
-            .0,
-            "its conversation could not be confirmed"
-        );
-        evidence.retired = Ok(vec![ended]);
-        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Ended);
-        evidence.retired = Err("unreadable".into());
-        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+            let problem =
+                saved_chat_problem(&unrecorded, &[], &evidence, || Err("unqualified".into()));
+            assert_eq!(problem, Some((UNCHECKED.into(), CHAT_RECOVERY)));
+            evidence.retired = Ok(vec![ended]);
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unrecorded);
+            let (reason, recovery) = saved_chat_problem(&unrecorded, &[], &evidence, || {
+                panic!("an ended unrecorded pane needs no qualification")
+            })
+            .unwrap();
+            let mut inspection = SourceInspection::default();
+            inspection.stop(unrecorded.id, StoppedKind::Chat, &reason, recovery);
+            assert_eq!(
+                inspection.stopped[0].reason,
+                "ended before it recorded its conversation"
+            );
+            assert_eq!(
+                inspection.stopped[0].recovery,
+                "Choose Resume conversation in the new tab (+) menu to find a saved conversation, or start a new conversation"
+            );
+            assert!(
+                saved_chat_problem(&running, &[], &evidence, || Err("unqualified".into()))
+                    .is_some()
+            );
+            assert_eq!(
+                saved_chat_problem(
+                    &unrecorded,
+                    std::slice::from_ref(&unrecorded),
+                    &evidence,
+                    || Err("unqualified".into())
+                )
+                .unwrap()
+                .0,
+                "its conversation could not be confirmed"
+            );
+            evidence.retired = Ok(vec![ended]);
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Ended);
+            evidence.retired = Err("unreadable".into());
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+        }
     }
 
     #[test]
@@ -4895,7 +5009,7 @@ mod tests {
             vec![(card.id, ended.clone()), (card.id, earlier.clone())],
         );
         retired.retired = Ok(vec![ended.clone(), earlier.clone()]);
-        assert_eq!(retired.classify(&card), SavedExecution::Ended);
+        assert_eq!(retired.classify(&card), ABSENT_WITHOUT_RECEIPT);
 
         // A recorded retirement is required for every owner, in any boot.
         let mut unrecorded = evidence(
@@ -4906,8 +5020,11 @@ mod tests {
         assert_eq!(unrecorded.classify(&card), SavedExecution::Unproved);
 
         // A retirement record does not outweigh a process that remains.
-        let mut alive = evidence(holders.path(), vec![(card.id, running.clone())]);
-        alive.retired = Ok(vec![running]);
+        let mut alive = evidence(
+            holders.path(),
+            vec![(card.id, ended.clone()), (card.id, running.clone())],
+        );
+        alive.retired = Ok(vec![ended.clone(), running]);
         assert_eq!(alive.classify(&card), SavedExecution::Running);
 
         // No census owner is no evidence of what ran the pane.
