@@ -3685,6 +3685,22 @@ fn editor_input_projects_only_when_it_changes_what_the_projection_reads() {
     }
     assert_eq!(projections(), before, "pane-local input projects nothing");
     assert_eq!(app.context_sections_height, Some(240.0));
+
+    // A clean file's first edit makes it block navigation, which the
+    // worktree protections read, so it projects; a further edit does not.
+    let (clean, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved\n");
+    app.cards
+        .insert(card, CardRuntime::Repository(Box::new(clean)));
+    drop(app.update(edit(Editor::Move(Motion::Right))));
+    let dirty = |app: &Cagents| matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.is_dirty());
+    assert!(!dirty(&app));
+    let before = projections();
+    drop(app.update(edit(Editor::Edit(Edit::Insert('c')))));
+    assert!(dirty(&app));
+    assert_eq!(projections(), before + 1, "the first edit dirties the file");
+    let before = projections();
+    drop(app.update(edit(Editor::Edit(Edit::Insert('d')))));
+    assert_eq!(projections(), before, "a further edit projects nothing");
 }
 
 #[test]
