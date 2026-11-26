@@ -1423,7 +1423,7 @@ fn darwin_codex_writer(
         if let Some(deadline) = deadline {
             check_deadline(deadline)?;
         }
-        let observation = (|| {
+        let observation = observe_darwin_codex_process(deadline, || {
             let Some(program) = crate::process::inspect_account_program(pid, uid, |executable| {
                 let name = executable.file_name().unwrap_or_default();
                 named_codex_writer(name) || codex_interpreter(name)
@@ -1433,7 +1433,7 @@ fn darwin_codex_writer(
             };
             darwin_writer_matches(program.executable, &program.arguments, marker, conversation)
                 .map(|matches| matches.then_some(program.process))
-        })();
+        });
         match observation {
             Ok(Some(owner)) => return Ok((Some(owner), None)),
             Ok(None) => {}
@@ -1450,6 +1450,31 @@ fn darwin_codex_writer(
         }
     }
     Ok((None, uncertainty))
+}
+
+#[cfg(target_os = "macos")]
+fn observe_darwin_codex_process(
+    deadline: Option<Instant>,
+    mut observe: impl FnMut() -> io::Result<Option<crate::daemon::holder_registry::Process>>,
+) -> io::Result<Option<crate::daemon::holder_registry::Process>> {
+    let result = observe();
+    if result
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(libc::EIO))
+    {
+        // XNU can fail to copy the argument stack while a process changes.
+        // Only another observation can establish unrelatedness or exit.
+        let pause = deadline.map_or(STARTING_RETRY, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(STARTING_RETRY)
+        });
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+            return observe();
+        }
+    }
+    result
 }
 
 #[cfg(target_os = "macos")]
@@ -2308,6 +2333,31 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_process_io_error_gets_one_fresh_observation() {
+        let mut calls = 0;
+        let result = observe_darwin_codex_process(None, || {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(None)
+            }
+        });
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(calls, 2);
+
+        calls = 0;
+        let error = observe_darwin_codex_process(None, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, 2);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
