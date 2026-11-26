@@ -258,7 +258,7 @@ impl Lifecycle {
             if let Some(error) = error {
                 tracing::warn!(terminal = %id, %error, "Completed terminal remains listed for explicit cleanup");
                 state.terminal_retirements.get_mut(&id).unwrap().failure = Some(error);
-                state.inventory_generation += 1;
+                state.inventory_changed();
             } else {
                 retired.push(state.retire_terminal_if_current(id, &handle));
             }
@@ -333,7 +333,7 @@ impl Lifecycle {
                 state
                     .terminal_retirements
                     .insert(*id, Retirement::submitting(handle.clone()));
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             handles
         };

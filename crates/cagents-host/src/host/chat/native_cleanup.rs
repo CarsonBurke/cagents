@@ -211,7 +211,7 @@ fn close_retained_inner(
         }
         if closing.is_none() {
             state.chat_spawning.insert(source.id, source.clone());
-            state.inventory_generation += 1;
+            state.inventory_changed();
         }
         (state.proof().clone(), pending, actor, named)
     };
@@ -411,7 +411,7 @@ fn close_retained_inner(
     }
     if closing.is_none() {
         state.chat_spawning.remove(&source.id);
-        state.inventory_generation += 1;
+        state.inventory_changed();
     }
     if result.is_ok() {
         if expected.is_some_and(|expected| {

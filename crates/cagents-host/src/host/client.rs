@@ -743,7 +743,7 @@ impl Drop for ExplicitCloseGuard {
                 && entry.failure.is_none()
             {
                 entry.failure = Some("Explicit close was interrupted before cleanup could be confirmed; retry the retained result".into());
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 true
             } else {
                 false
@@ -899,7 +899,7 @@ fn reserve_terminal_close(
             previous: None,
         };
         let previous = state.terminal_retirements.insert(terminal, entry);
-        state.inventory_generation += 1;
+        state.inventory_changed();
         (reservation, previous)
     };
     reservation.previous = previous;
@@ -987,7 +987,7 @@ fn finish_terminal_close(
             && entry.handle.same_worker(&close.handle)
         {
             entry.failure = Some(message.clone());
-            state.inventory_generation += 1;
+            state.inventory_changed();
         }
         return Err(error(message));
     }
@@ -1038,7 +1038,7 @@ fn finish_terminal_close(
                 && entry.handle.same_worker(&close.handle)
             {
                 entry.failure = Some(message.clone());
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             return Err(error(message));
         }
@@ -2662,7 +2662,7 @@ fn process_admitted_request(
                         .get(&terminal_id)
                         .is_some_and(|entry| entry.ticket == close.ticket)
                     {
-                        state.inventory_generation += 1;
+                        state.inventory_changed();
                         let removed = state.terminal_retirements.remove(&terminal_id);
                         if let Some(previous) = close.previous.take() {
                             state.terminal_retirements.insert(terminal_id, previous);

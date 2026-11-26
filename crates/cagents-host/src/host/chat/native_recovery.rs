@@ -338,7 +338,7 @@ fn restore_with_policy_for_start(
             capacity::require_available(&state)?;
         }
         capacity::Reservation::install(&mut admission, host, &mut state, source)?;
-        state.inventory_generation += 1;
+        state.inventory_changed();
         state.proof().clone()
     };
     let result = restore_reserved(host, client, source, &proof).map_err(setup_error);
@@ -660,7 +660,7 @@ fn restore_authenticated(
         context.installed();
     }
     state.upgrade_chats.insert(id, previous_sources);
-    state.inventory_generation += 1;
+    state.inventory_changed();
     drop(state);
     drop(retired);
     // The agent's record, and possibly its pane, now name the successor, which

@@ -858,7 +858,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         tracing::warn!(%error, "Codex listeners in the temporary directory will not be kept fresh");
     }
     let tally_host = Arc::downgrade(&host);
-    let _tray = crate::tray::start(move || {
+    let tally_updates = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).tally_updates);
+    let _tray = crate::tray::start(tally_updates, move || {
         let host = tally_host.upgrade()?;
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         Some(state.agent_tally())

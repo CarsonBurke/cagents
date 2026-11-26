@@ -599,6 +599,9 @@ fn changed_for_instance(
         return;
     }
     let proof = state.proof().clone();
+    if matches!(update, Update::Activity { .. }) {
+        state.tally_updates.notify_one();
+    }
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind.
     if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
@@ -2784,7 +2787,7 @@ fn start_publishing(
         };
         session.proof = Some(state.proof().clone());
         capacity::Reservation::install(&mut admission, host, &mut state, &session)?;
-        state.inventory_generation += 1;
+        state.inventory_changed();
         source_handle
     };
     let result = (|| {
@@ -3148,7 +3151,7 @@ fn start_publishing(
         if let Some(context) = &execution {
             context.installed();
         }
-        state.inventory_generation += 1;
+        state.inventory_changed();
         drop(state);
         drop(retired);
         if remote {
@@ -3499,7 +3502,7 @@ fn codex_terminal_view(
         record.source_process = paired_terminal.observe_agent_process();
         record.returning_terminal = false;
         owners = paired_close::Owners::capture(&state, &state.chats[&chat_id])?;
-        state.inventory_generation += 1;
+        state.inventory_changed();
         Ok(ServerResponse::ChatTerminal {
             chat_id,
             session: descriptor.session.clone(),
@@ -4682,7 +4685,7 @@ fn process_inner(
                     .expect("validated exact attachment");
                 record.returning_terminal = true;
                 record.completion_observed = false;
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 state.recovery_independence.extend(chat_id, terminal_id);
                 // The terminal resumes this chat's conversation under its
                 // claim, which refuses any other's (see
@@ -4788,7 +4791,7 @@ fn process_inner(
                         Instant::now() + ACKNOWLEDGEMENT_GRACE,
                     ),
                 );
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 Ok((record, old_pair))
             })();
             match publication {
@@ -4854,7 +4857,7 @@ fn process_inner(
                 .find_map(|(&id, receipt)| (receipt.terminal.id == terminal_id).then_some(id));
             if let Some(source_id) = source_id {
                 state.chat_handoffs.remove(&source_id);
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             Ok(ServerResponse::Accepted)
         }
@@ -5164,7 +5167,7 @@ pub(super) fn close_captured(
                 "The paired terminal changed while its previous worker was closing.",
             ));
         }
-        state.inventory_generation += 1;
+        state.inventory_changed();
         let record = state.chats.remove(&chat_id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(chat_id);
@@ -5731,7 +5734,7 @@ pub(super) fn stop_failed_upgrade_restore(
         require_current(&state)?;
         let record = state.chats.remove(&id);
         if record.is_some() {
-            state.inventory_generation += 1;
+            state.inventory_changed();
             if let Some(notifications) = &state.notifications {
                 notifications.retire(id);
             }
@@ -5833,7 +5836,7 @@ pub(super) fn close_terminal_actor(
             .chats
             .remove(&terminal_id)
             .expect("validated exact attachment");
-        state.inventory_generation += 1;
+        state.inventory_changed();
         record
     };
     drop(removed);
