@@ -1866,7 +1866,7 @@ impl UiUpdateGuard {
             result => return result,
         }
         let (send, receive) = std::sync::mpsc::sync_channel(1);
-        thread::Builder::new()
+        std::thread::Builder::new()
             .name("cutover-launch-fence".into())
             .spawn(move || {
                 let _ = send.send(Self::acquire_with_operation(libc::LOCK_EX));
