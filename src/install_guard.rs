@@ -216,6 +216,13 @@ pub(crate) fn reserve_darwin_publication() -> io::Result<File> {
         .map(crate::instance::OwnedLock::into_file)
 }
 
+/// Starting a new update must not recreate its journal during an uninstall
+/// that has already removed the old worker lock's directory entry.
+#[cfg(target_os = "macos")]
+pub(crate) fn admit_darwin_update_start() -> io::Result<crate::instance::OwnedLock> {
+    crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_SH | libc::LOCK_NB)
+}
+
 #[cfg(target_os = "macos")]
 fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
     // XDG_RUNTIME_DIR may name the parent of the default runtime. Keep this
@@ -341,10 +348,39 @@ pub(crate) fn run(
         #[cfg(target_os = "macos")]
         let _publication = {
             // The publishing shell may outlive this coordinator. It holds
-            // both fences until it has finished mutating the installation.
+            // the launch, publication, and any existing worker fence until
+            // it has finished mutating the installation.
             let publication = reserve_darwin_publication()?;
             inherit_darwin_publication(&mut command, &publication)?;
-            publication
+            let publication_job = match std::fs::symlink_metadata(prefix.join(".update/lock")) {
+                Ok(_) => Some(
+                    crate::update::exclude_update_jobs(prefix)
+                        .map_err(|error| match error {
+                            crate::update::UpdateError::Busy => io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "Finish or cancel the cagents update before running the installer",
+                            ),
+                            error => io::Error::other(error),
+                        })?
+                        .into_file(),
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(job) = &publication_job {
+                let fd = job.as_raw_fd();
+                // SAFETY: the parent retains the validated descriptor through
+                // spawn; the publishing shell inherits the same description.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            (publication, publication_job)
         };
         let published = execute(&mut command);
         guard.leave_launch_fence_with_successor();
