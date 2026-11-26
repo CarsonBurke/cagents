@@ -15937,6 +15937,14 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
             "Claude ignores the excluded {name} source"
         );
         launch.recipe.arguments.clear();
+        for invalid in [r#"{"attribution":true}"#, r#"{"attribution":{"commit":1}}"#] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                settings(&launch),
+                Some(json!({"attribution": {"commit": "", "pr": "custom"}})),
+                "{name}: {invalid}"
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 
@@ -15951,13 +15959,13 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
     std::fs::create_dir(&intermediate).unwrap();
     std::fs::write(
         intermediate.join("settings.local.json"),
-        r#"{"attribution":true}"#,
+        r#"{"attribution":{"pr":"intermediate"}}"#,
     )
     .unwrap();
-    std::fs::write(&root_shared, r#"{"attribution":true}"#).unwrap();
+    std::fs::write(&root_shared, r#"{"attribution":{"commit":"root"}}"#).unwrap();
     let system_overlay = Some(json!({"attribution": {"commit": "", "pr": "custom"}}));
     assert_eq!(settings(&launch), system_overlay);
-    std::fs::write(&root_local, r#"{"attribution":true}"#).unwrap();
+    std::fs::write(&root_local, r#"{"attribution":{"sessionUrl":false}}"#).unwrap();
     assert_eq!(settings(&launch), None);
     std::fs::remove_file(root_local).unwrap();
     std::fs::remove_file(root_shared).unwrap();
@@ -16010,7 +16018,13 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
     assert_eq!(settings(&launch), None);
     launch.recipe.arguments.clear();
 
-    for invalid in ["{}", "malformed", "[]"] {
+    for invalid in [
+        "{}",
+        "malformed",
+        "[]",
+        r#"{"attribution":true}"#,
+        r#"{"attribution":{"pr":false}}"#,
+    ] {
         std::fs::write(&system_settings, invalid).unwrap();
         assert_eq!(settings(&launch), None, "{invalid}");
     }

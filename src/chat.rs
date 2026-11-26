@@ -5289,7 +5289,21 @@ fn managed_claude_attribution(
             return None;
         }
         let settings: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        settings.get("attribution").cloned()
+        settings
+            .get("attribution")
+            .filter(|value| {
+                value.as_bool() == Some(false)
+                    || value.as_object().is_some_and(|fields| {
+                        fields
+                            .get("commit")
+                            .is_none_or(serde_json::Value::is_string)
+                            && fields.get("pr").is_none_or(serde_json::Value::is_string)
+                            && fields
+                                .get("sessionUrl")
+                                .is_none_or(serde_json::Value::is_boolean)
+                    })
+            })
+            .cloned()
     }
 
     let enabled = |name| sources.split(',').any(|source| source.trim() == name);
