@@ -429,7 +429,10 @@ impl Journal {
                     return Ok(None);
                 };
                 if !acknowledged {
-                    if save_withdrawal || key.starts_with("automation:") {
+                    if save_withdrawal
+                        || key.starts_with("automation:")
+                        || key.starts_with("review:")
+                    {
                         remember_notice_withdrawal(connection, &key, &id)?;
                     }
                     diesel::update(notice)
@@ -1290,6 +1293,17 @@ mod tests {
             .unwrap();
         drop(journal);
         let mut journal = Journal::open(&path).unwrap();
+        // The acknowledgement and both portal identities survived after
+        // the notice row was removed and before any desktop withdrawal ran.
+        let withdrawals = journal.group_withdrawals_for(&[]).unwrap();
+        assert_eq!(
+            withdrawals,
+            [
+                first.id,
+                crate::host::notifications::batching::desktop_id(&first.event.target()),
+            ]
+            .into()
+        );
         assert!(
             journal
                 .record(make(request.clone()), false)
