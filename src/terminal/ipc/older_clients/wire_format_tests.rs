@@ -1160,18 +1160,20 @@ fn actual_main_187_receives_invalid_request_for_a_refusal_before_any_effect() {
     );
 }
 
-/// A client from before Send now reads a snapshot without its fields, and a
-/// snapshot from a source before it reads as one with nothing to send early,
-/// whatever follows it in the message.
+/// An older client reads only the capabilities its protocol knows, and a
+/// snapshot from an older source defaults the missing fields without
+/// consuming the next bytes of the message.
 #[test]
-fn send_now_is_left_out_for_older_clients_and_absent_from_older_sources() {
+fn queued_input_fields_follow_the_peers_protocol() {
     use crate::chat::{Capabilities, SendNow, Snapshot};
-    let older = SEND_QUEUED_NOW - 1;
+
     let snapshot = Snapshot {
         generation: 3,
         capabilities: Capabilities {
             steer: true,
+            interrupt_modes: vec!["foreground".into()],
             send_queued_now: true,
+            queue_holds: true,
             ..Capabilities::default()
         },
         send_now: Some(SendNow::Delivering),
@@ -1179,27 +1181,25 @@ fn send_now_is_left_out_for_older_clients_and_absent_from_older_sources() {
     };
     let message = (snapshot.clone(), 7u8);
     let current = postcard::to_stdvec(&message).unwrap();
-    let sent = encoding_for(older, || postcard::to_stdvec(&message)).unwrap();
-    // One byte for the capability, two for the request.
-    assert_eq!(sent.len() + 3, current.len());
-    let (read, after): (Snapshot, u8) =
-        decoding_from(older, || postcard::from_bytes(&sent)).unwrap();
-    assert_eq!(after, 7);
-    assert_eq!(
-        read,
-        Snapshot {
-            capabilities: Capabilities {
-                send_queued_now: false,
-                ..snapshot.capabilities.clone()
-            },
-            send_now: None,
-            ..snapshot.clone()
+    for (protocol, omitted) in [
+        (SEND_QUEUED_NOW - 1, 4),
+        (SEND_QUEUED_NOW, 1),
+        (QUEUE_HOLDS, 0),
+    ] {
+        let sent = encoding_for(protocol, || postcard::to_stdvec(&message)).unwrap();
+        assert_eq!(sent.len() + omitted, current.len(), "protocol {protocol}");
+        let (read, after): (Snapshot, u8) =
+            decoding_from(protocol, || postcard::from_bytes(&sent)).unwrap();
+        let mut expected = snapshot.clone();
+        expected.capabilities.queue_holds = protocol >= QUEUE_HOLDS;
+        if protocol < SEND_QUEUED_NOW {
+            expected.capabilities.send_queued_now = false;
+            expected.send_now = None;
         }
-    );
-    // The current protocol carries both.
-    let (read, _): (Snapshot, u8) = postcard::from_bytes(&current).unwrap();
-    assert_eq!(read, snapshot);
-    // JSON, as a saved page holds it, is never encoded for an older client.
+        assert_eq!(after, 7, "protocol {protocol}");
+        assert_eq!(read, expected, "protocol {protocol}");
+    }
+    // Saved JSON carries the current fields independently of the wire layout.
     let saved: Snapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
     assert_eq!(saved, snapshot);
 }
