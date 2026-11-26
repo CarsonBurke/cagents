@@ -228,10 +228,20 @@ fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<Launc
 #[cfg(feature = "host")]
 pub(crate) const CLAUDE_ATTRIBUTION_OVERLAY: &str = "CAGENTS_CLAUDE_ATTRIBUTION_OVERLAY";
 
-/// Resolve the managed preference at the spawn boundary and keep it out of
-/// the recipe used for the next restore. Explicit terminal settings win.
 #[cfg(feature = "host")]
-pub(crate) fn claude_attribution_overlay(launch: &LaunchRecipe) -> Option<String> {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ClaudeAttributionOverlay {
+    pub position: usize,
+    pub argument: String,
+    pub original: Vec<String>,
+}
+
+/// Resolve the managed preference at the spawn boundary and keep it out of
+/// the recipe used for the next restore. Explicit attribution wins.
+#[cfg(feature = "host")]
+pub(crate) fn claude_attribution_overlay(
+    launch: &LaunchRecipe,
+) -> Option<ClaudeAttributionOverlay> {
     claude_attribution_overlay_with(launch, crate::chat::protocol::claude::managed_attribution)
 }
 
@@ -239,30 +249,93 @@ pub(crate) fn claude_attribution_overlay(launch: &LaunchRecipe) -> Option<String
 pub(crate) fn claude_attribution_overlay_with(
     launch: &LaunchRecipe,
     attribution: impl FnOnce(&LaunchRecipe, &str) -> Option<serde_json::Value>,
-) -> Option<String> {
-    if Provider::from_program(&launch.program) != Some(Provider::Claude) {
+) -> Option<ClaudeAttributionOverlay> {
+    let provider = Provider::Claude;
+    if Provider::from_program(&launch.program) != Some(provider) {
         return None;
     }
     let recipe = interactive_recipe(launch, Selector::Fresh)
         .or_else(|| interactive_recipe(launch, Selector::Picker))?;
     let mut sources = "user,project,local";
-    let mut arguments = recipe.arguments.iter();
-    while let Some(flag) = arguments.next() {
-        if flag == "--settings" {
-            return None;
-        }
-        if Provider::Claude.is_value_option(flag)
-            && let Some(value) = arguments.next()
-            && flag == "--setting-sources"
-        {
-            sources = value;
+    let mut explicit = None;
+    let mut arguments = launch.arguments.iter().enumerate().peekable();
+    while let Some((position, argument)) = arguments.next() {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(key, value)| (key, Some(value)));
+        if provider.is_identity_option(flag) {
+            if inline.is_none() {
+                arguments.next_if(|(_, value)| !value.starts_with('-'));
+            }
+        } else if provider.is_value_option(flag) || provider.is_cwd_option(flag) {
+            let (value, length) = match inline {
+                Some(value) => (value, 1),
+                None => (arguments.next()?.1.as_str(), 2),
+            };
+            match flag {
+                "--settings" => explicit = Some((position, length, value)),
+                "--setting-sources" => sources = value,
+                _ => {}
+            }
         }
     }
-    let attribution = attribution(&recipe, sources)?;
-    Some(format!(
-        "--settings={}",
-        serde_json::json!({"attribution": attribution})
-    ))
+    let value = crate::chat::protocol::claude::attribution_settings(
+        explicit.map(|(_, _, value)| value),
+        || attribution(&recipe, sources),
+    )?;
+    let (position, original) = explicit.map_or((0, Vec::new()), |(position, length, _)| {
+        (
+            position,
+            launch.arguments[position..position + length].to_vec(),
+        )
+    });
+    Some(ClaudeAttributionOverlay {
+        position,
+        argument: format!("--settings={value}"),
+        original,
+    })
+}
+
+#[cfg(feature = "host")]
+fn restore_claude_attribution(launch: &mut LaunchRecipe, environment: &[u8]) {
+    let Some((Provider::Claude, arguments)) = Provider::launched(launch) else {
+        return;
+    };
+    let Some(overlay) = environment.split(|byte| *byte == 0).find_map(|entry| {
+        let json = entry
+            .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())?
+            .strip_prefix(b"=")?;
+        serde_json::from_slice::<ClaudeAttributionOverlay>(json).ok()
+    }) else {
+        return;
+    };
+    if arguments.get(overlay.position) != Some(&overlay.argument) {
+        return;
+    }
+    let inline = match overlay.original.as_slice() {
+        [] => None,
+        [joined] => match joined.strip_prefix("--settings=") {
+            Some(value) => Some(value),
+            None => return,
+        },
+        [flag, value] if flag == "--settings" => Some(value.as_str()),
+        _ => return,
+    };
+    let Some(generated) = overlay
+        .argument
+        .strip_prefix("--settings=")
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|settings| settings.get("attribution").cloned())
+    else {
+        return;
+    };
+    let expected = crate::chat::protocol::claude::attribution_settings(inline, || Some(generated));
+    if expected.is_some_and(|value| overlay.argument == format!("--settings={value}")) {
+        // An interpreter, when present, owns argv[1]. The recorded
+        // position is relative to the provider's own arguments.
+        let index = launch.arguments.len() - arguments.len() + overlay.position;
+        launch.arguments.splice(index..=index, overlay.original);
+    }
 }
 
 /// Bind provider-confirmed identity while discarding already-consumed prompts.
@@ -1400,23 +1473,8 @@ fn read_process_launch(
         working_directory,
         environment: Default::default(),
     };
-    if let Some(environ) = &environ
-        && let Some((Provider::Claude, arguments)) = Provider::launched(&raw)
-        && let Some(first) = arguments.first()
-        && let Some(value) = first.strip_prefix("--settings=")
-        && environ.split(|byte| *byte == 0).any(|entry| {
-            entry
-                .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())
-                .and_then(|entry| entry.strip_prefix(b"="))
-                == Some(first.as_bytes())
-        })
-        && serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
-            .is_ok_and(|settings| settings.len() == 1 && settings.contains_key("attribution"))
-    {
-        // The interpreter, when there is one, owns argv[1]. The overlay
-        // follows the provider executable or script's name.
-        let index = raw.arguments.len() - arguments.len();
-        raw.arguments.remove(index);
+    if let Some(environ) = &environ {
+        restore_claude_attribution(&mut raw, environ);
     }
     let recognized = Provider::recognize_launch(&raw);
     let native_agent = Provider::from_program(&raw.program).is_some();
@@ -2457,34 +2515,56 @@ mod tests {
     #[test]
     fn recovery_discards_only_the_marked_claude_attribution_overlay() {
         let directory = tempfile::tempdir().unwrap();
-        let base = launch(
-            "claude",
-            &["--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
-        );
-        let mut running = base.clone();
-        let overlay = r#"--settings={"attribution":false}"#;
-        running.arguments.insert(0, overlay.into());
-        process_fixture(directory.path(), 100, &running, &[]);
-        let root = directory.path().join("100");
-        for (environment, expected) in [
-            (format!("{CLAUDE_ATTRIBUTION_OVERLAY}={overlay}\0"), &base),
-            (
-                format!(r#"{CLAUDE_ATTRIBUTION_OVERLAY}=--settings={{"attribution":{{}}}}"#),
-                &running,
-            ),
-            (String::new(), &running),
+        for original_settings in [
+            vec![],
+            vec![r#"--settings={"theme":"dark"}"#],
+            vec!["--settings", r#"{"theme":"dark"}"#],
         ] {
-            fs::write(root.join("environ"), environment).unwrap();
-            let observed = read_process_launch(
-                &ProcessView::Proc(root.clone()),
-                ForegroundRequest {
-                    hint: Some(&base),
-                    agent: true,
-                },
-            )
-            .unwrap();
-            assert_eq!(observed.inherited.unwrap().arguments, expected.arguments);
-            assert_eq!(observed.exact.unwrap().arguments, expected.arguments);
+            let mut base = launch(
+                "claude",
+                &["--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
+            );
+            base.arguments
+                .extend(original_settings.into_iter().map(str::to_owned));
+            let overlay =
+                claude_attribution_overlay_with(&base, |_, _| Some(serde_json::Value::Bool(false)))
+                    .unwrap();
+            let mut running = base.clone();
+            running.arguments.splice(
+                overlay.position..overlay.position + overlay.original.len(),
+                [overlay.argument.clone()],
+            );
+            let marker = |overlay| {
+                format!(
+                    "{CLAUDE_ATTRIBUTION_OVERLAY}={}\0",
+                    serde_json::to_string(overlay).unwrap()
+                )
+            };
+            let exact = marker(&overlay);
+            let different = marker(&ClaudeAttributionOverlay {
+                argument: r#"--settings={"attribution":true}"#.into(),
+                ..overlay
+            });
+            for (environment, expected) in [
+                (exact, &base),
+                (different, &running),
+                (String::new(), &running),
+            ] {
+                let fixture = tempfile::tempdir_in(directory.path()).unwrap();
+                process_fixture(fixture.path(), 100, &running, &[]);
+                let root = fixture.path().join("100");
+                fs::write(root.join("environ"), environment).unwrap();
+                let observed = read_process_launch(
+                    &ProcessView::Proc(root),
+                    ForegroundRequest {
+                        hint: Some(&base),
+                        agent: true,
+                    },
+                )
+                .unwrap();
+                assert_eq!(observed.inherited.unwrap().arguments, expected.arguments);
+                assert_eq!(observed.exact.unwrap().arguments, expected.arguments);
+            }
         }
     }
 

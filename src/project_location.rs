@@ -213,15 +213,35 @@ pub fn git_directories(checkout: &Path) -> Option<GitDirectories> {
     let private = if fs::metadata(&marker).ok()?.is_dir() {
         fs::canonicalize(&marker).ok()?
     } else {
-        let content = fs::read_to_string(&marker).ok()?;
+        let content = git_marker_text(&marker).ok()?;
         fs::canonicalize(checkout.join(line(content.strip_prefix("gitdir: ")?))).ok()?
     };
-    let common = match fs::read_to_string(private.join("commondir")) {
+    let common = match git_marker_text(&private.join("commondir")) {
         Ok(common) => fs::canonicalize(private.join(line(&common))).ok()?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => private.clone(),
         Err(_) => return None,
     };
     Some(GitDirectories { private, common })
+}
+
+fn git_marker_text(path: &Path) -> io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // A Git path fits well within this limit. Do not wait for an unusual
+    // filesystem entry while reading project metadata at launch.
+    const MAX_GIT_MARKER: u64 = 64 * 1024;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("Git marker is not a regular file"));
+    }
+    let bytes = crate::fs_safety::read_bounded(&mut file, MAX_GIT_MARKER)?;
+    if bytes.len() as u64 > MAX_GIT_MARKER {
+        return Err(io::Error::other("Git marker exceeds 64 KiB"));
+    }
+    String::from_utf8(bytes).map_err(io::Error::other)
 }
 
 /// One line of a Git metadata file, which Git accepts with CRLF too.

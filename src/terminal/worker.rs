@@ -3231,11 +3231,16 @@ impl Worker {
                 }
             }
             if let Some(overlay) = crate::model::agent_recovery::claude_attribution_overlay(&launch)
+                && let Ok(marker) = serde_json::to_string(&overlay)
             {
-                command.get_argv_mut().insert(1, overlay.as_str().into());
+                let start = overlay.position + 1;
+                command.get_argv_mut().splice(
+                    start..start + overlay.original.len(),
+                    [overlay.argument.into()],
+                );
                 command.env(
                     crate::model::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY,
-                    overlay,
+                    marker,
                 );
             }
         }

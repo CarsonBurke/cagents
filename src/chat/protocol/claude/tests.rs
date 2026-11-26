@@ -15775,6 +15775,7 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
         crate::model::agent_recovery::claude_attribution_overlay_with(recipe, |recipe, sources| {
             chat::managed_claude_attribution(recipe, &homes, &system, sources)
         })
+        .map(|overlay| overlay.argument)
     };
     assert_eq!(
         terminal_overlay(&launch.recipe).as_deref(),
@@ -15814,6 +15815,36 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
         std::fs::remove_file(path).unwrap();
     }
 
+    let nested = project.join("src/feature");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
+    std::fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    launch.recipe.working_directory = nested;
+    let root_shared = project.join(".claude/settings.json");
+    let root_local = project.join(".claude/settings.local.json");
+    let intermediate = project.join("src/.claude");
+    std::fs::create_dir(&intermediate).unwrap();
+    std::fs::write(
+        intermediate.join("settings.local.json"),
+        r#"{"attribution":true}"#,
+    )
+    .unwrap();
+    std::fs::write(&root_shared, r#"{"attribution":true}"#).unwrap();
+    let system_overlay = Some(json!({"attribution": {"commit": "", "pr": "custom"}}));
+    assert_eq!(settings(&launch), system_overlay);
+    std::fs::write(&root_local, r#"{"attribution":true}"#).unwrap();
+    assert_eq!(settings(&launch), None);
+    std::fs::remove_file(root_local).unwrap();
+    std::fs::remove_file(root_shared).unwrap();
+    std::fs::remove_dir_all(project.join(".git")).unwrap();
+
+    launch.recipe.working_directory = project.clone();
+    let fifo = project.join(".claude/settings.json");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    assert_eq!(settings(&launch), system_overlay);
+    std::fs::remove_file(fifo).unwrap();
+
     // This linked checkout has a different parent directory from its primary
     // checkout. Its personal local settings come from the primary root.
     let checkout = directory.path().join("primary");
@@ -15839,6 +15870,14 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
         settings(&launch),
         Some(json!({"attribution": {"commit": "", "pr": "custom"}, "theme": "dark"}))
     );
+    assert_eq!(
+        terminal_overlay(&launch.recipe).as_deref(),
+        Some(r#"--settings={"attribution":{"commit":"","pr":"custom"},"theme":"dark"}"#)
+    );
+    launch.recipe.arguments = vec!["--settings".into(), r#"{"attribution":true}"#.into()];
+    assert!(terminal_overlay(&launch.recipe).is_none());
+    launch.recipe.arguments = vec!["--settings".into(), "private-settings.json".into()];
+    assert!(terminal_overlay(&launch.recipe).is_none());
     launch.recipe.arguments = vec!["--setting-sources=project,local".into()];
     assert_eq!(settings(&launch), None);
     launch.recipe.arguments.clear();

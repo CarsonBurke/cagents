@@ -334,6 +334,23 @@ pub(crate) fn managed_attribution(
     chat::managed_claude_attribution(recipe, &homes, &system, sources)
 }
 
+pub(crate) fn attribution_settings(
+    explicit: Option<&str>,
+    attribution: impl FnOnce() -> Option<Value>,
+) -> Option<String> {
+    // A file path stays intact. Its contents may include credentials and
+    // Claude loads it on its own.
+    let mut settings: serde_json::Map<String, Value> = match explicit {
+        Some(value) => serde_json::from_str(value).ok()?,
+        None => serde_json::Map::new(),
+    };
+    if settings.contains_key("attribution") {
+        return None;
+    }
+    settings.insert("attribution".into(), attribution()?);
+    Some(Value::Object(settings).to_string())
+}
+
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
     arguments_with_attribution(launch, managed_attribution)
 }
@@ -455,16 +472,11 @@ fn arguments_with_attribution(
     // read the current preference, without saving a flag into their recipe.
     // Inline settings already live in argv and can share the same overlay.
     // Leave a file argument intact so its contents stay out of argv.
-    let settings: Option<serde_json::Map<String, Value>> = match settings_value {
-        Some(index) => serde_json::from_str(&result[index]).ok(),
-        None => Some(serde_json::Map::new()),
-    };
-    if let Some(mut settings) = settings
-        && !settings.contains_key("attribution")
-        && let Some(attribution) = attribution(&launch.recipe, setting_sources)
+    if let Some(value) =
+        attribution_settings(settings_value.map(|index| result[index].as_str()), || {
+            attribution(&launch.recipe, setting_sources)
+        })
     {
-        settings.insert("attribution".into(), attribution);
-        let value = Value::Object(settings).to_string();
         if let Some(index) = settings_value {
             result[index] = value;
         } else {
