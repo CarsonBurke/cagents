@@ -40,6 +40,20 @@ import kotlin.concurrent.thread
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
+ * The phone's key from [load], or the failure that tells the person what to
+ * do: a key that can't be used stops the connection until they make a new
+ * one; any other failure may pass, so connecting goes on trying.
+ */
+internal fun <K> keyForConnecting(load: () -> K): K = try {
+    load()
+} catch (e: PhoneKeyUnusable) {
+    throw ConnectFailure.Refused(e.message.orEmpty())
+} catch (e: Exception) {
+    // The Keystore failing for now, such as before the phone is first unlocked.
+    throw ConnectFailure.Network("This phone couldn't load its key just now.", e)
+}
+
+/**
  * Reaches the bridge by SSH: authenticates with the [PhoneKey], checks the
  * computer's host key against the one pinned for it, and runs the bridge as
  * the remote command, its standard input and output carrying the API.
@@ -59,12 +73,7 @@ class SshBridgeTransport(
                 hosts = target.hosts,
                 port = target.port,
                 user = target.user,
-                key = try {
-                    phoneKey()
-                } catch (e: PhoneKeyUnusable) {
-                    // Not to be retried: only a new key, made by the person, helps.
-                    throw ConnectFailure.Refused(e.message.orEmpty())
-                },
+                key = keyForConnecting(phoneKey),
                 hostKeys = StoredHostKeys(hostKeys, target),
                 command = target.command,
                 // A computer named by its pairing code was paired; one set up by hand has no name.

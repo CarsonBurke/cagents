@@ -96,6 +96,7 @@ fun ConversationScreen(
     session: String,
     snackbar: SnackbarHostState,
     onBack: () -> Unit,
+    onSettings: () -> Unit,
 ) {
     // Watched for as long as this screen is on the back stack: across
     // configuration changes, not just while composed.
@@ -147,7 +148,7 @@ fun ConversationScreen(
                     connection = view.connection,
                     hasData = conversation?.loaded == true,
                     onRetry = vm::retryNow,
-                    onSettings = onBack,
+                    onSettings = onSettings,
                     onReviewHostKey = vm::reviewHostKey,
                 )
                 if (conversation?.loaded == true) PlanStrip(state)
