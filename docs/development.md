@@ -45,6 +45,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `dev:browser` | Run the development UI with the embedded browser |
 | `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check and lint one [lane](#feature-boundaries), all targets by default |
 | `check:editor` | Type-check and lint ceditor |
+| `check:macos:cli`, `check:macos:host`, `check:macos:ui` | Type-check and lint one lane for Apple Silicon macOS on the build host, without a Mac; see [macOS](#macos) |
 | `check:dictate`, `test:dictate` | Type-check and lint, or test, the [dictation helper](#feature-boundaries) |
 | `check` | `check:isolation`, then `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:isolation` | Check, without compiling, that each lane resolves only its own dependency graph ([feature boundaries](#feature-boundaries)) |
@@ -507,6 +508,13 @@ without `--instance` unless it runs inside a session through
 nested session cannot put a UI on the user's desktop. It requires a session's
 private `nh-*` runtime directory and no `DISPLAY` or `WAYLAND_SOCKET`, which is
 what `niri-harness exec` provides.
+
+An unnamed run inside a harness session has a private runtime directory but
+the shared development storage. While the unnamed development daemon in your
+login session serves that storage, the nested run's daemon refuses to start,
+and its window says which daemon holds the storage; give the nested run an
+`--instance` instead. The same holds for the production storage: a production
+`cagents-ui` launched in a harness session refuses while your own cagents runs.
 
 To fill an instance with a realistic workspace before its first launch, see
 [Fixture workspaces](fixture-workspace.md#a-development-instance).
@@ -1133,7 +1141,7 @@ the detached `.worktrees/.prebuild` checkout. Its offline regression is
 Rust compiles on the build host named by `CAGENTS_BUILD_REMOTE` (default
 `fw16`, reached with `ssh`), never here: `scripts/cargo-gate` sends every Cargo
 command that compiles there through `scripts/cargo-offload`, without taking a
-slot here. Commands that compile nothing, such as `metadata`, `tree` or
+build slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as `scripts/build-ceditor-product`, builds there too,
@@ -1171,6 +1179,30 @@ another) from a clean environment, as sshd would, and only what the caller
 uses comes back. `scripts/native-evidence` builds this way. A gate without
 `scripts/cargo-offload` beside it refuses to build unless
 `CAGENTS_BUILD_REMOTE=local` is set.
+
+Cargo offload and remote native evidence share local sync slots across all
+worktrees for the same Linux user. Source preparation, uploads and artifact
+downloads take a slot and run at CPU nice +10 and best-effort I/O priority 7.
+If all slots are in use, the client prints `waiting for a local sync slot`
+and blocks in the kernel. Remote compilation continues without a local slot.
+
+| Client setting | Default | Effect |
+| --- | --- | --- |
+| `CAGENTS_BUILD_LOCAL_SYNC_SLOTS` | `2` | Concurrent local file phases. Set the same value for every client on the laptop. |
+| `CAGENTS_BUILD_LOCAL_SYNC_LOCK` | `/var/tmp/cagents-offload-local-UID.lock` | Lock file prefix. Clients must use the same prefix to share slots. |
+| `CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS` | `180` | Wall-clock limit for each transfer attempt. A failed connection gets one retry where the transfer can be repeated safely. |
+| `CAGENTS_BUILD_REMOTE_COMMAND_TIMEOUT_SECONDS` | `7200` | Wall-clock limit for a long-lived remote command or lease connection. |
+
+SSH probes the server every 15 seconds and gives up after four unanswered
+probes. The transfer deadline also covers a stuck local SSH proxy, including
+`tailscale nc`. The client stops and reaps the transport tree when its
+invoking process exits. Once a remote command begins, a lost connection
+fails the command so its effects cannot be replayed. Waiting for the build
+host to accept a lease keeps its separate admission budget and retry interval.
+Source and artifact transfers hold the slot on the build host until they exit.
+A delayed channel must still prove its exact lease before it starts. If a
+gate update refuses a command inside an older hold, finish that hold and
+start a new one.
 
 The host has build slots under
 `~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
@@ -1237,9 +1269,10 @@ While the host is unreachable, does not answer within
 leased slot's own build output), the command waits and tries again every
 `CAGENTS_BUILD_REMOTE_RETRY_SECONDS` (default 15), saying why once and then
 once a minute. It never builds here instead. `CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS`
-bounds that wait, and the wait for a slot there, as it does a wait here; on
-expiry the command exits 124 naming the cause. The build there has no
-timeout. Set `CAGENTS_BUILD_REMOTE=local` to build here.
+bounds that wait, the wait for a slot there and the initial local sync slot
+wait. On expiry the command exits 124 naming the cause. The transport
+deadlines still apply after admission. Set `CAGENTS_BUILD_REMOTE=local` to
+build here.
 
 Each slot's build output is bounded by its lease. Cargo removes nothing, and
 every feature lane, profile and kind of target of the `cagents` crate keeps
@@ -2605,9 +2638,9 @@ tool timeout drops the SSH connection, and that ends the work on the host too.
 TERM, HUP or INT sent to the wrapper alone also ends and reaps its SSH
 connections, Git's and rsync's included, and then the wrapper dies by that
 signal; the host ends the build or comparison they started. A signal its
-caller ignores stays ignored, so `nohup` keeps a run through a closed
-terminal. A session detached by an explicit `start` keeps running until
-`stop`.
+caller ignores stays ignored. If the invoking shell exits, the wrapper ends
+the connections it owns. A session detached by an explicit `start` keeps
+running until `stop`.
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
@@ -2748,11 +2781,14 @@ It builds the three matched executables with the `local` Cargo profile,
 versioned `<version>+local.<short sha>`. That profile keeps release identity
 and optimization but skips link-time optimization and single-unit code
 generation. Each build is incremental, so after the first one only changed
-code is recompiled. The script stages the archive with
-`install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
-affected session and asks before replacing anything. `--stage-only` stops
-after staging; finish later with `cagents daemon upgrade`. The staged build
-always supplies the updater. A source daemon whose protocol live updates do
+code is recompiled. The new build's `cagents daemon upgrade` shows the
+affected sessions and asks before replacing anything. The public `cagents`
+command keeps serving the current installation until the replacement daemon
+is ready. `--stage-only` stops after staging and prints the command to
+finish later. Rerunning the script for the same staged build reuses it. If
+another update changed the source, the installer verifies the archive again
+before staging it over the newer installation.
+A source daemon whose protocol live updates do
 not start from is refused before anything changes; follow the cold
 installation the refusal describes.
 
@@ -2820,8 +2856,8 @@ with `--stop stop`, as a person would type. Extra upgrade flags use
 `--upgrade-arg=--interrupt`; the harness adds no policy automatically. Refusals are measured outcomes: even
 a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
-That staged path is how `scripts/install-local` updates, and NEW's own worker
-runs it. A person updates from the app instead, and there OLD's installed worker
+NEW's own worker runs this staged path, as it does for `scripts/install-local`.
+Update from the app and OLD's installed worker
 runs the whole update, including the checks after NEW starts. Add `--feed DIR`
 to rehearse that path: DIR is a file feed holding NEW's signed bundle
 (`scripts/release feed`), and the feed's archive must match `--new-dir`. OLD's
@@ -3128,3 +3164,16 @@ Cagents installation untouched. Existing private builds remain available to
 running windows and daemons; update Ceditor with its original installer, not the
 Cagents self-updater. Opening an alert for the other application requires that
 application to be installed alongside the daemon or in an absolute PATH directory.
+
+## macOS
+
+The daemon and UI are being ported to Apple Silicon macOS. The plan is in
+issue #4045. `mise run check:macos:LANE` type-checks a lane for
+`aarch64-apple-darwin` on the build host. Rust cross-checks natively, and
+`scripts/darwin-cc` compiles the C that build scripts need using the zig that
+`mise.toml` pins. The build host needs that target once:
+`rustup target add aarch64-apple-darwin --toolchain 1.93.0` (the
+`rust-toolchain.toml` channel). A check cannot link or run
+anything, so behavior, and anything that needs Apple's frameworks, still has
+to be verified on a real Mac.
+

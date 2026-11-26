@@ -3823,6 +3823,7 @@ mod tests {
 
     /// Voluntary context switches, the times a thread slept and was woken,
     /// of this process's native watcher threads, by thread ID.
+    #[cfg(target_os = "linux")]
     fn watcher_thread_switches() -> BTreeMap<String, u64> {
         std::fs::read_dir("/proc/self/task")
             .unwrap()
@@ -3845,6 +3846,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // Measures inotify worker wakeups through procfs.
     fn reading_watched_files_does_not_wake_the_watcher() {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(directory.path());

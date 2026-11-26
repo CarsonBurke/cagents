@@ -369,6 +369,10 @@ impl ChatWire {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn chat_delivery_survives_daemon_restart() {
     if retained_fixture::run_isolated() {
         return;
@@ -486,6 +490,10 @@ fn chat_delivery_survives_daemon_restart() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() {
     if retained_fixture::run_isolated() {
         return;
@@ -589,6 +597,10 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn terminal_console_answers_requests_and_submits_durable_followups() {
     if retained_fixture::run_isolated() {
         return;
@@ -701,6 +713,10 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
 /// runs tools with large outputs: the pane shows what the agent said and one
 /// line per step, each once, and none of what those steps carried.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn terminal_console_prints_each_line_once_without_tool_payloads() {
     if retained_fixture::run_isolated() {
         return;
@@ -764,6 +780,10 @@ fn terminal_console_prints_each_line_once_without_tool_payloads() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn retained_agent_closes_during_a_delayed_fixture_stream() {
     if retained_fixture::run_isolated() {
         return;
@@ -936,6 +956,10 @@ fn repeated_private_cli_capture_does_not_renew_original_deadline() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
     if retained_fixture::run_isolated() {
         return;
@@ -1012,6 +1036,10 @@ fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn an_owner_drives_its_agent_by_short_handles() {
     if retained_fixture::run_isolated() {
         return;
@@ -1073,6 +1101,10 @@ fn an_owner_drives_its_agent_by_short_handles() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
     if retained_fixture::run_isolated() {
         return;
@@ -1164,6 +1196,10 @@ fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn active_native_chat_moves_without_restarting_and_accepts_followups() {
     if retained_fixture::run_isolated() {
         return;

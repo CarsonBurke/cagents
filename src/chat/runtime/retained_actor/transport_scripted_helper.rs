@@ -40,7 +40,7 @@ impl ScriptedHelper {
     ) -> (RemoteActor, Self) {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = root.path().join("scripted-helper.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let actor = RemoteActor::scripted_fixture(socket.clone(), source.clone(), scope);
         let template = actor.state().as_ref().clone();
         let script = Arc::new(Mutex::new(Script::default()));

@@ -849,14 +849,15 @@ stream_reply_turn() {
 # Ends the busy first turn as finished, unless an interrupt ended it first.
 settle_first_turn() {
     settle_at=
-    # This fixture does not start what was queued; it is gone with the turn.
-    queued_frames=()
     if [ "$busy" = true ]; then
         busy=false
         jq -cn --arg session "$session" --arg turn "$turn" \
             '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
         session_idle
     fi
+    # Then, as Claude Code does, the next turn starts what was queued during
+    # this one.
+    if [ "${#queued_frames[@]}" -gt 0 ]; then deliver_queued; fi
 }
 
 # Reads the next frame, or settles the first turn when its time comes first.

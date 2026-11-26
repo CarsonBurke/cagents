@@ -1,0 +1,93 @@
+{
+  "id": "fixture-update-review",
+  "version": "9.8.7",
+  "phase": "WaitingForIdle",
+  "message": "Waiting for the confirmed conversations to become idle",
+  "log_path": "/fixture/update.log",
+  "confirmation": {
+    "nonce": "fixture-review-nonce",
+    "expires_at_unix_ms": 18446744073709551615,
+    "preview": {
+      "candidate": {
+        "version": "9.8.7",
+        "protocol": 32,
+        "digest": "fixture-only"
+      },
+      "replaces_daemon": true,
+      "from_version": "9.8.6",
+      "windows": 1,
+      "labels": {
+        "00000000-0000-4000-8000-000000000001": "Build terminal · demo",
+        "00000000-0000-4000-8000-000000000002": "gemini-lead · Release checks",
+        "00000000-0000-4000-8000-000000000003": "login · Release checks",
+        "00000000-0000-4000-8000-000000000004": "ci · Release checks",
+        "00000000-0000-4000-8000-000000000005": "notes · Release checks"
+      },
+      "stopped": [],
+      "daemon": {
+        "capability": {
+          "proof": {
+            "host_session_id": "fixture-host",
+            "boot_id": "fixture-boot",
+            "host_incarnation": "fixture-daemon"
+          },
+          "token": "fixture-only",
+          "inventory_generation": 1,
+          "live_terminals": 2,
+          "background_subagents": 0,
+          "background_identity": "",
+          "expires_at_unix_ms": 9223372036854775807
+        },
+        "policy": "when_idle",
+        "sessions": [
+          {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "kind": "terminal",
+            "title": "Build terminal · demo",
+            "identity": "fixture-pane-1",
+            "disposition": "continues",
+            "reason": "The terminal and its running processes stay alive.",
+            "interrupted_subagents": []
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "kind": "native_chat",
+            "title": "gemini-lead · Release checks",
+            "identity": "fixture-pane-2",
+            "disposition": "waits_for_idle",
+            "reason": "The update will wait for this conversation to become idle, then resume it.",
+            "interrupted_subagents": []
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000003",
+            "kind": "native_chat",
+            "title": "login · Release checks",
+            "identity": "fixture-pane-3",
+            "disposition": "waits_for_idle",
+            "reason": "The update will wait for this conversation to become idle, then resume it.",
+            "interrupted_subagents": []
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000004",
+            "kind": "native_chat",
+            "title": "ci · Release checks",
+            "identity": "fixture-pane-4",
+            "disposition": "waits_for_idle",
+            "reason": "The update will wait for this conversation to become idle, then resume it.",
+            "interrupted_subagents": []
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000005",
+            "kind": "native_chat",
+            "title": "notes · Release checks",
+            "identity": "fixture-pane-5",
+            "disposition": "resumes",
+            "reason": "The saved conversation will reopen with a new provider process.",
+            "interrupted_subagents": []
+          }
+        ],
+        "blockers": []
+      }
+    }
+  }
+}

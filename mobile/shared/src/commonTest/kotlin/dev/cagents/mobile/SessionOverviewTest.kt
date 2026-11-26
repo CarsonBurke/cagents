@@ -65,7 +65,7 @@ class SessionOverviewTest {
     }
 
     @Test
-    fun keepsTheSessionsInReachOfAnAccountFullOfNotices() {
+    fun historicalReviewsDoNotCountAsCurrentAttention() {
         val sessions = listOf(
             session("work", Activity.Working, 3),
             session("done", Activity.Idle, 2),
@@ -75,7 +75,7 @@ class SessionOverviewTest {
         fun notice(id: String, kind: NoticeKind, session: String? = null, asks: Boolean = false) =
             Notice(id = id, kind = kind, asks = asks, title = kind.name, session = session)
         // Newest first, as the bridge sends them.
-        val notices = (1..500).map { notice("r$it", NoticeKind.ReviewRequested, asks = true) } +
+        val notices = (1..1_491).map { notice("r$it", NoticeKind.ReviewRequested, asks = true) } +
             notice("a2", NoticeKind.Waiting, "asks", asks = true) +
             notice("a1", NoticeKind.Waiting, "asks", asks = true) +
             notice("gone", NoticeKind.Waiting, "closed", asks = true) +
@@ -86,9 +86,8 @@ class SessionOverviewTest {
             notice("x", NoticeKind.Succeeded, "closed")
         val overview = SessionOverview.of(sessions, notices)
 
-        assertEquals(listOf("notice/a2", "reviews"), overview.attention.map { it.key })
+        assertEquals(listOf("notice/a2"), overview.attention.map { it.key })
         assertEquals(listOf("a2", "a1"), assertIs<AttentionItem.FromNotice>(overview.attention[0]).covers)
-        assertEquals(500, assertIs<AttentionItem.Reviews>(overview.attention[1]).notices.size)
         // The working session's "finished" belongs to an earlier turn.
         assertEquals(mapOf("done" to "f2"), overview.outcomes.mapValues { it.value.id })
         // "answered" is working again, so its old request is no longer a card.
@@ -115,10 +114,9 @@ class SessionOverviewTest {
         val overview = SessionOverview.of(listOf(session("done", Activity.Idle, 1)), notices)
 
         assertEquals(
-            listOf("notice/waiting", "notice/message", "notice/paused", "notice/blocked", "notice/new-kind", "reviews"),
+            listOf("notice/waiting", "notice/message", "notice/paused", "notice/blocked", "notice/new-kind"),
             overview.attention.map { it.key },
         )
-        assertEquals("review", assertIs<AttentionItem.Reviews>(overview.attention.last()).notices.single().id)
         assertEquals("failed", overview.outcomes["done"]?.id)
     }
 }

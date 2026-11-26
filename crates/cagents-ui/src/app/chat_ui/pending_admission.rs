@@ -1,18 +1,51 @@
 //! Cached shared descriptors can present saved text, but cannot start providers.
 use super::*;
 
+/// Whether `a` and `b` name one conversation: the same chat and provider
+/// conversation. The proof, continuity and listener are the daemon's record
+/// of what hosts it, which it reissues when it relaunches the conversation,
+/// as after a reboot; they don't change whose draft the pane holds.
+pub(in crate::app) fn same_conversation(a: &chat::Session, b: &chat::Session) -> bool {
+    a.id == b.id
+        && a.launch.provider == b.launch.provider
+        && a.launch.session_id == b.launch.session_id
+}
+
+/// Why a saved pane shows only its saved draft.
+#[derive(Clone, Copy)]
+pub(super) enum PendingPane {
+    /// It waits for its view, which `held` says more about when the view
+    /// itself is held back.
+    Waiting { held: Option<&'static str> },
+    /// Its saved descriptor failed its agent's proof, so it stays as saved
+    /// rather than waiting to reconnect.
+    Fenced,
+    /// A copy of an unsent draft its pane kept when the pane's conversation
+    /// changed. It never reconnects.
+    Copy,
+}
+
+pub(in crate::app) const RETAINED_COPY_TITLE: &str = "A copy of your unsent message";
+pub(in crate::app) const RETAINED_COPY_EXPLANATION: &str = "This conversation changed before you sent this, so cagents kept your text here. The conversation continues in its own pane. Copy what you still need, then close this copy. Closing it doesn't stop any agent.";
+
 impl Runtime {
     pub(super) fn awaiting_admission(&self) -> bool {
         matches!(self.connection, Connection::AwaitingAdmission)
     }
 
-    /// `fenced`: the saved descriptor failed its agent's proof, so this pane
-    /// stays as saved rather than waiting to reconnect, and says so.
+    /// Whether the unsent draft holds anything worth keeping: text other
+    /// than whitespace, or an attachment.
+    pub(super) fn has_unsent_words_or_attachments(&self) -> bool {
+        !self.unsent_attachments().is_empty() || !self.unsent_text().trim().is_empty()
+    }
+
     pub(super) fn pending_admission_view(
         &self,
         trailing_clearance: f32,
-        fenced: bool,
+        pending: PendingPane,
     ) -> Element<'_, Message> {
+        let fenced = matches!(pending, PendingPane::Fenced);
+        let card = self.target.card;
         let text = self.unsent_text();
         // Files and images wait with the text; their names say they were kept.
         let attached = self
@@ -23,17 +56,28 @@ impl Runtime {
         let mut children = Vec::new();
         // Why the pane waits leads: an update restore the daemon is still
         // running or holds, when that is the reason, above the draft it kept.
-        if !fenced {
-            let (title, explanation) = self.update_wait.admission();
+        if let PendingPane::Waiting { held } = pending {
+            let (title, explanation) = self.update_wait.admission(held);
             if let Some(title) = title {
                 children.push(design::title(title).into());
             }
             children.push(design::body(explanation).into());
         }
+        if matches!(pending, PendingPane::Copy) {
+            // A copy waits for nothing: it says what it is, and closes.
+            children.push(design::title(RETAINED_COPY_TITLE).into());
+            children.push(design::body(RETAINED_COPY_EXPLANATION).into());
+            children.push(
+                crate::ui_controls::button::primary("Close copy")
+                    .id(card_control_id(card, "retained-copy.close"))
+                    .name("Close copy")
+                    .on_press(Message::CloseCard(card))
+                    .into(),
+            );
+        }
         if fenced {
             // The same heading, explanation and Close as a fenced pane with no
             // chat runtime, which is drawn as an unavailable pane.
-            let card = self.target.card;
             children.push(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(Icon::Warning, design::STATUS_ICON_SIZE),
@@ -114,6 +158,50 @@ impl Runtime {
 impl Cagents {
     pub(in crate::app) fn chat_awaiting_admission(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.awaiting_admission())
+    }
+
+    /// A copy of an unsent draft kept beside the pane that holds its
+    /// conversation now: this window's own, and never admitted, so nothing
+    /// waits for it. A kept pane whose view retired it has no such pane
+    /// beside it, and stays what it is.
+    pub(in crate::app) fn is_retained_chat_copy(&self, card: CardId) -> bool {
+        self.durable.local_only_cards.contains(&card)
+            && self
+                .durable
+                .pending_chat_admissions
+                .get(&card)
+                .is_some_and(|source| self.shared_pane_holds_chat(card, source.id))
+    }
+
+    /// Whether a shared pane other than `card` holds chat `chat`.
+    fn shared_pane_holds_chat(&self, card: CardId, chat: TerminalId) -> bool {
+        self.durable.cards.iter().any(|other| {
+            other.id != card
+                && other.existence.is_open()
+                && !self.durable.local_only_cards.contains(&other.id)
+                && matches!(&other.kind, CardKind::Chat(session) if session.id == chat)
+        })
+    }
+
+    pub(super) fn pending_pane(&self, card: CardId) -> PendingPane {
+        let duplicate = || {
+            matches!(
+                self.card_state(card).map(|state| &state.kind),
+                Some(CardKind::Chat(session)) if self.shared_pane_holds_chat(card, session.id)
+            )
+        };
+        if self.shared_views.quarantined.contains(&card) && !duplicate() {
+            PendingPane::Fenced
+        } else if self.is_retained_chat_copy(card) || self.shared_views.quarantined.contains(&card)
+        {
+            // A fenced alias of a pane that holds its conversation is a copy
+            // of it in all but name.
+            PendingPane::Copy
+        } else {
+            PendingPane::Waiting {
+                held: self.channel_pane_view_hold(card),
+            }
+        }
     }
 
     pub(in crate::app) fn await_shared_chat_admission(
@@ -227,7 +315,31 @@ impl Cagents {
             return (Task::none(), None);
         };
         runtime.connection = Connection::AwaitingAdmission;
-        self.retain_unresolved_shared_upgrade(&pane)
+        // A view that still lists the card with the same conversation, as
+        // when only the daemon's proof changed again, keeps the draft there.
+        // A snapshot can still list a pane another client has closed, so a
+        // closed or retired pane doesn't count.
+        let source = runtime.session.clone();
+        if !self.shared_views.closed.contains(&card)
+            && let Some(listed) = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| !view.retired.contains(&card))
+            .find_map(|view| {
+                view.panes.iter().find(|listed| {
+                    listed.id == card
+                        && matches!(&listed.kind, CardKind::Chat(session) if same_conversation(session, &source))
+                })
+            })
+        {
+            let listed = listed.clone();
+            return self.admit_shared_chat_inner(&listed, false, true);
+        }
+        // Otherwise the card's own pane may already be retired or replaced,
+        // so its Content can't be assumed to belong there: it is kept as a
+        // copy.
+        self.admit_shared_chat_inner(&pane, false, false)
     }
 
     pub(in crate::app) fn shared_upgrade_target_changed(
@@ -283,20 +395,25 @@ impl Cagents {
         &mut self,
         pane: &crate::workspace_model::views::Pane,
     ) -> (Task<Message>, Option<CardId>) {
-        self.admit_shared_chat_inner(pane, true)
+        self.admit_shared_chat_inner(pane, true, true)
     }
 
+    /// Keeps the unproved source of a pane its view still lists, without
+    /// attaching it.
     pub(in crate::app) fn retain_unresolved_shared_upgrade(
         &mut self,
         pane: &crate::workspace_model::views::Pane,
     ) -> (Task<Message>, Option<CardId>) {
-        self.admit_shared_chat_inner(pane, false)
+        self.admit_shared_chat_inner(pane, false, true)
     }
 
+    /// `listed`: `pane` is what its view lists now, so a draft of the same
+    /// conversation stays on it rather than in a copy.
     fn admit_shared_chat_inner(
         &mut self,
         pane: &crate::workspace_model::views::Pane,
         resolve_upgrade: bool,
+        listed: bool,
     ) -> (Task<Message>, Option<CardId>) {
         let Some(CardRuntime::Chat(mut runtime)) = self.cards.remove(&pane.id) else {
             return (Task::none(), None);
@@ -330,12 +447,15 @@ impl Cagents {
         // the current pane, with its original descriptor and content intact.
         let same_source =
             matches!(&pane.kind, CardKind::Chat(session) if session == &runtime.session);
+        // A descriptor the daemon reissued for the same conversation, as
+        // when it relaunched it after a reboot, still owns this draft.
+        let same_conversation = listed
+            && !same_source
+            && matches!(&pane.kind, CardKind::Chat(session) if same_conversation(session, &runtime.session));
         // The copy can only be read and copied, so only text and attachments
         // earn one. A model choice alone stays bound to its own draft and is
-        // not offered to the replacement.
-        if !same_source
-            && (!runtime.unsent_text().is_empty() || !runtime.unsent_attachments().is_empty())
-        {
+        // not offered to the replacement, and whitespace is not text.
+        if !same_source && !same_conversation && runtime.has_unsent_words_or_attachments() {
             let retained = CardId::new();
             let mut state = self
                 .card_state(pane.id)
@@ -391,6 +511,13 @@ impl Cagents {
             // actual Ready handler, which replaces only the connection.
             runtime.connection = Connection::Connecting;
             self.cards.insert(pane.id, CardRuntime::Chat(runtime));
+        } else if same_conversation {
+            // Only what the reader typed carries over: the runtime that opens
+            // for the daemon's descriptor restores it from the saved draft.
+            // Nothing the old runtime held in flight is replayed.
+            self.cards.insert(pane.id, CardRuntime::Chat(runtime));
+            self.stash_unsent_chat(pane.id);
+            self.cards.remove(&pane.id);
         }
         if let (Some(CardKind::Chat(saved)), CardKind::Chat(canonical)) = (
             self.card_state(pane.id).map(|card| card.kind.clone()),
@@ -405,8 +532,16 @@ impl Cagents {
             // Failed exact lineage is not permission to restart either actor.
             // Keep the source copy inert and leave the canonical pane's retry
             // explicit instead of falling through to ordinary resume/start.
+            let kept_here = self
+                .chat_ui
+                .drafts
+                .get(&pane.id)
+                .is_some_and(|draft| !draft.trim().is_empty())
+                || self.chat_ui.draft_attachments.contains_key(&pane.id);
             let notice = if saved_copy.is_some() {
                 "Could not reconnect this conversation. Your draft is in the pane beside it. Retry to reconnect."
+            } else if kept_here {
+                "Could not reconnect this conversation. Retry to reconnect; your unsent draft comes back with it."
             } else {
                 "Could not reconnect this conversation. Retry to reconnect."
             };

@@ -15,6 +15,27 @@ fn wait(mut predicate: impl FnMut() -> bool, reason: &str) {
     }
 }
 
+pub(super) fn stop_fixture_process(process: &crate::daemon::holder_registry::Process) {
+    if process.pid == std::process::id() as i32 || !process.is_current() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: this is a recorded fixture process in its private runtime.
+    unsafe {
+        libc::kill(process.pid, libc::SIGKILL);
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(pin) = crate::daemon::PinnedProcess::open(process.pid as u32)
+        && process.is_current()
+        && pin.signal(libc::SIGKILL).unwrap_or(false)
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !pin.exited().unwrap_or(true) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 fn cleanup_discoveries(directory: &Path) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -31,11 +52,7 @@ fn cleanup_discoveries(directory: &Path) {
             && let Ok(owner) = serde_json::from_slice::<HolderRecord>(&bytes)
         {
             for process in [&owner.root, &owner.holder] {
-                if process.pid != std::process::id() as i32 && process.is_current() {
-                    unsafe {
-                        libc::kill(process.pid, libc::SIGKILL);
-                    }
-                }
+                stop_fixture_process(process);
             }
         }
     }
@@ -44,8 +61,8 @@ fn cleanup_discoveries(directory: &Path) {
 /// Same bounded isolated-subprocess pattern as retained_admission_tests; the
 /// parent retains its directory until the exact child exits and cleans only
 /// discovery records under that child's private runtime on failure.
-fn isolated() -> Option<PathBuf> {
-    const MODE: &str = "CAGENTS_RETAINED_RESOLUTION_TEST";
+pub(super) fn isolated() -> Option<PathBuf> {
+    const MODE: &str = "CAGENTS_RETAINED_HOST_CLAUDE_TEST";
     let test = thread::current().name().unwrap().to_owned();
     if std::env::var(MODE).as_deref() == Ok(test.as_str()) {
         return Some(PathBuf::from(
@@ -53,6 +70,7 @@ fn isolated() -> Option<PathBuf> {
         ));
     }
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let path = root.path().canonicalize().unwrap();
     for child in [
         "home/.claude",
         "run",
@@ -62,30 +80,34 @@ fn isolated() -> Option<PathBuf> {
         "bin",
         "project",
     ] {
-        fs::create_dir_all(root.path().join(child)).unwrap();
+        fs::create_dir_all(path.join(child)).unwrap();
     }
-    let stdout = root.path().join("test.stdout");
-    let stderr = root.path().join("test.stderr");
+    let stdout = path.join("test.stdout");
+    let stderr = path.join("test.stderr");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &test, "--nocapture"])
         .env_clear()
         .envs(crate::retained_fixture::owner_env())
+        .envs(
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .map(|authority| (crate::agent_execution::AUTHORITY_ENV, authority)),
+        )
         .env(MODE, &test)
         .env(
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
             retained_actor_tests::retained_helper_executable(),
         )
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-        .env("CAGENTS_HOLDER_ROOT", root.path())
-        .env("HOME", root.path().join("home"))
-        .env("CLAUDE_CONFIG_DIR", root.path().join("home/.claude"))
-        .env("XDG_RUNTIME_DIR", root.path().join("run"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("CAGENTS_HOLDER_ROOT", &path)
+        .env("HOME", path.join("home"))
+        .env("CLAUDE_CONFIG_DIR", path.join("home/.claude"))
+        .env("XDG_RUNTIME_DIR", path.join("run"))
+        .env("XDG_DATA_HOME", path.join("data"))
+        .env("XDG_CONFIG_HOME", path.join("config"))
+        .env("XDG_CACHE_HOME", path.join("cache"))
         .env(
             "PATH",
-            format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            format!("{}:/usr/bin:/bin", path.join("bin").display()),
         )
         .stdout(fs::File::create(&stdout).unwrap())
         .stderr(fs::File::create(&stderr).unwrap())
@@ -103,15 +125,17 @@ fn isolated() -> Option<PathBuf> {
         }
         thread::sleep(Duration::from_millis(10));
     };
-    cleanup_discoveries(&root.path().join("run"));
+    cleanup_discoveries(&path.join("run"));
+    let output = fs::read_to_string(stdout).unwrap();
     let outcome = match status {
-        Some(status) if status.success() => return None,
-        Some(status) => format!("failed with {status}"),
+        Some(status) if status.success() && output.contains("test result: ok. 1 passed") => {
+            return None;
+        }
+        Some(status) => format!("did not pass its selected test ({status})"),
         None => "was killed at its 90-second deadline".to_owned(),
     };
     panic!(
-        "resolution fixture {test} {outcome}\n--- its stdout ---\n{}\n--- its stderr ---\n{}",
-        fs::read_to_string(stdout).unwrap(),
+        "retained Claude fixture {test} {outcome}\n--- its stdout ---\n{output}\n--- its stderr ---\n{}",
         fs::read_to_string(stderr).unwrap()
     );
 }
@@ -205,10 +229,34 @@ impl Fixture {
         let identity = handle
             .actor_identity()
             .expect("actual remote helper required");
-        wait(
-            || handle.attachment_snapshot().ready,
-            "helper did not become ready",
-        );
+        let startup_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snapshot = handle.attachment_snapshot();
+            if snapshot.ready {
+                break;
+            }
+            if snapshot.exited || Instant::now() >= startup_deadline {
+                let listener = crate::daemon::holder_registry::socket(
+                    &crate::daemon::holder_registry::directory(
+                        crate::daemon::holder_registry::Kind::Native,
+                    )
+                    .unwrap(),
+                    id,
+                );
+                let record = crate::daemon::holder_registry::execution_record(&listener);
+                let image = record
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map(|owner| owner.root.executable());
+                panic!(
+                    "offline provider failed readiness: {:?}; holder {record:?}; image {image:?}; fixture trace {:?}",
+                    snapshot.error,
+                    fs::read_to_string(root.join("provider-trace.jsonl"))
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let original = host.lock().unwrap().chats[&id].session.clone();
         assert!(original.launch.session_id.is_none());
         assert!(matches!(
@@ -414,17 +462,73 @@ impl Drop for Fixture {
         }
         // Failure containment only, not a successful retirement oracle.
         for process in [&self.identity.record.root, &self.identity.record.holder] {
-            if process.is_current() {
-                unsafe {
-                    libc::kill(process.pid, libc::SIGKILL);
-                }
-            }
+            stop_fixture_process(process);
         }
     }
 }
 
 #[test]
+fn ordinary_shutdown_settles_a_wait_with_an_already_acknowledged_helper_outbox() {
+    #[cfg(target_os = "linux")]
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::new(root);
+    let handle = fixture.handle();
+    // A published waiting notice can outlast its helper's acknowledged
+    // outbox. Seed that durable half of the boundary while leaving the real
+    // retained owner responsive to an ordinary close.
+    let notifications = fixture.broker.as_ref().unwrap().handle();
+    let receipt = notifications
+        .record_committed(crate::notifications::Event::session(
+            fixture.original.id,
+            Provider::Claude,
+            fixture.root.join("project"),
+            crate::notifications::Evidence {
+                key: "previously published waiting request".into(),
+                kind: crate::notifications::Kind::Waiting,
+            },
+        ))
+        .unwrap();
+    receipt
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let unread_wait = || {
+        notifications.snapshot().notices.into_iter().find(|notice| {
+            notice.event.source_session() == Some(fixture.original.id)
+                && notice.event.evidence.kind == crate::notifications::Kind::Waiting
+                && !notice.acknowledged
+        })
+    };
+    wait(
+        || unread_wait().is_some(),
+        "the waiting notice did not publish",
+    );
+    let notice = unread_wait().unwrap();
+    assert!(handle.uncommitted_outcomes().unwrap().is_empty());
+    fixture.host.lock().unwrap().graceful_shutdown();
+    super::super::finish_chat_shutdown(&fixture.host).unwrap();
+    drop(fixture.broker.take());
+
+    let path = crate::instance::project_dirs()
+        .unwrap()
+        .data_dir()
+        .join("agent-attention.sqlite3");
+    let (_, mut reopened) = super::super::notifications::JournalTestBridge::new(&path).unwrap();
+    assert!(
+        reopened
+            .list()
+            .unwrap()
+            .into_iter()
+            .any(|stored| stored.id == notice.id && stored.acknowledged)
+    );
+}
+
+#[test]
 fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -477,6 +581,10 @@ fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launchin
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -591,6 +699,10 @@ fn real_failed_cleanup_attachment_recovers_the_same_provider_without_closing_it(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_retained_claude_update_preview_preserves_pre_id_and_active_turns() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -699,6 +811,10 @@ const SPLIT_THIRD_FRAME: (&str, &str) = (
 /// actor has read but not applied keeps readiness Unready, so the provider's
 /// record and `busy` alone do not mean the held turn has settled.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn real_retained_update_readiness_settles_once_the_actor_applies_recorded_output() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -731,6 +847,7 @@ fn real_retained_update_readiness_settles_once_the_actor_applies_recorded_output
 
 #[test]
 fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -846,6 +963,7 @@ fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
 
 #[test]
 fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -895,6 +1013,7 @@ fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
 
 #[test]
 fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -975,6 +1094,7 @@ fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
 
 #[test]
 fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1034,6 +1154,7 @@ fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
 
 #[test]
 fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1121,6 +1242,7 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
 
 #[test]
 fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1169,6 +1291,7 @@ fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
 // and isolated() retain their original bounded real-helper ownership mechanics.
 #[test]
 fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }

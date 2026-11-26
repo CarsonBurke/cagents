@@ -814,8 +814,37 @@ where
     }
 }
 
-/// Ctrl+Delete / Ctrl+Backspace delete the adjacent word, then the usual
-/// iced editor chords (copy/cut/paste/select-all and caret motion).
+/// How far a modified Backspace or Delete reaches: the platform's chord
+/// for the adjacent word, or on macOS also Command for the rest of the line.
+///
+/// Ctrl deletes a word on Linux and Option does on macOS, as each system's
+/// own text fields do; iced's editor treats any modified Backspace as a
+/// single character.
+pub fn deletion_motion(modifiers: keyboard::Modifiers, key: &keyboard::Key) -> Option<Motion> {
+    use keyboard::{Modifiers, key::Named};
+    let forward = match key.as_ref() {
+        keyboard::Key::Named(Named::Backspace) => false,
+        keyboard::Key::Named(Named::Delete) => true,
+        _ => return None,
+    };
+    let (backward, ahead) = if cfg!(target_os = "macos") {
+        if modifiers == Modifiers::ALT {
+            (Motion::WordLeft, Motion::WordRight)
+        } else if modifiers == Modifiers::LOGO {
+            (Motion::Home, Motion::End)
+        } else {
+            return None;
+        }
+    } else if modifiers.control() && !modifiers.alt() && !modifiers.shift() {
+        (Motion::WordLeft, Motion::WordRight)
+    } else {
+        return None;
+    };
+    Some(if forward { ahead } else { backward })
+}
+
+/// The platform's word and line deletions (see [`deletion_motion`]), then the
+/// usual iced editor chords (copy/cut/paste/select-all and caret motion).
 pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
     // Every editor on screen sees every key press. Only the focused one may
     // act on it, or Ctrl+Backspace typed anywhere else would delete a word
@@ -823,22 +852,11 @@ pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
     if !matches!(press.status, Status::Focused { .. }) {
         return None;
     }
-    if press.modifiers.command() && !press.modifiers.alt() && !press.modifiers.shift() {
-        match press.key.as_ref() {
-            keyboard::Key::Named(keyboard::key::Named::Delete) => {
-                return Some(Binding::Sequence(vec![
-                    Binding::Select(Motion::WordRight),
-                    Binding::Delete,
-                ]));
-            }
-            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-                return Some(Binding::Sequence(vec![
-                    Binding::Select(Motion::WordLeft),
-                    Binding::Delete,
-                ]));
-            }
-            _ => {}
-        }
+    if let Some(motion) = deletion_motion(press.modifiers, &press.key) {
+        return Some(Binding::Sequence(vec![
+            Binding::Select(motion),
+            Binding::Delete,
+        ]));
     }
     Binding::from_key_press(press)
 }
@@ -6278,8 +6296,8 @@ mod tests {
                 Status::Active
             },
         };
-        let ctrl = keyboard::Modifiers::CTRL;
-        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let ctrl = keyboard::Modifiers::COMMAND;
+        let ctrl_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
         assert_eq!(
             history_command(&press("z", ctrl, true)),
             Some(HistoryCommand::Undo)
@@ -6310,5 +6328,34 @@ mod tests {
             default_bindings::<()>(backspace).is_none(),
             "an unfocused editor must not delete a word typed at another widget"
         );
+    }
+
+    #[test]
+    fn modified_deletions_reach_as_far_as_the_platforms_text_fields() {
+        use keyboard::{Modifiers, key::Named};
+        let backspace = keyboard::Key::Named(Named::Backspace);
+        let delete = keyboard::Key::Named(Named::Delete);
+        let word = if cfg!(target_os = "macos") {
+            Modifiers::ALT
+        } else {
+            Modifiers::CTRL
+        };
+        assert_eq!(deletion_motion(word, &backspace), Some(Motion::WordLeft));
+        assert_eq!(deletion_motion(word, &delete), Some(Motion::WordRight));
+        assert_eq!(deletion_motion(word | Modifiers::SHIFT, &backspace), None);
+        assert_eq!(deletion_motion(Modifiers::empty(), &backspace), None);
+        assert_eq!(
+            deletion_motion(word, &keyboard::Key::Character("w".into())),
+            None
+        );
+        let line = deletion_motion(Modifiers::LOGO, &backspace);
+        if cfg!(target_os = "macos") {
+            assert_eq!(line, Some(Motion::Home));
+            assert_eq!(deletion_motion(Modifiers::LOGO, &delete), Some(Motion::End));
+            // Control+Backspace is a terminal habit, not a Mac text chord.
+            assert_eq!(deletion_motion(Modifiers::CTRL, &backspace), None);
+        } else {
+            assert_eq!(line, None);
+        }
     }
 }

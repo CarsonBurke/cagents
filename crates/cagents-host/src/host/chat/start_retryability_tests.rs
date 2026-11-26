@@ -21,8 +21,16 @@ fn isolated(name: &str) -> Option<PathBuf> {
                 .into(),
         );
     }
+    #[cfg(target_os = "linux")]
     let directory = tempfile::tempdir().unwrap();
+    #[cfg(target_os = "macos")]
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    #[cfg(target_os = "linux")]
     let root = directory.path();
+    #[cfg(target_os = "macos")]
+    let canonical = directory.path().canonicalize().unwrap();
+    #[cfg(target_os = "macos")]
+    let root = canonical.as_path();
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     for path in [
         "home/.codex",
@@ -45,6 +53,10 @@ fn isolated(name: &str) -> Option<PathBuf> {
         ])
         .env_clear()
         .envs(crate::retained_fixture::owner_env())
+        .envs(
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .map(|authority| (crate::agent_execution::AUTHORITY_ENV, authority)),
+        )
         .env(MODE, name)
         .env("CAGENTS_START_RETRYABILITY_ROOT", root)
         .env("HOME", root.join("home"))
@@ -74,10 +86,12 @@ fn isolated(name: &str) -> Option<PathBuf> {
         }
         thread::sleep(Duration::from_millis(10));
     };
+    let output = fs::read_to_string(root.join("stdout")).unwrap();
     assert!(
-        status.is_some_and(|status| status.success()),
-        "isolated startup fixture failed or timed out:\n{}\n{}",
-        fs::read_to_string(root.join("stdout")).unwrap(),
+        status.is_some_and(|status| status.success())
+            && output.contains("test result: ok. 1 passed"),
+        "isolated startup fixture failed, selected no test, or timed out:\n{}\n{}",
+        output,
         fs::read_to_string(root.join("stderr")).unwrap(),
     );
     None
@@ -184,6 +198,7 @@ fn wait_for_ready(host: &SharedHost, source: &Session, client: &ClientHandle) {
 
 #[test]
 fn executable_permission_repair_retries_the_same_saved_conversation() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -249,6 +264,7 @@ for line in sys.stdin:
 
 #[test]
 fn codex_recipe_thread_conflict_is_blocked_without_launching_a_provider() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -421,6 +437,10 @@ fn assert_repaired_resume_prepares(host: &SharedHost, source: &Session) {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn surviving_claude_process_keeps_retry_until_its_owned_process_exits() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -466,6 +486,10 @@ fn surviving_claude_process_keeps_retry_until_its_owned_process_exits() {
 /// was its only writer this boot. The client reads that refusal as one a
 /// restart lifts, and says the conversation is not reopened yet.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn an_unmatched_ended_actor_waits_for_a_restart_rather_than_a_retry() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -569,6 +593,10 @@ fn an_unmatched_ended_actor_waits_for_a_restart_rather_than_a_retry() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn missing_captured_claude_home_keeps_retry_until_same_inode_is_restored() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -617,6 +645,10 @@ fn missing_captured_claude_home_keeps_retry_until_same_inode_is_restored() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn managed_account_registry_io_is_retryable_but_malformed_data_is_blocked() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -737,6 +769,7 @@ fn managed_account_registry_io_is_retryable_but_malformed_data_is_blocked() {
 
 #[test]
 fn invalid_resume_continuity_stays_blocked_through_prepare_handshake() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -787,6 +820,7 @@ fn invalid_resume_continuity_stays_blocked_through_prepare_handshake() {
 
 #[test]
 fn missing_claude_history_repair_restores_the_same_read_only_card_without_launching() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -889,6 +923,10 @@ fn missing_claude_history_repair_restores_the_same_read_only_card_without_launch
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn codex_endpoint_repair_retries_the_same_socket_and_thread() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -957,6 +995,7 @@ fn codex_endpoint_repair_retries_the_same_socket_and_thread() {
 
 #[test]
 fn connect_shutdown_can_retry_but_an_exact_other_host_is_blocked() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1078,7 +1117,7 @@ fn publication_retries_transient_changes_and_blocks_a_lost_reservation() {
     drop(state.chats.remove(&source.id));
 
     let mut recipe = LaunchRecipe::shell(root.path().into()).unwrap();
-    recipe.program = "/bin/true".into();
+    recipe.program = "/usr/bin/true".into();
     recipe.arguments.clear();
     let terminal = crate::model::TerminalSession {
         id: source.id,
@@ -1124,6 +1163,7 @@ fn publication_retries_transient_changes_and_blocks_a_lost_reservation() {
 /// the read can succeed later, and nothing was launched.
 #[test]
 fn an_unreadable_update_floor_keeps_retry_without_launching() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }

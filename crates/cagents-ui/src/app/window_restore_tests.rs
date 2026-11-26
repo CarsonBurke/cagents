@@ -437,8 +437,9 @@ fn removed_saved_worktree_restores_its_live_project_or_home_from_store() {
 #[test]
 fn saved_unregistered_directory_still_restores_when_it_exists() {
     let directory = tempfile::tempdir().unwrap();
-    let mut app = fixture(directory.path());
-    let outside = directory.path().join("outside-catalog");
+    let root = directory.path().canonicalize().unwrap();
+    let mut app = fixture(root.as_path());
+    let outside = root.as_path().join("outside-catalog");
     std::fs::create_dir_all(&outside).unwrap();
     let card = terminal(&outside);
     let durable = Arc::make_mut(&mut app.durable);
@@ -446,7 +447,7 @@ fn saved_unregistered_directory_still_restores_when_it_exists() {
     durable.focused = Some(card.id);
     durable.active_worktree = Some(outside.clone());
     durable.worktree_focus.insert(outside.clone(), card.id);
-    let restored = restart(app, &directory.path().join("unregistered.sqlite3"), false);
+    let restored = restart(app, &root.as_path().join("unregistered.sqlite3"), false);
     assert_eq!(restored.active_workspace, Some(outside));
     assert_eq!(restored.workspace.focused(), Some(card.id));
 }

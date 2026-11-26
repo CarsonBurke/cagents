@@ -21,6 +21,17 @@ pub struct StoppedPane {
     pub recovery: String,
 }
 
+impl StoppedPane {
+    pub fn recovery_notice(&self) -> String {
+        let detail = super::review::recovery_detail(&self.reason, &self.recovery);
+        let mut chars = detail.chars();
+        match chars.next() {
+            Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+            None => detail,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoppedWindow {
     pub window: usize,

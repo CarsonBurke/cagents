@@ -75,21 +75,11 @@ impl Client {
     fn verify_owner(&self, socket: &Path) -> Result<(), String> {
         let pid = crate::daemon::lease_owner(&socket.with_file_name("cagentsd.lock"), &self.proof)
             .map_err(|_| "Source service ownership cannot be verified")?;
-        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: initialized buffers have the exact kernel credential layout.
-        if unsafe {
-            libc::getsockopt(
-                self.stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut peer as *mut libc::ucred).cast(),
-                &mut length,
-            )
-        } != 0
-            || length as usize != std::mem::size_of::<libc::ucred>()
-            || peer.uid != crate::daemon::current_uid()
-            || u32::try_from(peer.pid).ok() != Some(pid)
+        // Darwin names the last process to use the source's end, which is the
+        // source either way: before it accepts, its end takes the pid from the
+        // listener it binds and serves alone. See `daemon::peer_credentials`.
+        if !crate::daemon::peer_credentials(&self.stream)
+            .is_ok_and(|peer| peer.uid == crate::daemon::current_uid() && peer.pid == pid)
         {
             return Err("Source connection does not belong to its authenticated service".into());
         }
@@ -665,6 +655,36 @@ impl Write for DeadlineStream<'_> {
 mod tests {
     use super::*;
 
+    fn inspection_socket_pair() -> (UnixStream, UnixStream) {
+        // Use the inspection connector so Darwin can refresh socket timeouts
+        // while reading the source's final buffered response after close.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.sock");
+        let listener = crate::descriptor::bind(&path).unwrap();
+        let stream = crate::control::connect_control_socket(&path, Duration::from_secs(2)).unwrap();
+        let (peer, _) = crate::descriptor::accept(&listener).unwrap();
+        (stream, peer)
+    }
+
+    #[test]
+    fn inspection_reads_a_buffered_response_after_the_source_closes() {
+        let (mut stream, mut peer) = inspection_socket_pair();
+        let payload = b"ready";
+        peer.write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        peer.write_all(payload).unwrap();
+        drop(peer);
+
+        let mut stream = DeadlineStream {
+            stream: &mut stream,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        assert_eq!(
+            read_payload_with_limit(&mut stream, MAX_FRAME).unwrap(),
+            payload
+        );
+    }
+
     fn source_protocols() -> std::collections::BTreeSet<u16> {
         crate::update::source::protocols().collect()
     }
@@ -991,7 +1011,7 @@ mod tests {
     }
 
     fn history_preview_at_protocol(protocol: u16) {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (stream, mut peer) = inspection_socket_pair();
         let source = super::super::tests::session();
         let mut requested = source.clone();
         requested.proof = Some(proof());
@@ -1115,7 +1135,7 @@ mod tests {
             crate::upgrade::handoff::MAX_CHATS,
             crate::upgrade::handoff::MAX_CHATS + 1,
         ] {
-            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let (stream, mut peer) = inspection_socket_pair();
             let source = populated_inventory().0;
             let worker = std::thread::spawn(move || {
                 let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
@@ -1174,7 +1194,7 @@ mod tests {
             let mut inventory: Vec<_> = (0..total).map(|_| descriptor()).collect();
             inventory.sort_by_key(|terminal| terminal.session.id);
             let expected = inventory.clone();
-            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let (stream, mut peer) = inspection_socket_pair();
             let count = pages.len();
             let worker = std::thread::spawn(move || {
                 let mut rest = inventory.as_slice();
@@ -1234,12 +1254,12 @@ mod tests {
             let mut owner = proof();
             owner.boot_id = crate::daemon::read_boot_id().unwrap();
             let _lease = crate::daemon::HostLease::acquire(&paths, &owner).unwrap();
-            let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let listener = crate::descriptor::bind(&paths.socket).unwrap();
             let expected = owner.clone();
             let source = super::super::tests::session();
             let expected_source = source.clone();
             let worker = std::thread::spawn(move || {
-                let (mut peer, _) = listener.accept().unwrap();
+                let (mut peer, _) = crate::descriptor::accept(&listener).unwrap();
                 peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 peer.set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -1298,7 +1318,7 @@ mod tests {
     #[test]
     fn compatible_source_request_uses_its_own_version() {
         for protocol in source_protocols() {
-            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let (stream, mut peer) = inspection_socket_pair();
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let worker = std::thread::spawn(move || {
                 let request: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
@@ -1333,7 +1353,7 @@ mod tests {
     #[test]
     fn current_response_refuses_changed_protocol_owner_and_request_identity() {
         for mismatch in 0..3 {
-            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let (stream, mut peer) = inspection_socket_pair();
             peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             peer.set_write_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -1385,7 +1405,7 @@ mod tests {
 
     #[test]
     fn expired_current_inspection_sends_no_request() {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (stream, mut peer) = inspection_socket_pair();
         peer.set_nonblocking(true).unwrap();
         let mut client = Client {
             stream,
@@ -1402,7 +1422,7 @@ mod tests {
 
     #[test]
     fn history_change_wait_needs_a_presentation_change_and_fails_a_wedged_reader_cleanly() {
-        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (stream, mut peer) = inspection_socket_pair();
         let chat = super::super::tests::session().id;
         let mut client = Client {
             stream,

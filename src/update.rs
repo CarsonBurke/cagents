@@ -5,6 +5,16 @@
 mod cancellation;
 mod candidate;
 mod confirmation;
+#[cfg(target_os = "macos")]
+mod cutover;
+#[cfg(all(target_os = "macos", feature = "host"))]
+#[doc(hidden)]
+pub use cutover::{
+    LiveInventory as CutoverLiveInventory, StartupCheckpoint as CutoverStartupCheckpoint,
+    startup_checkpoint as cutover_startup_checkpoint,
+};
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use cutover::{Original as ReadyCutoverOriginal, record as record_ready_cutover};
 mod feed;
 mod floor;
 mod floor_display;
@@ -12,14 +22,24 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
+mod publication;
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
+#[doc(hidden)]
+pub use publication::LocalPublication;
 mod pending_recovery;
+pub mod progress;
 pub mod recovery;
+#[cfg(target_os = "macos")]
+mod release_stage;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
 mod review_fixture;
 pub use recovery::TargetRecoveryRequired;
 pub mod source;
-pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
+pub use confirmation::{
+    Choice as UpdateChoice, Confirmation as UpdateConfirmation, cancel, decide,
+};
 pub mod impact;
 mod review;
 pub mod source_inspection;
@@ -28,7 +48,6 @@ mod signature;
 #[cfg(feature = "ui")]
 pub mod startup;
 use std::{
-    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::{
@@ -123,14 +142,26 @@ impl CancellationToken {
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
+    #[error(
+        "self-update requires a full user installation made by install.sh; source and OS-package installs must use their original installation method"
+    )]
+    UnsupportedInstallation,
     #[error("{0}")]
     Invalid(String),
+    #[error("No published release of cagents offers in-app updates yet.")]
+    NoPublishedRelease,
+    #[error("The release server has no asset at {0}.")]
+    ReleaseAssetMissing(String),
     #[error("another update is already running")]
     Busy,
     #[error(transparent)]
     TargetRecoveryRequired(Box<recovery::TargetRecoveryRequired>),
     #[error("Update cancelled")]
     Cancelled,
+    #[error("The update changed before your choice could be applied.")]
+    DecisionExpired,
+    #[error("The update review already has an answer.")]
+    DecisionAlreadySubmitted,
     /// The review was closed, or expired, while something it named had to
     /// be resolved by hand first. Unlike a cancellation, this says what.
     #[error("{}", .0.report())]
@@ -194,9 +225,21 @@ struct Asset {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum UpdateState {
-    Unsupported { reason: String },
-    Current { version: String },
-    Available { release: Box<Release> },
+    Unsupported {
+        reason: String,
+    },
+    Current {
+        version: String,
+    },
+    Available {
+        release: Box<Release>,
+    },
+    /// A newer release that this platform installs only by running its
+    /// installer again: `command` runs that release's installer.
+    InstallerAvailable {
+        release: Box<Release>,
+        command: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -329,6 +372,53 @@ pub(crate) fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
     })
 }
 
+/// The stable launch bundle can resolve only the currently selected build.
+#[cfg(target_os = "macos")]
+pub(crate) fn stable_ui_bundle(
+    executable: &Path,
+    launcher: &Path,
+) -> Result<Option<PathBuf>, UpdateError> {
+    if executable
+        .file_name()
+        .is_none_or(|name| name != "cagents-ui")
+    {
+        return Ok(None);
+    }
+    let layout = match locate(executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // A recovery coordinator from another build cannot assume its UI speaks
+    // the new startup connection. Keep direct startup for that fallback.
+    if !locate(launcher).is_ok_and(|caller| caller.version_root == layout.version_root)
+        || served_version_root(&layout)? != layout.version_root
+        || crate::install_guard::has_staged_owner_marker(&layout.version_root)
+    {
+        return Ok(None);
+    }
+    let bundle = layout.prefix.join("Cagents.app");
+    if !fs::symlink_metadata(&bundle).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == crate::daemon::current_uid()
+            && metadata.mode() & 0o022 == 0
+    }) {
+        // Older or incomplete installs can still open the physical UI.
+        return Ok(None);
+    }
+    let entry = bundle.join("Contents/MacOS/Cagents");
+    if !fs::symlink_metadata(&entry).is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.uid() == crate::daemon::current_uid()
+            && metadata.mode() & 0o022 == 0
+            && metadata.mode() & 0o111 != 0
+    }) || !entry.canonicalize().is_ok_and(|physical| physical == entry)
+    {
+        return Ok(None);
+    }
+    Ok(Some(bundle))
+}
+
 /// The three executables are released, installed and spoken as one set: a
 /// version directory holding only some of them cannot host a window.
 fn matched_set(bin: &Path) -> bool {
@@ -343,13 +433,16 @@ struct Installation {
 }
 impl Installation {
     fn detect() -> Result<Self, UpdateError> {
-        if !cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_env = "gnu"
+        if !cfg!(any(
+            all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_env = "gnu"
+            ),
+            all(target_os = "macos", target_arch = "aarch64")
         )) {
             return Err(invalid(
-                "self-update supports only Linux x86_64 GNU release installs",
+                "self-update supports only Linux x86_64 GNU and Apple Silicon macOS release installs",
             ));
         }
         if !cfg!(feature = "full") {
@@ -357,7 +450,7 @@ impl Installation {
                 "browserless builds must be updated with their package manager or installer",
             ));
         }
-        Self::from_executable(&std::env::current_exe()?)
+        Self::from_executable(&crate::process::current_executable()?)
     }
 
     fn from_executable(executable: &Path) -> Result<Self, UpdateError> {
@@ -416,13 +509,17 @@ const PREPARED_CANDIDATE_MARKER: &str = ".cagents-prepared-candidate-v1.json";
 
 /// Whether `install.sh` left the version tree at `root` as a candidate it has
 /// not verified, such as one kept after a failed or rolled-back update. It
-/// removes both markers once it verifies a publication; a later install of that
+/// removes these markers once it verifies a publication; a later install of that
 /// release revalidates a marked tree. Releases before that removal left the
 /// prepared marker on trees they published, which are refused here too.
 pub(crate) fn is_unverified_candidate(root: &Path) -> bool {
-    [RETAINED_CANDIDATE_MARKER, PREPARED_CANDIDATE_MARKER]
-        .iter()
-        .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
+    [
+        RETAINED_CANDIDATE_MARKER,
+        PREPARED_CANDIDATE_MARKER,
+        installed::LOCAL_STAGE_MARKER,
+    ]
+    .iter()
+    .any(|marker| fs::symlink_metadata(root.join(marker)).is_ok())
 }
 
 /// Whether `install.sh` would refuse to install `version` again because this
@@ -437,10 +534,67 @@ fn holds_installed_tree(prefix: &Path, version: &str) -> bool {
 fn invalid(message: impl Into<String>) -> UpdateError {
     UpdateError::Invalid(message.into())
 }
-fn unsupported_install() -> UpdateError {
-    invalid(
-        "self-update requires a full user installation made by install.sh; source and OS-package installs must use their original installation method",
+/// macOS cannot hand a running daemon's sessions to another version yet, so
+/// an installation there updates only through its installer, which a person
+/// runs once the daemon has stopped. The app finds a newer release and says
+/// so; it never stops the daemon or installs a release itself. The command
+/// ends the text, so it can be copied whole: for a verified release it runs
+/// that release's own installer for that version.
+fn installer_updates(version: Option<&str>) -> String {
+    format!(
+        "On macOS, update cagents by running its installer again from a system terminal. \
+         It says how to stop the running daemon first. Run:\n\n{}",
+        installer_command(version)
     )
+}
+
+/// The terminal command that installs `version`, or the latest release.
+fn installer_command(version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!(
+            "curl -fsSL {}/download/v{version}/install-macos.sh | sh -s -- --version {version}",
+            feed::PUBLIC_FEED
+        ),
+        None => format!(
+            "curl -fsSL {}/latest/download/install-macos.sh | sh",
+            feed::PUBLIC_FEED
+        ),
+    }
+}
+
+/// Whether a check offers `version` to `installation`: a newer release,
+/// unless the updater would refuse it. Offering a version already unpacked
+/// would only end in the updater's refusal; that build is offered through
+/// `current`. The macOS installer reinstalls a retained version, such as the
+/// newer one a rollback left behind, so it is offered there.
+fn offers_release(installation: &Installation, version: &str) -> Result<bool, UpdateError> {
+    Ok(is_newer(version, &installation.version)?
+        && (cfg!(target_os = "macos") || !holds_installed_tree(&installation.prefix, version)))
+}
+
+/// What a check reports about `release`, newer than the installation.
+fn offered(release: Release, installer_only: bool) -> UpdateState {
+    if installer_only {
+        UpdateState::InstallerAvailable {
+            command: installer_command(Some(&release.version)),
+            release: Box::new(release),
+        }
+    } else {
+        UpdateState::Available {
+            release: Box::new(release),
+        }
+    }
+}
+
+fn installer_updates_only(version: Option<&str>) -> Result<(), UpdateError> {
+    if cfg!(target_os = "macos") {
+        return Err(invalid(installer_updates(version)));
+    }
+    Ok(())
+}
+
+fn unsupported_install() -> UpdateError {
+    UpdateError::UnsupportedInstallation
 }
 fn stable_version(text: &str) -> Result<Version, UpdateError> {
     let version = Version::parse(text).map_err(|_| invalid("invalid release version"))?;
@@ -472,9 +626,8 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
     if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
         && let Some(release) = review_fixture::release(Path::new(&root))?
     {
-        return Ok(UpdateState::Available {
-            release: Box::new(release),
-        });
+        let installer_only = review_fixture::offers_installer(Path::new(&root));
+        return Ok(offered(release, installer_only));
     }
     let installation = match Installation::detect() {
         Ok(installation) => installation,
@@ -488,19 +641,19 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
         Ok(feed) => feed,
         Err(reason) => return Ok(UpdateState::Unsupported { reason }),
     };
-    let release = feed.latest(
-        |version| {
-            // Offering a version already unpacked would only end in the
-            // installer's refusal. That build is offered through `current`.
-            Ok(is_newer(version, &installation.version)?
-                && !holds_installed_tree(&installation.prefix, version))
-        },
+    let release = match feed.latest(
+        |version| offers_release(&installation, version),
         cancellation,
-    )?;
+    ) {
+        Err(error @ UpdateError::NoPublishedRelease) => {
+            return Ok(UpdateState::Unsupported {
+                reason: error.to_string(),
+            });
+        }
+        result => result?,
+    };
     Ok(match release {
-        Some(release) => UpdateState::Available {
-            release: Box::new(release),
-        },
+        Some(release) => offered(release, cfg!(target_os = "macos")),
         None => UpdateState::Current {
             version: installation.version,
         },
@@ -520,10 +673,10 @@ fn is_newer(release: &str, installed: &str) -> Result<bool, UpdateError> {
 fn unmanaged_reason(error: UpdateError) -> String {
     // Only a layout install.sh did not make belongs to another tool; any
     // other failure of a self-managed install is reported as it is.
-    if error.to_string() != unsupported_install().to_string() {
+    if !matches!(error, UpdateError::UnsupportedInstallation) {
         return error.to_string();
     }
-    let executable = std::env::current_exe().and_then(|path| path.canonicalize());
+    let executable = crate::process::current_executable().and_then(|path| path.canonicalize());
     match executable {
         Ok(path) if path.components().any(|part| part.as_os_str() == "target") => {
             "This is a build from source. Install a release to receive updates.".into()
@@ -569,6 +722,7 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
             "a native evidence session never installs a release",
         ));
     }
+    installer_updates_only(Some(&release.version))?;
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
@@ -584,32 +738,39 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
 }
 
 pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
-    apply_installed_from(executable, false)
+    apply_installed_from(Some(executable))
 }
 
-fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
+fn apply_installed_from(window_candidate: Option<&Path>) -> Result<UpdateJob, UpdateError> {
+    installer_updates_only(None)?;
     recovery::inspect_pending_current()?;
     let mut installation = running_installation()?;
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     let served = served_version_root(&layout)?;
-    if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
-        return Err(invalid(
-            "the installed candidate changed; inspect the installation again",
-        ));
-    }
-    // The served build owns every update, including an older daemon's
-    // replacement and a remaining window-only replacement.
-    installation.version = installed_entry_worker(&layout, &served)?;
-    let version = served
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(unsupported_install)?
-        .to_owned();
+    let candidate = match window_candidate {
+        None => installed_terminal_candidate(&layout, &served)?,
+        Some(executable) => {
+            if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
+                return Err(invalid(
+                    "the installed candidate changed; inspect the installation again",
+                ));
+            }
+            served.clone()
+        }
+    };
+    // The candidate owns its update. For a privately staged CLI, compare
+    // against the public version so an absent daemon still permits the switch.
+    let source_layout = if candidate == served {
+        layout
+    } else {
+        locate(&served.join("bin/cagents-ui"))?
+    };
+    installation.version = installed_entry_worker(&source_layout, &candidate)?;
     start_job(
         &installation,
-        &version,
-        &if terminal {
-            UpdateRequest::InstalledFromTerminal { root: served }
+        &installation.version,
+        &if window_candidate.is_none() {
+            UpdateRequest::InstalledFromTerminal { root: candidate }
         } else {
             UpdateRequest::Installed { root: served }
         },
@@ -679,16 +840,28 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
-    // An interrupted preparation has its own immutable source census. Do not
-    // route this retry through old `current` or construct a fresh empty source.
-    recovery::inspect_pending_current()?;
-    let layout = locate(&std::env::current_exe()?)?;
-    let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
     if cancellation::requested() {
         return Err(UpdateError::Cancelled);
     }
-    let initial = apply_installed_from(&candidate, true)?;
+    let initial = apply_installed_from(None)?;
     drive_terminal_review(initial, yes, interrupt)
+}
+
+fn installed_terminal_candidate(
+    caller: &InstallLayout,
+    served: &Path,
+) -> Result<PathBuf, UpdateError> {
+    if caller.version_root != served {
+        match fs::symlink_metadata(caller.version_root.join(installed::LOCAL_STAGE_MARKER)) {
+            Ok(_) => {
+                installed::Selection::capture(caller)?;
+                return Ok(caller.version_root.clone());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(served.to_owned())
 }
 
 pub fn upgrade_release(
@@ -697,8 +870,27 @@ pub fn upgrade_release(
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
+    if cfg!(target_os = "macos") {
+        // Offer the installer command for the release, once it is verified.
+        let selected = selected_upgrade(&Installation::detect()?, version)?;
+        return Err(invalid(installer_updates(Some(&selected.version))));
+    }
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
+    let selected = selected_upgrade(&installation, version)?;
+    if cancellation::requested() {
+        return Err(UpdateError::Cancelled);
+    }
+    let initial = start_job(
+        &installation,
+        &selected.version,
+        &UpdateRequest::ReleaseFromTerminal(selected.clone()),
+    )?;
+    drive_terminal_review(initial, yes, interrupt)
+}
+
+/// The verified release `version`, when it is newer than `installation`.
+fn selected_upgrade(installation: &Installation, version: &str) -> Result<Release, UpdateError> {
     let parsed = stable_version(version)?;
     let selected = feed::Feed::configured()
         .map_err(invalid)?
@@ -710,15 +902,7 @@ pub fn upgrade_release(
             "selected release is not newer than the running installation",
         ));
     }
-    if cancellation::requested() {
-        return Err(UpdateError::Cancelled);
-    }
-    let initial = start_job(
-        &installation,
-        &selected.version,
-        &UpdateRequest::ReleaseFromTerminal(selected.clone()),
-    )?;
-    drive_terminal_review(initial, yes, interrupt)
+    Ok(selected)
 }
 
 /// Inspect retained preparation before constructing a new update census.
@@ -743,7 +927,10 @@ fn drive_terminal_review(
     yes: bool,
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
-    drive_terminal_review_with(initial, yes, interrupt, &mut NativeTerminalReview)
+    let mut terminal = NativeTerminalReview {
+        progress: progress::TerminalChanges::watch().ok(),
+    };
+    drive_terminal_review_with(initial, yes, interrupt, &mut terminal)
 }
 
 trait TerminalReview: Write {
@@ -751,17 +938,47 @@ trait TerminalReview: Write {
     fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError>;
     fn cancel(&mut self, job: &str) -> Result<bool, UpdateError>;
     fn read_line(&mut self, answer: &mut String) -> io::Result<usize>;
+    fn read_review_line(
+        &mut self,
+        answer: &mut String,
+        _review: &UpdateJob,
+        _deadline: Instant,
+    ) -> io::Result<usize> {
+        self.read_line(answer)
+    }
     fn is_terminal(&self) -> bool;
     fn interrupted(&self) -> bool;
     fn worker_running(&mut self) -> Result<bool, UpdateError> {
         Ok(false)
     }
-    fn pause(&mut self) {
+    fn pause(&mut self, _deadline: Instant) {
         thread::sleep(Duration::from_millis(250));
     }
 }
 
-struct NativeTerminalReview;
+struct NativeTerminalReview {
+    progress: Option<progress::TerminalChanges>,
+}
+
+#[derive(Debug, Error)]
+#[error("The update review moved on")]
+struct PromptChanged;
+
+fn prompt_changed(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|reason| reason.is::<PromptChanged>())
+}
+
+fn same_terminal_prompt(shown: &UpdateJob, current: &UpdateJob) -> bool {
+    shown.id == current.id
+        && shown.phase == current.phase
+        && shown.active_confirmation().is_some_and(|shown| {
+            current.active_confirmation().is_some_and(|current| {
+                shown.nonce == current.nonce && confirmation::now_ms() < current.expires_at_unix_ms
+            })
+        })
+}
 impl Write for NativeTerminalReview {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         io::stderr().lock().write(bytes)
@@ -775,13 +992,65 @@ impl TerminalReview for NativeTerminalReview {
         status()
     }
     fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError> {
-        decide(job, nonce, choice)
+        confirmation::answer_prompt(job, nonce, choice)
     }
     fn cancel(&mut self, job: &str) -> Result<bool, UpdateError> {
         confirmation::cancel(job)
     }
     fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
         cancellation::read_line(answer)
+    }
+    fn read_review_line(
+        &mut self,
+        answer: &mut String,
+        shown: &UpdateJob,
+        deadline: Instant,
+    ) -> io::Result<usize> {
+        use progress::TerminalWake;
+        let expires = shown.active_confirmation().map(|confirmation| {
+            Duration::from_millis(
+                confirmation
+                    .expires_at_unix_ms
+                    .saturating_sub(confirmation::now_ms()),
+            )
+        });
+        let deadline = expires
+            .and_then(|expires| Instant::now().checked_add(expires))
+            .map_or(deadline, |expires| deadline.min(expires));
+        cancellation::read_line_with(answer, |input| {
+            let changed = || io::Error::other(PromptChanged);
+            let current = || -> io::Result<bool> {
+                Ok(Instant::now() < deadline
+                    && status()
+                        .map_err(io::Error::other)?
+                        .as_ref()
+                        .is_some_and(|current| same_terminal_prompt(shown, current)))
+            };
+            let wake_at = self.progress.as_ref().map_or_else(
+                || deadline.min(Instant::now() + Duration::from_millis(250)),
+                |_| deadline,
+            );
+            let ready = match progress::TerminalChanges::wait_with_input(
+                self.progress.as_ref(),
+                Some(input),
+                Some(wake_at),
+            ) {
+                TerminalWake::Input => true,
+                TerminalWake::Unavailable => {
+                    self.progress = None;
+                    false
+                }
+                TerminalWake::Changed | TerminalWake::Deadline => false,
+            };
+            if cancellation::requested() {
+                return Err(changed());
+            }
+            if !current()? {
+                cancellation::discard_terminal_input(input)?;
+                return Err(changed());
+            }
+            Ok(ready)
+        })
     }
     fn is_terminal(&self) -> bool {
         use std::io::IsTerminal;
@@ -798,6 +1067,65 @@ impl TerminalReview for NativeTerminalReview {
             Err(error) => Err(error),
         }
     }
+    fn pause(&mut self, deadline: Instant) {
+        if let Some(progress) = &self.progress {
+            if progress.wait(deadline) == progress::TerminalWake::Unavailable {
+                self.progress = None;
+            }
+        } else {
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+/// What a terminal says as an idle wait progresses: the conversations it
+/// waits for when it starts, then each one as it becomes idle and how many
+/// remain, so a long wait shows it is still moving and on what.
+fn idle_wait_progress(
+    previous: Option<&Vec<(crate::model::TerminalId, String)>>,
+    current: &[(crate::model::TerminalId, String)],
+) -> Option<String> {
+    let names = |items: &[(crate::model::TerminalId, String)]| {
+        items
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
+    let Some(previous) = previous.filter(|previous| !previous.is_empty()) else {
+        return (!current.is_empty()).then(|| {
+            format!(
+                "Waiting for these conversations to finish their current work:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.\n",
+                names(current)
+            )
+        });
+    };
+    let held = |items: &[(crate::model::TerminalId, String)], id| {
+        items.iter().any(|(other, _)| *other == id)
+    };
+    let mut progress = String::new();
+    for (id, name) in previous {
+        if !held(current, *id) {
+            progress.push_str(&format!("{name} is idle.\n"));
+        }
+    }
+    let joined: Vec<_> = current
+        .iter()
+        .filter(|(id, _)| !held(previous, *id))
+        .cloned()
+        .collect();
+    if !joined.is_empty() {
+        progress.push_str(&format!("Also waiting for:\n  {}\n", names(&joined)));
+    }
+    if progress.is_empty() {
+        return None;
+    }
+    match current.len() {
+        0 => {}
+        1 => progress.push_str(&format!("Still waiting for {}.\n", current[0].1)),
+        count => progress.push_str(&format!("Still waiting for {count} conversations.\n")),
+    }
+    Some(progress)
 }
 
 fn drive_terminal_review_with(
@@ -806,14 +1134,9 @@ fn drive_terminal_review_with(
     interrupt: bool,
     terminal: &mut impl TerminalReview,
 ) -> Result<UpdateJob, UpdateError> {
-    let mut policy = if interrupt {
-        impact::Policy::Interrupt
-    } else {
-        impact::Policy::WhenIdle
-    };
+    let mut choose_interrupt = interrupt;
     let mut submitted = std::collections::BTreeSet::new();
     let mut waiting = None;
-    let mut policy_requested = None;
     let mut reviewed = None;
     // The review the person confirmed. A renewal it still covers, by the same
     // rule the worker uses to keep an approval, needs no second answer.
@@ -834,7 +1157,7 @@ fn drive_terminal_review_with(
             })?;
         if job.phase.is_terminal() {
             if terminal.worker_running()? {
-                terminal.pause();
+                terminal.pause(deadline);
                 continue;
             }
             // Refresh after proving the worker has settled: the snapshot read
@@ -864,46 +1187,35 @@ fn drive_terminal_review_with(
             }
         } else if let Some(confirmation) = job.active_confirmation() {
             if job.phase == UpdatePhase::WaitingForIdle {
-                let labels: Vec<_> = confirmation
-                    .preview
-                    .daemon
-                    .iter()
-                    .flat_map(|daemon| &daemon.sessions)
-                    .filter(|item| item.disposition == impact::Disposition::WaitsForIdle)
-                    .map(|item| {
-                        confirmation
-                            .preview
-                            .labels
-                            .names
-                            .get(&item.id)
-                            .unwrap_or(&item.title)
-                            .clone()
-                    })
-                    .collect();
-                if !labels.is_empty() && waiting.as_ref() != Some(&labels) {
-                    writeln!(
-                        terminal,
-                        "Waiting for these conversations to finish their current work:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
-                        labels.join("\n  ")
-                    )?;
-                    waiting = Some(labels);
+                choose_interrupt = false;
+                let labels = confirmation.preview.waiting_for_idle();
+                if let Some(progress) = idle_wait_progress(waiting.as_ref(), &labels) {
+                    write!(terminal, "{progress}")?;
                 }
+                waiting = Some(labels);
                 // Approval belongs to this review, even if a worker republishes
                 // it with a fresh nonce during its cancellable idle wait.
                 submitted.insert(confirmation.nonce.clone());
             }
-            if confirmation.stop.is_none()
-                && confirmation
-                    .preview
-                    .daemon
-                    .as_ref()
-                    .is_some_and(|daemon| daemon.policy != policy)
+            if choose_interrupt
+                && confirmation.stop.is_none()
+                && let Some(daemon) = &confirmation.preview.daemon
             {
-                if policy_requested.as_ref() != Some(&confirmation.nonce) {
-                    terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
-                    policy_requested = Some(confirmation.nonce.clone());
+                choose_interrupt = false;
+                if daemon.policy != impact::Policy::Interrupt {
+                    submit_current_choice(
+                        terminal,
+                        &job.id,
+                        &confirmation.nonce,
+                        UpdateChoice::Policy(impact::Policy::Interrupt),
+                    )?;
+                    submitted.insert(confirmation.nonce.clone());
+                    continue;
                 }
-            } else if !submitted.contains(&confirmation.nonce) {
+            }
+            if !submitted.contains(&confirmation.nonce)
+                && confirmation::now_ms() < confirmation.expires_at_unix_ms
+            {
                 if let Some(list) = &confirmation.stop {
                     write!(
                         terminal,
@@ -922,7 +1234,7 @@ fn drive_terminal_review_with(
                     }
                     let is_terminal = terminal.is_terminal();
                     let choice = match floor_display::read_stop_choice_from(
-                        |answer| terminal.read_line(answer),
+                        |answer| terminal.read_review_line(answer, &job, deadline),
                         is_terminal,
                         list,
                     ) {
@@ -934,16 +1246,20 @@ fn drive_terminal_review_with(
                                 }
                                 continue;
                             }
-                            let _ = terminal.cancel(&job.id);
+                            if prompt_changed(&error) {
+                                continue;
+                            }
                             return Err(error.into());
                         }
                     };
-                    if !submit_current_choice(
+                    let accepted = submit_current_choice(
                         terminal,
                         &job.id,
                         &confirmation.nonce,
                         choice.clone(),
-                    )? {
+                    )?;
+                    submitted.insert(confirmation.nonce.clone());
+                    if !accepted {
                         // Live work changed while the person was reading or
                         // typing. Reload and display its new list in this CLI.
                         continue;
@@ -951,21 +1267,19 @@ fn drive_terminal_review_with(
                     if matches!(choice, UpdateChoice::Cancel) {
                         return Err(confirmation::closed(&confirmation.preview));
                     }
-                    submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
                 if confirmed
                     .as_ref()
                     .is_some_and(|approved| approved.preserves_consent(&confirmation.preview))
                 {
-                    if submit_current_choice(
+                    submit_current_choice(
                         terminal,
                         &job.id,
                         &confirmation.nonce,
                         UpdateChoice::Confirm,
-                    )? {
-                        submitted.insert(confirmation.nonce.clone());
-                    }
+                    )?;
+                    submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
                 write!(
@@ -995,7 +1309,7 @@ fn drive_terminal_review_with(
                 } else if let Some(choice) = ordinary_approval(yes, terminal.is_terminal()) {
                     choice
                 } else {
-                    match prompt_review(terminal, &confirmation.preview) {
+                    match prompt_review(terminal, &job, deadline) {
                         Ok(choice) => choice,
                         Err(error) => {
                             if terminal.interrupted() {
@@ -1004,56 +1318,58 @@ fn drive_terminal_review_with(
                                 }
                                 continue;
                             }
-                            // A failed read is not the person's answer, so
-                            // it ends the update as the stop list's does.
-                            let _ = terminal.cancel(&job.id);
+                            if prompt_changed(&error) {
+                                continue;
+                            }
                             return Err(error.into());
                         }
                     }
                 };
                 match choice {
                     OrdinaryChoice::Cancel => {
-                        terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
-                        // Says what the worker records for this review.
-                        return Err(confirmation::closed(&confirmation.preview));
-                    }
-                    OrdinaryChoice::InterruptNow => {
-                        confirmed = None;
-                        reviewed = Some(confirmation.preview.clone());
-                        if !submit_current_choice(
-                            terminal,
-                            &job.id,
-                            &confirmation.nonce,
-                            choice.into(),
-                        )? {
-                            continue;
-                        }
-                        reviewed = Some(review::interruption_review(&confirmation.preview));
-                        policy = impact::Policy::Interrupt;
-                        policy_requested = Some(confirmation.nonce.clone());
-                        submitted.insert(confirmation.nonce.clone());
-                    }
-                    OrdinaryChoice::Confirm => {
-                        confirmed = Some(confirmation.preview.clone());
-                        reviewed = Some(confirmation.preview.clone());
                         if submit_current_choice(
                             terminal,
                             &job.id,
                             &confirmation.nonce,
                             choice.into(),
                         )? {
-                            submitted.insert(confirmation.nonce.clone());
+                            return Err(confirmation::closed(&confirmation.preview));
                         }
+                        submitted.insert(confirmation.nonce.clone());
+                    }
+                    OrdinaryChoice::InterruptNow => {
+                        confirmed = None;
+                        reviewed = Some(confirmation.preview.clone());
+                        let accepted = submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )?;
+                        if accepted {
+                            reviewed = Some(review::interruption_review(&confirmation.preview));
+                        }
+                        submitted.insert(confirmation.nonce.clone());
+                    }
+                    OrdinaryChoice::Confirm => {
+                        reviewed = Some(confirmation.preview.clone());
+                        confirmed = Some(confirmation.preview.clone());
+                        submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )?;
+                        submitted.insert(confirmation.nonce.clone());
                     }
                 }
             }
         }
-        terminal.pause();
+        terminal.pause(deadline);
     }
 }
 
-/// A stale nonce means re-display, while a real failure must release prepared
-/// windows through cancellation of the current review.
+/// A concurrent or stale answer leaves the worker's published decision in charge.
 fn submit_current_choice(
     terminal: &mut impl TerminalReview,
     job: &str,
@@ -1062,16 +1378,20 @@ fn submit_current_choice(
 ) -> Result<bool, UpdateError> {
     match terminal.decide(job, nonce, choice) {
         Ok(()) => Ok(true),
+        Err(UpdateError::DecisionExpired | UpdateError::DecisionAlreadySubmitted) => Ok(false),
         Err(error) => {
             if terminal
                 .status()?
                 .filter(|current| current.id == job)
-                .and_then(|current| current.active_confirmation().cloned())
-                .is_some_and(|confirmation| confirmation.nonce != nonce)
+                .is_some_and(|current| {
+                    current.phase != UpdatePhase::AwaitingConfirmation
+                        || current
+                            .active_confirmation()
+                            .is_none_or(|confirmation| confirmation.nonce != nonce)
+                })
             {
                 return Ok(false);
             }
-            let _ = terminal.cancel(job);
             Err(error)
         }
     }
@@ -1114,8 +1434,13 @@ fn review_answer(answer: &str, working: bool) -> Option<OrdinaryChoice> {
 
 fn prompt_review(
     terminal: &mut impl TerminalReview,
-    preview: &impact::Preview,
+    job: &UpdateJob,
+    deadline: Instant,
 ) -> io::Result<OrdinaryChoice> {
+    let preview = &job
+        .active_confirmation()
+        .ok_or_else(|| io::Error::other(PromptChanged))?
+        .preview;
     let working = preview.daemon.as_ref().is_some_and(|daemon| {
         daemon.policy == impact::Policy::WhenIdle
             && daemon
@@ -1131,7 +1456,7 @@ fn prompt_review(
         |prompt, answer| {
             terminal.write_all(prompt.as_bytes())?;
             terminal.flush()?;
-            terminal.read_line(answer)
+            terminal.read_review_line(answer, job, deadline)
         },
         working,
         stops,
@@ -1195,7 +1520,7 @@ fn source_client_for(daemon: &impact::DaemonImpact) -> Result<source::Client, Up
 }
 
 fn running_installation() -> Result<Installation, UpdateError> {
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     if layout.version != crate::version() {
         return Err(unsupported_install());
     }
@@ -1210,9 +1535,24 @@ fn start_job(
     version: &str,
     request: &UpdateRequest,
 ) -> Result<UpdateJob, UpdateError> {
+    #[cfg(target_os = "macos")]
+    let _publication = crate::install_guard::admit_darwin_update_start().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            UpdateError::Busy
+        } else {
+            error.into()
+        }
+    })?;
     recovery::inspect_pending_current()?;
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
+    #[cfg(target_os = "macos")]
+    if let Some(previous) = cutover::read_job(&state)? {
+        let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+        if cutover::pending_selected(&layout, &state, &previous)? {
+            return Err(UpdateError::Busy);
+        }
+    }
     retention::before_start(&state);
     let id = uuid::Uuid::new_v4().to_string();
     let job = UpdateJob {
@@ -1284,7 +1624,7 @@ fn start_job(
 
 /// Returns the latest operation, including retained failure diagnostics.
 pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
-    let executable = std::env::current_exe()?;
+    let executable = crate::process::current_executable()?;
     if executable
         .parent()
         .and_then(Path::parent)
@@ -1305,6 +1645,16 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
         Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(target_os = "macos")]
+    if job.phase == UpdatePhase::Failed {
+        let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+        if cutover::pending_selected(&layout, &state, &job)? {
+            job.phase = UpdatePhase::Installing;
+            job.message = "Finishing the update".into();
+            job.refusal = None;
+            return Ok(Some(job));
+        }
+    }
     if !job.phase.is_terminal() {
         match acquire_lock(&state) {
             Ok(_lock) => {
@@ -1315,6 +1665,13 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
                     JOB_STATE_LIMIT,
                 )?)?;
                 if !job.phase.is_terminal() {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+                        if cutover::pending_selected(&layout, &state, &job)? {
+                            return Ok(Some(job));
+                        }
+                    }
                     job.phase = UpdatePhase::Failed;
                     job.confirmation = None;
                     job.message =
@@ -1395,7 +1752,7 @@ enum Reconciled {
 
 #[cfg(feature = "ui")]
 fn reconcile_failure(job: &UpdateJob) -> Result<Reconciled, UpdateError> {
-    let window = locate(&std::env::current_exe()?)?;
+    let window = locate(&crate::process::current_executable()?)?;
     let served = served_version_root(&window)?;
     let daemon = installed_daemon_owner(&window)?;
     if job.version == window.version {
@@ -1688,7 +2045,7 @@ fn completed_presentation(mut job: UpdateJob) -> UpdateJob {
 /// `protocol_check_could_have_failed_it`, for the build serving now, whose
 /// receipt shows `proof` serving. Whether `proof` is the daemon serving now
 /// is the caller's to establish. Returns whether the job is now complete.
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(feature = "ui")]
 fn settle_as_completed(
     state: &Path,
     judged: &UpdateJob,
@@ -1699,6 +2056,15 @@ fn settle_as_completed(
         Err(UpdateError::Busy) => return Ok(false),
         lock => lock?,
     };
+    settle_under_worker_lease(state, judged, proof)
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+fn settle_under_worker_lease(
+    state: &Path,
+    judged: &UpdateJob,
+    proof: &crate::model::HostSessionProof,
+) -> Result<bool, UpdateError> {
     let current: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
     if current.id != judged.id
@@ -1736,11 +2102,6 @@ fn settle_as_completed(
     Ok(true)
 }
 
-/// How long a daemon of an update's target waits for the worker that
-/// installed it to finish, before leaving its failure to a window.
-#[cfg(feature = "host")]
-const SUCCESSOR_SETTLE_PATIENCE: Duration = Duration::from_secs(30 * 60);
-
 /// Run once by a daemon that has finished starting, serving as `serving`.
 ///
 /// A 0.2.3 worker records its update failed after this build already took
@@ -1750,8 +2111,12 @@ const SUCCESSOR_SETTLE_PATIENCE: Duration = Duration::from_secs(30 * 60);
 /// the worker's own verifier receipt names this daemon serving, it settles the
 /// job complete. Anything else leaves the record as it is.
 #[cfg(feature = "host")]
-pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
-    let Ok(executable) = std::env::current_exe() else {
+pub fn settle_as_successor(
+    serving: crate::model::HostSessionProof,
+    #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
+    #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory + Send + 'static,
+) {
+    let Ok(executable) = crate::process::current_executable() else {
         return;
     };
     let Ok(layout) = locate(&executable) else {
@@ -1762,76 +2127,69 @@ pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
     if !state.is_dir() {
         return;
     }
-    let spawned = thread::Builder::new()
-        .name("update-settle".into())
-        .spawn(move || {
-            let deadline = Instant::now() + SUCCESSOR_SETTLE_PATIENCE;
-            loop {
-                match successor_settle_step(&layout, &state, &serving) {
-                    Ok(SettleStep::Wait) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(500));
-                    }
-                    Ok(SettleStep::Settled(job)) => {
-                        tracing::info!(job, "settled an older worker's update failure as complete");
-                        return;
-                    }
-                    Ok(_) => return,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not settle the last update's record");
-                        return;
-                    }
+    let spawned =
+        thread::Builder::new().name("update-settle".into()).spawn(
+            move || match settle_after_worker(
+                &layout,
+                &state,
+                &serving,
+                #[cfg(target_os = "macos")]
+                entry_checkpoint,
+                #[cfg(target_os = "macos")]
+                observe_live,
+            ) {
+                Ok(Some(job)) => {
+                    tracing::info!(
+                        job,
+                        "completed the installed update after the worker exited"
+                    );
                 }
-            }
-        });
+                Ok(None) => (),
+                Err(error) => tracing::warn!(%error, "could not settle the last update's record"),
+            },
+        );
     if let Err(error) = spawned {
         tracing::warn!(%error, "could not watch the last update's record");
     }
 }
 
 #[cfg(feature = "host")]
-#[derive(Debug, PartialEq, Eq)]
-enum SettleStep {
-    /// The worker is still running; look again.
-    Wait,
-    /// Nothing here for this daemon to settle.
-    Done,
-    Settled(String),
-}
-
-#[cfg(feature = "host")]
-fn successor_settle_step(
+fn settle_after_worker(
     layout: &InstallLayout,
     state: &Path,
     serving: &crate::model::HostSessionProof,
-) -> Result<SettleStep, UpdateError> {
-    // The lease first: a receipt read once its worker has gone is its last.
-    let worker_running = match acquire_lock(state) {
-        Ok(_lease) => false,
-        Err(UpdateError::Busy) => true,
-        Err(error) => return Err(error),
-    };
-    if worker_running {
-        return Ok(SettleStep::Wait);
-    }
+    #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
+    #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory,
+) -> Result<Option<String>, UpdateError> {
+    // The kernel wakes this thread when the original worker releases the
+    // lease, including on process exit. Keep it through the verdict so a new
+    // job cannot change status between reading and recording the outcome.
+    let file = open_worker_lock(state)?;
+    let _lease = crate::instance::owned_file_lock(file, libc::LOCK_EX)?;
     let job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(SettleStep::Done);
-        }
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(target_os = "macos")]
+    if let Some(completed) = cutover::finish(
+        layout,
+        state,
+        serving,
+        job.clone(),
+        entry_checkpoint,
+        observe_live,
+    )? {
+        return Ok(Some(completed));
+    }
     if job.phase != UpdatePhase::Failed
         || job.version != layout.version
         || !protocol_check_could_have_failed_it(&job)
         || served_version_root(layout)? != layout.version_root
     {
-        return Ok(SettleStep::Done);
+        return Ok(None);
     }
-    Ok(if settle_as_completed(state, &job, serving)? {
-        SettleStep::Settled(job.id)
-    } else {
-        SettleStep::Done
-    })
+    Ok(settle_under_worker_lease(state, &job, serving)?.then_some(job.id))
 }
 
 #[cfg(any(feature = "ui", test))]
@@ -1895,7 +2253,7 @@ fn failed_job_reached_its_target(
 /// `+local` builds a developer installs, since nothing here is downloaded: the
 /// bytes are already installed under a privately owned root.
 pub fn superseding_ui() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
+    let executable = crate::process::current_executable().ok()?;
     if let Some(replacement) = superseding_ui_from(&executable) {
         return Some(replacement);
     }
@@ -1911,7 +2269,7 @@ pub fn superseding_ui() -> Option<PathBuf> {
 /// install can leave it behind, so the only process [`superseding_ui`] can
 /// ever find a replacement for. A source build never is one.
 pub fn runs_from_installation() -> bool {
-    std::env::current_exe().is_ok_and(|executable| locate(&executable).is_ok())
+    crate::process::current_executable().is_ok_and(|executable| locate(&executable).is_ok())
 }
 
 fn daemon_protocol_mismatch() -> bool {
@@ -1995,7 +2353,7 @@ pub fn restart_windows(instance: &str) -> Result<(), UpdateError> {
             crate::instance::NAME
         )));
     }
-    let layout = locate(&std::env::current_exe()?)?;
+    let layout = locate(&crate::process::current_executable()?)?;
     if served_version_root(&layout)? != layout.version_root {
         return Err(invalid(
             "only the installed version may reopen saved windows",
@@ -2029,7 +2387,8 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     let _lock = inherited_lock(&state)?;
     let mut job: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
-    if job.id != job_id || job.phase != UpdatePhase::Starting {
+    let resume_stage = cfg!(target_os = "macos") && job.phase == UpdatePhase::Verifying;
+    if job.id != job_id || (job.phase != UpdatePhase::Starting && !resume_stage) {
         return Err(invalid("update job is no longer pending"));
     }
     // Reserve startup until readiness or a recorded failure. Success closes
@@ -2143,21 +2502,60 @@ fn perform_update(
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
 ) -> Result<Completion, UpdateError> {
-    let request: UpdateRequest = serde_json::from_slice(&read_private(
+    let request_bytes = read_private(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
-    )?)?;
+    )?;
+    let request: UpdateRequest = serde_json::from_slice(&request_bytes)?;
+    #[cfg(target_os = "macos")]
+    let request_digest: [u8; 32] = Sha256::digest(&request_bytes).into();
     let terminal = matches!(request, UpdateRequest::ReleaseFromTerminal(_));
+    #[cfg(target_os = "macos")]
+    if job.phase == UpdatePhase::Verifying {
+        let (UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release)) =
+            &request
+        else {
+            return Err(invalid(
+                "Only a verified release can transfer its update worker",
+            ));
+        };
+        let candidate = release_stage::resume(installation, state, job, release, &request_digest)?;
+        return installed::perform(
+            installation,
+            state,
+            job,
+            installed::Candidate::Release(&candidate),
+            handoff,
+            survivors,
+            terminal,
+        );
+    }
     let selected = match request {
         UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
             Installation::detect()?;
             release
         }
         UpdateRequest::Installed { root } => {
-            return installed::perform(installation, state, job, &root, handoff, survivors, false);
+            return installed::perform(
+                installation,
+                state,
+                job,
+                installed::Candidate::Local(&root),
+                handoff,
+                survivors,
+                false,
+            );
         }
         UpdateRequest::InstalledFromTerminal { root } => {
-            return installed::perform(installation, state, job, &root, handoff, survivors, true);
+            return installed::perform(
+                installation,
+                state,
+                job,
+                installed::Candidate::Local(&root),
+                handoff,
+                survivors,
+                true,
+            );
         }
     };
     let cancellation = CancellationToken::for_job(state, &job.id)?;
@@ -2174,29 +2572,31 @@ fn perform_update(
         UpdatePhase::Downloading,
         "Downloading the release",
     )?;
-    // The signed metadata names every digest. The checksum file the installer
-    // reads again must agree with it, or the two would vouch for different
-    // bytes.
-    let mut checksums = feed.download(&release, &release.checksums, &cancellation)?;
-    let mut manifest = String::new();
-    checksums.read_to_string(&mut manifest)?;
-    checksums.seek(SeekFrom::Start(0))?;
-    let archive_hash = release.archive.sha256;
-    if checksum_for(&manifest, &release.archive.name)? != archive_hash
-        || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
-    {
-        return Err(invalid(
-            "the release's checksum file disagrees with its signed metadata",
-        ));
-    }
-    let installer = feed.download(&release, &release.installer, &cancellation)?;
-    let archive = feed.download(&release, &release.archive, &cancellation)?;
+    let assets = feed.verified_assets(&release, &cancellation)?;
     set_phase(
         state,
         job,
         UpdatePhase::Verifying,
         "Verifying the downloaded release",
     )?;
+    #[cfg(target_os = "macos")]
+    if cfg!(target_os = "macos") {
+        return release_stage::extract_and_exec(
+            installation,
+            state,
+            job,
+            &release,
+            request_digest,
+            &assets,
+            &cancellation,
+        );
+    }
+    let feed::VerifiedAssets {
+        installer,
+        archive,
+        checksums,
+    } = assets;
+    let archive_hash = release.archive.sha256;
     let daemon_digest = archive_daemon_digest(&release, &archive, &cancellation)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
@@ -2204,7 +2604,7 @@ fn perform_update(
         staged.verify_compatible_handshake(&cancellation)?;
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
-    let context = ReviewContext::capture(installation)?;
+    let context = ReviewContext::capture(&installation.version)?;
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
         Installation::detect()?;
@@ -2230,7 +2630,7 @@ fn perform_update(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
-    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    guard.prepare_windows(Duration::from_secs(45))?;
     // The build these windows run, to return to if the new one cannot open.
     let previous = installation.prefix.join("current").canonicalize()?;
     // The daemon serving these windows; one still serving after the install
@@ -2295,7 +2695,7 @@ fn perform_update(
             |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
             handoff,
             survivors,
-            &guard,
+            &mut guard,
         )?;
         let target_daemon = installation
             .prefix
@@ -2310,7 +2710,7 @@ fn perform_update(
             )?;
         }
         confirmation::prepared(state, job)?;
-        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
+        guard.close_remaining_prepared_windows(Duration::from_secs(45))?;
         Installation::detect()?;
         set_phase(
             state,
@@ -2385,7 +2785,7 @@ fn perform_update(
         &recovery,
         state,
         job,
-        install_result.is_ok().then_some(&*survivors),
+        install_result.is_ok().then_some(survivors),
     )?;
     let (new, old) = (&release.version, &installation.version);
     match restored {
@@ -2497,7 +2897,7 @@ fn verify_reopened_service(
     recovery: &recovery::Context,
     state: &Path,
     job: &mut UpdateJob,
-    successor: Option<&floor::Survivors>,
+    successor: Option<&mut floor::Survivors>,
 ) -> Result<Handoff, UpdateError> {
     let census = recovery
         .census
@@ -2523,10 +2923,11 @@ fn verify_reopened_service(
     if matches!(receipt.outcome, recovery::Outcome::NoSource) {
         Ok(Handoff::NoDaemon)
     } else if receipt.usable() {
-        if let Some(successor) = successor
-            && let Err(error) = successor.confirm_successor(&receipt)
-        {
-            return report_recovery_failure(state, job, error);
+        if let Some(successor) = successor {
+            if let Err(error) = successor.confirm_successor(&receipt) {
+                return report_recovery_failure(state, job, error);
+            }
+            successor.record_verified_pauses(&receipt.outcome, |id| census.has_recorded_chat(*id));
         }
         Ok(Handoff::Served)
     } else {
@@ -2540,10 +2941,10 @@ struct ReviewContext {
 }
 
 impl ReviewContext {
-    fn capture(installation: &Installation) -> Result<Self, UpdateError> {
+    fn capture(selected_version: &str) -> Result<Self, UpdateError> {
         let guard = crate::instance::UiUpdateGuard::acquire()?;
         let windows = guard.verified_windows()?;
-        let layout = locate(&std::env::current_exe()?)?;
+        let layout = locate(&crate::process::current_executable()?)?;
         let from_version = installed_daemon_owner(&layout)?
             .map(|owner| owner.version)
             .or_else(|| {
@@ -2551,7 +2952,7 @@ impl ReviewContext {
                     .first()
                     .and_then(|window| locate(&window.executable).ok().map(|layout| layout.version))
             })
-            .unwrap_or_else(|| installation.version.clone());
+            .unwrap_or_else(|| selected_version.to_owned());
         Ok(Self {
             from_version,
             windows: windows.len(),
@@ -2598,7 +2999,7 @@ fn inspect_source_panes_mode(
     reconcile_retained: bool,
 ) -> Result<source_inspection::SourceInspection, UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
-    let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
+    let helper = crate::companion::Product::Daemon.beside(&crate::process::current_executable()?)?;
     let before = fs::symlink_metadata(&helper)?;
     if !before.is_file()
         || !crate::install_guard::trusted_executable_owner(before.uid())
@@ -2665,18 +3066,14 @@ pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> 
 
 const CEDITOR_COMPANION: &str = "Ceditor's companion";
 
-fn owned_cli_protocol(
+pub(crate) fn owned_cli_protocol(
     executable: &Path,
     subject: &str,
     operation: &'static str,
 ) -> Result<u16, UpdateError> {
-    let envelope = companion_read(
-        executable,
-        &["--json", "daemon", "protocol-version"],
-        None,
-        subject,
-        operation,
-    )?;
+    let mut command = Command::new(executable);
+    command.args(["--json", "daemon", "protocol-version"]);
+    let envelope = companion_read(command, subject, operation, &CancellationToken::new(), None)?;
     envelope
         .get("data")
         .and_then(|data| data.get("protocol_version"))
@@ -2696,12 +3093,16 @@ pub(crate) fn companion_identity(
         "cagents-namespace-inspect-{}",
         uuid::Uuid::new_v4()
     ));
+    let mut command = Command::new(executable);
+    command
+        .args(["--json", "daemon", "status"])
+        .env("XDG_RUNTIME_DIR", isolated);
     let envelope = companion_read(
-        executable,
-        &["--json", "daemon", "status"],
-        Some(&isolated),
+        command,
         CEDITOR_COMPANION,
         "editor companion instance check",
+        &CancellationToken::new(),
+        None,
     )?;
     match envelope
         .get("data")
@@ -2724,46 +3125,48 @@ pub(crate) fn companion_identity(
 }
 
 fn companion_read(
-    executable: &Path,
-    arguments: &[&str],
-    runtime: Option<&Path>,
+    mut command: Command,
     subject: &str,
     operation: &'static str,
+    cancellation: &CancellationToken,
+    expected: Option<&fs::Metadata>,
 ) -> Result<serde_json::Value, UpdateError> {
-    let before = fs::symlink_metadata(executable)?;
+    let before = fs::symlink_metadata(command.get_program())?;
     if !before.is_file()
         || !crate::install_guard::trusted_executable_owner(before.uid())
         || before.mode() & 0o022 != 0
     {
         return Err(invalid(format!("{subject} is not an owned executable")));
     }
-    let mut command = Command::new(executable);
-    crate::install_guard::sanitize_child_environment(&mut command);
-    command.args(arguments);
-    if let Some(runtime) = runtime {
-        command.env("XDG_RUNTIME_DIR", runtime);
+    if expected.is_some_and(|expected| !same_companion_executable(expected, &before)) {
+        return Err(invalid(format!("{subject} changed before preflight")));
     }
+    crate::install_guard::sanitize_child_environment(&mut command);
+    command.env_remove(crate::agent_execution::AUTHORITY_ENV);
     let mut output = bounded_command(
         &mut command,
         operation,
         SMALL_ASSET_LIMIT,
         Duration::from_secs(5),
-        &CancellationToken::new(),
+        cancellation,
     )?;
-    let after = fs::symlink_metadata(executable)?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-        || before.uid() != after.uid()
-        || before.mode() != after.mode()
-    {
+    let after = fs::symlink_metadata(command.get_program())?;
+    if !same_companion_executable(&before, &after) {
         return Err(invalid(format!("{subject} changed during preflight")));
     }
     Ok(serde_json::from_reader(&mut output)?)
+}
+
+fn same_companion_executable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && before.uid() == after.uid()
+        && before.mode() == after.mode()
 }
 
 fn observe_impact(
@@ -3032,7 +3435,7 @@ fn finish_handoff(
     // dead. Preserve any listener rather than starting a competing daemon.
     let socket_has_listener = crate::terminal_ipc::daemon_socket_path()
         .ok()
-        .is_some_and(|p| std::os::unix::net::UnixStream::connect(p).is_ok());
+        .is_some_and(|p| crate::descriptor::connect_settled(p).is_ok());
     if verified.has_listener() || socket_has_listener {
         if let Err(error) = verified.save(&outcome_path) {
             eprintln!("Could not save recovery proof: {error}");
@@ -3427,6 +3830,10 @@ fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
     Ok(())
 }
 fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
+    lock_file(open_worker_lock(state)?)
+}
+
+fn open_worker_lock(state: &Path) -> Result<File, UpdateError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3436,7 +3843,7 @@ fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError>
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(state.join("lock"))?;
     validate_lock(&file)?;
-    lock_file(file)
+    Ok(file)
 }
 
 fn lock_file(file: File) -> Result<crate::instance::OwnedLock, UpdateError> {
@@ -3460,7 +3867,7 @@ fn validate_lock(file: &File) -> Result<(), UpdateError> {
     }
     Ok(())
 }
-fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
+fn inherited_lock(state: &Path) -> Result<File, UpdateError> {
     // SAFETY: F_GETFD probes existence before taking ownership of the reserved fd.
     if unsafe { libc::fcntl(WORKER_LOCK_FD, libc::F_GETFD) } == -1 {
         return Err(invalid(
@@ -3478,7 +3885,9 @@ fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateErro
     if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(lock)
+    // The successor may inherit this same description with the acknowledged
+    // checkpoint. The worker must close its copy without issuing LOCK_UN.
+    Ok(lock.into_file())
 }
 
 /// Stream a subprocess into sealed storage without buffering a release binary
@@ -3490,6 +3899,24 @@ fn bounded_command(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<File, UpdateError> {
+    bounded_command_with_stderr(
+        command,
+        operation,
+        limit,
+        timeout,
+        cancellation,
+        Stdio::null(),
+    )
+}
+
+fn bounded_command_with_stderr(
+    command: &mut Command,
+    operation: &'static str,
+    limit: u64,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    stderr: Stdio,
+) -> Result<File, UpdateError> {
     if cancellation.cancelled() {
         return Err(UpdateError::Cancelled);
     }
@@ -3497,7 +3924,7 @@ fn bounded_command(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0);
     let child = command
         .spawn()
@@ -3545,9 +3972,9 @@ fn bounded_command(
             }
             thread::sleep(Duration::from_millis(20));
         }
-        seal_file(&file)?;
+        let mut file = seal_file(file)?;
         file.seek(SeekFrom::Start(0))?;
-        Ok(())
+        Ok(file)
     })();
     // Keep the original leader unreaped through failed status and sealing/seek
     // errors, since each still needs original-group cleanup. Success preserves
@@ -3559,8 +3986,8 @@ fn bounded_command(
             cleanup,
         }),
         (Err(operation), Ok(())) => Err(operation),
-        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
-        (Ok(()), Ok(())) => Ok(file),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+        (Ok(file), Ok(())) => Ok(file),
     }
 }
 
@@ -3575,13 +4002,7 @@ struct StreamingChild {
 impl StreamingChild {
     fn new(child: std::process::Child) -> io::Result<Self> {
         // Capture before the freshly spawned child can be reaped or handed off.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
-        let identity = if raw < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: successful pidfd_open returns a new owned descriptor.
-            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-        };
+        let identity = crate::process::identity::child_identity(&child);
         Self::with_identity(child, identity)
     }
 
@@ -3625,48 +4046,9 @@ impl StreamingChild {
         })
     }
 
+    /// Only finish omits WNOWAIT, after its last possible group signal.
     fn status(&self, flags: i32) -> io::Result<Option<std::process::ExitStatus>> {
-        use std::os::unix::process::ExitStatusExt;
-        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: the captured original pidfd cannot select a recycled PID.
-            // Only finish omits WNOWAIT, after its last possible group signal.
-            if unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.identity.as_raw_fd() as libc::id_t,
-                    &mut information,
-                    flags,
-                )
-            } == 0
-            {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        let (pid, status) = unsafe { (information.si_pid(), information.si_status()) };
-        if pid == 0 {
-            return Ok(None);
-        }
-        if pid as u32 != self.child.id() {
-            return Err(io::Error::other(
-                "streaming child observation returned another process",
-            ));
-        }
-        let raw = match information.si_code {
-            libc::CLD_EXITED => status << 8,
-            libc::CLD_KILLED => status,
-            libc::CLD_DUMPED => status | 0x80,
-            _ => {
-                return Err(io::Error::other(
-                    "streaming child observation returned an unexpected status",
-                ));
-            }
-        };
-        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+        crate::process::identity::child_exit_status(&self.identity, self.child.id(), flags)
     }
 
     fn observed_exit_status(&self) -> io::Result<Option<std::process::ExitStatus>> {
@@ -3705,6 +4087,13 @@ impl StreamingChild {
         } else {
             Ok(())
         };
+        // Darwin refuses to signal a group whose only member is an exited
+        // leader awaiting its reap, as this one is: nothing is left to kill.
+        #[cfg(target_os = "macos")]
+        let cleanup = match cleanup {
+            Err(error) if observed.is_some() && error.raw_os_error() == Some(libc::EPERM) => Ok(()),
+            cleanup => cleanup,
+        };
         // A failed signal must not leave a known-exited original leader as a
         // zombie. Conversely, a known-live signal-denied child cannot be waited
         // on indefinitely just to report cleanup uncertainty.
@@ -3736,7 +4125,7 @@ impl Drop for StreamingChild {
 
 #[cfg(target_os = "linux")]
 fn anonymous_file() -> io::Result<File> {
-    let name = CString::new("cagents-verified-update").expect("literal has no nul");
+    let name = std::ffi::CString::new("cagents-verified-update").expect("literal has no nul");
     let fd =
         unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd == -1 {
@@ -3744,21 +4133,79 @@ fn anonymous_file() -> io::Result<File> {
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
-#[cfg(not(target_os = "linux"))]
+/// Darwin has no memfd: an unlinked file in the per-user temporary
+/// directory, which no other process can name. Its descriptor closes on exec.
+#[cfg(target_os = "macos")]
 fn anonymous_file() -> io::Result<File> {
-    Err(io::Error::other("self-update requires Linux"))
+    tempfile::tempfile()
 }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn anonymous_file() -> io::Result<File> {
+    Err(io::Error::other("self-update requires Linux or macOS"))
+}
+/// The file `anonymous_file` made, its bytes fixed from here on: every later
+/// write, truncation or resize through the returned file fails.
 #[cfg(target_os = "linux")]
-fn seal_file(file: &File) -> io::Result<()> {
+fn seal_file(file: File) -> io::Result<File> {
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(file)
 }
-#[cfg(not(target_os = "linux"))]
-fn seal_file(_: &File) -> io::Result<()> {
-    Err(io::Error::other("self-update requires Linux"))
+/// Darwin has no seals, and no file flag refuses writes through a descriptor
+/// already open for them. Sealing instead returns a read-only descriptor of
+/// a clone of the bytes written so far, so every later write or truncation
+/// through it fails, as on a sealed memfd. On APFS the clone shares the
+/// file's blocks; elsewhere the bytes are copied. The clone is unlinked at
+/// once and lives only as long as the returned file.
+#[cfg(target_os = "macos")]
+fn seal_file(file: File) -> io::Result<File> {
+    use std::os::unix::fs::FileExt;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("sealed");
+    let parent = File::open(directory.path())?;
+    // SAFETY: both descriptors are open for the call and the name is
+    // NUL-terminated. The clone is created anew, never followed.
+    let cloned =
+        unsafe { libc::fclonefileat(file.as_raw_fd(), parent.as_raw_fd(), c"sealed".as_ptr(), 0) };
+    if cloned == -1 {
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EXDEV)
+        ) {
+            return Err(error);
+        }
+        let mut copy = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&path)?;
+        let mut buffer = vec![0_u8; 1 << 20];
+        let mut offset = 0;
+        loop {
+            match file.read_at(&mut buffer, offset) {
+                Ok(0) => break,
+                Ok(read) => {
+                    copy.write_all(&buffer[..read])?;
+                    offset += read as u64;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    // Opened close-on-exec, as the writable file was.
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&path)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn seal_file(_: File) -> io::Result<File> {
+    Err(io::Error::other("self-update requires Linux or macOS"))
 }
 
 fn checksum_for(manifest: &str, name: &str) -> Result<[u8; 32], UpdateError> {
@@ -3789,6 +4236,8 @@ fn checksum_for(manifest: &str, name: &str) -> Result<[u8; 32], UpdateError> {
     found.ok_or_else(|| invalid(format!("release lacks checksum for {name}")))
 }
 fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -3799,7 +4248,7 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
         }
         hasher.update(&buffer[..length]);
     }
-    if hasher.finalize().as_slice() != expected {
+    if &hasher.finalize()[..] != expected {
         return Err(invalid(
             "release SHA-256 verification failed; installation was not changed",
         ));
@@ -3810,6 +4259,108 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_the_selected_owned_install_uses_the_stable_launch_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().canonicalize().unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for version in ["1.2.3", "1.2.4"] {
+            let bin = prefix.join("versions").join(version).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for binary in ["cagents", "cagentsd", "cagents-ui"] {
+                fs::write(bin.join(binary), "fixture").unwrap();
+            }
+        }
+        std::os::unix::fs::symlink("versions/1.2.3", prefix.join("current")).unwrap();
+        let selected = prefix.join("versions/1.2.3/bin/cagents-ui");
+        let staged = prefix.join("versions/1.2.4/bin/cagents-ui");
+        let cli = prefix.join("versions/1.2.3/bin/cagents");
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
+
+        let bundle = prefix.join("Cagents.app");
+        let launcher = bundle.join("Contents/MacOS/Cagents");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&launcher)
+            .unwrap();
+        assert_eq!(stable_ui_bundle(&selected, &cli).unwrap(), Some(bundle));
+        assert!(stable_ui_bundle(&staged, &cli).unwrap().is_none());
+        assert!(stable_ui_bundle(&selected, &staged).unwrap().is_none());
+
+        // A staged owner can exec a different UI. Keep the direct path whose
+        // stdout handshake can follow that existing transition.
+        let owner = prefix.join("versions/1.2.3/.deferred-owner.json");
+        fs::write(&owner, "existing owner marker").unwrap();
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
+        fs::remove_file(owner).unwrap();
+
+        fs::remove_file(&launcher).unwrap();
+        std::os::unix::fs::symlink(&selected, launcher).unwrap();
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
+    }
+
+    #[test]
+    fn only_macos_sends_updates_to_its_installer() {
+        assert_eq!(
+            installer_updates_only(None).is_err(),
+            cfg!(target_os = "macos")
+        );
+        // Each command ends the text, so copying it takes nothing else.
+        assert!(installer_updates(Some("0.2.5")).ends_with(
+            "\n\ncurl -fsSL https://github.com/CarsonBurke/cagents/releases/download/v0.2.5/install-macos.sh | sh -s -- --version 0.2.5"
+        ));
+        assert!(installer_updates(None).ends_with(
+            "\n\ncurl -fsSL https://github.com/CarsonBurke/cagents/releases/latest/download/install-macos.sh | sh"
+        ));
+    }
+
+    #[test]
+    fn an_idle_wait_names_each_conversation_as_it_becomes_idle() {
+        use crate::model::TerminalId;
+        let [lead, review, build] = [(); 3].map(|()| TerminalId::new());
+        let named = |items: &[(TerminalId, &str)]| {
+            items
+                .iter()
+                .map(|(id, name)| (*id, (*name).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let all = named(&[(lead, "lead"), (review, "review"), (build, "build")]);
+        let started = idle_wait_progress(None, &all).unwrap();
+        assert!(started.starts_with(
+            "Waiting for these conversations to finish their current work:\n  lead\n  review\n  build\n"
+        ));
+        assert!(started.contains("Ctrl-C cancels the update"));
+        // An unchanged list says nothing more.
+        assert_eq!(idle_wait_progress(Some(&all), &all), None);
+        let two = named(&[(lead, "lead"), (build, "build")]);
+        assert_eq!(
+            idle_wait_progress(Some(&all), &two).unwrap(),
+            "review is idle.\nStill waiting for 2 conversations.\n"
+        );
+        let one = named(&[(lead, "lead")]);
+        assert_eq!(
+            idle_wait_progress(Some(&two), &one).unwrap(),
+            "build is idle.\nStill waiting for lead.\n"
+        );
+        let joined = named(&[(lead, "lead"), (review, "review")]);
+        assert_eq!(
+            idle_wait_progress(Some(&one), &joined).unwrap(),
+            "Also waiting for:\n  review\nStill waiting for 2 conversations.\n"
+        );
+        assert_eq!(
+            idle_wait_progress(Some(&one), &[]).unwrap(),
+            "lead is idle.\n"
+        );
+    }
+
     #[test]
     fn only_an_update_that_kept_the_daemon_puts_the_previous_build_back() {
         // A daemon kept by earlier updates still runs from its own version.
@@ -3830,6 +4381,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn recovery_installer_shell_requires_high_descriptor_support_before_shutdown() {
         preflight_recovery_shell(Path::new("/bin/bash")).unwrap();
         for shell in ["/bin/false", "/missing-cagents-recovery-shell"] {
@@ -3841,6 +4396,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn replacement_requires_retained_candidate_support_before_shutdown() {
         let root = tempfile::tempdir().unwrap();
         let installer = root.path().join("install.sh");
@@ -3929,6 +4488,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn recovery_daemon_digest_uses_the_exact_verified_archive_member() {
         let directory = tempfile::tempdir().unwrap();
         let release = release("9.8.7");
@@ -3994,6 +4557,7 @@ mod tests {
         assert!(review_answer("maybe", true).is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_lock_distinguishes_contention_from_a_descriptor_error() {
         let directory = tempfile::tempdir().unwrap();
@@ -4024,6 +4588,51 @@ mod tests {
         drop(held);
     }
 
+    #[test]
+    fn inherited_update_worker_lock_survives_worker_scope_exit() {
+        const STATE: &str = "CAGENTS_TEST_INHERITED_UPDATE_WORKER_STATE";
+        if let Some(state) = std::env::var_os(STATE) {
+            io::stdin().read_exact(&mut [0]).unwrap();
+            let state = Path::new(&state);
+            let worker = inherited_lock(state).unwrap();
+            let successor = worker.try_clone().unwrap();
+            drop(worker);
+            assert!(matches!(acquire_lock(state), Err(UpdateError::Busy)));
+            drop(successor);
+            assert!(acquire_lock(state).is_ok());
+            return;
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let lease = acquire_lock(state.path()).unwrap();
+        let fd = lease.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "update::tests::inherited_update_worker_lock_survives_worker_scope_exit",
+            ])
+            .env(STATE, state.path())
+            .stdin(Stdio::piped());
+        // SAFETY: The caller keeps the descriptor alive through spawn and the
+        // hook only makes it available in the child's reserved slot.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, WORKER_LOCK_FD) == -1
+                    || libc::fcntl(WORKER_LOCK_FD, libc::F_SETFD, 0) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(lease.into_file());
+        child.stdin.take().unwrap().write_all(&[0]).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {
         let child = Command::new("/bin/sleep")
@@ -4061,6 +4670,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
+    )]
     fn bounded_stream_preserves_success_and_size_failure() {
         let mut file = bounded_command(
             Command::new("/bin/sh").args(["-c", "printf fixture"]),
@@ -4088,6 +4701,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
+    )]
     fn bounded_stream_keeps_live_timeout_and_cancellation_cleanup() {
         // The children outlive the test's wait, so a command that waited for
         // them instead of its timeout or cancellation never returns.
@@ -4121,6 +4738,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
+    )]
     fn streaming_child_observation_keeps_leader_until_final_cleanup() {
         let child = Command::new("/bin/sh")
             .args(["-c", "exit 7"])
@@ -4145,9 +4766,10 @@ mod tests {
         assert!(child.finish(true).is_ok(), "completion remains disarmed");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn streaming_signal_error_reaps_exited_leader_and_refuses_live_wait() {
-        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let child = Command::new("true").process_group(0).spawn().unwrap();
         let mut child = StreamingChild::new(child).unwrap();
         crate::test_timing::eventually("the child's exit", || {
             child.observed_exit_status().unwrap().is_some()
@@ -4231,6 +4853,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bounded_failed_stream_cleans_owned_descendants_after_exit() {
         const MARKER: &str = "CAGENTS_UPDATE_DESCENDANT_CHILD";
@@ -4328,6 +4951,7 @@ sys.exit(7)
         println!("owned failed update stream descendant cleaned");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an owned user/PID namespace and namespace-local PID allocation control"]
     fn streaming_child_refuses_a_kernel_reused_original_pid() {
@@ -4373,7 +4997,7 @@ sys.exit(7)
             std::env::var_os(NS).unwrap()
         );
         fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
-        let child = Command::new("/bin/true").process_group(0).spawn().unwrap();
+        let child = Command::new("true").process_group(0).spawn().unwrap();
         assert_eq!(child.id(), 200);
         let mut original = StreamingChild::new(child).unwrap();
         original.child.wait().unwrap(); // Deliberately violate sole-reaper ownership.
@@ -4473,7 +5097,6 @@ sys.exit(7)
             ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
             read_frame, write_frame,
         };
-        use std::os::unix::net::UnixListener;
         let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
         let socket = crate::terminal_ipc::daemon_socket_path().unwrap();
         assert!(
@@ -4510,7 +5133,7 @@ sys.exit(7)
         )
         .unwrap();
         lease.sync_all().unwrap();
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let id = crate::model::TerminalId::new();
         let expected = impact::DaemonImpact {
@@ -4546,7 +5169,7 @@ sys.exit(7)
                     Instant::now() < deadline,
                     "private source fixture did not finish"
                 );
-                let (mut stream, _) = match listener.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&listener) {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         match completion.recv_timeout(Duration::from_millis(10)) {
@@ -4639,6 +5262,10 @@ sys.exit(7)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn installed_entry_admits_supported_sources_and_uses_the_candidate_worker() {
         const CASE: &str = "CAGENTS_TEST_INSTALLED_ENTRY_OWNER";
         let selector = thread::current().name().unwrap().to_owned();
@@ -4943,7 +5570,7 @@ finally:
             fallback_marker.display(),
         )
         .unwrap();
-        seal_file(&candidate_bytes).unwrap();
+        let candidate_bytes = seal_file(candidate_bytes).unwrap();
         let staged = candidate::Staged::from_file(
             candidate_bytes,
             "new".into(),
@@ -5136,10 +5763,14 @@ finally:
     }
 
     #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        ignore = "self-update runs only on Linux and macOS"
+    )]
     fn tampered_bytes_fail_and_verified_bytes_cannot_change() {
         let mut file = anonymous_file().unwrap();
         file.write_all(b"trusted archive").unwrap();
-        seal_file(&file).unwrap();
+        let mut file = seal_file(file).unwrap();
         let trusted: [u8; 32] = Sha256::digest(b"trusted archive").into();
         verify_digest(&mut file, &trusted).unwrap();
         assert!(file.write_all(b"tamper").is_err());
@@ -5208,6 +5839,24 @@ finally:
         )
         .unwrap();
         fs::rename(root.join("current-next"), root.join("current")).unwrap();
+    }
+
+    #[test]
+    fn only_macos_offers_a_newer_version_it_retains() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // Installed 0.1.4, then rolled back to 0.1.3.
+        install_tree(root, &["0.1.3", "0.1.4"], "0.1.3");
+        let installation = Installation {
+            prefix: root.to_path_buf(),
+            version: "0.1.3".into(),
+        };
+        assert_eq!(
+            offers_release(&installation, "0.1.4").unwrap(),
+            cfg!(target_os = "macos")
+        );
+        assert!(offers_release(&installation, "0.1.5").unwrap());
+        assert!(!offers_release(&installation, "0.1.3").unwrap());
     }
 
     #[test]
@@ -5620,7 +6269,7 @@ finally:
                     .unwrap(),
             )
             .unwrap();
-            let socket = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let socket = crate::descriptor::bind(&paths.socket).unwrap();
             socket.set_nonblocking(true).unwrap();
             fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600)).unwrap();
             fs::write(root.join("daemon-ready"), b"listener").unwrap();
@@ -5629,7 +6278,7 @@ finally:
                 ServerResponse, StartupState, read_frame, write_frame,
             };
             while !root.join("daemon-exit").exists() {
-                let (mut stream, _) = match socket.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&socket) {
                     Ok(c) => c,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -5699,7 +6348,8 @@ finally:
             return;
         }
         let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        // Recovery commands name the candidate by its physical install path.
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let paths = RuntimePaths::discover().unwrap();
         let proof = crate::model::HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("headless-recovery"),
@@ -6106,7 +6756,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 // This fixture itself runs outside an installation. The public
                 // entry cannot guess a target from its supplied UI path; the
                 // managed old UI/CLI routes are exercised above.
-                apply_installed_from(&root.path().join("versions/new/bin/cagents-ui"), true),
+                apply_installed(&root.path().join("versions/new/bin/cagents-ui")),
                 Err(UpdateError::Invalid(_))
             ));
             let original = recovery::census_path(root.path(), &job.id);
@@ -6274,24 +6924,14 @@ sys.stdin.buffer.read(1)
         let leaked_pid: u32 = ready.trim().parse().unwrap();
         let source = HandoffSource::pin(&paths, &proof).unwrap();
         // Pin the deliberate leak before allowing the original daemon to exit.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, leaked_pid, 0) };
-        assert!(fd >= 0);
-        struct Leak(File);
+        struct Leak(crate::pinned_process::PinnedProcess);
         impl Drop for Leak {
             fn drop(&mut self) {
-                // SAFETY: the exact fixture process is pinned, never looked up again.
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        self.0.as_raw_fd(),
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0,
-                    );
-                }
+                // The exact fixture process is pinned, never looked up again.
+                let _ = self.0.signal(libc::SIGKILL);
             }
         }
-        let leak = Leak(unsafe { File::from_raw_fd(fd as i32) });
+        let leak = Leak(crate::pinned_process::PinnedProcess::open(leaked_pid).unwrap());
         daemon.stdin.take().unwrap().write_all(b"x").unwrap();
         assert!(daemon.wait().unwrap().success());
         let state = root.path().to_owned();
@@ -6452,7 +7092,7 @@ sys.stdin.buffer.read(1)
             fn worker_running(&mut self) -> Result<bool, UpdateError> {
                 Ok(true)
             }
-            fn pause(&mut self) {}
+            fn pause(&mut self, _deadline: Instant) {}
         }
         let preview = impact::tests::blocked_preview();
         let job = UpdateJob {
@@ -6544,7 +7184,7 @@ sys.stdin.buffer.read(1)
                 self.worker_checks += 1;
                 Ok(!self.recovery_finished)
             }
-            fn pause(&mut self) {
+            fn pause(&mut self, _deadline: Instant) {
                 self.pauses += 1;
                 assert_eq!(self.pauses, 1, "the settled failure must return promptly");
                 self.recovery_finished = true;
@@ -7080,39 +7720,55 @@ mod reconciliation_tests {
         };
         write(recovery::outcome_path(&state, JOB), "pending.json");
 
-        // The old worker installed this daemon and is still running.
-        let worker = acquire_lock(&state).unwrap();
-        let step = || successor_settle_step(&layout, &state, &serving).unwrap();
-        assert_eq!(step(), SettleStep::Wait);
+        let step = || settle_after_worker(&layout, &state, &serving).unwrap();
         job.phase = UpdatePhase::Failed;
         job.message =
             "The confirmed successor does not serve this update's matched protocol".into();
         write_job(&state, &job).unwrap();
-        assert_eq!(step(), SettleStep::Wait);
-        drop(worker);
 
-        // It left its placeholder: nothing proved the service.
-        assert_eq!(step(), SettleStep::Done);
+        // The older worker left its placeholder: nothing proved the service.
+        assert_eq!(step(), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // Its receipt names a daemon that has since restarted.
         write(recovery::outcome_path(&state, JOB), "recovery.json");
         let mut restarted = serving.clone();
         restarted.host_incarnation = crate::model::HostIncarnation::new("restarted");
         assert_eq!(
-            successor_settle_step(&layout, &state, &restarted).unwrap(),
-            SettleStep::Done
+            settle_after_worker(&layout, &state, &restarted).unwrap(),
+            None
         );
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // A worker that records its release reports its own verdict.
         job.recorded_by = Some("0.2.4".into());
         write_job(&state, &job).unwrap();
-        assert_eq!(step(), SettleStep::Done);
+        assert_eq!(step(), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         job.recorded_by = None;
         write_job(&state, &job).unwrap();
 
-        // Its receipt names this daemon: the update completed.
-        assert_eq!(step(), SettleStep::Settled(JOB.into()));
+        // An active worker can replace its placeholder with the exact
+        // serving proof. The same waiter must use that final receipt.
+        thread::scope(|scope| {
+            let worker = acquire_lock(&state).unwrap();
+            write(recovery::outcome_path(&state, JOB), "pending.json");
+            let (waiting, started) = std::sync::mpsc::channel();
+            let (settled, verdict) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                waiting.send(()).unwrap();
+                settled.send(step()).unwrap();
+            });
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                verdict.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            write(recovery::outcome_path(&state, JOB), "recovery.json");
+            drop(worker);
+            assert_eq!(
+                verdict.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Some(JOB.into())
+            );
+        });
         let settled = recorded();
         assert_eq!(settled.phase, UpdatePhase::Complete);
         assert_eq!(settled.version, "0.2.4");
@@ -7131,8 +7787,8 @@ mod reconciliation_tests {
         assert!(state.join(format!("{JOB}.complete")).is_file());
         // Settled for good: a later daemon finds nothing to do.
         assert_eq!(
-            successor_settle_step(&layout, &state, &restarted).unwrap(),
-            SettleStep::Done
+            settle_after_worker(&layout, &state, &restarted).unwrap(),
+            None
         );
         assert_eq!(recorded().phase, UpdatePhase::Complete);
     }

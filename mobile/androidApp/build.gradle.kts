@@ -16,6 +16,12 @@ android {
         versionName = "0.1.0"
     }
 
+    // scripts/gradle-remote passes the debug key of the machine that asked
+    // for the build, so its APKs install over what that machine installed.
+    providers.gradleProperty("cagents.debugKeystore").orNull?.let { keystore ->
+        signingConfigs.getByName("debug").storeFile = rootProject.file(keystore)
+    }
+
     buildTypes {
         debug {
             applicationIdSuffix = ".debug"
@@ -85,6 +91,11 @@ dependencies {
     implementation(libs.navigation3.ui)
     implementation(libs.lifecycle.viewmodel.navigation3)
     implementation(libs.kotlinx.coroutines.android)
+
+    implementation(libs.camera.camera2)
+    implementation(libs.camera.lifecycle)
+    implementation(libs.camera.view)
+    implementation(libs.zxing.core)
 
     implementation(libs.sshj)
     implementation(libs.bouncycastle.prov)

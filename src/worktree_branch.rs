@@ -306,15 +306,34 @@ mod branch_delete_tests {
             ],
         );
         git(path, &["pack-refs", "--all"]);
-        delete_branch_checked_at(path, "unmerged", true, Some(&latest), &cancel).unwrap();
-        assert!(git(path, &["branch", "--list", "unmerged"]).is_empty());
-        let config = Command::new("git")
-            .current_dir(path)
-            .args(["config", "--local", "--get", "branch.unmerged.description"])
-            .output()
-            .unwrap();
-        assert_eq!(config.status.code(), Some(1));
+        #[cfg(target_os = "macos")]
+        {
+            let error = delete_branch_checked_at(path, "unmerged", true, Some(&latest), &cancel)
+                .unwrap_err();
+            assert_eq!(error.kind, BranchDeleteFailureKind::Other);
+            assert!(error.detail.contains("Registered HEAD fencing"));
+            assert_eq!(git(path, &["rev-parse", "refs/heads/unmerged"]), latest);
+            assert_eq!(
+                git(
+                    path,
+                    &["config", "--local", "--get", "branch.unmerged.description"]
+                ),
+                "discard only after confirmed"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            delete_branch_checked_at(path, "unmerged", true, Some(&latest), &cancel).unwrap();
+            assert!(git(path, &["branch", "--list", "unmerged"]).is_empty());
+            let config = Command::new("git")
+                .current_dir(path)
+                .args(["config", "--local", "--get", "branch.unmerged.description"])
+                .output()
+                .unwrap();
+            assert_eq!(config.status.code(), Some(1));
+        }
     }
+    #[cfg(target_os = "linux")] // Successful force deletion requires registered HEAD fencing.
     #[test]
     fn branch_deletion_preserves_exact_names_and_dotted_config_subsections() {
         let directory = tempfile::tempdir().unwrap();
@@ -371,6 +390,7 @@ mod branch_delete_tests {
             "preserved"
         );
     }
+    #[cfg(target_os = "linux")] // Successful force deletion requires registered HEAD fencing.
     #[test]
     fn force_deletion_fences_checkout_and_changed_commit_during_final_effect() {
         use std::{

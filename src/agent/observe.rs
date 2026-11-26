@@ -145,7 +145,9 @@ impl Observer {
             && let Some((state, attention)) = self.rollouts.observe(
                 process.pid,
                 process.start,
-                crate::model::agent_recovery::process_started(process.start)
+                u32::try_from(process.pid)
+                    .ok()
+                    .and_then(|pid| crate::process::clock::started_at(pid, process.start))
                     .and_then(|started| started.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|started| started.as_secs()),
             )

@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 205,
+    proven_at: 208,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -150,12 +150,18 @@ pub const DRAFT_MODEL_IN_LAUNCH: u16 = 202;
 /// neither (see [`WithoutTrailing`]).
 pub const SEND_QUEUED_NOW: u16 = 205;
 
-/// Whether a field [`SEND_QUEUED_NOW`] added is left out of the value being
-/// encoded, as `skip_serializing_if` asks. It is only ever a struct's last
-/// field, since postcard's positional encoding then leaves the fields before
-/// it as the older client reads them.
+/// Whether a field [`SEND_QUEUED_NOW`] added is left out. Older postcard
+/// layouts omit it and any capabilities appended after it.
 pub fn before_send_queued_now<T>(_: &T) -> bool {
     encoding_before(SEND_QUEUED_NOW)
+}
+
+/// The first protocol that reports whether the chat queue waits for the reader.
+pub const QUEUE_HOLDS: u16 = 207;
+
+/// Omit the trailing queue-hold capability from older wire layouts.
+pub fn before_queue_holds<T>(_: &T) -> bool {
+    encoding_before(QUEUE_HOLDS)
 }
 
 /// Reads a struct whose last `omitted` fields a source from before the
@@ -243,6 +249,7 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
         &["send_queued_now"],
         SEND_QUEUED_NOW,
     ),
+    ("cagents::chat::Capabilities", &["queue_holds"], QUEUE_HOLDS),
 ];
 
 /// Fields a later protocol added to a variant of a request's enum, which this
@@ -288,6 +295,7 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
         &["send_queued_now"],
         SEND_QUEUED_NOW,
     ),
+    ("cagents::chat::Capabilities", &["queue_holds"], QUEUE_HOLDS),
 ];
 
 /// Variants a later protocol appended that a client from before it is sent as

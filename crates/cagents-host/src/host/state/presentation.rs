@@ -186,21 +186,33 @@ impl HostState {
             .filter(|client| focused.contains(client))
             .or_else(|| focused.first().copied());
         let _ = handle.focus(!focused.is_empty());
+        // A visible observer may only read the screen. It cannot hold the
+        // fallback size owner slot until it supplies dimensions itself.
+        let has_size = |client| {
+            self.subscriptions
+                .viewports
+                .get(&(client, id))
+                .is_some_and(|view| view.size.is_some())
+        };
         let owner = owner
             .or_else(|| {
                 previous.filter(|client| {
-                    self.subscriptions
-                        .by_client
-                        .get(client)
-                        .and_then(|terminals| terminals.get(&id))
-                        == Some(&TerminalVisibility::Visible)
+                    has_size(*client)
+                        && self
+                            .subscriptions
+                            .by_client
+                            .get(client)
+                            .and_then(|terminals| terminals.get(&id))
+                            == Some(&TerminalVisibility::Visible)
                 })
             })
             .or_else(|| {
                 self.subscriptions.by_terminal.get(&id).and_then(|clients| {
                     clients
                         .iter()
-                        .find(|(_, visible)| **visible == TerminalVisibility::Visible)
+                        .find(|(client, visible)| {
+                            **visible == TerminalVisibility::Visible && has_size(**client)
+                        })
                         .map(|(client, _)| *client)
                 })
             });
@@ -584,6 +596,55 @@ mod tests {
         handle.shutdown().unwrap();
     }
     #[test]
+    fn a_read_only_terminal_view_sends_no_extra_pty_focus_reports() {
+        let (host, handle, id, _dir) = fixture_with(
+            r#"stty -echo; printf '\033[?1004h';
+               i=1; while [ $i -le 100 ]; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); done
+               IFS= read -r line
+               printf '\033]2;focus:%s\007' "$(printf %s "$line" | od -An -tx1 | tr -d ' \n')"
+               exec sleep 600"#,
+        );
+        let events = handle.events();
+        {
+            let mut state = host.lock().unwrap();
+            // Revealing and detaching a size-less observer must also be quiet
+            // when no desktop client is focused.
+            state
+                .set_visibility(2, id, TerminalVisibility::Visible)
+                .unwrap();
+            state.detach(2, id).unwrap();
+
+            state.focus_client(1, id, true).unwrap();
+            state.attach(2, id).unwrap();
+            state
+                .set_visibility(2, id, TerminalVisibility::Visible)
+                .unwrap();
+            drop(state.unregister_client(2));
+
+            // Real desktop visibility and focus changes still reach the PTY.
+            state
+                .set_visibility(1, id, TerminalVisibility::Hidden)
+                .unwrap();
+            state
+                .set_visibility(1, id, TerminalVisibility::Visible)
+                .unwrap();
+            state.focus_client(1, id, false).unwrap();
+        }
+        handle.input(b"\n".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let title = loop {
+            if let TerminalEvent::TitleChanged(title) = events.recv_deadline(deadline).unwrap()
+                && title.starts_with("focus:")
+            {
+                break title;
+            }
+        };
+        // Focus in, out, in, then out: CSI I and CSI O.
+        assert_eq!(title, "focus:1b5b491b5b4f1b5b491b5b4f");
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
     fn focus_elects_one_size_owner_and_observer_resize_is_local() {
         let (host, handle, id, _dir) = fixture();
         let first = crate::terminal::TerminalSize {
@@ -749,6 +810,10 @@ mod tests {
         handle.shutdown().unwrap();
     }
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+    )]
     fn continuously_dirty_output_keeps_two_custom_viewports_responsive() {
         if crate::retained_fixture::run_isolated() {
             return;

@@ -1347,7 +1347,11 @@ impl Cagents {
                     }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
-                        return launch_task(PathBuf::from("xdg-open"), target.path, false);
+                        return launch_task(
+                            PathBuf::from(file_manager::FOLDER_OPENER),
+                            target.path,
+                            false,
+                        );
                     }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;
@@ -2220,7 +2224,7 @@ fn merged_worktree_notice(
     notice.with_details(details)
 }
 
-fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
+pub(super) fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut command = std::process::Command::new(executable);

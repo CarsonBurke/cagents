@@ -599,12 +599,33 @@ fn changed_for_instance(
         return;
     }
     let proof = state.proof().clone();
+    if matches!(update, Update::Activity { .. }) {
+        state.tally_updates.notify_one();
+    }
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind.
     if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
         && let Some(courier) = &state.mailbox
     {
         courier.wake();
+    }
+    // A live provider that starts working again or becomes idle has settled
+    // its request. Unknown may mean a lost attachment, so require a
+    // completed actor without retained work before clearing on exit.
+    if let Some(record) = state.chats.get(&id)
+        && let Some(notifications) = &state.notifications
+        && record.handle.actor_identity().is_none()
+        && (matches!(
+            &update,
+            Update::Activity {
+                state: crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle,
+                ..
+            }
+        ) || (matches!(&update, Update::Observed { .. })
+            && record.handle.is_completed()
+            && !record.handle.owns_work()))
+    {
+        notifications.clear_session_waiting(id);
     }
     if let Update::Attention(evidence) | Update::AttentionContext { evidence, .. } = &update {
         if let Some(record) = state.chats.get(&id)
@@ -623,6 +644,12 @@ fn changed_for_instance(
         }
         return;
     }
+    if matches!(
+        update,
+        Update::Activity { .. } | Update::ConversationNameChanged | Update::FailureChanged
+    ) {
+        state.mobile_sessions_changed();
+    }
     if matches!(update, Update::ConversationNameChanged) {
         if let Some(titles) = &state.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
@@ -637,10 +664,9 @@ fn changed_for_instance(
     // Check the exact current producer under HostState; a failed/retained owner
     // must not masquerade as released work. Remote proxies publish Resident
     // metadata before this callback, so this reads no helper or transcript.
-    let wake_completed = instance.is_some()
-        && matches!(update, Update::Observed { .. })
-        && record.handle.is_completed()
-        && !record.handle.owns_work();
+    let completed = matches!(update, Update::Observed { .. }) && record.handle.is_completed();
+    let released = completed && !record.handle.owns_work();
+    let mobile_ended = released && !record.returning_terminal;
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
             &Update::Activity { state, generation } => ServerMessage::ChatActivity {
@@ -708,8 +734,15 @@ fn changed_for_instance(
     {
         record.handle.observe_next_update();
     }
+    // The completion flag is published after the final Activity event.
+    // An overview read triggered only by Activity can still see the old row.
+    if mobile_ended {
+        state.mobile_chat_ended(id);
+    } else if completed {
+        state.mobile_sessions_changed();
+    }
     drop(state);
-    if wake_completed {
+    if instance.is_some() && released {
         crate::daemon::wake();
     }
 }
@@ -1215,7 +1248,7 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
         }
         return Ok(());
     }
-    close_retained_native(host, session)
+    native_cleanup::close_from_pane(host, session)
 }
 
 /// Settles the Close of a conversation whose native owner ended without a
@@ -1533,8 +1566,12 @@ pub(super) fn lost_processes(
             )?);
         }
         if let Some(listener) = &listener {
+            #[cfg(target_os = "linux")]
             let providers =
                 super::upgrade_inspect::codex_listener_providers(session.id, &listener.socket)?;
+            #[cfg(target_os = "macos")]
+            let providers =
+                crate::daemon::lost_processes::listener_providers(session.id, &listener.socket)?;
             if !providers.is_empty() {
                 found.extend(crate::daemon::lost_processes::listener_census(&providers)?);
             }
@@ -1838,9 +1875,9 @@ fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool
     })? == SharedCodexService::Listening)
 }
 
-/// Read the same execution evidence for restart and picker preparation, so
-/// unreadable evidence retains its concrete diagnostic in both paths.
-fn require_ended_codex_execution(
+/// Read the same execution evidence for checkpoint restore, restart and
+/// picker preparation, preserving the diagnostic for unreadable evidence.
+pub(super) fn require_ended_codex_execution(
     host: &SharedHost,
     session: &Session,
     boot: &crate::model::BootId,
@@ -2513,6 +2550,19 @@ fn start_publishing(
             source_execution.as_ref()
         },
     )?;
+    #[cfg(target_os = "macos")]
+    if source.is_none()
+        && restart_launch.is_none()
+        && !saved_history_only
+        && session.launch.session_id.is_none()
+        && let Some(login_path) = crate::account::probe::shell_search_path()
+        && let Some(path) = combined_login_search_path(&process_launch.recipe, &login_path)
+    {
+        process_launch
+            .recipe
+            .environment
+            .insert("PATH".into(), path);
+    }
     // A begun thread's bare remote joins the account's shared daemon, which
     // owns the thread while it runs. With nothing serving that daemon, the
     // thread is reopened from its history on a listener of its own instead of
@@ -2780,7 +2830,7 @@ fn start_publishing(
         };
         session.proof = Some(state.proof().clone());
         capacity::Reservation::install(&mut admission, host, &mut state, &session)?;
-        state.inventory_generation += 1;
+        state.inventory_changed();
         source_handle
     };
     let result = (|| {
@@ -3144,7 +3194,7 @@ fn start_publishing(
         if let Some(context) = &execution {
             context.installed();
         }
-        state.inventory_generation += 1;
+        state.inventory_changed();
         drop(state);
         drop(retired);
         if remote {
@@ -3495,7 +3545,7 @@ fn codex_terminal_view(
         record.source_process = paired_terminal.observe_agent_process();
         record.returning_terminal = false;
         owners = paired_close::Owners::capture(&state, &state.chats[&chat_id])?;
-        state.inventory_generation += 1;
+        state.inventory_changed();
         Ok(ServerResponse::ChatTerminal {
             chat_id,
             session: descriptor.session.clone(),
@@ -4298,40 +4348,9 @@ fn process_inner(
         }
         ClientRequest::ChatList => {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let mut sessions = state
-                .chats
-                .values()
-                .filter(|record| {
-                    record.handle.owns_work()
-                        || record.returning_terminal
-                        || state
-                            .native_actor_startups
-                            .get(&record.session.id)
-                            .is_some_and(|pending| {
-                                pending
-                                    .failed_close
-                                    .as_ref()
-                                    .is_some_and(|target| target.matches(record))
-                            })
-                })
-                .map(Record::current_session)
-                .collect::<Vec<_>>();
-            sessions.extend(
-                state
-                    .chat_spawning
-                    .values()
-                    .filter(|pending| {
-                        state.historical_chat_retirements.get(&pending.id) != Some(*pending)
-                    })
-                    .map(|pending| {
-                        let mut session = pending.clone();
-                        // Inventory describes this daemon's pending attachment. Keep
-                        // the reservation's exact caller token unchanged for its CAS.
-                        session.proof = Some(state.proof().clone());
-                        session
-                    }),
-            );
-            Ok(ServerResponse::ChatListed { sessions })
+            Ok(ServerResponse::ChatListed {
+                sessions: chat_list_inventory(&state),
+            })
         }
         ClientRequest::ChatStartInPane {
             pane,
@@ -4505,6 +4524,22 @@ fn process_inner(
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
+            let released = state
+                .held_followups
+                .get_mut(&chat_id)
+                .is_some_and(|holders| holders.remove(&client));
+            if state
+                .held_followups
+                .get(&chat_id)
+                .is_some_and(std::collections::BTreeSet::is_empty)
+            {
+                state.held_followups.remove(&chat_id);
+            }
+            drop(state);
+            // A message waiting behind what this window held may go now.
+            if released {
+                super::agent_execution::mailbox::wake(host);
+            }
             Ok(ServerResponse::Detached)
         }
         ClientRequest::ChatCommand { chat_id, command } => {
@@ -4517,15 +4552,25 @@ fn process_inner(
         } => chat_command(host, client, chat_id, command, Some(delivery)),
         ClientRequest::ChatAcknowledge { chat_id, epoch } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            // An attached terminal can explicitly acknowledge its conversation.
+            // Output rearm during reconnect uses a separate request.
+            if state.attached_terminal_conversation(client, chat_id) {
+                drop(state);
+                super::notifications::acknowledge_predecessors(host, chat_id);
+                return Ok(ServerResponse::Accepted);
+            }
             if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
                 receipt.require_attached(client)?;
                 return Ok(ServerResponse::Accepted);
             }
             let record = attached_mut(&mut state, client, chat_id)?;
             let observation = record.observations.entry(client).or_default();
-            if epoch > observation.epoch {
-                observation.acknowledge(epoch, record.handle.observe_next_update());
+            if epoch <= observation.epoch {
+                return Ok(ServerResponse::Accepted);
             }
+            observation.acknowledge(epoch, record.handle.observe_next_update());
+            drop(state);
+            super::notifications::acknowledge_predecessors(host, chat_id);
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatVisibility { chat_id, visible } => {
@@ -4546,6 +4591,29 @@ fn process_inner(
             drop(state);
             if visible {
                 changed(&Arc::downgrade(host), chat_id, Update::Presentation);
+            }
+            Ok(ServerResponse::Accepted)
+        }
+        ClientRequest::ChatHoldsFollowups { chat_id, held } => {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
+                receipt.require_attached(client)?;
+                return Ok(ServerResponse::Accepted);
+            }
+            attached_mut(&mut state, client, chat_id)?;
+            let holders = state.held_followups.entry(chat_id).or_default();
+            let changed = if held {
+                holders.insert(client)
+            } else {
+                holders.remove(&client)
+            };
+            if holders.is_empty() {
+                state.held_followups.remove(&chat_id);
+            }
+            drop(state);
+            // A message waiting behind them may go now.
+            if changed && !held {
+                super::agent_execution::mailbox::wake(host);
             }
             Ok(ServerResponse::Accepted)
         }
@@ -4639,7 +4707,7 @@ fn process_inner(
                     .expect("validated exact attachment");
                 record.returning_terminal = true;
                 record.completion_observed = false;
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 state.recovery_independence.extend(chat_id, terminal_id);
                 // The terminal resumes this chat's conversation under its
                 // claim, which refuses any other's (see
@@ -4732,8 +4800,7 @@ fn process_inner(
                 }
                 let old_pair = owners.remove_pair(&mut state, &closing)?;
                 let mut record = state
-                    .chats
-                    .remove(&chat_id)
+                    .remove_chat(chat_id)
                     .expect("validated exact attachment");
                 state.chat_handoffs.insert(
                     chat_id,
@@ -4745,7 +4812,7 @@ fn process_inner(
                         Instant::now() + ACKNOWLEDGEMENT_GRACE,
                     ),
                 );
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 Ok((record, old_pair))
             })();
             match publication {
@@ -4811,7 +4878,7 @@ fn process_inner(
                 .find_map(|(&id, receipt)| (receipt.terminal.id == terminal_id).then_some(id));
             if let Some(source_id) = source_id {
                 state.chat_handoffs.remove(&source_id);
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             Ok(ServerResponse::Accepted)
         }
@@ -4964,48 +5031,89 @@ pub(super) fn close_captured(
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
-    handle.decide_detached_work(super::agent_execution::detached_work_on_close(
-        host, source.id,
-    ));
+    let detached = super::agent_execution::detached_work_on_close(host, source.id);
+    handle.decide_detached_work(detached);
     if let Err(error) = handle.close_for_resume() {
         // Its Release failed. When that is because the helper died while the
         // provider runs on, say what holds the conversation; the pane offers
         // to end it.
-        let refusal = registered_holder_lost_refusal(host, &source).ok().flatten();
+        let refusal = registered_holder_lost_refusal(host, &source);
+        #[cfg(target_os = "linux")]
+        let refusal = refusal.ok().flatten();
+        #[cfg(target_os = "macos")]
+        let refusal = refusal.unwrap_or_else(Some);
         return Err(unavailable(refusal.unwrap_or(error)));
     }
     let snapshot = handle.snapshot(None).ok_or_else(|| {
         unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")
     })?;
     target.require_current(host)?;
-    let (retained, pending_cleanup) = {
+    let (retained, pending_cleanup, registered_codex_pair) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let retained = state
+        let record = state
             .chats
             .get(&chat_id)
             .filter(|record| target.matches(record))
-            .map(|record| record.session.clone())
             .ok_or_else(|| {
                 unavailable("The thread changed while its previous actor was closing.")
             })?;
-        (retained, state.native_closing.contains_key(&chat_id))
+        // The holder's paired source includes the provider-confirmed continuity
+        // issued before close. The attachment's launch descriptor may predate
+        // that confirmation, so it cannot identify the paired receipt.
+        #[cfg(target_os = "macos")]
+        let issued_pair = state
+            .chat_close_reservations
+            .get(&chat_id)
+            .filter(|removal| {
+                removal.source == record.session
+                    && removal.current.launch.provider == Provider::Codex
+                    && removal.current.terminal.is_some()
+                    && matches!(
+                        removal.current.native_continuity,
+                        chat::NativeContinuity::Durable { .. }
+                    )
+                    && record
+                        .paired_terminal
+                        .as_ref()
+                        .is_some_and(|pair| pair.holder_identity().is_some())
+            });
+        #[cfg(target_os = "linux")]
+        let issued_pair: Option<&capacity::CloseRemoval> = None;
+        let pending = state.native_closing.get(&chat_id);
+        let retained = issued_pair.map_or(&record.session, |removal| {
+            // A previous retained-close request may already have matched and
+            // reserved the hosted launch descriptor. Settle that same retry.
+            pending
+                .map(native_cleanup::NativeClose::source)
+                .filter(|source| **source == removal.source)
+                .unwrap_or(&removal.current)
+        });
+        (retained.clone(), pending.is_some(), issued_pair.is_some())
     };
-    if handle.actor_identity().is_some() {
+    if handle.actor_identity().is_some() || registered_codex_pair {
         // The actor's final transcript is available, but its paired console
         // still needs an authenticated terminal cleanup receipt. Keep helper
         // discovery and exact close authority until both owners are proved
         // closed and their semantic retirement has committed.
-        native_cleanup::close_captured(host, &retained, &target, &closing).map_err(unavailable)?;
+        native_cleanup::close_captured(host, &retained, &target, &closing, detached)
+            .map_err(unavailable)?;
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
-    let closed_receipt = if matches!(
-        retained.native_continuity,
-        chat::NativeContinuity::Durable { .. }
-    ) {
+    let closed_receipt = if !pending_cleanup
+        && matches!(
+            retained.native_continuity,
+            chat::NativeContinuity::Durable { .. }
+        ) {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        chat::native_holder::closed_source(&retained, state.proof())
-            .map_err(unavailable)?
-            .is_some()
+        #[cfg(target_os = "macos")]
+        let receipt = if detached == crate::daemon::owned_children::DetachedWork::Stop {
+            chat::native_holder::closed_source_for_stop(&retained, state.proof())
+        } else {
+            chat::native_holder::closed_source(&retained, state.proof())
+        };
+        #[cfg(target_os = "linux")]
+        let receipt = chat::native_holder::closed_source(&retained, state.proof());
+        receipt.map_err(unavailable)?.is_some()
     } else {
         false
     };
@@ -5014,7 +5122,8 @@ pub(super) fn close_captured(
         // gone. A server preserved by an earlier failed adoption must
         // also acknowledge exact cleanup before this close can succeed.
         target.require_current(host)?;
-        native_cleanup::close_captured(host, &retained, &target, &closing).map_err(unavailable)?;
+        native_cleanup::close_captured(host, &retained, &target, &closing, detached)
+            .map_err(unavailable)?;
         return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
     }
     let terminal = {
@@ -5079,8 +5188,8 @@ pub(super) fn close_captured(
                 "The paired terminal changed while its previous worker was closing.",
             ));
         }
-        state.inventory_generation += 1;
-        let record = state.chats.remove(&chat_id);
+        state.inventory_changed();
+        let record = state.remove_chat(chat_id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(chat_id);
         }
@@ -5291,6 +5400,52 @@ fn prepare_native_process_launch(
         .environment
         .retain(|name, _| !removed.contains(name));
     Ok(process_launch)
+}
+
+/// A fresh provider keeps its caller's tool order. Supply directories absent
+/// from its PATH so a launcher can find dependencies installed for the user.
+#[cfg(any(target_os = "macos", test))]
+fn combined_login_search_path(
+    recipe: &crate::model::LaunchRecipe,
+    login_path: &std::ffi::OsStr,
+) -> Option<String> {
+    if recipe.unset_environment.contains("PATH") {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let directories = recipe
+        .environment
+        .get("PATH")
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(std::env::split_paths(login_path).filter(|directory| directory.is_absolute()))
+        .filter(|directory| seen.insert(directory.clone()));
+    std::env::join_paths(directories).ok()?.into_string().ok()
+}
+
+/// Keep the headless agent's resolved search path before its exact launch
+/// intent is persisted. Restart can use that path without recording the
+/// surrounding private account environment or probing another login shell.
+#[cfg(target_os = "macos")]
+pub(super) fn record_agent_login_path(launch: &mut chat::Launch) -> Result<(), ProtocolError> {
+    let Some(login) = crate::account::probe::shell_search_path() else {
+        return Ok(());
+    };
+    let materialized = prepare_native_process_launch(
+        launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            launch.provider,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )?;
+    if let Some(path) = combined_login_search_path(&materialized.recipe, &login)
+        && crate::model::agent_recovery::fresh_environment_key(launch.provider, "PATH", &path, true)
+    {
+        launch.recipe.environment.insert("PATH".into(), path);
+    }
+    Ok(())
 }
 
 /// The environment `restore_upgrade` will start `launch` with in the next
@@ -5644,9 +5799,9 @@ pub(super) fn stop_failed_upgrade_restore(
     let record = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_current(&state)?;
-        let record = state.chats.remove(&id);
+        let record = state.remove_chat(id);
         if record.is_some() {
-            state.inventory_generation += 1;
+            state.inventory_changed();
             if let Some(notifications) = &state.notifications {
                 notifications.retire(id);
             }
@@ -5745,10 +5900,9 @@ pub(super) fn close_terminal_actor(
         // and the caller's exact-worker attention fence. A successful native
         // handoff removes the old pair when it publishes its replacement.
         let record = state
-            .chats
-            .remove(&terminal_id)
+            .remove_chat(terminal_id)
             .expect("validated exact attachment");
-        state.inventory_generation += 1;
+        state.inventory_changed();
         record
     };
     drop(removed);
@@ -5758,3 +5912,38 @@ pub(super) fn close_terminal_actor(
 
 #[cfg(test)]
 pub(in crate::host) mod tests;
+
+pub(super) fn chat_list_inventory(state: &HostState) -> Vec<Session> {
+    let mut sessions = state
+        .chats
+        .values()
+        .filter(|record| {
+            record.handle.owns_work()
+                || record.returning_terminal
+                || state
+                    .native_actor_startups
+                    .get(&record.session.id)
+                    .is_some_and(|pending| {
+                        pending
+                            .failed_close
+                            .as_ref()
+                            .is_some_and(|target| target.matches(record))
+                    })
+        })
+        .map(Record::current_session)
+        .collect::<Vec<_>>();
+    sessions.extend(
+        state
+            .chat_spawning
+            .values()
+            .filter(|pending| state.historical_chat_retirements.get(&pending.id) != Some(*pending))
+            .map(|pending| {
+                let mut session = pending.clone();
+                // Inventory describes this daemon's pending attachment. Keep
+                // the reservation's exact caller token unchanged for its CAS.
+                session.proof = Some(state.proof().clone());
+                session
+            }),
+    );
+    sessions
+}

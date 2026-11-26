@@ -125,9 +125,9 @@ fn lifecycle_idle_exit_drains_a_late_original_before_releasing_listener_and_leas
     // Publish the SAME reserved original after the actual idle-triggered drain
     // began. Neither an empty terminal map nor a refused Close proves absence.
     ticket.quarantine();
-    ticket
-        .retain(child.0.take().unwrap(), original.pidfd.try_clone().unwrap())
-        .unwrap();
+    let retained = child.0.take().unwrap();
+    let pin = child_reaper::PinnedChild::of(&retained).unwrap();
+    ticket.retain(retained, pin).unwrap();
     assert!(child_reaper::has_retained_ownership());
     assert_lease_held(&paths);
     assert!(

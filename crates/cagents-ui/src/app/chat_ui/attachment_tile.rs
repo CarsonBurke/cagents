@@ -566,7 +566,7 @@ mod tests {
                 repeat: false,
             })
         };
-        let control = keyboard::Modifiers::CTRL;
+        let control = keyboard::Modifiers::COMMAND;
         for (event, expected) in [
             (chord("z", Code::KeyZ, control), vec![300]),
             // With nothing to redo, the workspace keeps Ctrl+Shift+Z.

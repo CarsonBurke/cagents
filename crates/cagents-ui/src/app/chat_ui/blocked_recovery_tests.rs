@@ -1609,7 +1609,7 @@ fn a_saved_pane_waiting_for_its_workspace_says_whether_the_update_holds_it() {
         }
         let labels = pane_labels(&mut app, card);
         let wait = chat_runtime(&app, card).update_wait;
-        let (expected_title, explanation) = wait.admission();
+        let (expected_title, explanation) = wait.admission(None);
         assert_eq!(expected_title, title, "{state:?}");
         if let Some(title) = title {
             assert!(labels.iter().any(|l| l == title), "{state:?}: {labels:?}");

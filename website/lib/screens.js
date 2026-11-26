@@ -1,5 +1,4 @@
-// Turns `<!--screenshot:NAME-->` markers in index.html into <picture>
-// elements, and `<!--install-command-->` into the published install command.
+// Turns `<!--screenshot:NAME-->` markers in index.html into expandable screenshots.
 // Every screenshot is a real capture of the native app; screens.json names
 // each one's alt text and the themes it was captured in.
 import { readFileSync } from "node:fs";
@@ -59,10 +58,11 @@ export function pictureHtml(screen, { eager = false } = {}) {
   const loading = eager ? `fetchpriority="high"` : `loading="lazy"`;
   const img = `<img src="/${screen.files[primary]}.webp" width="${screen.width}" height="${screen.height}" alt="${escapeHtml(screen.alt)}" decoding="async" ${loading} />`;
   const caption = screen.caption ? `<figcaption>${escapeHtml(screen.caption)}</figcaption>` : "";
-  return `<picture>${sources.join("")}${img}</picture>${caption}`;
+  const icon = `<svg class="shot-expand-icon" viewBox="-4 -4 24 24" aria-hidden="true"><path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
+  return `<a class="shot-expand" href="/${screen.files[primary]}.webp"><span class="visually-hidden">Expand screenshot. </span><picture>${sources.join("")}${img}</picture>${icon}</a>${caption}`;
 }
 
-export function renderPage(html, { screens, installCommand }) {
+export function renderPage(html, { screens }) {
   const used = new Set();
   const out = html
     .replace(/<!--screenshot:([a-z0-9-]+)(:eager)?-->/g, (_, name, eager) => {
@@ -70,8 +70,7 @@ export function renderPage(html, { screens, installCommand }) {
       if (!screen) throw new Error(`index.html names screenshot ${name}, which screens.json does not list`);
       used.add(name);
       return pictureHtml(screen, { eager: Boolean(eager) });
-    })
-    .replace("<!--install-command-->", () => escapeHtml(installCommand.trimEnd()));
+    });
   const unused = Object.keys(screens).filter((name) => !used.has(name));
   if (unused.length) throw new Error(`screens.json lists screenshots the page doesn't show: ${unused.join(", ")}`);
   return out;

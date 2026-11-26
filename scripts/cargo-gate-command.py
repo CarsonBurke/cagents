@@ -1,13 +1,18 @@
 #!/usr/bin/python3
 """Supervise one owned command, and keep the gate's admission clock.
 
-    cargo-gate-command.py [--wrapper NAME] [--admission-until DEADLINE] RECEIPT COMMAND...
+    cargo-gate-command.py [OPTIONS] RECEIPT COMMAND...
 
 --wrapper NAME supervises a whole program on its caller's behalf, as
 native-evidence-remote does itself: messages are NAME's, a cancelled run
 dies by the signal that cancelled it, so a calling shell stops as it would
 for the program, and the program gets longer than the gate's own grace to
 clean up, as it may be waiting on a gate that is draining.
+
+--parent PID cancels if the launching process dies. --watch-parent PID
+also watches that parent's own caller. --timeout SECONDS bounds the
+whole command, and --drain-on-exit owns its descendants on normal exit
+too. --admission-until DEADLINE keeps the gate's separate admission clock.
 """
 
 import sys
@@ -111,14 +116,22 @@ class Wakeups:
         else:
             self.poller.register(pidfd, self.select.POLLIN)
 
-    def wait(self, deadline):
+    def watch_parent(self, pid):
+        pidfd = self.os.pidfd_open(pid)
+        self.poller.register(pidfd, self.select.POLLIN)
+        return pidfd
+
+    def wait(self, deadline, parent):
         timeout = POLL_SECONDS if self.polling else None
         if deadline is not None:
             remaining = max(0, deadline - time.monotonic_ns()) / 1e9
             timeout = remaining if timeout is None else min(timeout, remaining)
         # poll() takes milliseconds; round up, so a deadline is not missed early.
         milliseconds = None if timeout is None else int(timeout * 1000) + 1
+        parent_exited = False
         for descriptor, _events in self.poller.poll(milliseconds):
+            if descriptor == parent:
+                parent_exited = True
             if descriptor == self.descriptors[0] or descriptor == self.receipt_watch:
                 try:
                     while self.os.read(descriptor, 4096):
@@ -126,6 +139,16 @@ class Wakeups:
                 except BlockingIOError:
                     pass
         # A readable pidfd stays readable; the loop finds the exit next.
+        return parent_exited
+
+
+def parent_of(pid):
+    from pathlib import Path
+
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()[1])
+    except FileNotFoundError:
+        return None
 
 
 def main():
@@ -141,9 +164,30 @@ def main():
     arguments = sys.argv[1:]
     wrapper = False
     grace = GRACE_SECONDS
-    if arguments[:1] == ["--wrapper"]:
-        wrapper, PROGRAM, grace = True, arguments[1], WRAPPER_GRACE_SECONDS
-        arguments = arguments[2:]
+    parent = caller = admission_deadline = command_deadline = None
+    drain_on_exit = False
+    while arguments and arguments[0].startswith("--"):
+        option, *arguments = arguments
+        if option == "--drain-on-exit":
+            drain_on_exit = True
+            continue
+        value, *arguments = arguments
+        if option == "--wrapper":
+            wrapper, PROGRAM, grace = True, value, WRAPPER_GRACE_SECONDS
+        elif option == "--parent":
+            parent = positive_integer(value)
+        elif option == "--watch-parent":
+            caller = positive_integer(value)
+        elif option == "--admission-until":
+            admission_deadline = positive_integer(value)
+        elif option == "--timeout":
+            command_deadline = time.monotonic_ns() + positive_integer(value) * 1_000_000_000
+        elif option == "--hold-fd":
+            # Keep this lock in the supervisor through drain(), without
+            # forwarding it to commands and their unrelated descendants.
+            os.set_inheritable(positive_integer(value), False)
+        else:
+            raise ValueError(f"unknown option {option}")
     signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
     # A signal the caller ignores, as nohup ignores HUP, stays ignored here and
     # in the command: it cancels nothing. The gate starts this as a background
@@ -153,10 +197,6 @@ def main():
     kept = signals if wrapper else (signal.SIGTERM, signal.SIGHUP)
     handled = [number for number in signals
                if number not in kept or signal.getsignal(number) != signal.SIG_IGN]
-    admission_deadline = None
-    if arguments[:1] == ["--admission-until"]:
-        admission_deadline = positive_integer(arguments[1])
-        arguments = arguments[2:]
     cancellation = 0
 
     def cancelled(number, _frame):
@@ -171,6 +211,14 @@ def main():
     receipt = Path(arguments[0])
     children_path = Path(f"/proc/self/task/{os.getpid()}/children")
     libc = ctypes.CDLL(None, use_errno=True)
+    if parent is not None:
+        # Use a separate signal so parent death still cancels when TERM was
+        # ignored. The PID check covers exit before prctl armed the signal.
+        signal.signal(signal.SIGUSR1, lambda _number, frame: cancelled(signal.SIGTERM, frame))
+        if libc.prctl(1, signal.SIGUSR1, 0, 0, 0):  # PR_SET_PDEATHSIG
+            raise OSError(ctypes.get_errno(), "cannot watch the launching process")
+        if os.getppid() != parent:
+            cancellation = signal.SIGTERM
     if libc.prctl(36, 1, 0, 0, 0):  # PR_SET_CHILD_SUBREAPER, before any spawn.
         raise OSError(ctypes.get_errno(), "cannot supervise command descendants")
     children_path.read_text()  # Fail before launch if child enumeration is unavailable.
@@ -196,6 +244,17 @@ def main():
 
     # Watched before the first read, so a receipt written after it wakes us.
     wakeups = Wakeups(receipt, ctypes, libc, os, signal)
+    caller_fd = None
+    if caller is not None and not cancellation:
+        # The gate is the parent and its invoking shell is one level up.
+        # Verify the relationship after opening the pidfd to avoid watching
+        # an unrelated process that reused the caller's PID.
+        try:
+            caller_fd = wakeups.watch_parent(caller)
+        except ProcessLookupError:
+            cancellation = signal.SIGTERM
+        if parent_of(parent) != caller:
+            cancellation = signal.SIGTERM
     if cancellation_requested():
         return cancelled_status()
     if admission_expired(admission_deadline):
@@ -234,9 +293,22 @@ def main():
         except ProcessLookupError:
             pass
 
+    def owns_transfer_lock(pid):
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            return (
+                len(argv) > 4
+                and argv[1] == b"-I"
+                and os.path.basename(argv[2]) == b"cargo-gate-command.py"
+                and argv[3] == b"--wrapper"
+                and b"--hold-fd" in argv[4:]
+            )
+        except OSError:
+            return False
+
     def drain():
         deadline = time.monotonic() + grace
-        terminating = set()
+        terminating = {}
         killing = set()
         # Retaining the primary reserves its PID until the last signal. Its
         # descendants become our children when their parents exit; even a
@@ -244,32 +316,40 @@ def main():
         send(primary.pid, signal.SIGTERM)
         send(primary.pid, signal.SIGCONT)
         while True:
-            force = time.monotonic() >= deadline
-            if force:
+            now = time.monotonic()
+            if now >= deadline:
                 send(primary.pid, signal.SIGKILL)
             for pid in adopted_children():
                 # These are this supervisor's actual unreaped children. With
                 # SIGCHLD at default and one waiter, their IDs cannot be reused
                 # before this loop reaps them. Adoption includes setsid children.
-                if force and pid not in killing:
-                    send(pid, signal.SIGKILL)
-                    killing.add(pid)
-                elif pid not in terminating:
+                if pid not in terminating:
+                    # If the client was killed, an adopted transport
+                    # supervisor still owns the slot. Let it reap its
+                    # transfers before forcing it, within one fixed budget.
+                    terminating[pid] = (
+                        deadline + WRAPPER_GRACE_SECONDS + 1
+                        if owns_transfer_lock(pid) else deadline
+                    )
                     send(pid, signal.SIGTERM)
                     send(pid, signal.SIGCONT)
-                    terminating.add(pid)
+                if now >= terminating[pid] and pid not in killing:
+                    send(pid, signal.SIGKILL)
+                    killing.add(pid)
                 reaped, _status = os.waitpid(pid, os.WNOHANG)
                 if reaped:
-                    terminating.discard(pid)
+                    del terminating[pid]
                     killing.discard(pid)
             # Reaping a parent may adopt another generation; rescan before
             # declaring completion. Never reap the anchor via waitpid(-1).
             if primary_exited() and children_path.read_text().split() == [str(primary.pid)]:
-                primary.wait()
-                return
+                return primary.wait()
             time.sleep(0.02)
 
     wakeups.watch_exit(primary.pid)
+    deadlines = [deadline for deadline in (admission_deadline, command_deadline)
+                 if deadline is not None]
+    deadline = min(deadlines, default=None)
     try:
         while True:
             if cancellation_requested():
@@ -278,15 +358,20 @@ def main():
             if admission_expired(admission_deadline):
                 drain()
                 return 124
+            if command_deadline is not None and time.monotonic_ns() >= command_deadline:
+                print(f"{PROGRAM}: transport deadline expired", file=sys.stderr)
+                drain()
+                return 124
             if primary_exited():
                 if cancellation_requested():
                     continue
                 # Normal completion commits here. Background cache services
                 # may outlive successful commands; only cancellation drains.
-                status = primary.wait()
+                status = drain() if drain_on_exit else primary.wait()
                 return status if status >= 0 else 128 - status
             reap_exited_adoptees()
-            wakeups.wait(admission_deadline)
+            if wakeups.wait(deadline, caller_fd):
+                cancellation = signal.SIGTERM
     except BaseException:
         # A supervisor failure after launch must not release a live build.
         drain()

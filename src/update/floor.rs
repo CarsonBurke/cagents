@@ -219,7 +219,7 @@ fn descriptor_impact<T: Serialize>(
         title: title.into(),
         identity: format!("{:x}", Sha256::digest(serde_json::to_vec(descriptor)?)),
         disposition: impact::Disposition::Blocked,
-        reason: String::new(),
+        reason: "".into(),
         interrupted_subagents: Vec::new(),
     })
 }
@@ -227,7 +227,15 @@ fn descriptor_impact<T: Serialize>(
 /// The worker engine uses the same source operations in production and in its
 /// refused-prepare tests. The adapter owns authentication, persistence and the
 /// final lease transfer; only this engine decides when destruction is allowed.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PreparationMode {
+    #[default]
+    AllowsReviewedStops,
+    AcknowledgedOnly,
+}
+
 trait FloorSource {
+    fn preparation_mode(&self) -> PreparationMode;
     fn observe(&mut self) -> Result<impact::Preview, UpdateError>;
     fn observe_policy(&mut self, policy: impact::Policy) -> Result<impact::Preview, UpdateError>;
     fn inventory(
@@ -251,6 +259,7 @@ trait FloorSource {
     ) -> Result<(), UpdateError> {
         Ok(())
     }
+    fn close_saved_windows(&mut self) -> Result<bool, UpdateError>;
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), source::PrepareError>;
     fn begin_interrupts(
         &mut self,
@@ -325,7 +334,7 @@ struct NativeSource<'a, O> {
     handoff: &'a mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &'a mut Survivors,
     reviewed: &'a impact::Preview,
-    guard: &'a crate::instance::UiUpdateGuard,
+    guard: &'a mut crate::instance::UiUpdateGuard,
     interrupts: Option<source::Interrupts>,
     interrupt_reviewed: Option<impact::DaemonImpact>,
     preparing_client: Option<source::Client>,
@@ -336,6 +345,9 @@ struct NativeSource<'a, O> {
 impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSource
     for NativeSource<'_, O>
 {
+    fn preparation_mode(&self) -> PreparationMode {
+        self.survivors.preparation_mode
+    }
     fn observe(&mut self) -> Result<impact::Preview, UpdateError> {
         (self.observe)(self.policy)
     }
@@ -474,6 +486,11 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         }
         self.preparing_client = Some(client);
         Ok(())
+    }
+    fn close_saved_windows(&mut self) -> Result<bool, UpdateError> {
+        self.guard
+            .close_remaining_prepared_windows(Duration::from_secs(45))
+            .map_err(UpdateError::from)
     }
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), source::PrepareError> {
         let mut client = self.preparing_client.take().ok_or_else(|| {
@@ -663,7 +680,7 @@ pub(super) fn quiesce(
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut Survivors,
-    guard: &crate::instance::UiUpdateGuard,
+    guard: &mut crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
     let Some(initial) = &confirmed.daemon else {
         return Ok(());
@@ -783,6 +800,12 @@ fn quiesce_source(
     result.map_err(|error| completed_error(error, &completed, service_stopped, background_tasks))
 }
 
+fn acknowledged_prepare_required() -> UpdateError {
+    invalid(
+        "The installed update requires the source to checkpoint its live work. The current terminal service is still running.",
+    )
+}
+
 fn quiesce_inner(
     state: &Path,
     job: &mut UpdateJob,
@@ -804,6 +827,15 @@ fn quiesce_inner(
             "Session ownership changed before stopping the source; review the update again",
         ));
     }
+    let acknowledged_only = source.preparation_mode() == PreparationMode::AcknowledgedOnly;
+    if acknowledged_only
+        && preview
+            .daemon
+            .as_ref()
+            .is_some_and(impact::DaemonImpact::blocked)
+    {
+        return Err(acknowledged_prepare_required());
+    }
     // Finish the ordinary, cancellable wait before collecting destructive consent.
     if preview.daemon.as_ref().is_some_and(|daemon| {
         daemon
@@ -823,6 +855,9 @@ fn quiesce_inner(
         .daemon
         .as_ref()
         .ok_or_else(|| invalid("The source disappeared during update review"))?;
+    if acknowledged_only && daemon.blocked() {
+        return Err(acknowledged_prepare_required());
+    }
     // Retain the full original census before any floor action can remove a
     // conversation. A later Ready checkpoint contains only its surviving subset.
     source.capture_before_floor(state, job, daemon)?;
@@ -831,10 +866,16 @@ fn quiesce_inner(
     // checkpoint. A refusal has not ended anything and precedes the one stop list.
     if !daemon.blocked() {
         source.begin_preparation(state, job, daemon)?;
+        // A mixed-protocol successor cannot start until the old windows
+        // release their leases. Prove that while the source still serves.
+        let drained_windows = source.close_saved_windows()?;
         confirmation::prepared(state, job)?;
         match source.prepare(daemon) {
             Ok(()) => return source.stopped(state, job, false),
             Err(source::PrepareError::Refused(error)) => {
+                if drained_windows || acknowledged_only {
+                    return Err(error);
+                }
                 confirmation::resume_cancellation(state, job)?;
                 eprintln!("The source could not checkpoint its work: {error}");
                 service = true;
@@ -1188,11 +1229,11 @@ fn floor_record_helper(
     mut record: crate::upgrade::floor::Record,
     capture: bool,
 ) -> Result<File, UpdateError> {
-    let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
+    let helper = crate::companion::Product::Daemon.beside(&crate::process::current_executable()?)?;
     let mut file = anonymous_file()?;
     file.write_all(&record.encode_capture().map_err(invalid)?)?;
+    let mut file = seal_file(file)?;
     file.seek(SeekFrom::Start(0))?;
-    seal_file(&file)?;
     let fd = file.as_raw_fd();
     let mut command = Command::new(helper);
     crate::install_guard::sanitize_child_environment(&mut command);
@@ -1202,7 +1243,7 @@ fn floor_record_helper(
         } else {
             "--retain-update-floor"
         })
-        .arg(format!("/proc/self/fd/{fd}"));
+        .arg(crate::descriptor::inherited_file_path(fd));
     candidate::inherit(&mut command, fd);
     guard.inherit_for_install(&mut command)?;
     bounded_command(
@@ -1240,6 +1281,7 @@ fn archive_checkpoint() -> Result<(), UpdateError> {
 /// shutdown are still visible. Shared user/application cgroups grant no link.
 #[derive(Default)]
 pub(super) struct Survivors {
+    preparation_mode: PreparationMode,
     ended: BTreeMap<(impact::SessionKind, TerminalId), super::floor_display::StopItem>,
     service_stopped: bool,
     source_prepared: bool,
@@ -1248,6 +1290,7 @@ pub(super) struct Survivors {
     recovery_capture_error: Option<String>,
     receipt: Option<crate::upgrade::recovery::Receipt>,
     recovery_outcome: Option<crate::upgrade::recovery::RecoveryOutcome>,
+    verified_paused_history: BTreeSet<TerminalId>,
     successor_target: Option<PathBuf>,
     interrupted: BTreeMap<(impact::SessionKind, TerminalId), InterruptedTurn>,
     unconfirmed_interrupts: BTreeMap<(impact::SessionKind, TerminalId), String>,
@@ -1280,11 +1323,14 @@ impl PreparationEvidence {
 
 struct InterruptedTurn {
     label: String,
-    recovery: String,
     background_tasks: BTreeSet<String>,
 }
 
 impl Survivors {
+    #[cfg(target_os = "macos")]
+    pub(super) fn require_acknowledged_preparation(&mut self) {
+        self.preparation_mode = PreparationMode::AcknowledgedOnly;
+    }
     /// Run only after the original daemon exited and its exact lease was
     /// acquired. A foreign or changed Prepared checkpoint never authorizes a
     /// normal startup, even if the original prepare was acknowledged.
@@ -1326,11 +1372,32 @@ impl Survivors {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn authorize_standby_successor(
+        &mut self,
+        target: &Path,
+        handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
+    ) -> Result<(), UpdateError> {
+        let handoff =
+            handoff.ok_or_else(|| invalid("The source did not transfer its runtime lease"))?;
+        let captured = self.captured_preparation.take().ok_or_else(|| {
+            invalid("The source did not acknowledge this installed cutover's original checkpoint")
+        })?;
+        self.receipt = Some(captured.standby_receipt(target, handoff).map_err(invalid)?);
+        self.successor_target = Some(target.to_owned());
+        Ok(())
+    }
+
     pub(super) fn inherit_recovery(&self, command: &mut Command) -> Result<(), UpdateError> {
         if let Some(receipt) = &self.receipt {
             receipt.inherit(command)?;
         }
         Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn recovery_receipt(&self) -> Option<&crate::upgrade::recovery::Receipt> {
+        self.receipt.as_ref()
     }
 
     /// Bind the target CLI's proof to the exact daemon selected for this update.
@@ -1358,6 +1425,11 @@ impl Survivors {
             return Ok(());
         };
         if let Some(receipt) = &self.receipt {
+            #[cfg(target_os = "macos")]
+            if receipt.is_ready() {
+                self.successor_serving = true;
+                return Ok(());
+            }
             self.recovery_outcome = Some(receipt.verify_successor(serving).map_err(invalid)?);
         }
         self.successor_serving = true;
@@ -1367,6 +1439,29 @@ impl Survivors {
     pub(super) fn release_recovery_reservation(&mut self) {
         if let Some(receipt) = &mut self.receipt {
             receipt.release_daemon_reservation();
+        }
+    }
+
+    pub(super) fn record_verified_pauses(
+        &mut self,
+        outcome: &recovery::Outcome,
+        has_recorded_chat: impl FnMut(&TerminalId) -> bool,
+    ) {
+        if let recovery::Outcome::Usable {
+            paused_chats,
+            paused_terminals,
+            ..
+        } = outcome
+        {
+            self.verified_paused_history = paused_chats
+                .iter()
+                .copied()
+                .filter(has_recorded_chat)
+                .collect();
+            self.recovery_outcome = Some(crate::upgrade::recovery::RecoveryOutcome {
+                paused_chats: paused_chats.clone(),
+                paused_terminals: paused_terminals.clone(),
+            });
         }
     }
 
@@ -1391,23 +1486,30 @@ impl Survivors {
         if outcome.paused_chats.is_empty() && outcome.paused_terminals.is_empty() {
             return String::new();
         }
-        let mut report = String::from("\nPaused after update recovery:\n");
+        let mut report = String::new();
         for id in &outcome.paused_chats {
+            if self
+                .ended
+                .contains_key(&(impact::SessionKind::NativeChat, *id))
+            {
+                continue;
+            }
             let label = self
                 .labels
                 .get(id)
                 .map(String::as_str)
                 .unwrap_or("Conversation");
-            let recorded = self.prepared_source.as_ref().is_some_and(|evidence| {
-                evidence.census.chats.iter().any(|chat| {
-                    chat.id == *id
-                        && chat
-                            .launch
-                            .session_id
-                            .as_ref()
-                            .is_some_and(|id| !id.trim().is_empty())
-                })
-            });
+            let recorded = self.verified_paused_history.contains(id)
+                || self.prepared_source.as_ref().is_some_and(|evidence| {
+                    evidence.census.chats.iter().any(|chat| {
+                        chat.id == *id
+                            && chat
+                                .launch
+                                .session_id
+                                .as_ref()
+                                .is_some_and(|id| !id.trim().is_empty())
+                    })
+                });
             let action = if recorded {
                 "open its tab to continue"
             } else {
@@ -1416,6 +1518,12 @@ impl Survivors {
             report.push_str(&format!("  {label}: {action}\n"));
         }
         for id in &outcome.paused_terminals {
+            if self
+                .ended
+                .contains_key(&(impact::SessionKind::Terminal, *id))
+            {
+                continue;
+            }
             let label = self
                 .labels
                 .get(id)
@@ -1423,7 +1531,11 @@ impl Survivors {
                 .unwrap_or("Terminal");
             report.push_str(&format!("  {label}: reopen a terminal to continue\n"));
         }
-        report
+        if report.is_empty() {
+            report
+        } else {
+            format!("\nPaused after update recovery:\n{report}")
+        }
     }
 
     fn record_interrupt_requests(
@@ -1474,19 +1586,10 @@ impl Survivors {
                 .unwrap_or(&session.title)
                 .clone();
             self.unconfirmed_interrupts.remove(&key);
-            let recovery = reviewed
-                .stopped
-                .iter()
-                .find(|pane| pane.pane == session.id)
-                .map_or_else(
-                    || "its saved conversation was kept".to_owned(),
-                    |pane| format!("after the update: {}. {}", pane.reason, pane.recovery),
-                );
             self.interrupted
                 .entry(key)
                 .or_insert_with(|| InterruptedTurn {
                     label,
-                    recovery,
                     background_tasks: session.interrupted_subagents.iter().cloned().collect(),
                 });
         }
@@ -1505,20 +1608,8 @@ impl Survivors {
         if !turns.is_empty() {
             report.push_str("\nCurrent turns interrupted:\n");
         }
-        for ((_, id), turn) in &turns {
-            let recovery = if self
-                .recovery_outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.paused_chats.contains(id))
-            {
-                "its conversation is paused after recovery"
-            } else {
-                &turn.recovery
-            };
-            report.push_str(&format!(
-                "  {}: current turn interrupted; {}\n",
-                turn.label, recovery
-            ));
+        for (_, turn) in &turns {
+            report.push_str(&format!("  {}\n", turn.label));
         }
         for ((_, id), turn) in &self.interrupted {
             if self.late_turns.contains(id) {

@@ -51,7 +51,6 @@ host = [
     "dep:image",
     "dep:ksni",
     "dep:libghostty-vt",
-    "dep:notify",
     "dep:portable-pty",
     "dep:rusqlite",
     "dep:tokio",
@@ -74,7 +73,6 @@ ui = [
     "image/tiff",
     "dep:jiff",
     "dep:libcosmic",
-    "dep:notify",
     "dep:rusqlite",
     "dep:tokio",
     "dep:tracing-subscriber",
@@ -127,7 +125,6 @@ unicode-casefold = { version = "0.2", optional = true }
 unicode-segmentation = { version = "1.13.3", optional = true }
 arc-swap = "1.7"
 async-channel = { version = "2.5", optional = true }
-ashpd = { version = "0.12.3", default-features = false, features = ["tokio"], optional = true }
 base64 = "0.22"
 bitflags = { version = "2.9", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -136,6 +133,7 @@ crossbeam-channel = "0.5"
 directories = "6.0"
 # Verifies the signature on a release's metadata before an update trusts it.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+errno = "0.3"
 # The one-time key a phone pairs with; already in the graph through uuid.
 getrandom = "0.4"
 glob = "0.3.4"
@@ -146,11 +144,12 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "markdown", "multi-window", "surface-message", "tokio", "wgpu", "winit", "xdg-portal"], optional = true }
 imara-diff = "0.2.0"
-ksni = { version = "0.3.6", optional = true }
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
-notify = { version = "=9.0.0-rc.8", optional = true }
+notify = "=9.0.0-rc.8"
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
+# The mobile bridge validates PNG bytes before staging an attachment.
+png = "0.18"
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
 # binary payload; a self-describing text format costs ~24x more bytes and one
 # heap allocation per character cell on both sides. postcard is already in the
@@ -172,7 +171,7 @@ sha2 = "0.10"
 thiserror = "2.0"
 # Atomic settings writes are shared by CLI, daemon, and UI.
 tempfile = "3.21"
-tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"], optional = true }
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 toml = { version = "1.1.4", features = ["preserve_order"] }
@@ -186,8 +185,15 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 # used by iced, without requiring a display server or affecting CLI/host lanes.
 accesskit_unix = { version = "0.18.0", git = "https://github.com/wash2/accesskit", tag = "cosmic-0.14", default-features = false, features = ["tokio"], optional = true }
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["wayland", "x11"], optional = true }
-# Only Linux enables the portal's Wayland handle integration.
-ashpd = { version = "0.12.3", default-features = false, features = ["wayland"], optional = true }
+# Desktop integration over D-Bus: portals, notifications and the tray. macOS
+# opens with open(1) and has no tray yet.
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"], optional = true }
+ksni = { version = "0.3.6", optional = true }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# Exact recovery repeatedly authenticates large executable images. This
+# version selects the arm64 SHA instructions in Rust without a C build.
+sha2-image = { package = "sha2", version = "0.11" }
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["test-util"] }
@@ -200,6 +206,20 @@ debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1
 
+# Parallelize LLVM for the workspace crates on the release build's critical
+# path while keeping the dependency profile and cross-crate LTO.
+[profile.release.package.cagents]
+codegen-units = 16
+
+[profile.release.package.cagents-host]
+codegen-units = 16
+
+[profile.release.package.cagents-ui]
+codegen-units = 16
+
+[profile.release.package.cagents-ui-kit]
+codegen-units = 16
+
 # Production builds for this workstation: release identity and optimization,
 # without the whole-crate code generation that makes each release take tens of
 # minutes. `scripts/install-local` uses it; published releases keep `release`.
@@ -208,6 +228,20 @@ inherits = "release"
 lto = false
 codegen-units = 256
 incremental = true
+
+# Package overrides are inherited from release and outrank the profile-wide
+# setting, so keep these crates incremental at the same partition size.
+[profile.local.package.cagents]
+codegen-units = 256
+
+[profile.local.package.cagents-host]
+codegen-units = 256
+
+[profile.local.package.cagents-ui]
+codegen-units = 256
+
+[profile.local.package.cagents-ui-kit]
+codegen-units = 256
 
 [profile.dev.package."*"]
 debug = 0

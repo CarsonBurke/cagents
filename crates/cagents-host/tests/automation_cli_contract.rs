@@ -29,6 +29,10 @@ impl Fixture {
         let mut command = Command::new(program);
         command
             .env_clear()
+            .envs(
+                std::env::var_os(cagents::agent_execution::AUTHORITY_ENV)
+                    .map(|authority| (cagents::agent_execution::AUTHORITY_ENV, authority)),
+            )
             .env("HOME", root.join("home"))
             .env("XDG_RUNTIME_DIR", root.join("run"))
             .env("XDG_DATA_HOME", root.join("data"))
@@ -78,6 +82,23 @@ impl Fixture {
 
     fn new() -> Self {
         Self::with_soft_limit(None)
+    }
+
+    fn data_directory(&self) -> std::path::PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            self.root
+                .path()
+                .join("data")
+                .join(cagents::instance::STORAGE_NAME)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.root
+                .path()
+                .join("home/Library/Application Support")
+                .join(format!("dev.cagents.{}", cagents::instance::STORAGE_NAME))
+        }
     }
 
     fn with_soft_limit(soft_limit: Option<libc::rlim_t>) -> Self {
@@ -185,6 +206,10 @@ impl Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn daemon_stop_then_start_waits_for_the_original_process_to_exit() {
     if retained_fixture::run_isolated() {
         return;
@@ -216,6 +241,10 @@ fn a_live_process_without_a_control_reply_is_not_ready() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it() {
     if retained_fixture::run_isolated() {
         return;
@@ -452,7 +481,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn precheck_shell_keeps_incoming_limits_while_daemon_retains_raised_limit() {
+fn precheck_preserves_shell_limits_and_requires_cleanup_ownership() {
     let mut incoming: libc::rlimit = unsafe { std::mem::zeroed() };
     assert_eq!(
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut incoming) },
@@ -500,10 +529,24 @@ fn precheck_shell_keeps_incoming_limits_while_daemon_retains_raised_limit() {
     ]);
     let firing = accepted["firing"]["id"].as_str().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
+    #[cfg(target_os = "linux")]
+    let expected_state = "skipped";
+    #[cfg(target_os = "macos")]
+    let expected_state = "interrupted";
     loop {
         let detail = fixture.cli(&["automation", "run", firing]);
-        if detail["run"]["firing"]["state"] == "skipped" {
+        if detail["run"]["firing"]["state"] == expected_state {
             assert!(detail["run"]["run"].is_null());
+            // Darwin cannot guarantee that a precheck's escaped descendants
+            // are gone. The supervisor must refuse before running the shell.
+            #[cfg(target_os = "macos")]
+            assert!(
+                detail["run"]["firing"]["diagnostic"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cleanup receipt"),
+                "{detail}"
+            );
             break;
         }
         assert!(
@@ -512,34 +555,42 @@ fn precheck_shell_keeps_incoming_limits_while_daemon_retains_raised_limit() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    let limit_text = |limit: libc::rlim_t| {
-        if limit == libc::RLIM_INFINITY {
-            "unlimited".to_owned()
-        } else {
-            limit.to_string()
-        }
-    };
-    assert_eq!(
-        fs::read_to_string(project.join("soft-limit"))
+    #[cfg(target_os = "linux")]
+    {
+        let limit_text = |limit: libc::rlim_t| {
+            if limit == libc::RLIM_INFINITY {
+                "unlimited".to_owned()
+            } else {
+                limit.to_string()
+            }
+        };
+        assert_eq!(
+            fs::read_to_string(project.join("soft-limit"))
+                .unwrap()
+                .trim(),
+            limit_text(soft_limit)
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("hard-limit"))
+                .unwrap()
+                .trim(),
+            limit_text(incoming.rlim_max)
+        );
+        let daemon_limits =
+            fs::read_to_string(format!("/proc/{}/limits", fixture.daemon.id())).unwrap();
+        let mut fields = daemon_limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max open files"))
             .unwrap()
-            .trim(),
-        limit_text(soft_limit)
-    );
-    assert_eq!(
-        fs::read_to_string(project.join("hard-limit"))
-            .unwrap()
-            .trim(),
-        limit_text(incoming.rlim_max)
-    );
-    let daemon_limits =
-        fs::read_to_string(format!("/proc/{}/limits", fixture.daemon.id())).unwrap();
-    let mut fields = daemon_limits
-        .lines()
-        .find_map(|line| line.strip_prefix("Max open files"))
-        .unwrap()
-        .split_whitespace();
-    assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
-    assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
+            .split_whitespace();
+        assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
+        assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(!project.join("soft-limit").exists());
+        assert!(!project.join("hard-limit").exists());
+    }
     let mut unchanged: libc::rlimit = unsafe { std::mem::zeroed() };
     assert_eq!(
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut unchanged) },
@@ -584,11 +635,7 @@ fn run_attention_rejected_by_the_journal_survives_a_killed_daemon() {
         .as_u64()
         .unwrap()
         .to_string();
-    let data = fixture
-        .root
-        .path()
-        .join("data")
-        .join(cagents::instance::STORAGE_NAME);
+    let data = fixture.data_directory();
     let journal = data.join("agent-attention.sqlite3");
     let source = data.join("workspace-model.sqlite3");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -732,6 +779,10 @@ fn run_attention_rejected_by_the_journal_survives_a_killed_daemon() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_and_removal() {
     if retained_fixture::run_isolated() {
         return;

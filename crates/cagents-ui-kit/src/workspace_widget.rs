@@ -133,7 +133,12 @@ impl ShortcutScope {
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => focused == FocusedPane::Chat,
-            Self::Inspector => !matches!(focused, FocusedPane::NoInspector | FocusedPane::None),
+            Self::Inspector => !matches!(
+                focused,
+                FocusedPane::NoInspector
+                    | FocusedPane::None
+                    | FocusedPane::Browser { inspector: false }
+            ),
         }
     }
 }
@@ -151,6 +156,10 @@ pub enum FocusedPane {
     /// which belongs to no worktree, or a browser outside a worktree's
     /// workspace, which has no worktree to show.
     NoInspector,
+    /// An embedded browser page, which takes every key it is given for the
+    /// page; `inspector` is whether the pane offers one, as a browser outside
+    /// a worktree's workspace does not.
+    Browser { inspector: bool },
     /// Any other pane.
     Other,
     /// No pane has focus.
@@ -1047,23 +1056,27 @@ pub fn recordable_shortcut_character(
     })
 }
 
-/// Whether a chord is undo or redo (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y) pressed in
-/// a chat pane, whose message editor has an undo history of its own.
+/// Whether a chord is undo or redo (primary+Z, primary+Shift+Z, primary+Y,
+/// the primary modifier being Ctrl on Linux and Cmd on macOS) pressed in a
+/// pane that can hold a text editor with an undo history of its own: a
+/// chat's message editor, a review comment, a file being edited.
 ///
 /// The pane's content sees such a chord before the workspace does: the
 /// focused editor takes it, and the workspace's action bound to the same
-/// chord, such as reopening a closed pane on Ctrl+Shift+Z, runs only when
-/// nothing there took it ([`deferred_shortcut_taken`]).
+/// chord, such as reopening a closed pane on primary+Shift+Z, runs only when
+/// nothing there took it ([`deferred_shortcut_taken`]). A terminal and a
+/// browser page are left out: each takes every key for its program, so the
+/// chord would never reach the workspace.
 pub(crate) fn defers_to_focused_editor(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     focused: FocusedPane,
 ) -> bool {
-    focused == FocusedPane::Chat
-        && modifiers.command()
-        && !modifiers.alt()
-        && !modifiers.logo()
+    !matches!(
+        focused,
+        FocusedPane::Terminal | FocusedPane::Browser { .. } | FocusedPane::None
+    ) && crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
         && match latin_key(key, physical_key) {
             Some('z') => true,
             Some('y') => !modifiers.shift(),

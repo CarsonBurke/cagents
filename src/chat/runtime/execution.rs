@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     agent_execution::{MAX_RESULT_BYTES, ResultSummary, State, Update},
-    chat::{Event, ItemContent, Role, Usage},
+    chat::{Event, ItemContent, Phase, Role, Usage},
     model::RunId,
     notifications::Kind,
 };
@@ -112,16 +112,21 @@ impl Tracker {
             return;
         };
         match event {
-            Event::Item(item) if item.role == Role::Assistant => {
-                if let ItemContent::Text {
+            Event::Item(item) if item.role == Role::Assistant => match &item.content {
+                // The agent's progress notes between steps are not its
+                // reply. Their streamed text carries no phase, so what it
+                // added goes once the item says what it is.
+                ItemContent::Text {
+                    phase: Phase::Commentary,
+                    ..
+                } => capture.remove(&item.id),
+                ItemContent::Text {
                     text,
                     thinking: false,
                     ..
-                } = &item.content
-                {
-                    capture.put(&item.id, text, false);
-                }
-            }
+                } => capture.put(&item.id, text, false),
+                _ => {}
+            },
             Event::TextDelta {
                 id,
                 role: Role::Assistant,
@@ -130,11 +135,8 @@ impl Tracker {
             } => capture.put(id, delta, true),
             Event::ItemsRemoved { ids } => {
                 for id in ids {
-                    if let Some(text) = capture.text.remove(id) {
-                        capture.bytes -= text.len();
-                    }
+                    capture.remove(id);
                 }
-                capture.order.retain(|id| !ids.contains(id));
             }
             Event::Error { message, .. } => {
                 capture.diagnostic =
@@ -224,6 +226,13 @@ impl Capture {
         entry.push_str(part);
         self.bytes += part.len();
     }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(text) = self.text.remove(id) {
+            self.bytes -= text.len();
+            self.order.retain(|known| known != id);
+        }
+    }
 }
 
 fn bounded(text: &str, limit: usize) -> &str {
@@ -245,6 +254,55 @@ mod tests {
             thinking: false,
             delta: delta.into(),
         }
+    }
+
+    fn item(id: &str, body: &str, thinking: bool, phase: Phase) -> Event {
+        Event::Item(crate::chat::Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking,
+                phase,
+            },
+            started_at: None,
+            at: None,
+        })
+    }
+
+    #[test]
+    fn progress_notes_and_thinking_are_left_out_of_the_reply() {
+        let mut tracker = Tracker::default();
+        let run = RunId::new();
+        tracker.start(run, "provider-request".into()).unwrap();
+        for event in [
+            item("thought", "Weighing it.", true, Phase::Final),
+            // Claude's narration arrives whole, after streaming as thinking.
+            item(
+                "narration",
+                "Checking the log next.",
+                false,
+                Phase::Commentary,
+            ),
+            // Codex streams a note's text before saying it is one.
+            text("note", "Looking at the "),
+            text("note", "settings next."),
+            item(
+                "note",
+                "Looking at the settings next.",
+                false,
+                Phase::Commentary,
+            ),
+            text("answer", "The warning is harmless."),
+            item("answer", "The warning is harmless.", false, Phase::Final),
+        ] {
+            tracker.observe(run, &event);
+        }
+        let updates = tracker.ended(false, Some(0), Usage::default());
+        let [(_, Update::Finished { result, .. })] = updates.as_slice() else {
+            panic!("expected one finished run")
+        };
+        assert_eq!(result.text, "The warning is harmless.");
     }
 
     #[test]

@@ -1,12 +1,102 @@
 //! A locally installed matched set uses the same review and checkpoint flow.
 use super::*;
 
-const BINARIES: [&str; 3] = ["cagents", "cagents-ui", "cagentsd"];
+const DAEMON_BINARY: &str = "cagentsd";
+const BINARIES: [&str; 3] = ["cagents", "cagents-ui", DAEMON_BINARY];
+pub(super) const LOCAL_STAGE_MARKER: &str = ".cagents-local-candidate-v1";
+const LOCAL_SOURCE_MARKER: &str = ".cagents-local-source-v1";
 
 #[derive(PartialEq, Eq)]
-struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
+pub(super) struct Selection {
+    current: PathBuf,
+    previous_link: Option<PathBuf>,
+}
 
-fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
+impl Selection {
+    #[cfg(target_os = "linux")]
+    pub(super) fn previous_link(&self) -> Option<&Path> {
+        self.previous_link.as_deref()
+    }
+    pub(super) fn capture(candidate: &InstallLayout) -> Result<Self, UpdateError> {
+        let current = served_version_root(candidate)?;
+        if current == candidate.version_root {
+            return Ok(Self {
+                current,
+                previous_link: None,
+            });
+        }
+        let prior = read_private(&candidate.version_root.join(LOCAL_STAGE_MARKER), 256)?;
+        let previous_link = fs::read_link(candidate.prefix.join("current"))?;
+        if !current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| prior.strip_suffix(b"\n") == Some(name.as_bytes()))
+            || served_version_root(candidate)? != current
+        {
+            return Err(invalid(
+                "The public installation changed since this build was staged",
+            ));
+        }
+        Ok(Self {
+            current,
+            previous_link: Some(previous_link),
+        })
+    }
+
+    pub(super) fn prepare(
+        &self,
+        candidate: &InstallLayout,
+    ) -> Result<Option<crate::install_guard::CurrentExchange>, UpdateError> {
+        if *self != Self::capture(candidate)? {
+            return Err(invalid(
+                "The installed application changed; review the new build before updating",
+            ));
+        }
+        self.previous_link
+            .as_deref()
+            .map(|expected| {
+                let link = Path::new("versions").join(&candidate.version);
+                crate::install_guard::CurrentExchange::prepare(&candidate.prefix, &link, expected)
+                    .map_err(UpdateError::from)
+            })
+            .transpose()
+    }
+}
+
+pub(super) fn complete_selection(
+    switch: Option<crate::install_guard::CurrentExchange>,
+    candidate: &InstallLayout,
+) -> Result<(), UpdateError> {
+    if let Some(switch) = switch {
+        switch.commit()?;
+        match fs::rename(
+            candidate.version_root.join(LOCAL_STAGE_MARKER),
+            candidate.version_root.join(LOCAL_SOURCE_MARKER),
+        ) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => eprintln!("Could not retire the local staging marker: {error}"),
+        }
+    }
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Stamp {
+    fn daemon_inode(&self) -> (u64, u64) {
+        let index = BINARIES
+            .iter()
+            .position(|&binary| binary == DAEMON_BINARY)
+            .unwrap();
+        let (device, inode, ..) = self.0[index];
+        (device, inode)
+    }
+}
+
+pub(super) fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     let mut entries = Vec::new();
     for binary in BINARIES {
         let metadata = fs::symlink_metadata(root.join("bin").join(binary))?;
@@ -31,15 +121,24 @@ fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     Ok(Stamp(entries))
 }
 
-fn digest(root: &Path) -> Result<String, UpdateError> {
+pub(super) fn digest(root: &Path, binaries: &[&str]) -> Result<String, UpdateError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
-    for binary in BINARIES {
+    for binary in binaries {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(root.join("bin").join(binary))?;
-        let size = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(invalid("installed binary is not an owned regular file"));
+        }
+        let size = metadata.len();
         if size > ARCHIVE_LIMIT {
             return Err(invalid("installed binary exceeds update size limit"));
         }
@@ -66,24 +165,50 @@ fn digest(root: &Path) -> Result<String, UpdateError> {
         .collect())
 }
 
+pub(super) enum Candidate<'a> {
+    Local(&'a Path),
+    #[cfg(target_os = "macos")]
+    Release(&'a super::release_stage::VerifiedCandidate),
+}
+
+impl Candidate<'_> {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Local(root) => root,
+            #[cfg(target_os = "macos")]
+            Self::Release(release) => &release.root,
+        }
+    }
+
+    fn digest(&self) -> Result<String, UpdateError> {
+        match self {
+            Self::Local(root) => digest(root, &BINARIES),
+            #[cfg(target_os = "macos")]
+            Self::Release(release) => release.digest(),
+        }
+    }
+}
+
 pub(super) fn perform(
     installation: &Installation,
     state: &Path,
     job: &mut UpdateJob,
-    root: &Path,
+    candidate: Candidate<'_>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
     terminal: bool,
 ) -> Result<Completion, UpdateError> {
-    let layout = locate(&std::env::current_exe()?)?;
+    let root = candidate.root();
+    let layout = locate(&crate::process::current_executable()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
     let source_owner = installed_daemon_owner(&layout)?;
-    if served_version_root(&layout)? != root {
+    if layout.version_root != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
     }
+    let selection = Selection::capture(&layout)?;
     set_phase(
         state,
         job,
@@ -91,26 +216,22 @@ pub(super) fn perform(
         "Verifying the installed application set",
     )?;
     let before = stamp(root)?;
-    let identity = digest(root)?;
-    let mut executable = anonymous_file()?;
-    let mut source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root.join("bin/cagents"))?;
-    io::copy(
-        &mut Read::by_ref(&mut source).take(512 * 1024 * 1024 + 1),
-        &mut executable,
-    )?;
-    if executable.metadata()?.len() > 512 * 1024 * 1024 {
-        return Err(invalid("installed CLI exceeds update size limit"));
-    }
-    seal_file(&executable)?;
+    let identity = candidate.digest()?;
     let cancellation = CancellationToken::for_job(state, &job.id)?;
-    let staged =
-        candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
+    let staged = candidate::Staged::from_installed(
+        root.join("bin/cagents"),
+        job.version.clone(),
+        identity,
+        &cancellation,
+    )?;
+    if stamp(root)? != before {
+        return Err(invalid(
+            "the installed application changed during verification",
+        ));
+    }
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
-        if served_version_root(&layout)? != root || stamp(root)? != before {
+        if Selection::capture(&layout)? != selection || stamp(root)? != before {
             return Err(invalid(
                 "the installed application changed; review the new build before updating",
             ));
@@ -126,7 +247,12 @@ pub(super) fn perform(
         .as_ref()
         .is_some_and(|owner| owner.version_root != root);
     let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
-    let context = ReviewContext::capture(installation)?;
+    let selected_version = selection
+        .current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(unsupported_install)?;
+    let context = ReviewContext::capture(selected_version)?;
     let confirmed = confirmation::wait(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
@@ -140,7 +266,7 @@ pub(super) fn perform(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
-    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    guard.prepare_windows(Duration::from_secs(45))?;
     {
         let inspected = crate::install_guard::preflight_source_panes(
             &guard,
@@ -159,7 +285,7 @@ pub(super) fn perform(
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
         if !confirmed.preserves_consent(&context.apply(latest))
-            || digest(root).map_err(io::Error::other)? != staged.identity.digest
+            || candidate.digest().map_err(io::Error::other)? != staged.identity.digest
         {
             return Err(invalid(
                 "The installed build or session ownership changed during pane inspection; existing windows were kept open",
@@ -167,7 +293,42 @@ pub(super) fn perform(
         }
     }
     confirmation::check_cancelled(state, job)?;
-    let output = StartupOutput::create(state)?;
+    #[cfg(target_os = "linux")]
+    let parks_successor = confirmed.replaces_daemon
+        || (selection.previous_link.is_some() && confirmed.daemon.is_none());
+    #[cfg(target_os = "macos")]
+    let parks_successor = confirmed.replaces_daemon && selection.previous_link.is_some();
+    #[cfg(target_os = "macos")]
+    if parks_successor {
+        survivors.require_acknowledged_preparation();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let parks_successor = false;
+    let switch = if parks_successor {
+        None
+    } else {
+        selection.prepare(&layout)?
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut standby = parks_successor
+        .then(|| {
+            crate::daemon::standby::Parked::launch(
+                &root.join("bin").join(DAEMON_BINARY),
+                before.daemon_inode(),
+                &guard,
+                selection.previous_link.as_deref(),
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            invalid(format!("The replacement terminal service could not start. Your current workspace is still open. {error}"))
+        })?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if standby.is_some() && stamp(root)? != before {
+        return Err(invalid(
+            "The installed application changed before the replacement could start",
+        ));
+    }
     let mut startup_attempted = false;
     let mut startup_owned = false;
     let mut previous = None;
@@ -179,7 +340,7 @@ pub(super) fn perform(
             let source =
                 crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
                     .map_err(|error| invalid(error.to_string()))?;
-            let executable = fs::read_link(format!("/proc/{}/exe", source.pid))?;
+            let executable = source.executable()?;
             let owner = locate(&executable)?;
             if owner.prefix != installation.prefix
                 || source.exited()?
@@ -192,6 +353,13 @@ pub(super) fn perform(
             }
             previous = (owner.version_root != root).then_some(owner.version_root);
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(standby) = standby.as_mut() {
+            standby.check_running()?;
+            if Selection::capture(&layout)? != selection {
+                return Err(invalid("The public installation changed before handoff"));
+            }
+        }
         recovery.shutdown_requested = confirmed.replaces_daemon;
         floor::quiesce(
             state,
@@ -201,22 +369,60 @@ pub(super) fn perform(
             |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
             handoff,
             survivors,
-            &guard,
+            &mut guard,
         )?;
         if previous.is_some()
+            && (!cfg!(target_os = "macos") || !parks_successor)
             && let Some(lease) = handoff.as_ref()
         {
             original_schema = Some(stopped_store_schema(root, &guard, lease)?);
         }
-        survivors.authorize_successor(&root.join("bin/cagentsd"), None, handoff.as_ref())?;
+        let daemon = root.join("bin/cagentsd");
+        #[cfg(target_os = "macos")]
+        if standby.is_some() {
+            survivors.authorize_standby_successor(&daemon, handoff.as_ref())?;
+        } else {
+            survivors.authorize_successor(&daemon, None, handoff.as_ref())?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        survivors.authorize_successor(&daemon, None, handoff.as_ref())?;
         confirmation::prepared(state, job)?;
-        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
+        guard.close_remaining_prepared_windows(Duration::from_secs(45))?;
         set_phase(
             state,
             job,
             UpdatePhase::Installing,
             "Starting the installed application",
         )?;
+        let timeout = crate::install_guard::daemon_start_timeout()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(standby) = standby.as_mut() {
+            let pid = standby.pid();
+            let daemon = root.join("bin").join(DAEMON_BINARY);
+            if confirmed.daemon.is_some() && handoff.is_none() {
+                return Err(invalid(
+                    "The replacement did not receive the terminal service lease",
+                ));
+            }
+            startup_attempted = true;
+            startup_owned = true;
+            standby
+                .activate(
+                    &daemon,
+                    handoff.as_ref(),
+                    survivors.recovery_receipt(),
+                    timeout,
+                    || {
+                        let _ = report_overdue_startup(state, job);
+                    },
+                )
+                .map_err(|error| {
+                    invalid(format!(
+                        "The replacement terminal service did not confirm startup: {error}"
+                    ))
+                })?;
+            return confirm_daemon_ready(&daemon, Some(pid), timeout);
+        }
         let mut command = Command::new(
             root.join("bin")
                 .join(crate::companion::Product::Cli.file_name()),
@@ -224,13 +430,13 @@ pub(super) fn perform(
         command.args(["--json", "daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
         unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        let output = StartupOutput::create(state)?;
         output.attach(&mut command)?;
         guard.inherit_for_install(&mut command)?;
         if let Some(handoff) = handoff.as_ref() {
             handoff.inherit(&mut command)?;
         }
         survivors.inherit_recovery(&mut command)?;
-        let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
         let started = wait_for_daemon_start(&mut command, timeout, state, job);
         startup_owned = started.as_ref().err().is_none_or(|failure| failure.spawned);
@@ -249,17 +455,62 @@ pub(super) fn perform(
         }
         // Wait through bounded restoration until the exact successor is
         // Ready, then prove this job's recovery inventory against it.
-        confirm_daemon_ready(&root.join("bin/cagentsd"), timeout)
+        confirm_daemon_ready(&root.join("bin/cagentsd"), None, timeout)
     })();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if result.is_err()
+        && let Some(candidate) = standby.as_mut()
+        && candidate.may_own_runtime()
+    {
+        let daemon = root.join("bin").join(DAEMON_BINARY);
+        let timeout = crate::install_guard::daemon_start_timeout()?;
+        // A missing acknowledgement can race a serving replacement. Only
+        // its authenticated readiness or exact process exit resolves custody.
+        if confirm_daemon_ready(&daemon, Some(candidate.pid()), timeout).is_ok() {
+            result = Ok(());
+        } else if candidate.may_own_runtime() {
+            #[cfg(target_os = "macos")]
+            guard.defer_reopening_to_recovery();
+            #[cfg(target_os = "linux")]
+            guard.set_fallback_executable(root.join("bin/cagents-ui"));
+            guard.set_recovery_restore_only();
+            if selection.previous_link.is_some() {
+                guard.leave_launch_fence_with_successor();
+            }
+            return Err(result.unwrap_err());
+        }
+    }
+    // No parked process should retain a launch-fence copy while closing an
+    // unsuccessful transaction and reopening the old application.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    drop(standby);
+    if result.is_ok() && parks_successor && selection.previous_link.is_some() {
+        result = selected_candidate(&layout.prefix, root);
+    } else if result.is_ok() {
+        result = complete_selection(switch, &layout);
+    }
     announce_primary_failure(&result);
+    #[cfg(target_os = "macos")]
+    if parks_successor && let Err(failure) = result {
+        let previous = previous.as_ref().unwrap_or(&selection.current);
+        if selected_candidate(&layout.prefix, previous).is_ok()
+            && crate::daemon::running_executable()
+                .is_ok_and(|exe| exe == Some(previous.join("bin/cagentsd")))
+        {
+            guard.set_fallback_executable(previous.join("bin/cagents-ui"));
+        } else {
+            guard.defer_reopening_to_recovery();
+        }
+        return Err(failure);
+    }
     let mut restored_previous = false;
     if result.is_err()
         && recovery.shutdown_requested
         && let Some(previous) = previous.as_ref()
     {
         match rollback_stopped_candidate(
-            &installation.prefix,
-            root,
+            &layout,
+            &selection,
             previous,
             original_schema,
             startup_owned,
@@ -308,7 +559,7 @@ pub(super) fn perform(
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
     let handoff_kind =
-        verify_reopened_service(&recovery, state, job, result.is_ok().then_some(&*survivors))?;
+        verify_reopened_service(&recovery, state, job, result.is_ok().then_some(survivors))?;
     finish_reopening_windows(state, job, result, handoff_kind, reopened)
 }
 
@@ -355,20 +606,20 @@ fn stopped_store_schema(
 }
 
 fn rollback_stopped_candidate(
-    prefix: &Path,
-    candidate: &Path,
+    candidate: &InstallLayout,
+    selection: &Selection,
     previous: &Path,
     schema: Option<u32>,
     startup_spawned: bool,
     guard: &crate::instance::UiUpdateGuard,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<bool, UpdateError> {
-    selected_candidate(prefix, candidate)?;
     let paths =
         crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
     if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
         return Ok(false);
     }
+    selected_candidate(&candidate.prefix, &selection.current)?;
     if handoff.is_none() {
         *handoff = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
             .map_err(|error| invalid(error.to_string()))?;
@@ -389,13 +640,15 @@ fn rollback_stopped_candidate(
     if startup_spawned {
         let schema = schema.ok_or_else(|| invalid("The previous store schema was not captured"))?;
         candidate_maintenance(
-            candidate,
+            &candidate.version_root,
             &["daemon", "downgrade-store", &schema.to_string()],
             guard,
             lease,
         )?;
     }
-    restore_current(prefix, candidate, previous)?;
+    if selection.current != previous {
+        restore_current(&candidate.prefix, &selection.current, previous)?;
+    }
     Ok(true)
 }
 
@@ -433,16 +686,21 @@ pub(super) fn restore_current(
 
 /// Listening is not proof that startup restored the reviewed panes. Recovery
 /// deliberately serves inspection while ordinary conversation requests fail.
-fn confirm_daemon_ready(expected: &Path, timeout: Duration) -> Result<(), UpdateError> {
+pub(super) fn confirm_daemon_ready(
+    expected: &Path,
+    pid: Option<u32>,
+    timeout: Duration,
+) -> Result<(), UpdateError> {
     let socket = crate::daemon::RuntimePaths::discover()
         .map_err(|error| invalid(error.to_string()))?
         .socket;
-    confirm_daemon_ready_at(&socket, expected, Instant::now() + timeout)
+    confirm_daemon_ready_at(&socket, expected, pid, Instant::now() + timeout)
 }
 
 fn confirm_daemon_ready_at(
     socket: &Path,
     expected: &Path,
+    pid: Option<u32>,
     deadline: Instant,
 ) -> Result<(), UpdateError> {
     use crate::{control::ControlClient, terminal_ipc::StartupState};
@@ -488,7 +746,9 @@ fn confirm_daemon_ready_at(
     let ownership = |proof: &crate::model::HostSessionProof| {
         let unavailable = || invalid("the confirmed terminal service changed or is unavailable");
         peer.verify(proof).map_err(|_| unavailable())?;
-        if peer.executable().map_err(|_| unavailable())? != expected {
+        if peer.executable().map_err(|_| unavailable())? != expected
+            || pid.is_some_and(|pid| pid != peer.pid())
+        {
             return Err(invalid("the confirmed terminal service changed"));
         }
         Ok(())
@@ -608,13 +868,16 @@ fn wait_for_daemon_start(
     job: &mut UpdateJob,
 ) -> Result<(), crate::install_guard::DaemonStartError> {
     crate::install_guard::wait_daemon_start_with_progress(command, timeout, || {
-        let persisted = set_phase(state, job, UpdatePhase::Installing, WAITING_FOR_STARTUP)
-            .map_err(|error| io::Error::other(error.to_string()));
-        // The CLI worker has no global tracing subscriber. Its ordinary
-        // captured stderr remains useful even if the status file cannot update.
-        let logged = writeln!(io::stderr().lock(), "{WAITING_FOR_STARTUP}");
-        persisted.and(logged)
+        report_overdue_startup(state, job)
     })
+}
+
+pub(super) fn report_overdue_startup(state: &Path, job: &mut UpdateJob) -> io::Result<()> {
+    let persisted = set_phase(state, job, UpdatePhase::Installing, WAITING_FOR_STARTUP)
+        .map_err(|error| io::Error::other(error.to_string()));
+    // The captured stderr remains useful even if the status file cannot update.
+    let logged = writeln!(io::stderr().lock(), "{WAITING_FOR_STARTUP}");
+    persisted.and(logged)
 }
 
 /// Bound on each captured stream: a `daemon start` envelope is well under a
@@ -750,6 +1013,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_staged_selection_is_bound_to_the_public_source_until_it_commits() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().canonicalize().unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for version in ["source", "candidate", "other"] {
+            let bin = prefix.join("versions").join(version).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for binary in BINARIES {
+                fs::write(bin.join(binary), "").unwrap();
+            }
+        }
+        let current = prefix.join("current");
+        symlink("versions/source", &current).unwrap();
+        let candidate = locate(&prefix.join("versions/candidate/bin/cagents")).unwrap();
+        assert!(Selection::capture(&candidate).is_err());
+
+        let marker = candidate.version_root.join(LOCAL_STAGE_MARKER);
+        private_create(&marker)
+            .unwrap()
+            .write_all(b"source\n")
+            .unwrap();
+        let selection = Selection::capture(&candidate).unwrap();
+        drop(selection.prepare(&candidate).unwrap());
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            Path::new("versions/source")
+        );
+        assert!(marker.is_file());
+
+        let switch = selection.prepare(&candidate).unwrap();
+        fs::remove_file(&current).unwrap();
+        symlink("versions/other", &current).unwrap();
+        assert!(complete_selection(switch, &candidate).is_err());
+        assert!(Selection::capture(&candidate).is_err());
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            Path::new("versions/other")
+        );
+        assert!(marker.is_file());
+
+        fs::remove_file(&current).unwrap();
+        symlink("versions/source", &current).unwrap();
+        complete_selection(selection.prepare(&candidate).unwrap(), &candidate).unwrap();
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            Path::new("versions/candidate")
+        );
+        assert!(!marker.exists());
+        assert!(
+            Selection::capture(&candidate)
+                .unwrap()
+                .previous_link
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn stopped_installed_candidate_rolls_back_only_without_a_live_writer() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         const ROOT: &str = "CAGENTS_INSTALLED_ROLLBACK_FIXTURE_ROOT";
@@ -774,6 +1103,15 @@ mod tests {
         let root = PathBuf::from(root);
         let old = root.join("versions/old");
         let candidate = root.join("versions/candidate");
+        let layout = InstallLayout {
+            prefix: root.clone(),
+            version_root: candidate.clone(),
+            version: "candidate".into(),
+        };
+        let published = Selection {
+            current: candidate.clone(),
+            previous_link: None,
+        };
         for version in [&old, &candidate] {
             fs::create_dir_all(version.join("bin")).unwrap();
         }
@@ -800,7 +1138,7 @@ else: raise AssertionError(sys.argv)
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         fs::create_dir_all(&paths.directory).unwrap();
         fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut stopped = Command::new("/bin/true").spawn().unwrap();
+        let mut stopped = Command::new("true").spawn().unwrap();
         let stopped_pid = stopped.id();
         stopped.wait().unwrap();
         let proof = crate::model::HostSessionProof {
@@ -826,8 +1164,8 @@ else: raise AssertionError(sys.argv)
         fs::write(root.join("fail-conversion"), "fail").unwrap();
         assert!(
             rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -840,7 +1178,7 @@ else: raise AssertionError(sys.argv)
         // A command that never spawned cannot have converted the store; old
         // recovery must not depend on invoking that unavailable candidate.
         assert!(
-            rollback_stopped_candidate(&root, &candidate, &old, None, false, &guard, &mut lease,)
+            rollback_stopped_candidate(&layout, &published, &old, None, false, &guard, &mut lease,)
                 .unwrap()
         );
         assert_eq!(root.join("current").canonicalize().unwrap(), old);
@@ -854,8 +1192,8 @@ else: raise AssertionError(sys.argv)
         lock.write_all(&metadata(std::process::id())).unwrap();
         assert!(
             !rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -872,8 +1210,8 @@ else: raise AssertionError(sys.argv)
         lock.write_all(&metadata(stopped_pid)).unwrap();
         assert!(
             rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -888,8 +1226,8 @@ else: raise AssertionError(sys.argv)
         // An independently changed current is rejected before store conversion.
         assert!(
             rollback_stopped_candidate(
-                &root,
-                &candidate,
+                &layout,
+                &published,
                 &old,
                 Some(schema),
                 true,
@@ -899,6 +1237,24 @@ else: raise AssertionError(sys.argv)
             .is_err()
         );
         assert!(!root.join("converted").exists());
+        let private = Selection {
+            current: old.clone(),
+            previous_link: Some(PathBuf::from("versions/old")),
+        };
+        assert!(
+            rollback_stopped_candidate(
+                &layout,
+                &private,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .unwrap()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), old);
+        assert_eq!(fs::read_to_string(root.join("converted")).unwrap(), "23");
     }
 
     #[derive(Clone, Copy)]
@@ -923,13 +1279,10 @@ else: raise AssertionError(sys.argv)
                 StartupState, read_frame, write_frame,
             },
         };
-        use std::{
-            collections::VecDeque,
-            os::unix::net::{UnixListener, UnixStream},
-        };
+        use std::{collections::VecDeque, os::unix::net::UnixStream};
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("cagentsd.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let mut proof = HostSessionProof {
             host_session_id: HostSessionId::new("startup-probe"),
             boot_id: crate::daemon::read_boot_id().unwrap(),
@@ -953,7 +1306,7 @@ else: raise AssertionError(sys.argv)
         }
         let lease_path = root.path().join("cagentsd.lock");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
@@ -1046,7 +1399,7 @@ else: raise AssertionError(sys.argv)
         } else {
             std::env::current_exe().unwrap()
         };
-        let result = confirm_daemon_ready_at(&socket, &executable, Instant::now() + timeout);
+        let result = confirm_daemon_ready_at(&socket, &executable, None, Instant::now() + timeout);
         // A client whose deadline passed before it connected left the
         // fixture waiting to accept; this connection ends that wait.
         drop(UnixStream::connect(&socket));
@@ -1525,12 +1878,12 @@ exit 1"#,
             fs::write(root.join("bin").join(binary), b"first build").unwrap();
         }
         let original_stamp = stamp(&root).unwrap();
-        let original_identity = digest(&root).unwrap();
+        let original_identity = digest(&root, &BINARIES).unwrap();
         let replacement = root.join("bin/replacement");
         fs::write(&replacement, b"other build").unwrap();
         fs::rename(replacement, root.join("bin/cagentsd")).unwrap();
         assert!(stamp(&root).unwrap() != original_stamp);
-        assert_ne!(digest(&root).unwrap(), original_identity);
+        assert_ne!(digest(&root, &BINARIES).unwrap(), original_identity);
         // A different target behind an unchanged version name cannot borrow
         // the previous confirmation through a symlink either.
         fs::remove_file(root.join("bin/cagentsd")).unwrap();

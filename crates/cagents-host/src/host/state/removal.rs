@@ -51,7 +51,7 @@ mod tests {
                 provider: crate::agent::Provider::Muse,
                 session_id: None,
                 recipe: LaunchRecipe {
-                    program: "/bin/true".into(),
+                    program: "/usr/bin/true".into(),
                     arguments: vec![],
                     working_directory: "/fixture".into(),
                     environment: Default::default(),
@@ -134,7 +134,7 @@ mod tests {
             host_incarnation: HostIncarnation::new("incarnation"),
         });
         let launch = LaunchRecipe {
-            program: "/bin/true".into(),
+            program: "/usr/bin/true".into(),
             arguments: vec![],
             working_directory: "/fixture".into(),
             environment: Default::default(),

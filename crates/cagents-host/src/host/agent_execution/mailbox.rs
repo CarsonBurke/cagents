@@ -9,6 +9,12 @@
 //! conversation receives it after its turn. It acts as an execution client,
 //! not as a person, so delivering never takes over a delegated agent.
 //!
+//! What the person wrote during a turn goes before any message: the courier
+//! starts no turn while the provider holds a message they queued, and waits
+//! a while for a window holding follow-ups for a provider with no queue to
+//! send them. Every message waiting for a conversation then arrives in one
+//! prompt, so several cost the conversation one turn rather than one each.
+//!
 //! A conversation a usage limit stops is idle yet takes nothing, so the
 //! courier also judges which ones a limit stops. It holds their messages, and
 //! tells every surface showing such a conversation that it is limited and
@@ -43,6 +49,11 @@ use std::{
 /// across a suspend, which the monotonic wait does not count. With nothing
 /// outstanding the courier sleeps until an edge or the hourly prune.
 const FALLBACK: Duration = Duration::from_secs(15);
+/// The longest the courier waits, once a conversation is idle, for a window
+/// to send the follow-ups the person wrote during its turn, which go before
+/// any message from another session. A window sends them the moment it sees
+/// the turn end; this bounds the wait on one that crashed or cannot.
+const PERSON_FIRST: Duration = Duration::from_secs(20);
 /// How often the courier forgets messages past their retention.
 const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// The shortest handle a session can be named by, so a typo does not reach
@@ -216,6 +227,21 @@ pub(super) fn to_agent(
     };
     if !eligible || previous.is_some() {
         return Ok(None);
+    }
+    // What the person wrote for its conversation goes first, and the message
+    // after it, together with any other waiting, as a person's conversation
+    // takes messages. Writing does not take the agent over; sending does.
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .held_followups
+        .contains_key(&session.id)
+    {
+        return Ok(Some(Handoff::Held {
+            agent: agent.id,
+            reason: "A person wrote its conversation a prompt; it receives the message after that"
+                .into(),
+        }));
     }
     if unverified {
         return Ok(Some(Handoff::Held {
@@ -773,6 +799,9 @@ struct Inner {
     changed: Condvar,
     /// What each conversation's subscribers were last told of its limit.
     limits: Mutex<BTreeMap<TerminalId, Told>>,
+    /// When the courier first found each conversation idle while a window
+    /// held the person's follow-ups for it, in milliseconds since the epoch.
+    yielding: Mutex<BTreeMap<TerminalId, u64>>,
     #[cfg(test)]
     scanned_generation: Mutex<Option<u64>>,
     #[cfg(test)]
@@ -856,6 +885,7 @@ impl Courier {
             state: Mutex::new(WakeState::default()),
             changed: Condvar::new(),
             limits: Mutex::new(BTreeMap::new()),
+            yielding: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             scanned_generation: Mutex::new(None),
             #[cfg(test)]
@@ -1058,11 +1088,12 @@ impl Handle {
         limits
     }
 
-    /// Gives each lineage with a live, idle conversation its oldest waiting
-    /// message. Returns when the courier must look again: when the next held
-    /// reply is released or a known usage limit resets, and soon while a
-    /// message is pending, a conversation is limited or a queued run failed
-    /// to start; `None` when nothing is outstanding.
+    /// Gives each lineage with a live, idle conversation the messages waiting
+    /// for it. Returns when the courier must look again: when the next held
+    /// reply is released, a known usage limit resets or a conversation stops
+    /// waiting for the person's follow-ups, and soon while a message is
+    /// pending, a conversation is limited or a queued run failed to start;
+    /// `None` when nothing is outstanding.
     fn deliver(&self, host: &SharedHost) -> Result<Option<u64>, String> {
         let limits = self.publish_limits(host, super::now());
         let reset = limits
@@ -1071,24 +1102,115 @@ impl Handle {
             .filter(|at| *at >= 0)
             .map(|at| (at as u64).saturating_mul(1000))
             .min();
-        let queued_failed = self.start_queued(host);
+        self.forget_yields(host);
+        let (queued_failed, deferred) = self.start_queued(host);
         let (released, pending) = self.deliver_messages(host, &limits)?;
         let outstanding = (queued_failed || pending || !limits.is_empty())
             .then(|| super::now().saturating_add(FALLBACK.as_millis() as u64));
-        Ok([released, reset, outstanding].into_iter().flatten().min())
+        Ok([released, reset, outstanding, deferred]
+            .into_iter()
+            .flatten()
+            .min())
     }
 
-    /// Starts the prompts agents hold behind work that has since ended.
-    /// Returns whether one failed to start, or the queue could not be read.
-    fn start_queued(&self, host: &SharedHost) -> bool {
-        super::start_queued(host).unwrap_or_else(|error| {
+    /// Starts the prompts agents hold behind work that has since ended,
+    /// except a message that would go before what the person wrote for its
+    /// conversation. Returns whether one failed to start, or the queue could
+    /// not be read, and when to look again for one that waits.
+    fn start_queued(&self, host: &SharedHost) -> (bool, Option<u64>) {
+        let now = super::now();
+        let mut due: Option<u64> = None;
+        let failed = super::start_queued(host, |accepted| {
+            match self.waits_for_person(host, accepted, now) {
+                Some(until) => {
+                    if let Some(until) = until {
+                        due = Some(due.map_or(until, |due| due.min(until)));
+                    }
+                    true
+                }
+                None => false,
+            }
+        })
+        .unwrap_or_else(|error| {
             tracing::warn!(%error, "cannot start queued agent prompts");
             true
-        })
+        });
+        (failed, due)
     }
 
-    /// Returns when the next held reply is released, and whether any message
-    /// is still pending for a recipient.
+    /// Whether `accepted`, a message an agent takes as a run, waits for what
+    /// the person wrote for the agent's idle conversation, and until when if
+    /// it is a window that holds it. `None` when it need not wait.
+    fn waits_for_person(
+        &self,
+        host: &SharedHost,
+        accepted: &crate::agent_execution::Accepted,
+        now: u64,
+    ) -> Option<Option<u64>> {
+        let Some(crate::agent_execution::HostedSession::Chat(session)) = &accepted.agent.session
+        else {
+            return None;
+        };
+        let (handle, held) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state.chats.get(&session.id)?;
+            (
+                record.handle.clone(),
+                state.held_followups.contains_key(&session.id),
+            )
+        };
+        // A conversation at work, or one that has ended, is the run's own
+        // to wait for or reopen.
+        if !handle.is_idle() {
+            return None;
+        }
+        let message = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .run_is_message(accepted.run.id)
+            .unwrap_or(false);
+        if !message {
+            return None;
+        }
+        if !handle.takes_courier() {
+            // The provider holds a message the person queued; its turn ends
+            // in a wake.
+            return Some(None);
+        }
+        held.then(|| self.yields(session.id, now))
+            .flatten()
+            .map(Some)
+    }
+
+    /// Forgets when each conversation began to wait for the person's
+    /// follow-ups once it no longer does: idle, with a window holding them.
+    /// The next time it does, it waits as long again.
+    fn forget_yields(&self, host: &SharedHost) {
+        let held: Vec<(TerminalId, chat::runtime::Handle)> = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .held_followups
+                .keys()
+                .filter_map(|id| Some((*id, state.chats.get(id)?.handle.clone())))
+                .collect()
+        };
+        let waiting: BTreeSet<TerminalId> = held
+            .into_iter()
+            .filter(|(_, handle)| handle.takes_courier())
+            .map(|(id, _)| id)
+            .collect();
+        self.0
+            .yielding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|id, _| waiting.contains(id));
+    }
+
+    /// Returns when the courier must look again for a held reply's release
+    /// or a person's follow-ups, and whether any message is still pending for
+    /// a recipient.
     fn deliver_messages(
         &self,
         host: &SharedHost,
@@ -1123,13 +1245,17 @@ impl Handle {
         if pending.is_empty() {
             return Ok((released, outstanding));
         }
-        let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
+        let chats: Vec<Conversation> = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             state
                 .chats
                 .iter()
                 .filter(|(_, record)| !record.handle.is_completed())
-                .map(|(id, record)| (*id, record.session.launch.provider, record.handle.clone()))
+                .map(|(id, record)| Conversation {
+                    id: *id,
+                    handle: record.handle.clone(),
+                    held: state.held_followups.contains_key(id),
+                })
                 .collect()
         };
         let lineages = self
@@ -1137,30 +1263,45 @@ impl Handle {
             .registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .session_lineages(chats.iter().map(|(id, _, _)| *id))?;
+            .session_lineages(chats.iter().map(|chat| chat.id))?;
+        let mut due = released;
+        let mut prompted = BTreeSet::new();
         for message in pending {
             let Some(recipient) = message.to.lineage else {
                 continue;
             };
-            let limited = chats
-                .iter()
-                .any(|(id, _, _)| lineages.get(id) == Some(&recipient) && limits.contains_key(id));
-            // One message at a time, as reopening an agent's conversation for
-            // one can take a while and must not hold off an upgrade for all.
+            // The prompt its conversation was given took every message then
+            // deliverable to it.
+            if prompted.contains(&recipient) {
+                continue;
+            }
+            let limited = chats.iter().any(|chat| {
+                lineages.get(&chat.id) == Some(&recipient) && limits.contains_key(&chat.id)
+            });
+            // One recipient at a time, as reopening an agent's conversation
+            // for one can take a while and must not hold off an upgrade for
+            // all.
             let Some(delivered) = with_control(host, || {
                 self.deliver_message(
                     host, &message, recipient, limited, &chats, &lineages, limits,
                 )
             }) else {
-                return Ok((released, outstanding));
+                return Ok((due, outstanding));
             };
-            delivered?;
+            match delivered? {
+                Delivered::Prompted => {
+                    prompted.insert(recipient);
+                }
+                Delivered::Yields(until) => due = Some(due.map_or(until, |due| due.min(until))),
+                Delivered::Elsewhere => {}
+            }
         }
-        Ok((released, outstanding))
+        Ok((due, outstanding))
     }
 
     /// Gives one pending message to its recipient: as a run of the agent
-    /// cagents hosts for it, or into its idle conversation.
+    /// cagents hosts for it, or into its idle conversation, together with
+    /// every other message waiting for it there.
     #[allow(clippy::too_many_arguments)]
     fn deliver_message(
         &self,
@@ -1168,10 +1309,10 @@ impl Handle {
         message: &Message,
         recipient: crate::agent_execution::Lineage,
         limited: bool,
-        chats: &[(TerminalId, crate::agent::Provider, chat::runtime::Handle)],
+        chats: &[Conversation],
         lineages: &BTreeMap<TerminalId, crate::agent_execution::Lineage>,
         limits: &BTreeMap<TerminalId, UsageLimit>,
-    ) -> Result<(), String> {
+    ) -> Result<Delivered, String> {
         {
             match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
                 // Its run has it, or it waits its turn to become one.
@@ -1180,15 +1321,15 @@ impl Handle {
                     | Handoff::Waiting { .. }
                     | Handoff::Behind { .. }
                     | Handoff::NoSlot { .. },
-                )) => return Ok(()),
+                )) => return Ok(Delivered::Elsewhere),
                 Ok(Some(Handoff::Ended { reason, run, .. })) => {
                     tracing::info!(%reason, %run, message = %message.id, "a message's run ended");
-                    return Ok(());
+                    return Ok(Delivered::Elsewhere);
                 }
                 // Its run has it, perhaps already with the provider.
                 Ok(Some(Handoff::Unknown { reason, run, .. })) => {
                     tracing::warn!(%reason, %run, message = %message.id, "a message's run ended without proof of delivery");
-                    return Ok(());
+                    return Ok(Delivered::Elsewhere);
                 }
                 // Not as a run, but as a message, as a person's conversation
                 // takes one.
@@ -1198,57 +1339,144 @@ impl Handle {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, message = %message.id, "cannot hand a message to its agent");
-                    return Ok(());
+                    return Ok(Delivered::Elsewhere);
                 }
             }
         }
-        let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
-            lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
+        // An idle conversation whose provider holds nothing the person
+        // queued: what they queued goes first, and its turn ends idle again.
+        let Some(chat) = chats.iter().find(|chat| {
+            lineages.get(&chat.id) == Some(&recipient)
+                && chat.handle.takes_courier()
+                && !limits.contains_key(&chat.id)
         }) else {
-            return Ok(());
+            return Ok(Delivered::Elsewhere);
         };
-        self.hand_over(message, *session, handle)
+        let now = super::now();
+        if chat.held
+            && let Some(until) = self.yields(chat.id, now)
+        {
+            tracing::debug!(message = %message.id, session = %chat.id, "messages wait for the person's follow-ups");
+            return Ok(Delivered::Yields(until));
+        }
+        let messages = self.together(message, recipient, now)?;
+        self.hand_over(&messages, chat.id, &chat.handle)?;
+        Ok(Delivered::Prompted)
     }
 
-    /// Claims the message for `session` before prompting, so that an inbox
-    /// read racing the prompt cannot return it too, and releases the claim if
-    /// the conversation refuses the prompt. A prompt the conversation took
-    /// but did not acknowledge in time may still run, so its message stays
-    /// delivered: a message reaches a conversation at most once.
-    fn hand_over(
+    /// Until when, in milliseconds since the epoch, `session`, idle while a
+    /// window holds the person's follow-ups for it, still waits for that
+    /// window to send them; `None` once it has waited [`PERSON_FIRST`], so a
+    /// window that cannot send them holds no message back for longer.
+    fn yields(&self, session: TerminalId, now: u64) -> Option<u64> {
+        let mut yielding = self.0.yielding.lock().unwrap_or_else(|p| p.into_inner());
+        let until = yielding
+            .entry(session)
+            .or_insert(now)
+            .saturating_add(PERSON_FIRST.as_millis() as u64);
+        (now < until).then_some(until)
+    }
+
+    /// The messages the prompt that gives `message` to its conversation
+    /// carries: every one deliverable to its recipient, oldest first, up to
+    /// the size of one prompt. An agent cagents hosts takes messages as runs,
+    /// one each, so one that takes this one as a message takes it alone.
+    fn together(
         &self,
         message: &Message,
+        recipient: crate::agent_execution::Lineage,
+        now: u64,
+    ) -> Result<Vec<Message>, String> {
+        let registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let takes_runs = match registry.lineage_agent(recipient)? {
+            Some(agent) => registry.takes_messages_as_runs(&agent)?,
+            None => false,
+        };
+        if takes_runs {
+            return Ok(vec![message.clone()]);
+        }
+        let mut waiting = registry.deliverable_to(recipient, now)?;
+        drop(registry);
+        if !waiting.iter().any(|waiting| waiting.id == message.id) {
+            waiting.insert(0, message.clone());
+        }
+        let mut bytes = 0;
+        let mut together = Vec::with_capacity(waiting.len());
+        for waiting in waiting {
+            bytes += self.0.seal.seal(&waiting, now).len() + 2;
+            if !together.is_empty() && bytes > crate::agent_execution::MAX_PROMPT_BYTES {
+                break;
+            }
+            together.push(waiting);
+        }
+        Ok(together)
+    }
+
+    /// Claims `messages` for `session` before prompting, so that an inbox
+    /// read racing the prompt cannot return them too, and releases the claim
+    /// if the conversation refuses the prompt. A prompt the conversation took
+    /// but did not acknowledge in time may still run, so its messages stay
+    /// delivered: a message reaches a conversation at most once. Each message
+    /// settles on its own, as its recipient reading it would settle it.
+    fn hand_over(
+        &self,
+        messages: &[Message],
         session: TerminalId,
         handle: &chat::runtime::Handle,
     ) -> Result<(), String> {
         let registry = &self.0.registry;
-        if !registry
+        let ids: Vec<MessageId> = messages.iter().map(|message| message.id).collect();
+        let claimed = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .deliver_message(message.id, session, super::now())?
-        {
+            .deliver_messages(&ids, session, super::now())?;
+        if claimed.is_empty() {
             return Ok(());
         }
+        let given = messages
+            .iter()
+            .filter(|message| claimed.contains(&message.id));
         if let Some(host) = self.0.host.upgrade() {
             super::given_work(&host, session);
         }
-        match handle.try_idle_prompt(self.0.seal.seal(message, super::now())) {
+        match handle.try_idle_prompt(self.0.seal.seal_all(given, super::now())) {
             Ok(()) => {}
             Err(Rejection::Refused(error)) => {
-                // Most often a person's own prompt won the idle conversation;
-                // the message waits for the turn that prompt starts to finish.
-                tracing::debug!(%error, message = %message.id, %session, "conversation refused a message");
+                // The conversation took a turn of its own since it was seen
+                // idle, most often for a person's prompt; the messages wait
+                // for that turn to finish.
+                tracing::debug!(%error, messages = claimed.len(), %session, "conversation refused messages");
                 registry
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .undeliver_message(message.id, session)?;
+                    .undeliver_messages(&claimed, session)?;
             }
             Err(Rejection::Unacknowledged(error)) => {
-                tracing::warn!(%error, message = %message.id, %session, "conversation did not acknowledge a message");
+                tracing::warn!(%error, messages = claimed.len(), %session, "conversation did not acknowledge messages");
             }
         }
         Ok(())
     }
+}
+
+/// A live conversation as the courier sees it in a pass.
+struct Conversation {
+    id: TerminalId,
+    handle: chat::runtime::Handle,
+    /// Whether a window holds follow-ups the person wrote for its next turn.
+    held: bool,
+}
+
+/// What became of a message the courier tried to deliver.
+enum Delivered {
+    /// Its conversation was given it in a prompt, with every other message
+    /// then waiting for it.
+    Prompted,
+    /// Its conversation waits until then for a window to send the person's
+    /// follow-ups first.
+    Yields(u64),
+    /// An agent's run took it or will, or no conversation can take it now.
+    Elsewhere,
 }
 
 #[cfg(test)]
@@ -1288,6 +1516,7 @@ mod tests {
             state: Mutex::default(),
             changed: Condvar::new(),
             limits: Mutex::default(),
+            yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
@@ -1323,7 +1552,11 @@ mod tests {
             }
         }
         let delivery = Delivery(Some(std::thread::spawn(move || {
-            delivery_courier.hand_over(&delivery_message, session, &delivery_handle)
+            delivery_courier.hand_over(
+                std::slice::from_ref(&delivery_message),
+                session,
+                &delivery_handle,
+            )
         })));
         actor.wait_for_queued_prompt();
         assert_eq!(
@@ -1348,7 +1581,9 @@ mod tests {
         );
         assert_eq!(actor.handle.requests().len(), 1);
 
-        courier.hand_over(&message, session, &actor.handle).unwrap();
+        courier
+            .hand_over(std::slice::from_ref(&message), session, &actor.handle)
+            .unwrap();
         assert_eq!(stored().state, State::Pending);
         assert_eq!(
             actor.prompt_count(),
@@ -1357,12 +1592,16 @@ mod tests {
         );
         actor.clear_request();
         assert!(actor.handle.is_idle());
-        courier.hand_over(&message, session, &actor.handle).unwrap();
+        courier
+            .hand_over(std::slice::from_ref(&message), session, &actor.handle)
+            .unwrap();
         let delivered = stored();
         assert_eq!(delivered.state, State::Delivered);
         assert_eq!(delivered.to.session, Some(session));
         assert_eq!(actor.prompt_count(), 1);
-        courier.hand_over(&message, session, &actor.handle).unwrap();
+        courier
+            .hand_over(std::slice::from_ref(&message), session, &actor.handle)
+            .unwrap();
         assert_eq!(stored(), delivered);
         assert_eq!(
             actor.prompt_count(),
@@ -1404,11 +1643,14 @@ mod tests {
             state: Mutex::default(),
             changed: Condvar::new(),
             limits: Mutex::default(),
+            yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
         let mut actor = RequestRaceFixture::with_input_failure(true);
-        courier.hand_over(&message, session, &actor.handle).unwrap();
+        courier
+            .hand_over(std::slice::from_ref(&message), session, &actor.handle)
+            .unwrap();
         let delivered = registry
             .lock()
             .unwrap()
@@ -1421,7 +1663,7 @@ mod tests {
         // the first actor exited before its caller could observe provider I/O.
         let mut successor = RequestRaceFixture::new();
         courier
-            .hand_over(&message, session, &successor.handle)
+            .hand_over(std::slice::from_ref(&message), session, &successor.handle)
             .unwrap();
         assert_eq!(actor.prompt_count(), 1);
         assert_eq!(successor.prompt_count(), 0);
@@ -1439,6 +1681,10 @@ mod tests {
             RetainedInputOutcome::Disconnected,
         ] {
             let refused = matches!(&outcome, RetainedInputOutcome::Acknowledged(Err(_)));
+            let awaits_receipt = matches!(
+                &outcome,
+                RetainedInputOutcome::Unavailable | RetainedInputOutcome::Disconnected
+            );
             let directory = tempfile::tempdir().unwrap();
             let registry = Arc::new(Mutex::new(
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
@@ -1466,6 +1712,7 @@ mod tests {
                 state: Mutex::default(),
                 changed: Condvar::new(),
                 limits: Mutex::default(),
+                yielding: Mutex::default(),
                 scanned_generation: Mutex::new(None),
                 scanned: Condvar::new(),
             }));
@@ -1482,7 +1729,11 @@ mod tests {
             let delivery_actor = actor.clone();
             let delivery_message = message.clone();
             let delivery = std::thread::spawn(move || {
-                delivery_courier.hand_over(&delivery_message, session, &delivery_actor)
+                delivery_courier.hand_over(
+                    std::slice::from_ref(&delivery_message),
+                    session,
+                    &delivery_actor,
+                )
             });
             // This completes a genuinely pending Remote IdlePrompt envelope;
             // hand_over has already committed its claim before invoking it.
@@ -1498,7 +1749,11 @@ mod tests {
                 let retry_courier = courier.clone();
                 let retry_message = message.clone();
                 let retry = std::thread::spawn(move || {
-                    retry_courier.hand_over(&retry_message, session, &retry_actor)
+                    retry_courier.hand_over(
+                        std::slice::from_ref(&retry_message),
+                        session,
+                        &retry_actor,
+                    )
                 });
                 assert_eq!(answer(RetainedInputOutcome::Acknowledged(Ok(()))), 1);
                 retry.join().unwrap().unwrap();
@@ -1507,11 +1762,17 @@ mod tests {
                 assert_eq!(settled.state, State::Delivered);
                 assert_eq!(settled.to.session, Some(session));
                 let retained = actor.pending_retained_inputs();
-                assert_eq!(retained.len(), 1);
-                assert_eq!(retained[0].sequence, 1);
+                // Unknown is a received, terminal receipt. Connection
+                // loss retains the envelope until replay yields a receipt.
+                assert_eq!(retained.len(), usize::from(awaits_receipt));
+                if let Some(envelope) = retained.first() {
+                    assert_eq!(envelope.sequence, 1);
+                }
                 // The real courier path must observe Delivered and return
                 // before allocating any replacement input envelope.
-                courier.hand_over(&message, session, &actor).unwrap();
+                courier
+                    .hand_over(std::slice::from_ref(&message), session, &actor)
+                    .unwrap();
                 assert_eq!(stored(), settled);
                 assert_eq!(actor.pending_retained_inputs(), retained);
             }
@@ -1575,6 +1836,7 @@ mod tests {
             state: Mutex::default(),
             changed: Condvar::new(),
             limits: Mutex::default(),
+            yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
@@ -1643,6 +1905,7 @@ mod tests {
             state: Mutex::default(),
             changed: Condvar::new(),
             limits: Mutex::default(),
+            yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
@@ -1670,5 +1933,277 @@ mod tests {
         wake.wake();
         assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         thread.join().unwrap();
+    }
+
+    /// A courier over a test host listing one live conversation, on a real
+    /// actor, with messages from the person waiting for it.
+    struct Delivering {
+        courier: Handle,
+        host: SharedHost,
+        registry: SharedRegistry,
+        session: TerminalId,
+        actor: crate::chat::runtime::courier_tests::RequestRaceFixture,
+        messages: Vec<Message>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Delivering {
+        /// `bodies` are written oldest first.
+        fn new(bodies: &[&str]) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let host = crate::host::service::test_host();
+            let registry = Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            ));
+            let actor = crate::chat::runtime::courier_tests::RequestRaceFixture::new();
+            let session = TerminalId::new();
+            let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+            recipe.program = "/bin/cat".into();
+            recipe.arguments.clear();
+            host.lock().unwrap().chats.insert(
+                session,
+                crate::host::chat::Record {
+                    execution_instance: uuid::Uuid::new_v4(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: crate::chat::Session {
+                        id: session,
+                        proof: None,
+                        terminal: None,
+                        native_continuity: Default::default(),
+                        owned_codex_listener: None,
+                        launch: crate::chat::Launch {
+                            provider: crate::agent::Provider::Omp,
+                            recipe,
+                            session_id: None,
+                            draft_model: None,
+                        },
+                    },
+                    handle: actor.handle.clone(),
+                    source_process: None,
+                    subscribers: BTreeMap::from([(1, true)]),
+                    observations: Default::default(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+            let created = super::super::now() - 1_000;
+            let messages: Vec<Message> = bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| Message {
+                    id: MessageId::new(),
+                    from: Party::user(),
+                    to: Party {
+                        lineage: Some(Lineage(session)),
+                        session: None,
+                        title: None,
+                    },
+                    reply_to: None,
+                    body: (*body).into(),
+                    wait_until_ms: None,
+                    state: State::Pending,
+                    created_ms: created + index as u64,
+                })
+                .collect();
+            // Posted newest first: when each was written decides the order.
+            for message in messages.iter().rev() {
+                registry.lock().unwrap().post_message(message).unwrap();
+            }
+            let courier = Handle(Arc::new(Inner {
+                host: Arc::downgrade(&host),
+                registry: registry.clone(),
+                seal: Arc::new(Seal::new([7; 32])),
+                state: Mutex::default(),
+                changed: Condvar::new(),
+                limits: Mutex::default(),
+                yielding: Mutex::default(),
+                scanned_generation: Mutex::new(None),
+                scanned: Condvar::new(),
+            }));
+            Self {
+                courier,
+                host,
+                registry,
+                session,
+                actor,
+                messages,
+                _directory: directory,
+            }
+        }
+
+        /// One courier pass; when it must look again.
+        /// One of the courier's passes over the messages, as `deliver` makes.
+        fn pass(&self) -> Option<u64> {
+            self.courier.forget_yields(&self.host);
+            self.courier
+                .deliver_messages(&self.host, &BTreeMap::new())
+                .unwrap()
+                .0
+        }
+
+        fn states(&self) -> Vec<(State, Option<TerminalId>)> {
+            let registry = self.registry.lock().unwrap();
+            self.messages
+                .iter()
+                .map(|message| {
+                    let stored = registry.message(message.id).unwrap().unwrap();
+                    (stored.state, stored.to.session)
+                })
+                .collect()
+        }
+
+        fn all(&self, state: State) -> Vec<(State, Option<TerminalId>)> {
+            let session = (state == State::Delivered).then_some(self.session);
+            vec![(state, session); self.messages.len()]
+        }
+
+        /// Has a window declare it holds the person's follow-ups, or not.
+        fn hold_followups(&self, held: bool) {
+            let mut state = self.host.lock().unwrap();
+            if held {
+                state
+                    .held_followups
+                    .entry(self.session)
+                    .or_default()
+                    .insert(1);
+            } else {
+                state.held_followups.remove(&self.session);
+            }
+        }
+
+        /// The bodies each prompt the conversation took carried, in the
+        /// order it read them.
+        fn prompted(&self) -> Vec<Vec<String>> {
+            self.actor
+                .prompt_texts()
+                .iter()
+                .map(|text| {
+                    crate::agent_execution::mailbox::open_all(
+                        text,
+                        &crate::agent_execution::mailbox::SealShaped,
+                    )
+                    .expect("each prompt is the courier's frames")
+                    .into_iter()
+                    .map(|opened| opened.body)
+                    .collect()
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn every_waiting_message_reaches_the_conversation_in_one_prompt_in_order() {
+        let mut fixture = Delivering::new(&["First", "Second", "Third"]);
+        assert_eq!(fixture.pass(), None);
+        assert_eq!(fixture.prompted(), [["First", "Second", "Third"]]);
+        // Each settles on its own, as the recipient reading it would.
+        assert_eq!(fixture.states(), fixture.all(State::Delivered));
+        // Nothing is given twice.
+        fixture.pass();
+        assert_eq!(fixture.actor.prompt_count(), 1);
+        fixture.actor.close();
+    }
+
+    #[test]
+    fn the_persons_queued_message_goes_before_waiting_messages() {
+        let mut fixture = Delivering::new(&["First", "Second"]);
+        fixture.actor.set_persons_queue(true);
+        fixture.pass();
+        assert_eq!(
+            fixture.actor.prompt_count(),
+            0,
+            "no courier turn ahead of the person"
+        );
+        assert_eq!(fixture.states(), fixture.all(State::Pending));
+
+        // Seen without it, then refused by the actor once it is queued: the
+        // claim is released, and the messages wait for the next turn's end.
+        fixture.actor.set_persons_queue(false);
+        assert!(fixture.actor.handle.takes_courier());
+        fixture.actor.set_persons_queue(true);
+        fixture
+            .courier
+            .hand_over(&fixture.messages, fixture.session, &fixture.actor.handle)
+            .unwrap();
+        assert_eq!(fixture.actor.prompt_count(), 0);
+        assert_eq!(fixture.states(), fixture.all(State::Pending));
+
+        fixture.actor.set_persons_queue(false);
+        fixture.pass();
+        assert_eq!(fixture.prompted(), [["First", "Second"]]);
+        assert_eq!(fixture.states(), fixture.all(State::Delivered));
+        fixture.actor.close();
+    }
+
+    #[test]
+    fn a_window_holding_the_persons_followups_sends_them_first() {
+        let mut fixture = Delivering::new(&["First", "Second"]);
+        fixture.hold_followups(true);
+        let before = super::super::now();
+        let until = fixture
+            .pass()
+            .expect("the courier looks again when it stops waiting");
+        let wait = PERSON_FIRST.as_millis() as u64;
+        assert!((before + wait..=super::super::now() + wait).contains(&until));
+        assert_eq!(fixture.actor.prompt_count(), 0);
+        assert_eq!(fixture.states(), fixture.all(State::Pending));
+
+        // The window sends them: the provider is at work on them, and the
+        // messages wait for its turn to end.
+        fixture.hold_followups(false);
+        fixture.actor.set_persons_queue(true);
+        fixture.pass();
+        assert_eq!(fixture.actor.prompt_count(), 0);
+        assert!(
+            fixture.courier.0.yielding.lock().unwrap().is_empty(),
+            "the next turn waits for its own follow-ups as long again"
+        );
+        fixture.actor.set_persons_queue(false);
+        fixture.pass();
+        assert_eq!(fixture.prompted(), [["First", "Second"]]);
+        assert_eq!(fixture.states(), fixture.all(State::Delivered));
+        fixture.actor.close();
+    }
+
+    #[test]
+    fn a_window_that_never_sends_its_followups_holds_messages_back_only_so_long() {
+        let mut fixture = Delivering::new(&["First", "Second"]);
+        fixture.hold_followups(true);
+        let until = fixture.pass().expect("the courier looks again");
+        assert_eq!(fixture.actor.prompt_count(), 0);
+        // Passes while it waits, with or without messages to deliver, keep
+        // when the wait began.
+        fixture.courier.forget_yields(&fixture.host);
+        assert_eq!(fixture.pass(), Some(until));
+        // As if the window had held them, unsent, for the whole wait.
+        *fixture
+            .courier
+            .0
+            .yielding
+            .lock()
+            .unwrap()
+            .get_mut(&fixture.session)
+            .unwrap() -= PERSON_FIRST.as_millis() as u64;
+        fixture.pass();
+        assert_eq!(fixture.prompted(), [["First", "Second"]]);
+        assert_eq!(fixture.states(), fixture.all(State::Delivered));
+        fixture.actor.close();
+    }
+
+    #[test]
+    fn yielding_to_the_persons_followups_is_bounded_from_when_it_began() {
+        let fixture = Delivering::new(&[]);
+        let wait = PERSON_FIRST.as_millis() as u64;
+        let start = 1_000_000;
+        let yields = |session, now| fixture.courier.yields(session, now);
+        assert_eq!(yields(fixture.session, start), Some(start + wait));
+        assert_eq!(
+            yields(fixture.session, start + wait - 1),
+            Some(start + wait)
+        );
+        assert_eq!(yields(fixture.session, start + wait), None);
+        let other = TerminalId::new();
+        assert_eq!(yields(other, start + wait), Some(start + 2 * wait));
     }
 }

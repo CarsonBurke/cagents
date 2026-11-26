@@ -227,6 +227,13 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
     let mut rescanned = BTreeSet::new();
     for record in records.iter().filter(|record| !record.bare) {
         let old = retained.get(&record.id).copied();
+        let primary = primary_path.as_ref() == Some(&record.path);
+        // Git may still list a linked worktree whose marker was removed.
+        // Suppress its row and watch entry while retaining the listed
+        // candidate so a repaired marker can come back on a selective scan.
+        if !primary && (listed || old.is_none()) && checkout_removed(&record.path) {
+            continue;
+        }
         let prior_status = previous.and_then(|previous| previous.status_reads.get(&record.id));
         let listed_branch = record
             .branch
@@ -282,7 +289,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         let mut worktree = Worktree {
             id: record.id,
             path: record.path.clone(),
-            primary: primary_path.as_ref() == Some(&record.path),
+            primary,
             locked: record.lock.locked,
             created_at_unix_ms: record
                 .created_at_unix_ms
@@ -894,24 +901,28 @@ mod tests {
         .trim()
         .to_owned();
         git(&fixture.root, &["update-ref", "refs/heads/theirs", &head]);
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&fixture.root)
-            .arg("update-ref")
-            .arg(OsStr::from_bytes(b"refs/heads/theirs-\xff"))
-            .arg(&head)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git update-ref: {output:?}");
+        // APFS rejects non-UTF-8 ref filenames.
+        #[cfg(target_os = "linux")]
+        let invalid_name = {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&fixture.root)
+                .arg("update-ref")
+                .arg(OsStr::from_bytes(b"refs/heads/theirs-\xff"))
+                .arg(&head)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git update-ref: {output:?}");
+            branch_identity(OsStr::from_bytes(b"theirs-\xff"))
+        };
 
         let local = run(&fixture, None, &git_watch::Change::default());
-        let invalid_name = branch_identity(OsStr::from_bytes(b"theirs-\xff"));
-        for name in ["theirs", invalid_name.as_str()] {
+        let check_branch = |name| {
             assert!(
                 local.branch_names.contains(name),
                 "{name} stays in the census"
@@ -920,7 +931,10 @@ mod tests {
                 !local.branches.contains_key(name),
                 "{name} has neither a checkout nor a pull request"
             );
-        }
+        };
+        check_branch("theirs");
+        #[cfg(target_os = "linux")]
+        check_branch(invalid_name.as_str());
         let base = local.base.as_ref().unwrap();
         assert!(!local.divergence.contains_key(&(head, base.oid.clone())));
     }
@@ -1145,10 +1159,17 @@ mod tests {
     #[test]
     fn a_removed_worktree_leaves_the_scan_and_its_siblings_intact() {
         let fixture = fixture();
+        // Keep Git listing the admin record even on versions that would
+        // otherwise mark the missing marker prunable.
+        git(
+            &fixture.root,
+            &["worktree", "lock", fixture.linked.to_str().unwrap()],
+        );
         let first = run(&fixture, None, &git_watch::Change::default());
         // A sandbox placeholder at the removed marker does not keep the
         // checkout in the scan while Git's worktree list still names it.
         let marker = fixture.linked.join(".git");
+        let gitfile = std::fs::read(&marker).unwrap();
         std::fs::remove_file(&marker).unwrap();
         std::fs::create_dir(&marker).unwrap();
         let second = run(
@@ -1161,6 +1182,33 @@ mod tests {
         );
         assert_eq!(second.worktrees.len(), 1);
         assert!(second.worktrees[0].primary);
+        assert!(
+            second
+                .plan
+                .as_ref()
+                .unwrap()
+                .worktrees
+                .iter()
+                .all(|worktree| worktree.root != fixture.linked)
+        );
+
+        std::fs::remove_dir(&marker).unwrap();
+        std::fs::write(&marker, gitfile).unwrap();
+        let restored = run(
+            &fixture,
+            Some(&second),
+            &git_watch::Change {
+                references: true,
+                ..git_watch::Change::default()
+            },
+        );
+        assert_eq!(restored.listed_at, second.listed_at);
+        assert!(
+            restored
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == fixture.linked)
+        );
     }
 
     #[test]
@@ -1211,6 +1259,10 @@ mod tests {
             run_at(&fixture, previous, change, false, &BTreeSet::new(), now)
         };
         let first = scan(None, &git_watch::Change::default());
+        let can_reuse_link_only_status = first
+            .status_reads
+            .get(&at(&first, &link_only).id)
+            .is_some_and(|read| !read.metadata_changed(&link_only));
         assert_eq!(at(&first, &file_mode).dirty.as_ref().unwrap().paths, 0);
         assert!(
             first
@@ -1267,10 +1319,15 @@ mod tests {
         assert_eq!(at(&recovered, &file_mode).dirty.as_ref().unwrap().paths, 1);
         assert!(at(&recovered, &file_mode).status_read_at > at(&first, &file_mode).status_read_at);
         assert_eq!(at(&recovered, &link_only).link.as_ref(), Some(&issue));
-        assert_eq!(
-            at(&recovered, &link_only).status_read_at,
-            at(&first, &link_only).status_read_at
-        );
+        // Filesystems that cannot attest to metadata rewrites re-read status
+        // conservatively on a rescan, even for a link-only change.
+        let link_status = at(&recovered, &link_only).status_read_at;
+        let original_link_status = at(&first, &link_only).status_read_at;
+        if can_reuse_link_only_status {
+            assert_eq!(link_status, original_link_status);
+        } else {
+            assert!(link_status > original_link_status);
+        }
     }
 
     #[test]

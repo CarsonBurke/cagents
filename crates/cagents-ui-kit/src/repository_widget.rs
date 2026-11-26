@@ -9389,28 +9389,20 @@ pub fn expand_ignored_directories(
 }
 
 pub fn load_directory_listing(root: &Path, relative: &Path) -> Result<Vec<RepositoryFile>, String> {
-    use std::os::fd::AsRawFd;
+    const LIMIT: usize = 20_000;
     // The folder may itself be the user's link, such as `~/.gemini` into a
     // dotfiles checkout. List the directory it names, as opening it would;
     // links among its entries are still listed rather than followed.
     let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
     let handle_root = crate::fs_safety::Root::open(&root).map_err(|error| error.to_string())?;
-    let handle = if relative.as_os_str().is_empty() {
-        std::fs::File::open(&root).map_err(|error| error.to_string())?
-    } else {
-        crate::fs_safety::open_beneath(&handle_root, relative).map_err(|error| error.to_string())?
-    };
-    let descriptor_path = format!("/proc/self/fd/{}", handle.as_raw_fd());
+    let (names, more) = crate::fs_safety::first_entries_beneath(&handle_root, relative, LIMIT)
+        .map_err(|error| error.to_string())?;
+    if more {
+        return Err("This folder has more than 20,000 entries; open a narrower folder.".into());
+    }
     let mut files = Vec::new();
-    let mut entries = 0usize;
-    for entry in std::fs::read_dir(descriptor_path).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        entries += 1;
-        if entries > 20_000 {
-            return Err("This folder has more than 20,000 entries; open a narrower folder.".into());
-        }
-        let name = entry.file_name();
-        if name == "." || name == ".." || name == ".git" {
+    for name in names {
+        if name == ".git" {
             continue;
         }
         let path = if relative.as_os_str().is_empty() {
@@ -10521,19 +10513,24 @@ fn pdf_document_view<'a>(
             zoom,
         }))
     };
-    let mut controls: Vec<Element<'a, RepositoryAction>> = vec![
-        turn(0, Icon::First, "First page", page > 0).into(),
-        turn(
-            page.saturating_sub(1),
-            Icon::ChevronLeft,
-            "Previous page",
-            page > 0,
-        )
-        .into(),
-        crate::design::body(format!("{} / {pages}", page + 1)).into(),
-        turn(page + 1, Icon::ChevronRight, "Next page", page + 1 < pages).into(),
-        turn(pages - 1, Icon::Last, "Last page", page + 1 < pages).into(),
-    ];
+    // A one-page document has no pages to turn, so it draws no "1 / 1"
+    // among four controls that could never be pressed.
+    let mut controls: Vec<Element<'a, RepositoryAction>> = Vec::with_capacity(12);
+    if pages > 1 {
+        controls.extend([
+            turn(0, Icon::First, "First page", page > 0).into(),
+            turn(
+                page.saturating_sub(1),
+                Icon::ChevronLeft,
+                "Previous page",
+                page > 0,
+            )
+            .into(),
+            crate::design::body(format!("{} / {pages}", page + 1)).into(),
+            turn(page + 1, Icon::ChevronRight, "Next page", page + 1 < pages).into(),
+            turn(pages - 1, Icon::Last, "Last page", page + 1 < pages).into(),
+        ]);
+    }
     // The status sits on the flexible gap's left, so that a render starting or
     // landing cannot move the controls on its right. The zoom controls are the
     // ones a reader presses repeatedly, and a caption appearing beneath the

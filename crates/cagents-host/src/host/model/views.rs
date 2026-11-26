@@ -6,6 +6,7 @@ use crate::workspace_model::{
 
 pub(in crate::host::model) mod bindings;
 mod compaction;
+mod foreign_proof;
 pub(in crate::host::model) mod store;
 pub(super) use store::{all, occupied, occupied_for_start, operation_seen, read};
 
@@ -594,13 +595,14 @@ pub(super) fn retire_agent(
 
 #[cfg(test)]
 fn apply(transaction: &rusqlite::Transaction<'_>, edit: &ModelEdit) -> Result<bool, String> {
-    apply_recorded(transaction, edit, &mut Recorder::default())
+    apply_recorded(transaction, edit, &mut Recorder::default(), None)
 }
 
 pub(super) fn apply_recorded(
     transaction: &rusqlite::Transaction<'_>,
     edit: &ModelEdit,
     recorder: &mut Recorder,
+    serving: Option<&crate::model::HostSessionProof>,
 ) -> Result<bool, String> {
     let scope = match edit {
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
@@ -821,6 +823,29 @@ pub(super) fn apply_recorded(
         }
         _ => unreachable!(),
     }
+    // A kept ID is a change to what the window wrote, even where the stored
+    // view is unchanged: the new revision sends the window the pane it lacks.
+    if keep_confirmed_chat_identities(transaction, &stored, &mut view)? {
+        changed = true;
+    }
+    if changed && let Some(serving) = serving {
+        // Check the resulting view so ignored writes and edits to an existing
+        // foreign pane's presentation still follow the normal store rules.
+        for pane in &view.panes {
+            if let crate::model::CardKind::Chat(chat) = &pane.kind
+                && let Some(proof) = chat.proof.as_ref()
+                && proof != serving
+                && !stored.panes.iter().any(|prior| {
+                    prior.id == pane.id
+                        && matches!(&prior.kind,
+                        crate::model::CardKind::Chat(old)
+                            if old.id == chat.id && old.proof.as_ref() == Some(proof))
+                })
+            {
+                return Err(Registry::VIEW_FOREIGN_CHAT_PROOF.into());
+            }
+        }
+    }
     if changed || !existed {
         view.revision = store::next_revision(transaction)?;
         recorder.revised(
@@ -903,6 +928,8 @@ impl Registry {
     pub(crate) const VIEW_REVISION_CONFLICT: &'static str = "workspace view revision conflict";
     pub(crate) const VIEW_REMOVAL_CONFLICT: &'static str =
         crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT;
+    pub(crate) const VIEW_FOREIGN_CHAT_PROOF: &str =
+        "A workspace edit tried to write a chat pane with another daemon's proof";
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(
@@ -1038,6 +1065,84 @@ pub(super) fn learn_chat_pane_identity(
         &HostedSession::Chat(learned.clone()),
         None,
     )
+}
+
+/// Saves `saved`'s conversation ID to the pane presenting its chat, when the
+/// pane still shows exactly that process without it. `saved` is the daemon's
+/// own record of the chat, its open agent's session, which already holds the
+/// ID its provider confirmed: a pane written before that, or by a window that
+/// read the agent before it, would otherwise keep pointing at no conversation.
+pub(super) fn learn_saved_chat_pane_identity(
+    db: &Connection,
+    saved: &crate::chat::Session,
+) -> Result<bool, String> {
+    // One indexed read answers almost every caller.
+    if saved.launch.session_id.is_none() || !store::chat_pane_lacks_identity(db, saved.id)? {
+        return Ok(false);
+    }
+    match chat_pane_session(db, saved.id)? {
+        Some(current) if crate::chat::is_first_codex_identity_update(&current, saved) => {
+            learn_chat_pane_identity(db, &current, saved)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Keeps the conversation ID a window's write would take from a chat pane.
+///
+/// A confirmed ID is never given up by the same chat under the same proof: a
+/// window that read the pane or its agent before the provider named the
+/// thread writes the descriptor it saw, and without the ID nothing can resume
+/// the conversation once its process is gone. Such a write keeps the ID the
+/// pane held, or the one the chat's open agent holds, rather than being
+/// refused, as the store merges a draft's model choice (see `merged_kind`):
+/// the rest of the write still applies, and a refused seed or insert would
+/// leave the agent with no pane at all. Only panes `view` changes from
+/// `stored` are checked, and only the exact identity-learning shape is
+/// restored ([`crate::chat::is_first_codex_identity_update`]); a write that
+/// changes the chat, its proof or its launch is not this and stands. Returns
+/// whether any pane kept its ID.
+fn keep_confirmed_chat_identities(
+    db: &Connection,
+    stored: &View,
+    view: &mut View,
+) -> Result<bool, String> {
+    use crate::{agent_execution::HostedSession, model::CardKind};
+    let mut kept = false;
+    for pane in &mut view.panes {
+        let CardKind::Chat(next) = &pane.kind else {
+            continue;
+        };
+        if next.launch.session_id.is_some() {
+            continue;
+        }
+        let previous = stored.panes.iter().find(|stored| stored.id == pane.id);
+        if previous == Some(&*pane) {
+            continue;
+        }
+        let held = previous.and_then(|previous| match &previous.kind {
+            CardKind::Chat(held) if held.launch.session_id.is_some() => Some(held.clone()),
+            _ => None,
+        });
+        let saved = match held {
+            Some(held) => Some(held),
+            None => super::execution::agent_for_session_in(db, next.id)?.and_then(|agent| {
+                match agent.session {
+                    Some(HostedSession::Chat(saved)) if saved.launch.session_id.is_some() => {
+                        Some(saved)
+                    }
+                    _ => None,
+                }
+            }),
+        };
+        if let Some(saved) = saved
+            && crate::chat::is_first_codex_identity_update(next, &saved)
+        {
+            pane.kind = CardKind::Chat(saved);
+            kept = true;
+        }
+    }
+    Ok(kept)
 }
 
 fn adopt_authenticated_pane(

@@ -52,7 +52,7 @@ impl Product {
         Ok(directory.join(self.file_name()))
     }
     pub fn beside_current(self) -> io::Result<PathBuf> {
-        self.beside(&std::env::current_exe()?)
+        self.beside(&crate::process::current_executable()?)
     }
 }
 

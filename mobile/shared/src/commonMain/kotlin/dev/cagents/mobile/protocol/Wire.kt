@@ -35,7 +35,7 @@ val WireJson = Json {
 /** One line from the bridge. */
 sealed interface ServerLine {
     data class WelcomeLine(val welcome: Welcome) : ServerLine
-    data class Ok(val id: Long) : ServerLine
+    data class Ok(val id: Long, val page: DetailPage? = null) : ServerLine
 
     /** [id] is null for an error that answers no request. */
     data class Error(val id: Long?, val error: RemoteError) : ServerLine
@@ -48,6 +48,8 @@ sealed interface ServerLine {
 sealed interface Event {
     data class Sessions(val sessions: List<Session>) : Event
     data class Notifications(val notices: List<Notice>) : Event
+    data class TerminalScreenUpdated(val screen: TerminalScreen) : Event
+    data class TerminalWatchEnded(val ending: TerminalEnded) : Event
     data class Conversation(val update: ConversationUpdate) : Event
     data class ConversationEnded(val session: String, val message: String) : Event
     data class Closing(val message: String) : Event
@@ -67,7 +69,10 @@ fun decodeServerLine(line: String): ServerLine {
     val obj = WireJson.parseToJsonElement(line).jsonObject
     return when (val type = obj.string("type")) {
         "welcome" -> ServerLine.WelcomeLine(WireJson.decodeFromJsonElement(obj))
-        "ok" -> ServerLine.Ok(obj.requireLong("id"))
+        "ok" -> ServerLine.Ok(
+            obj.requireLong("id"),
+            obj["page"]?.let { WireJson.decodeFromJsonElement<DetailPage>(it) },
+        )
         "error" -> ServerLine.Error(
             id = obj.long("id"),
             error = obj["error"]?.let { WireJson.decodeFromJsonElement<RemoteError>(it) } ?: RemoteError(),
@@ -81,6 +86,8 @@ private fun decodeEvent(name: String?, data: JsonElement): Event = when (name) {
     "sessions" -> Event.Sessions(WireJson.decodeFromJsonElement<SessionList>(data).sessions)
     "notifications" -> Event.Notifications(WireJson.decodeFromJsonElement<NoticeList>(data).notices)
     "conversation" -> Event.Conversation(WireJson.decodeFromJsonElement(data))
+    "terminal_screen" -> Event.TerminalScreenUpdated(WireJson.decodeFromJsonElement(data))
+    "terminal_ended" -> Event.TerminalWatchEnded(WireJson.decodeFromJsonElement(data))
     "conversation_ended" -> data.jsonObject.let {
         Event.ConversationEnded(it.string("session").orEmpty(), it.string("message").orEmpty())
     }
@@ -167,8 +174,47 @@ sealed class Call(val op: String) {
 
     data class WatchConversation(override val session: String) : OnSession("conversation.watch")
     data class UnwatchConversation(override val session: String) : OnSession("conversation.unwatch")
+    data class WatchTerminal(override val session: String) : OnSession("terminal.watch")
+    data class UnwatchTerminal(override val session: String) : OnSession("terminal.unwatch")
+    data class RefreshReadCheckpoint(override val session: String) : OnSession("conversation.read_checkpoint")
+    data class ReadConversation(override val session: String, val checkpoint: String) : OnSession("conversation.read") {
+        override fun params(): JsonObject = buildJsonObject {
+            put("session", session)
+            put("checkpoint", checkpoint)
+        }
+    }
     data class LoadEarlier(override val session: String) : OnSession("conversation.load_earlier")
     data class Interrupt(override val session: String) : OnSession("conversation.interrupt")
+
+    data class ReadDetail(
+        override val session: String,
+        val item: String,
+        val kind: DetailKind,
+        val path: String? = null,
+        val cursor: String? = null,
+    ) : OnSession("conversation.${kind.wire}") {
+        override fun params() = buildJsonObject {
+            put("session", session)
+            put("item", item)
+            path?.let { put("path", it) }
+            cursor?.let { put("cursor", it) }
+        }
+    }
+
+    data class SendImage(
+        override val session: String,
+        val text: String,
+        val mode: SendMode,
+        val image: ImageAttachment,
+    ) : OnSession("conversation.send_image") {
+        override fun params() = buildJsonObject {
+            put("session", session)
+            put("text", text)
+            put("mode", mode.wire)
+            put("name", image.name)
+            put("png_base64", image.pngBase64)
+        }
+    }
 
     data class Send(override val session: String, val text: String, val mode: SendMode) :
         OnSession("conversation.send") {

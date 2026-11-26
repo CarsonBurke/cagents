@@ -48,6 +48,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ListPage { .. }
         | R::ListResidentTerminals
         | R::WatchTerminals
+        | R::WatchMobile { .. }
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
         | R::ReadWorkspaceView { .. }
@@ -129,6 +130,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatCommand { .. }
         | R::ChatDeliver { .. }
         | R::ChatVisibility { .. }
+        | R::ChatHoldsFollowups { .. }
         | R::ChatRead { .. }
         | R::ChatClose { .. }
         | R::ChatCloseRetained { .. }

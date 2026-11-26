@@ -6,6 +6,9 @@ set -euo pipefail
 PROGRAM=release
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_HOST=${CAGENTS_RELEASE_BUILD_HOST:-fw16}
+# The Apple Silicon Mac that builds the macOS release beside the Linux one;
+# without one, a release is Linux only.
+MACOS_HOST=${CAGENTS_RELEASE_MACOS_HOST:-}
 BUNDLES=${CAGENTS_RELEASE_BUNDLES:-"${XDG_STATE_HOME:-$HOME/.local/state}/cagents-release"}
 GITHUB_REPOSITORY=${CAGENTS_RELEASE_GITHUB_REPOSITORY:-CarsonBurke/cagents}
 # The rehearsal's private user on the build host; by default
@@ -30,7 +33,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/release COMMAND [VERSION] [OPTIONS]
 
-  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY] [--build-host HOST]
+  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY] [--build-host HOST] [--macos-host MAC]
                    Release a bundle HOST already built: the newest bundle of
                    main whose tests passed, or SHA's. Says how far it is
                    behind main and offers to wait for a prebuild of the tip
@@ -42,11 +45,19 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    with KEY (default CAGENTS_RELEASE_SIGNING_KEY), or says how.
                    VERSION is the one the commit declares; an unpublished
                    earlier cut of it is replaced. Without a terminal, a
-                   bundle behind main needs --wait or --commit.
+                   bundle behind main needs --wait or --commit. With
+                   --macos-host (default CAGENTS_RELEASE_MACOS_HOST), MAC
+                   reuses the commit's prepared Apple Silicon bundle, or
+                   builds, signs it ad hoc and smoke-tests it if needed.
+  prepare-macos [--commit SHA] [--macos-host MAC]
+                   Build and smoke-test the Apple Silicon assets for SHA
+                   (default: main's tip) before cutting. The cache is keyed
+                   by host, version and commit. Cut creates the release tag
+                   and signs the release metadata.
   bump VERSION     Set every product manifest and Cargo.lock to VERSION.
                    Commit it through a pull request, then tag the merged
                    commit: git tag -a vVERSION -m vVERSION COMMIT
-  build VERSION [--notes FILE] [--build-host HOST]
+  build VERSION [--notes FILE] [--build-host HOST] [--macos-host MAC]
                    Build tag vVERSION on HOST (default: CAGENTS_RELEASE_BUILD_HOST
                    or fw16) in the glibc-baseline environment, require its
                    passing test verdict from main's sentinel there (testing
@@ -56,6 +67,7 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
                    fixes and speedups since the previous tag here.
+                   --macos-host adds the macOS release, as for cut.
   rehearse VERSION [--staged | --from-draft] [--build-host HOST]
                    Rehearse installed cagents updating from the newest
                    published release to the signed cut VERSION, on HOST,
@@ -100,7 +112,7 @@ shift
 case $COMMAND in -h|--help) usage; exit 0 ;; esac
 VERSION=
 TAG=
-if [[ $COMMAND != cut ]]; then
+if [[ $COMMAND != cut && $COMMAND != prepare-macos ]]; then
     (($# >= 1)) || fail "$COMMAND needs a VERSION"
     VERSION=$1
     shift
@@ -116,12 +128,14 @@ STAGED=false
 FROM_DRAFT=false
 ACTIONS=false
 YES=false
+MACOS_FLAG=false
 while (($#)); do
     case $1 in
-        --notes|--build-host|--feed|--commit|--key)
+        --notes|--build-host|--macos-host|--feed|--commit|--key)
             (($# >= 2)) && [[ -n $2 ]] || fail "$1 requires a value"
             case $1 in
-                --notes) NOTES=$2 ;; --build-host) BUILD_HOST=$2 ;; --feed) FEED=$2 ;;
+                --notes) NOTES=$2 ;; --build-host) BUILD_HOST=$2 ;; --macos-host) MACOS_HOST=$2; MACOS_FLAG=true ;;
+                --feed) FEED=$2 ;;
                 --commit) COMMIT=$2 ;; --key) KEY=$2 ;;
             esac
             shift 2
@@ -134,11 +148,25 @@ while (($#)); do
         *) fail "unknown argument: $1 (see --help)" ;;
     esac
 done
-[[ $COMMAND == cut || ( -z $COMMIT && -z $KEY && $WAIT == false ) ]] \
-    || fail '--commit, --key and --wait are for cut'
+[[ $COMMAND == cut || $COMMAND == prepare-macos || -z $COMMIT ]] \
+    || fail '--commit is for cut and prepare-macos'
+[[ $COMMAND == cut || ( -z $KEY && $WAIT == false ) ]] \
+    || fail '--key and --wait are for cut'
 [[ $ACTIONS == false || $COMMAND == cut || $COMMAND == publish ]] || fail '--actions is for cut and publish'
 [[ $YES == false || $COMMAND == publish ]] || fail '--yes is for publish'
 [[ $ACTIONS == false || -z $KEY ]] || fail '--actions signs in GitHub Actions; drop --key'
+[[ $MACOS_FLAG == false || $ACTIONS == false ]] || fail 'GitHub Actions builds no macOS release yet; cut it here with --macos-host'
+[[ $MACOS_FLAG == false || $COMMAND == cut || $COMMAND == build || $COMMAND == prepare-macos ]] \
+    || fail '--macos-host is for cut, build and prepare-macos'
+if [[ $COMMAND == cut && $ACTIONS == false ]] || [[ $COMMAND == build || $COMMAND == prepare-macos ]]; then
+    # ssh hands the host's login shell the command line, which may not be POSIX.
+    [[ -z $MACOS_HOST || $MACOS_HOST =~ ^[A-Za-z0-9][-A-Za-z0-9_.@]*$ ]] || fail "unsafe --macos-host: $MACOS_HOST"
+else
+    if [[ -n $MACOS_HOST && $COMMAND == cut ]]; then
+        printf 'release: GitHub Actions builds no macOS release yet; this release will be Linux only (CAGENTS_RELEASE_MACOS_HOST is not used).\n' >&2
+    fi
+    MACOS_HOST=
+fi
 [[ -z $COMMIT || $WAIT == false ]] || fail "--wait releases main's tip; --commit releases another bundle"
 [[ $COMMAND == rehearse || ( $STAGED == false && $FROM_DRAFT == false ) ]] || fail '--staged and --from-draft are for rehearse'
 [[ $STAGED == false || $FROM_DRAFT == false ]] || fail "--from-draft rehearses the in-app update, which publication requires; drop --staged"
@@ -150,6 +178,13 @@ repository_git() (
 
 package_version() {
     sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}' "$1"
+}
+
+version_at() {
+    local version
+    version=$(repository_git show "$1:Cargo.toml" | package_version /dev/stdin)
+    [[ $version =~ $VERSION_PATTERN ]] || fail "$1 does not declare a stable version"
+    printf '%s' "$version"
 }
 
 bump() {
@@ -178,10 +213,18 @@ bump() {
     printf '  git tag -a %s -m %s COMMIT && git push origin %s\n' "$TAG" "$TAG" "$TAG"
 }
 
+# Both paths publish one bundle directory and partial stage per version.
+lock_release_bundle() {
+    mkdir -p -- "$BUNDLES"
+    exec 7>"$BUNDLES/.release-$VERSION.lock"
+    flock 7
+}
+
 build() {
     local commit relative remote_output bundle
     commit=$(repository_git rev-parse --verify "refs/tags/$TAG^{commit}") \
         || fail "tag $TAG does not exist here; create it on the merged version bump first"
+    lock_release_bundle
     bundle=$BUNDLES/$VERSION
     [[ ! -e $bundle ]] || fail "$bundle exists; remove it to build $VERSION again"
     relative=$(host_repository)
@@ -267,6 +310,14 @@ EOF
     scp -q -r -- "$BUILD_HOST:$remote_output" "$bundle.partial"
     "$ROOT_DIR/scripts/release-metadata" check --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$commit" >/dev/null || fail 'the copied bundle does not match its metadata'
+    if [[ -n $MACOS_HOST ]]; then
+        local protocol
+        protocol=$(jq -r .protocol "$bundle.partial/release-metadata.json")
+        add_macos "$bundle.partial" "$commit"
+        rm -- "$bundle.partial/release-metadata.json"
+        "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
+            --source-commit "$commit" --protocol "$protocol" --notes "$NOTES" >/dev/null
+    fi
     mv -- "$bundle.partial" "$bundle"
     # shellcheck disable=SC2029
     ssh "$BUILD_HOST" rm -rf -- "$remote_output" "/var/tmp/cagents-release/$VERSION-notes.md"
@@ -274,6 +325,157 @@ EOF
     printf '  jq -r .notes %q\n' "$bundle/release-metadata.json"
     printf '  ssh-keygen -Y sign -n cagents-release -f KEY %q\n' "$bundle/release-metadata.json"
 }
+
+# Builds into DIRECTORY the Apple Silicon release of COMMIT, which
+# MACOS_HOST builds, signs ad hoc and smoke-tests with the commit's own
+# scripts/package-macos. It builds an export of the commit, which like the
+# Linux build's has no .git, and keeps its Cargo target under the Mac's
+# ~/Library/Caches/cagents-release/target for the next release.
+build_macos() (
+    local directory=$1 commit=$2 source epoch name remote created=false
+    repository_git cat-file -e "$commit:scripts/package-macos" 2>/dev/null \
+        || fail "$commit has no scripts/package-macos to build its macOS release"
+    epoch=$(repository_git show -s --format=%ct "$commit")
+    source=$(mktemp "${TMPDIR:-/var/tmp}/cagents-macos-source.XXXXXX")
+    remote=Library/Caches/cagents-release/run-${source##*.}
+    cleanup_macos_build() {
+        rm -f -- "$source"
+        if [[ $created == true ]]; then
+            ssh "$MACOS_HOST" bash -s -- "$remote" <<'MAC' || :
+rm -rf -- ~/"$1"
+MAC
+        fi
+    }
+    trap cleanup_macos_build EXIT
+    repository_git archive --format=tar.gz -o "$source" "$commit" || fail "cannot export $commit for the Mac"
+    printf 'Building the macOS release of %s on %s.\n' "$commit" "$MACOS_HOST"
+    # Each upload and output belongs to one caller. The Mac keeps a stable
+    # source path and Cargo target for reuse, so hold its lock across the
+    # complete package and smoke test, including copies out of Cargo's target.
+    ssh "$MACOS_HOST" bash -s -- "$remote" <<'MAC' || fail "cannot prepare $MACOS_HOST"
+set -euo pipefail
+mkdir -p "$HOME/Library/Caches/cagents-release"
+mkdir -m 700 -- ~/"$1"
+MAC
+    created=true
+    scp -q -- "$source" "$MACOS_HOST:$remote/source.tar.gz" || fail "cannot copy the source to $MACOS_HOST"
+    ssh "$MACOS_HOST" bash -s -- "$remote" "$epoch" <<'MAC' || fail "$MACOS_HOST could not build the macOS release (above)"
+set -euo pipefail
+cd ~/Library/Caches/cagents-release
+exec /usr/bin/python3 -I -c '
+import fcntl, os, sys
+
+descriptor = os.open(".build.lock", os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(descriptor, fcntl.LOCK_EX)
+if descriptor == 9:
+    os.set_inheritable(9, True)
+else:
+    os.dup2(descriptor, 9, inheritable=True)
+    os.close(descriptor)
+os.execv("/bin/bash", ["/bin/bash", "-s", "--", *sys.argv[1:]])
+' "$HOME/$1" "$2" <<'BUILD'
+set -euo pipefail
+trap 'exit 1' HUP INT TERM
+rm -rf -- build-source
+mkdir -- build-source
+trap 'rm -rf -- build-source' EXIT
+tar -xzf "$1/source.tar.gz" -C build-source
+export PATH=$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+export CARGO_TARGET_DIR=$HOME/Library/Caches/cagents-release/target SOURCE_DATE_EPOCH=$2
+build-source/scripts/package-macos --output "$1/dist" </dev/null 9>&-
+BUILD
+MAC
+    for name in "$(macos_archive)" install-macos.sh SHA256SUMS-macos; do
+        scp -q -- "$MACOS_HOST:$remote/dist/$name" "$directory/$name" \
+            || fail "cannot copy $name from $MACOS_HOST"
+    done
+    macos_checksums_match "$directory" \
+        || fail "the macOS release copied from $MACOS_HOST does not match its checksums"
+)
+
+macos_archive() {
+    printf 'cagents-%s-aarch64-apple-darwin.tar.gz' "$VERSION"
+}
+
+macos_checksums_match() (
+    cd -- "$1" || exit 1
+    local archive
+    archive=$(macos_archive)
+    local name
+    for name in "$archive" install-macos.sh SHA256SUMS-macos; do
+        [[ -f $name && ! -L $name ]] || exit 1
+    done
+    sha256sum -- "$archive" install-macos.sh | cmp -s -- - SHA256SUMS-macos
+)
+
+macos_cache_dir() {
+    local directory=$BUNDLES/.prepared-macos/$MACOS_HOST/$VERSION
+    mkdir -p -m 700 -- "$directory" || fail "cannot create $directory"
+    printf '%s' "$directory"
+}
+
+macos_receipt() {
+    printf '%s\n' "$2"
+    sha256sum < "$1/SHA256SUMS-macos"
+}
+
+prepared_macos_matches() {
+    local bundle=$1 commit=$2
+    [[ -f $bundle/receipt && ! -L $bundle/receipt ]] \
+        && macos_checksums_match "$bundle" \
+        && macos_receipt "$bundle" "$commit" | cmp -s -- - "$bundle/receipt"
+}
+
+add_macos() (
+    [[ -n $MACOS_HOST ]] || exit 0
+    local directory=$1 commit=$2 cache bundle
+    cache=$(macos_cache_dir)
+    bundle=$cache/$commit
+    exec 8>"$cache/.lock"
+    flock 8
+    if prepared_macos_matches "$bundle" "$commit"; then
+        cp -- "$bundle/$(macos_archive)" "$bundle/install-macos.sh" "$bundle/SHA256SUMS-macos" "$directory/"
+        if ! macos_checksums_match "$directory" \
+            || ! macos_receipt "$directory" "$commit" | cmp -s -- - "$bundle/receipt"; then
+            fail "the staged macOS assets do not match the prepared release"
+        fi
+        printf 'Using the prepared macOS release of %s.\n' "$commit"
+    else
+        build_macos "$directory" "$commit"
+    fi
+)
+
+prepare_macos() {
+    [[ -n $MACOS_HOST ]] || fail 'prepare-macos needs --macos-host MAC'
+    local commit
+    repository_git fetch --quiet origin main
+    commit=$(repository_git rev-parse --verify --end-of-options "${COMMIT:-origin/main}^{commit}") \
+        || fail "unknown commit: $COMMIT"
+    repository_git merge-base --is-ancestor "$commit" origin/main || fail "$commit is not on main"
+    prepare_macos_commit "$commit"
+}
+
+prepare_macos_commit() (
+    local commit=$1 cache bundle stage started=$SECONDS
+    VERSION=$(version_at "$commit")
+    cache=$(macos_cache_dir)
+    bundle=$cache/$commit
+    exec 8>"$cache/.lock"
+    flock 8
+    if prepared_macos_matches "$bundle" "$commit"; then
+        printf 'macOS release of %s is already prepared.\n' "$commit"
+        return
+    fi
+    stage=$(mktemp -d "$cache/.prepare.XXXXXX")
+    trap 'rm -rf -- "$stage"' EXIT
+    trap 'exit 1' HUP INT TERM
+    mkdir -- "$stage/assets"
+    build_macos "$stage/assets" "$commit"
+    macos_receipt "$stage/assets" "$commit" > "$stage/assets/receipt"
+    [[ ! -e $bundle ]] || mv -T -- "$bundle" "$stage/rejected"
+    mv -T -- "$stage/assets" "$bundle"
+    printf 'Prepared the macOS release of %s in %ss.\n' "$commit" "$((SECONDS - started))"
+)
 
 # The build host's checkout of this repository, relative to its home. The
 # host keeps one checkout, at the main worktree's path, so a linked worktree
@@ -299,7 +501,7 @@ on_host() {
 # Prints, as JSON, the build host's prebuilt bundles with each one's test
 # verdict, the build running and the commit main's sentinel compiled last.
 prebuilt() {
-    on_host <<'HOST'
+    on_host "$1" <<'HOST'
 set -euo pipefail
 cd ~/"$1"
 scripts/prebuild-release --repository "$PWD" status --json | /usr/bin/python3 -I -c '
@@ -308,28 +510,44 @@ status = json.load(sys.stdin)
 verdicts = pathlib.Path.home() / ".local/state/cagents-main-sentinel/verdicts"
 def verdict(sha):
     try:
-        return json.loads((verdicts / f"{sha}.json").read_text()).get("passed")
+        result = json.loads((verdicts / f"{sha}.json").read_text())
+        if isinstance(result, dict) and result.get("sha") == sha:
+            return result.get("passed")
     except (OSError, ValueError):
         return None
 # An unreadable bundle.json reads as null; such a bundle is no candidate.
 status["bundles"] = [bundle for bundle in status["bundles"] if bundle]
 for bundle in status["bundles"]:
     bundle["passed"] = verdict(bundle["sha"])
+status["tip_passed"] = verdict(sys.argv[1])
 print(json.dumps(status))
-'
+' "$2"
 HOST
 }
 
 # Builds main's tip on the build host at normal priority and requires its
 # passing verdict, which the sentinel gives while the bundle builds.
-prebuild_tip() {
-    local tip=$1
+start_tip_prebuild() {
+    local tip=$1 relative output mode=wait
+    relative=$(host_repository)
+    if [[ -n $CUT_LINUX_ARCHIVE ]]; then
+        mode=stream
+        exec {output}>"$CUT_LINUX_ARCHIVE"
+    else
+        exec {output}>&1
+    fi
     printf 'Prebuilding %s on %s at normal priority; its tests run beside it if they have not yet.\n' \
         "$tip" "$BUILD_HOST"
-    on_host "$tip" <<'HOST'
+    # Keep the SSH PID so interruption stops our waiter. The requested
+    # fw16 prebuild can still finish and be reused.
+    # shellcheck disable=SC2029
+    ssh "$BUILD_HOST" bash -s -- "$relative" "$tip" "$mode" >&"$output" <<'HOST' &
 set -euo pipefail
 cd ~/"$1"
 tip=$2
+if [[ $3 == stream ]]; then
+    exec 3>&1 1>&2
+fi
 scripts/prebuild-release --repository "$PWD" request "$tip" >/dev/null
 scripts/main-build-sentinel --repository "$PWD" --require-tests "$tip" > /dev/null 2>&1 </dev/null &
 tests=$!
@@ -356,7 +574,22 @@ case $status in
     1) echo "release: $tip fails its tests; see ~/.local/state/cagents-main-sentinel/logs on the build host" >&2; exit 1 ;;
     *) echo "release: the sentinel gave $tip no verdict (status $status); run the release again" >&2; exit 1 ;;
 esac
+if [[ $3 == stream ]]; then
+    # Keep the bytes even if the bundle is evicted while macOS prepares.
+    # Hold the eviction lock only while linking the immutable asset files.
+    store=$HOME/.local/state/cagents-prebuilt
+    snapshot=$(mktemp -d "$store/.cut.XXXXXXXXXX")
+    trap 'rm -rf -- "$snapshot"' EXIT
+    trap 'exit 1' HUP INT TERM
+    (
+        flock 9
+        cp -al -- "$store/bundles/$tip/dist" "$snapshot/dist"
+    ) 9>>"$store/pins.lock"
+    tar -C "$snapshot/dist" -cf - . >&3
+fi
 HOST
+    TIP_PREBUILD_PID=$!
+    exec {output}>&-
 }
 
 # The versions tagged on origin, as a JSON array.
@@ -397,19 +630,32 @@ HOST
 }
 
 NOTES_FILE=
+TIP_PREBUILD_PID=
+CUT_LINUX_ARCHIVE=
 cut_cleanup() {
+    if [[ -n $TIP_PREBUILD_PID ]]; then
+        # This is the only background job cut starts. Use the job table so a
+        # finished waiter's numeric PID cannot target an unrelated process.
+        kill -TERM %+ 2>/dev/null || :
+        wait "$TIP_PREBUILD_PID" || :
+    fi
+    [[ -z $CUT_LINUX_ARCHIVE ]] || rm -f -- "$CUT_LINUX_ARCHIVE"
     [[ -z $NOTES_FILE ]] || rm -f -- "$NOTES_FILE"
     unpin_bundle
 }
 
 # Named apart from the cut command, which it would otherwise shadow.
 cut_release() {
-    local status released selected sha behind tip answer version bundle protocol previous key building
+    local status released selected sha behind tip answer bundle protocol previous key building
+    local prebuild_status=0 tip_version
     trap cut_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     repository_git fetch --quiet origin main
     MAIN=$(repository_git rev-parse --verify origin/main)
     tip=$MAIN
-    status=$(prebuilt) || fail "cannot read the prebuilt bundles on $BUILD_HOST"
+    status=$(prebuilt "$tip") || fail "cannot read the prebuilt bundles on $BUILD_HOST"
     released=$(released_versions) || fail 'cannot read the tags on origin'
     if [[ -n $COMMIT ]]; then
         sha=$(repository_git rev-parse --verify "$COMMIT^{commit}") || fail "unknown commit: $COMMIT"
@@ -444,14 +690,26 @@ cut_release() {
             [[ $answer == [yY] ]] || fail 'nothing released'
         fi
         unpin_bundle
-        prebuild_tip "$tip" || fail "no bundle of $tip"
+        if [[ -n $MACOS_HOST && $sha != "$tip" ]] && jq -e '.tip_passed == true' <<< "$status" >/dev/null; then
+            tip_version=$(version_at "$tip")
+            if [[ ! -e $BUNDLES/$tip_version/release-metadata.json.sig ]] && \
+                ! jq -e --arg v "$tip_version" 'index($v) != null' <<< "$released" >/dev/null; then
+                mkdir -p -- "$BUNDLES"
+                CUT_LINUX_ARCHIVE=$(mktemp "$BUNDLES/.linux-cut.XXXXXXXXXX")
+            fi
+        fi
+        start_tip_prebuild "$tip"
+        # Keep the Mac in the foreground for SSH authentication and cleanup.
+        [[ -z $CUT_LINUX_ARCHIVE ]] || prepare_macos_commit "$tip"
+        wait "$TIP_PREBUILD_PID" || prebuild_status=$?
+        TIP_PREBUILD_PID=
+        ((prebuild_status == 0)) || fail "no bundle of $tip"
         sha=$tip
-        pin_bundle "$sha"
+        [[ -n $CUT_LINUX_ARCHIVE ]] || pin_bundle "$sha"
     fi
-    version=$(repository_git show "$sha:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}')
-    [[ $version =~ $VERSION_PATTERN ]] || fail "$sha does not declare a stable version"
-    VERSION=$version
+    VERSION=$(version_at "$sha")
     TAG=v$VERSION
+    lock_release_bundle
     if jq -e --arg v "$VERSION" 'index($v)' <<< "$released" >/dev/null; then
         # publish pushes the tag just before it publishes; a failure between
         # the two leaves the tag on origin with nothing published.
@@ -500,8 +758,15 @@ cut_release() {
     fi
     mkdir -p -- "$BUNDLES"
     rm -rf -- "$bundle.partial"
-    printf 'Copying the bundle of %s (%s) from %s.\n' "$sha" "$VERSION" "$BUILD_HOST"
-    scp -q -r -- "$BUILD_HOST:.local/state/cagents-prebuilt/bundles/$sha/dist" "$bundle.partial"
+    if [[ -n $CUT_LINUX_ARCHIVE ]]; then
+        mkdir -- "$bundle.partial"
+        tar -xf "$CUT_LINUX_ARCHIVE" -C "$bundle.partial"
+        rm -f -- "$CUT_LINUX_ARCHIVE"
+        CUT_LINUX_ARCHIVE=
+    else
+        printf 'Copying the bundle of %s (%s) from %s.\n' "$sha" "$VERSION" "$BUILD_HOST"
+        scp -q -r -- "$BUILD_HOST:.local/state/cagents-prebuilt/bundles/$sha/dist" "$bundle.partial"
+    fi
     # Every file matches the size and digest the prebuild recorded for this
     # commit and version: what is signed is what was built and smoke-tested.
     "$ROOT_DIR/scripts/release-metadata" check --dir "$bundle.partial" --version "$VERSION" \
@@ -517,6 +782,7 @@ cut_release() {
     fi
     [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
     [[ $(wc -c < "$NOTES") -le 65536 ]] || fail 'release notes exceed 64 KiB; pass a shorter --notes FILE'
+    add_macos "$bundle.partial" "$sha"
     rm -- "$bundle.partial/release-metadata.json"
     "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$sha" --protocol "$protocol" --notes "$NOTES" >/dev/null
@@ -999,6 +1265,7 @@ case $COMMAND in
     bump) bump ;;
     build) build ;;
     cut) cut_release ;;
+    prepare-macos) prepare_macos ;;
     rehearse) rehearse ;;
     feed)
         [[ -n $FEED ]] || fail 'feed needs --feed DIR'

@@ -1,9 +1,9 @@
 use super::*;
+use crate::host::model::AgentRunUpdateRisk;
 use crate::update::impact::{
-    DaemonImpact, Disposition, Policy, QUEUED_MESSAGES, SessionImpact, SessionKind,
+    DaemonImpact, Disposition, Policy, SessionCause, SessionImpact, SessionKind,
 };
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 
 /// The caller holds the control gate. SQL and actor barriers deliberately run
 /// without HostState: both may need host events to finish admitted work.
@@ -53,10 +53,15 @@ pub(in crate::host) fn inspect(
         )
     };
     let mut blockers = cleanup_failures;
-    // Agents whose only outstanding work is queued for their own conversation.
+    // Agents whose only outstanding work is a delivery in flight to their own
+    // conversation. Runs still queued unsent are carried and hold nothing.
     let mut queued = BTreeMap::new();
+    let mut agent_runs = BTreeMap::new();
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        agent_runs = registry
+            .agent_runs_at_risk_on_restart()
+            .map_err(upgrade_error)?;
         for hold in registry.agent_update_holds().map_err(upgrade_error)? {
             match hold.session {
                 Some(session) => {
@@ -103,7 +108,7 @@ pub(in crate::host) fn inspect(
     let mut impact = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .upgrade_impact_with_queued(policy, &queued.keys().copied().collect())?;
+        .upgrade_impact_with_agent_work(policy, &queued.keys().copied().collect(), &agent_runs)?;
     // Queued work no listed conversation will deliver still fences the update.
     for (session, blocker) in queued {
         if !impact.sessions.iter().any(|item| {
@@ -158,17 +163,20 @@ impl HostState {
 
     #[cfg(test)]
     pub(crate) fn upgrade_impact(&mut self, policy: Policy) -> Result<DaemonImpact, ProtocolError> {
-        self.upgrade_impact_with_queued(policy, &BTreeSet::new())
+        self.upgrade_impact_with_agent_work(policy, &BTreeSet::new(), &BTreeMap::new())
     }
 
-    /// `queued` names conversations that have messages accepted for them but
-    /// not yet delivered. An accepted run is never redispatched after a
-    /// restart, so the update waits for each one to receive them, under
-    /// either policy; interrupting its turn would not deliver them.
-    pub(in crate::host) fn upgrade_impact_with_queued(
+    /// `queued` names conversations with a delivery in flight: a run a
+    /// dispatcher has claimed but the provider has not yet started. A claimed
+    /// run is never redispatched after a restart, so the update waits for
+    /// each one to receive it, under either policy; interrupting its turn
+    /// would not deliver it. Runs still queued unsent are not named: they
+    /// follow their agent through the restart.
+    pub(in crate::host) fn upgrade_impact_with_agent_work(
         &mut self,
         policy: Policy,
         queued: &BTreeSet<TerminalId>,
+        agent_runs: &BTreeMap<TerminalId, AgentRunUpdateRisk>,
     ) -> Result<DaemonImpact, ProtocolError> {
         let capability = self
             .shutdown_preflight(Instant::now())
@@ -257,10 +265,11 @@ impl HostState {
             let aligned = crate::chat::protocol::align_resume_identity(&mut launch).is_ok();
             let continuity = record.handle.native_continuity();
             let durable = continuity.retains_provider();
+            let actor = record.handle.actor_identity();
             let retained_claude = matches!(
                 continuity,
                 crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
-            ) && record.handle.actor_identity().is_some();
+            ) && actor.is_some();
             let hosted_source = !super::super::chat::owns_codex_listener(&record.session)
                 && self
                     .terminals
@@ -280,35 +289,38 @@ impl HostState {
                 source.launch.session_id = confirmed.clone();
             }
             let migration = crate::upgrade::handoff::validate_chat_source(&source, &launch);
-            let (disposition, reason): (_, Cow<str>) = if record.returning_terminal {
-                (
-                    Disposition::Blocked,
-                    "Finish the pending return to terminal or close this conversation.".into(),
-                )
+            let agent_warning = || {
+                let risk = agent_runs.get(&id).filter(|risk| {
+                    crate::agent_execution::same_chat_process(&risk.session, &record.session)
+                })?;
+                if retained_claude
+                    && actor
+                        .as_ref()
+                        .is_some_and(|identity| identity.instance == record.execution_instance)
+                {
+                    let retained = record.handle.retained_runs();
+                    if risk.runs.iter().all(|run| retained.contains(run)) {
+                        return None;
+                    }
+                }
+                Some(SessionCause::AgentRunUnconfirmed {
+                    queued_prompts: risk.queued_prompts,
+                })
+            };
+            let (disposition, reason) = if record.returning_terminal {
+                (Disposition::Blocked, SessionCause::ReturningToTerminal)
             } else if self.provider_ended(id, record) {
-                (
-                    Disposition::Resumes,
-                    crate::update::impact::PROVIDER_ENDED.into(),
-                )
+                (Disposition::Resumes, SessionCause::ProviderEnded)
             } else if record.handle.is_completed() {
-                (
-                    Disposition::Blocked,
-                    crate::update::impact::STOPPED_WITH_UNSETTLED_WORK.into(),
-                )
-            } else if let Err(reason) = &migration {
-                (Disposition::Blocked, reason.as_str().into())
-            } else if let Err(reason) = &environment {
-                (Disposition::Blocked, reason.as_str().into())
+                (Disposition::Blocked, SessionCause::UnsettledProvider)
+            } else if let Err(reason) = migration {
+                (Disposition::Blocked, SessionCause::Detail(reason))
+            } else if let Err(reason) = environment {
+                (Disposition::Blocked, SessionCause::Detail(reason))
             } else if !ready {
-                (
-                    Disposition::Blocked,
-                    "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.".into(),
-                )
+                (Disposition::Blocked, SessionCause::ProviderStarting)
             } else if (!aligned || launch.terminal_recipe().is_none()) && !retained_claude {
-                (
-                    Disposition::Blocked,
-                    "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.".into(),
-                )
+                (Disposition::Blocked, SessionCause::UnrecordedConversation)
             } else if durable
                 && self.terminals.get(&id).is_some_and(|terminal| {
                     !terminal.handle.is_completed()
@@ -317,27 +329,34 @@ impl HostState {
             {
                 (
                     Disposition::Blocked,
-                    "The paired console cannot preserve its live process through this update."
-                        .into(),
+                    SessionCause::PairedTerminalCannotCarry,
                 )
             } else if queued.contains(&id) {
-                (Disposition::WaitsForIdle, QUEUED_MESSAGES.into())
+                (Disposition::WaitsForIdle, SessionCause::PendingDelivery)
             } else if durable {
                 (
                     Disposition::Continues,
-                    "The provider, active turn, and pending approvals stay alive while the application reconnects.".into(),
-                )
-            } else if busy && policy == Policy::WhenIdle {
-                (
-                    Disposition::WaitsForIdle,
-                    waits_for_idle_reason(&hold).into(),
+                    agent_warning().unwrap_or_else(|| {
+                        "The provider, active turn, and pending approvals stay alive while the application reconnects.".into()
+                    }),
                 )
             } else if busy {
-                (Disposition::Interrupted, interrupted_reason(&hold).into())
+                match policy {
+                    Policy::WhenIdle => (
+                        Disposition::WaitsForIdle,
+                        agent_warning().unwrap_or_else(|| waits_for_idle_reason(&hold).into()),
+                    ),
+                    Policy::Interrupt => (
+                        Disposition::Interrupted,
+                        agent_warning().unwrap_or_else(|| interrupted_reason(&hold).into()),
+                    ),
+                }
             } else {
                 (
                     Disposition::Resumes,
-                    "The saved conversation will reopen with a new provider process.".into(),
+                    agent_warning().unwrap_or_else(|| {
+                        "The saved conversation will reopen with a new provider process.".into()
+                    }),
                 )
             };
             impact.sessions.push(SessionImpact {
@@ -363,7 +382,7 @@ impl HostState {
                     record.handle.native_continuity(),
                 ))?,
                 disposition,
-                reason: reason.into_owned(),
+                reason,
                 interrupted_subagents: if disposition == Disposition::Interrupted {
                     interrupted_subagents
                 } else {
