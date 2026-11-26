@@ -156,6 +156,7 @@ struct ClaudeOrdering {
     transcript: Option<(u64, u64)>,
     idle_input: bool,
     fence: Option<ClaudeFence>,
+    deferred: Option<crate::notifications::Evidence>,
 }
 
 impl ClaudeOrdering {
@@ -171,8 +172,13 @@ impl ClaudeOrdering {
             self.transcript = Some(transcript);
             self.idle_input = false;
             self.fence = self.fence.map(|_| ClaudeFence::AwaitingInput);
+            self.deferred = None;
         }
-        if clear == Some(AttentionClear::TurnStarted) {
+        let started = clear == Some(AttentionClear::TurnStarted);
+        if started || edges.claude_input {
+            self.deferred = None;
+        }
+        if started {
             self.fence = Some(if self.idle_input {
                 ClaudeFence::InputObservedIdle
             } else {
@@ -180,33 +186,45 @@ impl ClaudeOrdering {
             });
         }
         if let Some(fence) = self.fence {
-            // An older completion may arrive on any poll after the census
-            // reported a new start. Even returning to Idle doesn't establish
-            // which turn emitted it. Require order in this exact transcript.
+            // A previous result can arrive on any poll after the census
+            // reported a start. Returning to Idle without ordered root
+            // input is still no evidence of which turn completed.
+            let exact_transcript =
+                edges.claude_transcript.is_some() && edges.claude_transcript == self.transcript;
             let ordered = if edges.claude_input {
                 edges.claude_ordered_notice
             } else {
                 match fence {
                     ClaudeFence::AwaitingInput => false,
-                    // The census can miss an entire turn between Idle and
-                    // Working. A prior Idle input can belong to that missed
-                    // turn, so it cannot authorize a result during new work.
-                    ClaudeFence::InputObservedIdle => state == ActivityState::Idle,
+                    ClaudeFence::InputObservedIdle => {
+                        exact_transcript && state == ActivityState::Idle
+                    }
                     ClaudeFence::InputObservedActive => true,
                 }
             };
-            if edges.notice.is_some() && ordered {
+            if !ordered
+                && let Some(candidate) = edges.notice.take()
+                && matches!(fence, ClaudeFence::InputObservedIdle)
+                && !edges.claude_input
+                && exact_transcript
+                && state == ActivityState::Working
+            {
+                // A cached Working census can outlast the transcript's
+                // only completion. Keep one ordered candidate until the
+                // exact transcript is observed again while idle.
+                self.deferred = Some(candidate);
+            }
+            if edges.notice.is_none() && exact_transcript && state == ActivityState::Idle {
+                edges.notice = self.deferred.take();
+            }
+            if edges.notice.is_some() {
                 self.fence = None;
-            } else {
-                edges.notice = None;
-                if edges.claude_input {
-                    self.fence = Some(match state {
-                        ActivityState::Idle | ActivityState::Unknown => {
-                            ClaudeFence::InputObservedIdle
-                        }
-                        _ => ClaudeFence::InputObservedActive,
-                    });
-                }
+                self.deferred = None;
+            } else if edges.claude_input {
+                self.fence = Some(match state {
+                    ActivityState::Idle | ActivityState::Unknown => ClaudeFence::InputObservedIdle,
+                    _ => ClaudeFence::InputObservedActive,
+                });
             }
         }
         if state != ActivityState::Idle || edges.notice.is_some() {
@@ -708,17 +726,21 @@ mod tests {
         );
         assert!(observation.attention.is_none());
 
-        // The prior Idle input could belong to a turn the census missed
-        // altogether. Its result cannot revive a notice mid-work.
-        append(result("missed-turn"));
+        // The transcript can finish before the cached Working census
+        // changes. Only this one result is written.
+        append(result("completed-before-idle"));
         let observation = observe(ActivityState::Working);
         assert_eq!(observation.clear_attention, None);
         assert!(observation.attention.is_none());
+        assert!(observe(ActivityState::Working).attention.is_none());
 
-        append(result("later"));
         let observation = observe(ActivityState::Idle);
         assert_eq!(observation.clear_attention, None);
-        assert_eq!(observation.attention.unwrap().key, "claude:later");
+        assert_eq!(
+            observation.attention.unwrap().key,
+            "claude:completed-before-idle"
+        );
+        assert!(observe(ActivityState::Idle).attention.is_none());
 
         append(result("before-unconfirmed-input"));
         append(input(
@@ -760,8 +782,12 @@ mod tests {
         );
         explicit["origin"] = serde_json::json!({"kind": "human"});
         append(explicit);
+        assert!(observe(ActivityState::Working).attention.is_none());
+        // A newer genuine input discards the previous held candidate.
+        assert!(observe(ActivityState::Idle).attention.is_none());
+
         append(result("explicit-human-result"));
-        let observation = observe(ActivityState::Working);
+        let observation = observe(ActivityState::Idle);
         assert_eq!(observation.clear_attention, None);
         assert_eq!(
             observation.attention.unwrap().key,
@@ -861,15 +887,33 @@ mod tests {
             claude_input: true,
             ..attention::Edges::default()
         };
+        assert!(ordering.notice(ActivityState::Idle, None, setup).is_none());
+        let same = || attention::Edges {
+            claude_transcript: old_transcript,
+            ..attention::Edges::default()
+        };
         assert!(
             ordering
                 .notice(
                     ActivityState::Working,
                     Some(AttentionClear::TurnStarted),
-                    setup,
+                    same(),
                 )
                 .is_none()
         );
+        let completion = attention::Edges {
+            notice: Some(crate::notifications::Evidence {
+                key: "held".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            }),
+            ..same()
+        };
+        assert!(
+            ordering
+                .notice(ActivityState::Working, None, completion)
+                .is_none()
+        );
+        assert!(ordering.deferred.is_some());
         for claude_transcript in [new_transcript, old_transcript] {
             let unproven = attention::Edges {
                 claude_transcript,
@@ -884,6 +928,7 @@ mod tests {
                     .notice(ActivityState::Idle, None, unproven)
                     .is_none()
             );
+            assert!(ordering.deferred.is_none());
         }
     }
 
