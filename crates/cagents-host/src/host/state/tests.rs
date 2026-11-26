@@ -1217,6 +1217,33 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
 /// The real CLI names its session only on the frames of a turn, and a
 /// provider can stop on its own. Neither an idle resumed conversation nor
 /// one that already ended may hold an update hostage.
+fn wait_for_local_fixture_identity(
+    handle: &crate::chat::runtime::Handle,
+    expected: &str,
+    trace: &std::path::Path,
+) {
+    #[cfg(target_os = "linux")]
+    let timeout = Duration::from_secs(5);
+    #[cfg(target_os = "macos")]
+    let timeout = Duration::from_secs(15);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let confirmed = handle.confirmed_session_id();
+        if confirmed.as_deref() == Some(expected) {
+            return;
+        }
+        if handle.is_completed() || Instant::now() >= deadline {
+            let snapshot_error = handle.snapshot(None).and_then(|snapshot| snapshot.error);
+            panic!(
+                "local provider failed to confirm {expected}; confirmed {confirmed:?}; failure {:?}; snapshot error {snapshot_error:?}; fixture trace {:?}",
+                handle.failure(),
+                fs::read_to_string(trace)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 pub(super) fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
     if !upgrade_fixture_in_fresh_process() {
@@ -1241,8 +1268,14 @@ pub(super) fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
     // different conversation, which the adapter refuses as a failure.
     fs::write(&executable, r#"#!/usr/bin/python3
 import json, os, sys
+def trace(event):
+    with open(__file__ + ".trace", "a") as out:
+        out.write(str(os.getpid()) + " " + event + "\n")
+trace("started")
 for line in sys.stdin:
     request = json.loads(line)
+    if request["request"]["subtype"] == "initialize":
+        trace("received initialize")
     if request["request"]["subtype"] == "interrupt":
         print(json.dumps({"type": "system", "subtype": "init", "session_id": os.environ["OTHER_SESSION"]}), flush=True)
     print(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"], "response": {}}}), flush=True)
@@ -1317,11 +1350,9 @@ for line in sys.stdin:
     };
     let (idle, idle_handle) = start(IDLE);
     let (ended, ended_handle) = start(ENDED);
+    let trace = executable.with_extension("trace");
     for (handle, id) in [(&idle_handle, IDLE), (&ended_handle, ENDED)] {
-        wait(
-            &|| handle.confirmed_session_id().as_deref() == Some(id),
-            "an idle resumed conversation was never confirmed",
-        );
+        wait_for_local_fixture_identity(handle, id, &trace);
     }
     ended_handle.command(Command::Interrupt).unwrap();
     wait(
@@ -1422,12 +1453,18 @@ pub(super) fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_co
     let log = cwd.join("launches");
     fs::write(&executable, r#"#!/usr/bin/python3
 import json, os, sys
+def trace(event):
+    with open(__file__ + ".trace", "a") as out:
+        out.write(str(os.getpid()) + " " + event + "\n")
+trace("started")
 identity = next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--resume="))
 with open(os.environ["LAUNCH_LOG"], "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\n")
 print(json.dumps({"type": "system", "subtype": "init", "session_id": identity}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
+    if request["request"]["subtype"] == "initialize":
+        trace("received initialize")
     if request["request"]["subtype"] == "interrupt":
         print(json.dumps({"type": "conversation_reset", "session_id": identity}), flush=True)
         identity = os.environ["NEXT_SESSION"]
@@ -1493,21 +1530,12 @@ for line in sys.stdin:
     let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&source.id]
         .handle
         .clone();
-    let wait_for_identity = |expected: &str| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.confirmed_session_id().as_deref() != Some(expected) {
-            assert!(
-                Instant::now() < deadline,
-                "provider failed to confirm {expected}"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    };
-    wait_for_identity(A);
+    let trace = executable.with_extension("trace");
+    wait_for_local_fixture_identity(&handle, A, &trace);
     // The hidden actor changes conversations without a presentation read
     // refreshing its persisted card's original launch or cached identity.
     handle.command(Command::Interrupt).unwrap();
-    wait_for_identity(B);
+    wait_for_local_fixture_identity(&handle, B, &trace);
     let store = Store::open(&cwd.join("checkpoint")).unwrap();
     let capability = host
         .lock()
