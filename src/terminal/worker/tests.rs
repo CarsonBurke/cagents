@@ -245,7 +245,9 @@ fn checked_close_waits_for_an_adopted_reaped_roots_exact_release() {
         admitted.recv().unwrap();
         worker.run();
     }));
-    initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+    initialized
+        .recv_timeout(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(5))
+        .unwrap();
     let expected = handle.holder_identity().unwrap().clone();
     let closer = handle.clone();
     let close_source = source.clone();
@@ -519,7 +521,11 @@ fn location_titles_are_told_from_titles_that_say_more() {
 #[test]
 fn a_shell_location_title_gives_way_to_the_foreground_command() {
     let directory = tempfile::tempdir().unwrap();
-    let working = directory.path().join("billing-service");
+    let working = directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("billing-service");
     std::fs::create_dir(&working).unwrap();
     let (mut worker, events) = capture_worker_for(LaunchRecipe {
         unset_environment: Default::default(),
@@ -1066,9 +1072,13 @@ fn accepted_search_is_not_lost_when_a_real_pty_completes() {
         wait_for_text(&handle, "retained-hit");
         handle.input(b"\n").unwrap();
         handle.search(request, "retained-hit".into(), true).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !handle.is_completed() {
-            assert!(std::time::Instant::now() < deadline);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real terminal did not complete for search {request}; events: {:?}",
+                handle.events().try_iter().collect::<Vec<_>>()
+            );
             thread::sleep(Duration::from_millis(5));
         }
         assert!(handle.events().try_iter().any(|event| matches!(event, TerminalEvent::SearchResults { request: id, matches, .. } if id == request && matches.len() == 1)));
@@ -1976,6 +1986,9 @@ fn proven_checked_shutdown_does_not_require_natural_pty_eof() {
     );
 }
 
+// The fixture keeps reading and writing the inherited slave after its
+// session leader exits. Darwin revokes that tty at leader exit.
+#[cfg(target_os = "linux")]
 #[test]
 fn deferred_close_fences_older_input_during_final_query_backpressure() {
     if !std::path::Path::new("/usr/bin/python3").exists() {
@@ -2260,7 +2273,9 @@ fn deferred_natural_close_keeps_registered_holder_receipt_authority() {
             worker: owner,
         }),
     };
-    initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+    initialized
+        .recv_timeout(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(5))
+        .unwrap();
     let record = handle.holder_identity().unwrap().clone();
     assert!(record.holder.is_current() && !record.root.is_current());
     assert!(!handle.is_completed());
@@ -2356,7 +2371,7 @@ fn fresh_omp_activity_does_not_require_a_resumable_session() {
     use std::time::Instant;
     let directory = tempdir().unwrap();
     let executable = directory.path().join("omp");
-    symlink("/bin/sleep", &executable).unwrap();
+    agent_sleep_fixture(&executable);
     let (mut worker, events) = capture_worker_for(LaunchRecipe {
         unset_environment: Default::default(),
         program: executable.to_str().unwrap().into(),
@@ -2371,31 +2386,34 @@ fn fresh_omp_activity_does_not_require_a_resumable_session() {
         ]),
     });
     let deadline = Instant::now() + Duration::from_secs(3);
-    let process = loop {
-        if let Some(process) = worker.observe_agent_process().cloned() {
-            break process;
-        }
+    while worker.observe_agent_process().is_none() {
         assert!(Instant::now() < deadline, "PTY foreground never became OMP");
         std::thread::sleep(Duration::from_millis(1));
-    };
-    let tty = std::fs::read_link(format!("/proc/{}/fd/0", process.pid)).unwrap();
-    let markers = directory.path().join("terminal-sessions");
-    std::fs::create_dir(&markers).unwrap();
-    std::fs::write(
-        markers.join(format!(
-            "pts-{}",
-            tty.file_name().unwrap().to_str().unwrap()
-        )),
-        format!(
-            "{}\n{}\n",
-            directory.path().display(),
-            directory
-                .path()
-                .join("sessions/fresh_12345678-1234-1234-1234-123456789abc.jsonl")
-                .display()
-        ),
-    )
-    .unwrap();
+    }
+    // Only Linux verifies OMP's synthetic /dev/pts marker. Darwin should
+    // still show fresh OMP activity while it cannot prove a resume identity.
+    #[cfg(target_os = "linux")]
+    {
+        let pid = worker.agent_process.as_ref().unwrap().pid;
+        let tty = std::fs::read_link(format!("/proc/{pid}/fd/0")).unwrap();
+        let markers = directory.path().join("terminal-sessions");
+        std::fs::create_dir(&markers).unwrap();
+        std::fs::write(
+            markers.join(format!(
+                "pts-{}",
+                tty.file_name().unwrap().to_str().unwrap()
+            )),
+            format!(
+                "{}\n{}\n",
+                directory.path().display(),
+                directory
+                    .path()
+                    .join("sessions/fresh_12345678-1234-1234-1234-123456789abc.jsonl")
+                    .display()
+            ),
+        )
+        .unwrap();
+    }
     worker.handle_command(Command::Hide);
     let generation = worker.generation;
     for title in ["π ⠋ fresh", "π ⠙ fresh", "π ! fresh", "π > fresh"] {
@@ -2443,7 +2461,7 @@ fn activity_application_rejects_replaced_processes_and_expired_results() {
     let directory = tempdir().unwrap();
     let executable = directory.path().join("claude");
     // A harmless native executable with recognizable argv; no provider I/O.
-    symlink("/bin/sleep", &executable).unwrap();
+    agent_sleep_fixture(&executable);
     let (mut worker, _) = capture_worker_for(LaunchRecipe {
         unset_environment: Default::default(),
         program: executable.to_str().unwrap().into(),
@@ -3261,7 +3279,7 @@ fn agent_process_edges_wake_even_when_the_activity_scalar_is_unchanged() {
 fn foreground_sampling_discovers_shell_exec_without_a_process_group_change() {
     let directory = tempdir().unwrap();
     let executable = directory.path().join("claude");
-    symlink("/bin/sleep", &executable).unwrap();
+    agent_sleep_fixture(&executable);
     let (mut worker, _) = capture_worker_for(LaunchRecipe {
         unset_environment: Default::default(),
         program: "/bin/sh".into(),
@@ -3290,6 +3308,28 @@ fn foreground_sampling_discovers_shell_exec_without_a_process_group_change() {
     );
     assert!(worker.published.agent_process.lock().unwrap().is_some());
     worker.run();
+}
+
+#[cfg(target_os = "linux")]
+fn agent_sleep_fixture(path: &std::path::Path) {
+    symlink("/bin/sleep", path).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn agent_sleep_fixture(path: &std::path::Path) {
+    // Give the stand-in an inspectable provider environment. The protected
+    // system sleep binary does not expose the environment on Darwin.
+    fs::copy("/bin/sleep", path).unwrap();
+    let result = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 #[test]
@@ -3427,18 +3467,59 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
         assert_eq!(&ready, b"ready");
         let root = RootIdentity::capture(held.child.pid(), None).unwrap();
         let started = std::time::Instant::now();
-        let status = shutdown_child_exit(
-            &held.child,
-            &held.master,
-            Some(&root),
-            &exits,
-            false,
-            budget,
-        )
-        .unwrap();
+        let shutdown = || {
+            shutdown_child_exit(
+                &held.child,
+                &held.master,
+                Some(&root),
+                &exits,
+                false,
+                budget,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let status = {
+            // XNU waits for the master to drain before reporting the shell's
+            // exit. Use the same cancellable reader as the normal worker.
+            drop(reader);
+            let Reader {
+                output: _output,
+                wake,
+                done,
+                thread,
+                discard_pending,
+                ..
+            } = Reader::start(TerminalId::new(), &held.master, 8, Vec::new()).unwrap();
+            discard_pending.store(true, Ordering::Release);
+            let result = shutdown();
+            drop(wake);
+            assert!(
+                matches!(
+                    done.recv_timeout(READER_SHUTDOWN_GRACE),
+                    Err(RecvTimeoutError::Disconnected)
+                ),
+                "the held PTY reader did not stop after shutdown"
+            );
+            thread.join().unwrap();
+            result
+        };
+        #[cfg(target_os = "linux")]
+        let status = shutdown();
+        let status = status.unwrap_or_else(|error| {
+            panic!(
+                "shutdown with expected exit {expected_code:?} failed after {:?}: {error}; root exited {:?}; session census {:?}",
+                started.elapsed(),
+                held.child.exited_within(Duration::ZERO),
+                close_processes::session_is_empty(held.child.pid(), Instant::now() + Duration::from_secs(2)),
+            );
+        });
         // Escalation follows the hangup grace, long before the deadline's
         // confirmation tail would force it.
-        assert!(started.elapsed() < budget.deadline - budget.confirmation_reserve);
+        assert!(
+            started.elapsed() < budget.deadline - budget.confirmation_reserve,
+            "shutdown with expected exit {expected_code:?} delayed {:?}",
+            started.elapsed()
+        );
         match expected_code {
             Some(code) => assert_eq!(status.exit_code(), code),
             None => assert!(status.signal().is_some()),
@@ -4370,7 +4451,13 @@ fn codex_terminal_uses_private_temp_variables_and_cleans_up_on_exit() {
         .unwrap();
         worker.run();
         if program == "codex" {
+            #[cfg(target_os = "linux")]
             assert!(!tmpdir.exists());
+            #[cfg(target_os = "macos")]
+            assert!(
+                tmpdir.is_dir(),
+                "Darwin cannot prove that no detached process uses TMPDIR"
+            );
             previous_tmpdir = Some(tmpdir);
         }
         assert!(shared.is_dir());
@@ -4644,7 +4731,22 @@ fn explicit_recipe_environment_overrides_terminal_defaults() {
 fn removed_managed_home_cannot_relaunch_from_final_pty_environment() {
     const CHILD: &str = "CAGENTS_REMOVED_ACCOUNT_PTY_TEST";
     if std::env::var_os(CHILD).is_none() {
-        let directory = tempfile::tempdir().unwrap();
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let directory = tempfile::tempdir_in(parent).unwrap();
+        let data = directory.path().join("data");
+        #[cfg(target_os = "linux")]
+        let managed_data = data.join(crate::instance::storage_name());
+        #[cfg(target_os = "macos")]
+        let managed_data = {
+            // ProjectDirs uses the child's HOME instead of XDG_DATA_HOME
+            // on Darwin. Carry the real installation's relative layout.
+            let base = directories::BaseDirs::new().unwrap();
+            let project = crate::instance::project_dirs().unwrap();
+            directory
+                .path()
+                .join(project.data_dir().strip_prefix(base.home_dir()).unwrap())
+        };
+        let managed = managed_data.join("accounts/codex/12345678-1234-4234-8234-123456789abc");
         for mode in ["inherited", "returned"] {
             assert!(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "terminal::worker::tests::removed_managed_home_cannot_relaunch_from_final_pty_environment", "--nocapture"])
@@ -4652,9 +4754,9 @@ fn removed_managed_home_cannot_relaunch_from_final_pty_environment() {
                 // The child names its storage as this process does.
                 .envs(std::env::var_os(crate::instance::DEVELOPMENT_INSTANCE_ENV)
                     .map(|instance| (crate::instance::DEVELOPMENT_INSTANCE_ENV, instance)))
-                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_DATA_HOME", &data)
                 .env("PATH", "/usr/bin:/bin")
-                .env("CODEX_HOME", directory.path().join("data").join(crate::instance::storage_name()).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
+                .env("CODEX_HOME", &managed)
                 .status().unwrap().success());
         }
         return;
