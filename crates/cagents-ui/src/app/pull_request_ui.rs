@@ -28,8 +28,14 @@ pub enum Action {
     Choose { card: CardId, key: WorkKey },
     /// Open one check's details page.
     OpenCheck(Url),
-    /// Open a listed pull request in the browser, from its row's button.
+    /// Open a listed pull request in the browser.
     OpenInBrowser(Url),
+    /// Show this work's changes in `card`'s inspector, from its row's menu.
+    ShowChanges { card: CardId, key: WorkKey },
+    /// Put a row's link, branch or path on the clipboard.
+    Copy { text: String, notice: String },
+    /// Open a row's worktree in the file manager.
+    OpenFolder(PathBuf),
 }
 
 impl Action {
@@ -154,58 +160,90 @@ impl Cagents {
                 self.place_inspected_work();
                 Task::none()
             }
-            Action::Choose { card, key } => {
-                let shown_open = self
-                    .context_sections
-                    .is_open(context_sections::Section::Workspace);
-                let inspector = &mut self.pull_request_inspector;
-                let Some(state) = inspector.conversations.get(&card) else {
-                    return Task::none();
-                };
-                state.choose(&mut inspector.choices, key, shown_open);
-                // Choosing work is asking to see it, here: a pane not focused
-                // is focused, so its inspector draws the changes and files.
-                let focus = if self.workspace.focused() == Some(card) {
-                    Task::none()
-                } else {
-                    self.focus_workspace_card(card)
-                };
-                if shown_open {
-                    return focus;
+            Action::Choose { card, key } => self.show_work(card, key, true),
+            Action::ShowChanges { card, key } => {
+                let show = self.show_work(card, key, false);
+                if self.active_folder_scope() {
+                    // The panel still shows the plain folder it was bound to,
+                    // which has no source control; the end of this update
+                    // binds it to the chosen worktree and reads that.
+                    self.context_sections.workspace_view =
+                        context_sections::WorkspaceView::SourceControl;
+                    return Task::batch([show, self.save_settings_task(false)]);
                 }
-                self.context_sections
-                    .set_open(context_sections::Section::Workspace, true);
-                Task::batch([focus, self.save_settings_task(false)])
+                let changes = self.handle_context_section(context_sections::Action::Show(
+                    context_sections::WorkspaceView::SourceControl,
+                ));
+                Task::batch([show, changes])
+            }
+            Action::Copy { text, notice } => {
+                chat_ui::invalidate_copy_intent();
+                self.status = Some(TransientNotice::success(notice));
+                iced::clipboard::write(text)
+            }
+            Action::OpenFolder(path) => {
+                project_ui::launch_task(PathBuf::from("xdg-open"), path, false)
             }
             Action::OpenCheck(url) | Action::OpenInBrowser(url) => self.open_clicked_link(url),
             Action::Open {
                 repository,
                 number,
                 url,
-            } => {
-                let project = self
-                    .sidebar_model
-                    .projects
-                    .iter()
-                    .find(|project| {
-                        self.github_availability
-                            .get(&project.id)
-                            .and_then(GitHubAvailability::repository_key)
-                            .is_some_and(|own| own.same_repository(&repository))
-                    })
-                    .map(|project| project.id);
-                match (project, self.settings.pull_request_open_target) {
-                    (Some(project), PullRequestOpenTarget::Review)
-                        if self.pull_request_target(project, number).is_some() =>
-                    {
-                        self.review_pull_request(project, number)
-                    }
-                    // A pull request no open project's GitHub state lists can
-                    // still be read on GitHub.
-                    _ => self.open_clicked_link(url),
-                }
-            }
+            } => match self.reviewable_project(&repository, number) {
+                Some(project) => self.review_pull_request(project, number),
+                // A pull request no open project's GitHub state lists can
+                // still be read on GitHub.
+                None => self.open_clicked_link(url),
+            },
         }
+    }
+
+    /// The open project whose review pane would open pull request `number`
+    /// of `repository`, when the settings send pull requests there and its
+    /// GitHub state lists it.
+    fn reviewable_project(&self, repository: &GitHubRepoKey, number: u64) -> Option<ProjectId> {
+        if self.settings.pull_request_open_target != PullRequestOpenTarget::Review {
+            return None;
+        }
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| {
+                self.github_availability
+                    .get(&project.id)
+                    .and_then(GitHubAvailability::repository_key)
+                    .is_some_and(|own| own.same_repository(repository))
+            })?
+            .id;
+        self.pull_request_target(project, number).map(|_| project)
+    }
+
+    /// Shows `key`'s changes and files in `card`'s inspector, focusing the
+    /// pane and expanding Workspace. Choosing work already shown there
+    /// folds or unfolds its details when `toggle` is set.
+    fn show_work(&mut self, card: CardId, key: WorkKey, toggle: bool) -> Task<Message> {
+        let shown_open = self
+            .context_sections
+            .is_open(context_sections::Section::Workspace);
+        let inspector = &mut self.pull_request_inspector;
+        let Some(state) = inspector.conversations.get(&card) else {
+            return Task::none();
+        };
+        state.choose(&mut inspector.choices, key, toggle && shown_open);
+        // Choosing work is asking to see it, here: a pane not focused
+        // is focused, so its inspector draws the changes and files.
+        let focus = if self.workspace.focused() == Some(card) {
+            Task::none()
+        } else {
+            self.focus_workspace_card(card)
+        };
+        if shown_open {
+            return focus;
+        }
+        self.context_sections
+            .set_open(context_sections::Section::Workspace, true);
+        Task::batch([focus, self.save_settings_task(false)])
     }
 
     /// The conversation a chat pane holds.
@@ -508,6 +546,7 @@ impl Cagents {
                 .is_open(context_sections::Section::Workspace),
             listed != mentions,
             &openable,
+            &|repository, number| self.reviewable_project(repository, number).is_some(),
         );
         // The list scrolls between the section's header and the rule below
         // it, on the inspector's fill.

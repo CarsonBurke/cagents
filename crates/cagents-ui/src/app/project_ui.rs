@@ -2224,7 +2224,7 @@ fn merged_worktree_notice(
     notice.with_details(details)
 }
 
-fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
+pub(super) fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut command = std::process::Command::new(executable);
