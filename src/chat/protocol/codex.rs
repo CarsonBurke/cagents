@@ -2026,7 +2026,7 @@ impl Codex {
                         // History describes the child at the time of this call.
                         // A live subscription or prior hydration owns its current
                         // outcome; paging an old spawn must not restart it.
-                        if self.children.contains_key(id)
+                        if (self.children.contains_key(id) || self.listed_unloaded.contains_key(id))
                             && let Some(metadata) = metadata.as_object_mut()
                         {
                             metadata.remove("status");
@@ -4525,7 +4525,7 @@ impl Codex {
         if self.subagent_detail == chat::UNLOADED_CHILD_RUNNING
             && !matches!(
                 status["type"].as_str(),
-                Some("active" | "idle" | "systemError")
+                Some("active" | "idle" | "notLoaded" | "systemError")
             )
         {
             return;
@@ -4546,7 +4546,7 @@ impl Codex {
         match status["type"].as_str() {
             Some("active") => self.subagent_status = Some(ToolStatus::Running),
             Some("systemError") => self.subagent_status = Some(ToolStatus::Failed),
-            Some("idle")
+            Some("idle" | "notLoaded")
                 if self
                     .subagent_status
                     .is_none_or(|value| value == ToolStatus::Running) =>

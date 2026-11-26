@@ -4108,6 +4108,43 @@ fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state(
 }
 
 #[test]
+fn paging_a_recorded_collaboration_cannot_replace_a_newer_catalog_observation() {
+    for recorded in ["running", "completed"] {
+        let mut parent = adapter();
+        let mut listed = Step::default();
+        parent.listed_unloaded.insert("older".into(), true);
+        parent
+            .discover_child_as(
+                "older",
+                &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                ChildName::Listed,
+                false,
+                false,
+                &mut listed,
+            )
+            .unwrap();
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(&mut state, listed.events);
+        let mut page = Step::default();
+        parent
+            .page(
+                &json!({"data":[{"id":"prior","status":"completed","items":[{
+                "id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed",
+                "senderThreadId":"thread-exact","receiverThreadIds":["older"],
+                "agentsStates":{"older":{"status":recorded,"agentNickname":"Earlier child"}}
+            }]}],"nextCursor":null}),
+                &mut page,
+                true,
+            )
+            .unwrap();
+        assert_eq!(resumes(&page).len(), 1);
+        crate::chat::runtime::project_events_for_test(&mut state, page.events);
+        assert!(state.subagents[0].last_seen_running());
+        assert!(!state.holds_work());
+    }
+}
+
+#[test]
 fn a_nested_child_never_evicts_its_ancestors_to_make_room() {
     let mut parent = adapter();
     let thread = |index: usize, parent: &str| json!({"id":format!("child-{index:03}"),"parentThreadId":parent,"status":{"type":"notLoaded"}});
