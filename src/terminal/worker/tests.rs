@@ -4382,6 +4382,11 @@ fn env_recipe(environment: BTreeMap<String, String>) -> LaunchRecipe {
 fn codex_terminal_uses_private_temp_variables_and_cleans_up_on_exit() {
     use std::path::Path;
 
+    #[cfg(target_os = "linux")]
+    if crate::daemon::codex_temp::cleanup_fixture::run() {
+        return;
+    }
+
     let directory = tempdir().unwrap();
     let shared = directory.path().join("shared");
     let runtime = directory.path().join("runtime");
@@ -4422,6 +4427,10 @@ fn codex_terminal_uses_private_temp_variables_and_cleans_up_on_exit() {
                 .insert("TMPDIR".into(), runtime.to_str().unwrap().into());
         }
         let (worker, _) = capture_worker_with(recipe, config);
+        #[cfg(target_os = "linux")]
+        if program == "codex" {
+            crate::daemon::codex_temp::cleanup_fixture::include_provider(worker.child.pid());
+        }
         crate::test_timing::eventually("the terminal's TMPDIR report", || reported.is_file());
         let values = fs::read_to_string(&reported).unwrap();
         let [tmpdir, tmp, temp]: [&str; 3] = values.lines().collect::<Vec<_>>().try_into().unwrap();
