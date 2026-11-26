@@ -382,19 +382,21 @@ fn curl_failure(
     http_status: Option<u16>,
     host: &str,
 ) -> UpdateError {
-    match status.code() {
-        Some(5..=7) => invalid(format!(
+    match (status.code(), http_status) {
+        (Some(5..=7), _) => invalid(format!(
             "{host} is unreachable. Check your network connection."
         )),
-        Some(22) if let Some(code) = http_status => {
+        (Some(22), Some(code)) => {
             invalid(format!("{host} returned HTTP {code} while {operation}."))
         }
-        Some(28) => UpdateError::Timeout(operation),
-        Some(35 | 51 | 53 | 54 | 58 | 59 | 60 | 77 | 80 | 83 | 90 | 91) => invalid(format!(
+        (Some(28), _) => UpdateError::Timeout(operation),
+        (Some(35 | 51 | 53 | 54 | 58 | 59 | 60 | 77 | 80 | 83 | 90 | 91), _) => invalid(format!(
             "A secure connection to {host} could not be established."
         )),
-        Some(56 | 52 | 18) => invalid(format!("The connection to {host} broke off. Try again.")),
-        Some(63) => invalid(format!("{operation} exceeds its size limit")),
+        (Some(56 | 52 | 18), _) => {
+            invalid(format!("The connection to {host} broke off. Try again."))
+        }
+        (Some(63), _) => invalid(format!("{operation} exceeds its size limit")),
         _ => UpdateError::Exited { operation, status },
     }
 }
