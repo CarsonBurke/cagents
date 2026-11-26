@@ -149,6 +149,7 @@ fn finish_watch(removed: bool) {
     let (ended, ending) = mpsc::channel();
     let session = session();
     let chat_id = session.id;
+    let expected_ack = uuid::Uuid::new_v4();
     let watch = start_scripted(
         1,
         session.clone(),
@@ -184,8 +185,27 @@ fn finish_watch(removed: bool) {
         api::ServerLine::Event(api::Event::Conversation(update)) if update.reset
     ));
 
+    // A rewatch opens the feed even while its conversation is hidden. Its
+    // first RPC is a presentation read, with no notice acknowledgements.
     let read = daemon.receive();
     assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+    assert!(watch.send(Command::Read {
+        id: 2,
+        unread: vec![expected_ack]
+    }));
+    let acknowledge = daemon.receive();
+    assert!(matches!(
+        acknowledge.request,
+        ClientRequest::ChatAcknowledge { chat_id: id, epoch: 1 } if id == chat_id
+    ));
+    daemon.respond(&acknowledge, ServerResponse::Accepted);
+    let dismiss = daemon.receive();
+    assert!(matches!(
+        dismiss.request,
+        ClientRequest::AcknowledgeNotification { id } if id == expected_ack
+    ));
+    daemon.respond(&dismiss, ServerResponse::Accepted);
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 2, page: None });
     assert!(watch.send(Command::Chat {
         id: 7,
         command: chat::Command::Interrupt,

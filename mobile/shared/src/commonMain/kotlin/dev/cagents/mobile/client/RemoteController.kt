@@ -339,6 +339,17 @@ class RemoteController(
     suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) =
         call(Call.Answer(session, request, action, answers))
 
+    suspend fun readConversation(session: String) {
+        if (!foreground.value) return
+        try {
+            call(Call.ReadConversation(session))
+        } catch (_: RequestFailed) {
+            // Older bridges and a watch that was just closed can refuse this.
+        } catch (_: ConnectionLost) {
+            // A newly visible reset on the next connection can acknowledge it.
+        }
+    }
+
     suspend fun acknowledge(notice: String) {
         call(Call.AcknowledgeNotification(notice))
         _state.update { state -> state.copy(notices = state.notices.filterNot { it.id == notice }) }

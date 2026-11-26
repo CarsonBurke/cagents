@@ -138,6 +138,9 @@ pub enum Call {
     WatchTerminal { session: String },
     #[serde(rename = "terminal.unwatch")]
     UnwatchTerminal { session: String },
+    /// The phone displayed a watched conversation to the person.
+    #[serde(rename = "conversation.read")]
+    ReadConversation { session: String },
     /// Extend a watched conversation's window with older items, when its
     /// state says `has_earlier`.
     #[serde(rename = "conversation.load_earlier")]

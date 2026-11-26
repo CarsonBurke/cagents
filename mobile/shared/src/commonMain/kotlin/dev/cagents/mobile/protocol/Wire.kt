@@ -176,6 +176,7 @@ sealed class Call(val op: String) {
     data class UnwatchConversation(override val session: String) : OnSession("conversation.unwatch")
     data class WatchTerminal(override val session: String) : OnSession("terminal.watch")
     data class UnwatchTerminal(override val session: String) : OnSession("terminal.unwatch")
+    data class ReadConversation(override val session: String) : OnSession("conversation.read")
     data class LoadEarlier(override val session: String) : OnSession("conversation.load_earlier")
     data class Interrupt(override val session: String) : OnSession("conversation.interrupt")
 

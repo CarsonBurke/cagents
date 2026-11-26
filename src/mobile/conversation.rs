@@ -41,7 +41,10 @@ use crate::{
 /// What the phone asked of a watched conversation.
 pub enum Command {
     /// A chat command, answered on the phone's request `id`.
-    Chat { id: u64, command: chat::Command },
+    Chat {
+        id: u64,
+        command: chat::Command,
+    },
     Detail {
         id: u64,
         request: details::Request,
@@ -54,6 +57,10 @@ pub enum Command {
         png_base64: String,
         mode: api::SendMode,
         slot: Arc<()>,
+    },
+    Read {
+        id: u64,
+        unread: Vec<uuid::Uuid>,
     },
     /// End the watch.
     Stop,
@@ -304,6 +311,7 @@ struct Followed {
     changed: bool,
     /// A publication read is in flight; one at a time keeps them in order.
     reading: bool,
+    read_epoch: u64,
     /// The daemon removed the chat or its provider completed. Try one
     /// final presentation read before ending the watch.
     ending: bool,
@@ -334,6 +342,7 @@ impl Connection {
             // so read once to begin with.
             changed: true,
             reading: false,
+            read_epoch: 0,
             ending: false,
         };
         // The phone may have stopped or replaced this watch while it was
@@ -432,6 +441,19 @@ impl Connection {
                         Ok(())
                     }
                 },
+                Ok(Input::Command(Command::Read { id, unread })) => {
+                    let result = self.acknowledge_view(&mut followed, unread);
+                    match result {
+                        Ok(()) => {
+                            self.outbox.ok(id);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            self.outbox.error(Some(id), unavailable(&error));
+                            Err(End::Daemon(lost(&error)))
+                        }
+                    }
+                }
                 Ok(Input::Frame(frame)) => match *frame {
                     Ok(Some(envelope)) => self.envelope(&mut followed, envelope),
                     Ok(None) => Err(End::Daemon("The computer's cagents daemon stopped.".into())),
@@ -475,6 +497,22 @@ impl Connection {
             })
             .chain(waiting_requests(&self.inputs));
         fail_requests(requests, &self.outbox, message);
+    }
+
+    fn acknowledge_view(
+        &mut self,
+        followed: &mut Followed,
+        unread: Vec<uuid::Uuid>,
+    ) -> Result<(), FrameError> {
+        followed.read_epoch = followed.read_epoch.saturating_add(1);
+        self.request(ClientRequest::ChatAcknowledge {
+            chat_id: self.chat_id,
+            epoch: followed.read_epoch,
+        })?;
+        for id in unread {
+            self.request(ClientRequest::AcknowledgeNotification { id })?;
+        }
+        Ok(())
     }
 
     fn command(
@@ -768,7 +806,10 @@ impl Connection {
 fn waiting_requests(inputs: &Receiver<Input>) -> impl Iterator<Item = u64> + '_ {
     inputs.try_iter().filter_map(|input| match input {
         Input::Command(
-            Command::Chat { id, .. } | Command::Detail { id, .. } | Command::ImagePrompt { id, .. },
+            Command::Chat { id, .. }
+            | Command::Detail { id, .. }
+            | Command::ImagePrompt { id, .. }
+            | Command::Read { id, .. },
         ) => Some(id),
         _ => None,
     })

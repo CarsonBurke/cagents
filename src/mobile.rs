@@ -523,6 +523,15 @@ impl Bridge {
                 }
                 Ok(Answered::Now)
             }
+            api::Call::ReadConversation { session } => {
+                let session = parse_session(&session)?;
+                let unread = self
+                    .notifications
+                    .as_ref()
+                    .map(|watch| watch.session_notices(session))
+                    .unwrap_or_default();
+                self.to_conversation_id(session, conversation::Command::Read { id, unread })
+            }
             api::Call::LoadEarlier { session } => {
                 self.command(id, &session, chat::Command::LoadEarlier)
             }
@@ -723,7 +732,14 @@ impl Bridge {
         session: &str,
         command: conversation::Command,
     ) -> Result<Answered, Failure> {
-        let session = parse_session(session)?;
+        self.to_conversation_id(parse_session(session)?, command)
+    }
+
+    fn to_conversation_id(
+        &self,
+        session: TerminalId,
+        command: conversation::Command,
+    ) -> Result<Answered, Failure> {
         let conversations = self.conversations.lock().unwrap();
         let Some((_, watch)) = conversations.get(&session) else {
             return Err(Failure::Refused(api::Error {

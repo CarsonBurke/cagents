@@ -21,6 +21,16 @@ class ConversationTest {
         Conversation(s).apply(ConversationUpdate(s, reset = true, items = items.toList())).conversation
 
     @Test
+    fun reconnectAdvancesTheDisplayedRevisionButStreamingDoesNot() {
+        val held = loaded(text("a", "Earlier"))
+        val updated = held.apply(ConversationUpdate(s, items = listOf(text("a", "Working")))).conversation
+        val reattached = updated.apply(ConversationUpdate(s, reset = true)).conversation
+        assertEquals(1L, held.resetRevision)
+        assertEquals(held.resetRevision, updated.resetRevision)
+        assertEquals(2L, reattached.resetRevision)
+    }
+
+    @Test
     fun appendsStreamIntoTheirItemAndLeaveTheRestAlone() {
         val held = loaded(text("a", "Earlier"), text("b", "On it"))
         val next = held.apply(ConversationUpdate(s, appends = listOf(TextAppend("b", 5, ", done.", at = 9)))).conversation
