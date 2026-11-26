@@ -120,7 +120,7 @@ pub(crate) fn run(
             // Archived records cannot publish a version or replace a live window.
             installed::selected_candidate(&layout.prefix, &layout.version_root)?;
             drop(retirement);
-            guard.relaunch_missing_windows(&pending.windows, &ui)?;
+            guard.relaunch_missing_windows(&settled.windows, &ui)?;
             verify(&pending, &daemon)
         };
         return match outcome {
@@ -339,6 +339,7 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
 
 struct Settled {
     job: String,
+    windows: Vec<String>,
     outcome: recovery::Receipt,
 }
 
@@ -354,6 +355,7 @@ fn verify_settled(
     recovery::require_prepared_scope(pending, &settled, daemon)?;
     Ok(Settled {
         job: settled.job,
+        windows: settled.windows,
         outcome,
     })
 }

@@ -2573,6 +2573,7 @@ pub struct SettledWitness {
 #[derive(Clone, Debug)]
 pub struct AlreadyRecovered {
     pub(crate) job: String,
+    pub(crate) windows: Vec<String>,
     pub source: HostSessionProof,
     pub census: Census,
     pub paused_terminals: Vec<TerminalId>,
@@ -3090,6 +3091,7 @@ fn recovered_data(
     AlreadyRecovered {
         witness,
         job: record.job,
+        windows: record.windows,
         source: record.source,
         census: record.census,
         paused_terminals: record.paused_terminals,
