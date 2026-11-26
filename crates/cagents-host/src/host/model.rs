@@ -424,7 +424,7 @@ impl Registry {
         {
             Self::pending_terminal_save_fixture_error()?;
         }
-        self.apply_delta_guarded(edit, |_, _| Ok(()))
+        self.apply_delta_guarded(edit, None, |_, _| Ok(()))
     }
 
     /// Acquire SQL writer admission before retaining resident serialization.
@@ -432,10 +432,12 @@ impl Registry {
     pub(crate) fn apply_delta_guarded<G>(
         &mut self,
         edit: &ModelEdit,
+        serving: Option<&crate::model::HostSessionProof>,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
     ) -> Result<DeltaApplied, String> {
         self.commit_delta(
             edit,
+            serving,
             |seen, sql| guard(seen, sql).map(|guard| (guard, false)),
             true,
         )
@@ -452,7 +454,7 @@ impl Registry {
     where
         E: From<String>,
     {
-        self.commit_delta(edit, |_, sql| guard(sql), true)
+        self.commit_delta(edit, None, |_, sql| guard(sql), true)
     }
 
     #[cfg(test)]
@@ -470,6 +472,7 @@ impl Registry {
     fn commit_delta<G, E>(
         &mut self,
         edit: &ModelEdit,
+        serving: Option<&crate::model::HostSessionProof>,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<(G, bool), E>,
         check_schema: bool,
     ) -> Result<DeltaApplied, E>
@@ -493,7 +496,7 @@ impl Registry {
         let mut recorder = views::Recorder::default();
         let mut removed_channels = Vec::new();
         let changed = match edit {
-            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder)?,
+            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder, serving)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service"

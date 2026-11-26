@@ -595,13 +595,14 @@ pub(super) fn retire_agent(
 
 #[cfg(test)]
 fn apply(transaction: &rusqlite::Transaction<'_>, edit: &ModelEdit) -> Result<bool, String> {
-    apply_recorded(transaction, edit, &mut Recorder::default())
+    apply_recorded(transaction, edit, &mut Recorder::default(), None)
 }
 
 pub(super) fn apply_recorded(
     transaction: &rusqlite::Transaction<'_>,
     edit: &ModelEdit,
     recorder: &mut Recorder,
+    serving: Option<&crate::model::HostSessionProof>,
 ) -> Result<bool, String> {
     let scope = match edit {
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
@@ -827,6 +828,24 @@ pub(super) fn apply_recorded(
     if keep_confirmed_chat_identities(transaction, &stored, &mut view)? {
         changed = true;
     }
+    if changed && let Some(serving) = serving {
+        // Check the resulting view so ignored writes and edits to an existing
+        // foreign pane's presentation still follow the normal store rules.
+        for pane in &view.panes {
+            if let crate::model::CardKind::Chat(chat) = &pane.kind
+                && let Some(proof) = chat.proof.as_ref()
+                && proof != serving
+                && !stored.panes.iter().any(|prior| {
+                    prior.id == pane.id
+                        && matches!(&prior.kind,
+                        crate::model::CardKind::Chat(old)
+                            if old.id == chat.id && old.proof.as_ref() == Some(proof))
+                })
+            {
+                return Err(Registry::VIEW_FOREIGN_CHAT_PROOF.into());
+            }
+        }
+    }
     if changed || !existed {
         view.revision = store::next_revision(transaction)?;
         recorder.revised(
@@ -909,6 +928,8 @@ impl Registry {
     pub(crate) const VIEW_REVISION_CONFLICT: &'static str = "workspace view revision conflict";
     pub(crate) const VIEW_REMOVAL_CONFLICT: &'static str =
         crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT;
+    pub(crate) const VIEW_FOREIGN_CHAT_PROOF: &str =
+        "A workspace edit tried to write a chat pane with another daemon's proof";
     pub(crate) const VIEW_SOURCE_CONFLICT: &'static str = "The pane source changed; refuse stale source intent and rebase presentation on the current pane";
 
     pub(crate) fn view_change_refusal(
