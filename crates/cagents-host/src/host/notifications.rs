@@ -14,7 +14,7 @@ use journal::Journal;
 use osascript::{Activation, PortalOwner, connect, remove, send, send_test};
 #[cfg(target_os = "linux")]
 use portal::{Activation, PortalOwner, connect, remove, send, send_test};
-use withdrawals::{Withdrawal, Withdrawals};
+use withdrawals::Withdrawals;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -679,8 +679,7 @@ fn protect_automation_toast(
     {
         // Commit the stable desktop cleanup before the new event can overwrite
         // the only journal row containing the old notice's sequence.
-        journal.remember_group_withdrawal(batching::desktop_id(target))?;
-        journal.remember_group_withdrawal(previous)?;
+        journal.remember_notice_withdrawal(target, previous)?;
     }
     Ok(())
 }
@@ -1319,14 +1318,9 @@ async fn run(
                 let Some(entry) = withdrawals.pop_first() else {
                     break;
                 };
-                let result = remove(backend, entry.id()).await.and_then(|()| {
-                    if let Withdrawal::Group(id) = entry
-                        && persisted_withdrawals.contains(&id)
-                    {
-                        journal.finish_group_withdrawal(id)?;
-                    }
-                    Ok(())
-                });
+                let result = remove(backend, entry.id())
+                    .await
+                    .and_then(|()| journal.finish_group_withdrawal(entry.id()));
                 if let Err(error) = result {
                     withdrawals.requeue(entry);
                     snapshot.diagnostic = Some(error);
