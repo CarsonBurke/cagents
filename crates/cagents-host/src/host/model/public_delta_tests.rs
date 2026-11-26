@@ -149,8 +149,12 @@ fn a_delta_commit_and_scope_read_do_not_parse_an_unrelated_scope() {
     assert_eq!(view.unwrap().panes, vec![kept.clone()]);
     assert_eq!(
         registry.pane_view(kept.id).unwrap().unwrap().panes,
-        vec![kept]
+        vec![kept.clone()]
     );
+    let target = registry.pane_chat_start_view(kept.id).unwrap();
+    assert_eq!(target.identity, identity);
+    assert!(!target.retired);
+    assert_eq!(target.view.unwrap().panes, vec![kept]);
     assert_eq!(sequence, committed.receipt.sequence);
 }
 
@@ -236,4 +240,13 @@ fn subscriber_snapshot_excludes_transfer_tombstones_from_closed_identities() {
     let (snapshot, ids) = registry.subscriber_snapshot().unwrap();
     assert_eq!(ids, vec![closed.id]);
     assert_eq!(snapshot, registry.model().unwrap());
+    let target = registry.pane_chat_start_view(moved.id).unwrap();
+    assert!(!target.retired);
+    assert_eq!(target.view.unwrap().scope, Scope::Channel(other));
+    let target = registry.pane_chat_start_view(closed.id).unwrap();
+    assert!(target.retired);
+    assert!(target.view.is_none());
+    let target = registry.pane_chat_start_view(CardId::new()).unwrap();
+    assert!(!target.retired);
+    assert!(target.view.is_none());
 }
