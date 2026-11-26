@@ -1997,6 +1997,11 @@ fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
     working.waiting = false;
     working.changed += 1;
     assert!(actor.publish_resident(working.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+    assert!(actor.publish_resident_inner(working.clone(), false, Some(&working)));
     assert!(actor.state().legacy_waiting_settled);
     assert_eq!(actor.state().waiting_attention, None);
     assert_eq!(
@@ -2023,6 +2028,44 @@ fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
 }
 
 #[test]
+fn older_legacy_replies_cannot_confirm_a_wait_opened_after_they_were_requested() {
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let actor = RemoteActor::fixture();
+    let mut initial = actor.state().as_ref().clone();
+    initial.waiting_attention = None;
+    initial.completed = false;
+    initial.activity = ActivityState::Working;
+    initial.waiting = false;
+    initial.outbox_latest = 2;
+    assert!(actor.publish_resident(initial.clone()));
+
+    let mut newest = initial.clone();
+    newest.activity = ActivityState::Waiting;
+    newest.waiting = true;
+    newest.outbox_latest = 3;
+    assert!(actor.publish_resident(newest.clone()));
+
+    let mut delayed = initial.clone();
+    delayed.outbox_latest = 3;
+    // Two readers copied Working before the outbox received the new wait.
+    for _ in 0..2 {
+        assert!(actor.publish_resident_inner(delayed.clone(), false, Some(&initial)));
+        assert_eq!(
+            actor.waiting_resolution(Some(3)),
+            Some(RetainedWaiting::Current)
+        );
+    }
+    // Re-reading after the first publication sees the current Waiting.
+    assert!(actor.publish_resident_inner(newest, false, Some(&delayed)));
+    assert_eq!(
+        actor.waiting_resolution(Some(3)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
 fn an_idle_legacy_attachment_fetches_a_full_state_at_the_same_revision() {
     let mut fixture = resident_fixture();
     fixture.server.actor.0.state.lock().unwrap().ready = true;
@@ -2044,7 +2087,8 @@ fn an_idle_legacy_attachment_fetches_a_full_state_at_the_same_revision() {
     initial.generation = initial.generation.max(actor.state().generation);
     initial.changed = initial.changed.max(actor.state().changed);
     assert!(actor.publish_resident(initial));
-    let after = actor.state().waiting_state_cursor();
+    let before = actor.state();
+    let after = before.waiting_state_cursor();
     assert_ne!(after, revision);
     let forced = state(after);
     let next: Option<Resident> =
@@ -2052,7 +2096,7 @@ fn an_idle_legacy_attachment_fetches_a_full_state_at_the_same_revision() {
     let mut next = next.expect("unchanged revision still carries the authenticated state");
     next.generation = actor.state().generation;
     next.changed = actor.state().changed;
-    assert!(actor.publish_resident(next));
+    assert!(actor.publish_resident_inner(next, false, Some(&before)));
     assert_eq!(
         actor.waiting_resolution(None),
         Some(crate::chat::runtime::RetainedWaiting::Resolved)

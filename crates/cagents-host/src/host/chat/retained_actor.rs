@@ -783,11 +783,6 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     let registry = super::super::agent_execution::registry(host)?;
     let mut execution_owner = None;
     target.handle.refresh_retained_state()?;
-    if let Some(receipt) = admit_waiting_resolution(host, &target, None)? {
-        receipt
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "The notification journal did not confirm the waiting settlement")??;
-    }
     persist_confirmed_identity(host, &target, &registry)?;
     #[cfg(test)]
     drain_fence::pass(id);
@@ -860,6 +855,13 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     if more {
         // An outcome that followed a conversation since reset republished it.
         persist_confirmed_identity(host, &target, &registry)?;
+    }
+    // A separate attention-store failure must not block execution outcomes
+    // or acknowledgement of independent retained work.
+    if let Some(receipt) = admit_waiting_resolution(host, &target, None)? {
+        receipt
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "The notification journal did not confirm the waiting settlement")??;
     }
     // One bounded page per actor per pass. A detached actor can have many
     // pages without another latest-sequence edge; explicitly revisit it until
