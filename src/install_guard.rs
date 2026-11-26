@@ -45,7 +45,7 @@ pub(crate) fn preflight_source_panes(
 
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
-const PUBLICATION_FD_ENV: &str = "CAGENTS_INSTALL_PUBLICATION_FD";
+pub(crate) const PUBLICATION_FD_ENV: &str = "CAGENTS_INSTALL_PUBLICATION_FD";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
 
 #[derive(serde::Deserialize)]
@@ -281,7 +281,7 @@ pub(crate) fn inherit_darwin_publication(
 }
 
 #[cfg(target_os = "macos")]
-fn inherited_darwin_publication() -> io::Result<Option<(File, i32)>> {
+pub(crate) fn inherited_darwin_publication() -> io::Result<Option<(File, i32)>> {
     let Some(value) = std::env::var_os(PUBLICATION_FD_ENV) else {
         return Ok(None);
     };
@@ -298,22 +298,6 @@ fn inherited_darwin_publication() -> io::Result<Option<(File, i32)>> {
     let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
     crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
     Ok(Some((file, fd)))
-}
-
-/// Consume the installed updater's exact account fence at standby entry.
-/// The caller must still be single-threaded.
-#[cfg(all(target_os = "macos", feature = "host"))]
-pub(crate) unsafe fn take_darwin_publication() -> io::Result<Option<File>> {
-    let Some((file, fd)) = inherited_darwin_publication()? else {
-        return Ok(None);
-    };
-    // SAFETY: the caller is single-threaded and supplied the inherited
-    // descriptor. `file` retains the same lock when the original closes.
-    unsafe {
-        std::env::remove_var(PUBLICATION_FD_ENV);
-        libc::close(fd);
-    }
-    Ok(Some(file))
 }
 
 pub(crate) fn verify_publication() -> io::Result<()> {
@@ -1370,7 +1354,7 @@ fn execute(command: &mut Command) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

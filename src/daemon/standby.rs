@@ -469,6 +469,23 @@ impl Activated {
     }
 }
 
+/// Consume the installed updater's exact account fence at standby entry.
+/// The caller must still be single-threaded.
+#[cfg(all(target_os = "macos", feature = "host"))]
+unsafe fn take_darwin_publication() -> io::Result<Option<File>> {
+    use crate::install_guard::{PUBLICATION_FD_ENV, inherited_darwin_publication};
+    let Some((file, fd)) = inherited_darwin_publication()? else {
+        return Ok(None);
+    };
+    // SAFETY: the caller is single-threaded and supplied the inherited
+    // descriptor. `file` retains the same lock when the original closes.
+    unsafe {
+        std::env::remove_var(PUBLICATION_FD_ENV);
+        libc::close(fd);
+    }
+    Ok(Some(file))
+}
+
 #[cfg(feature = "host")]
 /// Wait for activation without opening the store, lease, or public socket.
 ///
@@ -485,7 +502,7 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     // SAFETY: this is the single-threaded standby entry. The sender's copy
     // remains held until publication, even after the successor sends Started.
     #[cfg(target_os = "macos")]
-    let publication = unsafe { crate::install_guard::take_darwin_publication()? };
+    let publication = unsafe { take_darwin_publication()? };
     #[cfg(target_os = "linux")]
     let publication = std::env::var_os(LOCAL_PREVIOUS_CURRENT)
         .map(|expected| {
