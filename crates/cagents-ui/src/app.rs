@@ -14778,13 +14778,12 @@ impl Cagents {
         let previous_errors = bound
             .map(|source| source.ignored_directory_errors().clone())
             .unwrap_or_default();
-        let previous = bound.and_then(|source| source.source_snapshot().cloned());
         let tree = if browse_files {
             FileTree::Built
         } else {
             FileTree::Deferred
         };
-        let previous_digest = bound.and_then(|source| source.source_digest(tree).copied());
+        let (previous, previous_digest) = source_control_ui::kept_source(bound, tree);
         let expanded = self
             .sidebar_state
             .expanded_directory_paths()

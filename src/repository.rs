@@ -2711,24 +2711,27 @@ fn file_inventory_digest(files: &[u8], status: &[u8]) -> FileInventoryDigest {
 
 /// SHA-256 over the snapshot's options, every raw listing, and the filesystem
 /// identity of every path status reports, or `None` when one of those paths
-/// was modified within [`SNAPSHOT_RACY_WINDOW`] of `started`.
+/// was modified or changed at or after `racy_after`.
 ///
 /// Status alone cannot stand for the line counts: an unstaged file edited
 /// again keeps its status line, and an untracked file's line is only its
 /// name. Their contents cannot change without changing the identity hashed
 /// here, except within one timestamp tick, which the racy window excludes.
+/// The ctime is checked as well as the mtime because a copy that restores
+/// the mtime (`cp -p`, `rsync -t`) leaves only the ctime current.
+///
+/// Not covered: configuration that changes line counts without changing
+/// status, such as `.git/info/attributes` or a `diff` driver. A read after
+/// any other change picks it up.
 fn snapshot_digest(
     worktree: &Path,
     options: SnapshotOptions,
     listing: &SnapshotListing,
-    started: std::time::SystemTime,
+    racy_after: std::time::SystemTime,
 ) -> Option<SnapshotDigest> {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::MetadataExt;
 
-    let racy_after = started
-        .checked_sub(SNAPSHOT_RACY_WINDOW)
-        .unwrap_or(std::time::UNIX_EPOCH);
     let mut hasher = Sha256::new();
     let part = |hasher: &mut Sha256, bytes: &[u8]| {
         hasher.update((bytes.len() as u64).to_le_bytes());
@@ -2744,7 +2747,10 @@ fn snapshot_digest(
     );
     part(&mut hasher, &listing.status_output);
     part(&mut hasher, &listing.files.stdout);
-    part(&mut hasher, &[u8::from(listing.remotes.success)]);
+    part(
+        &mut hasher,
+        &listing.remotes.exit_code.unwrap_or(-1).to_le_bytes(),
+    );
     part(&mut hasher, &listing.remotes.stdout);
     part(&mut hasher, &listing.refs.stdout);
     for entry in &listing.status.entries {
@@ -2752,9 +2758,15 @@ fn snapshot_digest(
             hasher.update([0]);
             continue;
         };
-        if metadata
-            .modified()
-            .map_or(true, |modified| modified >= racy_after)
+        let changed = std::time::UNIX_EPOCH
+            + Duration::new(
+                metadata.ctime().max(0) as u64,
+                metadata.ctime_nsec().clamp(0, 999_999_999) as u32,
+            );
+        if changed >= racy_after
+            || metadata
+                .modified()
+                .map_or(true, |modified| modified >= racy_after)
         {
             return None;
         }
@@ -4254,7 +4266,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// status line exactly as it was, still reads as a change. A file written
     /// within [`SNAPSHOT_RACY_WINDOW`] of the read could be written again
     /// within the same timestamp tick, so such a read returns no digest and
-    /// the next one is read in full.
+    /// the next one is read in full. The window is measured on this
+    /// machine's clock, so a network filesystem whose server runs more than
+    /// that far behind can defeat it.
     pub fn snapshot_if_changed(
         &self,
         worktree: &Path,
@@ -4262,9 +4276,24 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         previous: Option<&SnapshotDigest>,
         cancellation: &CancellationToken,
     ) -> Result<SnapshotRead, RepositoryError> {
-        let started = std::time::SystemTime::now();
+        let racy_after = std::time::SystemTime::now()
+            .checked_sub(SNAPSHOT_RACY_WINDOW)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        self.snapshot_settled_before(worktree, options, previous, racy_after, cancellation)
+    }
+
+    /// [`Self::snapshot_if_changed`] trusting the identity of files last
+    /// written before `racy_after`.
+    fn snapshot_settled_before(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        previous: Option<&SnapshotDigest>,
+        racy_after: std::time::SystemTime,
+        cancellation: &CancellationToken,
+    ) -> Result<SnapshotRead, RepositoryError> {
         let listing = self.snapshot_listing(worktree, options, cancellation)?;
-        let digest = snapshot_digest(worktree, options, &listing, started);
+        let digest = snapshot_digest(worktree, options, &listing, racy_after);
         if digest.is_some() && digest.as_ref() == previous {
             return Ok(SnapshotRead::Unchanged);
         }
@@ -8439,17 +8468,6 @@ mod tests {
             );
         }
 
-        /// Backdates a file past the racy window, as a file the user last
-        /// touched a while ago would be.
-        fn settle(path: &Path) {
-            fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - 4 * SNAPSHOT_RACY_WINDOW)
-                .unwrap();
-        }
-
         #[test]
         fn a_snapshot_reads_unchanged_until_anything_it_shows_changes() {
             let directory = tempfile::tempdir().unwrap();
@@ -8460,17 +8478,25 @@ mod tests {
             git(root, &["commit", "-m", "base"]);
             fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap();
             fs::write(root.join("untracked.txt"), "a\n").unwrap();
-            settle(&root.join("tracked.txt"));
-            settle(&root.join("untracked.txt"));
             let cancel = CancellationToken::new();
-            let options = SnapshotOptions::default();
-            let read = |previous: Option<&SnapshotDigest>| {
+            // Every write below finished before its read began, so none is
+            // racy; the window itself has its own test.
+            let read_with = |options: SnapshotOptions, previous: Option<&SnapshotDigest>| {
                 service()
-                    .snapshot_if_changed(root, options, previous, &cancel)
+                    .snapshot_settled_before(
+                        root,
+                        options,
+                        previous,
+                        std::time::SystemTime::now(),
+                        &cancel,
+                    )
                     .unwrap()
             };
+            let read = |previous| read_with(SnapshotOptions::default(), previous);
             let changed = |read: SnapshotRead| match read {
-                SnapshotRead::Changed { snapshot, digest } => (*snapshot, digest),
+                SnapshotRead::Changed { snapshot, digest } => {
+                    (*snapshot, digest.expect("no write is racy"))
+                }
                 SnapshotRead::Unchanged => panic!("the read should have seen a change"),
             };
             let added = |snapshot: &RepositorySnapshot, area: ChangeArea| {
@@ -8478,51 +8504,56 @@ mod tests {
             };
 
             let (first, digest) = changed(read(None));
-            let digest = digest.expect("settled files are not racy");
             assert_eq!(added(&first, ChangeArea::Unstaged), Some(1));
             assert_eq!(read(Some(&digest)), SnapshotRead::Unchanged);
 
             // Editing a file that is already modified leaves its status line
             // as it was; only the line counts move.
             fs::write(root.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
-            settle(&root.join("tracked.txt"));
             let (edited, digest) = changed(read(Some(&digest)));
             assert_eq!(edited.status.entries.len(), first.status.entries.len());
             assert_eq!(added(&edited, ChangeArea::Unstaged), Some(2));
-            let digest = digest.unwrap();
+
+            // A rewrite of the same size is told apart by its times alone.
+            // Two writes this close can share a coarse timestamp, which the
+            // racy window exists for, so this one names its own mtime.
+            fs::write(root.join("tracked.txt"), "one\nTWO\nthree\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(root.join("tracked.txt"))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000))
+                .unwrap();
+            let (_, digest) = changed(read(Some(&digest)));
 
             // An untracked file's status line is only its name.
             fs::write(root.join("untracked.txt"), "a\nb\nc\n").unwrap();
-            settle(&root.join("untracked.txt"));
             let (grown, digest) = changed(read(Some(&digest)));
             assert_eq!(added(&grown, ChangeArea::Untracked), Some(3));
-            let digest = digest.unwrap();
 
             // Staging changes the index and nothing in the worktree.
             git(root, &["add", "tracked.txt"]);
             let (staged, digest) = changed(read(Some(&digest)));
             assert_eq!(added(&staged, ChangeArea::Staged), Some(2));
-            let digest = digest.unwrap();
 
-            // A new branch moves no file but is listed.
+            // A new branch or remote moves no file but is listed.
             git(root, &["branch", "topic"]);
             let (branched, digest) = changed(read(Some(&digest)));
             assert_eq!(branched.local_refs.len(), 2);
-            let digest = digest.unwrap();
+            git(
+                root,
+                &["remote", "add", "origin", "https://example.invalid/r"],
+            );
+            let (remote, digest) = changed(read(Some(&digest)));
+            assert_eq!(remote.remotes.len(), 1);
 
             // A read the caller asks for differently is a different read.
+            let collapsed = SnapshotOptions {
+                untracked_changes: false,
+                untracked_files: true,
+            };
             assert!(matches!(
-                service()
-                    .snapshot_if_changed(
-                        root,
-                        SnapshotOptions {
-                            untracked_changes: false,
-                            untracked_files: true,
-                        },
-                        Some(&digest),
-                        &cancel,
-                    )
-                    .unwrap(),
+                read_with(collapsed, Some(&digest)),
                 SnapshotRead::Changed { .. }
             ));
             assert_eq!(read(Some(&digest)), SnapshotRead::Unchanged);
@@ -8544,9 +8575,15 @@ mod tests {
                 panic!("a read without a digest always reads in full");
             };
             assert_eq!(digest, None);
-            settle(&root.join("fresh.txt"));
+            // The same file is trusted once it was written before the cutoff.
             let SnapshotRead::Changed { digest, .. } = service()
-                .snapshot_if_changed(root, SnapshotOptions::default(), None, &cancel)
+                .snapshot_settled_before(
+                    root,
+                    SnapshotOptions::default(),
+                    None,
+                    std::time::SystemTime::now(),
+                    &cancel,
+                )
                 .unwrap()
             else {
                 panic!("a read without a digest always reads in full");
@@ -12763,11 +12800,13 @@ mod tests {
                 success(b""),
             ]
         };
+        // An empty worktree: the listed file is absent, so nothing is racy.
+        let worktree = tempfile::tempdir().unwrap();
         let mut outputs = listing();
         outputs.extend([success(b""), success(b"")]);
         let read = fake_service(outputs)
             .snapshot_if_changed(
-                Path::new("/repo"),
+                worktree.path(),
                 SnapshotOptions::default(),
                 None,
                 &CancellationToken::new(),
@@ -12784,7 +12823,7 @@ mod tests {
         let executor = Arc::new(FakeExecutor::with_outputs(listing()));
         let read = RepositoryService::new("git", Arc::clone(&executor))
             .snapshot_if_changed(
-                Path::new("/repo"),
+                worktree.path(),
                 SnapshotOptions::default(),
                 Some(&digest),
                 &CancellationToken::new(),

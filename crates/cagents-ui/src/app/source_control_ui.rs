@@ -180,6 +180,22 @@ impl Cagents {
     }
 }
 
+/// What a read that builds `tree` may compare with: the snapshot `source` was
+/// built from and its digest, unless its rows cannot stand for that read.
+pub(super) fn kept_source(
+    source: Option<&SourceControlModel>,
+    tree: FileTree,
+) -> (Option<Arc<RepositorySnapshot>>, Option<SnapshotDigest>) {
+    source
+        .filter(|source| source.stands_for(tree))
+        .map_or((None, None), |source| {
+            (
+                source.source_snapshot().cloned(),
+                source.source_digest().copied(),
+            )
+        })
+}
+
 /// Compares a finished read with the snapshot the panel was built from and,
 /// when they differ, builds the model that replaces it. It runs on the
 /// reader's blocking thread, so a reload costs the UI thread only installing
@@ -423,27 +439,37 @@ mod tests {
     }
 
     /// With only Changes showing, the reader leaves the Files tree unbuilt,
-    /// and that model's digest cannot excuse the read that showing Files
-    /// starts, even though Git answers it identically.
+    /// and that model cannot stand for the read that showing Files starts,
+    /// even when Git answers it identically.
     #[test]
     fn a_changes_only_read_defers_the_files_tree_until_files_is_shown() {
-        let (_, key) = bound();
+        let (mut app, key) = bound();
         let digest = Some(SnapshotDigest::fixture(1));
-        let SourceControlRead::Changed(deferred) =
-            source_control_read(key.clone(), None, snapshot(), digest, FileTree::Deferred)
-        else {
-            panic!("a first read always builds");
-        };
+        let request = app.refresh_ui.source_generation;
+        let read = source_control_read(key.clone(), None, snapshot(), digest, FileTree::Deferred);
+        drop(app.source_control_loaded(key.clone(), request, Ok(read)));
+        let deferred = source(&app);
         assert!(deferred.files.is_empty());
         assert!(!deferred.files_built());
-        assert_eq!(deferred.source_digest(FileTree::Deferred), digest.as_ref());
-        assert_eq!(deferred.source_digest(FileTree::Built), None);
+        assert!(deferred.stands_for(FileTree::Deferred));
+        assert!(!deferred.stands_for(FileTree::Built));
 
-        let SourceControlRead::Changed(built) =
-            source_control_read(key, None, snapshot(), digest, FileTree::Built)
-        else {
-            panic!("a first read always builds");
-        };
+        // The reader withholds the kept snapshot from a Files read, so an
+        // equal answer is built rather than kept.
+        let (kept, kept_digest) = kept_source(Some(deferred), FileTree::Built);
+        assert_eq!((kept.as_ref(), kept_digest), (None, None));
+        assert!(kept_source(Some(deferred), FileTree::Deferred).0.is_some());
+        drop(app.reload_source_control(&key));
+        let request = app.refresh_ui.source_generation;
+        let read = source_control_read(
+            key.clone(),
+            kept.as_deref(),
+            snapshot(),
+            digest,
+            FileTree::Built,
+        );
+        drop(app.source_control_loaded(key, request, Ok(read)));
+        let built = source(&app);
         assert!(built.files_built());
         assert!(
             built
@@ -451,8 +477,8 @@ mod tests {
                 .iter()
                 .any(|row| row.path == repo_path("src/main.rs"))
         );
-        assert_eq!(built.source_digest(FileTree::Built), digest.as_ref());
-        assert_eq!(built.source_digest(FileTree::Deferred), digest.as_ref());
+        assert!(built.stands_for(FileTree::Built) && built.stands_for(FileTree::Deferred));
+        assert_eq!(built.source_digest(), digest.as_ref());
     }
 
     /// A touched but unedited file changes the digest and not the snapshot.
@@ -466,10 +492,7 @@ mod tests {
         let read = source_control_read(key.clone(), None, snapshot(), first, FileTree::Deferred);
         drop(app.source_control_loaded(key.clone(), request, Ok(read)));
         let shown = Arc::clone(source(&app).source_snapshot().unwrap());
-        assert_eq!(
-            source(&app).source_digest(FileTree::Deferred),
-            first.as_ref()
-        );
+        assert_eq!(source(&app).source_digest(), first.as_ref());
 
         let touched = Some(SnapshotDigest::fixture(2));
         drop(app.reload_source_control(&key));
@@ -484,9 +507,6 @@ mod tests {
         assert!(matches!(read, SourceControlRead::Unchanged { .. }));
         drop(app.source_control_loaded(key, request, Ok(read)));
         assert!(Arc::ptr_eq(source(&app).source_snapshot().unwrap(), &shown));
-        assert_eq!(
-            source(&app).source_digest(FileTree::Deferred),
-            touched.as_ref()
-        );
+        assert_eq!(source(&app).source_digest(), touched.as_ref());
     }
 }

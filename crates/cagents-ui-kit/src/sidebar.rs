@@ -2616,14 +2616,16 @@ impl SourceControlModel {
         self.source_snapshot.as_ref()
     }
 
-    /// The digest of the reads behind [`Self::source_snapshot`], if a read
-    /// that builds `tree` may stop at it. A model whose Files tree was left
-    /// unbuilt cannot stand for a read that builds one, however equal Git's
-    /// answers are.
-    pub fn source_digest(&self, tree: FileTree) -> Option<&SnapshotDigest> {
-        self.source_digest
-            .as_ref()
-            .filter(|_| self.files_built || tree == FileTree::Deferred)
+    /// The digest of the reads behind [`Self::source_snapshot`], if any.
+    pub fn source_digest(&self) -> Option<&SnapshotDigest> {
+        self.source_digest.as_ref()
+    }
+
+    /// Whether these rows can stand for a read that builds `tree`, so an
+    /// equal read may keep them. A model whose Files tree was left unbuilt
+    /// cannot stand for one that builds it, however equal Git's answers are.
+    pub fn stands_for(&self, tree: FileTree) -> bool {
+        self.files_built || tree == FileTree::Deferred
     }
 
     /// Records that a read whose snapshot equalled this model's hashed to
