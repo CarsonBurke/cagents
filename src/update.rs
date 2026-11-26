@@ -130,6 +130,10 @@ impl CancellationToken {
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
+    #[error(
+        "self-update requires a full user installation made by install.sh; source and OS-package installs must use their original installation method"
+    )]
+    UnsupportedInstallation,
     #[error("{0}")]
     Invalid(String),
     #[error("another update is already running")]
@@ -527,9 +531,7 @@ fn installer_updates_only(version: Option<&str>) -> Result<(), UpdateError> {
 }
 
 fn unsupported_install() -> UpdateError {
-    invalid(
-        "self-update requires a full user installation made by install.sh; source and OS-package installs must use their original installation method",
-    )
+    UpdateError::UnsupportedInstallation
 }
 fn stable_version(text: &str) -> Result<Version, UpdateError> {
     let version = Version::parse(text).map_err(|_| invalid("invalid release version"))?;
@@ -601,7 +603,7 @@ fn is_newer(release: &str, installed: &str) -> Result<bool, UpdateError> {
 fn unmanaged_reason(error: UpdateError) -> String {
     // Only a layout install.sh did not make belongs to another tool; any
     // other failure of a self-managed install is reported as it is.
-    if error.to_string() != unsupported_install().to_string() {
+    if !matches!(error, UpdateError::UnsupportedInstallation) {
         return error.to_string();
     }
     let executable = crate::process::current_executable().and_then(|path| path.canonicalize());
