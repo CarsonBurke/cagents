@@ -52,6 +52,8 @@ const PAIRED_TERMINAL_CANNOT_CARRY: &str =
 
 // These two values are encoded in the existing string slot. Reviews use
 // their own wording so they can describe either update choice.
+const QUEUED_PROMPTS_READY: &str =
+    "Its saved conversation will reopen with its unsent prompts queued.";
 const AGENT_RUN_UNCONFIRMED: &str = "Updating now ends this agent's run with an unknown outcome.";
 const AGENT_RUN_UNCONFIRMED_WITH_QUEUE: &str =
     "Updating now ends this agent's run with an unknown outcome and leaves queued prompts unsent.";
@@ -62,6 +64,7 @@ const AGENT_RUN_UNCONFIRMED_WITH_QUEUE: &str =
 #[serde(from = "String")]
 pub enum SessionCause {
     PendingDelivery,
+    QueuedPromptsReady,
     ProviderEnded,
     UnsettledProvider,
     BackgroundWork,
@@ -78,6 +81,7 @@ impl SessionCause {
     pub fn as_str(&self) -> &str {
         match self {
             Self::PendingDelivery => QUEUED_MESSAGES,
+            Self::QueuedPromptsReady => QUEUED_PROMPTS_READY,
             Self::ProviderEnded => PROVIDER_ENDED,
             Self::UnsettledProvider => STOPPED_WITH_UNSETTLED_WORK,
             Self::BackgroundWork => BACKGROUND_WORK,
@@ -124,6 +128,7 @@ impl From<String> for SessionCause {
     fn from(text: String) -> Self {
         match text.as_str() {
             QUEUED_MESSAGES => Self::PendingDelivery,
+            QUEUED_PROMPTS_READY => Self::QueuedPromptsReady,
             PROVIDER_ENDED => Self::ProviderEnded,
             STOPPED_WITH_UNSETTLED_WORK => Self::UnsettledProvider,
             BACKGROUND_WORK => Self::BackgroundWork,

@@ -57,11 +57,17 @@ pub(in crate::host) fn inspect(
     // conversation. Runs still queued unsent are carried and hold nothing.
     let mut queued = BTreeMap::new();
     let mut agent_runs = BTreeMap::new();
+    let mut queue_ready = BTreeSet::new();
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         agent_runs = registry
             .agent_runs_at_risk_on_restart()
             .map_err(upgrade_error)?;
+        if policy == Policy::WhenIdle {
+            queue_ready = registry
+                .agent_queues_ready_for_update()
+                .map_err(upgrade_error)?;
+        }
         for hold in registry.agent_update_holds().map_err(upgrade_error)? {
             match hold.session {
                 Some(session) => {
@@ -109,6 +115,15 @@ pub(in crate::host) fn inspect(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .upgrade_impact_with_agent_work(policy, &queued.keys().copied().collect(), &agent_runs)?;
+    for item in &mut impact.sessions {
+        if item.kind == SessionKind::NativeChat
+            && item.disposition == Disposition::Resumes
+            && queue_ready.contains(&item.id)
+            && !item.reason.unconfirmed_agent_run()
+        {
+            item.reason = SessionCause::QueuedPromptsReady;
+        }
+    }
     // Queued work no listed conversation will deliver still fences the update.
     for (session, blocker) in queued {
         if !impact.sessions.iter().any(|item| {

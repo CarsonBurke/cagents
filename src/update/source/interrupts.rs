@@ -30,6 +30,7 @@ struct Observation {
     publication: u64,
     permitted_children: BTreeSet<String>,
     run: Option<RunIdentity>,
+    latest_accepted: bool,
     activity: Activity,
     interrupted_generation: Option<u64>,
     stopped_children: BTreeSet<String>,
@@ -140,8 +141,9 @@ impl Observation {
                 "The interrupted conversation's registry owner changed",
             ));
         }
+        self.latest_accepted = state == Some(agent_execution::State::Accepted);
         if identity != self.run {
-            self.late_turn |= state != Some(agent_execution::State::Accepted);
+            self.late_turn |= !self.latest_accepted;
             self.run = identity;
         }
         // The directory names the newest acceptance, which can be a prompt
@@ -177,7 +179,16 @@ fn run_at(
     let Some(delegation) = &entry.delegation else {
         return Ok((None, None));
     };
-    if delegation.run.is_some() != delegation.run_state.is_some() {
+    let owner_is_nil = match &delegation.owner {
+        directory::Owner::User => false,
+        directory::Owner::Session(lineage) => lineage.0.as_uuid().is_nil(),
+        directory::Owner::Automation(id) => id.is_nil(),
+    };
+    if delegation.run.is_some() != delegation.run_state.is_some()
+        || delegation.agent.as_uuid().is_nil()
+        || delegation.run.is_some_and(|id| id.as_uuid().is_nil())
+        || owner_is_nil
+    {
         return Err(invalid(
             "The source did not confirm the conversation's accepted run state",
         ));
@@ -386,6 +397,7 @@ fn begin_with(
             publication: snapshot.generation,
             permitted_children: item.interrupted_subagents.iter().cloned().collect(),
             run: run_at(&entries, session)?.0,
+            latest_accepted: false,
             activity: Activity {
                 busy: false,
                 accepted: false,
@@ -505,7 +517,8 @@ fn poll_with(
         let run_active = observed.observe_run(&entries)?;
         if !observed.activity.settled
             || run_active
-            || observed.run.is_none() && !observed.activity.completion
+            || observed.run.as_ref().and_then(|run| run.run).is_none()
+                && !observed.activity.completion
         {
             pending.push(*id);
         }
@@ -539,7 +552,10 @@ fn poll_with(
                 if item.disposition == impact::Disposition::WaitsForIdle {
                     observed.late_turn = true;
                     pending.push(item.id);
-                } else if item.reason.unconfirmed_agent_run() {
+                } else if item.reason.unconfirmed_agent_run()
+                    || (observed.latest_accepted
+                        && item.reason != impact::SessionCause::QueuedPromptsReady)
+                {
                     pending.push(item.id);
                 }
             }
@@ -690,6 +706,7 @@ mod tests {
             publication: 0,
             permitted_children: BTreeSet::new(),
             run: run_at(std::slice::from_ref(entry), session).unwrap().0,
+            latest_accepted: false,
             activity: Activity {
                 busy: false,
                 accepted: false,
@@ -760,11 +777,8 @@ mod tests {
                         if phase > 0 && phase != 3 {
                             observed.sessions[0].disposition = impact::Disposition::Resumes;
                         }
-                        if queued && phase == 1 {
-                            observed.sessions[0].reason =
-                                impact::SessionCause::AgentRunUnconfirmed {
-                                    queued_prompts: true,
-                                };
+                        if queued && policy == impact::Policy::WhenIdle && phase == 2 {
+                            observed.sessions[0].reason = impact::SessionCause::QueuedPromptsReady;
                         }
                         ServerResponse::UpgradeImpact(observed)
                     }
