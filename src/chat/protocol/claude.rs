@@ -413,55 +413,22 @@ fn read_attribution_file(directory: &Path, argument: &str) -> Option<String> {
     .then_some(value)
 }
 
-/// Resolves the explicit settings at the point they would be passed to
-/// Claude. File-valued settings stay in a private file when overlaid.
+/// Apply an override to an inline settings value or an otherwise bare
+/// launch. Explicit file settings stay with Claude. Only a bare launch may
+/// write a large standalone attribution value to process-owned storage.
 pub(crate) fn launch_attribution_argument(
-    cwd: &Path,
     explicit: Option<&str>,
     attribution: impl FnOnce() -> Option<Value>,
+    directory: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> Option<String> {
-    launch_attribution_argument_with(cwd, explicit, attribution, |value| {
-        crate::instance::runtime_directory()
-            .and_then(|directory| write_attribution_file(&directory, value))
-    })
-}
-
-fn launch_attribution_argument_with(
-    cwd: &Path,
-    explicit: Option<&str>,
-    attribution: impl FnOnce() -> Option<Value>,
-    stage: impl FnOnce(&str) -> std::io::Result<String>,
-) -> Option<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let explicit_path = explicit.filter(|value| !value.trim_start().starts_with('{'));
-    let value = if let Some(path) = explicit_path {
-        // Independent homes never need their explicit files read by cagents.
-        let inherited = attribution()?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(cwd.join(path))
-            .ok()?;
-        if !file.metadata().ok()?.is_file() {
-            return None;
-        }
-        let mut value = String::new();
-        file.take(MAX_SETTINGS_FILE + 1)
-            .read_to_string(&mut value)
-            .ok()?;
-        if value.len() as u64 > MAX_SETTINGS_FILE {
-            return None;
-        }
-        attribution_settings(Some(&value), || Some(inherited))?
-    } else {
-        attribution_settings(explicit, attribution)?
-    };
-    if explicit_path.is_none() && value.len() <= MAX_INLINE_ATTRIBUTION {
+    let value = attribution_settings(explicit, attribution)?;
+    if value.len() <= MAX_INLINE_ATTRIBUTION {
         return Some(value);
     }
-    match stage(&value) {
+    if explicit.is_some() {
+        return None;
+    }
+    match directory().and_then(|directory| write_attribution_file(&directory, &value)) {
         Ok(argument) => Some(argument),
         Err(error) => {
             tracing::warn!(%error, "cannot stage the managed Claude attribution setting");
@@ -470,22 +437,90 @@ fn launch_attribution_argument_with(
     }
 }
 
+pub(crate) fn terminal_attribution_directory() -> std::io::Result<PathBuf> {
+    let root = crate::instance::runtime_directory()?;
+    let boot = crate::daemon::read_boot_id()?;
+    Ok(root.join(format!(".claude-attribution-boot-{}", boot.as_str())))
+}
+
+pub(crate) fn prepare_terminal_attribution_directory() -> std::io::Result<PathBuf> {
+    let directory = terminal_attribution_directory()?;
+    crate::secure_file::prepare_private_directory(&directory)?;
+    // The runtime can be persistent on Darwin. No terminal from a past
+    // kernel boot can still use these generated attribution-only files.
+    if let Some(root) = directory.parent() {
+        for entry in std::fs::read_dir(root)?.flatten() {
+            if entry.path() != directory
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.file_name().to_str().is_some_and(|name| {
+                    name.strip_prefix(".claude-attribution-boot-")
+                        .is_some_and(|boot| uuid::Uuid::parse_str(boot).is_ok())
+                })
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    Ok(directory)
+}
+
 pub(crate) fn decode_attribution_argument(argument: &str) -> Option<String> {
     let candidate = argument.strip_prefix("--settings=")?;
     if candidate.starts_with('{') {
         return Some(candidate.to_owned());
     }
-    read_attribution_file(&crate::instance::runtime_directory().ok()?, candidate)
+    read_attribution_file(&terminal_attribution_directory().ok()?, candidate)
+}
+
+pub(crate) fn apply_spawn_attribution(spec: &mut ProcessSpec, store: &std::path::Path) {
+    let recipe = crate::model::LaunchRecipe {
+        program: spec.program.clone(),
+        arguments: Vec::new(),
+        working_directory: spec.working_directory.clone(),
+        environment: spec.environment.clone(),
+        unset_environment: spec.unset_environment.clone(),
+    };
+    apply_spawn_attribution_with(
+        &mut spec.arguments,
+        &recipe,
+        || Ok(store.to_path_buf()),
+        managed_attribution,
+    );
+}
+
+fn apply_spawn_attribution_with(
+    arguments: &mut Vec<String>,
+    recipe: &crate::model::LaunchRecipe,
+    directory: impl FnOnce() -> std::io::Result<PathBuf>,
+    attribution: impl FnOnce(&crate::model::LaunchRecipe, &str) -> Option<Value>,
+) {
+    let mut settings = None;
+    let mut sources = "user,project,local";
+    let mut args = arguments.iter().enumerate();
+    while let Some((index, flag)) = args.next() {
+        if crate::agent::Provider::Claude.is_value_option(flag) {
+            let Some((_, value)) = args.next() else { break };
+            match flag.as_str() {
+                "--settings" => settings = Some(index + 1),
+                "--setting-sources" => sources = value,
+                _ => {}
+            }
+        }
+    }
+    if let Some(value) = launch_attribution_argument(
+        settings.map(|index| arguments[index].as_str()),
+        || attribution(recipe, sources),
+        directory,
+    ) {
+        if let Some(index) = settings {
+            arguments[index] = value;
+        } else {
+            arguments.extend(["--settings".into(), value]);
+        }
+    }
 }
 
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
-    arguments_with_attribution(launch, managed_attribution)
-}
-
-fn arguments_with_attribution(
-    launch: &Launch,
-    attribution: impl FnOnce(&crate::model::LaunchRecipe, &str) -> Option<Value>,
-) -> Result<Vec<String>, String> {
     if launch.recipe.arguments.len() > 128
         || launch
             .recipe
@@ -504,8 +539,6 @@ fn arguments_with_attribution(
         validate_id(id)?;
     }
     let mut result = Vec::new();
-    let mut settings_value = None;
-    let mut setting_sources = "user,project,local";
     let mut args = launch.recipe.arguments.iter().peekable();
     while let Some(arg) = args.next() {
         let (flag, inline) = arg
@@ -561,11 +594,6 @@ fn arguments_with_attribution(
             {
                 return Err(format!("Unknown Claude launch permission mode {value}"));
             }
-            match flag {
-                "--settings" => settings_value = Some(result.len() + 1),
-                "--setting-sources" => setting_sources = value,
-                _ => {}
-            }
             result.extend([flag.into(), value.into()]);
         } else if crate::chat::fresh::claude_arity(flag)
             == Some(crate::chat::fresh::ArgumentArity::Values)
@@ -593,19 +621,6 @@ fn arguments_with_attribution(
             return Err(format!(
                 "Claude option {flag} cannot safely transfer to native chat; remove it before connecting"
             ));
-        }
-    }
-    // Resolve at process launch so fresh, resumed and recovered chats all
-    // read the current preference, without saving a flag into their recipe.
-    if let Some(value) = launch_attribution_argument(
-        &launch.recipe.working_directory,
-        settings_value.map(|index| result[index].as_str()),
-        || attribution(&launch.recipe, setting_sources),
-    ) {
-        if let Some(index) = settings_value {
-            result[index] = value;
-        } else {
-            result.extend(["--settings".into(), value]);
         }
     }
     // Older stored chats and terminal conversions may predate native launch

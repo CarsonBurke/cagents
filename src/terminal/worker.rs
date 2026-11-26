@@ -3218,8 +3218,9 @@ impl Worker {
             command.env_remove(name);
         }
         command.env_remove(crate::model::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY);
-        if crate::agent::Provider::from_program(&execution.program)
-            == Some(crate::agent::Provider::Claude)
+        if config.adoption.is_none()
+            && crate::agent::Provider::from_program(&execution.program)
+                == Some(crate::agent::Provider::Claude)
         {
             let mut launch = execution.clone();
             for name in ["HOME", "CLAUDE_CONFIG_DIR"] {

@@ -292,9 +292,9 @@ pub(crate) fn claude_attribution_overlay_with(
         return None;
     }
     let value = crate::chat::protocol::claude::launch_attribution_argument(
-        &recipe.working_directory,
         explicit.map(|(_, _, value)| value),
         || attribution(&recipe, sources),
+        crate::chat::protocol::claude::prepare_terminal_attribution_directory,
     )?;
     Some(ClaudeAttributionOverlay {
         position,
@@ -346,17 +346,8 @@ fn restore_claude_attribution(launch: &mut LaunchRecipe, environment: &[u8]) {
     else {
         return;
     };
-    let original_is_file = inline.is_some_and(|original| !original.trim_start().starts_with('{'));
-    // The staged file's name authenticates its exact private contents. The
-    // user's original file can change after launch; keep the original path
-    // for the next launch instead of copying its old contents into a recipe.
-    let valid = if original_is_file {
-        !overlay.argument.starts_with("--settings={")
-    } else {
-        crate::chat::protocol::claude::attribution_settings(inline, || Some(generated)).as_deref()
-            == Some(value.as_str())
-    };
-    if valid {
+    let expected = crate::chat::protocol::claude::attribution_settings(inline, || Some(generated));
+    if expected.as_deref() == Some(value.as_str()) {
         // An interpreter, when present, owns argv[1]. The recorded
         // position is relative to the provider's own arguments.
         let index = launch.arguments.len() - arguments.len() + overlay.position;
@@ -551,7 +542,11 @@ impl ProcessView {
     fn environment(&self) -> Option<Vec<u8>> {
         match self {
             #[cfg(any(target_os = "linux", test))]
-            Self::Proc(root) => bounded_read(root.join("environ"), MAX_PROCESS_ENVIRONMENT),
+            Self::Proc(root) => bounded_read(
+                root.join("environ"),
+                MAX_PROCESS_ENVIRONMENT + MAX_ATTRIBUTION_MARKER_BYTES,
+            )
+            .and_then(bounded_process_environment),
             #[cfg(target_os = "macos")]
             &Self::Darwin(pid) => {
                 process_environment(crate::process::inspect::arguments(pid).ok()?)
@@ -599,12 +594,44 @@ fn process_environment(observed: crate::process::inspect::Arguments) -> Option<V
     if observed.environment.is_empty() {
         return None;
     }
-    let environment = observed.environ();
-    (environment.len() <= MAX_PROCESS_ENVIRONMENT).then_some(environment)
+    bounded_process_environment(observed.environ())
 }
 
 #[cfg(feature = "host")]
 const MAX_PROCESS_ENVIRONMENT: usize = 128 * 1024;
+
+#[cfg(feature = "host")]
+const MAX_ATTRIBUTION_MARKER_BYTES: usize = 96 * 1024;
+
+#[cfg(feature = "host")]
+fn bounded_process_environment(environment: Vec<u8>) -> Option<Vec<u8>> {
+    if environment.len() <= MAX_PROCESS_ENVIRONMENT {
+        return Some(environment);
+    }
+    if environment.len() > MAX_PROCESS_ENVIRONMENT + MAX_ATTRIBUTION_MARKER_BYTES {
+        return None;
+    }
+    // Preserve the existing budget for the process's own environment. The
+    // exact generated setting is verified separately before argv is restored.
+    let mut entries = environment
+        .split_inclusive(|byte| *byte == 0)
+        .filter(|entry| {
+            entry
+                .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())
+                .and_then(|value| value.strip_prefix(b"="))
+                .is_some_and(|json| {
+                    serde_json::from_slice::<ClaudeAttributionOverlay>(
+                        json.strip_suffix(&[0]).unwrap_or(json),
+                    )
+                    .is_ok()
+                })
+        });
+    let marker = entries.next()?;
+    if entries.next().is_some() || environment.len() - marker.len() > MAX_PROCESS_ENVIRONMENT {
+        return None;
+    }
+    Some(environment)
+}
 
 #[cfg(feature = "host")]
 struct ProcessLaunch {
@@ -2620,14 +2647,17 @@ mod tests {
             agent: true,
         };
         assert!(read_process_launch(&ProcessView::Proc(root.clone()), request).is_none());
-        fs::write(
-            root.join("environ"),
+        let mut environment = b"UNOBSERVED=".to_vec();
+        environment.resize(MAX_PROCESS_ENVIRONMENT - 1, b'x');
+        environment.push(0);
+        environment.extend_from_slice(
             format!(
                 "{CLAUDE_ATTRIBUTION_OVERLAY}={}\0",
                 serde_json::to_string(&overlay).unwrap()
-            ),
-        )
-        .unwrap();
+            )
+            .as_bytes(),
+        );
+        fs::write(root.join("environ"), environment).unwrap();
         let request = ForegroundRequest {
             hint: Some(&base),
             agent: true,

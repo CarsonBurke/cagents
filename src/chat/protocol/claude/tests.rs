@@ -15732,15 +15732,14 @@ fn a_reopened_narration_reads_as_commentary_from_its_signature() {
 }
 
 #[test]
-fn large_managed_attribution_and_explicit_files_stay_in_private_settings_files() {
+fn large_managed_attribution_uses_private_settings_and_explicit_files_stay_in_place() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempfile::tempdir().unwrap();
-    let stage = |value: &str| write_attribution_file(directory.path(), value);
     let inherited = json!({"commit": "a".repeat(150 * 1024), "pr": ""});
+    let fixture_directory = || Ok(directory.path().to_path_buf());
     let argument =
-        launch_attribution_argument_with(directory.path(), None, || Some(inherited.clone()), stage)
-            .unwrap();
+        launch_attribution_argument(None, || Some(inherited.clone()), fixture_directory).unwrap();
     assert!(argument.len() < MAX_INLINE_ATTRIBUTION);
     let staged = read_attribution_file(directory.path(), &argument).unwrap();
     assert_eq!(
@@ -15752,37 +15751,24 @@ fn large_managed_attribution_and_explicit_files_stay_in_private_settings_files()
         0o600
     );
     assert_eq!(
-        stage(&staged).unwrap(),
+        write_attribution_file(directory.path(), &staged).unwrap(),
         argument,
         "identical launches reuse the file"
     );
 
     let path = directory.path().join("settings.json");
     std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
-    let argument = launch_attribution_argument_with(
-        directory.path(),
-        Some("settings.json"),
-        || Some(json!(false)),
-        stage,
-    )
-    .unwrap();
-    assert_eq!(
-        read_attribution_file(directory.path(), &argument).as_deref(),
-        Some(r#"{"attribution":false,"theme":"dark"}"#)
-    );
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        r#"{"theme":"dark"}"#
-    );
-    std::fs::write(path, r#"{"attribution":true}"#).unwrap();
     assert!(
-        launch_attribution_argument_with(
-            directory.path(),
-            Some("settings.json"),
-            || Some(json!(false)),
-            stage,
+        launch_attribution_argument(
+            path.to_str(),
+            || panic!("Claude owns this explicit file"),
+            || panic!("no settings may be staged for it"),
         )
         .is_none()
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        r#"{"theme":"dark"}"#
     );
 }
 
@@ -15815,13 +15801,25 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
         draft_model: None,
     };
     let settings = |launch: &Launch| {
-        arguments_with_attribution(launch, |recipe, sources| {
-            chat::managed_claude_attribution(recipe, &homes, &system, sources)
-        })
-        .unwrap()
-        .windows(2)
-        .find(|pair| pair[0] == "--settings")
-        .map(|pair| serde_json::from_str::<Value>(&pair[1]).unwrap())
+        let mut arguments = arguments(launch).unwrap();
+        assert!(arguments.iter().all(|argument| {
+            !argument.contains("attribution")
+                || launch
+                    .recipe
+                    .arguments
+                    .iter()
+                    .any(|original| original.contains("attribution"))
+        }));
+        apply_spawn_attribution_with(
+            &mut arguments,
+            &launch.recipe,
+            || Ok(directory.path().to_path_buf()),
+            |recipe, sources| chat::managed_claude_attribution(recipe, &homes, &system, sources),
+        );
+        arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--settings")
+            .map(|pair| serde_json::from_str::<Value>(&pair[1]).unwrap())
     };
 
     std::fs::write(&system_settings, r#"{"attribution":false,"theme":"dark"}"#).unwrap();
