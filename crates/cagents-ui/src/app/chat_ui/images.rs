@@ -1532,22 +1532,29 @@ impl Gallery {
                 )
             }
         };
-        let toolbar = widget::row::with_children(vec![
-            icon(
-                Icon::ChevronLeft,
-                "Previous image (Left)",
-                navigation,
-                Action::ImageNext(host, false),
-            ),
-            design::caption(format!("{} / {}", self.selected + 1, self.entries.len()))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            icon(
-                Icon::ChevronRight,
-                "Next image (Right)",
-                navigation,
-                Action::ImageNext(host, true),
-            ),
+        // A lone image has nothing to browse to, so it draws no "1 / 1"
+        // between two arrows that could never be pressed.
+        let mut toolbar = Vec::with_capacity(9);
+        if navigation {
+            toolbar.extend([
+                icon(
+                    Icon::ChevronLeft,
+                    "Previous image (Left)",
+                    true,
+                    Action::ImageNext(host, false),
+                ),
+                design::caption(format!("{} / {}", self.selected + 1, self.entries.len()))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+                icon(
+                    Icon::ChevronRight,
+                    "Next image (Right)",
+                    true,
+                    Action::ImageNext(host, true),
+                ),
+            ]);
+        }
+        toolbar.extend([
             iced::widget::Space::new().width(Length::Fill).into(),
             command(
                 Icon::Copy,
@@ -1577,9 +1584,10 @@ impl Gallery {
                 true,
                 Action::CloseImage(host),
             ),
-        ])
-        .spacing(step::GAP_S)
-        .align_y(iced::Alignment::Center);
+        ]);
+        let toolbar = widget::row::with_children(toolbar)
+            .spacing(step::GAP_S)
+            .align_y(iced::Alignment::Center);
         let canvas: Element<'_, Message> = match (entry.shown(), image) {
             (Some(handle), Some(image)) => {
                 let viewer: Element<'_, Message> = iced::widget::image::Viewer::new(handle.clone())
