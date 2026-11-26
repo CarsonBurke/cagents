@@ -2538,8 +2538,12 @@ fn start_publishing(
         && !saved_history_only
         && session.launch.session_id.is_none()
         && let Some(login_path) = crate::account::probe::shell_search_path()
+        && let Some(path) = combined_login_search_path(&process_launch.recipe, &login_path)
     {
-        add_login_search_directories(&mut process_launch.recipe, &login_path);
+        process_launch
+            .recipe
+            .environment
+            .insert("PATH".into(), path);
     }
     // A begun thread's bare remote joins the account's shared daemon, which
     // owns the thread while it runs. With nothing serving that daemon, the
@@ -5383,12 +5387,12 @@ fn prepare_native_process_launch(
 /// A fresh provider keeps its caller's tool order. Supply directories absent
 /// from its PATH so a launcher can find dependencies installed for the user.
 #[cfg(any(target_os = "macos", test))]
-fn add_login_search_directories(
-    recipe: &mut crate::model::LaunchRecipe,
+fn combined_login_search_path(
+    recipe: &crate::model::LaunchRecipe,
     login_path: &std::ffi::OsStr,
-) {
+) -> Option<String> {
     if recipe.unset_environment.contains("PATH") {
-        return;
+        return None;
     }
     let mut seen = std::collections::HashSet::new();
     let directories = recipe
@@ -5398,11 +5402,32 @@ fn add_login_search_directories(
         .flat_map(std::env::split_paths)
         .chain(std::env::split_paths(login_path).filter(|directory| directory.is_absolute()))
         .filter(|directory| seen.insert(directory.clone()));
-    if let Ok(path) = std::env::join_paths(directories)
-        && let Ok(path) = path.into_string()
+    std::env::join_paths(directories).ok()?.into_string().ok()
+}
+
+/// Keep the headless agent's resolved search path before its exact launch
+/// intent is persisted. Restart can use that path without recording the
+/// surrounding private account environment or probing another login shell.
+#[cfg(target_os = "macos")]
+pub(super) fn record_agent_login_path(launch: &mut chat::Launch) -> Result<(), ProtocolError> {
+    let Some(login) = crate::account::probe::shell_search_path() else {
+        return Ok(());
+    };
+    let materialized = prepare_native_process_launch(
+        launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            launch.provider,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )?;
+    if let Some(path) = combined_login_search_path(&materialized.recipe, &login)
+        && crate::model::agent_recovery::fresh_environment_key(launch.provider, "PATH", &path, true)
     {
-        recipe.environment.insert("PATH".into(), path);
+        launch.recipe.environment.insert("PATH".into(), path);
     }
+    Ok(())
 }
 
 /// The environment `restore_upgrade` will start `launch` with in the next

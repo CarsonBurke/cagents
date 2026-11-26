@@ -3760,11 +3760,13 @@ fn fresh_launch_preserves_path_order_and_adds_missing_login_search_directories()
         environment: BTreeMap::from([("PATH".into(), "/selected:/shared".into())]),
         unset_environment: Default::default(),
     };
-    add_login_search_directories(&mut recipe, std::ffi::OsStr::new("/shared:./local:/login"));
-    assert_eq!(recipe.environment["PATH"], "/selected:/shared:/login");
+    assert_eq!(
+        combined_login_search_path(&recipe, std::ffi::OsStr::new("/shared:./local:/login"))
+            .as_deref(),
+        Some("/selected:/shared:/login"),
+    );
 
     recipe.environment.remove("PATH");
     recipe.unset_environment.insert("PATH".into());
-    add_login_search_directories(&mut recipe, std::ffi::OsStr::new("/login"));
-    assert!(!recipe.environment.contains_key("PATH"));
+    assert!(combined_login_search_path(&recipe, std::ffi::OsStr::new("/login")).is_none());
 }
