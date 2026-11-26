@@ -5745,7 +5745,7 @@ mod tests {
             [Probe::Hover(None)],
             "moving off a published hover ends it"
         );
-        let (event, at) = moved(29.0);
+        let (event, at) = moved(20.0 + 6.0 * 9.0);
         assert_eq!(
             deliver(&mut editor, &mut tree, event, at),
             [],
