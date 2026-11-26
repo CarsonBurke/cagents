@@ -4,7 +4,8 @@ use cagents::{
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     process::ProcessExecutor,
     repository::{
-        CancellationToken, CommitOutcome, CommitRequest, DiffBasis, MutationOutcome, PathSelection,
+        CancellationToken, CommitOutcome, CommitRequest, DiffBasis, MutationFailure, MutationOutcome,
+        PathSelection, RepositoryError,
         PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryService, RepositorySnapshot,
         StageRequest, UnstageRequest,
     },
@@ -275,6 +276,9 @@ pub enum Message {
     StartupWindowOpened,
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
+    /// A stage refused because conflicted paths in it still hold conflict
+    /// markers, which the user is then asked about.
+    StageNeedsConfirmation(CardId, Vec<PathSelection>, Vec<RepoPath>),
     Discarded(CardId, Vec<RepoPath>, Result<MutationOutcome, String>),
     Committed(CardId, String, Result<CommitOutcome, String>),
     Pushed(CardId, Result<PushOutcome, String>),
@@ -1182,6 +1186,10 @@ impl Editor {
         self.current()?.navigation.pending_discard()
     }
 
+    fn pending_git_confirmation(&self) -> Option<&sidebar::GitConfirmation> {
+        self.current()?.navigation.pending_git_confirmation()
+    }
+
     fn modal_open(&self) -> bool {
         self.settings_open
             || self.quick_open
@@ -1191,6 +1199,7 @@ impl Editor {
             || self.checkout_history_open
             || self.notices_open
             || self.pending_discard().is_some()
+            || self.pending_git_confirmation().is_some()
     }
 
     fn settings_footer(&self) -> Element<'_, Message> {
@@ -3042,6 +3051,7 @@ impl Editor {
             return Task::none();
         };
         cosmic::task::future(async move {
+            let refused = selection.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
                 let token = CancellationToken::default();
@@ -3062,6 +3072,34 @@ impl Editor {
                         &token,
                     )
                 }
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            match result {
+                Ok(MutationOutcome::NotApplied {
+                    failure: MutationFailure::ConflictMarkers { paths },
+                }) => Message::StageNeedsConfirmation(id, refused, paths),
+                result => Message::Mutation(id, result),
+            }
+        })
+    }
+
+    /// Runs one Changes-panel command that reports a [`MutationOutcome`].
+    fn git_command(
+        &mut self,
+        id: CardId,
+        kind: MutationKind,
+        run: impl FnOnce(&RepositoryService, &Path) -> Result<MutationOutcome, RepositoryError>
+        + Send
+        + 'static,
+    ) -> Task<Message> {
+        let Some(root) = self.begin_mutation(id, kind) else {
+            return Task::none();
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                run(&RepositoryService::system("git"), &root)
             })
             .await
             .map_err(|error| error.to_string())
@@ -3419,6 +3457,9 @@ impl Application for Editor {
                 if self.pending_discard().is_some() {
                     return self.update(Message::Sidebar(SidebarAction::CancelDiscard));
                 }
+                if self.pending_git_confirmation().is_some() {
+                    return self.update(Message::Sidebar(SidebarAction::CancelGitConfirmation));
+                }
                 if self.notices_open {
                     return self.close_notices();
                 }
@@ -3449,7 +3490,11 @@ impl Application for Editor {
                 && !matches!(
                     &message,
                     Message::Sidebar(
-                        SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
+                        SidebarAction::ConfirmDiscard { .. }
+                            | SidebarAction::CancelDiscard
+                            | SidebarAction::ConfirmStageConflictMarkers { .. }
+                            | SidebarAction::ConfirmAbortOperation { .. }
+                            | SidebarAction::CancelGitConfirmation
                     )
                 )
                 && matches!(
@@ -4019,7 +4064,11 @@ impl Application for Editor {
                     if self.modal_open()
                         && !matches!(
                             action,
-                            SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
+                            SidebarAction::ConfirmDiscard { .. }
+                                | SidebarAction::CancelDiscard
+                                | SidebarAction::ConfirmStageConflictMarkers { .. }
+                                | SidebarAction::ConfirmAbortOperation { .. }
+                                | SidebarAction::CancelGitConfirmation
                         )
                     {
                         return Task::none();
@@ -4083,6 +4132,11 @@ impl Application for Editor {
                         | SidebarAction::ToggleSection { key, .. }
                         | SidebarAction::RequestDiscard { key, .. }
                         | SidebarAction::ConfirmDiscard { key, .. }
+                        | SidebarAction::RequestStageConflictMarkers { key, .. }
+                        | SidebarAction::ConfirmStageConflictMarkers { key, .. }
+                        | SidebarAction::RequestAbortOperation { key, .. }
+                        | SidebarAction::ConfirmAbortOperation { key, .. }
+                        | SidebarAction::ContinueOperation { key, .. }
                         | SidebarAction::CommitMessageChanged { key, .. }
                         | SidebarAction::Commit { key, .. }
                         | SidebarAction::Push { key, .. }
@@ -4108,6 +4162,20 @@ impl Application for Editor {
                             return Task::none();
                         }
                     }
+                    // Only the confirmation the mounted dialog describes runs.
+                    if matches!(
+                        action,
+                        SidebarAction::ConfirmStageConflictMarkers { .. }
+                            | SidebarAction::ConfirmAbortOperation { .. }
+                    ) && tab
+                        .navigation
+                        .pending_git_confirmation()
+                        .map(sidebar::GitConfirmation::confirm_action)
+                        .as_ref()
+                        != Some(&action)
+                    {
+                        return Task::none();
+                    }
                     if let SidebarAction::RequestDiscard { request, .. } = &action
                         && (request.worktree != tab.runtime.descriptor.worktree
                             || tab.mutation.is_some())
@@ -4121,7 +4189,40 @@ impl Application for Editor {
                             widget::text_input::focus(sidebar::discard_cancel_id())
                                 .map(cosmic::Action::App)
                         }
-                        SidebarAction::CancelDiscard => self.resume_pending_files(),
+                        SidebarAction::CancelDiscard | SidebarAction::CancelGitConfirmation => {
+                            self.resume_pending_files()
+                        }
+                        SidebarAction::RequestStageConflictMarkers { .. }
+                        | SidebarAction::RequestAbortOperation { .. } => {
+                            widget::text_input::focus(sidebar::git_confirmation_cancel_id())
+                                .map(cosmic::Action::App)
+                        }
+                        SidebarAction::ConfirmStageConflictMarkers { key, selection } => {
+                            let worktree = key.canonical_path;
+                            self.git_command(id, MutationKind::Stage, move |service, _| {
+                                service.stage_with_conflict_markers(
+                                    &StageRequest {
+                                        worktree,
+                                        selection,
+                                    },
+                                    &CancellationToken::default(),
+                                )
+                            })
+                        }
+                        SidebarAction::ConfirmAbortOperation { kind, .. } => {
+                            self.git_command(id, MutationKind::Abort, move |service, root| {
+                                service.abort_operation(root, kind, &CancellationToken::default())
+                            })
+                        }
+                        SidebarAction::ContinueOperation { kind, .. } => {
+                            self.git_command(id, MutationKind::Continue, move |service, root| {
+                                service.continue_operation(
+                                    root,
+                                    kind,
+                                    &CancellationToken::default(),
+                                )
+                            })
+                        }
                         SidebarAction::ConfirmDiscard { request, .. } => {
                             if self.begin_mutation(id, MutationKind::Discard).is_none() {
                                 return Task::none();
@@ -4312,6 +4413,7 @@ impl Application for Editor {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
                                     let mut source = SourceControlModel::ready(key, &snapshot);
                                     source.set_mutation(tab.mutation);
+                                    tab.navigation.adopt_operation_message(&source);
                                     tab.sidebar.source_control = Some(source);
                                 }
                                 // A remote added or retargeted since the last
@@ -4356,6 +4458,23 @@ impl Application for Editor {
                         );
                     }
                     Task::batch(tasks)
+                }
+                Message::StageNeedsConfirmation(id, selection, paths) => {
+                    let finished = self.finish_mutation(id, None);
+                    let Some(key) = self
+                        .tab(id)
+                        .and_then(|tab| tab.navigation.active_worktree().cloned())
+                    else {
+                        return finished;
+                    };
+                    let ask = self.update(Message::Sidebar(
+                        SidebarAction::RequestStageConflictMarkers {
+                            key,
+                            selection,
+                            paths,
+                        },
+                    ));
+                    Task::batch([finished, ask])
                 }
                 Message::Mutation(id, result) => {
                     let notice = match result {
@@ -5270,6 +5389,16 @@ impl Application for Editor {
                 )
                 .map(Message::Sidebar),
                 Message::Sidebar(SidebarAction::CancelDiscard),
+            ));
+        }
+        if let Some(pending) = self.pending_git_confirmation() {
+            return Some(dialog_overlay(
+                sidebar::git_confirmation_dialog(
+                    pending,
+                    widget::Id::new("dialog.question.ConfirmGitCommand"),
+                )
+                .map(Message::Sidebar),
+                Message::Sidebar(SidebarAction::CancelGitConfirmation),
             ));
         }
         if let Some(dialog) = &self.file_dialog {
@@ -10338,6 +10467,7 @@ mod tests {
             local_refs: Vec::new(),
             remote_refs: Vec::new(),
             remote_heads: Vec::new(),
+            operation: None,
         }
     }
 

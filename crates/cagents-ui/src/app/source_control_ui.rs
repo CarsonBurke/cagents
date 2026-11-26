@@ -46,6 +46,7 @@ impl Cagents {
         // A worktree's first read decides which Git view it opens on.
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             self.sidebar_state.settle_changes_tab(source);
+            self.sidebar_state.adopt_operation_message(source);
         }
         ControlFlow::Continue(self.refresh_branch_changes(&snapshot))
     }
@@ -230,6 +231,7 @@ mod tests {
             local_refs: Vec::new(),
             remote_refs: Vec::new(),
             remote_heads: Vec::new(),
+            operation: None,
         }
     }
 

@@ -463,6 +463,7 @@ mod tests {
             }],
             remote_refs: Vec::new(),
             remote_heads: Vec::new(),
+            operation: None,
         }
     }
 

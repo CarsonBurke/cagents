@@ -24,11 +24,11 @@ use std::{
 use cagents::repository::{
     CancellationToken, ChangeArea, ChangeKind, CommandSpec, CommitOutcome, CommitRequest,
     ConflictKind, DiffBasis, DiffContent, DiffRequest, DiffSide, DiscardRequest, HeadState,
-    HistoryRequest, HistoryRevision, MutationFailure, MutationLocks, MutationOutcome, Oid,
-    PathSelection, ProcessExecutor, ProcessFailure, ProcessFailureKind, ProcessOutput, PushOutcome,
-    PushRequest, PushTarget, RemoteSideRef, RepoPath, RepositoryService, RepositorySnapshot,
-    StageRequest, SystemProcessExecutor, TrackingState, UnstageRequest, ValidatedBranchName,
-    ValidatedRefName,
+    HistoryRequest, HistoryRevision, InProgressOperation, MutationFailure, MutationLocks,
+    MutationOutcome, Oid, OperationKind, PathSelection, ProcessExecutor, ProcessFailure,
+    ProcessFailureKind, ProcessOutput, PushOutcome, PushRequest, PushTarget, RemoteSideRef,
+    RepoPath, RepositoryService, RepositorySnapshot, StageRequest, SystemProcessExecutor,
+    TrackingState, UnstageRequest, ValidatedBranchName, ValidatedRefName,
 };
 
 /// Applies configuration isolation and a fixed identity to every command,
@@ -5215,5 +5215,210 @@ fn successful_push_refuses_a_changed_source_oid_and_preserves_first_publish() {
     assert_eq!(
         fs::read(fixture.work().join("a.txt")).unwrap(),
         b"source committed before first publish\n"
+    );
+}
+
+/// Two branches that both changed `f.txt` and `g.txt` from a shared base,
+/// with `main` checked out.
+fn diverged(fixture: &Fixture) -> (Oid, Oid) {
+    fixture.write("f.txt", b"base\n");
+    fixture.write("g.txt", b"base\n");
+    fixture.commit_all("base");
+    fixture.git_in_work(&["checkout", "--quiet", "-b", "side"]);
+    fixture.write("f.txt", b"theirs\n");
+    fixture.write("g.txt", b"theirs\n");
+    let theirs = fixture.commit_all("theirs");
+    fixture.git_in_work(&["checkout", "--quiet", "main"]);
+    fixture.write("f.txt", b"ours\n");
+    fixture.write("g.txt", b"ours\n");
+    let ours = fixture.commit_all("ours");
+    (ours, theirs)
+}
+
+fn operation(fixture: &Fixture) -> Option<InProgressOperation> {
+    fixture
+        .service()
+        .in_progress_operation(&fixture.work(), &CancellationToken::new())
+        .expect("operation state")
+}
+
+/// The panel names the operation a worktree stopped in, from the state Git
+/// leaves behind, and carries the merge message Git prepared without the
+/// conflict list it appends as comments.
+#[test]
+fn snapshot_reports_each_operation_in_progress() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let (_, theirs) = diverged(&fixture);
+    assert_eq!(operation(&fixture), None);
+    assert_eq!(fixture.snapshot().operation, None);
+
+    fixture.run_failing(&fixture.work(), &["merge", "--no-edit", "side"]);
+    let merge = fixture.snapshot().operation.expect("a merge in progress");
+    assert_eq!(merge.kind, OperationKind::Merge);
+    assert!(merge.pending_commit);
+    assert!(!merge.sequence);
+    assert_eq!(merge.message.as_deref(), Some("Merge branch 'side'"));
+    fixture.git_in_work(&["merge", "--abort"]);
+
+    fixture.run_failing(&fixture.work(), &["cherry-pick", "side"]);
+    let pick = operation(&fixture).expect("a cherry-pick in progress");
+    assert_eq!(pick.kind, OperationKind::CherryPick);
+    assert!(pick.pending_commit);
+    assert_eq!(
+        pick.subject.as_deref(),
+        Some(&theirs.as_str()[..12]),
+        "the commit being picked"
+    );
+    assert_eq!(pick.message.as_deref(), Some("theirs"));
+    fixture.git_in_work(&["cherry-pick", "--abort"]);
+
+    fixture.git_in_work(&["checkout", "--quiet", "side"]);
+    fixture.run_failing(&fixture.work(), &["rebase", "main"]);
+    let rebase = operation(&fixture).expect("a rebase in progress");
+    assert_eq!(rebase.kind, OperationKind::Rebase);
+    assert_eq!(rebase.subject.as_deref(), Some("side"));
+    assert_eq!(rebase.progress, Some((1, 1)));
+    assert!(
+        !rebase.pending_commit && rebase.message.is_none(),
+        "a rebase's steps are committed by --continue, not by a commit"
+    );
+}
+
+/// A revert that conflicts is reported as a revert.
+#[test]
+fn snapshot_reports_a_conflicted_revert() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("f.txt", b"one\n");
+    fixture.commit_all("one");
+    fixture.write("f.txt", b"two\n");
+    let two = fixture.commit_all("two");
+    fixture.write("f.txt", b"three\n");
+    fixture.commit_all("three");
+    fixture.run_failing(&fixture.work(), &["revert", "--no-edit", two.as_str()]);
+    let revert = operation(&fixture).expect("a revert in progress");
+    assert_eq!(revert.kind, OperationKind::Revert);
+    assert!(revert.pending_commit);
+    assert_eq!(revert.subject.as_deref(), Some(&two.as_str()[..12]));
+    assert!(
+        revert
+            .message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Revert \"two\"")),
+        "{revert:?}"
+    );
+}
+
+/// Staging a conflicted file is how Git is told it is resolved, so a file
+/// still holding conflict markers is refused, staging nothing, until the
+/// user confirms; a resolved one stages as before.
+#[test]
+fn staging_a_conflicted_file_with_markers_needs_confirmation() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    diverged(&fixture);
+    fixture.run_failing(&fixture.work(), &["merge", "--no-edit", "side"]);
+    fixture.write("g.txt", b"resolved\n");
+    let request = StageRequest {
+        worktree: fixture.work(),
+        selection: vec![
+            PathSelection::new(path("f.txt")),
+            PathSelection::new(path("g.txt")),
+        ],
+    };
+
+    let outcome = fixture
+        .service()
+        .stage(&request, &CancellationToken::new())
+        .expect("stage");
+    assert_eq!(
+        outcome,
+        MutationOutcome::NotApplied {
+            failure: MutationFailure::ConflictMarkers {
+                paths: vec![path("f.txt")]
+            }
+        }
+    );
+    assert_eq!(
+        fixture
+            .text(&["ls-files", "--unmerged", "--", "g.txt"])
+            .lines()
+            .count(),
+        3,
+        "nothing in the refused selection was staged"
+    );
+
+    let outcome = fixture
+        .service()
+        .stage_with_conflict_markers(&request, &CancellationToken::new())
+        .expect("stage");
+    assert!(
+        matches!(outcome, MutationOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(fixture.text(&["ls-files", "--unmerged"]), "");
+    assert!(
+        fixture
+            .git_in_work(&["cat-file", "blob", ":f.txt"])
+            .starts_with(b"<<<<<<< HEAD\n"),
+        "the confirmed stage records the file as it is"
+    );
+}
+
+/// Abort returns the worktree to the commit and contents it had before the
+/// merge began; Continue resumes a rebase once its conflict is resolved.
+#[test]
+fn abort_restores_the_pre_merge_state_and_continue_finishes_a_rebase() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let (ours, _) = diverged(&fixture);
+    fixture.run_failing(&fixture.work(), &["merge", "--no-edit", "side"]);
+    let service = fixture.service();
+    let cancel = CancellationToken::new();
+
+    // The operation the user saw must be the one aborted.
+    let refused = service
+        .abort_operation(&fixture.work(), OperationKind::Rebase, &cancel)
+        .expect("abort");
+    assert!(
+        matches!(refused, MutationOutcome::NotApplied { .. }),
+        "{refused:?}"
+    );
+    assert!(fixture.work().join(".git/MERGE_HEAD").exists());
+
+    let aborted = service
+        .abort_operation(&fixture.work(), OperationKind::Merge, &cancel)
+        .expect("abort");
+    assert!(
+        matches!(aborted, MutationOutcome::Applied { .. }),
+        "{aborted:?}"
+    );
+    assert_eq!(fixture.head(), ours);
+    assert_eq!(fixture.porcelain(), "");
+    assert_eq!(operation(&fixture), None);
+
+    fixture.git_in_work(&["checkout", "--quiet", "side"]);
+    fixture.run_failing(&fixture.work(), &["rebase", "main"]);
+    fixture.write("f.txt", b"rebased\n");
+    fixture.write("g.txt", b"rebased\n");
+    fixture.git_in_work(&["add", "f.txt", "g.txt"]);
+    let continued = service
+        .continue_operation(&fixture.work(), OperationKind::Rebase, &cancel)
+        .expect("continue");
+    assert!(
+        matches!(continued, MutationOutcome::Applied { .. }),
+        "{continued:?}"
+    );
+    assert_eq!(operation(&fixture), None);
+    assert_eq!(fixture.text(&["log", "-1", "--format=%s"]), "theirs");
+    assert_eq!(
+        fixture.text(&["rev-parse", "HEAD~1"]),
+        ours.as_str(),
+        "the step was replayed onto main"
     );
 }

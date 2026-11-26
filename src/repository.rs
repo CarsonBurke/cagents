@@ -994,6 +994,9 @@ pub struct RepositorySnapshot {
     pub remote_refs: Vec<RemoteRefRecord>,
     /// One entry per remote whose `HEAD` pointer this repository has fetched.
     pub remote_heads: Vec<RemoteHead>,
+    /// The merge, rebase, cherry-pick or revert this worktree stopped in.
+    #[serde(default)]
+    pub operation: Option<InProgressOperation>,
 }
 
 impl RepositorySnapshot {
@@ -1029,6 +1032,137 @@ impl RepositorySnapshot {
         upstream_remote
             .and_then(|remote| self.remote_head(remote))
             .or_else(|| self.remote_head("origin"))
+    }
+}
+
+/// A multi-step Git operation that stopped part-way and is waiting for the
+/// user to conclude or abandon it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl OperationKind {
+    /// The Git subcommand that owns `--continue` and `--abort` for this
+    /// operation.
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+        }
+    }
+
+    /// The operation as a person names it, in a sentence's middle.
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+        }
+    }
+}
+
+/// The operation a worktree is in the middle of, read from the state files
+/// Git leaves in the worktree's administrative directory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InProgressOperation {
+    pub kind: OperationKind,
+    /// True when `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `REVERT_HEAD` exists, so
+    /// a commit concludes this step even with an index equal to `HEAD`'s
+    /// tree. See [`RepositoryService::has_pending_commit_state`]. Always
+    /// false for a rebase, whose steps `--continue` commits.
+    pub pending_commit: bool,
+    /// True when a cherry-pick or revert sequence has further commits to
+    /// apply after this one, so concluding it takes `--continue` rather than
+    /// only a commit.
+    pub sequence: bool,
+    /// What the operation is bringing in, as Git recorded it: the branch a
+    /// rebase is replaying, or the commit a cherry-pick or revert applies.
+    pub subject: Option<String>,
+    /// The rebase step this stopped at and the number of steps, when Git
+    /// recorded both.
+    pub progress: Option<(u32, u32)>,
+    /// The commit message Git prepared in `MERGE_MSG`, with comment lines
+    /// removed, for the commit that concludes a merge, cherry-pick or revert.
+    pub message: Option<String>,
+}
+
+/// The longest `MERGE_MSG` adopted as a commit draft. Git writes the message
+/// it prepared plus a conflict list; anything larger is not a draft anyone
+/// typed and is left for the user to write.
+const MERGE_MESSAGE_LIMIT: u64 = 64 * 1024;
+
+/// The state files and directories [`RepositoryService::in_progress_operation`]
+/// reads, in the order it asks Git to locate them.
+const OPERATION_STATE_PATHS: [&str; 7] = [
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "MERGE_MSG",
+];
+
+/// Whether `reader` holds a line that opens or closes a conflict block:
+/// exactly seven `<` or `>` at the start of a line, followed by a space or
+/// the line's end. Git writes both around every conflict, in the merge and
+/// diff3 styles alike; the `=======` separator alone is not counted, because
+/// it is also a Markdown and reStructuredText heading underline.
+///
+/// The scan reads in bounded chunks and keeps only a line's first eight
+/// bytes, so a very large or single-line file costs no more memory than a
+/// small one.
+pub fn scan_conflict_markers(
+    reader: &mut impl Read,
+    cancellation: &CancellationToken,
+) -> io::Result<bool> {
+    const WIDTH: usize = 7;
+    let mut chunk = [0_u8; 64 * 1024];
+    // The first `WIDTH + 1` bytes of the current line.
+    let mut prefix = [0_u8; WIDTH + 1];
+    let mut used = 0;
+    let marker = |prefix: &[u8], used: usize| {
+        used >= WIDTH
+            && (prefix[..WIDTH] == [b'<'; WIDTH] || prefix[..WIDTH] == [b'>'; WIDTH])
+            && (used == WIDTH || matches!(prefix[WIDTH], b' ' | b'\t' | b'\r'))
+    };
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "conflict marker scan cancelled",
+            ));
+        }
+        let length = match reader.read(&mut chunk) {
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if length == 0 {
+            return Ok(marker(&prefix, used));
+        }
+        for byte in &chunk[..length] {
+            if *byte == b'\n' {
+                if marker(&prefix, used) {
+                    return Ok(true);
+                }
+                used = 0;
+            } else if used < prefix.len() {
+                prefix[used] = *byte;
+                used += 1;
+                if used == prefix.len() && marker(&prefix, used) {
+                    return Ok(true);
+                }
+            }
+        }
     }
 }
 
@@ -1452,6 +1586,13 @@ pub enum MutationFailure {
     Rejected {
         reason: String,
     },
+    /// Staging would mark these conflicted paths resolved while their files
+    /// still hold conflict markers. Nothing was staged;
+    /// [`RepositoryService::stage_with_conflict_markers`] stages them once
+    /// the user confirms.
+    ConflictMarkers {
+        paths: Vec<RepoPath>,
+    },
 }
 
 impl fmt::Display for MutationFailure {
@@ -1461,6 +1602,19 @@ impl fmt::Display for MutationFailure {
             Self::Path { path, reason } => write!(formatter, "{path}: {reason}"),
             Self::Rejected { reason } | Self::Reconciliation { reason } => {
                 formatter.write_str(reason)
+            }
+            Self::ConflictMarkers { paths } => {
+                let names = paths
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let verb = if paths.len() == 1 {
+                    "contains"
+                } else {
+                    "contain"
+                };
+                write!(formatter, "{names} still {verb} conflict markers")
             }
         }
     }
@@ -4196,6 +4350,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let parsed = parse_refs(&output.stdout);
         let refs = invalid_output(parsed, output)?;
 
+        let operation = self.in_progress_operation(worktree, cancellation)?;
+
         Ok(RepositorySnapshot {
             status,
             files,
@@ -4203,6 +4359,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             local_refs: refs.local,
             remote_refs: refs.remote,
             remote_heads: refs.remote_heads,
+            operation,
         })
     }
 
@@ -5019,15 +5176,48 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Stages the selected paths, including the deletion half of a rename the
     /// index still has.
+    ///
+    /// A conflicted path whose file still holds conflict markers is refused
+    /// with [`MutationFailure::ConflictMarkers`], and nothing is staged:
+    /// staging it is how Git is told the conflict is resolved, and the
+    /// markers would then be committed. See
+    /// [`Self::stage_with_conflict_markers`].
     pub fn stage(
         &self,
         request: &StageRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        self.stage_checked(request, true, cancellation)
+    }
+
+    /// [`Self::stage`] for a selection the user confirmed should be marked
+    /// resolved although its files still hold conflict markers.
+    pub fn stage_with_conflict_markers(
+        &self,
+        request: &StageRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        self.stage_checked(request, false, cancellation)
+    }
+
+    fn stage_checked(
+        &self,
+        request: &StageRequest,
+        refuse_markers: bool,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
         let worktree = &request.worktree;
+        if refuse_markers {
+            let paths = self.conflict_marker_paths(worktree, &request.selection, cancellation)?;
+            if !paths.is_empty() {
+                return Ok(MutationOutcome::NotApplied {
+                    failure: MutationFailure::ConflictMarkers { paths },
+                });
+            }
+        }
         let paths = self.matchable_pathspecs(worktree, &request.selection, cancellation)?;
         if paths.is_empty() {
             return Err(ValidationError::EmptySelection.into());
@@ -5691,6 +5881,309 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // `--git-path` answers relative to the working directory it ran
             // in, which is the worktree.
             .any(|path| worktree.join(path).exists()))
+    }
+
+    /// The merge, rebase, cherry-pick or revert this worktree stopped in, or
+    /// `None` when it is in none of them.
+    ///
+    /// One `rev-parse --git-path` locates every state file, since a linked
+    /// worktree keeps them in its own administrative directory, and the rest
+    /// is reading those few small files. A rebase is reported ahead of the
+    /// merge or pick it is replaying, because `--continue` and `--abort`
+    /// belong to the rebase. `git am`, which shares `rebase-apply`, is not
+    /// one of these operations and is reported as none.
+    pub fn in_progress_operation(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<InProgressOperation>, RepositoryError> {
+        let mut arguments = vec![OsString::from("rev-parse")];
+        for state in OPERATION_STATE_PATHS {
+            arguments.push(OsString::from("--git-path"));
+            arguments.push(OsString::from(state));
+        }
+        let command = self.git_read(worktree, arguments);
+        let output = self.run_checked(&command, cancellation)?;
+        let located: Vec<PathBuf> = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| worktree.join(bytes_to_path(line)))
+            .collect();
+        let [
+            merge_head,
+            cherry_pick_head,
+            revert_head,
+            rebase_merge,
+            rebase_apply,
+            sequencer,
+            merge_msg,
+        ] = located.as_slice()
+        else {
+            return Err(RepositoryError::InvalidOutput {
+                field: "git-path",
+                reason: format!(
+                    "expected {} paths, got {}",
+                    OPERATION_STATE_PATHS.len(),
+                    located.len()
+                ),
+            });
+        };
+        let read_line = |path: &Path| {
+            fs::read(path).ok().and_then(|bytes| {
+                let line = String::from_utf8_lossy(&bytes).trim().to_owned();
+                (!line.is_empty()).then_some(line)
+            })
+        };
+        let read_number = |path: &Path| read_line(path).and_then(|line| line.parse::<u32>().ok());
+        let short = |line: String| match line.get(..12) {
+            Some(prefix) if is_hex_oid(&line) => prefix.to_owned(),
+            _ => line,
+        };
+        let pending_commit =
+            merge_head.exists() || cherry_pick_head.exists() || revert_head.exists();
+
+        let rebase = if rebase_merge.is_dir() {
+            Some((
+                rebase_merge.join("msgnum"),
+                rebase_merge.join("end"),
+                rebase_merge,
+            ))
+        } else if rebase_apply.is_dir() && !rebase_apply.join("applying").exists() {
+            Some((
+                rebase_apply.join("next"),
+                rebase_apply.join("last"),
+                rebase_apply,
+            ))
+        } else {
+            None
+        };
+        let (kind, subject, progress) = if let Some((step, steps, directory)) = rebase {
+            let subject = read_line(&directory.join("head-name")).map(|name| {
+                name.strip_prefix("refs/heads/")
+                    .map_or_else(|| name.clone(), str::to_owned)
+            });
+            let progress = read_number(&step).zip(read_number(&steps));
+            (OperationKind::Rebase, subject, progress)
+        } else if merge_head.exists() {
+            (OperationKind::Merge, None, None)
+        } else if cherry_pick_head.exists() {
+            (
+                OperationKind::CherryPick,
+                read_line(cherry_pick_head).map(short),
+                None,
+            )
+        } else if revert_head.exists() {
+            (
+                OperationKind::Revert,
+                read_line(revert_head).map(short),
+                None,
+            )
+        } else if sequencer.is_dir() {
+            // Between two steps of a sequence: the last pick was committed
+            // and `--continue` applies the next. The to-do list says which
+            // command the sequence runs.
+            let next = fs::read(sequencer.join("todo")).unwrap_or_default();
+            let next = String::from_utf8_lossy(&next);
+            let Some(command) = next
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+            else {
+                return Ok(None);
+            };
+            let kind = match command.split_whitespace().next() {
+                Some("revert" | "r") => OperationKind::Revert,
+                _ => OperationKind::CherryPick,
+            };
+            (kind, None, None)
+        } else {
+            return Ok(None);
+        };
+
+        let pending_commit = pending_commit && kind != OperationKind::Rebase;
+        let message = if pending_commit {
+            self.merge_message(worktree, merge_msg, cancellation)?
+        } else {
+            None
+        };
+        Ok(Some(InProgressOperation {
+            kind,
+            pending_commit,
+            sequence: matches!(kind, OperationKind::CherryPick | OperationKind::Revert)
+                && sequencer.is_dir(),
+            subject,
+            progress,
+            message,
+        }))
+    }
+
+    /// `MERGE_MSG` as the commit it prepares would record it: Git's own
+    /// `stripspace` removes the conflict list and every other comment line,
+    /// honouring the repository's `core.commentChar`.
+    fn merge_message(
+        &self,
+        worktree: &Path,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, RepositoryError> {
+        let Ok(file) = fs::File::open(path) else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MERGE_MESSAGE_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MERGE_MESSAGE_LIMIT
+        {
+            return Ok(None);
+        }
+        let command = self
+            .git_read(worktree, ["stripspace", "--strip-comments"])
+            .stdin(bytes);
+        let output = self.run_checked(&command, cancellation)?;
+        let message = String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned();
+        Ok((!message.is_empty()).then_some(message))
+    }
+
+    /// The conflicted paths in `selection` whose working-tree file still
+    /// holds a conflict marker; see [`scan_conflict_markers`].
+    ///
+    /// Only an unmerged path is scanned. A resolved or ordinary file may
+    /// legitimately contain marker-like lines, such as a test fixture or this
+    /// very documentation, and staging it is not resolving a conflict.
+    pub fn conflict_marker_paths(
+        &self,
+        worktree: &Path,
+        selection: &[PathSelection],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RepoPath>, RepositoryError> {
+        // Unmerged entries are few even in a large index, so they are listed
+        // whole rather than matched against a long selection.
+        let command = self.git_literal_read(worktree, ["ls-files", "--unmerged", "-z"]);
+        let output = self.run_checked(&command, cancellation)?;
+        if output.stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        let unmerged: HashSet<&[u8]> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|record| record.splitn(2, |byte| *byte == b'\t').nth(1))
+            .collect();
+        let root = fs_safety::Root::open(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let mut marked = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in selection {
+            let path = &entry.path;
+            if !unmerged.contains(path.as_bytes()) || !seen.insert(path) {
+                continue;
+            }
+            // A conflict that deleted the file on one side may leave no
+            // file at all, and a symlink or directory holds no text.
+            let Ok(metadata) = fs_safety::metadata_beneath(&root, path.as_path()) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let mut file = fs_safety::open_beneath(&root, path.as_path())
+                .map_err(|error| ValidationError::Io(format!("{path}: {error}")))?;
+            if scan_conflict_markers(&mut file, cancellation)
+                .map_err(|error| ValidationError::Io(format!("{path}: {error}")))?
+            {
+                marked.push(path.clone());
+            }
+        }
+        Ok(marked)
+    }
+
+    /// Abandons the operation the worktree stopped in, restoring what it
+    /// held before the operation began. Resolutions already made are lost,
+    /// which is why the panel asks first.
+    ///
+    /// `expected` is the operation the user saw; a worktree that has since
+    /// moved on to a different one, or finished, is refused rather than
+    /// having whatever it is in now abandoned.
+    pub fn abort_operation(
+        &self,
+        worktree: &Path,
+        expected: OperationKind,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if let Some(refusal) = self.operation_refusal(worktree, expected, cancellation)? {
+            return Ok(refusal);
+        }
+        let command = self.git_mutation(worktree, [expected.command(), "--abort"]);
+        Ok(self.run_mutation(
+            &command,
+            Vec::new(),
+            MutationScope::AllOrNothing,
+            cancellation,
+        ))
+    }
+
+    /// Resumes the operation the worktree stopped in, once its conflicts are
+    /// resolved and staged: `git <operation> --continue`, which commits the
+    /// staged step with the message Git prepared and applies the rest.
+    ///
+    /// Git would otherwise open an editor on that message, and there is no
+    /// terminal to show it in, so the editor is one that accepts the message
+    /// unchanged. A message the user wrote is committed with
+    /// [`Self::commit`] instead, which a later `--continue` then follows.
+    pub fn continue_operation(
+        &self,
+        worktree: &Path,
+        expected: OperationKind,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if let Some(refusal) = self.operation_refusal(worktree, expected, cancellation)? {
+            return Ok(refusal);
+        }
+        let command = self
+            .git_mutation(worktree, [expected.command(), "--continue"])
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true");
+        Ok(self.run_mutation(
+            &command,
+            Vec::new(),
+            MutationScope::AllOrNothing,
+            cancellation,
+        ))
+    }
+
+    /// A refusal when the worktree is not in the `expected` operation.
+    fn operation_refusal(
+        &self,
+        worktree: &Path,
+        expected: OperationKind,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MutationOutcome>, RepositoryError> {
+        let current = self.in_progress_operation(worktree, cancellation)?;
+        if current
+            .as_ref()
+            .is_some_and(|current| current.kind == expected)
+        {
+            return Ok(None);
+        }
+        let reason = match current {
+            Some(current) => format!(
+                "the worktree is in a {} now, not a {}",
+                current.kind.noun(),
+                expected.noun()
+            ),
+            None => format!("there is no {} in progress", expected.noun()),
+        };
+        Ok(Some(MutationOutcome::NotApplied {
+            failure: MutationFailure::Rejected { reason },
+        }))
     }
 
     /// Commits the index, reconciling the outcome against HEAD.
@@ -7557,6 +8050,48 @@ mod tests {
     use super::*;
     use std::{ffi::OsStr, sync::Mutex};
 
+    /// Markers open and close a block at a line's start, in every style and
+    /// line ending Git writes; a setext heading's `=======` or a longer run
+    /// of `<` is not one, and a marker split across read chunks is still
+    /// found.
+    #[test]
+    fn conflict_marker_scan_finds_block_edges_only() {
+        let scan = |bytes: &[u8]| {
+            scan_conflict_markers(&mut io::Cursor::new(bytes), &CancellationToken::new()).unwrap()
+        };
+        assert!(scan(
+            b"a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> side\n"
+        ));
+        assert!(scan(b"<<<<<<< HEAD\r\nours\r\n"));
+        assert!(scan(b"x\n>>>>>>> side"));
+        assert!(scan(b"x\n<<<<<<<\n"));
+        assert!(scan(b"x\n>>>>>>>"));
+        assert!(!scan(b"Title\n=======\n"));
+        assert!(!scan(b"<<<<<<<< eight\n"));
+        assert!(!scan(b"  <<<<<<< indented\n"));
+        assert!(!scan(b"<<<<<<"));
+        assert!(!scan(b""));
+
+        // A reader that hands back one byte at a time splits every line.
+        struct Trickle<'a>(&'a [u8]);
+        impl Read for Trickle<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let Some((first, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                buffer[0] = *first;
+                self.0 = rest;
+                Ok(1)
+            }
+        }
+        let mut long = vec![b'x'; 100_000];
+        long.extend_from_slice(b"\n>>>>>>> side\n");
+        assert!(scan_conflict_markers(&mut Trickle(&long), &CancellationToken::new()).unwrap());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(scan_conflict_markers(&mut Trickle(&long), &cancelled).is_err());
+    }
+
     #[derive(Default)]
     struct FakeExecutor {
         commands: Mutex<Vec<CommandSpec>>,
@@ -7591,6 +8126,22 @@ mod tests {
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         })
+    }
+
+    /// `ls-files --unmerged` in a worktree with nothing unmerged, which
+    /// [`RepositoryService::stage`] reads before it stages anything.
+    fn no_conflicts() -> Result<ProcessOutput, ProcessFailure> {
+        success(b"")
+    }
+
+    /// The `rev-parse --git-path` locating operation state that a snapshot
+    /// reads last, for a worktree in no merge, rebase, cherry-pick or revert.
+    fn no_operation() -> Result<ProcessOutput, ProcessFailure> {
+        let mut paths = Vec::new();
+        for state in OPERATION_STATE_PATHS {
+            paths.extend_from_slice(format!(".git/{state}\n").as_bytes());
+        }
+        success(&paths)
     }
 
     mod file_inventory {
@@ -9863,6 +10414,7 @@ mod tests {
             local_refs: refs.local.clone(),
             remote_refs: refs.remote.clone(),
             remote_heads: refs.remote_heads.clone(),
+            operation: None,
         };
         assert_eq!(
             snapshot
@@ -10232,6 +10784,7 @@ mod tests {
 
         // The index no longer has the source: only HEAD does.
         let service = fake_service(vec![
+            no_conflicts(),
             success(b""),
             unset.clone(),
             success(b""),
@@ -10255,7 +10808,7 @@ mod tests {
         );
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(
-            commands[4].stdin.as_deref(),
+            commands[5].stdin.as_deref(),
             Some(b"new name.txt\0".as_slice())
         );
         drop(commands);
@@ -10263,6 +10816,7 @@ mod tests {
         // The index still has it, which is the unstaged rename this
         // application also has to stage as a pair.
         let service = fake_service(vec![
+            no_conflicts(),
             success(b"H old name.txt\0"),
             unset,
             success(b"H old name.txt\0"),
@@ -10319,6 +10873,7 @@ mod tests {
         };
         let files = listing(&[("100644", "a"), ("100644", "b"), ("100644", "dir")]);
         let service = fake_service(vec![
+            no_conflicts(),
             unset.clone(),
             index.clone(),
             files,
@@ -10330,26 +10885,32 @@ mod tests {
             MutationOutcome::Applied { .. }
         ));
         let commands = service.executor.commands.lock().unwrap();
-        assert!(commands[2].arguments.contains(&OsString::from("-s")));
+        assert!(commands[3].arguments.contains(&OsString::from("-s")));
         assert!(
-            commands[3]
+            commands[4]
                 .arguments
                 .contains(&OsString::from("--no-index"))
         );
         assert_eq!(
-            commands[3].stdin.as_deref(),
+            commands[4].stdin.as_deref(),
             Some(b"./dir/new\0./dir/sub/new\0".as_slice())
         );
         // Naming `b` again adds the gitlink after its file entry is removed.
         assert_eq!(
-            commands[4].stdin.as_deref(),
+            commands[5].stdin.as_deref(),
             Some(b"a\0b\0dir/new\0dir/sub/new\0b\0".as_slice())
         );
         drop(commands);
 
         // A gitlink at an enclosing directory is a submodule.
         let gitlink = listing(&[("100644", "a"), ("100644", "b"), ("160000", "dir/sub")]);
-        let service = fake_service(vec![unset.clone(), index.clone(), gitlink, exit(1, b"")]);
+        let service = fake_service(vec![
+            no_conflicts(),
+            unset.clone(),
+            index.clone(),
+            gitlink,
+            exit(1, b""),
+        ]);
         let MutationOutcome::NotApplied {
             failure: MutationFailure::Rejected { reason },
         } = service.stage(&selected, &cancel).unwrap()
@@ -10357,12 +10918,13 @@ mod tests {
             panic!("a path inside a submodule must not be staged");
         };
         assert_eq!(reason, "dir/sub/new: path is in submodule 'dir/sub'");
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 4);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 5);
 
         // An index too large to list leaves the checks to `git add`.
         let mut capped = launched_failure(b"");
         capped.kind = ProcessFailureKind::OutputLimit;
         let service = fake_service(vec![
+            no_conflicts(),
             unset.clone(),
             index.clone(),
             Err(capped),
@@ -10373,12 +10935,13 @@ mod tests {
             MutationOutcome::Applied { .. }
         ));
         let commands = service.executor.commands.lock().unwrap();
-        assert_eq!(commands.len(), 4);
-        assert!(commands[3].arguments.contains(&OsString::from("add")));
+        assert_eq!(commands.len(), 5);
+        assert!(commands[4].arguments.contains(&OsString::from("add")));
         drop(commands);
 
         // Only an untracked path inside a directory needs the index listing.
         let service = fake_service(vec![
+            no_conflicts(),
             unset.clone(),
             success(b""),
             exit(1, b""),
@@ -10389,11 +10952,16 @@ mod tests {
             service.stage(&request(&["top"]), &cancel).unwrap(),
             MutationOutcome::Applied { .. }
         ));
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 4);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 5);
 
         // An untracked path that no longer exists is refused before Git
         // checks ignores or writes anything.
-        let service = fake_service(vec![unset.clone(), success(b""), listing(&[])]);
+        let service = fake_service(vec![
+            no_conflicts(),
+            unset.clone(),
+            success(b""),
+            listing(&[]),
+        ]);
         let MutationOutcome::NotApplied {
             failure: MutationFailure::Rejected { reason },
         } = service
@@ -10403,17 +10971,17 @@ mod tests {
             panic!("a ghost must not be reported staged");
         };
         assert_eq!(reason, "gone: path does not match anything known to git");
-        assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 4);
 
         // A sparse checkout keeps `git add`, which refuses paths outside it.
-        let service = fake_service(vec![success(b"true\n"), success(b"")]);
+        let service = fake_service(vec![no_conflicts(), success(b"true\n"), success(b"")]);
         assert!(matches!(
             service.stage(&selected, &cancel).unwrap(),
             MutationOutcome::Applied { .. }
         ));
         let commands = service.executor.commands.lock().unwrap();
-        assert_eq!(commands.len(), 2);
-        assert!(commands[1].arguments.contains(&OsString::from("add")));
+        assert_eq!(commands.len(), 3);
+        assert!(commands[2].arguments.contains(&OsString::from("add")));
     }
 
     /// `core.fsmonitor` set to a non-boolean value names a program Git runs
@@ -10552,6 +11120,7 @@ mod tests {
     #[test]
     fn stage_that_never_started_is_definitively_not_applied() {
         let service = fake_service(vec![
+            no_conflicts(),
             exit(1, b""),
             success(b"H a.txt\0"),
             Err(unstarted_failure()),
@@ -10568,6 +11137,7 @@ mod tests {
         assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
 
         let service = fake_service(vec![
+            no_conflicts(),
             exit(1, b""),
             success(b"H a.txt\0"),
             Err(launched_failure(b"")),
@@ -12367,6 +12937,7 @@ mod tests {
             // No remotes configured.
             exit(1, b""),
             success(&refs),
+            no_operation(),
         ]);
         let snapshot = service
             .snapshot(worktree.path(), &CancellationToken::new())
@@ -12491,6 +13062,7 @@ mod tests {
             // No remotes configured.
             exit(1, b""),
             success(b""),
+            no_operation(),
         ]);
         let snapshot = service
             .snapshot(Path::new("/repo"), &CancellationToken::new())

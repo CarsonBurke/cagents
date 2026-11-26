@@ -414,6 +414,19 @@ fn open(question: Question) -> Opened {
                 sidebar::discard_confirm_id(),
             )
         }
+        Question::ConfirmGitCommand => {
+            let mut app = tests::context_inspector_test_app(false);
+            let opening = app.update(Message::Sidebar(SidebarAction::RequestAbortOperation {
+                key: tests::discard_key(),
+                kind: crate::repository::OperationKind::Merge,
+            }));
+            opened(
+                app,
+                opening,
+                sidebar::git_confirmation_cancel_id(),
+                sidebar::git_confirmation_confirm_id(),
+            )
+        }
         Question::DeleteSidebarSelection => {
             let (mut app, _, channels) = sidebar_selection_ui::tests::fixture();
             sidebar_selection_ui::tests::select(&mut app, &channels[..2]);

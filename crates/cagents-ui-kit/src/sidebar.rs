@@ -31,10 +31,11 @@ use crate::{
     model::{CardId, ChannelId, ProjectId, ProjectKind, ProjectState, WorktreeId},
     repository::{
         BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
-        ConflictKind, DiffBasis, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid,
-        PathSelection, PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo,
-        RepositorySnapshot, StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName,
-        WorktreeRecord, build_file_tree, build_file_tree_with_directories,
+        ConflictKind, DiffBasis, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState,
+        InProgressOperation, Oid, OperationKind, PathSelection, PushTarget, RemoteRecord, RepoPath,
+        RepositoryId, RepositoryInfo, RepositorySnapshot, StatusSnapshot, TrackingState,
+        ValidatedBranchName, ValidatedRefName, WorktreeRecord, build_file_tree,
+        build_file_tree_with_directories,
     },
     splitter::{Edge as SplitterEdge, Splitter},
     ui_controls::Icon,
@@ -1771,6 +1772,10 @@ pub enum MutationKind {
     Discard,
     Commit,
     Push,
+    /// Abandoning a merge, rebase, cherry-pick or revert.
+    Abort,
+    /// Resuming a rebase, cherry-pick or revert sequence.
+    Continue,
 }
 
 impl MutationKind {
@@ -1781,6 +1786,52 @@ impl MutationKind {
             Self::Discard => "Discarding…",
             Self::Commit => "Committing…",
             Self::Push => "Pushing…",
+            Self::Abort => "Aborting…",
+            Self::Continue => "Continuing…",
+        }
+    }
+}
+
+/// A Git command in the Changes panel the user has been asked to confirm.
+///
+/// Built once, when the intent is raised, so what the dialog describes is
+/// exactly what its confirmation runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitConfirmation {
+    /// Marking conflicted paths resolved although their files still hold
+    /// conflict markers, which a commit would then record.
+    StageConflictMarkers {
+        key: ActiveWorktreeKey,
+        selection: Vec<PathSelection>,
+        paths: Vec<RepoPath>,
+    },
+    /// Abandoning the operation and every resolution made in it.
+    AbortOperation {
+        key: ActiveWorktreeKey,
+        kind: OperationKind,
+    },
+}
+
+impl GitConfirmation {
+    pub fn key(&self) -> &ActiveWorktreeKey {
+        match self {
+            Self::StageConflictMarkers { key, .. } | Self::AbortOperation { key, .. } => key,
+        }
+    }
+
+    /// The one action that runs the confirmed command.
+    pub fn confirm_action(&self) -> SidebarAction {
+        match self {
+            Self::StageConflictMarkers { key, selection, .. } => {
+                SidebarAction::ConfirmStageConflictMarkers {
+                    key: key.clone(),
+                    selection: selection.clone(),
+                }
+            }
+            Self::AbortOperation { key, kind } => SidebarAction::ConfirmAbortOperation {
+                key: key.clone(),
+                kind: *kind,
+            },
         }
     }
 }
@@ -1949,7 +2000,13 @@ impl ChangeRow {
                 format!("{status} {label}, {counts}")
             }
             .into_boxed_str(),
-            stage_name: format!("Stage {label}").into_boxed_str(),
+            // Staging a conflicted path is how Git is told it is resolved.
+            stage_name: if entry.area == ChangeArea::Conflict {
+                format!("Mark {label} resolved")
+            } else {
+                format!("Stage {label}")
+            }
+            .into_boxed_str(),
             unstage_name: format!("Unstage {label}").into_boxed_str(),
             discard_name: format!("Discard {label}").into_boxed_str(),
             label: label.into_boxed_str(),
@@ -2266,6 +2323,8 @@ pub struct SourceControlModel {
     /// The most recent mutation failure, retained until the next attempt.
     pub error: Option<String>,
     pub staged_count: usize,
+    /// The merge, rebase, cherry-pick or revert the worktree stopped in.
+    pub operation: Option<InProgressOperation>,
     pub files: Vec<FileRow>,
     ignored_directory_errors: BTreeMap<RepoPath, String>,
     groups: Vec<ChangeGroup>,
@@ -2418,6 +2477,7 @@ impl SourceControlModel {
             mutation: None,
             error: None,
             staged_count: 0,
+            operation: None,
             files: Vec::new(),
             ignored_directory_errors: BTreeMap::new(),
             groups: Vec::new(),
@@ -2539,6 +2599,7 @@ impl SourceControlModel {
             mutation: None,
             error: None,
             staged_count,
+            operation: snapshot.operation.clone(),
             files,
             ignored_directory_errors: snapshot.files.ignored_directory_errors.clone(),
             groups,
@@ -2766,9 +2827,33 @@ impl SourceControlModel {
         self.mutation.is_some()
     }
 
-    /// Commit needs a message, something staged, and no mutation in flight.
+    /// Commit needs a message, something to commit, and no mutation in
+    /// flight.
     pub fn can_commit(&self, message: &str) -> bool {
-        !message.trim().is_empty() && self.staged_count > 0 && !self.busy()
+        !message.trim().is_empty() && self.has_commit_content() && !self.busy()
+    }
+
+    /// Whether a commit would record anything Git accepts: staged changes,
+    /// or a merge, cherry-pick or revert whose conflicts are all resolved.
+    /// Resolving every conflict in favour of ours leaves nothing staged, and
+    /// the commit that concludes the merge is still required; Git creates it.
+    /// Git refuses any commit while a path is still conflicted.
+    pub fn has_commit_content(&self) -> bool {
+        self.conflict_count() == 0 && (self.staged_count > 0 || self.concludes_operation())
+    }
+
+    /// Whether a commit now concludes the operation's current step.
+    pub fn concludes_operation(&self) -> bool {
+        self.operation
+            .as_ref()
+            .is_some_and(|operation| operation.pending_commit)
+            && self.conflict_count() == 0
+    }
+
+    /// How many paths are still conflicted.
+    pub fn conflict_count(&self) -> usize {
+        self.group(ChangeArea::Conflict)
+            .map_or(0, |group| group.rows.len())
     }
 
     /// Push needs a non-detached branch that is actually ahead of an upstream.
@@ -3198,6 +3283,10 @@ struct CommitDraft {
     composer: CommitComposer,
     amend: bool,
     revision: u64,
+    /// The message Git prepared for the operation in progress, once this
+    /// draft adopted it, with the revision it was adopted at. A draft still
+    /// at that revision is Git's text rather than the user's.
+    adopted: Option<(String, u64)>,
 }
 
 /// The exact ordered roots the projection owns, borrowed on a cache hit.
@@ -3343,6 +3432,7 @@ pub struct SidebarState {
     files_page: usize,
     publish: Option<PublishDraft>,
     discard: Option<DiscardConfirmation>,
+    git_confirmation: Option<GitConfirmation>,
     panel_selection: Option<PanelSelection>,
 }
 
@@ -4632,6 +4722,12 @@ impl SidebarState {
         self.discard.as_ref()
     }
 
+    /// The Git command awaiting confirmation, which the application mounts
+    /// with [`git_confirmation_dialog`].
+    pub fn pending_git_confirmation(&self) -> Option<&GitConfirmation> {
+        self.git_confirmation.as_ref()
+    }
+
     pub fn publish_draft(&self) -> Option<&PublishDraft> {
         self.publish.as_ref()
     }
@@ -4678,6 +4774,61 @@ impl SidebarState {
     fn revise_commit_draft(&mut self) {
         self.commit_generation = self.commit_generation.wrapping_add(1);
         self.commit_draft.revision = self.commit_generation;
+    }
+
+    /// Replaces the draft with `message`: its first line the subject, the
+    /// rest the description.
+    fn fill_commit_draft(&mut self, message: &str) {
+        self.revise_commit_draft();
+        message.clone_into(&mut self.commit_draft.message);
+        let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
+        self.commit_draft.subject = subject.to_owned();
+        self.commit_draft.subject_composer = CommitComposer(
+            cosmic::iced::widget::text_editor::Content::with_text(subject),
+        );
+        self.commit_draft.composer =
+            CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
+                description.trim_start_matches('\n'),
+            ));
+    }
+
+    /// Fills an empty commit draft with the message Git prepared for the
+    /// merge, cherry-pick or revert in progress, which is the message
+    /// `git commit` would have opened its editor on. Called once a read of
+    /// the bound worktree is in.
+    ///
+    /// The message is adopted once per operation: a draft the user emptied
+    /// stays empty. A draft still holding exactly the adopted text is
+    /// cleared when the operation ends without it, by an abort or outside
+    /// this application, so a finished merge's message is not left behind
+    /// for an unrelated commit.
+    pub fn adopt_operation_message(&mut self, source: &SourceControlModel) {
+        if !matches!(source.data_state, SidebarDataState::Ready)
+            || self.active_worktree.as_ref() != Some(&source.key)
+        {
+            return;
+        }
+        let prepared = source
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.message.as_deref());
+        let draft = &self.commit_draft;
+        let adopted = draft.adopted.as_ref();
+        let untouched = adopted.is_some_and(|(_, revision)| *revision == draft.revision);
+        if untouched && adopted.map(|(message, _)| message.as_str()) != prepared {
+            self.commit_draft = CommitDraft::default();
+        }
+        let draft = &self.commit_draft;
+        let Some(prepared) = prepared else {
+            return;
+        };
+        if draft.message.is_empty()
+            && !draft.amend
+            && draft.adopted.as_ref().map(|(message, _)| message.as_str()) != Some(prepared)
+        {
+            self.fill_commit_draft(prepared);
+            self.commit_draft.adopted = Some((prepared.to_owned(), self.commit_draft.revision));
+        }
     }
 
     /// Rebinds the source-control panel after a focus or model change.
@@ -4792,7 +4943,9 @@ impl SidebarState {
             return;
         }
         self.changes_tab_settled = true;
-        self.changes_tab = if source.has_uncommitted_changes() {
+        // An operation in progress is shown in Changes, even one whose
+        // resolution left nothing to list.
+        self.changes_tab = if source.has_uncommitted_changes() || source.operation.is_some() {
             ChangesTab::Changes
         } else {
             ChangesTab::Branch
@@ -4944,17 +5097,7 @@ impl SidebarState {
                 });
             }
             SidebarAction::CommitMessageChanged { message, .. } => {
-                self.revise_commit_draft();
-                self.commit_draft.message.clone_from(message);
-                let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
-                self.commit_draft.subject = subject.to_owned();
-                self.commit_draft.subject_composer = CommitComposer(
-                    cosmic::iced::widget::text_editor::Content::with_text(subject),
-                );
-                self.commit_draft.composer =
-                    CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
-                        description.trim_start_matches('\n'),
-                    ));
+                self.fill_commit_draft(message);
             }
             SidebarAction::CommitSubjectEditorCursor { cursor, .. } => {
                 self.commit_draft.subject_composer.0.move_to(*cursor);
@@ -5009,6 +5152,28 @@ impl SidebarState {
             SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard => {
                 self.discard = None;
             }
+            SidebarAction::RequestStageConflictMarkers {
+                key,
+                selection,
+                paths,
+            } => {
+                self.git_confirmation = Some(GitConfirmation::StageConflictMarkers {
+                    key: key.clone(),
+                    selection: selection.clone(),
+                    paths: paths.clone(),
+                });
+            }
+            SidebarAction::RequestAbortOperation { key, kind } => {
+                self.git_confirmation = Some(GitConfirmation::AbortOperation {
+                    key: key.clone(),
+                    kind: *kind,
+                });
+            }
+            SidebarAction::ConfirmStageConflictMarkers { .. }
+            | SidebarAction::ConfirmAbortOperation { .. }
+            | SidebarAction::CancelGitConfirmation => {
+                self.git_confirmation = None;
+            }
             SidebarAction::OpenPublish {
                 key,
                 branch,
@@ -5056,6 +5221,7 @@ impl SidebarState {
             | SidebarAction::OpenAutomations
             | SidebarAction::OpenWork
             | SidebarAction::Stage { .. }
+            | SidebarAction::ContinueOperation { .. }
             | SidebarAction::ChangeGroup { .. }
             | SidebarAction::Unstage { .. }
             | SidebarAction::Commit { .. }
@@ -5356,6 +5522,35 @@ pub enum SidebarAction {
         request: DiscardRequest,
     },
     CancelDiscard,
+    /// Raises the confirmation for staging conflicted paths whose files still
+    /// hold conflict markers. The application raises it when Git's stage was
+    /// refused for exactly that reason.
+    RequestStageConflictMarkers {
+        key: ActiveWorktreeKey,
+        selection: Vec<PathSelection>,
+        paths: Vec<RepoPath>,
+    },
+    /// Stages the confirmed selection, conflict markers and all.
+    ConfirmStageConflictMarkers {
+        key: ActiveWorktreeKey,
+        selection: Vec<PathSelection>,
+    },
+    /// Raises the confirmation for abandoning the operation in progress.
+    RequestAbortOperation {
+        key: ActiveWorktreeKey,
+        kind: OperationKind,
+    },
+    ConfirmAbortOperation {
+        key: ActiveWorktreeKey,
+        kind: OperationKind,
+    },
+    /// Dismisses whichever [`GitConfirmation`] is showing.
+    CancelGitConfirmation,
+    /// Resumes the rebase, cherry-pick or revert sequence in progress.
+    ContinueOperation {
+        key: ActiveWorktreeKey,
+        kind: OperationKind,
+    },
     CommitMessageChanged {
         key: ActiveWorktreeKey,
         message: String,
@@ -11307,12 +11502,126 @@ fn list_mode_toggle<'a>(
         .into()
 }
 
+/// The merge, rebase, cherry-pick or revert the worktree stopped in: what it
+/// is, what is left to do, and how to finish or abandon it.
+///
+/// A step that a commit concludes offers no Continue of its own, because
+/// the commit box beneath is that action, already filled with the message
+/// Git prepared; two controls for one commit would read as two different
+/// things.
+fn operation_banner<'a>(
+    source: &'a SourceControlModel,
+    operation: &'a InProgressOperation,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    let key = &source.key;
+    let subject = operation.subject.as_deref();
+    let mut title = match (operation.kind, subject) {
+        (OperationKind::Merge, _) => "Merge in progress".to_owned(),
+        (OperationKind::Rebase, Some(subject)) => format!("Rebasing {subject}"),
+        (OperationKind::Rebase, None) => "Rebase in progress".to_owned(),
+        (OperationKind::CherryPick, Some(subject)) => format!("Cherry-picking {subject}"),
+        (OperationKind::CherryPick, None) => "Cherry-pick in progress".to_owned(),
+        (OperationKind::Revert, Some(subject)) => format!("Reverting {subject}"),
+        (OperationKind::Revert, None) => "Revert in progress".to_owned(),
+    };
+    if let Some((step, steps)) = operation.progress {
+        title.push_str(&format!(" · step {step} of {steps}"));
+    }
+    let conflicts = source.conflict_count();
+    let noun = operation.kind.noun();
+    let continues = !operation.pending_commit;
+    let status = if conflicts > 0 {
+        format!(
+            "Resolve {conflicts} conflicted {}, then mark {} resolved.",
+            if conflicts == 1 { "file" } else { "files" },
+            if conflicts == 1 { "it" } else { "each" },
+        )
+    } else if operation.pending_commit && operation.sequence {
+        "Commit this step, then continue with the next.".to_owned()
+    } else if operation.pending_commit {
+        format!("Commit to conclude the {noun}.")
+    } else if operation.kind == OperationKind::Rebase {
+        "Continue to commit this step and replay the rest.".to_owned()
+    } else {
+        format!("Continue to apply the rest of the {noun}.")
+    };
+    let gate = modal_open || source.busy();
+    let abort = crate::ui_controls::button::secondary("Abort")
+        .name(format!("Abort the {noun}"))
+        .on_press_maybe(gated(
+            SidebarAction::RequestAbortOperation {
+                key: key.clone(),
+                kind: operation.kind,
+            },
+            gate,
+        ));
+    let mut actions = widget::row::with_capacity(3)
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .push(widget::Space::new().width(Length::Fill))
+        .push(abort);
+    if continues {
+        actions = actions.push(
+            crate::ui_controls::button::primary("Continue")
+                .name(format!("Continue the {noun}"))
+                .on_press_maybe(gated(
+                    SidebarAction::ContinueOperation {
+                        key: key.clone(),
+                        kind: operation.kind,
+                    },
+                    gate || conflicts > 0,
+                )),
+        );
+    }
+    widget::container(
+        widget::column::with_children(vec![
+            widget::row::with_children(vec![
+                widget::icon(Icon::Warning.handle()).size(16).into(),
+                design::body(title)
+                    .font(design::title_font())
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .into(),
+            design::caption(status)
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+            actions.into(),
+        ])
+        .spacing(space::XS),
+    )
+    .padding(Padding::from([space::S, space::S]))
+    .width(Length::Fill)
+    .class(theme::Container::custom(|theme| {
+        cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(design::raised(theme))),
+            border: cosmic::iced::Border {
+                radius: design::RADIUS_S.into(),
+                width: 1.0,
+                color: design::warning_color(theme),
+            },
+            icon_color: Some(design::warning_color(theme)),
+            ..Default::default()
+        }
+    }))
+    .into()
+}
+
 fn changes_section<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let mut column = widget::column::with_capacity(source.groups().len() + 1).spacing(space::XS);
+    let mut column = widget::column::with_capacity(source.groups().len() + 2)
+        .spacing(space::XS)
+        // A slot, so the banner coming and going moves no row's state.
+        .push(slot(source.operation.as_ref().map(|operation| {
+            operation_banner(source, operation, modal_open)
+        })));
     if source.groups().iter().all(ChangeGroup::is_empty) {
         column = column.push(design::caption(
             if state.section_expanded(PanelSection::Untracked) {
@@ -12046,6 +12355,7 @@ fn commit_description_style(
 /// last change it was written for.
 fn offers_commit(state: &SidebarState, source: &SourceControlModel) -> bool {
     source.has_uncommitted_changes()
+        || source.concludes_operation()
         || state.commit_draft.amend
         || !state.commit_message().trim().is_empty()
 }
@@ -12137,7 +12447,11 @@ fn changes_footer<'a>(
     let can_commit = !modal_open
         && !source.busy()
         && !state.commit_draft.subject.trim().is_empty()
-        && (source.staged_count > 0 || (state.commit_draft.amend && source.head_oid.is_some()));
+        && (if state.commit_draft.amend {
+            source.head_oid.is_some() && source.conflict_count() == 0
+        } else {
+            source.has_commit_content()
+        });
     let commit_action = SidebarAction::Commit {
         key: key.clone(),
         message: message.to_owned(),
@@ -12252,8 +12566,16 @@ fn changes_footer<'a>(
         "Enter a commit summary"
     } else if source.busy() {
         "Git operation in progress"
-    } else if source.staged_count == 0 && !state.commit_draft.amend {
+    } else if source.conflict_count() > 0 {
+        "Resolve conflicts to commit"
+    } else if !source.has_commit_content() && !state.commit_draft.amend {
         "Stage changes to commit"
+    } else if !state.commit_draft.amend && source.concludes_operation() {
+        match source.operation.as_ref().map(|operation| operation.kind) {
+            Some(OperationKind::CherryPick) => "Commit to conclude the cherry-pick",
+            Some(OperationKind::Revert) => "Commit to conclude the revert",
+            _ => "Commit to conclude the merge",
+        }
     } else if !can_commit && state.commit_draft.amend && source.head_oid.is_none() {
         "No commit to amend"
     } else {
@@ -12689,6 +13011,87 @@ pub fn discard_confirmation_dialog(
         ),
         520.0,
     )
+}
+
+/// The confirmation the application mounts before a [`GitConfirmation`] runs,
+/// on the same terms as [`discard_confirmation_dialog`].
+pub fn git_confirmation_dialog(
+    pending: &GitConfirmation,
+    surface_id: Id,
+) -> Element<'_, SidebarAction> {
+    let (title, body, consequence, confirm): (String, String, &str, &str) = match pending {
+        GitConfirmation::StageConflictMarkers { paths, .. } => {
+            let named = match paths.as_slice() {
+                [path] => path.display().into_owned(),
+                paths => format!("{} files", paths.len()),
+            };
+            (
+                format!("Mark {named} resolved?"),
+                if paths.len() == 1 {
+                    format!("{named} still contains conflict markers (<<<<<<< and >>>>>>>).")
+                } else {
+                    let list = paths
+                        .iter()
+                        .take(5)
+                        .map(|path| path.display().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let more = paths.len().saturating_sub(5);
+                    let more = if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    };
+                    format!("{list}{more} still contain conflict markers (<<<<<<< and >>>>>>>).")
+                },
+                "Marking them resolved stages the markers, and the next commit records them.",
+                "Mark resolved",
+            )
+        }
+        GitConfirmation::AbortOperation { kind, .. } => {
+            let noun = kind.noun();
+            (
+                format!("Abort the {noun}?"),
+                format!(
+                    "The worktree returns to where it was before the {noun} began. \
+                     Conflicts you resolved and changes you staged for it are lost."
+                ),
+                "This can't be undone from Git.",
+                "Abort",
+            )
+        }
+    };
+    crate::dialog_ui::confirmation_surface(
+        surface_id,
+        widget::column::with_children(vec![
+            design::title(title).into(),
+            design::body(body)
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+            design::caption(consequence)
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+        ])
+        .spacing(space::M),
+        crate::dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary("Cancel")
+                .id(git_confirmation_cancel_id())
+                .on_press(SidebarAction::CancelGitConfirmation),
+            crate::ui_controls::button::destructive(confirm)
+                .id(git_confirmation_confirm_id())
+                .on_press(pending.confirm_action()),
+        ),
+        520.0,
+    )
+}
+
+/// The two answers of [`git_confirmation_dialog`].
+pub fn git_confirmation_cancel_id() -> Id {
+    stable_id("git-confirmation.cancel")
+}
+
+pub fn git_confirmation_confirm_id() -> Id {
+    stable_id("git-confirmation.confirm")
 }
 
 /// The discard confirmation's two answers. Named here because the dialog is

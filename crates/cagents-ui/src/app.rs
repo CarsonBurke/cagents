@@ -165,9 +165,9 @@ use crate::{
     repository::{
         CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
         CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
-        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
-        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome,
-        WorktreeRecord,
+        PathSelection, PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo,
+        RepositoryService, RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest,
+        WorktreeCreationOutcome, WorktreeRecord,
     },
     repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
     session::{
@@ -3172,7 +3172,11 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
 fn answers_discard_confirmation(action: &SidebarAction) -> bool {
     matches!(
         action,
-        SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
+        SidebarAction::ConfirmDiscard { .. }
+            | SidebarAction::CancelDiscard
+            | SidebarAction::ConfirmStageConflictMarkers { .. }
+            | SidebarAction::ConfirmAbortOperation { .. }
+            | SidebarAction::CancelGitConfirmation
     )
 }
 
@@ -5037,6 +5041,15 @@ pub enum Message {
         /// A commit that succeeded clears the message input; one that did not
         /// must keep it, because the text is the user's work.
         committed: bool,
+    },
+    /// A stage Git was not asked to run, because conflicted paths in it still
+    /// hold conflict markers. The mutation ends as if it reported nothing,
+    /// and the user is asked whether to mark them resolved regardless.
+    StageNeedsConfirmation {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        selection: Vec<PathSelection>,
+        paths: Vec<RepoPath>,
     },
     NewTerminal,
     TerminalFailure(terminal_failure::Action),
@@ -11162,6 +11175,12 @@ impl Cagents {
                     Projection::Full,
                 );
             }
+            if self.sidebar_state.pending_git_confirmation().is_some() {
+                return (
+                    self.dispatch(Message::Sidebar(SidebarAction::CancelGitConfirmation)),
+                    Projection::Full,
+                );
+            }
             if self.project_ui.modal_open() {
                 return (
                     self.handle_project_action(project_ui::Action::Dismiss),
@@ -14920,6 +14939,51 @@ impl Cagents {
         Some(id)
     }
 
+    /// A stage, which Git refuses for a conflicted path still holding
+    /// conflict markers. That refusal becomes a question rather than a
+    /// failure report; see [`Message::StageNeedsConfirmation`].
+    fn stage_task(
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        selection: Vec<PathSelection>,
+    ) -> Task<Message> {
+        cosmic::task::future(async move {
+            let request = StageRequest {
+                worktree: key.canonical_path.clone(),
+                selection,
+            };
+            let joined = tokio::task::spawn_blocking(move || {
+                let service = RepositoryService::system("git");
+                let outcome = service.stage(&request, &CancellationToken::default());
+                (request.selection, outcome)
+            })
+            .await;
+            let report = match joined {
+                Ok((
+                    selection,
+                    Ok(MutationOutcome::NotApplied {
+                        failure: crate::repository::MutationFailure::ConflictMarkers { paths },
+                    }),
+                )) => {
+                    return Message::StageNeedsConfirmation {
+                        key,
+                        operation,
+                        selection,
+                        paths,
+                    };
+                }
+                Ok((_, outcome)) => mutation_report("Stage", outcome),
+                Err(error) => Some(format!("Git worker failed: {error}")),
+            };
+            Message::SourceControlMutated {
+                key,
+                operation,
+                report,
+                committed: false,
+            }
+        })
+    }
+
     /// The task one finished mutation turns into: report what Git did, then
     /// re-read the worktree, because the index is the only authority on what
     /// the mutation left behind.
@@ -15263,6 +15327,7 @@ impl Cagents {
             // destroy work becomes the one dialog the pane keeps its commands
             // live behind.
             || self.sidebar_state.pending_discard().is_some()
+            || self.sidebar_state.pending_git_confirmation().is_some()
     }
 
     fn open_sidebar_navigation_row(&mut self, row: sidebar::SelectionRow) -> Task<Message> {
@@ -15780,6 +15845,11 @@ impl Cagents {
                 dialog_ui::Question::DiscardChanges
                     .initial_focus(sidebar::discard_cancel_id(), sidebar::discard_confirm_id()),
             )
+        } else if self.sidebar_state.pending_git_confirmation().is_some() {
+            Some(dialog_ui::Question::ConfirmGitCommand.initial_focus(
+                sidebar::git_confirmation_cancel_id(),
+                sidebar::git_confirmation_confirm_id(),
+            ))
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
         } else if self.channel_ui.modal_open() {
@@ -17497,6 +17567,17 @@ impl Application for Cagents {
                 )
                 .map(Message::Sidebar),
                 Some(Message::Sidebar(SidebarAction::CancelDiscard)),
+                1.0,
+            ));
+        }
+        if let Some(pending) = self.sidebar_state.pending_git_confirmation() {
+            return Some(dialog_ui::overlay(
+                sidebar::git_confirmation_dialog(
+                    pending,
+                    dialog_ui::Question::ConfirmGitCommand.surface_id(),
+                )
+                .map(Message::Sidebar),
+                Some(Message::Sidebar(SidebarAction::CancelGitConfirmation)),
                 1.0,
             ));
         }
@@ -20524,6 +20605,25 @@ impl Cagents {
                 report,
                 committed,
             } => handled!(self.source_control_mutated(key, operation, report, committed)),
+            Message::StageNeedsConfirmation {
+                key,
+                operation,
+                selection,
+                paths,
+            } => {
+                // A stale answer, for a mutation the panel has moved on
+                // from, asks nothing.
+                let settled =
+                    handled!(self.source_control_mutated(key.clone(), operation, None, false));
+                let ask = self.dispatch(Message::Sidebar(
+                    SidebarAction::RequestStageConflictMarkers {
+                        key,
+                        selection,
+                        paths,
+                    },
+                ));
+                Task::batch([settled, ask])
+            }
         };
         self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });
         task

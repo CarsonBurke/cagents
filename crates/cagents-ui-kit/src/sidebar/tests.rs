@@ -11953,6 +11953,7 @@ fn branch_only_changes_keep_historical_paths_and_accent() {
             local_refs: Vec::new(),
             remote_refs: Vec::new(),
             remote_heads: Vec::new(),
+            operation: None,
         },
     );
     assert!(!source.has_changes());
@@ -13363,7 +13364,16 @@ fn an_unpushable_branch_says_why() {
 #[test]
 fn committing_is_offered_only_by_the_working_tree_view() {
     let renderer = headless_renderer();
-    let model = panel_model();
+    // Git refuses a commit while any path is unmerged, so the fixture's
+    // conflict would hide Commit from every view.
+    let mut resolved = snapshot();
+    resolved
+        .status
+        .entries
+        .retain(|entry| entry.area != ChangeArea::Conflict);
+    resolved.status.dirty.conflicted = 0;
+    let model =
+        panel_model().with_source_control(Some(SourceControlModel::ready(main_key(), &resolved)));
     let mut state = panel_state(&model);
     state.apply(&SidebarAction::CommitMessageChanged {
         key: main_key(),
@@ -13634,4 +13644,195 @@ fn untracked_starts_expanded_and_history_reloads_when_head_moves() {
         "failure requires explicit retry, not an automatic loop"
     );
     assert!(previous.can_load_history());
+}
+
+fn merge_in_progress(message: Option<&str>) -> crate::repository::InProgressOperation {
+    crate::repository::InProgressOperation {
+        kind: OperationKind::Merge,
+        pending_commit: true,
+        sequence: false,
+        subject: None,
+        progress: None,
+        message: message.map(str::to_owned),
+    }
+}
+
+/// A panel bound to `main`, built from `snapshot`.
+fn operation_panel(snapshot: &RepositorySnapshot) -> (SidebarModel, SidebarState) {
+    let source = SourceControlModel::ready(main_key(), snapshot);
+    let model = panel_model().with_source_control(Some(source));
+    let mut state = panel_state(&model);
+    state.changes_tab = ChangesTab::Changes;
+    (model, state)
+}
+
+/// Resolving every conflict in favour of ours leaves nothing staged, and the
+/// merge commit is still required. The panel used to keep Commit disabled
+/// until something was staged, so such a merge could not be finished here.
+#[test]
+fn an_all_ours_merge_is_committed_with_nothing_staged() {
+    let mut snapshot = snapshot();
+    snapshot.status.entries.clear();
+    snapshot.operation = Some(merge_in_progress(Some("Merge branch 'side'")));
+    let (model, mut state) = operation_panel(&snapshot);
+    let source = model.source_control.as_ref().unwrap();
+    assert_eq!(source.staged_count, 0);
+    assert!(source.concludes_operation());
+    assert!(source.can_commit("Merge branch 'side'"));
+
+    state.adopt_operation_message(source);
+    assert_eq!(state.commit_message(), "Merge branch 'side'");
+    let actions = frame_enter_presses(
+        &headless_renderer(),
+        git_panel(&model, &state, 380.0, false),
+    );
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            SidebarAction::Commit { message, amend: false, .. } if message == "Merge branch 'side'"
+        )),
+        "{actions:?}"
+    );
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        SidebarAction::RequestAbortOperation {
+            kind: OperationKind::Merge,
+            ..
+        }
+    )));
+    // The commit concludes the merge, so the banner offers no second
+    // control for the same commit.
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, SidebarAction::ContinueOperation { .. }))
+    );
+
+    // Without a merge in progress the same empty index has nothing to commit.
+    snapshot.operation = None;
+    let source = SourceControlModel::ready(main_key(), &snapshot);
+    assert!(!source.can_commit("anything"));
+}
+
+/// Git refuses any commit while a path is unmerged, so Commit, and a
+/// rebase's Continue, wait until the last conflict is marked resolved.
+#[test]
+fn committing_and_continuing_wait_for_every_conflict() {
+    let mut snapshot = snapshot();
+    snapshot.operation = Some(merge_in_progress(None));
+    let source = SourceControlModel::ready(main_key(), &snapshot);
+    assert_eq!(source.conflict_count(), 1);
+    assert!(source.staged_count > 0);
+    assert!(!source.can_commit("message"));
+
+    snapshot.operation = Some(crate::repository::InProgressOperation {
+        kind: OperationKind::Rebase,
+        pending_commit: false,
+        sequence: false,
+        subject: Some("side".into()),
+        progress: Some((2, 5)),
+        message: None,
+    });
+    let (model, state) = operation_panel(&snapshot);
+    let renderer = headless_renderer();
+    let continues = |model: &SidebarModel, state: &SidebarState| {
+        frame_enter_presses(&renderer, git_panel(model, state, 380.0, false))
+            .iter()
+            .any(|action| {
+                matches!(
+                    action,
+                    SidebarAction::ContinueOperation {
+                        kind: OperationKind::Rebase,
+                        ..
+                    }
+                )
+            })
+    };
+    assert!(!continues(&model, &state), "a conflict is still unresolved");
+    snapshot
+        .status
+        .entries
+        .retain(|entry| entry.area != ChangeArea::Conflict);
+    let (model, state) = operation_panel(&snapshot);
+    assert!(continues(&model, &state));
+}
+
+/// Git's prepared message fills an empty draft once per operation, never a
+/// draft the user wrote or emptied, and leaves with the operation.
+#[test]
+fn the_prepared_merge_message_fills_only_an_untouched_draft() {
+    let mut snapshot = snapshot();
+    snapshot.status.entries.clear();
+    snapshot.operation = Some(merge_in_progress(Some("Merge branch 'side'")));
+    let (model, mut state) = operation_panel(&snapshot);
+    let merging = model.source_control.clone().unwrap();
+
+    state.adopt_operation_message(&merging);
+    assert_eq!(state.commit_message(), "Merge branch 'side'");
+    // Emptied by the user, it stays empty across later reads.
+    state.apply(&SidebarAction::CommitMessageChanged {
+        key: main_key(),
+        message: String::new(),
+    });
+    state.adopt_operation_message(&merging);
+    assert_eq!(state.commit_message(), "");
+
+    // A draft the user wrote first is theirs.
+    let (_, mut written) = operation_panel(&snapshot);
+    written.apply(&SidebarAction::CommitMessageChanged {
+        key: main_key(),
+        message: "my words".into(),
+    });
+    written.adopt_operation_message(&merging);
+    assert_eq!(written.commit_message(), "my words");
+
+    // An untouched adoption leaves once the merge is aborted.
+    let (_, mut aborted) = operation_panel(&snapshot);
+    aborted.adopt_operation_message(&merging);
+    snapshot.operation = None;
+    aborted.adopt_operation_message(&SourceControlModel::ready(main_key(), &snapshot));
+    assert_eq!(aborted.commit_message(), "");
+}
+
+/// A conflicted row's stage control says what staging it means.
+#[test]
+fn a_conflicted_row_offers_to_mark_it_resolved() {
+    let source = source_control();
+    let conflict = source.group(ChangeArea::Conflict).unwrap();
+    let row = &conflict.rows()[0];
+    assert!(row.chrome.stage_name.starts_with("Mark "));
+    assert!(row.chrome.stage_name.ends_with(" resolved"));
+    let staged = source.group(ChangeArea::Unstaged).unwrap();
+    assert!(staged.rows()[0].chrome.stage_name.starts_with("Stage "));
+}
+
+/// A raised confirmation runs exactly what it describes, and any answer
+/// takes it down.
+#[test]
+fn a_git_confirmation_runs_what_it_describes() {
+    let mut state = SidebarState::default();
+    let selection = vec![PathSelection::new(repo_path("f.txt"))];
+    state.apply(&SidebarAction::RequestStageConflictMarkers {
+        key: main_key(),
+        selection: selection.clone(),
+        paths: vec![repo_path("f.txt")],
+    });
+    let pending = state.pending_git_confirmation().unwrap();
+    assert_eq!(
+        pending.confirm_action(),
+        SidebarAction::ConfirmStageConflictMarkers {
+            key: main_key(),
+            selection,
+        }
+    );
+    state.apply(&SidebarAction::CancelGitConfirmation);
+    assert!(state.pending_git_confirmation().is_none());
+
+    state.apply(&SidebarAction::RequestAbortOperation {
+        key: main_key(),
+        kind: OperationKind::Rebase,
+    });
+    let confirm = state.pending_git_confirmation().unwrap().confirm_action();
+    state.apply(&confirm);
+    assert!(state.pending_git_confirmation().is_none());
 }

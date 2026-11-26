@@ -80,6 +80,21 @@ impl Cagents {
             self.sidebar_state
                 .reveal_worktree(project, *worktree_id, true);
         }
+        // Only the confirmation the mounted dialog describes may run; a
+        // stale or forged one does nothing.
+        if matches!(
+            action,
+            SidebarAction::ConfirmStageConflictMarkers { .. }
+                | SidebarAction::ConfirmAbortOperation { .. }
+        ) && self
+            .sidebar_state
+            .pending_git_confirmation()
+            .map(sidebar::GitConfirmation::confirm_action)
+            .as_ref()
+            != Some(&action)
+        {
+            return ControlFlow::Break(Task::none());
+        }
         self.sidebar_state.apply(&action);
         // Opening a row, by pointer or keyboard, is navigation: it
         // ends any explicit selection and anchors a later range, but
@@ -401,7 +416,19 @@ impl Cagents {
             | SidebarAction::CancelPublish
             // `apply` already cleared the pending discard, and the
             // dialog it was driving is gone with it.
-            | SidebarAction::CancelDiscard => Task::none(),
+            | SidebarAction::CancelDiscard
+            | SidebarAction::CancelGitConfirmation => Task::none(),
+            SidebarAction::RequestStageConflictMarkers { .. }
+            | SidebarAction::RequestAbortOperation { .. } => {
+                if self.sidebar_state.pending_git_confirmation().is_some() {
+                    dialog_ui::Question::ConfirmGitCommand.focus(
+                        sidebar::git_confirmation_cancel_id(),
+                        sidebar::git_confirmation_confirm_id(),
+                    )
+                } else {
+                    Task::none()
+                }
+            }
             SidebarAction::RequestDiscard { .. } => {
                 if self.sidebar_state.pending_discard().is_some() {
                     dialog_ui::Question::DiscardChanges.focus(
@@ -444,13 +471,50 @@ impl Cagents {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
                     return ControlFlow::Break(Task::none());
                 };
+                Self::stage_task(key, operation, selection)
+            }
+            SidebarAction::ConfirmStageConflictMarkers { key, selection } => {
+                let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
+                    return ControlFlow::Break(Task::none());
+                };
                 let request = StageRequest {
                     worktree: key.canonical_path.clone(),
                     selection,
                 };
                 Self::mutation_task(key, operation, move |service, cancel| {
                     (
-                        mutation_report("Stage", service.stage(&request, cancel)),
+                        mutation_report(
+                            "Mark resolved",
+                            service.stage_with_conflict_markers(&request, cancel),
+                        ),
+                        false,
+                    )
+                })
+            }
+            SidebarAction::ConfirmAbortOperation { key, kind } => {
+                let Some(operation) = self.begin_mutation(&key, MutationKind::Abort, None) else {
+                    return ControlFlow::Break(Task::none());
+                };
+                let worktree = key.canonical_path.clone();
+                Self::mutation_task(key, operation, move |service, cancel| {
+                    (
+                        mutation_report("Abort", service.abort_operation(&worktree, kind, cancel)),
+                        false,
+                    )
+                })
+            }
+            SidebarAction::ContinueOperation { key, kind } => {
+                let Some(operation) = self.begin_mutation(&key, MutationKind::Continue, None)
+                else {
+                    return ControlFlow::Break(Task::none());
+                };
+                let worktree = key.canonical_path.clone();
+                Self::mutation_task(key, operation, move |service, cancel| {
+                    (
+                        mutation_report(
+                            "Continue",
+                            service.continue_operation(&worktree, kind, cancel),
+                        ),
                         false,
                     )
                 })
