@@ -49,14 +49,12 @@ impl ReviewMonitor {
             }
             MonitorUpdate::Completed(census) => {
                 let key = repository_key(&census.repository);
-                let previous = journal.review_census(&key, &census.viewer)?;
-                if let Some(prior) = &previous
-                    && prior != &census
-                    && (prior.start == census.start || !prior.start.precedes_census(&census.start))
+                if let Some(previous) = journal.review_census_stamp(&key, &census.viewer)?
+                    && (!previous.precedes_census(&census.start)
+                        || census.start.precedes_census(&previous))
                 {
                     return Ok(Vec::new());
                 }
-                let first_acceptance = previous.as_ref() != Some(&census);
                 let points = journal.review_points()?;
                 let eligible = notices
                     .iter()
@@ -67,19 +65,16 @@ impl ReviewMonitor {
                                 && census.repository.same_repository(&request.repository_key())
                                 && census.current.get(&request.number)
                                     != Some(&request.request)
-                                && points.get(&notice.id).map_or(first_acceptance, |point| {
-                                    point.precedes_census(&census.start)
-                                }) =>
+                                && points
+                                    .get(&notice.id)
+                                    .is_none_or(|point| point.precedes_census(&census.start)) =>
                         {
                             Some(notice.id)
                         }
                         _ => None,
                     })
                     .collect();
-                journal.commit_review_reconciliation(
-                    first_acceptance.then_some((key.as_str(), &census)),
-                    eligible,
-                )
+                journal.commit_review_reconciliation(Some((key.as_str(), &census)), eligible)
             }
         }
     }
@@ -94,22 +89,31 @@ impl ReviewMonitor {
         let Target::PullRequest(request) = &event.target else {
             return Err("Review observation has no review request".into());
         };
-        if let Some(point) = &point {
-            let at = i64::try_from(point.at).map_err(|error| error.to_string())?;
-            if seconds.saturating_sub(at) >= OBSERVATION_GRACE {
-                return Ok(None);
-            }
+        if let Some(point) = &point
+            && i64::try_from(point.at)
+                .map_or(true, |at| seconds.saturating_sub(at) >= OBSERVATION_GRACE)
+        {
+            return Ok(None);
         }
         let repository = repository_key(&request.repository_key());
         // Older clients report no scan point. Their accepted positives
         // participate in FIFO order, and a previously accepted census cannot
         // tell whether an unstamped observation represents a new request.
-        if let Some(point) = &point
-            && let Some(census) = journal.review_census(&repository, &request.viewer)?
-            && point.precedes_census(&census.start)
-            && census.current.get(&request.number) != Some(&request.request)
-        {
-            return Ok(None);
+        if let Some(point) = &point {
+            let is_current = match journal.review_census(&repository, &request.viewer)? {
+                Some(census) => {
+                    !point.precedes_census(&census.start)
+                        || census.current.get(&request.number) == Some(&request.request)
+                }
+                // The ordering fence is still authoritative, but its evicted
+                // payload can no longer prove that an older request was current.
+                None => journal
+                    .review_census_stamp(&repository, &request.viewer)?
+                    .is_none_or(|stamp| !point.precedes_census(&stamp)),
+            };
+            if !is_current {
+                return Ok(None);
+            }
         }
         journal.remember_review_watch(&repository, seconds)?;
         match point {
@@ -355,6 +359,12 @@ pub(super) mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            journal
+                .review_census_stamp(&repository_key(&repository), "alice")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(journal.list().unwrap(), [original.clone()]);
         assert!(journal.group_withdrawals().unwrap().is_empty());
 
@@ -369,6 +379,12 @@ pub(super) mod tests {
         );
         drop(journal);
         let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            journal
+                .review_census_stamp(&repository_key(&repository), "alice")
+                .unwrap(),
+            Some(point.clone())
+        );
         assert!(journal.list().unwrap()[0].acknowledged);
         assert!(journal.group_withdrawals().unwrap().contains(&original.id));
         let later =
@@ -382,6 +398,120 @@ pub(super) mod tests {
                 .is_empty()
         );
         assert!(journal.list().unwrap().contains(&later));
+    }
+
+    #[test]
+    fn an_evicted_census_cannot_reconcile_new_legacy_notices_on_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let repository = repo(None);
+        let key = repository_key(&repository);
+        let initial = Census {
+            repository: repository.clone(),
+            start: point(5, 100),
+            viewer: "alice".into(),
+            current: BTreeMap::from([(11, "still_open".into())]),
+        };
+        let mut monitor = ReviewMonitor::default();
+        monitor
+            .apply(
+                MonitorUpdate::Completed(initial.clone()),
+                &mut journal,
+                &[],
+                100,
+            )
+            .unwrap();
+        let (legacy, _) = observed(&repository, "alice", "legacy_after", 12, point(5, 100))
+            .events()
+            .next()
+            .unwrap();
+        let legacy = ReviewMonitor::record(&mut journal, legacy, None, false, 100)
+            .unwrap()
+            .unwrap();
+
+        // Fill the bounded membership cache once. Every row is a separate
+        // viewer of the same repository, so the original exact scope ages out.
+        for viewer in 0..256 {
+            let census = Census {
+                viewer: format!("other_{viewer}"),
+                ..initial.clone()
+            };
+            journal
+                .commit_review_reconciliation(Some((&key, &census)), Vec::new())
+                .unwrap();
+        }
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.review_census(&key, "alice").unwrap().is_none());
+        assert_eq!(
+            journal.review_census_stamp(&key, "alice").unwrap(),
+            Some(initial.start.clone())
+        );
+        assert!(
+            monitor
+                .apply(
+                    MonitorUpdate::Completed(initial.clone()),
+                    &mut journal,
+                    &[legacy.clone()],
+                    101
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(journal.list().unwrap().contains(&legacy));
+        assert!(journal.group_withdrawals().unwrap().is_empty());
+
+        // Without the old payload, no earlier positive can prove membership.
+        // Deferral must not burn the request identity in the seen ledger.
+        assert!(
+            request(
+                &mut journal,
+                &repository,
+                "alice",
+                "removed",
+                10,
+                point(4, 100)
+            )
+            .is_none()
+        );
+        assert!(
+            request(
+                &mut journal,
+                &repository,
+                "alice",
+                "still_open",
+                11,
+                point(5, 100)
+            )
+            .is_none()
+        );
+        let fresh = request(
+            &mut journal,
+            &repository,
+            "alice",
+            "still_open",
+            11,
+            point(6, 100),
+        )
+        .unwrap();
+        let latest = Census {
+            start: point(7, 100),
+            ..initial
+        };
+        let visible = journal.list().unwrap();
+        assert_eq!(
+            monitor
+                .apply(
+                    MonitorUpdate::Completed(latest),
+                    &mut journal,
+                    &visible,
+                    101
+                )
+                .unwrap(),
+            [legacy.id]
+        );
+        assert!(journal.list().unwrap().contains(&fresh));
     }
 
     #[test]

@@ -71,11 +71,18 @@ mod schema {
             census -> Text,
         }
     }
+    diesel::table! {
+        review_census_stamps (repository, viewer) {
+            repository -> Text,
+            viewer -> Text,
+            stamp -> Text,
+        }
+    }
     diesel::allow_tables_to_appear_in_same_query!(notices, seen, owners, review_requests_seen);
 }
 use schema::{
-    notices, owners, portal_group_withdrawals, review_censuses, review_notice_points,
-    review_requests_seen, review_watches, seen,
+    notices, owners, portal_group_withdrawals, review_census_stamps, review_censuses,
+    review_notice_points, review_requests_seen, review_watches, seen,
 };
 
 // PRAGMAs describe the SQLite connection rather than application rows.
@@ -130,6 +137,11 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS review_censuses (repository TEXT NOT NULL, viewer TEXT NOT NULL,
                 sequence INTEGER NOT NULL, census TEXT NOT NULL, PRIMARY KEY(repository,viewer));
             CREATE INDEX IF NOT EXISTS review_census_sequence ON review_censuses(sequence);
+            CREATE TABLE IF NOT EXISTS review_census_stamps (repository TEXT NOT NULL, viewer TEXT NOT NULL,
+                stamp TEXT NOT NULL, PRIMARY KEY(repository,viewer));
+            INSERT OR IGNORE INTO review_census_stamps (repository,viewer,stamp)
+                SELECT repository,viewer,json_extract(census,'$.start') FROM review_censuses
+                WHERE CASE WHEN json_valid(census) THEN json_type(census,'$.start') = 'object' ELSE 0 END;
             PRAGMA user_version=3;").map_err(|error| error.to_string())?;
         Ok(Self(connection))
     }
@@ -215,6 +227,22 @@ impl Journal {
             .transpose()
     }
 
+    /// The small ordering fence survives eviction of the full membership map.
+    pub fn review_census_stamp(
+        &mut self,
+        repository: &str,
+        viewer: &str,
+    ) -> Result<Option<ScanPoint>, String> {
+        review_census_stamps::table
+            .find((repository, viewer))
+            .select(review_census_stamps::stamp)
+            .first::<String>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
     /// Accept the census and retire its exact notices together. Replaying a
     /// committed census must leave legacy observations accepted after it alone.
     pub fn commit_review_reconciliation(
@@ -227,13 +255,28 @@ impl Journal {
         }
         let acceptance = acceptance
             .map(|(repository, census)| {
-                serde_json::to_string(census).map(|value| (repository, &census.viewer, value))
+                Ok::<_, serde_json::Error>((
+                    repository,
+                    &census.viewer,
+                    serde_json::to_string(&census.start)?,
+                    serde_json::to_string(census)?,
+                ))
             })
             .transpose()
             .map_err(|error| error.to_string())?;
         self.0
             .transaction::<_, diesel::result::Error, _>(|connection| {
-                if let Some((repository, viewer, value)) = acceptance {
+                if let Some((repository, viewer, stamp, value)) = acceptance {
+                    diesel::insert_into(review_census_stamps::table)
+                        .values((
+                            review_census_stamps::repository.eq(repository),
+                            review_census_stamps::viewer.eq(viewer),
+                            review_census_stamps::stamp.eq(&stamp),
+                        ))
+                        .on_conflict((review_census_stamps::repository, review_census_stamps::viewer))
+                        .do_update()
+                        .set(review_census_stamps::stamp.eq(&stamp))
+                        .execute(connection)?;
                     diesel::sql_query(
                         "INSERT INTO review_censuses(repository,viewer,sequence,census)
                          VALUES (?1,?2,(SELECT coalesce(max(sequence),0)+1 FROM review_censuses),?3)
