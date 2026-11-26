@@ -3952,23 +3952,18 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
     }
     assert_eq!(parent.children.len(), 32);
     assert!((0..32).all(|index| parent.children.contains_key(&format!("child-{index:03}"))));
-    // Nothing reports how a child that isn't subscribed goes on, so the
-    // conversation doesn't show a running one running for good.
     let mut state = chat::Snapshot::default();
     crate::chat::runtime::project_events_for_test(&mut state, events);
-    let shown = |id: &str| {
-        state
-            .subagents
-            .iter()
-            .find(|subagent| subagent.id == id)
-            .map(|subagent| subagent.status)
-    };
-    assert_eq!(shown("child-033"), Some(ToolStatus::Stopped));
-    assert!(
-        published
-            .iter()
-            .all(|id| shown(id).is_some_and(|status| status != ToolStatus::Running))
-    );
+    let observed = state
+        .subagents
+        .iter()
+        .find(|agent| agent.id == "child-033")
+        .expect("the earlier running child is listed");
+    assert_eq!(observed.status, ToolStatus::Running);
+    assert!(observed.last_seen_running());
+    assert!(!observed.outlives_turn());
+    assert!(!state.holds_work());
+    assert!(!state.is_working());
 
     for (read, id) in resumes(&first) {
         parent
@@ -4009,6 +4004,14 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
     assert!(live.events.iter().any(|event| matches!(event,
         Event::SubagentItemsRemoved { id, ids }
             if id == "child-033" && ids == &["codex-notice:unloaded:child-033"])));
+
+    crate::chat::runtime::project_events_for_test(&mut state, live.events);
+    let promoted = state
+        .subagents
+        .iter()
+        .find(|agent| agent.id == "child-033")
+        .unwrap();
+    assert!(!promoted.last_seen_running());
 
     // One listing publishes a bounded number of children, however many
     // pages Codex offers.

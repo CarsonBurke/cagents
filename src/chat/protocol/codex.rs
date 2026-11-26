@@ -1088,6 +1088,7 @@ impl Codex {
             return Ok(false);
         }
         let discovered = !self.children.contains_key(id);
+        let mut newly_loaded = false;
         if discovered && load {
             if self.children.len() >= MAX_LIVE_CHILDREN {
                 // Codex reads a nested child only through its loaded parent,
@@ -1144,7 +1145,8 @@ impl Codex {
             child.is_child = true;
             child.parent_child = parent_thread(metadata).map(str::to_owned);
             self.children.insert(id.into(), Box::new(child));
-            if self.listed_unloaded.remove(id) {
+            newly_loaded = self.listed_unloaded.remove(id);
+            if newly_loaded {
                 // Its transcript is about to load.
                 step.events.extend(chat::child_events(
                     id,
@@ -1175,14 +1177,12 @@ impl Codex {
         {
             child.selected = Some(model.clone());
         }
-        // Nothing reports when the run of a child that isn't subscribed ends,
-        // and no stop reaches it. Shown as running, it would spin for good,
-        // so it is settled as stopped, as a child only thought to be running
-        // is when its read finds it idle.
-        let status = agent_status(&metadata["status"]).map(|status| match status {
-            ToolStatus::Running if !load => ToolStatus::Stopped,
-            status => status,
-        });
+        let status = agent_status(&metadata["status"]);
+        let detail = if !load && status == Some(ToolStatus::Running) {
+            Some(chat::UNLOADED_CHILD_RUNNING.into())
+        } else {
+            newly_loaded.then(String::new)
+        };
         if let Some(status) = status
             && let Some(child) = self.children.get_mut(id)
         {
@@ -1200,7 +1200,7 @@ impl Codex {
         step.events.push(Event::Subagent {
             model,
             waiting: None,
-            detail: None,
+            detail,
             id: id.into(),
             // A role says what an agent can do, not who it is. Sparse,
             // role-only or superseded metadata publishes no name, so the

@@ -80,6 +80,9 @@ fn finished(child: &chat::Subagent) -> bool {
 }
 
 fn child_icon(child: &chat::Subagent) -> Icon {
+    if child.last_seen_running() {
+        return Icon::History;
+    }
     match child.status {
         chat::ToolStatus::Waiting => Icon::AgentBackground,
         chat::ToolStatus::Running if child.waiting => Icon::AgentWaiting,
@@ -1043,6 +1046,18 @@ mod tests {
             background: true,
             items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_listed_unloaded_running_child_has_a_static_status_in_the_chooser() {
+        let mut child = child("earlier", chat::ToolStatus::Running, false);
+        child.detail = chat::UNLOADED_CHILD_RUNNING.into();
+        assert_eq!(Section::of(&child), Section::Working);
+        assert_eq!(child_icon(&child), Icon::History);
+        assert_eq!(
+            super::super::view::AgentWork::default().caption(&child),
+            chat::UNLOADED_CHILD_RUNNING
+        );
     }
 
     fn named(id: &str, kind: &str, status: chat::ToolStatus, waiting: bool) -> chat::Subagent {

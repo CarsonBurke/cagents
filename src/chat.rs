@@ -2041,13 +2041,30 @@ pub fn codex_agent_task(path: &str) -> Option<String> {
     Some(first.to_uppercase().chain(letters).take(120).collect())
 }
 
+/// A thread-listing observation for a child whose transcript and later
+/// status changes aren't subscribed. It travels in the existing detail field.
+pub const UNLOADED_CHILD_RUNNING: &str = "Last seen running · transcript not loaded";
+
 impl Subagent {
+    pub fn last_seen_running(&self) -> bool {
+        self.status == ToolStatus::Running && self.detail == UNLOADED_CHILD_RUNNING
+    }
+
+    /// Live work that this connection can still observe and act on.
+    pub fn is_live(&self) -> bool {
+        self.status.is_live() && !self.last_seen_running()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status == ToolStatus::Running && !self.last_seen_running()
+    }
+
     /// Delegated work, running or waiting on its own background work, that
     /// cancelling the parent's turn would also stop, where the provider's
     /// interrupt does not spare it. Claude Code's interrupt kills a waiting
     /// agent and its own background work as it does a running one.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
-        self.status.is_live() && self.background && capabilities.interrupt_stops_background
+        self.is_live() && self.background && capabilities.interrupt_stops_background
     }
 }
 
@@ -2111,6 +2128,7 @@ impl Snapshot {
         let mut activity = SubagentActivity::default();
         for agent in &self.subagents {
             match agent.status {
+                ToolStatus::Running if agent.last_seen_running() => {}
                 ToolStatus::Running if agent.waiting => activity.waiting += 1,
                 ToolStatus::Running => activity.working += 1,
                 ToolStatus::Waiting => activity.on_background_work += 1,
@@ -2160,15 +2178,11 @@ impl Snapshot {
     /// its turn, a question to the user, or a subagent working or waiting on
     /// its own background work.
     pub fn holds_work(&self) -> bool {
-        self.turn_accepted() || self.subagents.iter().any(|agent| agent.status.is_live())
+        self.turn_accepted() || self.subagents.iter().any(Subagent::is_live)
     }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
-        self.busy
-            || self
-                .subagents
-                .iter()
-                .any(|agent| agent.status == ToolStatus::Running)
+        self.busy || self.subagents.iter().any(Subagent::is_running)
     }
     pub fn activity(&self) -> ActivityState {
         if self.exited {
@@ -2188,7 +2202,7 @@ impl Snapshot {
             || self
                 .subagents
                 .iter()
-                .any(|agent| agent.waiting && agent.status == ToolStatus::Running)
+                .any(|agent| agent.waiting && agent.is_running())
         {
             ActivityState::Waiting
         } else if self.is_working() {
@@ -2676,7 +2690,7 @@ impl Subagent {
     /// Whether it holds its conversation apart from the turn: it runs in the
     /// background, or waits on background work of its own.
     pub fn outlives_turn(&self) -> bool {
-        self.status == ToolStatus::Waiting || self.background && self.status.is_live()
+        self.status == ToolStatus::Waiting || self.background && self.is_live()
     }
 }
 

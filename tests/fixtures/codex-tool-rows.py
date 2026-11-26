@@ -54,6 +54,8 @@ starts two subagents, Arendt and Hume, each announced only by a
 subAgentActivity item, with no thread/started and no collaboration call naming
 them, waits for both to report, then answers. The thread listing names each
 child, with its agent path, once its turn has started.
+With CODEX_HOME/fixture-running-child-past-window present, thread/list exposes
+33 active children, with the oldest on the second page. Their turns stay open.
 """
 import copy
 import fcntl
@@ -576,6 +578,14 @@ class Scenario:
                 notify("turn/completed", turn=completed(
                     turn, [*echoed, *spawns, waited, *completions, answer]))]
 
+    def _large_child_listing(self, params):
+        """List 33 active children in two pages, as a saturated connection sees them."""
+        return {
+            "data": [self.large_children[-1]] if params.get("cursor") == "older"
+                    else self.large_children[:-1],
+            "nextCursor": None if params.get("cursor") == "older" else "older",
+        }
+
     def request(self, frame, codex_home):
         with self._changed:
             return self._request(frame, codex_home)
@@ -590,8 +600,29 @@ class Scenario:
         if script:
             self.name = script["name"]
         self.v2 = (Path(codex_home) / "fixture-multi-agent-v2").is_file()
+        large_listing = (Path(codex_home) / "fixture-running-child-past-window").is_file()
+        if large_listing and not hasattr(self, "large_children"):
+            self.large_children = [
+                {"id": f"00000000-0000-4000-8000-{index:012d}",
+                 "parentThreadId": self.thread,
+                 "agentNickname": f"Review {index:02d}" if index < 33 else "Earlier review",
+                 "status": {"type": "active", "activeFlags": []}}
+                for index in range(1, 34)
+            ]
+        large_child = next(
+            (child for child in self.large_children if child["id"] == params.get("threadId")),
+            None,
+        ) if large_listing else None
         if method == "initialize":
             result = {"userAgent": "cagents-offline-tool-rows", "codexHome": codex_home}
+        elif large_child is not None and method in ("thread/resume", "thread/read"):
+            result = {
+                "thread": large_child,
+                "initialTurnsPage": {"data": [], "nextCursor": None},
+                "model": self.model,
+            }
+        elif method == "thread/list" and large_listing and params.get("ancestorThreadId"):
+            result = self._large_child_listing(params)
         elif method in ("thread/start", "thread/resume"):
             thread = params.get("threadId", self.thread)
             if method == "thread/resume" and thread not in self._threads() \

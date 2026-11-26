@@ -1810,7 +1810,7 @@ impl LocalHandle {
         state
             .subagents
             .iter()
-            .filter(|agent| agent.background && agent.status.is_live())
+            .filter(|agent| agent.background && agent.is_live())
             .map(|agent| agent.id.clone())
             .collect()
     }
@@ -5062,7 +5062,7 @@ fn apply_projected_event(
 fn stop_snapshot_steps(state: &mut Snapshot) {
     stop_running_steps(&mut state.items);
     for agent in &mut state.subagents {
-        if agent.status == ToolStatus::Running {
+        if agent.is_running() {
             agent.status = ToolStatus::Stopped;
             agent.waiting = false;
         }
