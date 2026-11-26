@@ -383,9 +383,9 @@ mod tests {
             recorded_by: None,
         };
         let record = path(&state, &job.id);
+        private_create(&record).unwrap();
         let save = |intent: &Intent| {
             fs::write(&record, serde_json::to_vec(intent).unwrap()).unwrap();
-            fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
         };
         save(&intent);
         assert!(pending_selected(&layout, &state, &job).unwrap());
