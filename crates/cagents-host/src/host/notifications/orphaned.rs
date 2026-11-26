@@ -65,7 +65,11 @@ pub(in crate::host) fn collect(host: &SharedHost, model: &Registry) -> Result<us
     let native = holder_registry::directory(Kind::Native)?;
     let released = without_recovery(candidates, &saved, &terminals, &native)?;
 
-    if model.saved_session_inventory_sequence()? != sequence {
+    // A shared pane may be saved without changing resident inventory. Keep
+    // the workspace writer held from its final sequence check through enqueue.
+    let writer = super::super::workspace::writer(host).map_err(|error| error.message)?;
+    let writer = writer.lock().unwrap_or_else(|p| p.into_inner());
+    if writer.saved_session_inventory_sequence()? != sequence {
         return Ok(0);
     }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
