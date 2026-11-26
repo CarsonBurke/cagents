@@ -1247,8 +1247,8 @@ impl Residence {
             return;
         }
         use crate::upgrade::handoff::{Phase, Store};
-        let observed =
-            Store::existing().and_then(|store| store.map_or(Ok(None), |store| store.load()));
+        let observed = Store::observe_existing()
+            .and_then(|store| store.map_or(Ok(None), |store| store.load()));
         match observed {
             Ok(Some(checkpoint))
                 if checkpoint.phase == Phase::Prepared
