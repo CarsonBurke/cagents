@@ -21,9 +21,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.VerifiedUser
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -57,6 +59,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.cagents.mobile.android.BuildConfig
 import dev.cagents.mobile.android.data.ConnectionSettings
+import dev.cagents.mobile.android.ssh.PhoneKeyUnusable
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -120,6 +123,11 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+
+            // Nothing connects without the key, so its problem comes first, set up by hand or not.
+            phoneKey?.exceptionOrNull()?.let { problem ->
+                PhoneKeyProblem(problem, onTryAgain = vm::reloadPhoneKey, onMakeNew = vm::makeNewPhoneKey)
             }
 
             if (firstRun) {
@@ -274,10 +282,8 @@ private fun PhoneKeySection(phoneKey: Result<PhoneKeyInfo>?, user: String, snack
     val key = phoneKey?.getOrNull()
     when {
         phoneKey == null -> Text("Making the key…", style = MaterialTheme.typography.bodyMedium)
-        key == null -> Text(
-            "Couldn't make this phone's key: ${phoneKey.exceptionOrNull()?.message}",
-            color = MaterialTheme.colorScheme.error,
-        )
+        // Shown at the top of Settings, by PhoneKeyProblem.
+        key == null -> Text("See the problem above.", style = MaterialTheme.typography.bodyMedium)
         else -> {
             // The line authorized_keys needs, restricted to the bridge as docs/mobile-api.md prescribes.
             val home = if (user.isEmpty() || user == "root") "~" else "/home/$user"
@@ -334,6 +340,58 @@ private fun PhoneKeySection(phoneKey: Result<PhoneKeyInfo>?, user: String, snack
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun PhoneKeyProblem(problem: Throwable, onTryAgain: () -> Unit, onMakeNew: () -> Unit) {
+    val unusable = problem is PhoneKeyUnusable
+    var confirming by rememberSaveable { mutableStateOf(false) }
+    Surface(
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.Key, null, Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (unusable) "This phone's key can't be used" else "Couldn't load this phone's key",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+            Text(
+                if (unusable) {
+                    "The key this phone signs in with is damaged or gone, so no computer will accept it. " +
+                        "Make a new key, then pair again with your computer, or add the new key there."
+                } else {
+                    problem.message ?: problem::class.simpleName.orEmpty()
+                },
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (unusable) Button(onClick = { confirming = true }) { Text("Make a new key") }
+                TextButton(onClick = onTryAgain) { Text("Try again", color = MaterialTheme.colorScheme.onErrorContainer) }
+            }
+        }
+    }
+    if (confirming) {
+        AlertDialog(
+            onDismissRequest = { confirming = false },
+            title = { Text("Make a new key?") },
+            text = {
+                Text("Computers that accepted the old key won't accept this phone until you pair again, or add the new key there.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirming = false
+                    onMakeNew()
+                }) { Text("Make a new key") }
+            },
+            dismissButton = { TextButton(onClick = { confirming = false }) { Text("Cancel") } },
+        )
     }
 }
 

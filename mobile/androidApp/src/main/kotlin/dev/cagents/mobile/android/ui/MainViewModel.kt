@@ -82,11 +82,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val messages = _messages.receiveAsFlow()
 
     init {
-        viewModelScope.launch {
-            _phoneKey.value = withContext(Dispatchers.IO) {
-                runCatching { PhoneKey.get(app).let { PhoneKeyInfo(it.openSsh, it.fingerprint, it.hardwareBacked) } }
+        loadPhoneKey { PhoneKey.get(getApplication()) }
+    }
+
+    /** Loads the phone's key again, after a failure that may have passed. */
+    fun reloadPhoneKey() {
+        loadPhoneKey { PhoneKey.get(getApplication()) }
+    }
+
+    /**
+     * Replaces the phone's key with a new one, when the old one can't be
+     * used. Computers that trusted the old key must be told of the new one.
+     */
+    fun makeNewPhoneKey() {
+        loadPhoneKey { PhoneKey.replace(getApplication()) }.invokeOnCompletion {
+            if (_phoneKey.value?.isSuccess == true) {
+                _messages.trySend("Made a new key. Pair again with your computer, or add the new key there.")
             }
         }
+    }
+
+    private fun loadPhoneKey(load: () -> PhoneKey) = viewModelScope.launch {
+        _phoneKey.value = null
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching { load().let { PhoneKeyInfo(it.openSsh, it.fingerprint, it.hardwareBacked) } }
+        }
+        _phoneKey.value = loaded
+        // A connection waiting for a usable key tries again with it.
+        if (loaded.isSuccess) controller.retryNow()
     }
 
     fun saveSettings(new: ConnectionSettings) {

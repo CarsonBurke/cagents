@@ -9,12 +9,15 @@ import org.bouncycastle.crypto.signers.Ed25519Signer
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.security.InvalidKeyException
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.Signature
+import java.security.UnrecoverableKeyException
 import java.security.spec.ECGenParameterSpec
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -27,6 +30,10 @@ import javax.crypto.spec.GCMParameterSpec
  * with KeyMint 2), the private key lives there and signing happens in the
  * secure hardware. Otherwise the key is generated in software and its seed is
  * stored encrypted with an AES key that the Keystore holds.
+ *
+ * A key once made is never replaced silently, since computers trust it: if
+ * it stops working, loading it fails with [PhoneKeyUnusable] until the
+ * person asks for a new one with [replace].
  */
 class PhoneKey private constructor(
     override val publicKey: ByteArray,
@@ -50,9 +57,28 @@ class PhoneKey private constructor(
         @Volatile
         private var loaded: PhoneKey? = null
 
-        /** Loads the phone's key, making it on first use. Blocking: call off the main thread. */
+        /**
+         * Loads the phone's key, making it on first use. Blocking: call off
+         * the main thread. Throws [PhoneKeyUnusable] if the key it has can't
+         * be used.
+         */
         fun get(context: Context): PhoneKey = loaded ?: synchronized(this) {
             loaded ?: load(context.applicationContext).also { loaded = it }
+        }
+
+        /**
+         * Discards the phone's key, whatever state it is in, and makes a new
+         * one. Computers that trusted the old key won't accept the new one
+         * until it is added there. Blocking: call off the main thread.
+         */
+        fun replace(context: Context): PhoneKey = synchronized(this) {
+            loaded = null
+            val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
+            for (alias in listOf(SIGNING_ALIAS, WRAPPING_ALIAS)) runCatching { keyStore.deleteEntry(alias) }
+            val seedFile = File(context.applicationContext.noBackupFilesDir, SEED_FILE)
+            File(seedFile.parentFile, "${seedFile.name}.tmp").delete()
+            check(!seedFile.exists() || seedFile.delete()) { "Couldn't remove the old key" }
+            load(context.applicationContext).also { loaded = it }
         }
 
         private fun load(context: Context): PhoneKey {
@@ -88,7 +114,7 @@ class PhoneKey private constructor(
             }.onFailure {
                 // Only a key made just now is discarded: an older one is already authorized somewhere.
                 if (!existed) runCatching { keyStore.deleteEntry(SIGNING_ALIAS) }
-            }.getOrElse { if (existed) throw it else null }
+            }.getOrElse { if (existed) throw PhoneKeyUnusable(it) else null }
         }
 
         private fun keystoreSign(key: PrivateKey, data: ByteArray): ByteArray =
@@ -99,14 +125,16 @@ class PhoneKey private constructor(
             }
 
         private fun softwareKey(keyStore: KeyStore, seedFile: File): PhoneKey {
-            val wrapping = wrappingKey(keyStore)
             val seed = if (seedFile.exists()) {
-                val stored = seedFile.readBytes()
-                Cipher.getInstance("AES/GCM/NoPadding").run {
-                    init(Cipher.DECRYPT_MODE, wrapping, GCMParameterSpec(128, stored, 0, 12))
-                    doFinal(stored, 12, stored.size - 12)
+                // A missing wrapping key isn't made afresh here: it couldn't open this seed.
+                val wrapping = try {
+                    keyStore.getKey(WRAPPING_ALIAS, null) as SecretKey?
+                } catch (e: UnrecoverableKeyException) {
+                    throw PhoneKeyUnusable(e)
                 }
+                unsealSeed(seedFile.readBytes(), wrapping)
             } else {
+                val wrapping = wrappingKey(keyStore)
                 val fresh = ByteArray(32).also { SecureRandom().nextBytes(it) }
                 val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, wrapping) }
                 val sealed = cipher.iv + cipher.doFinal(fresh)
@@ -124,6 +152,33 @@ class PhoneKey private constructor(
                     generateSignature()
                 }
             }, hardwareBacked = false)
+        }
+
+        /**
+         * The seed in [stored], as [softwareKey] seals it: the GCM IV, then the
+         * encrypted seed and its tag. Throws [PhoneKeyUnusable] when it can't
+         * be opened with [wrapping], or [wrapping] is gone; other failures,
+         * which may pass, are thrown as they are.
+         */
+        internal fun unsealSeed(stored: ByteArray, wrapping: SecretKey?): ByteArray {
+            if (wrapping == null) throw PhoneKeyUnusable(IllegalStateException("The key that sealed it is gone."))
+            val seed = try {
+                Cipher.getInstance("AES/GCM/NoPadding").run {
+                    init(Cipher.DECRYPT_MODE, wrapping, GCMParameterSpec(128, stored, 0, 12))
+                    doFinal(stored, 12, stored.size - 12)
+                }
+            } catch (e: AEADBadTagException) {
+                // Not sealed with this key, or changed since.
+                throw PhoneKeyUnusable(e)
+            } catch (e: InvalidKeyException) {
+                // Such as a Keystore key permanently invalidated.
+                throw PhoneKeyUnusable(e)
+            } catch (e: IllegalArgumentException) {
+                // Too short to hold an IV.
+                throw PhoneKeyUnusable(e)
+            }
+            if (seed.size != 32) throw PhoneKeyUnusable(IllegalStateException("The stored seed is ${seed.size} bytes."))
+            return seed
         }
 
         private fun wrappingKey(keyStore: KeyStore): SecretKey {
@@ -154,3 +209,7 @@ class PhoneKey private constructor(
         }.toByteArray()
     }
 }
+
+/** The phone's key exists but can't be used, such as after the Keystore lost what it held. */
+class PhoneKeyUnusable(cause: Throwable) :
+    Exception("This phone's key can't be used anymore. Make a new one in Settings.", cause)

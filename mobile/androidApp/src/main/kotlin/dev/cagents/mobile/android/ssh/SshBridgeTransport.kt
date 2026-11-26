@@ -59,7 +59,12 @@ class SshBridgeTransport(
                 hosts = target.hosts,
                 port = target.port,
                 user = target.user,
-                key = phoneKey(),
+                key = try {
+                    phoneKey()
+                } catch (e: PhoneKeyUnusable) {
+                    // Not to be retried: only a new key, made by the person, helps.
+                    throw ConnectFailure.Refused(e.message.orEmpty())
+                },
                 hostKeys = StoredHostKeys(hostKeys, target),
                 command = target.command,
                 // A computer named by its pairing code was paired; one set up by hand has no name.
