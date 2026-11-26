@@ -1351,10 +1351,10 @@ pub fn shut_down_test_listener(listener: std::os::unix::net::UnixListener) {
     drop(listener);
 }
 
-/// LeaseHandoff deliberately closes without LOCK_UN because a successor
-/// can share its description. An unrelated test's concurrent fork can
-/// retain even a CLOEXEC copy until exec; create the tested descriptors
-/// only inside a coordinator with no other tests running beside it.
+/// Run a lease or listener fixture without other tests forking beside it.
+/// A concurrent fork can retain even a CLOEXEC copy until exec.
+/// LeaseHandoff closes without LOCK_UN because a successor can share its
+/// description, and Darwin listeners have no shared shutdown operation.
 #[cfg(test)]
 pub(crate) fn isolated_handoff_coordinator() -> bool {
     use std::os::unix::process::CommandExt;
@@ -2126,6 +2126,10 @@ mod tests {
 
     #[test]
     fn dead_daemon_lock_recovers_its_stale_socket() {
+        #[cfg(target_os = "macos")]
+        if !isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
         leave_stale_socket(&paths.socket);
@@ -2139,6 +2143,10 @@ mod tests {
 
     #[test]
     fn unheld_corrupt_lock_recovers_without_parsing_metadata() {
+        #[cfg(target_os = "macos")]
+        if !isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
         leave_stale_socket(&paths.socket);
@@ -2392,6 +2400,10 @@ for line in sys.stdin:
 
     #[test]
     fn rebuild_stop_recovers_unheld_corrupt_metadata_but_not_a_replaced_lock() {
+        #[cfg(target_os = "macos")]
+        if !isolated_handoff_coordinator() {
+            return;
+        }
         use std::time::Duration;
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
