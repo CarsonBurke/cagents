@@ -392,7 +392,6 @@ fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 's
 
 /// Observe an existing private lock without creating, repairing, or retaining
 /// it. This is a point-in-time status observation, never launch admission.
-#[cfg(feature = "ui")]
 pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
     let named = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -480,6 +479,12 @@ impl WindowLease {
                 }
             }
         }
+        let remote_fresh = new_window && crate::device::is_remote();
+        let fresh_slot = if remote_fresh {
+            crate::device::window_slot(Some(&uuid::Uuid::new_v4().to_string()))?
+        } else {
+            None
+        };
         let claims = match state_claim::claims_directory() {
             Ok(claims) => Some(claims),
             Err(error) if require_state => return Err(error),
@@ -492,8 +497,8 @@ impl WindowLease {
             &runtime_directory()?,
             claims.as_deref(),
             require_state,
-            new_window,
-            requested,
+            new_window && !remote_fresh,
+            fresh_slot.as_deref().or(requested),
             daemon_admission::admission_wait_timeout(),
             waiting,
         )?;
@@ -5707,6 +5712,41 @@ mod startup_update_tests {
                 String::from_utf8_lossy(&output.stderr),
             );
         }
+    }
+
+    #[test]
+    fn a_remote_window_claim_excludes_an_exact_reopen_until_its_lease_is_released() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for runtime in &runtimes {
+            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let open = |runtime: usize, slot: &str| {
+            WindowLease::acquire_waiting_in(
+                runtimes[runtime].path(),
+                Some(claims.path()),
+                false,
+                false,
+                Some(slot),
+                Duration::ZERO,
+                &mut |_| {},
+            )
+        };
+        let slot = crate::device::scoped_window_slot("remote", &uuid::Uuid::new_v4().to_string());
+        let other_slot = crate::device::scoped_window_slot("remote", "notes");
+        let named_claim = claims.path().join(format!("window.{slot}.lock"));
+        let (fresh, _) = open(0, &slot).unwrap();
+        let error = open(1, &slot).err().expect("the remote layout is held");
+        assert!(state_claim::state_in_use(&error).is_some());
+        drop(open(1, &other_slot).unwrap().0);
+        assert!(named_claim.exists(), "the sweep kept the active claim");
+
+        drop(fresh);
+        drop(open(1, &other_slot).unwrap().0);
+        assert!(!named_claim.exists(), "the sweep pruned the idle claim");
+        let (_reopened, reopened) = open(1, &slot).unwrap();
+        assert_eq!(reopened, slot);
+        assert!(named_claim.exists());
     }
 
     #[test]

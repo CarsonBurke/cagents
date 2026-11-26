@@ -465,15 +465,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         command.args(std::env::args_os().skip(1));
         return Err(command.exec().into());
     }
-    let unique_slot = uuid::Uuid::new_v4().to_string();
-    let remote_new_window = new_window && cagents::device::is_remote();
-    let new_window = new_window && !remote_new_window;
-    let slot = if remote_new_window {
-        Some(unique_slot.as_str())
-    } else {
-        slot
-    };
-    let scoped_slot = if device_window_scoped && !remote_new_window {
+    let scoped_slot = if device_window_scoped {
         slot.map(str::to_owned)
     } else {
         cagents::device::window_slot(slot)?

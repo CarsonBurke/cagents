@@ -4527,16 +4527,12 @@ fn launch_ui(
     slot: Option<&str>,
     source: Option<&str>,
 ) -> Result<CommandOutput, AppError> {
-    let unique_slot = uuid::Uuid::new_v4().to_string();
-    let remote_new_window = new_window && crate::device::is_remote();
-    let new_window = new_window && !remote_new_window;
-    let slot = if remote_new_window {
-        Some(unique_slot.as_str())
+    let scoped_slot = if new_window && crate::device::is_remote() {
+        // The new window allocates its own private slot at launch.
+        None
     } else {
-        slot
+        crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?
     };
-    let scoped_slot =
-        crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?;
     let slot = scoped_slot.as_deref();
     let activate = || match slot {
         Some(slot) => instance::activate_window(slot),

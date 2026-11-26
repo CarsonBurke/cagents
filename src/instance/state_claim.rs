@@ -42,7 +42,7 @@ use std::os::unix::fs::FileExt;
 /// can add some without an earlier one reading its claim as missing.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct Record {
-    format: u8,
+    format: u64,
     /// The holder's runtime lock: whoever holds it acts for this claim.
     guard: PathBuf,
     /// The runtime directory the holder serves, for people to read.
@@ -50,9 +50,13 @@ struct Record {
     pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
 }
 
-const FORMAT: u8 = 1;
+const FORMAT: u64 = 1;
 const MAX_RECORD_BYTES: u64 = 4096;
 const POLL: Duration = Duration::from_millis(20);
 /// How long a claimant watches the runtime lock a claim records before it
@@ -84,6 +88,8 @@ pub struct StateInUse {
     claimant: Claimant,
     pid: Option<u32>,
     runtime: Option<PathBuf>,
+    foreign_host: Option<String>,
+    unreadable: bool,
 }
 
 impl StateInUse {
@@ -98,6 +104,22 @@ impl StateInUse {
 
 impl std::fmt::Display for StateInUse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let resource = match self.claimant {
+            Claimant::Daemon | Claimant::Maintenance => "this cagents data",
+            Claimant::Window => "this cagents window's saved layout",
+        };
+        if self.unreadable {
+            return write!(
+                formatter,
+                "The ownership record for {resource} is unreadable. cagents could not verify that the saved data is free."
+            );
+        }
+        if let Some(host) = &self.foreign_host {
+            return write!(
+                formatter,
+                "Another cagents process on {host} is using {resource}. Close it on that machine before opening the same saved data here."
+            );
+        }
         let holder = match self.pid {
             Some(pid) => format!("process {pid}"),
             None => "it".to_owned(),
@@ -219,7 +241,8 @@ pub(crate) fn claim_daemon_state_in(
 
 /// The daemon that another runtime directory serves this instance's state
 /// from, if one does, for a launcher deciding whether to start one here.
-/// Reading a claim takes no lock on it, so a starting daemon is never held up.
+/// Recheck invalid bytes under a nonblocking shared lock so a claim being
+/// written does not masquerade as a permanently unreadable one.
 pub fn daemon_served_elsewhere(lock: &Path) -> io::Result<Option<StateInUse>> {
     served_elsewhere(&claims_directory()?.join(DAEMON_CLAIM), lock)
 }
@@ -274,13 +297,24 @@ pub(crate) fn require_idle_for_installation() -> io::Result<()> {
 }
 
 pub(crate) fn served_elsewhere(claim: &Path, lock: &Path) -> io::Result<Option<StateInUse>> {
-    let Some(recorded) = read_path(claim)? else {
-        return Ok(None);
+    let recorded = match read_path(claim) {
+        Ok(Some(recorded)) => recorded,
+        Ok(None) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            return verified_unreadable(claim);
+        }
+        Err(error) => return Err(error),
     };
-    if recorded.guard == canonical_guard(lock) || !guard_held(&recorded.guard) {
-        return Ok(None);
-    }
-    Ok(Some(refusal(Claimant::Daemon, Some(&recorded))))
+    let boot = local_boot();
+    let foreign = other_boot(&recorded, boot.as_deref());
+    let used = if foreign {
+        // A private runtime path and PID on another boot say nothing about a
+        // process here. The shared claim file is the cross-machine evidence.
+        private_lock_is_held(claim)?
+    } else {
+        recorded.guard != canonical_guard(lock) && guard_held(&recorded.guard)
+    };
+    Ok(used.then(|| refusal(Claimant::Daemon, Some(&recorded), foreign)))
 }
 
 /// Claim one window's saved state for the window that holds its slot lock
@@ -292,12 +326,112 @@ pub(crate) fn claim_window_state_in(
 ) -> io::Result<StateClaim> {
     validate_window_slot(slot)?;
     crate::secure_file::prepare_private_directory(claims)?;
+    if slot.starts_with("device-") {
+        prune_released_device_windows(claims, slot);
+    }
     acquire(
         &claims.join(format!("window.{slot}.lock")),
         record(slot_lock, None)?,
         Claimant::Window,
         WINDOW_PATIENCE,
     )
+}
+
+fn verified_unreadable(path: &Path) -> io::Result<Option<StateInUse>> {
+    let file = match open_claim(path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let lock = match owned_file_lock(file, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !same_named_claim(path, &lock)? {
+        return Ok(None);
+    }
+    match read(&lock) {
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            let mut reason = refusal(Claimant::Daemon, None, false);
+            reason.unreadable = true;
+            Ok(Some(reason))
+        }
+        Err(error) => Err(error),
+        Ok(_) => Ok(None),
+    }
+}
+
+fn open_claim(path: &Path, write: bool) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(write)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != current_uid() || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "claim is not a private owned regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn same_named_claim(path: &Path, file: &File) -> io::Result<bool> {
+    let opened = file.metadata()?;
+    match fs::symlink_metadata(path) {
+        Ok(named) => Ok(named.dev() == opened.dev() && named.ino() == opened.ino()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remote windows use distinct saved slots, so their idle claim files can
+/// accumulate indefinitely. Keep each exact claim while its window is open.
+fn prune_released_device_windows(claims: &Path, requested: &str) {
+    let Ok(entries) = fs::read_dir(claims) else {
+        return;
+    };
+    let current = format!("window.{requested}.lock");
+    let boot = local_boot();
+    for entry in entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            name.to_str().is_some_and(|name| {
+                name != current
+                    && name
+                        .strip_prefix("window.device-")
+                        .and_then(|name| name.strip_suffix(".lock"))
+                        .is_some_and(|slot| {
+                            slot.len() == 16 && slot.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+            })
+        })
+        .take(128)
+    {
+        let path = entry.path();
+        let result = (|| -> io::Result<()> {
+            let file = open_claim(&path, true)?;
+            let lock = owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)?;
+            if same_named_claim(&path, &lock)?
+                && let Some(recorded) = read(&lock)?
+                && (other_boot(&recorded, boot.as_deref()) || !guard_held(&recorded.guard))
+            {
+                fs::remove_file(&path)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+            )
+        {
+            tracing::debug!(%error, "could not prune an idle device window claim");
+        }
+    }
 }
 
 fn record(guard: &Path, host_session: Option<&str>) -> io::Result<Record> {
@@ -311,7 +445,23 @@ fn record(guard: &Path, host_session: Option<&str>) -> io::Result<Record> {
         guard,
         pid: process::id(),
         host_session: host_session.map(str::to_owned),
+        boot: local_boot(),
+        hostname: crate::mobile::host_name(),
     })
+}
+
+fn local_boot() -> Option<String> {
+    crate::daemon::read_boot_id()
+        .ok()
+        .map(|boot| boot.as_str().to_owned())
+}
+
+fn other_boot(record: &Record, local_boot: Option<&str>) -> bool {
+    record
+        .boot
+        .as_deref()
+        .zip(local_boot)
+        .is_some_and(|(recorded, ours)| recorded != ours)
 }
 
 /// The same runtime directory can be spelled several ways; a claim compares
@@ -336,48 +486,79 @@ fn acquire(
     loop {
         let found = match owned_lock(path, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(mut lock) => {
+                // A contender can open the old file before pruning unlinks it
+                // and acquire its lock afterward. It owns no named claim.
+                if !same_named_claim(path, &lock)? {
+                    if started.elapsed() >= patience {
+                        return Err(io::Error::other(refusal(claimant, None, false)));
+                    }
+                    continue;
+                }
                 // The claim's last holder left it, but its runtime lock may
                 // still be held, by its updater or by store maintenance, or be
                 // about to be, by an updater that has not yet seen it free.
-                if let Some(last) = read(&lock)
-                    && last.guard != ours.guard
-                    && taken_within(&last.guard, HANDOFF)
-                {
-                    return Err(io::Error::other(refusal(claimant, Some(&last))));
+                match read(&lock) {
+                    Ok(Some(last))
+                        if !other_boot(&last, ours.boot.as_deref())
+                            && last.guard != ours.guard
+                            && taken_within(&last.guard, HANDOFF) =>
+                    {
+                        return Err(io::Error::other(refusal(claimant, Some(&last), false)));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        let mut reason = refusal(claimant, None, false);
+                        reason.unreadable = true;
+                        return Err(io::Error::other(reason));
+                    }
+                    Err(error) => return Err(error),
+                    _ => {}
                 }
                 write(lock.file_mut(), &ours)?;
                 return Ok(StateClaim { _lock: lock });
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => read_path(path)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => match read_path(path) {
+                Ok(found) => found,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
+                Err(error) => return Err(error),
+            },
             Err(error) => return Err(error),
         };
-        if let Some(found) = &found
-            && found.guard != ours.guard
-            && guard_held(&found.guard)
-        {
-            return Err(io::Error::other(refusal(claimant, Some(found))));
+        if let Some(found) = &found {
+            let foreign = other_boot(found, ours.boot.as_deref());
+            if foreign || found.guard != ours.guard && guard_held(&found.guard) {
+                return Err(io::Error::other(refusal(claimant, Some(found), foreign)));
+            }
         }
         // Held, but by a predecessor in this runtime directory that has let
         // go of its runtime lock and is exiting, by a holder whose runtime
         // lock is free and so is exiting too, or by one still writing its
         // record. Each resolves by itself.
         if started.elapsed() >= patience {
-            return Err(io::Error::other(refusal(claimant, found.as_ref())));
+            return Err(io::Error::other(refusal(claimant, found.as_ref(), false)));
         }
         std::thread::sleep(POLL);
     }
 }
 
-fn refusal(claimant: Claimant, record: Option<&Record>) -> StateInUse {
+fn refusal(claimant: Claimant, record: Option<&Record>, foreign: bool) -> StateInUse {
     StateInUse {
         claimant,
         // During an update the recorded daemon has exited and the updater
         // holds its lease, so naming that process would send people after one
         // that isn't there.
         pid: record
+            .filter(|_| !foreign)
             .map(|record| record.pid)
             .filter(|&pid| process_exists(pid)),
-        runtime: record.map(|record| record.runtime.clone()),
+        runtime: record
+            .filter(|_| !foreign)
+            .map(|record| record.runtime.clone()),
+        foreign_host: foreign.then(|| {
+            record
+                .and_then(|record| record.hostname.clone())
+                .unwrap_or_else(|| "another machine".to_owned())
+        }),
+        unreadable: false,
     }
 }
 
@@ -509,24 +690,43 @@ fn parse_locks(locks: &str, device: u64, inode: u64) -> Listed {
     listed
 }
 
-fn read(file: &File) -> Option<Record> {
-    let length = file.metadata().ok()?.len();
-    if length == 0 || length > MAX_RECORD_BYTES {
-        return None;
+fn read(file: &File) -> io::Result<Option<Record>> {
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(None);
+    }
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid saved-data claim");
+    if length > MAX_RECORD_BYTES {
+        return Err(invalid());
     }
     let mut bytes = vec![0; length as usize];
-    file.read_exact_at(&mut bytes, 0).ok()?;
-    let record: Record = serde_json::from_slice(&bytes).ok()?;
-    (record.format == FORMAT).then_some(record)
+    file.read_exact_at(&mut bytes, 0).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            invalid()
+        } else {
+            error
+        }
+    })?;
+    // Future formats can add fields while retaining this ownership header.
+    // Its guard still fences this data during an update or store maintenance.
+    let record: Record = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if !record.guard.is_absolute() || record.guard.parent() != Some(&record.runtime) {
+        return Err(invalid());
+    }
+    Ok(Some(record))
 }
 
 fn read_path(path: &Path) -> io::Result<Option<Record>> {
     match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(file) => Ok(read(&file)),
+        Ok(file) if file.metadata()?.is_file() => read(&file),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid saved-data claim",
+        )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -627,6 +827,19 @@ mod tests {
         // With that lease released, the state is free to another directory.
         drop(lease);
         claim_daemon_state_in(claims.path(), &other.lock, None, Claimant::Daemon).unwrap();
+    }
+
+    #[test]
+    fn launch_diagnoses_persistent_invalid_bytes_after_the_writer_releases_its_claim() {
+        let claims = tempfile::tempdir().unwrap();
+        let path = claims.path().join(DAEMON_CLAIM);
+        let runtime = Runtime::new();
+        let mut writer = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        writer.file_mut().write_all(b"{\"future\":").unwrap();
+        assert_eq!(served_elsewhere(&path, &runtime.lock).unwrap(), None);
+        drop(writer);
+        let refusal = served_elsewhere(&path, &runtime.lock).unwrap().unwrap();
+        assert!(refusal.to_string().contains("unreadable"), "{refusal}");
     }
 
     #[test]
@@ -747,11 +960,16 @@ mod tests {
             runtime: PathBuf::from("/nonexistent"),
             pid,
             host_session: None,
+            boot: None,
+            hostname: None,
         };
-        assert_eq!(refusal(Claimant::Daemon, Some(&record(gone))).pid, None);
+        assert_eq!(
+            refusal(Claimant::Daemon, Some(&record(gone)), false).pid,
+            None
+        );
         let serving = std::process::id();
         assert_eq!(
-            refusal(Claimant::Daemon, Some(&record(serving))).pid,
+            refusal(Claimant::Daemon, Some(&record(serving)), false).pid,
             Some(serving)
         );
     }
@@ -781,6 +999,85 @@ mod tests {
         ));
         assert!(refusal.to_string().contains("already open"), "{refusal}");
         claim_window_state_in(claims.path(), "window-2", &second.lock).unwrap();
+    }
+
+    #[test]
+    fn a_newer_format_still_honors_its_held_runtime_guard() {
+        let claims = tempfile::tempdir().unwrap();
+        let (first, second) = (Runtime::new(), Runtime::new());
+        let held = first.hold();
+        let _other = second.hold();
+        let path = claims.path().join(DAEMON_CLAIM);
+        let mut opened = owned_lock(&path, libc::LOCK_EX).unwrap();
+        let mut saved = record(&first.lock, None).unwrap();
+        saved.format = FORMAT + 256;
+        write(opened.file_mut(), &saved).unwrap();
+        drop(opened);
+        let bytes = fs::read(&path).unwrap();
+
+        let refused = refusal_of(claim_daemon_state_in(
+            claims.path(),
+            &second.lock,
+            None,
+            Claimant::Daemon,
+        ));
+        assert_eq!(refused.runtime(), Some(saved.runtime.as_path()));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        drop(held);
+        claim_daemon_state_in(claims.path(), &second.lock, None, Claimant::Daemon).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_claim_is_neither_erased_nor_taken_over() {
+        let claims = tempfile::tempdir().unwrap();
+        let current = Runtime::new();
+        let _held = current.hold();
+        let path = claims.path().join(DAEMON_CLAIM);
+        let mut opened = owned_lock(&path, libc::LOCK_EX).unwrap();
+        opened.file_mut().write_all(b"{future format").unwrap();
+        drop(opened);
+
+        let refused = refusal_of(claim_daemon_state_in(
+            claims.path(),
+            &current.lock,
+            None,
+            Claimant::Daemon,
+        ));
+        assert!(refused.to_string().contains("unreadable"), "{refused}");
+        assert_eq!(fs::read(&path).unwrap(), b"{future format");
+    }
+
+    #[test]
+    fn a_held_claim_from_another_boot_names_that_host_even_at_the_same_path() {
+        let claims = tempfile::tempdir().unwrap();
+        let ours = Runtime::new();
+        let _lease = ours.hold();
+        let path = claims.path().join(DAEMON_CLAIM);
+        let mut held = owned_lock(&path, libc::LOCK_EX).unwrap();
+        let mut remote = record(&ours.lock, None).unwrap();
+        let local = remote
+            .boot
+            .as_ref()
+            .expect("test requires the local kernel boot ID");
+        remote.boot = Some(format!("{local}-other"));
+        remote.hostname = Some("workstation-b".into());
+        write(held.file_mut(), &remote).unwrap();
+
+        let refused = refusal_of(claim_daemon_state_in(
+            claims.path(),
+            &ours.lock,
+            None,
+            Claimant::Daemon,
+        ));
+        assert_eq!(refused.pid(), None);
+        assert_eq!(refused.runtime(), None);
+        assert!(refused.to_string().contains("workstation-b"), "{refused}");
+        assert_eq!(served_elsewhere(&path, &ours.lock).unwrap(), Some(refused));
+        drop(held);
+
+        assert_eq!(served_elsewhere(&path, &ours.lock).unwrap(), None);
+        claim_daemon_state_in(claims.path(), &ours.lock, None, Claimant::Daemon).unwrap();
     }
 
     #[test]
