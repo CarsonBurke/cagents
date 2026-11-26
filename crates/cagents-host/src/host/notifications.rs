@@ -313,7 +313,7 @@ impl Pending {
         }
     }
 
-        fn clear_waiting(&mut self, clear: WaitingClear) {
+    fn clear_waiting(&mut self, clear: WaitingClear) {
         if self
             .events
             .get(&clear.target)
@@ -1507,7 +1507,10 @@ fn session_settlement_admitted(shared: &Weak<Shared>, event: &Event) -> bool {
     shared.upgrade().is_some_and(|shared| {
         let pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending.started_turns.contains(&session)
-            || pending.cleared_waiting.iter().any(|clear| clear.matches(event))
+            || pending
+                .cleared_waiting
+                .iter()
+                .any(|clear| clear.matches(event))
     })
 }
 
@@ -4224,8 +4227,13 @@ mod tests {
             terminal_wait_prefix(&boot, original) + "later request"
         );
 
+        let previous = deferred.events[&target].clone();
         record(replacement, "replacement");
+        let next = shared.pending.lock().unwrap().events[&target].clone();
         handle.clear_terminal_waiting(session, &boot, original);
+        let broker = Arc::downgrade(&shared);
+        assert!(session_settlement_admitted(&broker, &previous));
+        assert!(!session_settlement_admitted(&broker, &next));
         let pending = deferred.followed_by(take_pending(&shared));
         assert_eq!(
             pending.events[&target].evidence.key,
