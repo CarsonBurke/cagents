@@ -1248,17 +1248,53 @@ fn a_codex_agent_whose_provider_survives_keeps_the_refusal() {
     assert!(has_native_owner(&fixture.source).unwrap());
 }
 
+#[cfg(target_os = "macos")]
+const CODEX_FIXTURE_MARKER: &str = "FIXTURE_STARTED_ARGV";
+
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static OFFLINE_CODEX_SERVER: extern "C" fn() = {
+    extern "C" fn serve_fixture() {
+        let Some(marker) = std::env::var_os(CODEX_FIXTURE_MARKER) else {
+            return;
+        };
+        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        if !matches!(arguments.as_slice(), [server, listen, endpoint]
+            if server == "app-server" && listen == "--listen" && endpoint.starts_with("unix://"))
+        {
+            return;
+        }
+        // Only a private fixture with exact app-server argv enters this
+        // test-only path. It records its real exec args and waits for EOF.
+        let notes = arguments.join("\n") + "\n";
+        let finished = std::fs::write(marker, notes)
+            .and_then(|()| std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()));
+        if let Err(error) = finished {
+            eprintln!("offline Codex fixture: {error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    serve_fixture
+};
+
 /// A fake app-server records its actual launch, then waits without speaking the
 /// provider protocol. These tests cover execution admission, not provider RPC.
 fn codex_start_fixture(root: &std::path::Path) -> Fixture {
     let mut fixture = Fixture::new(root);
     let program = root.join("codex");
     #[cfg(target_os = "linux")]
-    let script = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${0%/*}/started-argv\"\nexec /bin/sleep 60\n";
+    {
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${0%/*}/started-argv\"\nexec /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     #[cfg(target_os = "macos")]
-    let script = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$FIXTURE_STARTED_ARGV\"\nwhile IFS= read -r line; do :; done\n";
-    std::fs::write(&program, script).unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &program).unwrap();
     let home = root.join("codex-home");
     std::fs::create_dir(&home).unwrap();
     fixture.source.launch.recipe.program = program.to_str().unwrap().into();
@@ -1267,7 +1303,7 @@ fn codex_start_fixture(root: &std::path::Path) -> Fixture {
     let environment = {
         let mut environment = environment;
         environment.insert(
-            "FIXTURE_STARTED_ARGV".into(),
+            CODEX_FIXTURE_MARKER.into(),
             root.join("started-argv").to_str().unwrap().into(),
         );
         environment
