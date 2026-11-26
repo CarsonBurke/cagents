@@ -8,6 +8,8 @@ DEFAULT_REPOSITORY='<OWNER>/<REPO>'
 TARGET=aarch64-apple-darwin
 LABEL=dev.cagents.Cagents.Daemon
 MARKER_TEXT='cagents install root'
+LOGIN_COMMAND='CDPATH= cd -P "$1/current/bin" && exec "$PWD/cagents" daemon start'
+LOGIN_NAME=cagents-login
 
 usage() {
     cat <<'EOF'
@@ -155,12 +157,18 @@ installed_daemon() {
     fi
 }
 
-# Whether the login item at AGENT_PLIST runs a version of this installation.
+# Recognize this installation's stable login item and its older versioned form.
 owned_agent() {
     [ -f "$AGENT_PLIST" ] || return 1
     program=$("$PLIST_BUDDY" -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null) || return 1
     case $program in
         "$PREFIX/versions/"*) return 0 ;;
+        /bin/sh)
+            [ "$("$PLIST_BUDDY" -c 'Print :ProgramArguments:1' "$AGENT_PLIST")" = -c ] \
+                && [ "$("$PLIST_BUDDY" -c 'Print :ProgramArguments:2' "$AGENT_PLIST")" = "$LOGIN_COMMAND" ] \
+                && [ "$("$PLIST_BUDDY" -c 'Print :ProgramArguments:3' "$AGENT_PLIST")" = "$LOGIN_NAME" ] \
+                && [ "$("$PLIST_BUDDY" -c 'Print :ProgramArguments:4' "$AGENT_PLIST")" = "$PREFIX" ]
+            ;;
         *) return 1 ;;
     esac
 }
@@ -391,9 +399,9 @@ AGENT_PRIOR=$AGENT_STAGE/prior
 # changes until the release is in place and answers from there.
 #
 # The login item runs `cagents daemon start` once at login, as the XDG
-# autostart entry does on Linux. It names the version's real path: on macOS
-# an executable sees the path it was started by, and a daemon started
-# through `current` would look for its companions in the next version.
+# autostart entry does on Linux. Resolve the selected bin directory before
+# exec, so the CLI finds companions beside its own executable even if
+# another update switches current after launch.
 cat > "$AGENT_NEW" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -403,9 +411,11 @@ cat > "$AGENT_NEW" <<EOF
 	<string>$LABEL</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>$(printf '%s' "$TARGET_DIR/bin/cagents" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')</string>
-		<string>daemon</string>
-		<string>start</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>$(printf '%s' "$LOGIN_COMMAND" | sed 's/&/\&amp;/g')</string>
+		<string>$LOGIN_NAME</string>
+		<string>$(printf '%s' "$PREFIX" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

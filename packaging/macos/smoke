@@ -51,10 +51,30 @@ codesign --verify --strict "$PREFIX/Cagents.app" || fail 'the installed Cagents.
     || fail 'the Cagents.app launcher does not reach the installed cagents-ui'
 AGENT="$ROOT/home/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist"
 plutil -lint -s "$AGENT" || fail 'the login item is not a valid property list'
-[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT")" = "$PREFIX/versions/$VERSION/bin/cagents" ] \
-    || fail 'the login item does not run the version by its real path'
 [ "$(/usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$AGENT")" = true ] || fail 'the login item does not run at load'
 [ -z "$(find "$PREFIX" -xattrname com.apple.quarantine -print 2>/dev/null)" ] || fail 'installed files carry quarantine'
+
+# Exercise the plist's actual command after an updater selects another build.
+# A stand-in shows the path and arguments without launching a second daemon.
+login_argument() {
+    /usr/libexec/PlistBuddy -c "Print :ProgramArguments:$1" "$AGENT"
+}
+NEXT_BIN="$PREFIX/versions/smoke-successor/bin"
+mkdir -p "$NEXT_BIN"
+cat > "$NEXT_BIN/cagents" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$0" "$@"
+EOF
+chmod +x "$NEXT_BIN/cagents"
+ln -s versions/smoke-successor "$PREFIX/.smoke-next"
+mv -fh "$PREFIX/.smoke-next" "$PREFIX/current"
+login_result=$("$(login_argument 0)" "$(login_argument 1)" "$(login_argument 2)" \
+    "$(login_argument 3)" "$(login_argument 4)") || fail 'the login item could not start the selected build'
+[ "$login_result" = "$(printf '%s\n' "$NEXT_BIN/cagents" daemon start)" ] \
+    || fail 'the unchanged login item did not start the selected build by its real path'
+ln -s "versions/$VERSION" "$PREFIX/.smoke-next"
+mv -fh "$PREFIX/.smoke-next" "$PREFIX/current"
+rm -r "$PREFIX/versions/smoke-successor"
 
 # The daemon, started and stopped through the command link as a person
 # would, in the private runtime directory. On macOS an executable sees the
