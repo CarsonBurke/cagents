@@ -967,7 +967,7 @@ pub(crate) fn compare_with_recovery(
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "host"))]
+#[cfg(any(test, all(target_os = "macos", feature = "host")))]
 pub(crate) fn verify_ready_inventory(
     transaction: &str,
     source: &HostSessionProof,
@@ -1974,6 +1974,44 @@ mod tests {
             chats: vec![],
             checkpoint_before: None,
         }
+    }
+
+    #[test]
+    fn ready_selection_requires_a_new_same_boot_owner_with_original_live_lineage() {
+        let original = terminal();
+        let transaction = uuid::Uuid::new_v4().to_string();
+        let source = proof();
+        let mut serving = proof();
+        serving.host_session_id = crate::model::HostSessionId::new("successor");
+        serving.host_incarnation = crate::model::HostIncarnation::new("new daemon");
+        let captured = crate::upgrade::recovery::Census {
+            terminals: vec![original.session.clone()],
+            ..Default::default()
+        };
+        let mut live = original.clone();
+        live.session.continuity = TerminalContinuity::Live {
+            host_session_id: serving.host_session_id.clone(),
+            boot_id: serving.boot_id.clone(),
+            host_incarnation: serving.host_incarnation.clone(),
+        };
+        let verify = |serving: &HostSessionProof, terminals: &[TerminalDescriptor]| {
+            verify_ready_inventory(
+                &transaction,
+                &source,
+                &captured,
+                serving,
+                terminals,
+                &[],
+                &Default::default(),
+            )
+        };
+        assert!(verify(&source, std::slice::from_ref(&original)).is_err());
+        assert!(verify(&serving, &[]).is_err());
+        assert!(verify(&serving, std::slice::from_ref(&live)).is_err());
+        live.upgrade_sources.push(original.session);
+        assert!(verify(&serving, std::slice::from_ref(&live)).is_ok());
+        serving.boot_id = crate::model::BootId::new("another boot");
+        assert!(verify(&serving, &[live]).is_err());
     }
     #[test]
     fn a_census_takes_as_many_chats_as_a_daemon_may_host() {
