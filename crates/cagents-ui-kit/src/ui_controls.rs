@@ -36,7 +36,9 @@ pub use trailing::trailing;
 mod yielding;
 pub use yielding::yielding;
 
-pub use display::{badge, bounded_badge, change_counts, comment_card, display_path};
+pub use display::{
+    CountTone, badge, bounded_badge, change_counts, comment_card, count_badge, display_path,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use gauge::activity_animates;
 pub use gauge::{

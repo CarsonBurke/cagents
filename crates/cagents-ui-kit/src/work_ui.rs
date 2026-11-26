@@ -661,9 +661,12 @@ impl State {
                 .class(dot(column_tone(column)))
                 .into(),
             design::heading(column.label()).into(),
-            design::caption(items.len().to_string())
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
+            // An empty lane says so beneath; a zero badge would only repeat it.
+            if items.is_empty() {
+                widget::Space::new().into()
+            } else {
+                crate::ui_controls::count_badge(items.len().to_string(), Default::default())
+            },
         ])
         .spacing(space::S)
         .align_y(Alignment::Center)
