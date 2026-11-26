@@ -34,13 +34,19 @@ pub(super) enum ReceiptKind {
 pub(super) const SCOPED_SPARE: &str = "native-scope-spare-1";
 
 #[cfg(target_os = "macos")]
+pub(super) const UPDATE_RELEASE: &str = "native-update-release-1";
+
+#[cfg(target_os = "macos")]
 pub(super) fn supports_scoped_spare(record: &Record) -> bool {
-    record.build.as_ref().is_some_and(|build| {
-        build
-            .capabilities
-            .iter()
-            .any(|capability| capability == SCOPED_SPARE)
-    })
+    supports_capability(record, SCOPED_SPARE)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn supports_capability(record: &Record, capability: &str) -> bool {
+    record
+        .build
+        .as_ref()
+        .is_some_and(|build| build.capabilities.iter().any(|item| item == capability))
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,7 +228,24 @@ impl Detached {
                     .is_some_and(|role| role.matches(&receipt.record, &self.proof)))
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn update_release_receipt(&self, retain: bool) -> Result<bool, String> {
+        let digest = source_digest(&self.source)?;
+        self.receipt_matching(retain, DetachedWork::Spare, |receipt| {
+            receipt.sources.contains(&digest)
+        })
+    }
+
     pub(super) fn receipt(&self, retain: bool, detached: DetachedWork) -> Result<bool, String> {
+        self.receipt_matching(retain, detached, |_| true)
+    }
+
+    fn receipt_matching(
+        &self,
+        retain: bool,
+        detached: DetachedWork,
+        matches_source: impl Fn(&Receipt) -> bool,
+    ) -> Result<bool, String> {
         #[cfg(target_os = "macos")]
         if detached == DetachedWork::Stop && !supports_scoped_spare(&self.record) {
             // A legacy Darwin close receipt did not encode its cleanup scope.
@@ -233,7 +256,7 @@ impl Detached {
             &self.record.holder,
             ReceiptKind::Exact,
             retain,
-            |receipt| self.matches_receipt(receipt),
+            |receipt| self.matches_receipt(receipt) && matches_source(receipt),
         )?;
         #[cfg(target_os = "linux")]
         let _ = detached;
@@ -244,7 +267,7 @@ impl Detached {
                 &self.record.holder,
                 ReceiptKind::Spared,
                 retain,
-                |receipt| self.matches_receipt(receipt),
+                |receipt| self.matches_receipt(receipt) && matches_source(receipt),
             );
         }
         Ok(exact)

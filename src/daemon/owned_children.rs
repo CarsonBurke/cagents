@@ -204,13 +204,33 @@ impl OwnedChildren {
         if detached == DetachedWork::Spare && self.group_signalled {
             return Ok(());
         }
-        self.provider = Pinned::pin(provider)?;
+        #[cfg(target_os = "linux")]
+        {
+            self.provider = Pinned::pin(provider)?;
+        }
+        #[cfg(target_os = "macos")]
+        if !provider.is_empty() {
+            self.provider = Pinned::pin(provider)?;
+        }
         self.detached = if self.server_killed.get() || self.killed() {
             DetachedWork::Stop
         } else {
             detached
         };
         Ok(())
+    }
+
+    /// Set the extra pinned provider peer independently of the eventual
+    /// release scope. A wrapper may have started it in another process group.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn record_update_server(&mut self, server: &Process) -> io::Result<()> {
+        self.provider = Pinned::pin(std::slice::from_ref(server))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn spare_update_server(&mut self) {
+        self.detached = DetachedWork::Spare;
     }
 
     /// Whether the provider, or one of its `provider` processes this process

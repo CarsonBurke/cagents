@@ -292,21 +292,44 @@ fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
 #[cfg(target_os = "macos")]
 #[test]
 fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
+    verify_darwin_confirmed_codex_restart("nonretained-restart", false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn darwin_confirmed_upgrade_restarts_a_forked_nonretained_codex() {
+    verify_darwin_confirmed_codex_restart("forked-nonretained-restart", true);
+}
+
+#[cfg(target_os = "macos")]
+fn verify_darwin_confirmed_codex_restart(mode: &str, original_forks: bool) {
     use crate::host::upgrade_inspect::{
         CodexExecution, ExecutionEnd, codex_execution, execution_end,
     };
     use crate::terminal_ipc::{ClientRequest, ServerResponse};
     use std::os::fd::AsRawFd;
 
-    const RESTART: &str =
-        "host::state::native_upgrade_tests::darwin_ordinary_upgrade_restarts_nonretained_codex";
-    if std::env::var(MODE).as_deref() != Ok("nonretained-restart") {
-        run_darwin_native_fixture(RESTART, "nonretained-restart");
+    if std::env::var(MODE).as_deref() != Ok(mode) {
+        run_darwin_native_fixture(thread::current().name().unwrap(), mode);
         return;
     }
 
     let root = PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
     let program = install_provider(&root);
+    if original_forks {
+        let script = fs::read_to_string(&program).unwrap();
+        let launch = "exec \"$CAGENTS_UPGRADE_EXE\"";
+        let fork_once = "if [ ! -e \"$CAGENTS_UPGRADE_ROOT/original-launch-forked\" ]; then
+  /usr/bin/true
+  : > \"$CAGENTS_UPGRADE_ROOT/original-launch-forked\"
+fi";
+        assert_eq!(script.matches(launch).count(), 1);
+        fs::write(
+            &program,
+            script.replace(launch, &format!("{fork_once}\n{launch}")),
+        )
+        .unwrap();
+    }
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     let original = HostSessionProof {
         host_session_id: HostSessionId::new("nonretained-fixture"),
@@ -340,6 +363,12 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
     let handle = host.lock().unwrap().chats[&chat_id].handle.clone();
     wait_until(
         || {
+            if let Some(error) = handle.failure() {
+                panic!(
+                    "non-retained fixture provider failed: {error}; {:?}",
+                    handle.snapshot(None).and_then(|state| state.error)
+                );
+            }
             handle.confirmed_session_id().as_deref() == Some(THREAD)
                 && handle.check_update_readiness()
                     == Ok(crate::chat::runtime::UpdateReadiness::Idle)
@@ -371,15 +400,16 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
         "the original holder and provider did not exit",
     );
     assert!(!control.exists() && !listener.exists());
+    let holder = &previous_owner.holder;
     for suffix in ["closed", "spared"] {
-        let holder = &previous_owner.holder;
-        assert!(
-            !native
+        assert_eq!(
+            native
                 .join(format!(
                     "{chat_id}-{}-{}.{suffix}",
                     holder.pid, holder.start
                 ))
-                .exists()
+                .exists(),
+            (suffix == "spared") == original_forks
         );
     }
     let store = Store::discover().unwrap();
@@ -399,10 +429,13 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
         codex_execution(&saved.source, &original.boot_id),
         CodexExecution::Ended
     );
-    assert_eq!(
-        execution_end(&saved.source, &original.boot_id, Ok(Vec::new())),
-        ExecutionEnd::Unproved
-    );
+    if original_forks {
+        assert_eq!(
+            execution_end(&saved.source, &original.boot_id, Ok(Vec::new())),
+            ExecutionEnd::Unproved,
+            "scoped evidence must never stand in for whole-tree cleanup"
+        );
+    }
     drop(handle);
     drop(host);
     drop(lease);

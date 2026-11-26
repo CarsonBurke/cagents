@@ -832,6 +832,24 @@ impl Handle {
             Owner::Remote(remote) => remote.state().native_continuity.clone(),
         }
     }
+    /// Confirm that this exact app-server supports the update close scope.
+    #[cfg(target_os = "macos")]
+    pub fn verify_update_release(&self) -> Result<(), String> {
+        match &self.0 {
+            Owner::Local(local) => local.verify_update_release(),
+            Owner::Remote(_) => {
+                Err("Only a local native holder can prepare an update release".into())
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn commit_update_release(&self) {
+        if let Owner::Local(local) = &self.0 {
+            local.commit_update_release();
+        }
+    }
+
     pub fn preserve_for_restart(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.preserve_for_restart(),
