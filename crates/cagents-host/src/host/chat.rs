@@ -4509,6 +4509,22 @@ fn process_inner(
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
+            let released = state
+                .held_followups
+                .get_mut(&chat_id)
+                .is_some_and(|holders| holders.remove(&client));
+            if state
+                .held_followups
+                .get(&chat_id)
+                .is_some_and(std::collections::BTreeSet::is_empty)
+            {
+                state.held_followups.remove(&chat_id);
+            }
+            drop(state);
+            // A message waiting behind what this window held may go now.
+            if released {
+                super::agent_execution::mailbox::wake(host);
+            }
             Ok(ServerResponse::Detached)
         }
         ClientRequest::ChatCommand { chat_id, command } => {
@@ -4550,6 +4566,29 @@ fn process_inner(
             drop(state);
             if visible {
                 changed(&Arc::downgrade(host), chat_id, Update::Presentation);
+            }
+            Ok(ServerResponse::Accepted)
+        }
+        ClientRequest::ChatHoldsFollowups { chat_id, held } => {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
+                receipt.require_attached(client)?;
+                return Ok(ServerResponse::Accepted);
+            }
+            attached_mut(&mut state, client, chat_id)?;
+            let holders = state.held_followups.entry(chat_id).or_default();
+            let changed = if held {
+                holders.insert(client)
+            } else {
+                holders.remove(&client)
+            };
+            if holders.is_empty() {
+                state.held_followups.remove(&chat_id);
+            }
+            drop(state);
+            // A message waiting behind them may go now.
+            if changed && !held {
+                super::agent_execution::mailbox::wake(host);
             }
             Ok(ServerResponse::Accepted)
         }

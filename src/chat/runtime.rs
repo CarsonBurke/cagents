@@ -1760,6 +1760,12 @@ impl LocalHandle {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         accepts_prompt(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
     }
+    /// [`Self::is_idle`], and the provider holds nothing the person queued:
+    /// whether the courier may start a turn now.
+    pub(crate) fn takes_courier(&self) -> bool {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        accepts_courier(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
+    }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
         self.0
@@ -2889,6 +2895,12 @@ fn accepts_prompt(state: &Snapshot) -> bool {
     state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty()
 }
 
+/// Whether the courier may start a turn: the conversation takes a prompt,
+/// and the provider holds nothing the person queued, which goes first.
+fn accepts_courier(state: &Snapshot) -> bool {
+    accepts_prompt(state) && state.queued_messages.is_empty()
+}
+
 impl Actor {
     fn metadata_poll(&self, timeout: i32) -> (libc::pollfd, i32) {
         let mut watch = libc::pollfd {
@@ -3539,9 +3551,9 @@ impl Actor {
                     (run, command)
                 }
                 ActorCommand::IdlePrompt(text) => {
-                    if !accepts_prompt(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
+                    if !accepts_courier(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
                         let _ = refuse(
-                            "The conversation is no longer idle for courier delivery".into(),
+                            "The conversation is no longer idle for courier delivery, or the person's queued message goes first".into(),
                         );
                         continue;
                     }
