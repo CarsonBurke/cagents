@@ -837,6 +837,19 @@ pub fn repository_display_name(repository: &Path) -> String {
         .unwrap_or_else(|| repository.display().to_string())
 }
 
+/// The primary checkout of the project keyed by `repository`, the directory a
+/// person opened and recognizes: the directory holding a Git checkout's own
+/// `.git`, and otherwise the key itself, which is a folder project's own
+/// directory. A repository whose Git directory is elsewhere, such as a
+/// submodule's, is named by that directory, since only Git can say where its
+/// checkout is.
+pub fn primary_checkout(repository: &Path) -> &Path {
+    match repository.parent() {
+        Some(parent) if repository.file_name().is_some_and(|name| name == ".git") => parent,
+        _ => repository,
+    }
+}
+
 /// A Git repository with one linked worktree, for tests of checkouts.
 #[cfg(any(test, feature = "test-support"))]
 pub struct CheckoutFixture {

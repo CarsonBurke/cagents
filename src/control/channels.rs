@@ -201,8 +201,18 @@ fn opened_line(moved: &PaneMove, session: TerminalId) -> String {
     format!(
         "Session {session} had no pane. It now shows in {made}channel \"{title}\" ({}) in {}; open that channel to see it.",
         channel.id,
-        channel.repository.display()
+        checkout_location(channel)
     )
+}
+
+/// Where a channel's panes work, as a person names it: its linked worktree,
+/// or the project's checkout rather than the Git directory that keys it.
+fn checkout_location(channel: &crate::workspace_model::ModelChannel) -> String {
+    let checkout = channel
+        .checkout
+        .as_deref()
+        .unwrap_or_else(|| crate::workspace_model::primary_checkout(&channel.repository));
+    super::format::location(checkout, None)
 }
 
 /// The daemon's refusal says what to do instead; keep it as its sentence.
@@ -243,7 +253,7 @@ fn moved_line(moved: &PaneMove, own: bool) -> String {
             .unwrap_or(moved.pane.title.as_str());
         format!("pane \"{name}\"")
     };
-    let repository = channel.repository.display();
+    let repository = checkout_location(channel);
     if moved.from == Scope::Channel(channel.id) {
         let mut pane = pane;
         pane[..1].make_ascii_uppercase();
@@ -311,7 +321,7 @@ mod tests {
                 .into_iter()
                 .map(|id| ModelChannel {
                     id,
-                    repository: "/repo".into(),
+                    repository: "/repo/.git".into(),
                     title: "channel".into(),
                     title_source: Default::default(),
                     ordinal: 1,
@@ -332,7 +342,7 @@ mod tests {
                     provider: Provider::Claude,
                     account: None,
                     target: Target {
-                        repository: "/repo".into(),
+                        repository: "/repo/.git".into(),
                         directory: "/repo/tree".into(),
                         placement: Some(Scope::Channel(source)),
                     },
@@ -656,7 +666,7 @@ mod tests {
         let made = ChannelId::new();
         model.channels.push(ModelChannel {
             id: made,
-            repository: "/repo".into(),
+            repository: "/repo/.git".into(),
             title: "Auth refactor".into(),
             title_source: Default::default(),
             ordinal: 3,
@@ -716,6 +726,35 @@ mod tests {
             moved_line(&moved, true),
             format!("Your pane is already in channel \"channel\" ({here}).")
         );
+    }
+
+    /// #3825: a line names the checkout a person opened, never the Git
+    /// directory that keys the project, and a channel on a linked worktree
+    /// names that worktree.
+    #[test]
+    fn a_move_names_the_checkout_rather_than_the_git_directory() {
+        let (model, pane, to) = fixture();
+        let mut moved = PaneMove {
+            pane,
+            from: model.views[0].scope.clone(),
+            channel: model.channel(to).unwrap().clone(),
+            created: false,
+            sequence: 5,
+        };
+        let line = moved_line(&moved, true);
+        assert!(line.ends_with(") in /repo."), "{line}");
+        assert!(!line.contains(".git"), "{line}");
+
+        moved.channel.checkout = Some("/srv/repo-fix".into());
+        assert_eq!(
+            moved_line(&moved, true),
+            format!("Moved your pane to channel \"channel\" ({to}) in /srv/repo-fix.")
+        );
+
+        // A folder project is its own checkout.
+        moved.channel.checkout = None;
+        moved.channel.repository = "/srv/notes".into();
+        assert!(moved_line(&moved, true).ends_with(") in /srv/notes."));
     }
 
     #[test]
@@ -836,7 +875,7 @@ mod tests {
                         response: ServerResponse::PaneMoved(PaneMove {
                             pane,
                             from: Scope::Worktree {
-                                repository: "/repo".into(),
+                                repository: "/repo/.git".into(),
                                 path: "/repo".into(),
                             },
                             channel: served.channel(to).unwrap().clone(),
