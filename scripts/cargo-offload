@@ -2753,7 +2753,7 @@ class Offload:
         for option in ("--artifact-dir", "--out-dir"):
             if option in directories:
                 remote, local = directories[option]
-            back = back or self.fetch(slot, remote + "/", local + "/", shell)
+                back = back or self.fetch(slot, remote + "/", local + "/", shell)
         if back:
             say(f"could not copy the results back from {self.host} (rsync exited {back})")
         return back
