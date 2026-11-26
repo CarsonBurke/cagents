@@ -135,3 +135,95 @@ fn dispatch(open: &mut Command) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
+mod tests {
+    use super::*;
+    use crate::descriptor_frame::send_json_with_fds_until;
+
+    #[test]
+    fn startup_admits_only_the_exact_peer_epoch() {
+        use std::io::Read;
+
+        const PATH: &str = "CAGENTS_TEST_WINDOW_STARTUP_PATH";
+        const WRONG_EPOCH: &str = "CAGENTS_TEST_WINDOW_STARTUP_WRONG_EPOCH";
+        if let Some(path) = std::env::var_os(PATH) {
+            let mut stream = UnixStream::connect(path).unwrap();
+            let wrong_epoch = std::env::var_os(WRONG_EPOCH).is_some();
+            let started = crate::pinned_process::started_ticks_of(std::process::id()).unwrap();
+            send_json_with_fds_until(
+                &stream,
+                &Identity {
+                    started: started + u64::from(wrong_epoch),
+                    address: startup_admits_only_the_exact_peer_epoch as fn() as usize as u64,
+                },
+                &[],
+                Instant::now() + CONNECT_TIMEOUT,
+                HANDSHAKE_LIMIT,
+                0,
+                FrameByteOrder::LittleEndian,
+            )
+            .unwrap();
+            let mut decision = [0];
+            if wrong_epoch {
+                assert_eq!(stream.read(&mut decision).unwrap(), 0);
+            } else {
+                stream.read_exact(&mut decision).unwrap();
+                assert_eq!(decision, [ADMITTED]);
+                stream.write_all(b"ready\n").unwrap();
+            }
+            return;
+        }
+
+        let directory = tempfile::Builder::new()
+            .prefix("cgl.")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let path = directory.path().join("startup");
+        let listener = UnixListener::bind(&path).unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let metadata = fs::metadata(&executable).unwrap();
+        for wrong_epoch in [false, true] {
+            let mut command = Command::new(&executable);
+            command
+                .args([
+                    "--exact",
+                    "control::darwin_ui::tests::startup_admits_only_the_exact_peer_epoch",
+                ])
+                .env(PATH, &path)
+                .env_remove(WRONG_EPOCH);
+            if wrong_epoch {
+                command.env(WRONG_EPOCH, "1");
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + CONNECT_TIMEOUT;
+            assert!(
+                crate::descriptor::wait_for_activity(
+                    listener.as_fd(),
+                    libc::POLLIN,
+                    Some(deadline)
+                )
+                .unwrap()
+            );
+            let (mut response, _) = crate::descriptor::accept(&listener).unwrap();
+            let result = verify_window(
+                &response,
+                &executable,
+                (metadata.dev(), metadata.ino()),
+                deadline,
+            );
+            if wrong_epoch {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                response.write_all(&[ADMITTED]).unwrap();
+                assert_eq!(
+                    read_ui_launch_handshake(&mut response, CONNECT_TIMEOUT).unwrap(),
+                    None
+                );
+            }
+            drop(response);
+            assert!(child.wait().unwrap().success());
+        }
+    }
+}
