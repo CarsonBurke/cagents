@@ -464,6 +464,12 @@ fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, 
     let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
     let inherited =
         daemon::lease_handoff::clone_inherited_lease().map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    let _publication = if inherited.is_none() {
+        crate::install_guard::admit_darwin_state_access().map_err(|error| error.to_string())?
+    } else {
+        None
+    };
     let _lease =
         HostLease::acquire_for_store_maintenance(&paths, inherited).map_err(
             |error| match error {
@@ -658,9 +664,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // The lease excludes daemons only in this runtime directory. Before this
     // daemon restores, publishes or saves anything, it also claims the saved
     // data, which a daemon in another runtime directory may already serve.
-    // Declared after the lease, it is released first. A claim that fails for
-    // any other reason than that daemon, such as a read-only data directory,
-    // leaves this daemon serving what it can, as it did before claims.
+    // Declared after the lease, it is released first. Darwin's installer
+    // checks the production claim before changing or removing any saved data.
     let _state = match crate::instance::state_claim::claim_daemon_state(
         &paths.lock,
         proof.host_session_id.as_str(),
@@ -668,6 +673,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         Ok(claim) => Some(claim),
         Err(error) => match crate::instance::state_claim::state_in_use(&error) {
             Some(refusal) => return Err(HostError::StateInUse(refusal.clone())),
+            #[cfg(target_os = "macos")]
+            None if !crate::instance::IS_DEVELOPMENT || crate::update::runs_from_installation() => {
+                return Err(error.into());
+            }
             None => {
                 tracing::warn!(%error, "could not claim this instance's saved data; a daemon in another runtime directory is not kept away from it");
                 None
