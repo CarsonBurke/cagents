@@ -73,6 +73,7 @@ struct Pending {
     inboxes: Option<InboxAttention>,
     retired: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
+    predecessor_reads: BTreeSet<TerminalId>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
     /// The portal service's latest owner, when it changed; `Some(None)` means
@@ -108,6 +109,11 @@ impl Pending {
                 self.acknowledged.insert(id);
             }
         }
+        for session in newer.predecessor_reads {
+            if self.predecessor_reads.len() < MAX_PENDING {
+                self.predecessor_reads.insert(session);
+            }
+        }
         self.committed_events.extend(newer.committed_events);
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
@@ -136,6 +142,7 @@ impl Pending {
             inboxes: self.inboxes,
             retired: self.retired,
             acknowledged: self.acknowledged,
+            predecessor_reads: self.predecessor_reads,
             presence_changed: self.presence_changed,
             reload: self.reload,
             preferences: self.preferences,
@@ -316,9 +323,7 @@ impl Handle {
     }
 }
 
-/// A read of an attached conversation also covers notices from earlier
-/// owners of that conversation. Capture their UUIDs before resolving lineage
-/// so any newly published notice keeps its unread state.
+/// Queue a read of the durable predecessors of an attached conversation.
 pub(super) fn acknowledge_predecessors(host: &SharedHost, session: TerminalId) {
     let notifications = host
         .lock()
@@ -328,33 +333,45 @@ pub(super) fn acknowledge_predecessors(host: &SharedHost, session: TerminalId) {
     let Some(notifications) = notifications else {
         return;
     };
-    let unread: Vec<_> = notifications
-        .snapshot()
-        .notices
-        .into_iter()
-        .filter_map(|notice| match notice.event.target {
-            Target::Session(id) if id != session && !notice.acknowledged => Some((id, notice.id)),
-            _ => None,
-        })
-        .collect();
-    if unread.is_empty() {
-        return;
+    let mut pending = notifications
+        .0
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !pending.stopped && pending.predecessor_reads.len() < MAX_PENDING {
+        pending.predecessor_reads.insert(session);
+        drop(pending);
+        let _ = notifications.0.wake.try_send(());
     }
-    let predecessors = (|| {
-        let registry = super::agent_execution::registry(host)?;
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        registry.notice_predecessors(session)
-    })();
-    match predecessors {
-        Ok(predecessors) => {
-            for (session, id) in unread {
-                if predecessors.contains(&session) {
-                    notifications.acknowledge(id);
-                }
-            }
+}
+
+fn apply_predecessor_reads(
+    journal: &mut Journal,
+    sessions: &BTreeSet<TerminalId>,
+    predecessors: impl Fn(TerminalId) -> Result<BTreeSet<TerminalId>, String>,
+    mut cleared: impl FnMut(&Notice),
+) -> Result<(), String> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let mut prior = BTreeSet::new();
+    for session in sessions {
+        prior.extend(predecessors(*session)?);
+    }
+    if prior.is_empty() {
+        return Ok(());
+    }
+    // A commit receipt is observable before the broker publishes a snapshot.
+    // Read the journal here, before admitting any later events in this batch.
+    for notice in journal.list()? {
+        if matches!(notice.event.target, Target::Session(id) if prior.contains(&id))
+            && !notice.acknowledged
+        {
+            journal.acknowledge(notice.id)?;
+            cleared(&notice);
         }
-        Err(error) => tracing::debug!(%error, %session, "could not resolve attention lineage"),
     }
+    Ok(())
 }
 
 pub(super) struct Broker {
@@ -967,6 +984,22 @@ async fn run(
                 snapshot.diagnostic = Some(error);
             }
         }
+        if let Err(error) = apply_predecessor_reads(
+            journal,
+            &pending.predecessor_reads,
+            |session| {
+                let host = host.upgrade().ok_or("The daemon has stopped")?;
+                let registry = super::agent_execution::registry(&host)?;
+                let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                registry.notice_predecessors(session)
+            },
+            |notice| {
+                delivery.retain(|_, waiting| waiting.id != notice.id);
+                withdraw_notice(&mut withdrawals, notice);
+            },
+        ) {
+            snapshot.diagnostic = Some(error);
+        }
         for id in pending.acknowledged {
             if stopped(&shared) {
                 return;
@@ -1230,6 +1263,58 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         )
+    }
+
+    #[test]
+    fn predecessor_read_clears_a_committed_notice_before_snapshot_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut bridge) =
+            JournalTestBridge::new(&root.path().join("attention.sqlite")).unwrap();
+        let predecessor = TerminalId::new();
+        let current = TerminalId::new();
+        let other = TerminalId::new();
+        let receipt = handle
+            .record_committed(attention_event(predecessor, "first"))
+            .unwrap();
+        let previous = bridge
+            .commit_next(&Preferences::default(), false)
+            .unwrap()
+            .unwrap();
+        receipt.recv().unwrap().unwrap();
+        assert!(handle.snapshot().notices.is_empty());
+
+        let unrelated = bridge
+            .journal
+            .record(attention_event(other, "outside"), false)
+            .unwrap()
+            .unwrap();
+        let mut retired = Vec::new();
+        apply_predecessor_reads(
+            &mut bridge.journal,
+            &[current].into(),
+            |session| {
+                assert_eq!(session, current);
+                Ok([predecessor].into())
+            },
+            |notice| retired.push(notice.id),
+        )
+        .unwrap();
+        assert_eq!(retired, [previous.id]);
+        let visible = bridge.list().unwrap();
+        assert!(
+            visible
+                .iter()
+                .find(|notice| notice.id == previous.id)
+                .unwrap()
+                .acknowledged
+        );
+        assert!(visible.contains(&unrelated));
+        let later = bridge
+            .journal
+            .record(attention_event(predecessor, "later"), false)
+            .unwrap()
+            .unwrap();
+        assert!(bridge.list().unwrap().contains(&later));
     }
 
     #[test]

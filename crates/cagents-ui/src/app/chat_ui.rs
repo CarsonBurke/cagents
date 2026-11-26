@@ -384,7 +384,7 @@ pub enum Action {
     /// What the opening of a pane's conversation names its channel, read
     /// once because the chat's loaded window starts after it.
     OpeningName(CardId, String, Option<String>),
-    UpdatesAcknowledged(Target, Result<(), String>),
+    UpdatesAcknowledged(Target, Result<(), String>, bool),
     Reconnect(Target),
     DraftStartCheckpointed(
         Target,
@@ -11920,6 +11920,16 @@ impl Cagents {
         })
     }
     pub(super) fn acknowledge_chat_updates(&mut self, card: CardId) -> Task<Message> {
+        self.acknowledge_chat_updates_inner(card, true)
+    }
+
+    /// A lineage read from the visible pane should not replace its diagnostic
+    /// if the connection drops between the dwell check and the broker call.
+    pub(super) fn acknowledge_visible_chat_lineage(&mut self, card: CardId) -> Task<Message> {
+        self.acknowledge_chat_updates_inner(card, false)
+    }
+
+    fn acknowledge_chat_updates_inner(&self, card: CardId, report_error: bool) -> Task<Message> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
         };
@@ -11939,7 +11949,7 @@ impl Cagents {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-            Message::ChatUi(Action::UpdatesAcknowledged(target, result))
+            Message::ChatUi(Action::UpdatesAcknowledged(target, result, report_error))
         })
     }
     /// Hands what a conversation's provider reported about the account it
@@ -14831,8 +14841,9 @@ impl Cagents {
                     .unwrap_or_else(Task::none);
                 return Task::batch([retry, removal]);
             }
-            Action::UpdatesAcknowledged(target, result) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
+            Action::UpdatesAcknowledged(target, result, report_error) => {
+                if report_error
+                    && let Some(runtime) = self.chat_runtime_mut(target)
                     && let Err(error) = result
                 {
                     runtime.error = Some(error);

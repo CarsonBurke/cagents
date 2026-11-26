@@ -616,7 +616,9 @@ impl Cagents {
                 card,
                 session: self.card_state(card).and_then(card_session),
                 can_acknowledge: match self.cards.get(&card) {
-                    Some(CardRuntime::Chat(runtime)) => runtime.handle().is_some(),
+                    Some(CardRuntime::Chat(runtime)) => {
+                        runtime.handle().is_some_and(|handle| handle.is_connected())
+                    }
                     Some(CardRuntime::Terminal(_)) => true,
                     _ => false,
                 },
@@ -692,7 +694,7 @@ impl Cagents {
             if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&pane.card) {
                 let _ = handle.acknowledge_updates();
             }
-            return self.acknowledge_chat_updates(pane.card);
+            return self.acknowledge_visible_chat_lineage(pane.card);
         }
         self.acknowledge_active_pane_with_notices(false)
     }
