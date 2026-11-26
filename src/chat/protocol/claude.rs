@@ -472,20 +472,32 @@ pub(crate) fn decode_attribution_argument(argument: &str) -> Option<String> {
     read_attribution_file(&terminal_attribution_directory().ok()?, candidate)
 }
 
-pub(crate) fn apply_spawn_attribution(spec: &mut ProcessSpec, store: &std::path::Path) {
-    let recipe = crate::model::LaunchRecipe {
-        program: spec.program.clone(),
-        arguments: Vec::new(),
-        working_directory: spec.working_directory.clone(),
-        environment: spec.environment.clone(),
-        unset_environment: spec.unset_environment.clone(),
-    };
+pub(crate) fn apply_spawn_attribution(spec: &mut ProcessSpec, store: &Path) {
+    let recipe = spawn_attribution_recipe(spec);
     apply_spawn_attribution_with(
         &mut spec.arguments,
         &recipe,
         || Ok(store.to_path_buf()),
         managed_attribution,
     );
+}
+
+fn spawn_attribution_recipe(spec: &ProcessSpec) -> crate::model::LaunchRecipe {
+    // The provider's spawn clears the inherited environment. A missing
+    // key belongs to this exact execution, never the helper's own account.
+    let mut unset_environment = spec.unset_environment.clone();
+    for name in ["HOME", "CLAUDE_CONFIG_DIR"] {
+        if !spec.environment.contains_key(name) {
+            unset_environment.insert(name.to_owned());
+        }
+    }
+    crate::model::LaunchRecipe {
+        program: spec.program.clone(),
+        arguments: Vec::new(),
+        working_directory: spec.working_directory.clone(),
+        environment: spec.environment.clone(),
+        unset_environment,
+    }
 }
 
 fn apply_spawn_attribution_with(

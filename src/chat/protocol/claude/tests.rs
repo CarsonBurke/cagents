@@ -15732,6 +15732,27 @@ fn a_reopened_narration_reads_as_commentary_from_its_signature() {
 }
 
 #[test]
+fn native_attribution_uses_the_exact_spawn_environment() {
+    let mut recipe = crate::model::LaunchRecipe {
+        program: "claude".into(),
+        arguments: Vec::new(),
+        working_directory: "/work".into(),
+        environment: [("HOME".into(), "/fixture/system".into())].into(),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let captured = spawn_attribution_recipe(&spec);
+    assert!(
+        captured.unset_environment.contains("CLAUDE_CONFIG_DIR"),
+        "an absent config directory cannot be inherited from the daemon"
+    );
+    assert!(!captured.unset_environment.contains("HOME"));
+    recipe.environment.clear();
+    let captured = spawn_attribution_recipe(&ProcessSpec::from(&recipe));
+    assert!(captured.unset_environment.contains("HOME"));
+}
+
+#[test]
 fn large_managed_attribution_uses_private_settings_and_explicit_files_stay_in_place() {
     use std::os::unix::fs::PermissionsExt;
 
