@@ -2621,3 +2621,854 @@ fn muse_modes_are_offered_in_the_order_of_claude_s_equivalents() {
         ["manual", "auto", "dontAsk", "bypassPermissions"]
     );
 }
+
+// Antigravity 1.5.17's subagents, in the frames it sent for one started
+// alone, two started together and one stopped mid-command.
+const CHILD: &str = "8b1b5963-48e3-438e-8d6f-318ff25b3c04";
+const OTHER_CHILD: &str = "389cf9b0-52ad-471d-8cb4-f458060dd84a";
+
+fn invoke(call: &str, role: &str, prompt: &str, status: &str) -> Value {
+    json!({"sessionUpdate": "tool_call", "toolCallId": call, "name": "invoke_subagent",
+        "kind": "other", "title": "Run invoke_subagent", "status": status,
+        "rawInput": {"Model": "inherit", "Prompt": prompt, "Role": role, "TypeName": "self"}})
+}
+
+fn child_command(child: &str, call: &str, line: &str, status: &str) -> Value {
+    json!({"sessionUpdate": "tool_call", "toolCallId": format!("{child}:{call}"),
+        "name": "run_command", "kind": "execute", "title": line, "status": status,
+        "rawInput": {"CommandLine": line, "WaitMsBeforeAsync": 5000}})
+}
+
+fn asks(session: &str, id: &str, call: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+        "params": {"sessionId": session, "toolCall": call, "options": [
+            {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}})
+}
+
+/// Each subagent update: its ID, role, status and whether it waits.
+fn listed(step: &Step) -> Vec<(&str, &str, Option<ToolStatus>, Option<bool>)> {
+    step.events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Subagent {
+                id,
+                kind,
+                status,
+                waiting,
+                ..
+            } => Some((id.as_str(), kind.as_str(), *status, *waiting)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each subagent step shown: the subagent's ID, the step's ID and status.
+fn child_steps(step: &Step) -> Vec<(&str, &str, ToolStatus)> {
+    step.events
+        .iter()
+        .filter_map(|event| match event {
+            Event::SubagentItem { id, item } => Some((
+                id.as_str(),
+                item.id.as_str(),
+                match &item.content {
+                    ItemContent::Command { status, .. } | ItemContent::Tool { status, .. } => {
+                        *status
+                    }
+                    other => panic!("not a step: {other:?}"),
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn request(step: &Step) -> Request {
+    step.events
+        .iter()
+        .find_map(|event| match event {
+            Event::Request(request) => Some(request.clone()),
+            _ => None,
+        })
+        .expect("a request")
+}
+
+#[test]
+fn a_subagent_is_listed_by_its_role_with_its_steps_apart_from_the_parents() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Have a subagent list the files.");
+    let call = "call_12362618081845022504";
+    let subagent = format!("tool:{call}");
+    let prompt_text = "Please list all the files and directories in the current working directory (/var/tmp/agy-probe-proj) and report the list back in your response.";
+    let step = acp
+        .receive(update(
+            &session,
+            invoke(call, "File Lister", prompt_text, "in_progress"),
+        ))
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [(
+            subagent.as_str(),
+            "File Lister",
+            Some(ToolStatus::Running),
+            Some(false)
+        )]
+    );
+    assert!(step.events.iter().any(|event| matches!(event,
+        Event::Subagent { description, model: None, background: Some(false), .. }
+            if description == prompt_text)));
+    // The call that started it stays among the parent's steps, under the
+    // subagent's ID, which is how the step links to it.
+    assert_eq!(items(&step)[0].id, subagent);
+    // It reports its end as soon as the subagent starts.
+    let step = acp
+        .receive(update(
+            &session,
+            invoke(call, "File Lister", prompt_text, "completed"),
+        ))
+        .unwrap();
+    assert!(listed(&step).is_empty());
+
+    let command = child_command(
+        CHILD,
+        "call_6533409358328079481",
+        "ls -la /var/tmp/agy-probe-proj",
+        "pending",
+    );
+    let step = acp.receive(update(&session, command.clone())).unwrap();
+    let step_id = format!("tool:{CHILD}:call_6533409358328079481");
+    assert_eq!(
+        child_steps(&step),
+        [(subagent.as_str(), step_id.as_str(), ToolStatus::Running)]
+    );
+    assert!(items(&step).is_empty());
+    assert!(listed(&step).is_empty());
+
+    let step = acp.receive(asks(&session, "1", command.clone())).unwrap();
+    let asked = request(&step);
+    assert_eq!(asked.title, "File Lister: ls -la /var/tmp/agy-probe-proj");
+    assert!(step.events.contains(&Event::Waiting(true)));
+    assert_eq!(listed(&step), [(subagent.as_str(), "", None, Some(true))]);
+    assert!(items(&step).is_empty());
+    let step = acp
+        .command(Command::Answer {
+            request_id: asked.id,
+            action: "allow".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(listed(&step), [(subagent.as_str(), "", None, Some(false))]);
+    assert!(step.events.contains(&Event::Waiting(false)));
+
+    let mut running = command.clone();
+    running["sessionUpdate"] = json!("tool_call_update");
+    running["status"] = json!("in_progress");
+    acp.receive(update(&session, running)).unwrap();
+    // The parent's response ending while the subagent's command runs leaves
+    // the parent at work on its subagent, not waiting on background work.
+    let step = acp
+        .receive(update(
+            &session,
+            json!({"sessionUpdate": "usage_update", "used": 12688, "size": 1048576}),
+        ))
+        .unwrap();
+    assert!(statuses(&step).is_empty());
+    assert!(child_steps(&step).is_empty());
+    let mut done = command;
+    done["sessionUpdate"] = json!("tool_call_update");
+    done["status"] = json!("completed");
+    let step = acp.receive(update(&session, done)).unwrap();
+    assert_eq!(
+        child_steps(&step),
+        [(subagent.as_str(), step_id.as_str(), ToolStatus::Succeeded)]
+    );
+
+    assert!(
+        acp.command(Command::StopSubagent {
+            id: subagent.clone()
+        })
+        .is_err()
+    );
+    let Event::Capabilities(capabilities) = acp.capabilities() else {
+        unreachable!()
+    };
+    assert!(!capabilities.stop_subagent);
+
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [(
+            subagent.as_str(),
+            "",
+            Some(ToolStatus::Succeeded),
+            Some(false)
+        )]
+    );
+    let settled = step
+        .events
+        .iter()
+        .position(|event| *event == Event::TurnSettled)
+        .unwrap();
+    let ended = step
+        .events
+        .iter()
+        .position(|event| matches!(event, Event::Subagent { .. }))
+        .unwrap();
+    assert!(ended < settled, "the turn settles once its subagents have");
+}
+
+#[test]
+fn subagents_started_together_are_told_apart_only_on_evidence() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Start two subagents together.");
+    let patient = "call_14464107016637035427";
+    let hasty = "call_14464107016637036432";
+    for (call, role, text) in [
+        (
+            patient,
+            "Patient Reader",
+            "First read README.md, then run the shell command `sleep 6`, then run `echo patient-done`, and report the output.",
+        ),
+        (
+            hasty,
+            "Hasty Echo",
+            "Run the shell command `echo hasty-done` at once using run_command. Then report back.",
+        ),
+    ] {
+        acp.receive(update(&session, invoke(call, role, text, "in_progress")))
+            .unwrap();
+    }
+    // The one started second asks first, for what only its prompt names.
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(OTHER_CHILD, "call_1168", "echo hasty-done", "pending"),
+        ))
+        .unwrap();
+    assert_eq!(child_steps(&step)[0].0, format!("tool:{hasty}"));
+    let step = acp
+        .receive(asks(
+            &session,
+            "1",
+            child_command(OTHER_CHILD, "call_1168", "echo hasty-done", "pending"),
+        ))
+        .unwrap();
+    assert_eq!(request(&step).title, "Hasty Echo: echo hasty-done");
+    // `sleep 6` says too little to name a prompt, but one call is left.
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(CHILD, "call_1209", "sleep 6", "pending"),
+        ))
+        .unwrap();
+    assert_eq!(child_steps(&step)[0].0, format!("tool:{patient}"));
+    acp.receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+
+    // Two prompts that name nothing the child asks for leave it unmatched:
+    // listed apart, under its own session, rather than under either role.
+    let turn = prompt(&mut acp, "Start two more.");
+    for (call, role) in [("call_1", "Reviewer"), ("call_2", "Tester")] {
+        acp.receive(update(
+            &session,
+            invoke(
+                call,
+                role,
+                "Look over the change and report.",
+                "in_progress",
+            ),
+        ))
+        .unwrap();
+    }
+    let unmatched = "0f4e7b52-9a1d-4c8e-b7a3-2d6f1e9c5a04";
+    let command = child_command(unmatched, "call_3", "cargo test --workspace", "pending");
+    let step = acp.receive(update(&session, command.clone())).unwrap();
+    assert_eq!(
+        listed(&step),
+        [(unmatched, "", Some(ToolStatus::Running), Some(false))]
+    );
+    assert_eq!(child_steps(&step)[0].0, unmatched);
+    assert!(items(&step).is_empty());
+    let step = acp.receive(asks(&session, "2", command)).unwrap();
+    assert_eq!(request(&step).title, "Subagent: cargo test --workspace");
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let mut ended: Vec<_> = listed(&step)
+        .into_iter()
+        .filter_map(|(id, _, status, _)| status.map(|status| (id, status)))
+        .collect();
+    ended.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        ended,
+        [
+            (unmatched, ToolStatus::Succeeded),
+            ("tool:call_1", ToolStatus::Succeeded),
+            ("tool:call_2", ToolStatus::Succeeded),
+        ]
+    );
+}
+
+#[test]
+fn a_step_of_a_subagent_no_call_started_never_joins_the_parents() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    prompt(&mut acp, "Go on.");
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(CHILD, "call_9", "make release", "in_progress"),
+        ))
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [(CHILD, "", Some(ToolStatus::Running), Some(false))]
+    );
+    assert_eq!(child_steps(&step)[0].0, CHILD);
+    assert!(items(&step).is_empty());
+    // A parent call ID with a colon in it is still the parent's.
+    let step = acp
+        .receive(update(
+            &session,
+            json!({"sessionUpdate": "tool_call", "toolCallId": "mcp:search",
+                "title": "Search", "kind": "search", "status": "in_progress"}),
+        ))
+        .unwrap();
+    assert_eq!(items(&step)[0].id, "tool:mcp:search");
+    assert!(child_steps(&step).is_empty());
+}
+
+#[test]
+fn a_refused_subagent_command_ends_its_wait() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    prompt(&mut acp, "Have a subagent build it.");
+    let call = "call_7";
+    let subagent = format!("tool:{call}");
+    acp.receive(update(
+        &session,
+        invoke(call, "Builder", "Run make in the project.", "in_progress"),
+    ))
+    .unwrap();
+    let command = child_command(CHILD, "call_8", "make all -j8", "pending");
+    let step = acp.receive(asks(&session, "1", command.clone())).unwrap();
+    assert_eq!(listed(&step), [(subagent.as_str(), "", None, Some(true))]);
+    let step = acp
+        .command(Command::Answer {
+            request_id: request(&step).id,
+            action: "deny".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(listed(&step), [(subagent.as_str(), "", None, Some(false))]);
+    // The refused command is over though the agent never says so, and it
+    // never held the parent's own turn.
+    let mut running = command;
+    running["sessionUpdate"] = json!("tool_call_update");
+    running["status"] = json!("in_progress");
+    acp.receive(update(&session, running)).unwrap();
+    let step = acp
+        .receive(update(
+            &session,
+            json!({"sessionUpdate": "usage_update", "used": 1, "size": 1048576}),
+        ))
+        .unwrap();
+    assert!(statuses(&step).is_empty());
+
+    // Stopping the turn while the subagent asks ends its wait as well.
+    let step = acp
+        .receive(asks(
+            &session,
+            "2",
+            child_command(CHILD, "call_9", "make install", "pending"),
+        ))
+        .unwrap();
+    assert_eq!(listed(&step), [(subagent.as_str(), "", None, Some(true))]);
+    let step = acp.command(Command::Interrupt).unwrap();
+    assert!(listed(&step).contains(&(subagent.as_str(), "", None, Some(false))));
+}
+
+#[test]
+fn a_stopped_turn_stops_its_subagents_and_what_they_ran() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Have a subagent sleep.");
+    let call = "call_10804341966631667245";
+    let subagent = format!("tool:{call}");
+    acp.receive(update(
+        &session,
+        invoke(
+            call,
+            "Sleeper",
+            "Run the shell command `sleep 45 && echo woke` in the foreground and report its exact stdout and stderr output back.",
+            "in_progress",
+        ),
+    ))
+    .unwrap();
+    let command = child_command(
+        "eb272a0d-ea69-44e7-9a89-2593529b6ff6",
+        "call_5122787415558307460",
+        "sleep 45 && echo woke",
+        "in_progress",
+    );
+    acp.receive(update(&session, command.clone())).unwrap();
+    acp.command(Command::Interrupt).unwrap();
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    let step_id = format!("tool:{}", command["toolCallId"].as_str().unwrap());
+    assert_eq!(
+        child_steps(&step),
+        [(subagent.as_str(), step_id.as_str(), ToolStatus::Stopped)]
+    );
+    assert_eq!(
+        listed(&step),
+        [(
+            subagent.as_str(),
+            "",
+            Some(ToolStatus::Stopped),
+            Some(false)
+        )]
+    );
+    // agy fails the command after it has answered the prompt: still the
+    // same subagent's, and still stopped.
+    let mut failed = command;
+    failed["sessionUpdate"] = json!("tool_call_update");
+    failed["status"] = json!("failed");
+    let step = acp.receive(update(&session, failed)).unwrap();
+    assert!(listed(&step).is_empty());
+    assert_eq!(
+        child_steps(&step),
+        [(subagent.as_str(), step_id.as_str(), ToolStatus::Stopped)]
+    );
+}
+
+#[test]
+fn a_resumed_conversation_lists_its_subagents_as_ended() {
+    let session = "c25e32a9-5629-4617-889f-844d0916b3ff";
+    let mut acp = adapter(&[], Some(session));
+    let initialize = acp.initialize().unwrap();
+    let step = acp
+        .receive(reply(only_write(&initialize), muse_initialize()))
+        .unwrap();
+    let load = only_write(&step).clone();
+    assert_eq!(load["method"], "session/load");
+    let call = "call_12362618081845022504";
+    let subagent = format!("tool:{call}");
+    let step = acp
+        .receive(update(
+            session,
+            invoke(call, "File Lister", "List the files.", "completed"),
+        ))
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [(
+            subagent.as_str(),
+            "File Lister",
+            Some(ToolStatus::Ended),
+            Some(false)
+        )]
+    );
+    // agy replays none of a subagent's steps. One that came could be any
+    // replayed call's, so it is listed apart.
+    let step = acp
+        .receive(update(
+            session,
+            child_command(CHILD, "call_1", "ls -la /var/tmp/project", "completed"),
+        ))
+        .unwrap();
+    assert_eq!(child_steps(&step)[0].0, CHILD);
+    assert_eq!(
+        listed(&step),
+        [(CHILD, "", Some(ToolStatus::Ended), Some(false))]
+    );
+    let step = acp.receive(reply(&load, muse_new())).unwrap();
+    let history = step
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::History { items, .. } => Some(items),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        history.iter().all(|item| !item.id.contains(CHILD)),
+        "{history:?}"
+    );
+    assert!(history.iter().any(|item| item.id == format!("tool:{call}")));
+}
+
+#[test]
+fn only_a_session_id_before_the_colon_names_a_subagent() {
+    assert_eq!(subagents::child_of(&format!("{CHILD}:call_1")), Some(CHILD));
+    assert_eq!(subagents::child_of("call_6533409358328079481"), None);
+    assert_eq!(subagents::child_of("mcp:search"), None);
+    assert_eq!(subagents::child_of(&format!("{CHILD}:")), None);
+}
+
+/// A replayed call started no subagent of the turn that follows: a child
+/// heard from then is not taken for it, however many calls were replayed.
+#[test]
+fn a_child_after_a_resume_is_not_taken_for_a_replayed_subagent() {
+    let session = "c25e32a9-5629-4617-889f-844d0916b3ff";
+    let mut acp = adapter(&[], Some(session));
+    let initialize = acp.initialize().unwrap();
+    let step = acp
+        .receive(reply(only_write(&initialize), muse_initialize()))
+        .unwrap();
+    let load = only_write(&step).clone();
+    acp.receive(update(
+        session,
+        invoke("call_1", "File Lister", "List the files.", "completed"),
+    ))
+    .unwrap();
+    let mut step = acp.receive(reply(&load, muse_new())).unwrap();
+    while let Some(setting) = step.writes.first().cloned() {
+        let options = muse_new()["configOptions"].clone();
+        step = acp
+            .receive(reply(&setting, json!({"configOptions": options})))
+            .unwrap();
+    }
+    prompt(&mut acp, "Go on.");
+    let step = acp
+        .receive(update(
+            session,
+            child_command(OTHER_CHILD, "call_2", "ls -la /var/tmp/project", "pending"),
+        ))
+        .unwrap();
+    assert_eq!(child_steps(&step)[0].0, OTHER_CHILD);
+    assert_eq!(
+        listed(&step),
+        [(OTHER_CHILD, "", Some(ToolStatus::Running), Some(false))]
+    );
+}
+
+/// A subagent whose call failed, or that the reader would not let start,
+/// never ran: it says so at once, is not settled as finished with the
+/// turn, and no child is taken for it.
+#[test]
+fn a_subagent_that_never_started_ends_as_its_call_did() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Have two subagents check it.");
+    acp.receive(update(
+        &session,
+        invoke("call_1", "Checker", "Run make check.", "in_progress"),
+    ))
+    .unwrap();
+    let mut failed = invoke("call_1", "Checker", "Run make check.", "failed");
+    failed["sessionUpdate"] = json!("tool_call_update");
+    failed.as_object_mut().unwrap().remove("name");
+    let step = acp.receive(update(&session, failed)).unwrap();
+    assert_eq!(
+        listed(&step),
+        [("tool:call_1", "", Some(ToolStatus::Failed), Some(false))]
+    );
+
+    // A call that reported its subagent started keeps it, whatever a late
+    // revision says.
+    acp.receive(update(
+        &session,
+        invoke("call_4", "Linter", "Run make lint.", "completed"),
+    ))
+    .unwrap();
+    let mut late = invoke("call_4", "Linter", "Run make lint.", "failed");
+    late["sessionUpdate"] = json!("tool_call_update");
+    let step = acp.receive(update(&session, late)).unwrap();
+    assert!(listed(&step).is_empty());
+
+    // Asked about before it was reported, the call is known by its title,
+    // and its subagent waits on the answer before it is listed.
+    let mut asked = invoke("call_2", "Tester", "Run cargo test.", "pending");
+    asked.as_object_mut().unwrap().remove("name");
+    let step = acp.receive(asks(&session, "1", asked)).unwrap();
+    assert!(listed(&step).is_empty());
+    assert_eq!(request(&step).title, "Run invoke_subagent");
+    let step = acp
+        .command(Command::Answer {
+            request_id: request(&step).id,
+            action: "deny".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [(
+            "tool:call_2",
+            "Tester",
+            Some(ToolStatus::Denied),
+            Some(false)
+        )]
+    );
+
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(CHILD, "call_3", "make check", "pending"),
+        ))
+        .unwrap();
+    // The one subagent left that started is the child's.
+    assert_eq!(child_steps(&step)[0].0, "tool:call_4");
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [("tool:call_4", "", Some(ToolStatus::Succeeded), Some(false))]
+    );
+}
+
+/// A subagent's request still open when the turn ends no longer holds it
+/// waiting.
+#[test]
+fn a_turn_that_ends_with_a_subagent_asking_releases_it() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Have a subagent build it.");
+    acp.receive(update(
+        &session,
+        invoke("call_1", "Builder", "Run make.", "in_progress"),
+    ))
+    .unwrap();
+    let step = acp
+        .receive(asks(
+            &session,
+            "1",
+            child_command(CHILD, "call_2", "make all", "pending"),
+        ))
+        .unwrap();
+    assert_eq!(listed(&step), [("tool:call_1", "", None, Some(true))]);
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert!(
+        listed(&step)
+            .iter()
+            .all(|(_, _, _, waiting)| *waiting == Some(false))
+    );
+    assert!(step.events.contains(&Event::Waiting(false)));
+}
+
+/// Muse reports no subagents: a call ID with a session ID before its colon
+/// is one of its own steps.
+#[test]
+fn an_agent_without_subagents_keeps_every_step() {
+    let mut acp = adapter(&[], None);
+    acp.profile = &muse::PROFILE;
+    let session = ready(&mut acp);
+    prompt(&mut acp, "Go on.");
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(CHILD, "call_1", "make all", "in_progress"),
+        ))
+        .unwrap();
+    assert!(listed(&step).is_empty());
+    assert!(child_steps(&step).is_empty());
+    assert_eq!(items(&step)[0].id, format!("tool:{CHILD}:call_1"));
+}
+
+/// A pending `invoke_subagent`, such as one awaiting the reader's approval,
+/// lists its subagent only once it is under way, or once a child shows it
+/// has started.
+#[test]
+fn a_pending_subagent_call_is_listed_once_it_starts() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Have a subagent test it.");
+    let pending = invoke("call_1", "Tester", "Run cargo test.", "pending");
+    let step = acp.receive(update(&session, pending.clone())).unwrap();
+    assert!(listed(&step).is_empty());
+    let step = acp.receive(asks(&session, "1", pending.clone())).unwrap();
+    assert!(listed(&step).is_empty());
+    let step = acp
+        .command(Command::Answer {
+            request_id: request(&step).id,
+            action: "allow".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    assert!(listed(&step).is_empty());
+    let mut started = pending;
+    started["sessionUpdate"] = json!("tool_call_update");
+    started["status"] = json!("in_progress");
+    started.as_object_mut().unwrap().remove("rawInput");
+    let step = acp.receive(update(&session, started)).unwrap();
+    assert_eq!(
+        listed(&step),
+        [(
+            "tool:call_1",
+            "Tester",
+            Some(ToolStatus::Running),
+            Some(false)
+        )]
+    );
+
+    // A child heard from while its call still reads pending started it.
+    acp.receive(update(
+        &session,
+        invoke("call_2", "Builder", "Run make all.", "pending"),
+    ))
+    .unwrap();
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(CHILD, "call_3", "make all", "in_progress"),
+        ))
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [(
+            "tool:call_2",
+            "Builder",
+            Some(ToolStatus::Running),
+            Some(false)
+        )]
+    );
+    assert_eq!(child_steps(&step)[0].0, "tool:call_2");
+
+    // One still pending when the turn ends never started.
+    acp.receive(update(
+        &session,
+        invoke("call_4", "Linter", "Run make lint.", "pending"),
+    ))
+    .unwrap();
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert!(
+        listed(&step)
+            .iter()
+            .all(|(id, _, _, _)| *id != "tool:call_4")
+    );
+}
+
+/// A subagent's request after its turn has ended does not show it waiting
+/// again.
+#[test]
+fn an_ended_subagent_asking_is_not_shown_waiting() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Have a subagent build it.");
+    acp.receive(update(
+        &session,
+        invoke("call_1", "Builder", "Run make.", "in_progress"),
+    ))
+    .unwrap();
+    acp.receive(update(
+        &session,
+        child_command(CHILD, "call_2", "make all", "in_progress"),
+    ))
+    .unwrap();
+    acp.receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let step = acp
+        .receive(asks(
+            &session,
+            "1",
+            child_command(CHILD, "call_3", "make install", "pending"),
+        ))
+        .unwrap();
+    assert_eq!(request(&step).title, "Builder: make install");
+    assert!(listed(&step).is_empty());
+}
+
+/// Stopping a turn while a subagent asks cancels the request, ends the
+/// wait, and stops the subagent and its step with the turn.
+#[test]
+fn stopping_while_a_subagent_asks_stops_it() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Have a subagent build it.");
+    acp.receive(update(
+        &session,
+        invoke("call_1", "Builder", "Run make.", "in_progress"),
+    ))
+    .unwrap();
+    let command = child_command(CHILD, "call_2", "make all", "pending");
+    let step = acp.receive(asks(&session, "41", command.clone())).unwrap();
+    assert_eq!(listed(&step), [("tool:call_1", "", None, Some(true))]);
+    let step = acp.command(Command::Interrupt).unwrap();
+    assert_eq!(
+        step.writes[1],
+        json!({"jsonrpc": "2.0", "id": "41", "result": {"outcome": {"outcome": "cancelled"}}})
+    );
+    assert!(listed(&step).contains(&("tool:call_1", "", None, Some(false))));
+    assert!(step.events.contains(&Event::Waiting(false)));
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    assert_eq!(
+        listed(&step),
+        [("tool:call_1", "", Some(ToolStatus::Stopped), Some(false))]
+    );
+    let step_id = format!("tool:{CHILD}:call_2");
+    assert!(
+        child_steps(&step)
+            .iter()
+            .all(|(subagent, id, status)| *subagent == "tool:call_1"
+                && *id == step_id
+                && *status != ToolStatus::Running)
+    );
+}
+
+/// Beyond the children and calls it keeps, the oldest are forgotten, and
+/// a forgotten child heard from again stays with its subagent.
+#[test]
+fn subagents_beyond_the_bounds_forget_the_oldest() {
+    use super::subagents::{MAX_CHILDREN, MAX_INVOCATIONS};
+    let child = |n: usize| format!("00000000-0000-4000-8000-{n:012}");
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Start many subagents.");
+    acp.receive(update(
+        &session,
+        invoke("call_0", "First", "Run make first.", "in_progress"),
+    ))
+    .unwrap();
+    // The first child is the one unmatched call's; the rest are their own.
+    for n in 0..=MAX_CHILDREN {
+        acp.receive(update(
+            &session,
+            child_command(&child(n), "step", "make all", "in_progress"),
+        ))
+        .unwrap();
+    }
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(&child(0), "again", "make again", "in_progress"),
+        ))
+        .unwrap();
+    assert!(listed(&step).is_empty());
+    assert_eq!(child_steps(&step)[0].0, "tool:call_0");
+
+    for n in 1..=MAX_INVOCATIONS {
+        acp.receive(update(
+            &session,
+            invoke(&format!("call_{n}"), "Many", "Run it.", "in_progress"),
+        ))
+        .unwrap();
+    }
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    let ended = listed(&step);
+    assert_eq!(ended.len(), MAX_INVOCATIONS);
+    assert!(
+        ended
+            .iter()
+            .all(|(_, _, status, _)| *status == Some(ToolStatus::Succeeded))
+    );
+    assert!(
+        ended
+            .iter()
+            .any(|(id, _, _, _)| *id == format!("tool:call_{MAX_INVOCATIONS}"))
+    );
+}

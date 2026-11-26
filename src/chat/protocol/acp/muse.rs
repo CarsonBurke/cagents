@@ -40,6 +40,7 @@ pub static PROFILE: Profile = Profile {
     steers: false,
     cancel_stops_background: false,
     backgrounds_commands: false,
+    subagents: false,
 };
 
 /// Muse's ACP mode identifiers.
