@@ -436,6 +436,7 @@ pub enum TopCommand {
         #[arg(long)]
         #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
+        /// Check the launch fence for offline publication.
         #[arg(long, conflicts_with = "stage_only")]
         publish_only: bool,
     },
