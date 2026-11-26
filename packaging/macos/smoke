@@ -236,7 +236,8 @@ grep -q 'the cagents daemon is running and using saved work' "$ROOT/running-repa
 data="$ROOT/home/Library/Application Support/dev.cagents.cagents/smoke-data"
 mkdir -p "${data%/*}"
 touch "$data"
-if SMOKE_RUNTIME=$ROOT/other-runtime install_release --purge > "$ROOT/other-purge.log" 2>&1; then
+# An assignment before a shell function can persist in the caller on macOS.
+if (SMOKE_RUNTIME=$ROOT/other-runtime install_release --purge) > "$ROOT/other-purge.log" 2>&1; then
     fail 'a different runtime removed the installation while its daemon was running'
 fi
 grep -q 'the cagents daemon is running and using saved work' "$ROOT/other-purge.log" \
@@ -245,7 +246,7 @@ grep -q 'the cagents daemon is running and using saved work' "$ROOT/other-purge.
     || { cat "$ROOT/other-purge.log" >&2; fail 'a refused purge lost shared installation or app data'; }
 cli --no-start daemon status --json > "$ROOT/status.json" \
     && grep -q '"running": *true' "$ROOT/status.json" \
-    || fail 'the original runtime stopped serving after the refused purge'
+    || { cat "$ROOT/status.json" "$ROOT/daemon.log" >&2; fail 'the original runtime stopped serving after the refused purge'; }
 cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started through the link'
 
 # An unreadable claim cannot prove that saved state is free. A daemon using
