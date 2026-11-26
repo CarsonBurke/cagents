@@ -67,6 +67,16 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn migrate_predecessors(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE session_lineage_predecessors(
+             successor TEXT PRIMARY KEY,
+             predecessor TEXT NOT NULL CHECK (predecessor != successor)
+         ) STRICT;",
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Reconstructs lineages from the sessions that were issued authority, whose
 /// recorded recovery origins name the root each relaunch descends from, then
 /// moves every child to its parent's lineage.
@@ -206,21 +216,7 @@ fn seed(tx: &Transaction<'_>) -> Result<(), String> {
 impl Registry {
     /// The lineage a session joined when it was registered.
     pub(crate) fn session_lineage(&self, session: TerminalId) -> Result<Option<Lineage>, String> {
-        self.db
-            .query_row(
-                "SELECT lineage FROM session_lineages WHERE session_id = ?1",
-                [session.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .map(|lineage| {
-                lineage
-                    .parse()
-                    .map(Lineage)
-                    .map_err(|_| "Stored session lineage is invalid".to_owned())
-            })
-            .transpose()
+        lineage_in(&self.db, session)
     }
 
     /// The open agents bound to another session of `successor`'s lineage: the
@@ -361,6 +357,20 @@ impl Registry {
             params![successor.to_string(), lineage.to_string()],
         )
         .map_err(|error| error.to_string())?;
+        if lineage != Lineage(successor) {
+            let recorded = if pane_predecessor != predecessor
+                && lineage_in(&tx, pane_predecessor)? == Some(lineage)
+            {
+                pane_predecessor
+            } else {
+                predecessor
+            };
+            tx.execute(
+                "INSERT INTO session_lineage_predecessors(successor, predecessor) VALUES (?1, ?2)",
+                params![successor.to_string(), recorded.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        }
         let advanced = super::pane_chat_starts::advance(&tx, pane_predecessor, successor)?;
         if pane_current.is_some() && advanced == 0 {
             return Err("This pane changed while its successor was being prepared".into());
@@ -402,15 +412,45 @@ impl Registry {
         &self,
         session: TerminalId,
     ) -> Result<std::collections::BTreeSet<TerminalId>, String> {
+        let mut predecessors = std::collections::BTreeSet::new();
         let Some(lineage) = self.session_lineage(session)? else {
-            return Ok(Default::default());
+            return Ok(predecessors);
         };
-        Ok(self
-            .lineage_succession(lineage)?
-            .into_iter()
-            .skip_while(|candidate| *candidate != session)
-            .skip(1)
-            .collect())
+        if session == lineage.0 {
+            return Ok(predecessors);
+        }
+        let mut direct = self
+            .db
+            .prepare_cached(
+                "SELECT predecessor FROM session_lineage_predecessors WHERE successor=?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut current = session;
+        while current != lineage.0 {
+            let Some(previous) = direct
+                .query_row([current.to_string()], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(|error| error.to_string())?
+            else {
+                break;
+            };
+            let previous = previous
+                .parse::<TerminalId>()
+                .map_err(|_| "Stored session predecessor is invalid".to_owned())?;
+            if previous == session
+                || !predecessors.insert(previous)
+                || self
+                    .session_lineage(previous)?
+                    .is_some_and(|stored| stored != lineage)
+            {
+                return Err("Stored session predecessor conflicts with its lineage".into());
+            }
+            current = previous;
+        }
+        // A legacy row records membership and a root, but migration seeded
+        // rows in UUID order. Only the root is a proven earlier session.
+        predecessors.insert(lineage.0);
+        Ok(predecessors)
     }
 
     pub(crate) fn session_channels(
@@ -440,6 +480,23 @@ impl Registry {
         }
         Ok(channels)
     }
+}
+
+fn lineage_in(db: &Connection, session: TerminalId) -> Result<Option<Lineage>, String> {
+    db.query_row(
+        "SELECT lineage FROM session_lineages WHERE session_id = ?1",
+        [session.to_string()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(|lineage| {
+        lineage
+            .parse()
+            .map(Lineage)
+            .map_err(|_| "Stored session lineage is invalid".to_owned())
+    })
+    .transpose()
 }
 
 fn lineage_members_in(db: &Connection, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
@@ -599,6 +656,36 @@ mod tests {
 
     fn origin(registry: &Registry, authority: &Authority) -> Origin {
         registry.execution_origin(authority).unwrap()
+    }
+
+    #[test]
+    fn unordered_legacy_lineage_does_not_acknowledge_a_successor() {
+        let (mut registry, _directory, _) = fixture();
+        let root = TerminalId::from(uuid::Uuid::from_u128(9));
+        let older = TerminalId::from(uuid::Uuid::from_u128(3));
+        let newer = TerminalId::from(uuid::Uuid::from_u128(1));
+        // Schema 4 seeded membership in UUID order, which reverses this
+        // lineage's launch order.
+        for session in [newer, older, root] {
+            registry
+                .db
+                .execute(
+                    "INSERT INTO session_lineages(session_id,lineage) VALUES (?1,?2)",
+                    params![session.to_string(), root.to_string()],
+                )
+                .unwrap();
+        }
+        assert!(registry.notice_predecessors(root).unwrap().is_empty());
+        assert_eq!(registry.notice_predecessors(older).unwrap(), [root].into());
+        let exact = TerminalId::new();
+        assert_eq!(
+            registry.succeed(exact, newer, None, |_| false).unwrap(),
+            Lineage(root)
+        );
+        assert_eq!(
+            registry.notice_predecessors(exact).unwrap(),
+            [newer, root].into()
+        );
     }
 
     #[test]
