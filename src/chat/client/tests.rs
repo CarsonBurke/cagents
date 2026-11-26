@@ -2009,6 +2009,151 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
 }
 
 #[test]
+fn a_refused_completed_queue_page_allows_exact_recovery_after_reattach() {
+    let proof = handoff_proof();
+    let source = omp_card(Some(CONVERSATION), Some(proof.clone()));
+    let id = source.id;
+    let execution = uuid::Uuid::new_v4();
+    let receipt = uuid::Uuid::new_v4();
+    let queue = exited_queue_fixture(&source, 1, &"ø".repeat(ipc::EXITED_QUEUE_PAGE_BYTES / 2));
+    let bytes = Arc::new(postcard::to_allocvec(&queue).unwrap());
+    assert!(bytes.len() > ipc::EXITED_QUEUE_PAGE_BYTES);
+
+    for refuse in [true, false] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (done, release) = std::sync::mpsc::channel();
+        let proof = proof.clone();
+        let expected = source.clone();
+        let bytes = bytes.clone();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            let reply = |server: &mut UnixStream, codec: &mut FrameCodec, request_id, message| {
+                handoff_reply(server, codec, request_id, &proof, message);
+            };
+            let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert_eq!(
+                attach.request,
+                ClientRequest::ChatAttach {
+                    session: expected.clone()
+                }
+            );
+            reply(
+                &mut server,
+                &mut codec,
+                None,
+                ServerMessage::ChatQueueEnded {
+                    source: expected.clone(),
+                    execution,
+                    current: false,
+                },
+            );
+            reply(
+                &mut server,
+                &mut codec,
+                Some(attach.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session: expected.clone(),
+                        snapshot: Snapshot::default(),
+                    },
+                },
+            );
+            let first: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert_eq!(first.proof, Some(proof.clone()));
+            assert_eq!(
+                first.request,
+                ClientRequest::ChatReadExitedQueue {
+                    source: expected,
+                    execution: Some(execution),
+                }
+            );
+            reply(
+                &mut server,
+                &mut codec,
+                Some(first.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatExitedQueue {
+                        source: id,
+                        queued: Some(queue_page(receipt, &bytes, 0)),
+                    },
+                },
+            );
+            let next: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert_eq!(
+                next.request,
+                ClientRequest::ChatReadExitedQueuePage {
+                    source: id,
+                    receipt,
+                    offset: ipc::EXITED_QUEUE_PAGE_BYTES as u32,
+                }
+            );
+            let reply = if refuse {
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "The held input page expired",
+                    true,
+                ))
+            } else {
+                ServerMessage::Response {
+                    response: ServerResponse::ChatExitedQueuePage {
+                        source: id,
+                        page: queue_page(receipt, &bytes, ipc::EXITED_QUEUE_PAGE_BYTES),
+                    },
+                }
+            };
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(next.request_id),
+                &proof,
+                reply,
+            );
+            // A refusal must reach the caller before any socket EOF.
+            release.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let (send, receive) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            source.clone(),
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                if matches!(wake, Wake::CompletedQueue { .. } | Wake::Disconnected(_)) {
+                    let _ = send.send(wake);
+                }
+            },
+        )
+        .unwrap();
+        match receive.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Wake::Disconnected(error) if refuse => {
+                assert!(error.contains("The held input page expired"), "{error}");
+                assert!(error.contains("Reconnect to retry"), "{error}");
+            }
+            Wake::CompletedQueue {
+                source: recovered,
+                messages,
+                current: false,
+            } if !refuse => {
+                assert_eq!(*recovered, source);
+                assert_eq!(messages, queue.messages);
+            }
+            other => panic!(
+                "unexpected completed queue event {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        drop(handle);
+        done.send(()).unwrap();
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn a_retired_queue_larger_than_one_frame_arrives_complete_before_the_wake() {
     let source = stranded_claude(Some(CONVERSATION));
     let pending = exited_queue_fixture(&source, 9, &"é".repeat(480 * 1024));

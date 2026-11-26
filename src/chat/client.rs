@@ -370,7 +370,12 @@ impl CompletedQueueRead {
                     .append(source, page)
                     .map_err(|_| "Invalid continuation of a completed chat queue")?;
             }
-            ServerMessage::Error(_) => return Ok(None),
+            ServerMessage::Error(error) => {
+                return Err(format!(
+                    "Could not recover held chat input ({}). Reconnect to retry.",
+                    error.message
+                ));
+            }
             _ => return Err("Unexpected response to a completed chat queue read".into()),
         }
         let Some(collector) = self.collector.take() else {
