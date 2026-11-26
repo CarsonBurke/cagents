@@ -951,11 +951,8 @@ fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1095,11 +1092,8 @@ fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1235,11 +1229,8 @@ fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
 // Append inside the existing retained_resolution_tests module, where Fixture
 // and isolated() retain their original bounded real-helper ownership mechanics.
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
