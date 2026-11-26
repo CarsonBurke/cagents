@@ -378,7 +378,7 @@ def inside(path, root):
     return os.path.commonpath([path, root]) == root
 
 
-def build_metadata(root, version, environment):
+def build_metadata(root, version, environment, *, run=subprocess.run):
     """The version stamp build.rs would give this checkout, which the build
     host's copy, having no Git history, cannot work out itself. A value the
     caller sets is kept, unless a gate set it: then it is the stamp of
@@ -388,7 +388,7 @@ def build_metadata(root, version, environment):
         return given
 
     def git(*arguments):
-        result = subprocess.run(
+        result = run(
             ["git", "-C", root, *arguments], capture_output=True, text=True,
             env=dict(environment, GIT_OPTIONAL_LOCKS="0"),
         )
@@ -438,10 +438,10 @@ def checkout_stamp(arguments, environment):
                           environment) or ""
 
 
-def uncommitted(top, workspace, environment):
+def uncommitted(top, workspace, environment, *, run):
     """The workspace's files with changes that are not staged, and those with
     staged changes, as `cargo fix` judges a checkout before changing it."""
-    result = subprocess.run(
+    result = run(
         ["git", "-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--",
          workspace],
         capture_output=True, env=dict(environment, GIT_OPTIONAL_LOCKS="0"), check=True)
@@ -2155,6 +2155,22 @@ class Offload:
                 return subprocess.CompletedProcess(command, child.returncode, output, errors)
             say(f"transfer with {self.host} failed (status {child.returncode}); retrying once")
 
+    def local_command(self, command, *, input=None, capture_output=False, check=False, **options):
+        # Git traversal can outlive the Python worker on client death, too.
+        if capture_output:
+            options.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        child = self.spawn(
+            command, timeout=self.transfer_timeout, local_sync_fd=self.local_sync_fd,
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL, **options,
+        )
+        output, errors = child.communicate(input)
+        if self.cancelled:
+            raise offload_client.LocalSyncCancelled
+        result = subprocess.CompletedProcess(command, child.returncode, output, errors)
+        if check:
+            result.check_returncode()
+        return result
+
     def check_lease(self):
         if self.lease is not None and self.lease.poll() is not None and not self.cancelled:
             raise LeaseLost
@@ -2190,12 +2206,12 @@ class Offload:
         workspace, the directory the command runs from, Cargo's description
         of the workspace, and where the build host keeps its slots."""
         cargo = real_cargo(self.environment)
-        metadata = subprocess.run(
+        metadata = self.local_command(
             [cargo, "metadata", "--format-version", "1", "--no-deps"],
             capture_output=True, text=True, env=self.environment,
         )
-        top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True)
+        top = self.local_command(["git", "rev-parse", "--show-toplevel"],
+                                 capture_output=True, text=True)
         if metadata.returncode or top.returncode:
             raise Refusal("this is not a Cargo workspace in a Git checkout, which is "
                           f"what {self.host} builds")
@@ -2210,8 +2226,8 @@ class Offload:
         if os.path.commonpath([top, workspace, cwd]) != top:
             raise Refusal("the workspace is outside its Git checkout, which is what "
                           f"{self.host} builds")
-        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                                capture_output=True, text=True).stdout.strip()
+        common = self.local_command(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                    capture_output=True, text=True).stdout.strip()
         repository = Path(common).parent.name or Path(top).name
         return top, workspace, cwd, metadata, f"~/.cache/cagents-offload/{repository}"
 
@@ -2253,11 +2269,14 @@ class Offload:
 
     def run_build(self):
         try:
-            top, workspace, cwd, metadata, base = self.locate()
+            top, workspace, cwd, metadata, base = self.local(self.locate, admitting=True)
         except Refusal as refusal:
             return self.refuse(str(refusal))
         if self.plan.fixes and not self.plan.flag("--allow-no-vcs"):
-            dirty, staged = self.local(uncommitted, top, workspace, self.environment, admitting=True)
+            dirty, staged = self.local(
+                lambda: uncommitted(top, workspace, self.environment, run=self.local_command),
+                admitting=True,
+            )
             allowed_dirty = self.plan.flag("--allow-dirty")
             if dirty and not allowed_dirty:
                 return self.refuse("the working directory has uncommitted changes, which "
@@ -2770,7 +2789,7 @@ class Offload:
 
     def sync_sources(self, slot, top, local_target, remote_target, shell, version):
         """Prepare the source listing and upload the checkout and inputs."""
-        listing = subprocess.run(
+        listing = self.local_command(
             ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             capture_output=True, check=True,
         ).stdout
@@ -2805,7 +2824,9 @@ class Offload:
             ).returncode
             if status and not self.cancelled:
                 say(f"could not remove stale sources on {self.host} (status {status})")
-        stamp = None if status or self.cancelled else build_metadata(top, version, self.environment)
+        stamp = None
+        if not status and not self.cancelled:
+            stamp = build_metadata(top, version, self.environment, run=self.local_command)
         return sent, inputs, stamp, status
 
     def take_results(self, slot, source, top, sent, shell, status, remote_target, local_target,
@@ -2931,7 +2952,7 @@ class Offload:
         added = [name for name, new in written if new]
         ignored = set()
         if added:
-            check = subprocess.run(["git", "-C", top, "check-ignore", "-z", "--stdin"],
+            check = self.local_command(["git", "-C", top, "check-ignore", "-z", "--stdin"],
                                    input=b"".join(name + b"\0" for name in added),
                                    capture_output=True)
             if check.returncode in (0, 1):
@@ -3076,7 +3097,7 @@ class Hold(Offload):
 
     def run_build(self):
         try:
-            top, _, _, _, base = self.locate()
+            top, _, _, _, base = self.local(self.locate, admitting=True)
         except Refusal as refusal:
             return self.refuse(str(refusal))
         held = self.held(base, top)

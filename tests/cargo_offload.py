@@ -450,7 +450,10 @@ class Transport(unittest.TestCase):
     def test_a_gate_lets_an_adopted_transfer_finish_its_slot_cleanup(self):
         self.check_cancelled_transfer(nested=True)
 
-    def check_cancelled_transfer(self, *, nested):
+    def test_a_local_git_phase_keeps_its_slot_through_child_cleanup(self):
+        self.check_cancelled_transfer(nested=False, method="local_command")
+
+    def check_cancelled_transfer(self, *, nested, method="transfer"):
         with FixtureDirectory() as scope:
             prefix = Path(scope.name, "sync.lock")
             transfer = textwrap.dedent("""
@@ -473,9 +476,8 @@ class Transport(unittest.TestCase):
                     if sys.argv[4] == "True":
                         # Force the gate to adopt the independent supervisor.
                         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                    return build.local(
-                        lambda: build.transfer([sys.executable, "-c", sys.argv[3]]).returncode
-                    )
+                    run = getattr(build, sys.argv[5])
+                    return build.local(lambda: run([sys.executable, "-c", sys.argv[3]]).returncode)
                 build.run_build = run_build
                 sys.exit(build.run())
             """)
@@ -484,7 +486,7 @@ class Transport(unittest.TestCase):
                 "CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "1",
             }
             command = [sys.executable, "-I", "-c", client, str(ROOT / "scripts/cargo-offload"),
-                       str(prefix), transfer, str(nested)]
+                       str(prefix), transfer, str(nested), method]
             if nested:
                 command = [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"),
                            "/dev/null", *command]

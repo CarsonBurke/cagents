@@ -333,7 +333,7 @@ write_snapshot() {
 }
 
 snapshot() {
-    "${client[@]}" local /bin/bash -ec "$(declare -f die write_snapshot)"$'\nwrite_snapshot "$@"' \
+    transfer /bin/bash -ec "$(declare -f die write_snapshot)"$'\nwrite_snapshot "$@"' \
         native-evidence-snapshot "$@"
 }
 
