@@ -60,7 +60,7 @@ pub enum Command {
     },
     Read {
         id: u64,
-        unread: Vec<uuid::Uuid>,
+        checkpoint: uuid::Uuid,
     },
     /// End the watch.
     Stop,
@@ -107,6 +107,7 @@ impl Current {
 
 struct Opening {
     session: chat::Session,
+    notice: Option<uuid::Uuid>,
     stream: UnixStream,
     proof: HostSessionProof,
     next_request_id: u64,
@@ -150,9 +151,24 @@ impl Watch {
                             "Only a running native chat can be followed from the phone.",
                         ))
                     })?;
+                // Capture the exact old notice before attaching and reading
+                // the snapshot the phone will display. Later notices keep
+                // their own identities, even for this same conversation.
+                let notice = control.read_notifications().ok().and_then(|snapshot| {
+                    snapshot
+                        .notices
+                        .into_iter()
+                        .find(|notice| {
+                            !notice.acknowledged
+                                && notice.event.target
+                                    == crate::notifications::Target::Session(chat_id)
+                        })
+                        .map(|notice| notice.id)
+                });
                 let (stream, proof, next_request_id) = control.into_unsubscribed_stream();
                 Ok(Opening {
                     session,
+                    notice,
                     stream,
                     proof,
                     next_request_id,
@@ -181,6 +197,7 @@ impl Watch {
             .spawn(move || {
                 let Opening {
                     session,
+                    notice,
                     stream,
                     proof,
                     next_request_id,
@@ -217,7 +234,7 @@ impl Watch {
                     inputs,
                     pending: HashMap::new(),
                 };
-                let end = connection.run(id, session, feed);
+                let end = connection.run(id, session, notice, feed);
                 worker_stop.stop();
                 // Only a live watch can report an unexpected daemon loss.
                 // An unwatch also shuts down this stream to interrupt setup.
@@ -277,6 +294,10 @@ enum Pending {
     Read {
         final_read: bool,
     },
+    AcknowledgeChat {
+        id: u64,
+        notice: Option<uuid::Uuid>,
+    },
     Chat {
         id: u64,
         _upload_slot: Option<Arc<()>>,
@@ -312,6 +333,8 @@ struct Followed {
     /// A publication read is in flight; one at a time keeps them in order.
     reading: bool,
     read_epoch: u64,
+    read_checkpoint: uuid::Uuid,
+    read_notice: Option<uuid::Uuid>,
     /// The daemon removed the chat or its provider completed. Try one
     /// final presentation read before ending the watch.
     ending: bool,
@@ -320,7 +343,13 @@ struct Followed {
 impl Connection {
     /// Follow the chat until the phone, the conversation or the daemon ends
     /// the watch.
-    fn run(&mut self, id: u64, session: chat::Session, feed: Sender<Input>) -> End {
+    fn run(
+        &mut self,
+        id: u64,
+        session: chat::Session,
+        notice: Option<uuid::Uuid>,
+        feed: Sender<Input>,
+    ) -> End {
         let snapshot = match self.attach(session) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -343,17 +372,22 @@ impl Connection {
             changed: true,
             reading: false,
             read_epoch: 0,
+            read_checkpoint: uuid::Uuid::new_v4(),
+            read_notice: notice,
             ending: false,
         };
         // The phone may have stopped or replaced this watch while it was
         // attaching; then neither the answer nor the conversation is wanted.
         let opened = self.current.send(|| {
             self.outbox.ok(id);
-            if let Some(update) =
+            if let Some(mut update) =
                 followed
                     .mirror
                     .update(&followed.session, &followed.snapshot, true)
             {
+                if update.reset {
+                    update.read_checkpoint = Some(followed.read_checkpoint.to_string());
+                }
                 self.outbox
                     .event(api::Event::Conversation(Box::new(update)));
             }
@@ -441,18 +475,8 @@ impl Connection {
                         Ok(())
                     }
                 },
-                Ok(Input::Command(Command::Read { id, unread })) => {
-                    let result = self.acknowledge_view(&mut followed, unread);
-                    match result {
-                        Ok(()) => {
-                            self.outbox.ok(id);
-                            Ok(())
-                        }
-                        Err(error) => {
-                            self.outbox.error(Some(id), unavailable(&error));
-                            Err(End::Daemon(lost(&error)))
-                        }
-                    }
+                Ok(Input::Command(Command::Read { id, checkpoint })) => {
+                    self.acknowledge_view(&mut followed, id, checkpoint)
                 }
                 Ok(Input::Frame(frame)) => match *frame {
                     Ok(Some(envelope)) => self.envelope(&mut followed, envelope),
@@ -469,11 +493,14 @@ impl Connection {
     /// Send the phone what changed since it was last sent anything.
     fn publish(&self, followed: &mut Followed) {
         self.current.send(|| {
-            if let Some(update) =
+            if let Some(mut update) =
                 followed
                     .mirror
                     .update(&followed.session, &followed.snapshot, false)
             {
+                if update.reset {
+                    update.read_checkpoint = Some(followed.read_checkpoint.to_string());
+                }
                 self.outbox
                     .event(api::Event::Conversation(Box::new(update)));
             }
@@ -492,7 +519,9 @@ impl Connection {
         let requests = pending
             .into_values()
             .filter_map(|pending| match pending {
-                Pending::Chat { id, .. } | Pending::Detail { id, .. } => Some(id),
+                Pending::Chat { id, .. }
+                | Pending::AcknowledgeChat { id, .. }
+                | Pending::Detail { id, .. } => Some(id),
                 Pending::Read { .. } => None,
             })
             .chain(waiting_requests(&self.inputs));
@@ -502,17 +531,39 @@ impl Connection {
     fn acknowledge_view(
         &mut self,
         followed: &mut Followed,
-        unread: Vec<uuid::Uuid>,
-    ) -> Result<(), FrameError> {
+        id: u64,
+        checkpoint: uuid::Uuid,
+    ) -> Result<(), End> {
+        if checkpoint != followed.read_checkpoint {
+            self.outbox.error(
+                Some(id),
+                api_error(
+                    api::ErrorCode::NotWatching,
+                    "That conversation presentation has been replaced.",
+                ),
+            );
+            return Ok(());
+        }
         followed.read_epoch = followed.read_epoch.saturating_add(1);
-        self.request(ClientRequest::ChatAcknowledge {
+        match self.request(ClientRequest::ChatAcknowledge {
             chat_id: self.chat_id,
             epoch: followed.read_epoch,
-        })?;
-        for id in unread {
-            self.request(ClientRequest::AcknowledgeNotification { id })?;
+        }) {
+            Ok(request) => {
+                self.pending.insert(
+                    request,
+                    Pending::AcknowledgeChat {
+                        id,
+                        notice: followed.read_notice,
+                    },
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.outbox.error(Some(id), unavailable(&error));
+                Err(End::Daemon(lost(&error)))
+            }
         }
-        Ok(())
     }
 
     fn command(
@@ -702,6 +753,36 @@ impl Connection {
                     return Err(End::Conversation("The conversation ended.".into()));
                 }
             }
+            Some(Pending::AcknowledgeChat { id, notice }) => match envelope.message {
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                } => {
+                    if let Some(notice) = notice {
+                        match self.request(ClientRequest::AcknowledgeNotification { id: notice }) {
+                            Ok(request) => {
+                                self.pending.insert(
+                                    request,
+                                    Pending::Chat {
+                                        id,
+                                        _upload_slot: None,
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                self.outbox.error(Some(id), unavailable(&error));
+                                return Err(End::Daemon(lost(&error)));
+                            }
+                        }
+                    } else {
+                        self.outbox.ok(id);
+                    }
+                }
+                ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),
+                _ => self.outbox.error(
+                    Some(id),
+                    internal("The daemon answered a read unexpectedly."),
+                ),
+            },
             Some(Pending::Chat { id, _upload_slot }) => match envelope.message {
                 ServerMessage::Response { .. } => self.outbox.ok(id),
                 ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),

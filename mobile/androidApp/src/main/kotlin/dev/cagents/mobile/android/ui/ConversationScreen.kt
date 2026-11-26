@@ -119,10 +119,10 @@ fun ConversationScreen(
     val conversation = view.conversation
     val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsStateWithLifecycle()
     val visible = lifecycleState == Lifecycle.State.RESUMED
-    val displayed = conversation?.resetRevision ?: 0
-    LaunchedEffect(session, visible, displayed) {
-        if (visible && displayed > 0 && view.connection == ConnectionState.Connected) {
-            vm.readConversation(session)
+    val checkpoint = conversation?.readCheckpoint
+    LaunchedEffect(session, visible, checkpoint) {
+        if (visible && checkpoint != null && view.connection == ConnectionState.Connected) {
+            vm.readConversation(session, checkpoint)
         }
     }
 

@@ -339,10 +339,10 @@ class RemoteController(
     suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) =
         call(Call.Answer(session, request, action, answers))
 
-    suspend fun readConversation(session: String) {
+    suspend fun readConversation(session: String, checkpoint: String) {
         if (!foreground.value) return
         try {
-            call(Call.ReadConversation(session))
+            call(Call.ReadConversation(session, checkpoint))
         } catch (_: RequestFailed) {
             // Older bridges and a watch that was just closed can refuse this.
         } catch (_: ConnectionLost) {

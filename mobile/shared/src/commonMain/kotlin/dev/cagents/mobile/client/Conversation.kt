@@ -18,8 +18,8 @@ data class Conversation(
     val loaded: Boolean = false,
     /** Why the conversation can no longer be followed, when it can't. */
     val ended: String? = null,
-    /** Increases only after a fresh presentation from the current watch. */
-    val resetRevision: Long = 0,
+    /** The presentation this watch permits a visible reader to acknowledge. */
+    val readCheckpoint: String? = null,
 ) {
     /** The result of applying an update: the next conversation, and whether it fell out of step. */
     data class Applied(val conversation: Conversation, val desynced: Boolean)
@@ -64,7 +64,7 @@ data class Conversation(
                 items = placed,
                 loaded = true,
                 ended = null,
-                resetRevision = if (update.reset) resetRevision + 1 else resetRevision,
+                readCheckpoint = if (update.reset) update.readCheckpoint else readCheckpoint,
             ),
             desynced = false,
         )

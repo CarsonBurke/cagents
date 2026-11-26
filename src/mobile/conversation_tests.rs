@@ -100,6 +100,7 @@ fn start_scripted(
     stream: UnixStream,
     proof: HostSessionProof,
     outbox: Outbox,
+    notice: Option<uuid::Uuid>,
     ended: impl FnOnce(TerminalId, Option<String>) + Send + 'static,
 ) -> std::io::Result<Watch> {
     Watch::start(
@@ -112,6 +113,7 @@ fn start_scripted(
                 .map_err(|error| Failure::DaemonLost(error.to_string()))?;
             Ok(Opening {
                 session,
+                notice,
                 stream,
                 proof,
                 next_request_id: 2,
@@ -156,6 +158,7 @@ fn finish_watch(removed: bool) {
         bridge,
         proof(),
         outbox,
+        Some(expected_ack),
         move |chat, unfollowable| ended.send((chat, unfollowable)).unwrap(),
     )
     .unwrap();
@@ -180,32 +183,40 @@ fn finish_watch(removed: bool) {
     daemon.respond(&visibility, ServerResponse::Accepted);
     daemon.approve_watch(chat_id);
     assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1, page: None });
-    assert!(matches!(
-        next_line(&lines),
-        api::ServerLine::Event(api::Event::Conversation(update)) if update.reset
-    ));
+    let api::ServerLine::Event(api::Event::Conversation(update)) = next_line(&lines) else {
+        panic!("the watch did not publish its first reset");
+    };
+    assert!(update.reset);
+    let checkpoint = update.read_checkpoint.as_deref().unwrap().parse().unwrap();
 
-    // A rewatch opens the feed even while its conversation is hidden. Its
-    // first RPC is a presentation read, with no notice acknowledgements.
+    // Rewatching while hidden reads the next presentation and does not
+    // acknowledge. A delayed read from another watch is refused.
     let read = daemon.receive();
     assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
     assert!(watch.send(Command::Read {
         id: 2,
-        unread: vec![expected_ack]
+        checkpoint: uuid::Uuid::new_v4(),
     }));
+    assert!(matches!(
+        next_line(&lines),
+        api::ServerLine::Error { id: Some(2), error } if error.code == api::ErrorCode::NotWatching
+    ));
+    assert!(watch.send(Command::Read { id: 3, checkpoint }));
     let acknowledge = daemon.receive();
     assert!(matches!(
         acknowledge.request,
         ClientRequest::ChatAcknowledge { chat_id: id, epoch: 1 } if id == chat_id
     ));
+    assert!(lines.outgoing.try_recv().is_err());
     daemon.respond(&acknowledge, ServerResponse::Accepted);
     let dismiss = daemon.receive();
     assert!(matches!(
         dismiss.request,
         ClientRequest::AcknowledgeNotification { id } if id == expected_ack
     ));
+    assert!(lines.outgoing.try_recv().is_err());
     daemon.respond(&dismiss, ServerResponse::Accepted);
-    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 2, page: None });
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 3, page: None });
     assert!(watch.send(Command::Chat {
         id: 7,
         command: chat::Command::Interrupt,
@@ -357,6 +368,7 @@ fn a_watch_stopped_while_attaching_answers_once_and_sends_no_conversation() {
         bridge,
         proof(),
         outbox,
+        None,
         move |chat, unfollowable| ended.send((chat, unfollowable)).unwrap(),
     )
     .unwrap();

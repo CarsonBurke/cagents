@@ -174,7 +174,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun openConversation(session: String) = controller.open(session)
     fun closeConversation(session: String) = controller.close(session)
-    suspend fun readConversation(session: String) = controller.readConversation(session)
+    suspend fun readConversation(session: String, checkpoint: String) =
+        controller.readConversation(session, checkpoint)
     fun rewatch(session: String) = controller.rewatch(session)
 
     /** Sends a message; [done] says whether the computer took it. */

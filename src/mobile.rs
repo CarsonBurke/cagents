@@ -523,14 +523,14 @@ impl Bridge {
                 }
                 Ok(Answered::Now)
             }
-            api::Call::ReadConversation { session } => {
-                let session = parse_session(&session)?;
-                let unread = self
-                    .notifications
-                    .as_ref()
-                    .map(|watch| watch.session_notices(session))
-                    .unwrap_or_default();
-                self.to_conversation_id(session, conversation::Command::Read { id, unread })
+            api::Call::ReadConversation {
+                session,
+                checkpoint,
+            } => {
+                let checkpoint = uuid::Uuid::parse_str(&checkpoint).map_err(|_| {
+                    Failure::Refused(bad_request("Invalid conversation read checkpoint."))
+                })?;
+                self.to_conversation(&session, conversation::Command::Read { id, checkpoint })
             }
             api::Call::LoadEarlier { session } => {
                 self.command(id, &session, chat::Command::LoadEarlier)
@@ -732,14 +732,7 @@ impl Bridge {
         session: &str,
         command: conversation::Command,
     ) -> Result<Answered, Failure> {
-        self.to_conversation_id(parse_session(session)?, command)
-    }
-
-    fn to_conversation_id(
-        &self,
-        session: TerminalId,
-        command: conversation::Command,
-    ) -> Result<Answered, Failure> {
+        let session = parse_session(session)?;
         let conversations = self.conversations.lock().unwrap();
         let Some((_, watch)) = conversations.get(&session) else {
             return Err(Failure::Refused(api::Error {
