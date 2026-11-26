@@ -1637,7 +1637,7 @@ impl Runtime {
         let blocked_start = self.start_blocked.filter(|_| current_local_error);
         let mut rows = vec![
             widget::row::with_children(vec![
-                crate::ui_controls::passive_icon(Icon::Warning, design::LEADING_ICON_SIZE),
+                heading_mark(incident.kind, cleared, blocked_start.is_some()).view(),
                 design::transcript(if let Some(reopen) = blocked_start {
                     if self.is_draft() {
                         reopen.draft_headline()
@@ -1704,6 +1704,7 @@ impl Runtime {
         .max_width(design::READABLE_MEASURE)
         .into()
     }
+
     /// An incident's disclosure, copy action and, when expanded, its
     /// diagnostic preview. `surface` is the fill it is drawn on, which the
     /// scrolling preview fades into.
@@ -1806,9 +1807,68 @@ impl Runtime {
     }
 }
 
+/// The glyph at the head of a failure notice. A usage limit waits on a
+/// reset or another account rather than on a fix, so it takes the mark every
+/// other surface gives that state, in its tone; once the limit has cleared,
+/// or while the notice speaks for a blocked start instead, nothing is asked
+/// of the reader and the glyph is muted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadingMark {
+    State(crate::sidebar::AttentionState),
+    Muted(Icon),
+}
+
+impl HeadingMark {
+    fn view(self) -> Element<'static, Message> {
+        match self {
+            Self::State(state) => crate::sidebar::attention_mark(state, design::LEADING_ICON_SIZE),
+            Self::Muted(icon) => crate::ui_controls::passive_icon(icon, design::LEADING_ICON_SIZE),
+        }
+    }
+}
+
+fn heading_mark(kind: Option<FailureKind>, cleared: bool, blocked_start: bool) -> HeadingMark {
+    match kind {
+        Some(FailureKind::AccountLimit) if !blocked_start => {
+            if cleared {
+                HeadingMark::Muted(Icon::UsageLimit)
+            } else {
+                HeadingMark::State(crate::sidebar::AttentionState::Limited)
+            }
+        }
+        _ => HeadingMark::Muted(Icon::Warning),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A usage limit's notice carries the limit's own mark, as the status
+    /// line, sidebar and inspector do; other failures keep the caution.
+    #[test]
+    fn a_usage_limit_notice_is_headed_by_the_limits_mark() {
+        use crate::sidebar::AttentionState;
+        assert_eq!(
+            heading_mark(Some(FailureKind::AccountLimit), false, false),
+            HeadingMark::State(AttentionState::Limited)
+        );
+        assert_eq!(AttentionState::Limited.glyph(), Some(Icon::UsageLimit));
+        assert_eq!(
+            heading_mark(Some(FailureKind::AccountLimit), true, false),
+            HeadingMark::Muted(Icon::UsageLimit)
+        );
+        assert_eq!(
+            heading_mark(Some(FailureKind::AccountLimit), false, true),
+            HeadingMark::Muted(Icon::Warning)
+        );
+        for kind in [None, Some(FailureKind::NoAllowance)] {
+            assert_eq!(
+                heading_mark(kind, false, false),
+                HeadingMark::Muted(Icon::Warning)
+            );
+        }
+    }
 
     /// A provider's reason stays one readable line beside the summary.
     #[test]
