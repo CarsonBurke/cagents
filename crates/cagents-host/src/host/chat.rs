@@ -2532,6 +2532,15 @@ fn start_publishing(
             source_execution.as_ref()
         },
     )?;
+    #[cfg(target_os = "macos")]
+    if source.is_none()
+        && restart_launch.is_none()
+        && !saved_history_only
+        && session.launch.session_id.is_none()
+        && let Some(login_path) = crate::account::probe::shell_search_path()
+    {
+        add_login_search_directories(&mut process_launch.recipe, &login_path);
+    }
     // A begun thread's bare remote joins the account's shared daemon, which
     // owns the thread while it runs. With nothing serving that daemon, the
     // thread is reopened from its history on a listener of its own instead of
@@ -5400,6 +5409,31 @@ fn prepare_native_process_launch(
         .environment
         .retain(|name, _| !removed.contains(name));
     Ok(process_launch)
+}
+
+/// A fresh provider keeps its caller's tool order. Supply directories absent
+/// from its PATH so a launcher can find dependencies installed for the user.
+#[cfg(any(target_os = "macos", test))]
+fn add_login_search_directories(
+    recipe: &mut crate::model::LaunchRecipe,
+    login_path: &std::ffi::OsStr,
+) {
+    if recipe.unset_environment.contains("PATH") {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let directories = recipe
+        .environment
+        .get("PATH")
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(std::env::split_paths(login_path).filter(|directory| directory.is_absolute()))
+        .filter(|directory| seen.insert(directory.clone()));
+    if let Ok(path) = std::env::join_paths(directories)
+        && let Ok(path) = path.into_string()
+    {
+        recipe.environment.insert("PATH".into(), path);
+    }
 }
 
 /// The environment `restore_upgrade` will start `launch` with in the next

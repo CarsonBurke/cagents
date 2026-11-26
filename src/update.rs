@@ -12,9 +12,9 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
-#[cfg(all(target_os = "linux", feature = "host"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
 mod publication;
-#[cfg(all(target_os = "linux", feature = "host"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
 #[doc(hidden)]
 pub use publication::LocalPublication;
 mod pending_recovery;
@@ -136,6 +136,10 @@ pub enum UpdateError {
     UnsupportedInstallation,
     #[error("{0}")]
     Invalid(String),
+    #[error("No published release of cagents offers in-app updates yet.")]
+    NoPublishedRelease,
+    #[error("The release server has no asset at {0}.")]
+    ReleaseAssetMissing(String),
     #[error("another update is already running")]
     Busy,
     #[error(transparent)]
@@ -354,6 +358,53 @@ pub(crate) fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
         version_root: version_root.to_owned(),
         version: version.to_owned(),
     })
+}
+
+/// The stable launch bundle can resolve only the currently selected build.
+#[cfg(target_os = "macos")]
+pub(crate) fn stable_ui_bundle(
+    executable: &Path,
+    launcher: &Path,
+) -> Result<Option<PathBuf>, UpdateError> {
+    if executable
+        .file_name()
+        .is_none_or(|name| name != "cagents-ui")
+    {
+        return Ok(None);
+    }
+    let layout = match locate(executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // A recovery coordinator from another build cannot assume its UI speaks
+    // the new startup connection. Keep direct startup for that fallback.
+    if !locate(launcher).is_ok_and(|caller| caller.version_root == layout.version_root)
+        || served_version_root(&layout)? != layout.version_root
+        || crate::install_guard::has_staged_owner_marker(&layout.version_root)
+    {
+        return Ok(None);
+    }
+    let bundle = layout.prefix.join("Cagents.app");
+    if !fs::symlink_metadata(&bundle).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == crate::daemon::current_uid()
+            && metadata.mode() & 0o022 == 0
+    }) {
+        // Older or incomplete installs can still open the physical UI.
+        return Ok(None);
+    }
+    let entry = bundle.join("Contents/MacOS/Cagents");
+    if !fs::symlink_metadata(&entry).is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.uid() == crate::daemon::current_uid()
+            && metadata.mode() & 0o022 == 0
+            && metadata.mode() & 0o111 != 0
+    }) || !entry.canonicalize().is_ok_and(|physical| physical == entry)
+    {
+        return Ok(None);
+    }
+    Ok(Some(bundle))
 }
 
 /// The three executables are released, installed and spoken as one set: a
@@ -578,10 +629,17 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
         Ok(feed) => feed,
         Err(reason) => return Ok(UpdateState::Unsupported { reason }),
     };
-    let release = feed.latest(
+    let release = match feed.latest(
         |version| offers_release(&installation, version),
         cancellation,
-    )?;
+    ) {
+        Err(error @ UpdateError::NoPublishedRelease) => {
+            return Ok(UpdateState::Unsupported {
+                reason: error.to_string(),
+            });
+        }
+        result => result?,
+    };
     Ok(match release {
         Some(release) => offered(release, cfg!(target_os = "macos")),
         None => UpdateState::Current {
@@ -2402,23 +2460,12 @@ fn perform_update(
         UpdatePhase::Downloading,
         "Downloading the release",
     )?;
-    // The signed metadata names every digest. The checksum file the installer
-    // reads again must agree with it, or the two would vouch for different
-    // bytes.
-    let mut checksums = feed.download(&release, &release.checksums, &cancellation)?;
-    let mut manifest = String::new();
-    checksums.read_to_string(&mut manifest)?;
-    checksums.seek(SeekFrom::Start(0))?;
+    let feed::VerifiedAssets {
+        installer,
+        archive,
+        checksums,
+    } = feed.verified_assets(&release, &cancellation)?;
     let archive_hash = release.archive.sha256;
-    if checksum_for(&manifest, &release.archive.name)? != archive_hash
-        || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
-    {
-        return Err(invalid(
-            "the release's checksum file disagrees with its signed metadata",
-        ));
-    }
-    let installer = feed.download(&release, &release.installer, &cancellation)?;
-    let archive = feed.download(&release, &release.archive, &cancellation)?;
     set_phase(
         state,
         job,
@@ -2899,13 +2946,9 @@ pub(crate) fn owned_cli_protocol(
     subject: &str,
     operation: &'static str,
 ) -> Result<u16, UpdateError> {
-    let envelope = companion_read(
-        executable,
-        &["--json", "daemon", "protocol-version"],
-        None,
-        subject,
-        operation,
-    )?;
+    let mut command = Command::new(executable);
+    command.args(["--json", "daemon", "protocol-version"]);
+    let envelope = companion_read(command, subject, operation, &CancellationToken::new(), None)?;
     envelope
         .get("data")
         .and_then(|data| data.get("protocol_version"))
@@ -2925,12 +2968,16 @@ pub(crate) fn companion_identity(
         "cagents-namespace-inspect-{}",
         uuid::Uuid::new_v4()
     ));
+    let mut command = Command::new(executable);
+    command
+        .args(["--json", "daemon", "status"])
+        .env("XDG_RUNTIME_DIR", isolated);
     let envelope = companion_read(
-        executable,
-        &["--json", "daemon", "status"],
-        Some(&isolated),
+        command,
         CEDITOR_COMPANION,
         "editor companion instance check",
+        &CancellationToken::new(),
+        None,
     )?;
     match envelope
         .get("data")
@@ -2953,47 +3000,48 @@ pub(crate) fn companion_identity(
 }
 
 fn companion_read(
-    executable: &Path,
-    arguments: &[&str],
-    runtime: Option<&Path>,
+    mut command: Command,
     subject: &str,
     operation: &'static str,
+    cancellation: &CancellationToken,
+    expected: Option<&fs::Metadata>,
 ) -> Result<serde_json::Value, UpdateError> {
-    let before = fs::symlink_metadata(executable)?;
+    let before = fs::symlink_metadata(command.get_program())?;
     if !before.is_file()
         || !crate::install_guard::trusted_executable_owner(before.uid())
         || before.mode() & 0o022 != 0
     {
         return Err(invalid(format!("{subject} is not an owned executable")));
     }
-    let mut command = Command::new(executable);
+    if expected.is_some_and(|expected| !same_companion_executable(expected, &before)) {
+        return Err(invalid(format!("{subject} changed before preflight")));
+    }
     crate::install_guard::sanitize_child_environment(&mut command);
     command.env_remove(crate::agent_execution::AUTHORITY_ENV);
-    command.args(arguments);
-    if let Some(runtime) = runtime {
-        command.env("XDG_RUNTIME_DIR", runtime);
-    }
     let mut output = bounded_command(
         &mut command,
         operation,
         SMALL_ASSET_LIMIT,
         Duration::from_secs(5),
-        &CancellationToken::new(),
+        cancellation,
     )?;
-    let after = fs::symlink_metadata(executable)?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-        || before.uid() != after.uid()
-        || before.mode() != after.mode()
-    {
+    let after = fs::symlink_metadata(command.get_program())?;
+    if !same_companion_executable(&before, &after) {
         return Err(invalid(format!("{subject} changed during preflight")));
     }
     Ok(serde_json::from_reader(&mut output)?)
+}
+
+fn same_companion_executable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && before.uid() == after.uid()
+        && before.mode() == after.mode()
 }
 
 fn observe_impact(
@@ -3694,7 +3742,7 @@ fn validate_lock(file: &File) -> Result<(), UpdateError> {
     }
     Ok(())
 }
-fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
+fn inherited_lock(state: &Path) -> Result<File, UpdateError> {
     // SAFETY: F_GETFD probes existence before taking ownership of the reserved fd.
     if unsafe { libc::fcntl(WORKER_LOCK_FD, libc::F_GETFD) } == -1 {
         return Err(invalid(
@@ -3712,7 +3760,9 @@ fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateErro
     if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(lock)
+    // The successor may inherit this same description with the acknowledged
+    // checkpoint. The worker must close its copy without issuing LOCK_UN.
+    Ok(lock.into_file())
 }
 
 /// Stream a subprocess into sealed storage without buffering a release binary
@@ -3724,6 +3774,24 @@ fn bounded_command(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<File, UpdateError> {
+    bounded_command_with_stderr(
+        command,
+        operation,
+        limit,
+        timeout,
+        cancellation,
+        Stdio::null(),
+    )
+}
+
+fn bounded_command_with_stderr(
+    command: &mut Command,
+    operation: &'static str,
+    limit: u64,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    stderr: Stdio,
+) -> Result<File, UpdateError> {
     if cancellation.cancelled() {
         return Err(UpdateError::Cancelled);
     }
@@ -3731,7 +3799,7 @@ fn bounded_command(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0);
     let child = command
         .spawn()
@@ -4064,6 +4132,54 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_the_selected_owned_install_uses_the_stable_launch_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().canonicalize().unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for version in ["1.2.3", "1.2.4"] {
+            let bin = prefix.join("versions").join(version).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for binary in ["cagents", "cagentsd", "cagents-ui"] {
+                fs::write(bin.join(binary), "fixture").unwrap();
+            }
+        }
+        std::os::unix::fs::symlink("versions/1.2.3", prefix.join("current")).unwrap();
+        let selected = prefix.join("versions/1.2.3/bin/cagents-ui");
+        let staged = prefix.join("versions/1.2.4/bin/cagents-ui");
+        let cli = prefix.join("versions/1.2.3/bin/cagents");
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
+
+        let bundle = prefix.join("Cagents.app");
+        let launcher = bundle.join("Contents/MacOS/Cagents");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&launcher)
+            .unwrap();
+        assert_eq!(stable_ui_bundle(&selected, &cli).unwrap(), Some(bundle));
+        assert!(stable_ui_bundle(&staged, &cli).unwrap().is_none());
+        assert!(stable_ui_bundle(&selected, &staged).unwrap().is_none());
+
+        // A staged owner can exec a different UI. Keep the direct path whose
+        // stdout handshake can follow that existing transition.
+        let owner = prefix.join("versions/1.2.3/.deferred-owner.json");
+        fs::write(&owner, "existing owner marker").unwrap();
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
+        fs::remove_file(owner).unwrap();
+
+        fs::remove_file(&launcher).unwrap();
+        std::os::unix::fs::symlink(&selected, launcher).unwrap();
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
+    }
+
     #[test]
     fn only_macos_sends_updates_to_its_installer() {
         assert_eq!(
@@ -4343,6 +4459,50 @@ mod tests {
             matches!(lock_file(path_only), Err(UpdateError::Io(error)) if error.raw_os_error() == Some(libc::EBADF))
         );
         drop(held);
+    }
+
+    #[test]
+    fn inherited_update_worker_lock_survives_worker_scope_exit() {
+        const STATE: &str = "CAGENTS_TEST_INHERITED_UPDATE_WORKER_STATE";
+        if let Some(state) = std::env::var_os(STATE) {
+            io::stdin().read_exact(&mut [0]).unwrap();
+            let state = Path::new(&state);
+            let worker = inherited_lock(state).unwrap();
+            let successor = worker.try_clone().unwrap();
+            drop(worker);
+            assert!(matches!(acquire_lock(state), Err(UpdateError::Busy)));
+            drop(successor);
+            assert!(acquire_lock(state).is_ok());
+            return;
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let lease = acquire_lock(state.path()).unwrap();
+        let fd = lease.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "update::tests::inherited_update_worker_lock_survives_worker_scope_exit",
+            ])
+            .env(STATE, state.path())
+            .stdin(Stdio::piped());
+        // SAFETY: The caller keeps the descriptor alive through spawn and the
+        // hook only makes it available in the child's reserved slot.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, WORKER_LOCK_FD) == -1
+                    || libc::fcntl(WORKER_LOCK_FD, libc::F_SETFD, 0) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(lease.into_file());
+        child.stdin.take().unwrap().write_all(&[0]).unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]

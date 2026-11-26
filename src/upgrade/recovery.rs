@@ -9,6 +9,7 @@ pub mod verified;
 #[cfg(feature = "host")]
 pub use retention::collect_superseded;
 
+use super::handoff::Phase;
 use crate::{
     chat::Session,
     daemon::lease_handoff::LeaseHandoff,
@@ -540,6 +541,50 @@ struct ManualRequest {
     windows: Vec<String>,
 }
 
+impl ManualRequest {
+    /// The original checkpoint remains immutable across recovery attempts.
+    /// A synced request recorded before a close keeps that window in scope
+    /// even if the coordinator died before the successor claimed custody.
+    fn carried_windows(&self, state: &Path) -> Result<BTreeSet<String>, String> {
+        let mut carried = BTreeSet::new();
+        for entry in fs::read_dir(state).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let Some(job) = name.to_str().and_then(|name| name.strip_suffix(".request")) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(job).is_err() {
+                continue;
+            }
+            let Ok(Some(bytes)) = read_checkpoint(&entry.path()) else {
+                continue;
+            };
+            let Ok(prior) = serde_json::from_slice::<Self>(&bytes) else {
+                continue;
+            };
+            if prior.version == self.version
+                && prior.job == job
+                && prior.checkpoint == self.checkpoint
+                && prior.source == self.source
+                && prior.target == self.target
+                && prior.target_hash == self.target_hash
+                && prior.census_hash == self.census_hash
+            {
+                if !valid_recovery_windows(&prior.windows) {
+                    return Err("An earlier recovery recorded invalid window slots".into());
+                }
+                carried.extend(
+                    prior
+                        .windows
+                        .into_iter()
+                        .filter(|slot| !self.windows.contains(slot)),
+                );
+            }
+        }
+        Ok(carried)
+    }
+}
+
 /// A restored terminal's source/relaunch lineage is bounded by the complete
 /// checkpoint (8 MiB). Budget its published descriptor, paired sessions and
 /// current chats as well as the receipt itself before asking for shutdown.
@@ -765,11 +810,20 @@ struct Continuity {
 struct CheckpointIndex {
     version: u16,
     proof: HostSessionProof,
-    phase: String,
+    #[serde(deserialize_with = "checkpoint_phase_from_string")]
+    phase: Phase,
     terminals: Vec<TerminalSource>,
     #[serde(default)]
     carried: Vec<TerminalSource>,
     chats: Vec<ChatSource>,
+}
+
+fn checkpoint_phase_from_string<'de, D>(deserializer: D) -> Result<Phase, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let phase = String::deserialize(deserializer)?;
+    Phase::deserialize(serde::de::value::StrDeserializer::new(&phase))
 }
 
 #[derive(Deserialize)]
@@ -932,17 +986,48 @@ impl PendingRecovery {
         Self::inspect_at(&store.path)
     }
 
+    /// Recover the original scope of an already archived request. This is for
+    /// verifying its serving successor, with no authority to start a daemon.
+    pub(crate) fn inspect_archived(hash: &str, target: &Path) -> Result<Option<Self>, String> {
+        let Some(store) = super::handoff::Store::existing()? else {
+            return Ok(None);
+        };
+        Self::inspect_archived_at(&store.path, hash, target)
+    }
+
+    fn inspect_archived_at(
+        canonical: &Path,
+        hash: &str,
+        target: &Path,
+    ) -> Result<Option<Self>, String> {
+        if read_checkpoint(canonical)?.is_some() {
+            return Ok(None);
+        }
+        let Some(archive) = archived_proof(canonical, target)? else {
+            return Ok(None);
+        };
+        if archive.checkpoint_sha256 != hash {
+            return Ok(None);
+        }
+        let original = Self::inspect_at(&archive.archive_path)?
+            .ok_or("The exact archived Prepared checkpoint disappeared")?;
+        if original.checkpoint_hash != hash {
+            return Err("The archived Prepared checkpoint changed during inspection".into());
+        }
+        Ok(Some(original))
+    }
+
     fn inspect_at(path: &Path) -> Result<Option<Self>, String> {
         let Some(bytes) = read_checkpoint(path)? else {
             return Ok(None);
         };
         let checkpoint: CheckpointIndex =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if checkpoint.phase == "Ready" {
+        if checkpoint.phase == Phase::Ready {
             return Ok(None);
         }
         if !(1..=5).contains(&checkpoint.version)
-            || checkpoint.phase != "Prepared"
+            || checkpoint.phase != Phase::Prepared
             || !checkpoint.proof.is_complete()
             || checkpoint.terminals.len() + checkpoint.carried.len() > super::handoff::MAX_TERMINALS
             || checkpoint.chats.len() > super::handoff::MAX_CHATS
@@ -1034,19 +1119,14 @@ impl PendingRecovery {
                                 .any(|known| known.id == paired.id && !same_terminal(known, paired))
                     })
             })
-            || self.windows.len() > 1024
-            || self
-                .windows
-                .iter()
-                .any(|slot| crate::instance::validate_window_slot(slot).is_err())
-            || self.windows.iter().collect::<BTreeSet<_>>().len() != self.windows.len()
+            || !valid_recovery_windows(&self.windows)
         {
             return Err(
                 "Retained recovery census has duplicate, foreign or unbounded original owners"
                     .into(),
             );
         }
-        if validate_checkpoint(&self.authority(), bytes)? != "Prepared"
+        if validate_checkpoint(&self.authority(), bytes)? != Phase::Prepared
             || digest(bytes) != self.checkpoint_hash
         {
             return Err(
@@ -1220,9 +1300,15 @@ impl PendingRecovery {
         worker: &File,
         guard: &UiUpdateGuard,
         handoff: &LeaseHandoff,
+        windows: &[String],
     ) -> Result<Receipt, String> {
         if !yes || selected_hash != self.checkpoint_hash {
             return Err("Recovery requires --yes and the exact retained checkpoint SHA256; nothing was started".into());
+        }
+        if !valid_recovery_windows(windows)
+            || self.windows.iter().any(|slot| !windows.contains(slot))
+        {
+            return Err("Recovery requires the original saved window slots".into());
         }
         if !self.original_census_complete {
             return Err("Recovery needs the complete original census. Repeat this exact command with --census PATH naming the retained pre-update installer census; the checkpoint was preserved".into());
@@ -1300,7 +1386,7 @@ impl PendingRecovery {
             );
         }
         let target_hash = executable_hash(&target)?;
-        let request = ManualRequest {
+        let mut request = ManualRequest {
             version: 1,
             job: job.into(),
             checkpoint: self.checkpoint_hash.clone(),
@@ -1308,8 +1394,14 @@ impl PendingRecovery {
             target: target.clone(),
             target_hash: target_hash.clone(),
             census_hash: digest(&serde_json::to_vec(&self.census).map_err(|e| e.to_string())?),
-            windows: self.windows.clone(),
+            windows: windows.to_vec(),
         };
+        let carried = request.carried_windows(state)?;
+        request.windows.extend(carried);
+        if !valid_recovery_windows(&request.windows) {
+            return Err("The retained recovery window scope exceeds its limit".into());
+        }
+        let windows = request.windows.clone();
         let request = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -1328,6 +1420,7 @@ impl PendingRecovery {
             read_checkpoint(&self.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         self.validate(&bytes)?;
         let mut authority = self.authority();
+        authority.windows = windows;
         authority.job = job.into();
         authority.request_identity = digest(&request);
         authority.job_request_hash = digest(&request);
@@ -1456,7 +1549,12 @@ impl Preparation {
                 "The original update request changed before acknowledged checkpoint binding".into(),
             );
         }
-        self.authority.checkpoint_hash = digest(&bytes);
+        self.bind_acknowledged_checkpoint(&bytes)?;
+        Ok(CapturedPreparation(self))
+    }
+
+    fn bind_acknowledged_checkpoint(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.authority.checkpoint_hash = digest(bytes);
         persist_bound_capture(
             &self.authority.checkpoint_path,
             &CapturedCensus {
@@ -1469,8 +1567,7 @@ impl Preparation {
                 census: self.authority.census.clone(),
                 windows: self.authority.windows.clone(),
             },
-        )?;
-        Ok(CapturedPreparation(self))
+        )
     }
 
     fn validate_continuity(&self) -> Result<(), String> {
@@ -1527,24 +1624,12 @@ impl CapturedPreparation {
         let bytes = read_checkpoint(&preparation.authority.checkpoint_path)?
             .ok_or("The acknowledged checkpoint disappeared before recovery")?;
         let phase = validate_checkpoint(&preparation.authority, &bytes)?;
-        if phase == "Ready" {
+        if phase == Phase::Ready {
             // The same acknowledged source may finish Prepared -> Ready while
             // this worker continuously owns its fences. Retain the full
             // original scope for the exact final bytes consumed by normal
             // restoration, including panes ended before that checkpoint.
-            persist_bound_capture(
-                &preparation.authority.checkpoint_path,
-                &CapturedCensus {
-                    producer: Some(CaptureProducer::Acknowledged {
-                        job: preparation.authority.job.clone(),
-                        request_hash: preparation.authority.job_request_hash.clone(),
-                    }),
-                    source: preparation.authority.source.clone(),
-                    checkpoint_hash: Some(digest(&bytes)),
-                    census: preparation.authority.census.clone(),
-                    windows: preparation.authority.windows.clone(),
-                },
-            )?;
+            preparation.bind_acknowledged_checkpoint(&bytes)?;
             return Ok(None);
         }
         if digest(&bytes) != preparation.authority.checkpoint_hash {
@@ -1588,6 +1673,10 @@ impl CapturedPreparation {
 }
 
 impl Receipt {
+    pub(crate) fn saved_windows(&self) -> &[String] {
+        &self.authority.windows
+    }
+
     pub(crate) fn release_daemon_reservation(&mut self) {
         self.daemon.take();
     }
@@ -1754,31 +1843,52 @@ fn read_verified_record(
         target_hash,
         serving,
     )?;
-    let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
-    let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
-    if terminals.len() != live_terminals.len()
-        || chats.len() != live_chats.len()
-        || terminals != record.adopted_terminals.iter().copied().collect()
-        || chats != record.adopted_chats.iter().copied().collect()
-        || record.adopted_chat_descriptors.len() != live_chats.len()
-        || record.adopted_terminal_descriptors.len() != live_terminals.len()
-        || live_terminals.iter().any(|item| {
-            !record
-                .adopted_terminal_descriptors
-                .iter()
-                .any(|issued| same_adopted_terminal(issued, item, serving))
-                || !verified_terminal(census, item, serving, target)
-        })
-        || live_chats.iter().any(|item| {
-            !record.adopted_chat_descriptors.contains(item)
-                || !verified_chat(census, item, serving, live_terminals, target)
-        })
-    {
-        return Err(
-            "The serving recovery inventory differs from its verified original owners".into(),
-        );
-    }
+    record.verify_live_inventory(serving, live_terminals, live_chats)?;
     Ok(record)
+}
+
+impl RecoveryRecord {
+    /// A startup publisher uses the same lineage checks as an external
+    /// installer, against the live owner's inventory before opening admission.
+    pub fn verify_live_inventory(
+        &self,
+        serving: &HostSessionProof,
+        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        live_chats: &[Session],
+    ) -> Result<(), String> {
+        if !self.settled || self.successor.as_ref() != Some(serving) || !serving.is_complete() {
+            return Err("The replacement has not settled this recovery".into());
+        }
+        let target = self
+            .target
+            .as_deref()
+            .ok_or("Recovery is missing its exact target")?;
+        let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
+        let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
+        if terminals.len() != live_terminals.len()
+            || chats.len() != live_chats.len()
+            || terminals != self.adopted_terminals.iter().copied().collect()
+            || chats != self.adopted_chats.iter().copied().collect()
+            || self.adopted_chat_descriptors.len() != live_chats.len()
+            || self.adopted_terminal_descriptors.len() != live_terminals.len()
+            || live_terminals.iter().any(|item| {
+                !self
+                    .adopted_terminal_descriptors
+                    .iter()
+                    .any(|issued| same_adopted_terminal(issued, item, serving))
+                    || !verified_terminal(&self.census, item, serving, target)
+            })
+            || live_chats.iter().any(|item| {
+                !self.adopted_chat_descriptors.contains(item)
+                    || !verified_chat(&self.census, item, serving, live_terminals, target)
+            })
+        {
+            return Err(
+                "The serving recovery inventory differs from its verified original owners".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn same_adopted_terminal(
@@ -1983,7 +2093,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
     let bytes = super::handoff::Store::discover()?
         .read_bytes()?
         .ok_or("The acknowledged source has no Ready checkpoint")?;
-    if validate_checkpoint(&authority, &bytes)? != "Ready" {
+    if validate_checkpoint(&authority, &bytes)? != Phase::Ready {
         return Err("The acknowledged preparation is still Prepared; previous provider shutdown is unconfirmed and ordinary startup is refused".into());
     }
     Ok(())
@@ -2001,11 +2111,11 @@ pub fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, Termina
         .collect()
 }
 
-fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, String> {
+fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<Phase, String> {
     let checkpoint: CheckpointIndex = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if !(1..=5).contains(&checkpoint.version)
         || checkpoint.proof != authority.source
-        || !matches!(checkpoint.phase.as_str(), "Prepared" | "Ready")
+        || !matches!(checkpoint.phase, Phase::Prepared | Phase::Ready)
     {
         return Err("The checkpoint is not this update's acknowledged source preparation".into());
     }
@@ -2167,6 +2277,8 @@ fn open_recovery_executable(path: &Path) -> Result<File, String> {
 }
 
 fn hash_open_executable(file: &File) -> Result<String, String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut reader = file.take(512 * 1024 * 1024 + 1);
     let mut buffer = [0u8; 64 * 1024];
@@ -2177,7 +2289,12 @@ fn hash_open_executable(file: &File) -> Result<String, String> {
         }
         hash.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    let mut digest = String::with_capacity(64);
+    for byte in hash.finalize() {
+        use std::fmt::Write as _;
+        write!(&mut digest, "{byte:02x}").expect("formatting a SHA-256 digest into a string");
+    }
+    Ok(digest)
 }
 
 fn same_authority_path(left: &Path, right: &Path) -> bool {
@@ -2520,6 +2637,14 @@ pub struct RecoveryRecord {
     authority: Option<Continuity>,
 }
 
+fn valid_recovery_windows(windows: &[String]) -> bool {
+    windows.len() <= 1024
+        && windows
+            .iter()
+            .all(|slot| crate::instance::validate_window_slot(slot).is_ok())
+        && windows.iter().collect::<BTreeSet<_>>().len() == windows.len()
+}
+
 fn recovery_name(hash: &str) -> String {
     format!("daemon-upgrade.recovery.{hash}.json")
 }
@@ -2541,6 +2666,8 @@ pub struct SettledWitness {
 /// This value carries no locks, receipt, or authority to replay or adopt owners.
 #[derive(Clone, Debug)]
 pub struct AlreadyRecovered {
+    pub(crate) job: String,
+    pub(crate) windows: Vec<String>,
     pub source: HostSessionProof,
     pub census: Census,
     pub paused_terminals: Vec<TerminalId>,
@@ -2565,12 +2692,12 @@ fn validate_settled_record(
     let index: CheckpointIndex = serde_json::from_slice(checkpoint).map_err(|e| e.to_string())?;
     if record.checkpoint_hash != digest(checkpoint)
         || record.source != index.proof
-        || index.phase != "Prepared"
+        || index.phase != Phase::Prepared
     {
         return Err("Settled recovery does not match the exact Prepared checkpoint".into());
     }
     let authority = validate_settled_identity(record, checkpoint_path, target)?;
-    if validate_checkpoint(&authority, checkpoint)? != "Prepared" {
+    if validate_checkpoint(&authority, checkpoint)? != Phase::Prepared {
         return Err("Settled recovery no longer names a Prepared checkpoint".into());
     }
     Ok(())
@@ -3057,6 +3184,8 @@ fn recovered_data(
     descriptors.extend(additional);
     AlreadyRecovered {
         witness,
+        job: record.job,
+        windows: record.windows,
         source: record.source,
         census: record.census,
         paused_terminals: record.paused_terminals,
@@ -4212,7 +4341,7 @@ fn validate_received_checkpoint(authority: &Authority) -> Result<(), String> {
     let checkpoint =
         read_checkpoint(&authority.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
     super::handoff::validate_checkpoint_bytes(&checkpoint)?;
-    if validate_checkpoint(authority, &checkpoint)? != "Prepared"
+    if validate_checkpoint(authority, &checkpoint)? != Phase::Prepared
         || digest(&checkpoint) != authority.checkpoint_hash
     {
         return Err(
@@ -4343,7 +4472,7 @@ impl RecoveryRecord {
             format!("This recovery receipt could not be claimed. Existing recovery evidence was preserved: {error}")
         })
     }
-    pub fn finish(mut self, successor: &HostSessionProof) -> Result<(), String> {
+    pub fn finish(mut self, successor: &HostSessionProof) -> Result<Self, String> {
         self.validate_continuity()?;
         self.validate_census()?;
         self.adopted_terminal_descriptors = std::mem::take(&mut self.adopted_terminal_descriptors)
@@ -4355,7 +4484,7 @@ impl RecoveryRecord {
         self.settled = true;
         self.save()?;
         drop(self.authority.take());
-        Ok(())
+        Ok(self)
     }
 }
 

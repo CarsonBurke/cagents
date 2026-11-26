@@ -24,7 +24,6 @@ import androidx.compose.material.icons.automirrored.outlined.HelpOutline
 import androidx.compose.material.icons.outlined.MarkChatUnread
 import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.PanTool
-import androidx.compose.material.icons.outlined.RateReview
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.CircularProgressIndicator
@@ -285,13 +284,6 @@ private fun AttentionCard(item: AttentionItem, now: Long, onOpen: (String) -> Un
             body = item.entry.session.failure,
             target = item.entry.session.takeIf { it.watchable }?.id,
         )
-        is AttentionItem.Reviews -> AttentionContent(
-            icon = Icons.Outlined.RateReview,
-            title = if (item.notices.size == 1) "1 review request" else "${item.notices.size} review requests",
-            subtitle = "Your review was requested",
-            body = "Open them in cagents on the computer.",
-            target = null,
-        )
     }
     val content: @Composable () -> Unit = {
         Row(Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp)) {
@@ -338,7 +330,6 @@ private fun noticeIcon(notice: Notice) = when (notice.kind) {
     }
     NoticeKind.Succeeded -> Icons.Outlined.CheckCircle
     NoticeKind.Failed, NoticeKind.AutomationBlocked -> Icons.Outlined.ErrorOutline
-    NoticeKind.ReviewRequested -> Icons.Outlined.RateReview
     NoticeKind.MessageReceived -> Icons.Outlined.MarkChatUnread
     else -> Icons.Outlined.NotificationsActive
 }

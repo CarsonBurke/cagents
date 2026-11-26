@@ -80,6 +80,10 @@ fn process_user(
             .clone()
             .ok_or_else(|| "The automation scheduler is unavailable".to_owned())
     };
+    let resolves_attention = matches!(
+        &request,
+        Request::Edit { .. } | Request::Remove { .. } | Request::SetEnabled { enabled: true, .. }
+    );
     let response = match request {
         Request::Propose { .. } => {
             return Err(
@@ -222,6 +226,16 @@ fn process_user(
             Response::CancellationRequested
         }
     };
+    if resolves_attention {
+        let broker = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notifications
+            .clone();
+        if let Some(broker) = broker {
+            broker.reconcile_automation_attention();
+        }
+    }
     super::wake(host);
     Ok(response)
 }

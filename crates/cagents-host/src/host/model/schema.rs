@@ -238,8 +238,12 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
-            32 => {
+            33 => {
                 tx.execute_batch("DROP TABLE session_lineage_predecessors;")
+                    .map_err(|error| error.to_string())?;
+            }
+            32 => {
+                tx.execute_batch("DROP TABLE automation_attention_resolution;")
                     .map_err(|error| error.to_string())?;
             }
             31 => {
@@ -414,6 +418,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static THIRTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -436,6 +441,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         30 => &THIRTY,
         31 => &THIRTY_ONE,
         32 => &THIRTY_TWO,
+        33 => &THIRTY_THREE,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -1379,7 +1385,8 @@ mod tests {
             // channel work, schema 28 adds private pane chat ownership,
             // schema 29 retains explicitly deleted channel identities, and
             // schema 30 records each channel's checkout, and schema 31 adds
-            // indexes for mailbox run receipts and unfinished runs.
+            // indexes for mailbox run receipts and unfinished runs. Schema 32
+            // keeps automation attention resolution outside the bounded audit.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1399,6 +1406,7 @@ mod tests {
                 "deleted_channels",
                 "agent_runs_by_message",
                 "agent_runs_unfinished_by_agent",
+                "automation_attention_resolution",
                 "session_lineage_predecessors",
             ];
             for name in retention_names {

@@ -12,10 +12,10 @@
 //! like any other file; it spares only a live socket. Earlier releases
 //! allocated listeners in the daemon's temporary directory, where a server
 //! that ran for weeks lost its endpoint and could no longer be joined or
-//! handed to an update (#2436). New listeners live under the daemon's runtime
-//! directory, which nothing ages, and the ones still served from the old
-//! location are kept fresh until their conversations end.
-use crate::agent::observe::socket;
+//! handed to an update (#2436). New listeners prefer the daemon's runtime
+//! directory, which nothing ages. Listeners with a short temporary path
+//! are kept fresh until their conversations end.
+use crate::{agent::observe::socket, chat::protocol::codex::owned_listener_path_fits};
 use std::{
     io,
     os::unix::{
@@ -30,32 +30,57 @@ use std::{
 pub(crate) struct Roots {
     /// Where new listeners are allocated.
     current: PathBuf,
-    /// Where earlier releases allocated them. Conversations allocated there
-    /// keep their listener, because its path is part of the recipe every
-    /// window was issued; this daemon still recognizes it as its own.
-    legacy: PathBuf,
+    /// Temporary roots for both current and older recipes. Keep recognizing
+    /// a listener after the daemon starts with a shorter temporary directory.
+    temporary: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "macos")]
+const DARWIN_SHORT_TEMP: &str = "/private/var/tmp";
+#[cfg(target_os = "macos")]
+const DARWIN_LEGACY_TEMP: &str = "/var/tmp";
+
 impl Roots {
-    /// The daemon's own layout: new listeners under its runtime directory,
-    /// unless a listener there would not fit in a Unix socket address. A
-    /// development instance's runtime directory can be that long; its
-    /// listeners stay in the temporary directory, where they are refreshed.
+    /// Prefer the runtime directory, where the system does not age listeners.
+    /// Darwin's per-user runtime and temporary directories can both exceed
+    /// the address limit once the listener's UUID and filename are appended.
     pub(crate) fn in_runtime_directory(runtime: &Path) -> Self {
-        let legacy = std::env::temp_dir();
-        let current = runtime.join("codex");
-        let longest = current
-            .join(format!("cagents-codex-{}", crate::model::TerminalId::new()))
-            .join("control.sock");
-        if longest.as_os_str().len() > SOCKET_PATH_MAX {
+        Self::with_temporary_directory(runtime, std::env::temp_dir())
+    }
+
+    fn with_temporary_directory(runtime: &Path, temporary_directory: PathBuf) -> Self {
+        let temporary = vec![temporary_directory];
+        #[cfg(target_os = "macos")]
+        let temporary = {
+            let mut roots = temporary;
+            for system_root in [DARWIN_SHORT_TEMP, DARWIN_LEGACY_TEMP] {
+                let root = PathBuf::from(system_root);
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            roots
+        };
+
+        let runtime_root = runtime.join("codex");
+        let id = crate::model::TerminalId::new();
+        let fits =
+            |root: &Path| root.is_absolute() && owned_listener_path_fits(&Self::endpoint(root, id));
+        let current = if fits(&runtime_root) {
+            runtime_root
+        } else {
+            let fallback = temporary
+                .iter()
+                .find(|root| fits(root))
+                .unwrap_or(&temporary[0]);
             tracing::warn!(
                 runtime = %runtime.display(),
-                "the runtime directory is too long for Codex listener sockets; allocating them \
-                 in the temporary directory instead"
+                fallback = %fallback.display(),
+                "allocating Codex listeners in the temporary directory because the runtime path does not fit"
             );
-            return Self::at(legacy);
-        }
-        Self { current, legacy }
+            fallback.clone()
+        };
+        Self { current, temporary }
     }
 
     /// Allocates everything at `root`, as releases before #2436 did. Tests
@@ -63,13 +88,22 @@ impl Roots {
     pub(crate) fn at(root: PathBuf) -> Self {
         Self {
             current: root.clone(),
-            legacy: root,
+            temporary: vec![root],
         }
     }
 
     fn each(&self) -> impl Iterator<Item = &Path> {
-        std::iter::once(self.current.as_path())
-            .chain((self.legacy != self.current).then_some(self.legacy.as_path()))
+        std::iter::once(self.current.as_path()).chain(
+            self.temporary
+                .iter()
+                .map(PathBuf::as_path)
+                .filter(|root| *root != self.current.as_path()),
+        )
+    }
+
+    fn endpoint(root: &Path, id: crate::model::TerminalId) -> PathBuf {
+        root.join(format!("cagents-codex-{id}"))
+            .join("control.sock")
     }
 
     /// Points a Codex thread's `--remote` at its own listener: a new thread
@@ -96,17 +130,9 @@ impl Roots {
 
     /// Whether `socket` is the listener this daemon allocates for `id`.
     pub(crate) fn allocates(&self, id: crate::model::TerminalId, socket: &Path) -> bool {
-        self.each().any(|root| {
-            socket
-                == root
-                    .join(format!("cagents-codex-{id}"))
-                    .join("control.sock")
-        })
+        self.each().any(|root| socket == Self::endpoint(root, id))
     }
 }
-
-/// The longest path a Unix socket address holds, less its terminating NUL.
-const SOCKET_PATH_MAX: usize = 107;
 
 /// How often listeners in the legacy location are refreshed. The cleaner's
 /// shortest default age is ten days, for /tmp; /var/tmp's is thirty.
@@ -158,19 +184,29 @@ pub(crate) fn keep_legacy_listeners_fresh(host: &crate::host::state::SharedHost)
         let Some(host) = host.upgrade() else {
             return Next::Stop;
         };
-        let root = host
+        let temporary = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .codex_listeners
-            .legacy
+            .temporary
             .clone();
         drop(host);
-        if let Err(error) = refresh_served(&root) {
-            tracing::warn!(
-                %error,
-                root = %root.display(),
-                "Codex listeners in the temporary directory could not be kept fresh"
-            );
+        #[cfg(target_os = "macos")]
+        let mut refreshed = std::collections::HashSet::new();
+        for root in temporary {
+            // The issued recipe keeps its original spelling, but the system
+            // roots can name the same physical directory.
+            #[cfg(target_os = "macos")]
+            if !refreshed.insert(std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone())) {
+                continue;
+            }
+            if let Err(error) = refresh_served(&root) {
+                tracing::warn!(
+                    %error,
+                    root = %root.display(),
+                    "Codex listeners in the temporary directory could not be kept fresh"
+                );
+            }
         }
         Next::Continue
     })
@@ -426,7 +462,7 @@ mod tests {
     fn layout() -> Roots {
         Roots {
             current: "/run/user/1000/cagents/codex".into(),
-            legacy: "/var/tmp".into(),
+            temporary: vec!["/var/tmp".into()],
         }
     }
 
@@ -434,7 +470,7 @@ mod tests {
     fn a_new_listener_is_allocated_under_the_runtime_directory() {
         let roots = Roots::in_runtime_directory(Path::new("/run/user/1000/cagents"));
         assert_eq!(roots.current, Path::new("/run/user/1000/cagents/codex"));
-        assert_eq!(roots.legacy, std::env::temp_dir());
+        assert_eq!(roots.temporary[0], std::env::temp_dir());
 
         let roots = layout();
         let mut new = codex(&["--remote", "unix://"], None);
@@ -513,24 +549,48 @@ mod tests {
     }
 
     #[test]
-    fn a_runtime_directory_too_long_for_a_socket_keeps_the_temporary_directory() {
-        let fits = Path::new("/run/user/1000/cagents-development-ab");
-        assert_eq!(
-            Roots::in_runtime_directory(fits).current,
-            fits.join("codex")
-        );
+    fn a_runtime_directory_too_long_for_a_socket_uses_the_temporary_directory() {
+        use crate::chat::protocol::codex::OWNED_LISTENER_PATH_CAPACITY;
         // <runtime>/codex/cagents-codex-<36-byte id>/control.sock
         let below = "/codex/cagents-codex-".len() + 36 + "/control.sock".len();
-        let longest = "/".to_owned() + &"r".repeat(SOCKET_PATH_MAX - below - 1);
-        assert_eq!(
-            Roots::in_runtime_directory(Path::new(&longest)).current,
-            Path::new(&longest).join("codex")
-        );
+        let longest = "/".to_owned() + &"r".repeat(OWNED_LISTENER_PATH_CAPACITY - below - 2);
+        let temporary = PathBuf::from("/tmp");
+        let roots = Roots::with_temporary_directory(Path::new(&longest), temporary.clone());
+        assert_eq!(roots.current, Path::new(&longest).join("codex"));
         let too_long = longest + "x";
-        assert_eq!(
-            Roots::in_runtime_directory(Path::new(&too_long)),
-            Roots::at(std::env::temp_dir())
-        );
+        let roots = Roots::with_temporary_directory(Path::new(&too_long), temporary.clone());
+        assert_eq!(roots.current, temporary);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn long_darwin_runtime_and_temporary_paths_use_a_short_listener_root() {
+        let base = Path::new("/var/folders/aa/0123456789abcdefghijklmnopqrst");
+        let runtime = base.join("0/cagents/cagents");
+        let temp = base.join("T");
+        let roots = Roots::with_temporary_directory(&runtime, temp.clone());
+        assert_eq!(roots.current, Path::new(DARWIN_SHORT_TEMP));
+        let mut session = codex(&["--remote", "unix://"], None);
+        assert!(roots.claim(&mut session, &allocator()));
+        let endpoint = &session.owned_codex_listener.as_ref().unwrap().socket;
+        assert!(owned_listener_path_fits(endpoint));
+        assert!(!owned_listener_path_fits(&Roots::endpoint(
+            &temp, session.id
+        )));
+
+        let restarted = Roots::with_temporary_directory(&runtime, "/tmp".into());
+        assert!(restarted.allocates(session.id, endpoint));
+        let relative = Roots::with_temporary_directory(&runtime, "temp".into());
+        assert_eq!(relative.current, Path::new(DARWIN_SHORT_TEMP));
+
+        let mut legacy = codex(&[], Some("thread"));
+        let socket = Roots::endpoint(Path::new(DARWIN_LEGACY_TEMP), legacy.id);
+        legacy.launch.recipe.arguments =
+            vec!["--remote".into(), format!("unix://{}", socket.display())];
+        let recipe = legacy.launch.recipe.clone();
+        assert!(roots.claim(&mut legacy, &allocator()));
+        assert_eq!(legacy.owned_codex_listener.as_ref().unwrap().socket, socket);
+        assert_eq!(legacy.launch.recipe, recipe);
     }
 
     #[test]

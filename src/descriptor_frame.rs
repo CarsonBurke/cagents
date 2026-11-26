@@ -7,7 +7,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use std::io::{self, Write};
 use std::mem::{size_of, size_of_val, zeroed};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
@@ -84,37 +84,13 @@ fn remaining(deadline: Instant) -> Result<std::time::Duration, String> {
 }
 
 fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<(), String> {
-    loop {
-        let left = remaining(deadline)?;
-        let milliseconds = left
-            .as_millis()
-            .saturating_add(u128::from(left.subsec_nanos() % 1_000_000 != 0));
-        let timeout = milliseconds.min(libc::c_int::MAX as u128) as libc::c_int;
-        let mut descriptor = libc::pollfd {
-            fd: control.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(format!("poll descriptor frame: {error}"));
-        }
-        remaining(deadline)?;
-        if result == 0 {
-            continue;
-        }
-        if descriptor.revents & libc::POLLNVAL != 0 {
-            return Err("invalid descriptor frame socket".into());
-        }
-        // HUP/ERR must reach recvmsg/sendmsg, which reports EOF/the actual error.
-        if descriptor.revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
-            return Ok(());
-        }
+    let ready = crate::descriptor::wait_for_activity(control.as_fd(), events, Some(deadline))
+        .map_err(|error| format!("poll descriptor frame: {error}"))?;
+    if !ready {
+        return Err("descriptor frame deadline expired".into());
     }
+    remaining(deadline)?;
+    Ok(())
 }
 
 struct BoundedJson {

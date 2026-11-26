@@ -257,11 +257,31 @@ fn join_launched(
     path: &Path,
     limits: ListenerLimits,
     queued: &AtomicU64,
+    lock_wait: impl FnMut() -> Option<LockWait>,
+    halted: impl FnMut() -> Option<&'static str>,
+) -> Result<UnixStream, String> {
+    join_launched_with_clock(
+        path,
+        limits,
+        queued,
+        lock_wait,
+        halted,
+        Instant::now,
+        || thread::sleep(Duration::from_millis(20)),
+    )
+}
+
+fn join_launched_with_clock(
+    path: &Path,
+    limits: ListenerLimits,
+    queued: &AtomicU64,
     mut lock_wait: impl FnMut() -> Option<LockWait>,
     mut halted: impl FnMut() -> Option<&'static str>,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(),
 ) -> Result<UnixStream, String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let started = Instant::now();
+    let started = now();
     let mut sampled = started;
     let mut waited = Duration::ZERO;
     loop {
@@ -277,10 +297,10 @@ fn join_launched(
         if let Some(reason) = halted() {
             return Err(reason.into());
         }
-        let now = Instant::now();
-        if now.duration_since(sampled) >= limits.sample {
+        let current = now();
+        if current.duration_since(sampled) >= limits.sample {
             if let Some(wait) = lock_wait() {
-                waited += now.duration_since(sampled);
+                waited += current.duration_since(sampled);
                 queued.store(
                     u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
                     Ordering::Release,
@@ -296,15 +316,15 @@ fn join_launched(
                     ));
                 }
             }
-            sampled = now;
+            sampled = current;
         }
-        if now.duration_since(started).saturating_sub(waited) >= limits.own {
+        if current.duration_since(started).saturating_sub(waited) >= limits.own {
             return Err(format!(
                 "Codex server did not open its local socket within {} seconds",
                 limits.own.as_secs()
             ));
         }
-        thread::sleep(Duration::from_millis(20));
+        pause();
     }
 }
 
@@ -953,47 +973,53 @@ mod tests {
     #[test]
     fn time_queued_behind_another_lock_holder_is_not_charged_to_startup() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("codex.sock");
+        let second = Duration::from_secs(1);
         let limits = ListenerLimits {
-            own: Duration::from_millis(300),
-            queued: Duration::from_secs(5),
-            sample: Duration::from_millis(20),
+            own: 3 * second,
+            queued: 50 * second,
+            sample: second,
         };
-        let queued = AtomicU64::new(0);
-        let started = Instant::now();
-        let mut server = None;
-        let joined = join_launched(
-            &path,
-            limits,
-            &queued,
-            || {
-                (started.elapsed() < Duration::from_millis(900))
-                    .then_some(LockWait { holder: Some(7) })
-            },
-            || {
-                if started.elapsed() >= Duration::from_millis(1000) && server.is_none() {
-                    let bound = bound(&path);
-                    assert_eq!(unsafe { libc::listen(bound.as_raw_fd(), 1) }, 0);
-                    server = Some(bound);
-                }
-                None
-            },
-        );
+        let attempt = |path: &Path, lock_until: Duration| {
+            let queued = AtomicU64::new(0);
+            let origin = Instant::now();
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let mut server = None;
+            let joined = join_launched_with_clock(
+                path,
+                limits,
+                &queued,
+                || (elapsed.get() < lock_until).then_some(LockWait { holder: Some(7) }),
+                || None,
+                || origin + elapsed.get(),
+                || {
+                    elapsed.set(elapsed.get() + second);
+                    if elapsed.get() == 10 * second {
+                        let bound = bound(path);
+                        assert_eq!(unsafe { libc::listen(bound.as_raw_fd(), 1) }, 0);
+                        server = Some(bound);
+                    }
+                },
+            );
+            drop(server);
+            (
+                joined,
+                elapsed.get(),
+                Duration::from_millis(queued.load(Ordering::Acquire)),
+            )
+        };
+        let (joined, elapsed, queued) = attempt(&directory.path().join("queued.sock"), 9 * second);
         assert!(joined.is_ok(), "{joined:?}");
-        // Three times the startup budget passed, nearly all of it queued.
-        assert!(started.elapsed() >= Duration::from_millis(1000));
-        assert!(
-            Duration::from_millis(queued.load(Ordering::Acquire)) >= Duration::from_millis(700)
-        );
+        assert_eq!(elapsed, 10 * second);
+        assert_eq!(queued, 8 * second);
 
-        // Without the queue the same wait exceeds the server's own budget.
-        let absent = directory.path().join("absent.sock");
-        let error = join_launched(&absent, limits, &AtomicU64::new(0), || None, || None);
-        assert!(
-            error
-                .unwrap_err()
-                .starts_with("Codex server did not open its local socket within")
+        let (joined, elapsed, queued) =
+            attempt(&directory.path().join("unqueued.sock"), Duration::ZERO);
+        assert_eq!(
+            joined.unwrap_err(),
+            "Codex server did not open its local socket within 3 seconds",
         );
+        assert_eq!(elapsed, limits.own);
+        assert_eq!(queued, Duration::ZERO);
     }
 
     #[test]

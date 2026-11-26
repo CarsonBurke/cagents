@@ -14,6 +14,57 @@ fn test_host() -> HostState {
 }
 
 #[test]
+fn restore_keeps_the_checkpoint_until_ready_publication_is_finalized() {
+    use crate::upgrade::handoff::{Checkpoint, Phase, Store};
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(HostLock::new(test_host_with_incarnation("successor")));
+    let source = test_host_with_incarnation("source").proof().clone();
+    let mut checkpoint = Checkpoint::new(source, Vec::new(), Vec::new(), Vec::new());
+    checkpoint.phase = Phase::Ready;
+    let store = Store::open(directory.path()).unwrap();
+    let path = store.path.clone();
+    store.save(&checkpoint).unwrap();
+    let restore = |store| {
+        restore_upgrade_checkpoint(
+            &host,
+            store,
+            Some(checkpoint.clone()),
+            directory.path(),
+            None,
+        )
+        .unwrap()
+    };
+    let interrupted = restore(store);
+    let evidence = std::fs::read(&path).unwrap();
+    drop(interrupted);
+    assert_eq!(std::fs::read(&path).unwrap(), evidence);
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(store.load().unwrap().unwrap().phase, Phase::Restoring);
+
+    // Simulate a fresh startup from another acknowledged Ready checkpoint.
+    store.save(&checkpoint).unwrap();
+    let mut restored = restore(store);
+    restored.finish(&host).unwrap();
+    assert!(!path.exists());
+    assert!(host.lock().unwrap().retained_startup_checkpoint().is_none());
+
+    let store = Store::open(directory.path()).unwrap();
+    store.save(&checkpoint).unwrap();
+    let mut restored = restore(store);
+    // A failed retirement must keep the original identities protected even
+    // if the canonical name is already gone or can no longer be read.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(restored.finish(&host).is_err());
+    let state = host.lock().unwrap();
+    let retained = state.retained_startup_checkpoint().unwrap();
+    assert_eq!(retained.proof, checkpoint.proof);
+    assert_eq!(retained.phase, Phase::Restoring);
+    assert!(state.startup_recovery().is_some());
+}
+
+#[test]
 fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
     use crate::terminal_ipc::{ClientRequest, ServerResponse};
     let host = Arc::new(HostLock::new(test_host()));
@@ -53,7 +104,7 @@ fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
     assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn local_startup_reports_ready_only_after_public_selection() {
     let host = Arc::new(HostLock::new(test_host()));
@@ -69,6 +120,17 @@ fn local_startup_reports_ready_only_after_public_selection() {
     );
     assert_eq!(state.startup_recovery(), None);
     assert!(state.startup_blocks_shutdown());
+    drop(state);
+    assert_eq!(
+        crate::host::recovery_admission::admit(
+            &host,
+            &crate::terminal_ipc::ClientRequest::ChatCapacitySet { limit: 1 },
+        )
+        .unwrap_err()
+        .code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable
+    );
+    let mut state = host.lock().unwrap();
     state.publishing_startup = false;
     assert_eq!(state.startup_state(), StartupState::Ready);
     assert!(!state.startup_blocks_shutdown());

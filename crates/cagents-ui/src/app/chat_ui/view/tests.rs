@@ -10058,6 +10058,25 @@ fn concrete_activity_is_inferred_from_streamed_items() {
     assert_eq!(activity_label(&snapshot), "Responding");
 }
 
+#[test]
+fn following_an_unloaded_child_invalidates_its_coordination_projection() {
+    use std::hash::Hasher;
+
+    let (runtime, _) = prepared_runtime_for_test(&[]);
+    let mut child = native_child_fixture();
+    child.status = chat::ToolStatus::Running;
+    child.detail = chat::UNLOADED_CHILD_RUNNING.into();
+    child.items.clear();
+    let fingerprint = |child: &chat::Subagent| {
+        let mut hash = crate::fingerprint::hasher();
+        runtime.hash_agent_state(child, None, &mut hash);
+        hash.finish()
+    };
+    let before = fingerprint(&child);
+    child.detail.clear();
+    assert_ne!(before, fingerprint(&child));
+}
+
 /// The fingerprint of every exchange on screen, oldest first.
 fn fingerprints(runtime: &Runtime, dark: bool) -> Vec<u64> {
     runtime

@@ -11,16 +11,20 @@ What it does:
   waiting for an answer. Then what is working, then the rest, newest first.
   Agents a session started sit beneath it.
 - **Conversations.** Follow a chat as it streams. Commands, edits and tool
-  calls stay one line each until you tap them.
+  calls stay one line each until you tap them. On supported computers, open
+  saved output, full file patches and stored images when you need them.
 - **Decisions.** Answer approvals and questions with the options the agent
   offers. Nothing is approved by default.
 - **Messages.** Send a message. While a turn runs, steer it now or queue the
-  message for after it, or stop the turn.
-- **Reconnection.** A dropped connection comes back with backoff, and the app
-  watches again what it was showing. In the background it stops watching
-  and closes the connection after 30 seconds.
+  message for after it, or stop the turn. Use the attachment button to send
+  a photo to a conversation that accepts images.
+- **Reconnection.** The app stops watching in the background and keeps an
+  existing connection for up to 30 seconds if Android allows it. When you
+  return, the app checks the connection or reconnects, then resumes watching
+  what you had open. Repeated failures while you are using the app back off.
 
-Terminal sessions are listed but can't be opened; the API follows native chats.
+The app lists terminal agents. The API supports a read-only terminal view
+that the app does not yet display.
 
 ## Connect a computer
 

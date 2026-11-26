@@ -1011,6 +1011,22 @@ impl HostedTerminalHandle {
         )
     }
 
+    /// Follow the current terminal descriptor and live events from its cursor.
+    pub(crate) fn observe_at(
+        socket: impl Into<PathBuf>,
+        terminal_id: TerminalId,
+        expected_host: HostSessionProof,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+    ) -> Result<Self, HostedTerminalStartError> {
+        Self::start(
+            socket.into(),
+            terminal_id,
+            ConnectionIntent::Observe,
+            Some(expected_host),
+            Arc::new(wake),
+        )
+    }
+
     pub fn attach_or_spawn_at(
         socket: impl Into<PathBuf>,
         session: TerminalSession,
@@ -1072,7 +1088,7 @@ impl HostedTerminalHandle {
         let (command_tx, command_rx) = crossbeam_channel::bounded(COMMAND_CAPACITY);
         let (event_tx, event_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
         let initially_visible = match &intent {
-            ConnectionIntent::Attach => true,
+            ConnectionIntent::Attach | ConnectionIntent::Observe => true,
             ConnectionIntent::Spawn(spawn) | ConnectionIntent::AuthorizedSpawn { spawn, .. } => {
                 spawn.options.initially_visible
             }
@@ -1424,6 +1440,7 @@ impl HostedTerminalHandle {
 #[derive(Clone, Debug)]
 enum ConnectionIntent {
     Attach,
+    Observe,
     Spawn(Box<SpawnIntent>),
     AuthorizedSpawn {
         spawn: Box<SpawnIntent>,
@@ -2361,6 +2378,11 @@ fn serve_connection(
                     .iter()
                     .find(|terminal| terminal.session.id == terminal_id && terminal.attached)
                 {
+                    if matches!(intent, ConnectionIntent::Observe) {
+                        published
+                            .event_sequence
+                            .fetch_max(terminal.event_sequence, Ordering::AcqRel);
+                    }
                     published.observe_activity(terminal.activity);
                     if published
                         .observe_agent_activity(events, terminal.agent_activity)
@@ -2560,7 +2582,7 @@ fn serve_connection(
                     after_event_sequence: published.event_sequence.load(Ordering::Acquire),
                 },
             ),
-            ConnectionIntent::Attach => (
+            ConnectionIntent::Attach | ConnectionIntent::Observe => (
                 PendingRequest::Attach,
                 ClientRequest::Attach {
                     terminal_id,
@@ -2781,8 +2803,10 @@ fn serve_connection(
         if envelope.proof != proof {
             return ConnectionEnd::Retry;
         }
-        if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. })
-            && !attached
+        if matches!(
+            intent,
+            ConnectionIntent::AuthorizedSpawn { .. } | ConnectionIntent::Observe
+        ) && !attached
             && envelope.request_id.is_none()
             && matches!(
                 &envelope.message,
@@ -2796,9 +2820,9 @@ fn serve_connection(
             )
         {
             // Host subscriptions are installed before their response is queued,
-            // so genuine broadcasts can precede the exact source descriptor.
-            // Hold them without publication, requests or cursor advancement;
-            // preserve their order only after that descriptor is authenticated.
+            // so broadcasts can precede the source descriptor. Hold them
+            // without publication, requests or cursor advancement until it
+            // has established the source and the observer's live event cursor.
             let encoded_bytes = provisional_frame_bytes(
                 &envelope,
                 MAX_FRAME_BYTES.saturating_sub(provisional_bytes),
@@ -2866,6 +2890,11 @@ fn serve_connection(
                             );
                         }
                         attached = true;
+                        if matches!(intent, ConnectionIntent::Observe) {
+                            published
+                                .event_sequence
+                                .fetch_max(terminal.event_sequence, Ordering::AcqRel);
+                        }
                         published.observe_activity(terminal.activity);
                         if published
                             .observe_agent_activity(events, terminal.agent_activity)

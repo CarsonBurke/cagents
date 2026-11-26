@@ -45,7 +45,7 @@ pub(crate) fn preflight_source_panes(
 
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
-const PUBLICATION_FD_ENV: &str = "CAGENTS_INSTALL_PUBLICATION_FD";
+pub(crate) const PUBLICATION_FD_ENV: &str = "CAGENTS_INSTALL_PUBLICATION_FD";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
 
 #[derive(serde::Deserialize)]
@@ -152,6 +152,8 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
     ] {
         command.env_remove(name);
     }
+    #[cfg(target_os = "macos")]
+    command.env_remove(crate::instance::ui_startup::SOCKET_ENV);
 }
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -221,22 +223,92 @@ fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
     Ok(crate::instance::darwin_runtime_base()?.with_file_name("cagents.install-publication.lock"))
 }
 
+/// Serialize ordinary access to production state with offline publication.
+/// Installed processes also prove they are running the selected executable.
+/// The caller retains admission until it acquires its own state claim.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+pub fn admit_darwin_state_access() -> io::Result<Option<crate::instance::OwnedLock>> {
+    let executable = crate::process::current_executable()?;
+    let installed = installed_version_root(&executable).is_some()
+        || std::env::current_exe().is_ok_and(|path| installed_version_root(&path).is_some());
+    if !installed && crate::instance::IS_DEVELOPMENT {
+        return Ok(None);
+    }
+    let lock =
+        crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_SH | libc::LOCK_NB)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    io::Error::new(error.kind(), crate::instance::UpdateInProgress)
+                } else {
+                    error
+                }
+            })?;
+    if !installed {
+        return Ok(Some(lock));
+    }
+    let layout = crate::update::locate(&executable).map_err(io::Error::other)?;
+    let selected = std::fs::canonicalize(layout.prefix.join("current"))?;
+    let named = std::fs::metadata(&executable)?;
+    let mapped = crate::process::mapped_region_identity(
+        std::process::id(),
+        admit_darwin_state_access as *const () as usize as u64,
+    )?;
+    if selected != layout.version_root || (named.dev(), named.ino()) != mapped {
+        return Err(io::Error::other(
+            "The installed build changed before startup. Open cagents again to start the selected build.",
+        ));
+    }
+    Ok(Some(lock))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inherit_darwin_publication(
+    command: &mut Command,
+    publication: &File,
+) -> io::Result<()> {
+    let inherited = publication.try_clone()?;
+    command.env(PUBLICATION_FD_ENV, inherited.as_raw_fd().to_string());
+    // SAFETY: the closure holds the cloned File. The hook clears
+    // close-on-exec only on the child's copy of the descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(inherited.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inherited_darwin_publication() -> io::Result<Option<(File, i32)>> {
+    let Some(value) = std::env::var_os(PUBLICATION_FD_ENV) else {
+        return Ok(None);
+    };
+    let fd = value
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|fd| *fd >= 3)
+        .ok_or_else(|| io::Error::other("invalid inherited publication fence descriptor"))?;
+    // SAFETY: check the inherited descriptor before borrowing. The verifier
+    // owns no other handle that could close its original descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
+    crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
+    Ok(Some((file, fd)))
+}
+
 pub(crate) fn verify_publication() -> io::Result<()> {
     crate::instance::validate_install_guard()?;
     #[cfg(target_os = "macos")]
     {
-        let fd = std::env::var(PUBLICATION_FD_ENV)
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .filter(|fd| *fd >= 3)
+        let _publication = inherited_darwin_publication()?
             .ok_or_else(|| io::Error::other("installer has no inherited publication fence"))?;
-        // SAFETY: the descriptor is checked before borrowing, and no other
-        // code in the verifier can close an inherited descriptor.
-        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
-        crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
+        crate::instance::state_claim::require_idle_for_installation()?;
     }
     Ok(())
 }
@@ -271,18 +343,7 @@ pub(crate) fn run(
             // The publishing shell may outlive this coordinator. It holds
             // both fences until it has finished mutating the installation.
             let publication = reserve_darwin_publication()?;
-            let fd = publication.as_raw_fd();
-            command.env(PUBLICATION_FD_ENV, fd.to_string());
-            // SAFETY: the File is retained through execute. The hook only
-            // clears close-on-exec on the child's copy of the description.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
+            inherit_darwin_publication(&mut command, &publication)?;
             publication
         };
         let published = execute(&mut command);
@@ -1006,6 +1067,11 @@ pub(crate) fn staged_agent_owner_cli(executable: &Path) -> io::Result<Option<std
 
 /// The ownership marker a staging transaction recorded in `version_root`, if
 /// any. It is only private routing evidence; it never conveys authority.
+#[cfg(target_os = "macos")]
+pub(crate) fn has_staged_owner_marker(version_root: &Path) -> bool {
+    !matches!(read_staged_owner(version_root), Ok(None))
+}
+
 fn read_staged_owner(version_root: &Path) -> io::Result<Option<StagedOwner>> {
     use std::os::unix::fs::OpenOptionsExt;
     let marker = version_root.join(STAGED_OWNER);

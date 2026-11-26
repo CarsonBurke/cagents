@@ -6141,10 +6141,7 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy), |agent| {
-            (
-                agent.items.as_slice(),
-                agent.status == chat::ToolStatus::Running,
-            )
+            (agent.items.as_slice(), agent.is_running())
         });
         if resume.is_none()
             && self.preparation.context(
@@ -10524,7 +10521,7 @@ impl Cagents {
             matches!(card, CardRuntime::Chat(runtime)
             if runtime.visible.load(Ordering::Relaxed)
                 && (runtime.snapshot.busy
-                    || runtime.snapshot.subagents.iter().any(|agent| agent.status.is_live())))
+                    || runtime.snapshot.subagents.iter().any(chat::Subagent::is_live)))
         }) {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),

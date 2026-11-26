@@ -12397,6 +12397,46 @@ fn separate_commit_fields_preserve_description_and_clear_together() {
 }
 
 #[test]
+fn source_control_selection_tracks_comparison_changes_for_the_same_file() {
+    let mut state = SidebarState::default();
+    let key = main_key();
+    assert!(state.sync_active_worktree(&panel_model(), &focus_on(&key)));
+    let path = repo_path("src/app.rs");
+    let basis = DiffBasis::MergeBaseToHead {
+        base_ref: ValidatedRefName::parse("refs/remotes/origin/main").unwrap(),
+        head: Oid::parse_object("11".repeat(20)).unwrap(),
+        merge_base: Oid::parse_object("22".repeat(20)).unwrap(),
+    };
+
+    state.select_file(&key, Some((path.as_path(), None)));
+    state.select_file(&key, Some((path.as_path(), Some(&basis))));
+    assert_eq!(
+        state.panel_selection,
+        Some(PanelSelection {
+            path: path.clone(),
+            basis: Some(basis)
+        })
+    );
+
+    state.select_file(&key, Some((path.as_path(), Some(&DiffBasis::HeadToIndex))));
+    assert_eq!(
+        state.panel_selection,
+        Some(PanelSelection {
+            path: path.clone(),
+            basis: Some(DiffBasis::HeadToIndex)
+        })
+    );
+    state.select_file(&key, Some((path.as_path(), None)));
+    assert_eq!(
+        state.panel_selection,
+        Some(PanelSelection { path, basis: None })
+    );
+
+    state.select_file(&key, None);
+    assert_eq!(state.panel_selection, None);
+}
+
+#[test]
 fn rebinding_scopes_panel_drafts_and_restores_the_worktrees_commit_draft() {
     let model = panel_model();
     let mut state = SidebarState::default();

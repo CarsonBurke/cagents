@@ -29,6 +29,10 @@ use std::{
 };
 
 mod daemon_admission;
+#[cfg(target_os = "macos")]
+pub(crate) mod ui_startup;
+#[cfg(all(target_os = "macos", feature = "ui"))]
+pub use ui_startup::connect_ui_launcher;
 pub mod state_claim;
 #[doc(hidden)]
 pub mod ui_options;
@@ -462,6 +466,12 @@ impl WindowLease {
         requested: Option<&str>,
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let publication = crate::install_guard::admit_darwin_state_access()?;
+        #[cfg(target_os = "macos")]
+        let require_state = publication.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let require_state = false;
         // A window here would need a daemon here, which would refuse to serve
         // data a daemon in another runtime directory serves. Say so first:
         // that daemon's session, not this window, is what is in the way.
@@ -474,12 +484,18 @@ impl WindowLease {
                 }
             }
         }
-        let claims = state_claim::claims_directory()
-            .inspect_err(|error| tracing::warn!(%error, "window claims are unavailable"))
-            .ok();
+        let claims = match state_claim::claims_directory() {
+            Ok(claims) => Some(claims),
+            Err(error) if require_state => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "window claims are unavailable");
+                None
+            }
+        };
         let (lease, slot) = Self::acquire_waiting_in(
             &runtime_directory()?,
             claims.as_deref(),
+            require_state,
             new_window,
             requested,
             daemon_admission::admission_wait_timeout(),
@@ -509,6 +525,7 @@ impl WindowLease {
         Self::acquire_waiting_in(
             runtime,
             None,
+            false,
             new_window,
             requested,
             Duration::ZERO,
@@ -521,6 +538,7 @@ impl WindowLease {
     fn acquire_waiting_in(
         runtime: &Path,
         claims: Option<&Path>,
+        require_state: bool,
         new_window: bool,
         requested: Option<&str>,
         admission_timeout: Duration,
@@ -569,6 +587,7 @@ impl WindowLease {
                                 }
                                 return Err(error);
                             }
+                            Err(error) if require_state => return Err(error),
                             // A claim that can't be taken for another reason,
                             // such as a read-only data directory, leaves the
                             // window as it was before claims.
@@ -679,9 +698,10 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
                 "saved conversation inventory exceeds the recovery limit",
             ));
         }
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}")?;
-        stdout.flush()?;
+        write_ui_launch_line(
+            &format!("{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}"),
+            false,
+        )?;
     }
     Ok(())
 }
@@ -724,11 +744,20 @@ fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()
             Ok(_) => UI_LAUNCH_READY.to_owned(),
             Err(error) => format!("{UI_LAUNCH_ERROR_PREFIX}{error}").replace('\n', " "),
         };
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{message}")?;
-        stdout.flush()?;
+        write_ui_launch_line(&message, true)?;
     }
     Ok(())
+}
+
+fn write_ui_launch_line(message: &str, final_response: bool) -> io::Result<()> {
+    #[cfg(all(target_os = "macos", feature = "ui"))]
+    if let Some(result) = ui_startup::write_reply(message, final_response) {
+        return result;
+    }
+    let _ = final_response;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{message}")?;
+    stdout.flush()
 }
 
 pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};
@@ -1755,8 +1784,19 @@ impl UiUpdateGuard {
         }
     }
 
+    /// An already committed close is recorded in the retained checkpoint.
+    /// Leave those windows there when no launch can yet reach the successor.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn defer_reopening_to_recovery(&mut self) {
+        self.closed.clear();
+    }
+
+    pub(crate) fn running_window_slots(&self) -> io::Result<Vec<String>> {
+        running_window_slots(&self.runtime)
+    }
+
     pub fn has_running_windows(&self) -> io::Result<bool> {
-        running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
+        self.running_window_slots().map(|slots| !slots.is_empty())
     }
     /// Pass the held launch fence to an installer that would otherwise try to
     /// acquire it again. The child validates both this exact lock description
@@ -2202,6 +2242,20 @@ impl UiUpdateGuard {
     pub fn relaunch_windows(self, slots: &[String], executable: &Path) -> io::Result<()> {
         self.relaunch_windows_with_notes(slots, executable)
             .map(|_| ())
+    }
+
+    pub(crate) fn relaunch_missing_windows(
+        self,
+        slots: &[String],
+        executable: &Path,
+    ) -> io::Result<()> {
+        let running = running_window_slots(&self.runtime)?;
+        let missing: Vec<_> = slots
+            .iter()
+            .filter(|slot| !running.contains(slot))
+            .cloned()
+            .collect();
+        self.relaunch_windows(&missing, executable)
     }
 
     fn relaunch_windows_with_notes(
@@ -5616,6 +5670,7 @@ mod startup_update_tests {
             WindowLease::acquire_waiting_in(
                 runtime.path(),
                 Some(claims.path()),
+                false,
                 new_window,
                 None,
                 Duration::ZERO,
@@ -5704,6 +5759,7 @@ mod startup_update_tests {
             runtime.path(),
             None,
             false,
+            false,
             None,
             Duration::from_secs(30),
             &mut |elapsed| {
@@ -5724,6 +5780,7 @@ mod startup_update_tests {
         let error = WindowLease::acquire_waiting_in(
             runtime.path(),
             None,
+            false,
             false,
             None,
             Duration::from_millis(60),
