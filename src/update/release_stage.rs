@@ -1,5 +1,6 @@
 //! Stage a verified Darwin release and transfer the same job to its matched CLI.
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 const PROGRAMS: &[&str] = &["cagents", "cagents-ui", "cagentsd", "cagents-dictate"];
 
@@ -29,6 +30,13 @@ impl VerifiedCandidate {
 
 fn path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.release-stage.json"))
+}
+
+fn extraction_directory(state: &Path) -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(".release-stage-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(state)
 }
 
 pub(super) fn resume(
@@ -91,9 +99,7 @@ pub(super) fn extract_and_exec(
             "The selected installation changed while downloading the release",
         ));
     }
-    let stage_dir = tempfile::Builder::new()
-        .prefix(".release-stage-")
-        .tempdir_in(state)?;
+    let stage_dir = extraction_directory(state)?;
     extract(
         &installation.prefix,
         stage_dir.path(),
@@ -268,7 +274,6 @@ fn save(state: &Path, stage: &Stage) -> Result<(), UpdateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn sealed(bytes: &[u8]) -> File {
         let mut file = anonymous_file().unwrap();
@@ -285,10 +290,8 @@ mod tests {
         let selected = prefix.join("current");
         std::os::unix::fs::symlink("versions/0.2.3", &selected).unwrap();
         let state = state_dir(&prefix).unwrap();
-        let stage = tempfile::Builder::new()
-            .prefix(".release-stage-")
-            .tempdir_in(&state)
-            .unwrap();
+        let stage = extraction_directory(&state).unwrap();
+        assert_eq!(fs::metadata(stage.path()).unwrap().mode() & 0o777, 0o700);
         let asset = Asset {
             name: "offline fixture".into(),
             size: 0,
