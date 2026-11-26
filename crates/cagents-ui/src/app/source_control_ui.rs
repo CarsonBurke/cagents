@@ -1,6 +1,7 @@
 //! Applying source control results to the bound worktree: a loaded status
 //! snapshot, a page of commit history, and the end of a staged mutation.
 use super::*;
+use crate::repository::SnapshotDigest;
 use std::ops::ControlFlow;
 
 impl Cagents {
@@ -14,13 +15,14 @@ impl Cagents {
             return ControlFlow::Break(Task::none());
         }
         self.refresh_ui.source_cancel = None;
-        let snapshot: Arc<RepositorySnapshot> = match result {
-            Ok(SourceControlRead::Changed(snapshot)) => snapshot.into(),
-            Ok(SourceControlRead::Unchanged) => {
+        let model = match result {
+            Ok(SourceControlRead::Changed(model)) => *model,
+            Ok(SourceControlRead::Unchanged { digest }) => {
                 let Some(source) = self.sidebar_model.source_control.as_mut() else {
                     return ControlFlow::Break(Task::none());
                 };
                 source.set_reloading(false);
+                source.set_source_digest(digest);
                 // The worker compared against the snapshot this model was
                 // built from when the read began. A model that no longer
                 // holds one was replaced or edited since, and the request
@@ -39,10 +41,11 @@ impl Cagents {
                 return ControlFlow::Continue(Task::none());
             }
         };
+        let Some(snapshot) = model.source_snapshot().cloned() else {
+            return ControlFlow::Break(Task::none());
+        };
         self.apply_worktree_status(&key, &snapshot.status);
-        self.replace_source_control(
-            SourceControlModel::ready(key, &snapshot).built_from(Arc::clone(&snapshot)),
-        );
+        self.replace_source_control(model);
         // A worktree's first read decides which Git view it opens on.
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             self.sidebar_state.settle_changes_tab(source);
@@ -177,18 +180,24 @@ impl Cagents {
     }
 }
 
-/// Compares a finished read with the snapshot the panel was built from. It
-/// runs on the reader's blocking thread, so an unchanged worktree costs the
-/// UI thread nothing but the answer.
+/// Compares a finished read with the snapshot the panel was built from and,
+/// when they differ, builds the model that replaces it. It runs on the
+/// reader's blocking thread, so a reload costs the UI thread only installing
+/// the answer, however many files the worktree holds.
 pub(super) fn source_control_read(
+    key: ActiveWorktreeKey,
     previous: Option<&RepositorySnapshot>,
     snapshot: RepositorySnapshot,
+    digest: Option<SnapshotDigest>,
+    tree: FileTree,
 ) -> SourceControlRead {
     if previous == Some(&snapshot) {
-        SourceControlRead::Unchanged
-    } else {
-        SourceControlRead::Changed(Box::new(snapshot))
+        return SourceControlRead::Unchanged { digest };
     }
+    let snapshot = Arc::new(snapshot);
+    SourceControlRead::Changed(Box::new(
+        SourceControlModel::build(key, &snapshot, tree).built_from(Arc::clone(&snapshot), digest),
+    ))
 }
 
 #[cfg(test)]
@@ -258,13 +267,31 @@ mod tests {
         app.sidebar_model.source_control.as_ref().unwrap()
     }
 
+    /// What the worker makes of `read` for a panel showing Files.
+    fn worker_read(
+        key: &ActiveWorktreeKey,
+        previous: Option<&RepositorySnapshot>,
+        read: RepositorySnapshot,
+    ) -> SourceControlRead {
+        source_control_read(key.clone(), previous, read, None, FileTree::Built)
+    }
+
+    fn changed_rows(read: &SourceControlRead) -> usize {
+        match read {
+            SourceControlRead::Changed(model) => {
+                model.source_snapshot().unwrap().status.entries.len()
+            }
+            SourceControlRead::Unchanged { .. } => panic!("the read should have changed"),
+        }
+    }
+
     /// Starts a reload and answers it with what the worker would make of
     /// `read`, given the snapshot the panel held when the reload began.
     fn reload(app: &mut Cagents, key: &ActiveWorktreeKey, read: RepositorySnapshot) {
         let previous = source(app).source_snapshot().cloned();
         drop(app.reload_source_control(key));
         let request = app.refresh_ui.source_generation;
-        let read = source_control_read(previous.as_deref(), read);
+        let read = worker_read(key, previous.as_deref(), read);
         drop(app.source_control_loaded(key.clone(), request, Ok(read)));
     }
 
@@ -275,7 +302,7 @@ mod tests {
         drop(app.source_control_loaded(
             key.clone(),
             request,
-            Ok(SourceControlRead::Changed(Box::new(snapshot()))),
+            Ok(worker_read(&key, None, snapshot())),
         ));
         let first = Arc::clone(source(&app).source_snapshot().unwrap());
         // A rebuild allocates its rows while the model it replaces still
@@ -292,7 +319,11 @@ mod tests {
         drop(app.reload_source_control(&key));
         assert_eq!(source(&app).progress_label(), Some("Refreshing…"));
         let request = app.refresh_ui.source_generation;
-        drop(app.source_control_loaded(key.clone(), request, Ok(SourceControlRead::Unchanged)));
+        drop(app.source_control_loaded(
+            key.clone(),
+            request,
+            Ok(SourceControlRead::Unchanged { digest: None }),
+        ));
         assert_eq!(source(&app).progress_label(), None);
         assert!(Arc::ptr_eq(source(&app).source_snapshot().unwrap(), &first));
         assert_eq!(rows(&app), built);
@@ -319,25 +350,20 @@ mod tests {
 
     #[test]
     fn source_control_worker_reports_unchanged_only_for_an_equal_snapshot() {
+        let (_, key) = bound();
         let shown = snapshot();
+        assert_eq!(changed_rows(&worker_read(&key, None, snapshot())), 1);
         assert!(matches!(
-            source_control_read(None, snapshot()),
-            SourceControlRead::Changed(_)
-        ));
-        assert!(matches!(
-            source_control_read(Some(&shown), snapshot()),
-            SourceControlRead::Unchanged
+            worker_read(&key, Some(&shown), snapshot()),
+            SourceControlRead::Unchanged { .. }
         ));
         let mut status = snapshot();
         status.status.entries.push(unstaged("src/lib.rs"));
-        assert!(matches!(
-            source_control_read(Some(&shown), status),
-            SourceControlRead::Changed(read) if read.status.entries.len() == 2
-        ));
+        assert_eq!(changed_rows(&worker_read(&key, Some(&shown), status)), 2);
         let mut ignored = snapshot();
         ignored.files.ignored.push(repo_path("build/out.log"));
         assert!(matches!(
-            source_control_read(Some(&shown), ignored),
+            worker_read(&key, Some(&shown), ignored),
             SourceControlRead::Changed(_)
         ));
     }
@@ -379,7 +405,8 @@ mod tests {
             drop(app.update(Message::Sidebar(retry(&key))));
             assert!(!source(&app).ignored_directory_errors().contains_key(&build));
             let request = app.refresh_ui.source_generation;
-            let read = source_control_read(
+            let read = worker_read(
+                &key,
                 source(&app).source_snapshot().map(|shown| &**shown),
                 unreadable_build(),
             );
@@ -393,5 +420,73 @@ mod tests {
                 Some("Permission denied"),
             );
         }
+    }
+
+    /// With only Changes showing, the reader leaves the Files tree unbuilt,
+    /// and that model's digest cannot excuse the read that showing Files
+    /// starts, even though Git answers it identically.
+    #[test]
+    fn a_changes_only_read_defers_the_files_tree_until_files_is_shown() {
+        let (_, key) = bound();
+        let digest = Some(SnapshotDigest::fixture(1));
+        let SourceControlRead::Changed(deferred) =
+            source_control_read(key.clone(), None, snapshot(), digest, FileTree::Deferred)
+        else {
+            panic!("a first read always builds");
+        };
+        assert!(deferred.files.is_empty());
+        assert!(!deferred.files_built());
+        assert_eq!(deferred.source_digest(FileTree::Deferred), digest.as_ref());
+        assert_eq!(deferred.source_digest(FileTree::Built), None);
+
+        let SourceControlRead::Changed(built) =
+            source_control_read(key, None, snapshot(), digest, FileTree::Built)
+        else {
+            panic!("a first read always builds");
+        };
+        assert!(built.files_built());
+        assert!(
+            built
+                .files
+                .iter()
+                .any(|row| row.path == repo_path("src/main.rs"))
+        );
+        assert_eq!(built.source_digest(FileTree::Built), digest.as_ref());
+        assert_eq!(built.source_digest(FileTree::Deferred), digest.as_ref());
+    }
+
+    /// A touched but unedited file changes the digest and not the snapshot.
+    /// The model keeps its rows and takes the new digest, or every later
+    /// read would miss it and run in full.
+    #[test]
+    fn an_equal_read_with_a_new_digest_keeps_the_rows_and_takes_the_digest() {
+        let (mut app, key) = bound();
+        let request = app.refresh_ui.source_generation;
+        let first = Some(SnapshotDigest::fixture(1));
+        let read = source_control_read(key.clone(), None, snapshot(), first, FileTree::Deferred);
+        drop(app.source_control_loaded(key.clone(), request, Ok(read)));
+        let shown = Arc::clone(source(&app).source_snapshot().unwrap());
+        assert_eq!(
+            source(&app).source_digest(FileTree::Deferred),
+            first.as_ref()
+        );
+
+        let touched = Some(SnapshotDigest::fixture(2));
+        drop(app.reload_source_control(&key));
+        let request = app.refresh_ui.source_generation;
+        let read = source_control_read(
+            key.clone(),
+            Some(&shown),
+            snapshot(),
+            touched,
+            FileTree::Deferred,
+        );
+        assert!(matches!(read, SourceControlRead::Unchanged { .. }));
+        drop(app.source_control_loaded(key, request, Ok(read)));
+        assert!(Arc::ptr_eq(source(&app).source_snapshot().unwrap(), &shown));
+        assert_eq!(
+            source(&app).source_digest(FileTree::Deferred),
+            touched.as_ref()
+        );
     }
 }

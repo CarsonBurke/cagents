@@ -166,8 +166,8 @@ use crate::{
         CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
         CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
         PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
-        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome,
-        WorktreeRecord,
+        RepositorySnapshot, SnapshotRead, StageRequest, StatusSnapshot, UnstageRequest,
+        WorktreeCreationOutcome, WorktreeRecord,
     },
     repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
     session::{
@@ -179,9 +179,9 @@ use crate::{
         PullRequestOpenTarget, TerminalCursorStyle,
     },
     sidebar::{
-        self, ActiveWorktreeKey, MutationKind, PanelSection, SidebarAction, SidebarDataState,
-        SidebarFocus, SidebarMode, SidebarModel, SidebarProject, SidebarPullRequest, SidebarState,
-        SidebarWorktree, SourceControlModel,
+        self, ActiveWorktreeKey, FileTree, MutationKind, PanelSection, SidebarAction,
+        SidebarDataState, SidebarFocus, SidebarMode, SidebarModel, SidebarProject,
+        SidebarPullRequest, SidebarState, SidebarWorktree, SourceControlModel,
     },
     splitter::{Edge as SplitterEdge, Splitter},
     terminal::{
@@ -5528,10 +5528,15 @@ pub enum Message {
 /// was built from.
 #[derive(Debug, Clone)]
 pub enum SourceControlRead {
-    /// The worktree differs from what the panel shows; rebuild from this.
-    Changed(Box<RepositorySnapshot>),
+    /// The worktree differs from what the panel shows. The reader built the
+    /// replacement model, so the UI thread only installs it.
+    Changed(Box<SourceControlModel>),
     /// The read equals the snapshot the panel shows, so its model stands.
-    Unchanged,
+    /// `digest` is what this read hashed to, which can differ from the
+    /// model's when a file was touched without being edited.
+    Unchanged {
+        digest: Option<crate::repository::SnapshotDigest>,
+    },
 }
 
 /// An application exit in progress.
@@ -14774,17 +14779,49 @@ impl Cagents {
             .map(|source| source.ignored_directory_errors().clone())
             .unwrap_or_default();
         let previous = bound.and_then(|source| source.source_snapshot().cloned());
+        let tree = if browse_files {
+            FileTree::Built
+        } else {
+            FileTree::Deferred
+        };
+        let previous_digest = bound.and_then(|source| source.source_digest(tree).copied());
         let expanded = self
             .sidebar_state
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
+        let key_for_read = key.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                let mut snapshot = service
-                    .snapshot_with_options(&worktree, options, &cancellation)
+                let read = service
+                    .snapshot_if_changed(
+                        &worktree,
+                        options,
+                        previous_digest.as_ref(),
+                        &cancellation,
+                    )
                     .map_err(|error| error.to_string())?;
+                let (mut snapshot, digest) = match read {
+                    SnapshotRead::Changed { snapshot, digest } => (*snapshot, digest),
+                    SnapshotRead::Unchanged if !browse_files => {
+                        return Ok(SourceControlRead::Unchanged {
+                            digest: previous_digest,
+                        });
+                    }
+                    // Git's part stands, but ignored folders are listed from
+                    // the filesystem, which the digest does not cover.
+                    SnapshotRead::Unchanged => {
+                        let mut snapshot = previous
+                            .as_deref()
+                            .cloned()
+                            .ok_or("an unchanged read has no snapshot to keep")?;
+                        snapshot.files.ignored.clear();
+                        snapshot.files.ignored_directories.clear();
+                        snapshot.files.ignored_directory_errors.clear();
+                        (snapshot, previous_digest)
+                    }
+                };
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
@@ -14800,8 +14837,11 @@ impl Cagents {
                     )?;
                 }
                 Ok(source_control_ui::source_control_read(
+                    key_for_read,
                     previous.as_deref(),
                     snapshot,
+                    digest,
+                    tree,
                 ))
             })
             .await
