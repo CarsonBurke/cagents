@@ -233,7 +233,8 @@ Each session has an `id`, its `lineage` (the conversation it continues),
 `exited`, `failure`, `active_at` (Unix milliseconds) and `watchable`. A
 session started as an agent has `agent`, with its `owner` (`user`, `session`
 or `automation`), the owning session's `owner_lineage`, and `run`, its run
-state.
+state. When the daemon has the agent's label from its first accepted task,
+the session title uses that label.
 
 A watch sends a complete snapshot first. Changes on the computer trigger
 fresh snapshots, and several changes may be reflected in one event. The

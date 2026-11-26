@@ -13,7 +13,9 @@ use cagents_mobile_api as api;
 use crate::{
     agent::{ActivityState, Provider},
     agent_execution::{State, directory},
-    chat, notifications,
+    chat,
+    model::AgentId,
+    notifications,
 };
 
 /// Tool output is clipped to its last this many bytes: the end of a build or
@@ -24,7 +26,10 @@ const INPUT_HEAD_BYTES: usize = 2 * 1024;
 /// A delivered report is often the point of a conversation, so it keeps more.
 const DELIVERY_HEAD_BYTES: usize = 32 * 1024;
 
-pub fn session(member: &directory::Member) -> api::Session {
+pub fn session(
+    member: &directory::Member,
+    agent_labels: &HashMap<AgentId, String>,
+) -> api::Session {
     let entry = &member.session;
     api::Session {
         id: entry.id.to_string(),
@@ -35,7 +40,12 @@ pub fn session(member: &directory::Member) -> api::Session {
         },
         provider: entry.provider.map(|provider| provider_id(provider).into()),
         provider_label: entry.provider.map(|provider| provider.label().into()),
-        title: entry.title.clone(),
+        title: entry
+            .delegation
+            .as_ref()
+            .and_then(|delegation| agent_labels.get(&delegation.agent))
+            .or(entry.title.as_ref())
+            .cloned(),
         project: entry.project_name.clone(),
         directory: entry.directory.as_ref().map(|path| path_text(path)),
         activity: activity(entry.state),
