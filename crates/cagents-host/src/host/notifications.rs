@@ -4,6 +4,7 @@
 //! where the daemon has no app bundle to post from, through `osascript`.
 mod batching;
 mod journal;
+pub(super) mod orphaned;
 #[cfg(target_os = "macos")]
 mod osascript;
 #[cfg(target_os = "linux")]

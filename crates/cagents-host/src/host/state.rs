@@ -2491,6 +2491,23 @@ impl HostState {
         })
     }
 
+    pub(super) fn may_restore_session_notice(&self, id: TerminalId) -> bool {
+        self.terminals.contains_key(&id)
+            || self.chats.contains_key(&id)
+            || self.spawning.contains(&id)
+            || self.chat_spawning.contains_key(&id)
+            || self.handoff_terminals.contains_key(&id)
+            || self.chat_handoffs.contains_key(&id)
+            || self.native_closing.contains_key(&id)
+            || self.native_actor_startups.contains_key(&id)
+            || self.startup_custody_contains(id)
+            || self
+                .upgrade_chats
+                .values()
+                .flatten()
+                .any(|source| source.source.id == id)
+    }
+
     pub(super) fn startup_custody_contains(&self, id: TerminalId) -> bool {
         self.startup_custody.contains(&id)
     }
