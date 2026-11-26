@@ -295,7 +295,10 @@ fn claude_root_input(value: &serde_json::Value) -> bool {
     let mut has_input = false;
     for block in blocks {
         match block["type"].as_str() {
-            Some("text") if let Some(text) = block["text"].as_str() => {
+            Some("text") => {
+                let Some(text) = block["text"].as_str() else {
+                    return false;
+                };
                 has_input |= input_text(text);
             }
             Some("image" | "document") if block["source"].is_object() => has_input = true,
