@@ -128,7 +128,7 @@ impl Observation {
     }
 
     fn observe_run(&mut self, entries: &[directory::Entry]) -> Result<bool, UpdateError> {
-        let (identity, active) = run_at(entries, &self.session)?;
+        let (identity, state) = run_at(entries, &self.session)?;
         if match (&self.run, &identity) {
             (Some(before), Some(after)) => {
                 before.agent != after.agent || before.owner != after.owner
@@ -141,17 +141,26 @@ impl Observation {
             ));
         }
         if identity != self.run {
-            self.late_turn = true;
+            self.late_turn |= state != Some(agent_execution::State::Accepted);
             self.run = identity;
         }
-        Ok(active)
+        // The directory names the newest acceptance, which can be a prompt
+        // still behind the interrupted turn. An Accepted row by itself proves
+        // neither a new turn nor that the original run has stopped. Require
+        // the actor's completed turn, then let the final idle impact check
+        // for an outstanding dispatch or run anywhere in this agent's queue.
+        Ok(match state {
+            Some(agent_execution::State::Accepted) => !self.activity.completion,
+            Some(state) => !state.is_terminal(),
+            None => false,
+        })
     }
 }
 
 fn run_at(
     entries: &[directory::Entry],
     session: &Session,
-) -> Result<(Option<RunIdentity>, bool), UpdateError> {
+) -> Result<(Option<RunIdentity>, Option<agent_execution::State>), UpdateError> {
     let mut matches = entries.iter().filter(|entry| entry.id == session.id);
     let entry = matches.next().ok_or_else(|| {
         invalid("The interrupted conversation disappeared from the source run registry")
@@ -166,7 +175,7 @@ fn run_at(
         ));
     }
     let Some(delegation) = &entry.delegation else {
-        return Ok((None, false));
+        return Ok((None, None));
     };
     if delegation.run.is_some() != delegation.run_state.is_some() {
         return Err(invalid(
@@ -184,9 +193,7 @@ fn run_at(
             owner: delegation.owner.clone(),
             run: delegation.run,
         }),
-        delegation
-            .run_state
-            .is_some_and(|state| !state.is_terminal()),
+        delegation.run_state,
     ))
 }
 
@@ -526,12 +533,15 @@ fn poll_with(
         }
         check_scope(consent, &compared)?;
         for item in &idle.sessions {
-            if item.disposition == impact::Disposition::WaitsForIdle
-                && item.kind == impact::SessionKind::NativeChat
+            if item.kind == impact::SessionKind::NativeChat
                 && let Some(observed) = observations.get_mut(&item.id)
             {
-                observed.late_turn = true;
-                pending.push(item.id);
+                if item.disposition == impact::Disposition::WaitsForIdle {
+                    observed.late_turn = true;
+                    pending.push(item.id);
+                } else if item.reason.unconfirmed_agent_run() {
+                    pending.push(item.id);
+                }
             }
         }
         if !pending.is_empty() {
@@ -698,15 +708,20 @@ mod tests {
 
     #[test]
     fn protocol_156_acceptance_is_not_settlement_and_registry_must_commit_the_outcome() {
-        assert_quiescence(false);
+        assert_quiescence(false, false);
+    }
+
+    #[test]
+    fn a_newer_queued_acceptance_waits_for_the_running_outcome_but_not_delivery() {
+        assert_quiescence(false, true);
     }
 
     #[test]
     fn settled_target_keeps_previously_reviewed_blocked_owners_for_floor_review() {
-        assert_quiescence(true);
+        assert_quiescence(true, false);
     }
 
-    fn assert_quiescence(known_blocked: bool) {
+    fn assert_quiescence(known_blocked: bool, queued: bool) {
         let (session, mut daemon, entry) = fixture();
         if known_blocked {
             daemon.sessions.push(impact::SessionImpact {
@@ -745,6 +760,12 @@ mod tests {
                         if phase > 0 && phase != 3 {
                             observed.sessions[0].disposition = impact::Disposition::Resumes;
                         }
+                        if queued && phase == 1 {
+                            observed.sessions[0].reason =
+                                impact::SessionCause::AgentRunUnconfirmed {
+                                    queued_prompts: true,
+                                };
+                        }
                         ServerResponse::UpgradeImpact(observed)
                     }
                     ClientRequest::ChatList => ServerResponse::ChatListed {
@@ -782,7 +803,10 @@ mod tests {
                         if phase >= 3 {
                             entry.delegation.as_mut().unwrap().run = Some(late_run);
                         }
-                        if phase > 1 && phase != 3 {
+                        if queued && phase < 3 {
+                            entry.delegation.as_mut().unwrap().run_state =
+                                Some(agent_execution::State::Accepted);
+                        } else if phase > 1 && phase != 3 {
                             entry.delegation.as_mut().unwrap().run_state =
                                 Some(agent_execution::State::Cancelled);
                         }
