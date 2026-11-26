@@ -1844,8 +1844,13 @@ elif command in ("run", "run-client"):
              "--offline", *metadata_options],
             env=metadata_environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL)
-        metadata_output, _ = metadata_child.communicate()
+        metadata_output = metadata_child.stdout.read()
+        metadata_child.stdout.close()
+        # Keep the group leader unreaped until cancellation can no longer
+        # find it. An exited leader still reserves its PID and group number.
+        os.waitid(os.P_PID, metadata_child.pid, os.WEXITED | os.WNOWAIT)
         with launch_gate:
+            metadata_child.wait()
             child = None
         try:
             described = json.loads(metadata_output)
