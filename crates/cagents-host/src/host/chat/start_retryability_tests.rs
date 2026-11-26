@@ -195,11 +195,8 @@ fn wait_for_ready(host: &SharedHost, source: &Session, client: &ClientHandle) {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn executable_permission_repair_retries_the_same_saved_conversation() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -820,11 +817,8 @@ fn invalid_resume_continuity_stays_blocked_through_prepare_handshake() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn missing_claude_history_repair_restores_the_same_read_only_card_without_launching() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
