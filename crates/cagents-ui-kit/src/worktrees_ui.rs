@@ -948,9 +948,10 @@ impl<'a> View<'a> {
         }
         push_panes(&mut name, agents.len());
         let menu = Menu::Project(project.id);
+        let selected = current || self.state.menu == Some(menu);
         let button = widget::button::custom(lines)
             .name(name)
-            .class(crate::work_ui::card_style(current))
+            .class(crate::work_ui::card_style(selected))
             .padding([space::XS + space::XXS, space::S])
             .width(Length::Fill)
             .on_press_maybe(self.sidebar(SidebarAction::OpenRepository {
