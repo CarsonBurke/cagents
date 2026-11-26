@@ -941,7 +941,7 @@ fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
         drop(current);
         if let Some(host) = host.upgrade() {
             {
-                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 state.notifications_changed();
                 if terminal_waiting {
                     state.agent_activity_wake.notify();
