@@ -339,6 +339,11 @@ class RemoteController(
     suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) =
         call(Call.Answer(session, request, action, answers))
 
+    /** Request a fresh presentation when an already followed route is shown. */
+    fun refreshConversationForRead(session: String) {
+        if (session in _state.value.conversations) sync(session, SyncKind.Watch)
+    }
+
     suspend fun readConversation(session: String, checkpoint: String) {
         if (!foreground.value) return
         try {

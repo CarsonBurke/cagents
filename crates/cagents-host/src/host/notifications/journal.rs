@@ -96,6 +96,23 @@ impl Journal {
         Ok(Self(connection))
     }
 
+    /// Read only committed entries. The broker remains the sole writer
+    /// and can still be working on desktop delivery for these entries.
+    pub(super) fn committed_notices(path: &Path) -> Result<Vec<Notice>, String> {
+        crate::secure_file::open_existing_private_file_readonly(path)
+            .map_err(|error| error.to_string())?;
+        let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let mut url = url::Url::from_file_path(absolute)
+            .map_err(|()| "Notification journal path cannot be represented as a file URI")?;
+        url.query_pairs_mut().append_pair("mode", "ro");
+        let mut connection =
+            SqliteConnection::establish(url.as_str()).map_err(|error| error.to_string())?;
+        connection
+            .batch_execute("PRAGMA query_only=ON; PRAGMA busy_timeout=100;")
+            .map_err(|error| error.to_string())?;
+        Self(connection).list()
+    }
+
     /// Coalesce latest attention without resurrecting dismissed duplicates.
     pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
         event.validate()?;

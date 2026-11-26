@@ -174,6 +174,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun openConversation(session: String) = controller.open(session)
     fun closeConversation(session: String) = controller.close(session)
+    fun refreshConversationForRead(session: String) = controller.refreshConversationForRead(session)
     suspend fun readConversation(session: String, checkpoint: String) =
         controller.readConversation(session, checkpoint)
     fun rewatch(session: String) = controller.rewatch(session)

@@ -398,6 +398,34 @@ fn supervise(
     }
 }
 
+/// Explicit notification reads see the current journal, even while the
+/// broker awaits desktop delivery. Text remains subject to the broker's
+/// published privacy projection.
+pub(super) fn committed_snapshot(mut published: Snapshot) -> Snapshot {
+    let Some(dirs) = crate::instance::project_dirs() else {
+        return published;
+    };
+    match Journal::committed_notices(&dirs.data_dir().join("agent-attention.sqlite3")) {
+        Ok(notices) => combine_committed_notices(&mut published, notices),
+        Err(error) => {
+            tracing::debug!(%error, "could not read the committed attention journal");
+        }
+    }
+    published
+}
+
+fn combine_committed_notices(published: &mut Snapshot, mut notices: Vec<Notice>) {
+    let previews = published
+        .notices
+        .drain(..)
+        .filter_map(|notice| notice.event.content.map(|preview| (notice.id, preview)))
+        .collect::<std::collections::HashMap<_, _>>();
+    for notice in &mut notices {
+        notice.event.content = previews.get(&notice.id).cloned();
+    }
+    published.notices = notices;
+}
+
 fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
     if let Some(shared) = shared.upgrade() {
         let mut current = shared.snapshot.lock().unwrap_or_else(|p| p.into_inner());
@@ -1190,6 +1218,29 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         )
+    }
+
+    #[test]
+    fn an_explicit_attention_read_sees_committed_notice_ids_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let mut published = Snapshot::default();
+        let old = journal
+            .record(attention_event(session, "old"), false)
+            .unwrap()
+            .unwrap();
+        published.notices.push(old.clone());
+        let current = journal
+            .record(attention_event(session, "new"), false)
+            .unwrap()
+            .unwrap();
+
+        combine_committed_notices(&mut published, Journal::committed_notices(&path).unwrap());
+
+        assert_eq!(published.notices, [current]);
+        assert!(published.notices.iter().all(|notice| notice.id != old.id));
     }
 
     #[test]

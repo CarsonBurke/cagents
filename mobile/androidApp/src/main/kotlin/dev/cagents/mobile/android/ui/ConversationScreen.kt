@@ -120,8 +120,18 @@ fun ConversationScreen(
     val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsStateWithLifecycle()
     val visible = lifecycleState == Lifecycle.State.RESUMED
     val checkpoint = conversation?.readCheckpoint
+    val previouslyDisplayed = remember(session, visible) {
+        vm.remote.value.conversations[session]?.readCheckpoint
+    }
+    // A back-stack watch can stay open while Settings covers this route.
+    // Request a fresh presentation for this visit before reporting a read.
+    LaunchedEffect(session, visible, previouslyDisplayed) {
+        if (visible && previouslyDisplayed != null) vm.refreshConversationForRead(session)
+    }
     LaunchedEffect(session, visible, checkpoint) {
-        if (visible && checkpoint != null && view.connection == ConnectionState.Connected) {
+        if (visible && checkpoint != null && checkpoint != previouslyDisplayed &&
+            view.connection == ConnectionState.Connected
+        ) {
             vm.readConversation(session, checkpoint)
         }
     }
