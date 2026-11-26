@@ -966,6 +966,35 @@ pub(crate) fn compare_with_recovery(
         }
     }
 }
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn verify_ready_inventory(
+    transaction: &str,
+    source: &HostSessionProof,
+    original: &crate::upgrade::recovery::Census,
+    serving: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+    chats: &[crate::chat::Session],
+    lineage: &crate::upgrade::handoff::RecoveredChats,
+) -> Result<(), String> {
+    if source == serving || source.boot_id != serving.boot_id {
+        return Err("The replacement does not identify an exact new same-boot daemon".into());
+    }
+    let census = Census {
+        version: VERSION,
+        transaction: transaction.to_owned(),
+        source: Some(source.clone()),
+        terminals: original.terminals.clone(),
+        chats: original.chats.clone(),
+        checkpoint_before: None,
+    };
+    census.validate().map_err(|error| error.to_string())?;
+    match compare_with_recovery(&census, serving, terminals, chats, lineage, None, None) {
+        Outcome::Usable { .. } => Ok(()),
+        Outcome::Unverified { detail, .. } => Err(detail),
+        _ => Err("The Ready replacement did not verify its original inventory".into()),
+    }
+}
 fn same_owner_chat_matches(
     expected: &crate::chat::Session,
     current: &crate::chat::Session,

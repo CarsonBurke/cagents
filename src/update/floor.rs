@@ -1338,6 +1338,22 @@ impl Survivors {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn authorize_standby_successor(
+        &mut self,
+        target: &Path,
+        handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
+    ) -> Result<(), UpdateError> {
+        let handoff =
+            handoff.ok_or_else(|| invalid("The source did not transfer its runtime lease"))?;
+        let captured = self.captured_preparation.take().ok_or_else(|| {
+            invalid("The source did not acknowledge this installed cutover's original checkpoint")
+        })?;
+        self.receipt = Some(captured.standby_receipt(target, handoff).map_err(invalid)?);
+        self.successor_target = Some(target.to_owned());
+        Ok(())
+    }
+
     pub(super) fn inherit_recovery(&self, command: &mut Command) -> Result<(), UpdateError> {
         if let Some(receipt) = &self.receipt {
             receipt.inherit(command)?;
@@ -1345,7 +1361,7 @@ impl Survivors {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn recovery_receipt(&self) -> Option<&crate::upgrade::recovery::Receipt> {
         self.receipt.as_ref()
     }
@@ -1375,6 +1391,11 @@ impl Survivors {
             return Ok(());
         };
         if let Some(receipt) = &self.receipt {
+            #[cfg(target_os = "macos")]
+            if receipt.is_ready() {
+                self.successor_serving = true;
+                return Ok(());
+            }
             self.recovery_outcome = Some(receipt.verify_successor(serving).map_err(invalid)?);
         }
         self.successor_serving = true;

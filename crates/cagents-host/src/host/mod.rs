@@ -246,7 +246,16 @@ struct StartupPublication {
     publication: crate::update::LocalPublication,
     _admission: DaemonAdmission,
     #[cfg(target_os = "macos")]
-    recovered: Option<crate::upgrade::recovery::RecoveryRecord>,
+    recovered: Option<InstalledRestoration>,
+}
+
+#[cfg(target_os = "macos")]
+enum InstalledRestoration {
+    Prepared(crate::upgrade::recovery::RecoveryRecord),
+    Ready {
+        admission: crate::upgrade::recovery::ReadyAdmission,
+        restored: state::RestoredUpgrade,
+    },
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -268,26 +277,32 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
         .publish()
         .map_err(|error| error.to_string());
     #[cfg(target_os = "macos")]
-    let result = if readiness == StartupState::Ready {
-        publication
+    let result = (|| {
+        if readiness != StartupState::Ready {
+            return Err("The replacement retained the original owners for inspection".into());
+        }
+        let recovered = publication
             .recovered
-            .ok_or_else(|| "The replacement did not settle Prepared recovery".to_string())
-            .and_then(|record| {
-                record.verify_live_inventory(
-                    state.proof(),
-                    &state.list(0),
-                    &update_recovery::live_chat_descriptors(&state),
-                )
-            })
-            .and_then(|()| {
-                publication
-                    .publication
-                    .publish()
-                    .map_err(|error| error.to_string())
-            })
-    } else {
-        Err("The replacement retained the original owners for inspection".into())
-    };
+            .ok_or("The replacement did not settle the original checkpoint")?;
+        let terminals = state.list(0);
+        let chats = update_recovery::live_chat_descriptors(&state);
+        match &recovered {
+            InstalledRestoration::Prepared(record) => {
+                record.verify_live_inventory(state.proof(), &terminals, &chats)
+            }
+            InstalledRestoration::Ready { admission, .. } => {
+                admission.verify_live_inventory(state.proof(), &terminals, &chats)
+            }
+        }?;
+        publication
+            .publication
+            .publish()
+            .map_err(|error| error.to_string())?;
+        if let InstalledRestoration::Ready { mut restored, .. } = recovered {
+            restored.finish_locked(&mut state)?;
+        }
+        Ok::<_, String>(())
+    })();
     if let Err(error) = result {
         let detail = format!("Could not select the restored application: {error}");
         state.retain_startup_recovery(detail.clone());
@@ -695,6 +710,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let paths = RuntimePaths::discover()?;
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
     let mut standby = admission.standby.take();
+    #[cfg(target_os = "macos")]
+    let mut ready_admission = standby
+        .as_mut()
+        .and_then(daemon::standby::Activated::take_ready_admission);
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -828,16 +847,26 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     observe_fixture_startup("activity monitor started", None);
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
-    let mut prepared_outcome = None;
+    let mut installed_restoration = None;
     let listener = listener_before_restore(&paths, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
         let restored = (|| -> io::Result<()> {
+            #[cfg(target_os = "macos")]
+            if let Some(admission) = ready_admission.take() {
+                let restored = update_recovery::restore_installed_ready(&host, &admission)
+                    .map_err(io::Error::other)?;
+                installed_restoration = Some(InstalledRestoration::Ready {
+                    admission,
+                    restored,
+                });
+                return Ok(());
+            }
             if let Some(_record) = update_recovery::restore(&host).map_err(io::Error::other)? {
                 recovered_prepared = true;
                 #[cfg(target_os = "macos")]
                 {
-                    prepared_outcome = Some(_record);
+                    installed_restoration = Some(InstalledRestoration::Prepared(_record));
                 }
                 return Ok(());
             }
@@ -903,7 +932,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             publication,
             _admission: admission,
             #[cfg(target_os = "macos")]
-            recovered: prepared_outcome,
+            recovered: installed_restoration,
         })
     } else {
         drop(admission);
