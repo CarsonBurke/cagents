@@ -242,6 +242,10 @@ pub struct Resident {
     changed: u64,
 }
 impl Resident {
+    fn completed_without_work(&self) -> bool {
+        self.completed && !self.owns_work
+    }
+
     fn legacy_activity_is_settled(&self) -> bool {
         use crate::agent::ActivityState;
         self.waiting_attention.is_none()
@@ -864,7 +868,8 @@ impl RemoteActor {
     }
     pub fn wake_outcomes(&self) {
         let state = self.state();
-        if state.waiting_attention == Some(super::journal::WaitingAttention::Resolved)
+        if state.completed_without_work()
+            || state.waiting_attention == Some(super::journal::WaitingAttention::Resolved)
             || state.legacy_activity_is_settled()
             || state.outbox_latest > state.outbox_ack
             || state
@@ -1703,6 +1708,7 @@ impl RemoteActor {
             // Conversation identity is durable daemon metadata even when no
             // window subscribes and no semantic outcome accompanies it.
             if identity_changed
+                || (resident.completed_without_work() && !state.completed_without_work())
                 || (resident.outbox_latest > resident.outbox_ack
                     && resident.outbox_latest != state.outbox_latest)
                 || resident.waiting_attention != state.waiting_attention
@@ -1753,6 +1759,7 @@ impl RemoteActor {
         self.0.stop.store(true, Ordering::Release);
         self.0.wake.notify();
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let settled = state.completed_without_work();
         if let Some(mut resident) = resident {
             // A close response may also have been issued before installation
             // was acknowledged. Keep that actor-scoped fact monotonic while
@@ -1769,15 +1776,19 @@ impl RemoteActor {
             }
             *state = Arc::new(resident);
         }
-        let state = Arc::make_mut(&mut state);
-        state.completed = true;
-        state.owns_work = false;
-        state.idle = false;
-        state.ready = false;
-        state.failure = None;
-        state.close.completed = true;
-        state.close.owns_work = false;
-        state.close.closing = true;
+        let closed = Arc::make_mut(&mut state);
+        closed.completed = true;
+        closed.owns_work = false;
+        closed.idle = false;
+        closed.ready = false;
+        closed.failure = None;
+        closed.close.completed = true;
+        closed.close.owns_work = false;
+        closed.close.closing = true;
+        drop(state);
+        if !settled {
+            (self.0.notify)(Update::RetainedOutcomes);
+        }
     }
     fn endpoint_failed(&self, error: &str) -> bool {
         terminal_endpoint_error(error, self.0.identity.record.holder.is_current())

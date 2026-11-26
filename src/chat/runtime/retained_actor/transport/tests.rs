@@ -2517,6 +2517,59 @@ fn confirmation_wakes_durable_broker_without_semantic_outcomes() {
 }
 
 #[test]
+fn confirmed_completion_wakes_settlement_even_with_an_unchanged_wait_and_outbox() {
+    use crate::chat::runtime::RetainedWaiting;
+    let mut actor = RemoteActor::open_waiting_fixture();
+    let (sent, received) = crossbeam_channel::unbounded();
+    Arc::get_mut(&mut actor.0).unwrap().notify = Arc::new(move |update| {
+        sent.send(update).unwrap();
+    });
+    let mut resident = actor.state().as_ref().clone();
+    resident.outbox_ack = resident.outbox_latest;
+    assert!(actor.publish_resident(resident.clone()));
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    resident.completed = true;
+    resident.owns_work = true;
+    assert!(actor.publish_resident(resident.clone()));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Current)
+    );
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    resident.owns_work = false;
+    assert!(actor.publish_resident(resident.clone()));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Resolved)
+    );
+    assert!(
+        received
+            .try_iter()
+            .any(|update| matches!(update, Update::RetainedOutcomes))
+    );
+    assert!(actor.publish_resident(resident));
+    assert!(
+        received
+            .try_iter()
+            .all(|update| !matches!(update, Update::RetainedOutcomes))
+    );
+    actor.wake_outcomes();
+    assert!(
+        received
+            .try_iter()
+            .any(|update| matches!(update, Update::RetainedOutcomes))
+    );
+}
+
+#[test]
 fn synchronous_refresh_publishes_all_transitions_and_rejects_a_delayed_observer_response() {
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let socket = root.path().join("refresh.sock");
