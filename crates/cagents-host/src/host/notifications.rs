@@ -4164,7 +4164,10 @@ mod tests {
             |_, _| unreachable!(),
         )
         .unwrap();
-        assert_eq!(journal.list().unwrap(), [notice.clone()]);
+        assert_eq!(
+            journal.list().unwrap().as_slice(),
+            std::slice::from_ref(&notice)
+        );
 
         shared.snapshot.lock().unwrap().notices = vec![notice.clone()];
         assert_eq!(handle.terminal_waits(&boot), [(session, original)]);
