@@ -348,7 +348,12 @@ pub(super) mod tests {
             .unwrap();
         let mut monitor = ReviewMonitor::default();
         let error = monitor
-            .apply(census.clone(), &mut journal, &[original.clone()], 101)
+            .apply(
+                census.clone(),
+                &mut journal,
+                std::slice::from_ref(&original),
+                101,
+            )
             .unwrap_err();
         assert!(error.contains("fixture rejected acknowledgement"));
         drop(journal);
@@ -365,7 +370,10 @@ pub(super) mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(journal.list().unwrap(), [original.clone()]);
+        assert_eq!(
+            journal.list().unwrap().as_slice(),
+            std::slice::from_ref(&original)
+        );
         assert!(journal.group_withdrawals().unwrap().is_empty());
 
         fixture
@@ -373,7 +381,12 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(
             monitor
-                .apply(census.clone(), &mut journal, &[original.clone()], 101)
+                .apply(
+                    census.clone(),
+                    &mut journal,
+                    std::slice::from_ref(&original),
+                    101
+                )
                 .unwrap(),
             [original.id]
         );
@@ -393,7 +406,7 @@ pub(super) mod tests {
                 .unwrap();
         assert!(
             monitor
-                .apply(census, &mut journal, &[later.clone()], 102)
+                .apply(census, &mut journal, std::slice::from_ref(&later), 102)
                 .unwrap()
                 .is_empty()
         );
@@ -453,7 +466,7 @@ pub(super) mod tests {
                 .apply(
                     MonitorUpdate::Completed(initial.clone()),
                     &mut journal,
-                    &[legacy.clone()],
+                    std::slice::from_ref(&legacy),
                     101
                 )
                 .unwrap()
@@ -537,7 +550,7 @@ pub(super) mod tests {
         let mut monitor = ReviewMonitor::default();
         assert!(
             monitor
-                .expire(&mut journal, &[notice.clone()], now, observed)
+                .expire(&mut journal, std::slice::from_ref(&notice), now, observed)
                 .unwrap()
                 .is_empty()
         );
@@ -547,7 +560,7 @@ pub(super) mod tests {
             monitor
                 .expire(
                     &mut journal,
-                    &[notice.clone()],
+                    std::slice::from_ref(&notice),
                     now + SWEEP_INTERVAL,
                     observed + WATCH_GRACE
                 )
