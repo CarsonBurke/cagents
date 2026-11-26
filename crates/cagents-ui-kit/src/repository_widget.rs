@@ -10513,19 +10513,24 @@ fn pdf_document_view<'a>(
             zoom,
         }))
     };
-    let mut controls: Vec<Element<'a, RepositoryAction>> = vec![
-        turn(0, Icon::First, "First page", page > 0).into(),
-        turn(
-            page.saturating_sub(1),
-            Icon::ChevronLeft,
-            "Previous page",
-            page > 0,
-        )
-        .into(),
-        crate::design::body(format!("{} / {pages}", page + 1)).into(),
-        turn(page + 1, Icon::ChevronRight, "Next page", page + 1 < pages).into(),
-        turn(pages - 1, Icon::Last, "Last page", page + 1 < pages).into(),
-    ];
+    // A one-page document has no pages to turn, so it draws no "1 / 1"
+    // among four controls that could never be pressed.
+    let mut controls: Vec<Element<'a, RepositoryAction>> = Vec::with_capacity(12);
+    if pages > 1 {
+        controls.extend([
+            turn(0, Icon::First, "First page", page > 0).into(),
+            turn(
+                page.saturating_sub(1),
+                Icon::ChevronLeft,
+                "Previous page",
+                page > 0,
+            )
+            .into(),
+            crate::design::body(format!("{} / {pages}", page + 1)).into(),
+            turn(page + 1, Icon::ChevronRight, "Next page", page + 1 < pages).into(),
+            turn(pages - 1, Icon::Last, "Last page", page + 1 < pages).into(),
+        ]);
+    }
     // The status sits on the flexible gap's left, so that a render starting or
     // landing cannot move the controls on its right. The zoom controls are the
     // ones a reader presses repeatedly, and a caption appearing beneath the
