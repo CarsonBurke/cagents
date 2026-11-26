@@ -1253,11 +1253,7 @@ impl HostState {
             receipt.detach(client_id);
         }
         for record in self.chats.values_mut() {
-            record.subscribers.remove(&client_id);
-            record.observations.remove(&client_id);
-            record
-                .handle
-                .set_visible(record.subscribers.values().any(|visible| *visible));
+            record.detach(client_id);
         }
         self.held_followups.retain(|_, holders| {
             holders.remove(&client_id);

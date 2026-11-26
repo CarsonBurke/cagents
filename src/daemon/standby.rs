@@ -39,6 +39,8 @@ pub const ARGUMENT: &str = "--await-update-handoff";
 const LOCAL_PREVIOUS_CURRENT: &str = "CAGENTS_UPDATE_PREVIOUS_CURRENT";
 const FRAME_LIMIT: usize = 4096;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const STARTUP_EXIT_SETTLEMENT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
 const DESCRIPTOR_LIMIT: usize = 1 + RECEIPT_DESCRIPTORS.len();
 #[cfg(target_os = "macos")]
@@ -122,14 +124,15 @@ fn expect(mut stream: &UnixStream, status: Status) -> io::Result<()> {
         1 => Status::Parked,
         2 => Status::Started,
         3 => {
-            let (reason, _): (String, _) = receive_json_with_fds_until(
+            let reason = receive_json_with_fds_until::<String>(
                 stream,
                 Instant::now() + TRANSFER_TIMEOUT,
                 FRAME_LIMIT,
                 0,
                 FrameByteOrder::LittleEndian,
             )
-            .map_err(io::Error::other)?;
+            .map(|(reason, _)| reason)
+            .unwrap_or_else(|_| "The replacement daemon refused startup".to_owned());
             return Err(io::Error::other(AdmissionRejected(reason)));
         }
         _ => return Err(io::Error::other("invalid replacement daemon startup reply")),
@@ -176,7 +179,7 @@ pub(crate) struct Parked {
     #[cfg(target_os = "macos")]
     image: Option<ParkedImage>,
     #[cfg(target_os = "macos")]
-    _publication: fs::File,
+    publication: fs::File,
 }
 
 #[cfg(target_os = "macos")]
@@ -225,6 +228,25 @@ impl Parked {
         guard: &UiUpdateGuard,
         previous_current: Option<&Path>,
     ) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let publication = crate::install_guard::reserve_darwin_publication()?;
+        Self::launch_with_custody(
+            executable,
+            expected,
+            guard,
+            previous_current,
+            #[cfg(target_os = "macos")]
+            publication,
+        )
+    }
+
+    fn launch_with_custody(
+        executable: &Path,
+        expected: (u64, u64),
+        guard: &UiUpdateGuard,
+        previous_current: Option<&Path>,
+        #[cfg(target_os = "macos")] publication: fs::File,
+    ) -> io::Result<Self> {
         let (channel, receiver) = UnixStream::pair()?;
         crate::descriptor::keep_options_after_shutdown(channel.as_fd())?;
         let mut command = Command::new(executable);
@@ -245,8 +267,6 @@ impl Parked {
         unsafe { command.pre_exec(super::seal_inherited_descriptors) };
         guard.inherit_for_install(&mut command)?;
         #[cfg(target_os = "macos")]
-        let publication = crate::install_guard::reserve_darwin_publication()?;
-        #[cfg(target_os = "macos")]
         crate::install_guard::inherit_darwin_publication(&mut command, &publication)?;
         let child = command.spawn()?;
         // Command retains its socket copy for possible reuse. Only the
@@ -260,11 +280,63 @@ impl Parked {
             #[cfg(target_os = "macos")]
             image: None,
             #[cfg(target_os = "macos")]
-            _publication: publication,
+            publication,
         };
         parked.channel.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
         parked.verify_launch(pid, expected)?;
         Ok(parked)
+    }
+
+    /// A transport failure may leave a running custodian. An admission
+    /// refusal should also be reported as such instead of attempted again.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn exited_during_start(&mut self, error: &io::Error) -> bool {
+        if error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<AdmissionRejected>())
+        {
+            return false;
+        }
+        let child = self.child.as_mut().unwrap();
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return true;
+        }
+        // The transport can close before the child exits. Frame writes also
+        // wrap socket errors, so settle the exact process for any failure
+        // other than a typed refusal. The caller revalidates untouched Ready.
+        self.image.as_ref().is_some_and(|image| {
+            image
+                .process
+                .wait_for_exit(STARTUP_EXIT_SETTLEMENT)
+                .is_ok_and(|exited| exited)
+        }) && child.wait().is_ok()
+    }
+
+    /// The prior child is reaped. Keep the same account publication
+    /// description and every caller-owned fence across the new launch.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn retry_exited(
+        &mut self,
+        executable: &Path,
+        expected: (u64, u64),
+        guard: &UiUpdateGuard,
+        previous_current: Option<&Path>,
+    ) -> io::Result<()> {
+        if self.child.as_mut().unwrap().try_wait()?.is_none() {
+            return Err(io::Error::other(
+                "The original standby still owns its process",
+            ));
+        }
+        let next = Self::launch_with_custody(
+            executable,
+            expected,
+            guard,
+            previous_current,
+            self.publication.try_clone()?,
+        )?;
+        drop(self.child.take());
+        *self = next;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -420,7 +492,9 @@ impl Parked {
             // publish ownership. Settle that exact child before rolling back.
             let child = self.child.as_mut().unwrap();
             let _ = child.kill();
-            child.wait()?;
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "could not reap the refused standby");
+            }
         }
         result
     }
@@ -851,6 +925,36 @@ mod tests {
             panic!("buffered acknowledgement overdue")
         })
         .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exited_standby_can_retry_transport_loss_but_not_admission_refusal() {
+        let (channel, _peer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        let mut standby = Parked {
+            channel,
+            child: Some(child),
+            transferred: false,
+            image: None,
+            publication: tempfile::tempfile().unwrap(),
+        };
+        assert!(standby.exited_during_start(&io::Error::from(io::ErrorKind::UnexpectedEof)));
+        assert!(
+            !standby.exited_during_start(&io::Error::other(AdmissionRejected(
+                "fixture refusal".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn a_truncated_refusal_reason_does_not_turn_refusal_into_transport_loss() {
+        let (worker, mut daemon) = UnixStream::pair().unwrap();
+        daemon.write_all(&[3]).unwrap();
+        drop(daemon);
+        let error = wait_for_start(&worker, TRANSFER_TIMEOUT, || {}).unwrap_err();
+        assert!(error.get_ref().unwrap().is::<AdmissionRejected>());
     }
 
     #[test]

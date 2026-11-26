@@ -3028,11 +3028,12 @@ fn is_save_press(event: &keyboard::Event) -> bool {
     matches!(
         event,
         keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
+            key,
+            physical_key,
             modifiers,
             repeat: false,
             ..
-        } if key.eq_ignore_ascii_case("s")
+        } if crate::interaction::latin_key(key, *physical_key) == Some('s')
             && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && !modifiers.shift()
     )
@@ -3055,10 +3056,7 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
         return None;
     }
     if settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
-        return match key
-            .to_latin(*physical_key)
-            .map(|key| key.to_ascii_lowercase())
-        {
+        return match crate::interaction::latin_key(key, *physical_key) {
             Some('l') => Some(Message::FocusBrowserAddress(card)),
             Some('r') => Some(Message::BrowserReload(card)),
             _ => None,
@@ -10922,13 +10920,17 @@ impl Cagents {
         // A held chord copies once, so its repeats must not cancel the
         // copy its first press started.
         if let keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
+            key,
+            physical_key,
             modifiers,
             repeat: false,
             ..
         } = &event
             && modifiers.command()
-            && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
+            && matches!(
+                crate::interaction::latin_key(key, *physical_key),
+                Some('c' | 'x')
+            )
         {
             chat_ui::invalidate_copy_intent();
         }
@@ -10988,13 +10990,14 @@ impl Cagents {
             )
             .is_none()
             && let keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(key),
+                key,
+                physical_key,
                 modifiers,
                 ..
             } = &event
             && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && modifiers.shift()
-            && key.eq_ignore_ascii_case("s")
+            && crate::interaction::latin_key(key, *physical_key) == Some('s')
             && let Some(card) = self.workspace.focused()
             && !self.pane_content_inputs_blocked(card)
             && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
