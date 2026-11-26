@@ -274,6 +274,11 @@ mod tests {
                 },
                 client,
             },
+            model::ChatDraftModel,
+            terminal_ipc::{
+                ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+                ServerResponse, read_frame, write_frame,
+            },
         };
         use std::{os::unix::net::UnixStream, sync::Arc, thread};
 
@@ -329,6 +334,57 @@ mod tests {
             Some(queue.clone())
         );
         drop(lost);
+        worker.join().unwrap();
+
+        // Normal attachment ignores a stale draft preference. It may still
+        // return the hosted descriptor but must not announce a prior receipt.
+        let mut altered = source.clone();
+        altered.launch.draft_model = Some(Box::new(ChatDraftModel {
+            session: id,
+            provider: source.launch.provider,
+            model: Some("stale-draft-choice".into()),
+            reasoning: None,
+        }));
+        let (mut window, worker) = connect(94);
+        window
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        for (request_id, proof, request) in [
+            (
+                1,
+                None,
+                ClientRequest::Connect {
+                    expected_host: None,
+                    resume: Vec::new(),
+                },
+            ),
+            (
+                2,
+                source.proof.clone(),
+                ClientRequest::ChatAttach { session: altered },
+            ),
+        ] {
+            write_frame(
+                &mut window,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof,
+                    request,
+                },
+            )
+            .unwrap();
+            let reply: ServerEnvelope = read_frame(&mut window).unwrap().unwrap();
+            assert_eq!(reply.request_id, Some(request_id));
+            assert!(matches!(
+                reply.message,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. }
+                        | ServerResponse::ChatAttached { .. }
+                }
+            ));
+        }
+        drop(window);
         worker.join().unwrap();
 
         let (window, worker) = connect(92);
@@ -762,7 +818,8 @@ impl Archive {
 
     pub(super) fn prior_execution(
         &self,
-        source: &crate::chat::Session,
+        requested: &crate::chat::Session,
+        attached: &crate::chat::Session,
         resident: Uuid,
     ) -> Option<Uuid> {
         self.state
@@ -770,7 +827,9 @@ impl Archive {
             .unwrap_or_else(|error| error.into_inner())
             .entries
             .iter()
-            .find(|entry| entry.execution != resident && entry.names(source))
+            .find(|entry| {
+                entry.execution != resident && entry.names(requested) && entry.names(attached)
+            })
             .map(|entry| entry.execution)
     }
 }

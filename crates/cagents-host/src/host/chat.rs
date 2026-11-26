@@ -860,13 +860,14 @@ fn current_session_snapshot(
 fn announce_prior_queue(
     host: &SharedHost,
     client: ClientId,
-    source: &Session,
+    requested: &Session,
+    attached: &Session,
     resident: uuid::Uuid,
 ) {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down
-        || source.proof.as_ref() != Some(state.proof())
-        || state.chats.get(&source.id).is_none_or(|record| {
+        || attached.proof.as_ref() != Some(state.proof())
+        || state.chats.get(&attached.id).is_none_or(|record| {
             record.execution_instance != resident
                 || record.returning_terminal
                 || record.handle.is_completed()
@@ -877,7 +878,9 @@ fn announce_prior_queue(
     {
         return;
     }
-    if let Some(execution) = state.exited_queue_archive.prior_execution(source, resident)
+    if let Some(execution) = state
+        .exited_queue_archive
+        .prior_execution(requested, attached, resident)
         && let Some(delivery) = state.clients.get(&client)
     {
         let _ = delivery.push(ServerEnvelope {
@@ -885,7 +888,7 @@ fn announce_prior_queue(
             request_id: None,
             proof: state.proof().clone(),
             message: ServerMessage::ChatQueueEnded {
-                source: source.clone(),
+                source: attached.clone(),
                 execution,
             },
         });
@@ -4874,8 +4877,11 @@ fn process_inner(
             drop(state);
             let response =
                 current_session_snapshot(host, attachment.0, attachment.1, attachment.2)?;
-            if let ServerResponse::ChatAttached { session, .. } = &response {
-                announce_prior_queue(host, client, session, attachment.2);
+            if let ServerResponse::ChatAttached {
+                session: attached, ..
+            } = &response
+            {
+                announce_prior_queue(host, client, &session, attached, attachment.2);
             }
             Ok(response)
         }
