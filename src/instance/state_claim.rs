@@ -326,9 +326,6 @@ pub(crate) fn claim_window_state_in(
 ) -> io::Result<StateClaim> {
     validate_window_slot(slot)?;
     crate::secure_file::prepare_private_directory(claims)?;
-    if slot.starts_with("device-") {
-        prune_released_device_windows(claims, slot);
-    }
     acquire(
         &claims.join(format!("window.{slot}.lock")),
         record(slot_lock, None)?,
@@ -384,53 +381,6 @@ fn same_named_claim(path: &Path, file: &File) -> io::Result<bool> {
         Ok(named) => Ok(named.dev() == opened.dev() && named.ino() == opened.ino()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
-    }
-}
-
-/// Remote windows use distinct saved slots, so their idle claim files can
-/// accumulate indefinitely. Keep each exact claim while its window is open.
-fn prune_released_device_windows(claims: &Path, requested: &str) {
-    let Ok(entries) = fs::read_dir(claims) else {
-        return;
-    };
-    let current = format!("window.{requested}.lock");
-    let boot = local_boot();
-    for entry in entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name();
-            name.to_str().is_some_and(|name| {
-                name != current
-                    && name
-                        .strip_prefix("window.device-")
-                        .and_then(|name| name.strip_suffix(".lock"))
-                        .is_some_and(|slot| {
-                            slot.len() == 16 && slot.bytes().all(|b| b.is_ascii_hexdigit())
-                        })
-            })
-        })
-        .take(128)
-    {
-        let path = entry.path();
-        let result = (|| -> io::Result<()> {
-            let file = open_claim(&path, true)?;
-            let lock = owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)?;
-            if same_named_claim(&path, &lock)?
-                && let Some(recorded) = read(&lock)?
-                && (other_boot(&recorded, boot.as_deref()) || !guard_held(&recorded.guard))
-            {
-                fs::remove_file(&path)?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result
-            && !matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
-            )
-        {
-            tracing::debug!(%error, "could not prune an idle device window claim");
-        }
     }
 }
 

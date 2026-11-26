@@ -479,11 +479,11 @@ impl WindowLease {
                 }
             }
         }
-        let remote_fresh = new_window && crate::device::is_remote();
-        let fresh_slot = if remote_fresh {
-            crate::device::window_slot(Some(&uuid::Uuid::new_v4().to_string()))?
-        } else {
+        let device = crate::device::selected();
+        let requested = if new_window && device.is_some() {
             None
+        } else {
+            requested
         };
         let claims = match state_claim::claims_directory() {
             Ok(claims) => Some(claims),
@@ -497,8 +497,9 @@ impl WindowLease {
             &runtime_directory()?,
             claims.as_deref(),
             require_state,
-            new_window && !remote_fresh,
-            fresh_slot.as_deref().or(requested),
+            new_window,
+            requested,
+            device.map(|device| device.name.as_str()),
             daemon_admission::admission_wait_timeout(),
             waiting,
         )?;
@@ -529,6 +530,7 @@ impl WindowLease {
             false,
             new_window,
             requested,
+            None,
             Duration::ZERO,
             &mut |_| {},
         )
@@ -542,6 +544,7 @@ impl WindowLease {
         require_state: bool,
         new_window: bool,
         requested: Option<&str>,
+        device: Option<&str>,
         admission_timeout: Duration,
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<(Self, String)> {
@@ -562,10 +565,17 @@ impl WindowLease {
         }
         for index in 1..=1024 {
             let slot = requested.map(str::to_owned).unwrap_or_else(|| {
-                if !new_window {
-                    PRIMARY_WINDOW.into()
-                } else {
+                let slot = if new_window {
                     format!("window-{}", index + 1)
+                } else {
+                    PRIMARY_WINDOW.into()
+                };
+                // Reuse device slots after their leases end. The shared
+                // claim inode stays named, so older windows can still lock
+                // the same file even across a rolling upgrade.
+                match device {
+                    Some(device) => crate::device::scoped_window_slot(device, &slot),
+                    None => slot,
                 }
             });
             match owned_lock(
@@ -5639,6 +5649,7 @@ mod startup_update_tests {
                 false,
                 new_window,
                 None,
+                None,
                 Duration::ZERO,
                 &mut |_| {},
             )
@@ -5715,38 +5726,42 @@ mod startup_update_tests {
     }
 
     #[test]
-    fn a_remote_window_claim_excludes_an_exact_reopen_until_its_lease_is_released() {
+    fn remote_new_windows_reuse_the_same_shared_claim_after_release() {
+        use std::os::unix::fs::MetadataExt;
+
         let claims = tempfile::tempdir().unwrap();
         let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
         for runtime in &runtimes {
             fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let open = |runtime: usize, slot: &str| {
+        let open = |runtime: usize, slot: Option<&str>| {
             WindowLease::acquire_waiting_in(
                 runtimes[runtime].path(),
                 Some(claims.path()),
                 false,
-                false,
-                Some(slot),
+                slot.is_none(),
+                slot,
+                Some("remote"),
                 Duration::ZERO,
                 &mut |_| {},
             )
         };
-        let slot = crate::device::scoped_window_slot("remote", &uuid::Uuid::new_v4().to_string());
-        let other_slot = crate::device::scoped_window_slot("remote", "notes");
-        let named_claim = claims.path().join(format!("window.{slot}.lock"));
-        let (fresh, _) = open(0, &slot).unwrap();
-        let error = open(1, &slot).err().expect("the remote layout is held");
+        let (first, slot) = open(0, None).unwrap();
+        let file = claims.path().join(format!("window.{slot}.lock"));
+        let old_reader = fs::File::open(&file).unwrap();
+        let inode = old_reader.metadata().unwrap().ino();
+        let error = open(1, Some(&slot))
+            .err()
+            .expect("the remote layout is held");
         assert!(state_claim::state_in_use(&error).is_some());
-        drop(open(1, &other_slot).unwrap().0);
-        assert!(named_claim.exists(), "the sweep kept the active claim");
-
-        drop(fresh);
-        drop(open(1, &other_slot).unwrap().0);
-        assert!(!named_claim.exists(), "the sweep pruned the idle claim");
-        let (_reopened, reopened) = open(1, &slot).unwrap();
-        assert_eq!(reopened, slot);
-        assert!(named_claim.exists());
+        let (second, different) = open(1, None).unwrap();
+        assert_ne!(slot, different);
+        drop(first);
+        let (_reopened, reused) = open(0, None).unwrap();
+        assert_eq!(reused, slot);
+        assert_eq!(fs::metadata(file).unwrap().ino(), inode);
+        drop(second);
+        assert_eq!(fs::read_dir(claims.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -5761,6 +5776,7 @@ mod startup_update_tests {
             None,
             false,
             false,
+            None,
             None,
             Duration::from_secs(30),
             &mut |elapsed| {
@@ -5783,6 +5799,7 @@ mod startup_update_tests {
             None,
             false,
             false,
+            None,
             None,
             Duration::from_millis(60),
             &mut |_| {},
