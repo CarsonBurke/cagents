@@ -661,7 +661,14 @@ fn restore_automation_attention(
     host: &Weak<HostLock>,
     snapshot: &mut Snapshot,
     withdrawals: &mut Withdrawals,
+    reopening: bool,
 ) {
+    if !snapshot.notices.iter().any(|notice| {
+        matches!(notice.event.target, Target::Automation { .. })
+            && (reopening || !notice.acknowledged)
+    }) {
+        return;
+    }
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -669,21 +676,42 @@ fn restore_automation_attention(
         return;
     };
     let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    reconcile_automation_attention(journal, snapshot, withdrawals, reopening, |id, sequence| {
+        registry.automation_attention_resolved(id, sequence)
+    });
+}
+
+fn reconcile_automation_attention(
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    reopening: bool,
+    resolved: impl Fn(uuid::Uuid, u64) -> Result<bool, String>,
+) {
     for notice in &mut snapshot.notices {
-        if let Target::Automation { id, sequence } = notice.event.target
-            && !notice.acknowledged
-        {
-            match registry.automation_attention_resolved(id, sequence) {
-                Ok(true) => match journal.acknowledge(notice.id) {
-                    Ok(_) => {
-                        notice.acknowledged = true;
-                        withdraw_notice(withdrawals, notice);
+        let Target::Automation { id, sequence } = notice.event.target else {
+            continue;
+        };
+        if notice.acknowledged && !reopening {
+            continue;
+        }
+        match resolved(id, sequence) {
+            Ok(true) => {
+                if !notice.acknowledged {
+                    match journal.acknowledge(notice.id) {
+                        Ok(_) => notice.acknowledged = true,
+                        Err(error) => {
+                            snapshot.diagnostic = Some(error);
+                            continue;
+                        }
                     }
-                    Err(error) => snapshot.diagnostic = Some(error),
-                },
-                Ok(false) => {}
-                Err(error) => snapshot.diagnostic = Some(error),
+                }
+                // A daemon can exit between acknowledging and removing the
+                // toast. Retry the idempotent withdrawal when reopening.
+                withdraw_notice(withdrawals, notice);
             }
+            Ok(false) => {}
+            Err(error) => snapshot.diagnostic = Some(error),
         }
     }
 }
@@ -844,7 +872,7 @@ async fn run(
     match store.journal() {
         Ok(journal) => {
             restore(journal, &policy, &mut snapshot, &mut withdrawals);
-            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals);
+            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, true);
         }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
@@ -900,7 +928,7 @@ async fn run(
                 snapshot.diagnostic.clone_from(&settings_error);
             }
             restore(journal, &policy, &mut snapshot, &mut withdrawals);
-            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals);
+            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, true);
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -1094,7 +1122,7 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
-        restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals);
+        restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, false);
         if !policy.message_previews {
             for notice in &mut snapshot.notices {
                 notice.event.content = None;
@@ -1271,6 +1299,13 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
+        restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, false);
+        if !withdrawals.is_empty()
+            && proxy.is_some()
+            && let Some(shared) = shared.upgrade()
+        {
+            let _ = shared.wake.try_send(());
+        }
         if !policy.message_previews {
             for notice in &mut snapshot.notices {
                 notice.event.content = None;
@@ -1410,6 +1445,61 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn an_automation_toast_is_withdrawn_again_after_acknowledgement_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("automation.sqlite3");
+        let automation = Uuid::new_v4();
+        let target = Target::Automation {
+            id: automation,
+            sequence: 4,
+        };
+        let resolved = |id, sequence| Ok(id == automation && sequence <= 4);
+        let mut event = attention_event(TerminalId::new(), "automation-paused");
+        event.target = target.clone();
+        let mut journal = Journal::open(&path).unwrap();
+        let notice = journal.record(event, false).unwrap().unwrap();
+        journal.delivered(notice.id).unwrap();
+        let mut snapshot = Snapshot {
+            notices: journal.list().unwrap(),
+            ..Snapshot::default()
+        };
+        let mut withdrawals = Withdrawals::default();
+        reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            resolved,
+        );
+        let desktop = batching::desktop_id(&target);
+        assert!(withdrawals.contains(&desktop));
+
+        // Lose the process-local queue after SQLite committed the acknowledgement.
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        snapshot.notices = journal.list().unwrap();
+        assert!(snapshot.notices[0].acknowledged);
+        let mut withdrawals = Withdrawals::default();
+        reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            resolved,
+        );
+        assert!(withdrawals.is_empty());
+        reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            true,
+            resolved,
+        );
+        assert!(withdrawals.contains(&desktop));
+        assert!(withdrawals.contains(&notice.id));
     }
 
     #[test]
