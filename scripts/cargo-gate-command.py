@@ -293,9 +293,22 @@ def main():
         except ProcessLookupError:
             pass
 
+    def owns_transfer_lock(pid):
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            return (
+                len(argv) > 4
+                and argv[1] == b"-I"
+                and os.path.basename(argv[2]) == b"cargo-gate-command.py"
+                and argv[3] == b"--wrapper"
+                and b"--hold-fd" in argv[4:]
+            )
+        except OSError:
+            return False
+
     def drain():
         deadline = time.monotonic() + grace
-        terminating = set()
+        terminating = {}
         killing = set()
         # Retaining the primary reserves its PID until the last signal. Its
         # descendants become our children when their parents exit; even a
@@ -303,23 +316,29 @@ def main():
         send(primary.pid, signal.SIGTERM)
         send(primary.pid, signal.SIGCONT)
         while True:
-            force = time.monotonic() >= deadline
-            if force:
+            now = time.monotonic()
+            if now >= deadline:
                 send(primary.pid, signal.SIGKILL)
             for pid in adopted_children():
                 # These are this supervisor's actual unreaped children. With
                 # SIGCHLD at default and one waiter, their IDs cannot be reused
                 # before this loop reaps them. Adoption includes setsid children.
-                if force and pid not in killing:
-                    send(pid, signal.SIGKILL)
-                    killing.add(pid)
-                elif pid not in terminating:
+                if pid not in terminating:
+                    # If the client was killed, an adopted transport
+                    # supervisor still owns the slot. Let it reap its
+                    # transfers before forcing it, within one fixed budget.
+                    terminating[pid] = (
+                        deadline + WRAPPER_GRACE_SECONDS + 1
+                        if owns_transfer_lock(pid) else deadline
+                    )
                     send(pid, signal.SIGTERM)
                     send(pid, signal.SIGCONT)
-                    terminating.add(pid)
+                if now >= terminating[pid] and pid not in killing:
+                    send(pid, signal.SIGKILL)
+                    killing.add(pid)
                 reaped, _status = os.waitpid(pid, os.WNOHANG)
                 if reaped:
-                    terminating.discard(pid)
+                    del terminating[pid]
                     killing.discard(pid)
             # Reaping a parent may adopt another generation; rescan before
             # declaring completion. Never reap the anchor via waitpid(-1).

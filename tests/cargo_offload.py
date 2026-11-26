@@ -445,6 +445,12 @@ class Transport(unittest.TestCase):
             say.assert_called_once_with("transfer with host failed (status 124); retrying once")
 
     def test_a_transfer_keeps_its_local_slot_while_its_dead_client_is_drained(self):
+        self.check_cancelled_transfer(nested=False)
+
+    def test_a_gate_lets_an_adopted_transfer_finish_its_slot_cleanup(self):
+        self.check_cancelled_transfer(nested=True)
+
+    def check_cancelled_transfer(self, *, nested):
         with FixtureDirectory() as scope:
             prefix = Path(scope.name, "sync.lock")
             transfer = textwrap.dedent("""
@@ -456,29 +462,41 @@ class Transport(unittest.TestCase):
             """)
             client = textwrap.dedent("""
                 import runpy, sys
+                import signal
                 offload = runpy.run_path(sys.argv[1])
                 environment = {
                     "CAGENTS_BUILD_LOCAL_SYNC_LOCK": sys.argv[2],
                     "CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "1",
                 }
                 build = offload["Offload"]("host", offload["parse"](["check"]), environment)
-                build.run_build = lambda: build.local(
-                    lambda: build.transfer([sys.executable, "-c", sys.argv[3]]).returncode
-                )
+                def run_build():
+                    if sys.argv[4] == "True":
+                        # Force the gate to adopt the independent supervisor.
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    return build.local(
+                        lambda: build.transfer([sys.executable, "-c", sys.argv[3]]).returncode
+                    )
+                build.run_build = run_build
                 sys.exit(build.run())
             """)
             environment = {
                 "CAGENTS_BUILD_LOCAL_SYNC_LOCK": str(prefix),
                 "CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "1",
             }
-            with subprocess.Popen([sys.executable, "-I", "-c", client,
-                                   str(ROOT / "scripts/cargo-offload"), str(prefix), transfer],
-                                  stdout=subprocess.PIPE) as process:
+            command = [sys.executable, "-I", "-c", client, str(ROOT / "scripts/cargo-offload"),
+                       str(prefix), transfer, str(nested)]
+            if nested:
+                command = [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"),
+                           "/dev/null", *command]
+            with subprocess.Popen(command, stdout=subprocess.PIPE) as process:
                 try:
                     self.assertTrue(select.select([process.stdout], [], [], HANG_GUARD)[0])
                     transfer_pid = int(process.stdout.readline())
-                    process.kill()
-                    process.wait(timeout=HANG_GUARD)
+                    if nested:
+                        process.terminate()
+                    else:
+                        process.kill()
+                        process.wait(timeout=HANG_GUARD)
                     self.assertTrue(select.select([process.stdout], [], [], HANG_GUARD)[0])
                     self.assertEqual(process.stdout.readline(), b"draining\n")
                     with open(f"{prefix}.0") as lock:
@@ -488,6 +506,7 @@ class Transport(unittest.TestCase):
                     self.assertTrue(select.select([process.stdout], [], [], HANG_GUARD)[0])
                     self.assertEqual(process.stdout.read(), b"")
                     self.assertFalse(Path(f"/proc/{transfer_pid}").exists())
+                    process.wait(timeout=HANG_GUARD)
                     with offload.offload_client.local_phase(
                         environment, deadline=time.monotonic() + HANG_GUARD
                     ):
@@ -495,6 +514,37 @@ class Transport(unittest.TestCase):
                 finally:
                     if process.poll() is None:
                         process.kill()
+
+    def test_rsync_holds_the_remote_slot_and_refuses_a_superseded_lease(self):
+        with FixtureDirectory() as scope:
+            slot = Path(scope.name)
+            claim = slot / "claim"
+            claim.write_text(json.dumps({"generation": "first"}))
+            rsync = slot / "rsync"
+            rsync.write_text("#!/bin/sh\nprintf 'ready\\n'\nread -r line\n")
+            rsync.chmod(0o700)
+            build = offload.Offload("host", offload.parse(["check"]), {})
+            build.slot_generation = "first"
+            command = shlex.split(build.rsync_path(str(slot)).removeprefix("--rsync-path="))
+            environment = os.environ | {"PATH": f"{slot}:{os.environ['PATH']}"}
+            with subprocess.Popen(command, env=environment, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE) as transfer:
+                try:
+                    self.assertTrue(select.select([transfer.stdout], [], [], HANG_GUARD)[0])
+                    self.assertEqual(transfer.stdout.readline(), b"ready\n")
+                    claim.write_text(json.dumps({"generation": "second"}))
+                    with open(slot / "running") as running:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    transfer.stdin.write(b"done\n")
+                    transfer.stdin.flush()
+                    self.assertEqual(transfer.wait(timeout=HANG_GUARD), 0)
+                finally:
+                    transfer.stdin.close()
+            result = subprocess.run(command, env=environment, capture_output=True,
+                                    stdin=subprocess.DEVNULL, timeout=HANG_GUARD)
+            self.assertEqual(result.returncode, 255)
+            self.assertEqual(result.stdout, b"")
 
     def test_a_run_channel_retries_before_sending_a_cargo_request(self):
         with FixtureDirectory() as scope:
