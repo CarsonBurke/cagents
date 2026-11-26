@@ -115,6 +115,7 @@ pub(crate) fn run(
     let id = uuid::Uuid::new_v4().to_string();
     let log_path = state.join(format!("{id}.log"));
     let log = private_create(&log_path)?;
+    let saved_windows = pending.windows.clone();
     let mut receipt = pending
         .authorize_manual(
             checkpoint, yes, &state, &id, &daemon, &worker, &guard, &handoff,
@@ -178,7 +179,7 @@ pub(crate) fn run(
             Some(command)
         };
         let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
-        let windows = recovery_window_slots(&pending.windows, &current_windows);
+        let windows = recovery_window_slots(&saved_windows, &current_windows);
         if previous_link.is_none() {
             select_target(&layout)?;
         }
