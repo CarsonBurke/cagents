@@ -563,6 +563,12 @@ fn restore(
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
+    withdrawals.protect(
+        snapshot
+            .notices
+            .iter()
+            .map(|notice| batching::desktop_id(&notice.event.target)),
+    );
     match journal.group_withdrawals() {
         Ok(groups) => {
             for group in groups {
@@ -571,12 +577,6 @@ fn restore(
         }
         Err(error) => snapshot.diagnostic = Some(error),
     }
-    withdrawals.protect(
-        snapshot
-            .notices
-            .iter()
-            .map(|notice| batching::desktop_id(&notice.event.target)),
-    );
 }
 
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
@@ -1119,6 +1119,12 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
+        withdrawals.protect(
+            snapshot
+                .notices
+                .iter()
+                .map(|notice| batching::desktop_id(&notice.event.target)),
+        );
         let persisted_withdrawals = match journal.group_withdrawals() {
             Ok(groups) => {
                 for group in &groups {
@@ -1139,12 +1145,6 @@ async fn run(
                 notice.event.content = None;
             }
         }
-        withdrawals.protect(
-            snapshot
-                .notices
-                .iter()
-                .map(|notice| batching::desktop_id(&notice.event.target)),
-        );
         for notice in delivery.values_mut() {
             if let Some(current) = snapshot
                 .notices

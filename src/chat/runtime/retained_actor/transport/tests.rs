@@ -1947,6 +1947,43 @@ fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
 }
 
 #[test]
+fn an_idle_legacy_attachment_fetches_a_full_state_at_the_same_revision() {
+    let mut fixture = resident_fixture();
+    fixture.server.actor.0.state.lock().unwrap().ready = true;
+    fixture.server.journal.lock().unwrap().waiting_attention = None;
+    let revision = fixture.server.revision();
+    let proof = fixture.server.proof.clone();
+    let epoch = fixture.server.epoch;
+    let state = |after| Invocation {
+        proof: proof.clone(),
+        epoch: Some(epoch),
+        method: "state".into(),
+        args: json!([after]),
+    };
+    let ordinary = state(revision);
+    assert!(fixture.server.invoke(ordinary).unwrap().is_null());
+    let actor = RemoteActor::fixture();
+    let mut initial = fixture.server.resident().unwrap();
+    assert!(initial.legacy_activity_is_settled());
+    initial.generation = initial.generation.max(actor.state().generation);
+    initial.changed = initial.changed.max(actor.state().changed);
+    assert!(actor.publish_resident(initial));
+    let after = actor.state().waiting_state_cursor();
+    assert_ne!(after, revision);
+    let forced = state(after);
+    let next: Option<Resident> =
+        serde_json::from_value(fixture.server.invoke(forced).unwrap()).unwrap();
+    let mut next = next.expect("unchanged revision still carries the authenticated state");
+    next.generation = actor.state().generation;
+    next.changed = actor.state().changed;
+    assert!(actor.publish_resident(next));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(crate::chat::runtime::RetainedWaiting::Resolved)
+    );
+}
+
+#[test]
 fn a_wait_appended_after_active_metadata_was_sampled_is_still_open() {
     use super::super::journal::WaitingAttention;
 
