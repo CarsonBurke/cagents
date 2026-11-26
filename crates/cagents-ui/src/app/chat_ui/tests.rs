@@ -24441,6 +24441,27 @@ fn assert_inert_live_recovery_copy(f: &LiveSharedRecovery) {
     assert!(f.app.durable.local_only_cards.contains(&copy));
 }
 
+fn assert_draft_kept_without_copy(f: &mut LiveSharedRecovery, canonical: &chat::Session) {
+    assert!(
+        f.app.durable.local_only_cards.is_empty(),
+        "no copy of the pane is kept"
+    );
+    assert!(!f.app.cards.iter().any(|(card, value)| *card != f.card
+        && matches!(value, CardRuntime::Chat(runtime) if runtime.session == f.source)));
+    assert_eq!(
+        f.app.card_state(f.card).unwrap().kind,
+        CardKind::Chat(canonical.clone())
+    );
+    assert_eq!(
+        f.app
+            .persistent_workspace()
+            .chat_drafts
+            .get(&f.card)
+            .map(String::as_str),
+        Some(f.draft.as_str())
+    );
+}
+
 #[test]
 fn retained_live_model_upgrade_first_identity_and_bound_reset_require_the_same_exact_checkpoint() {
     for first_identity in [true, false] {
@@ -24477,6 +24498,7 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
         "writer refusal",
         "newer canonical before Ready",
         "newer canonical before writer ACK",
+        "pane closed elsewhere before writer ACK",
     ] {
         let mut f = live_shared_recovery_fixture();
         let target = project_live_shared_recovery(&mut f);
@@ -24503,6 +24525,7 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
             unreachable!()
         };
         next.proof.as_mut().unwrap().host_incarnation = "still-newer-daemon".into();
+        let next = next.clone();
         if case == "newer canonical before Ready" {
             drop(f.app.update(Message::WorkspaceModelObserved(
                 super::super::workspace_model_sync::ModelUpdate::Read(newer.clone()),
@@ -24520,7 +24543,9 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
             assert!(!chat_runtime(&f.app, f.card).connected());
         } else if case == "newer canonical before Ready" {
             assert_no_live_upgrade_checkpoint(checkpoint);
-            assert_inert_live_recovery_copy(&f);
+            // Only the proof changed: the same conversation keeps its pane
+            // and draft, and no copy is left beside it.
+            assert_draft_kept_without_copy(&mut f, &next);
         } else {
             let receipt = account_commit_reply(checkpoint);
             if case == "writer refusal" {
@@ -24535,12 +24560,40 @@ fn retained_live_model_upgrade_cannot_activate_unproved_refused_or_superseded_ha
                     &receipt,
                     Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
                 ));
+                if case == "pane closed elsewhere before writer ACK" {
+                    // The snapshot still lists the pane, but another client
+                    // has closed it, so the draft can't go back to it.
+                    f.app.shared_views.closed.insert(f.card);
+                }
+                // The newer descriptor supersedes the in-flight upgrade as
+                // soon as it is read, before the receipt is handled.
                 drop(f.app.update(Message::WorkspaceModelObserved(
                     super::super::workspace_model_sync::ModelUpdate::Read(newer),
                 )));
             }
             drop(f.app.update(receipt));
-            assert_inert_live_recovery_copy(&f);
+            if case == "pane closed elsewhere before writer ACK" {
+                assert_inert_live_recovery_copy(&f);
+            } else {
+                // The pane still holds the same conversation, so its draft
+                // stays on it and no copy is left beside it.
+                let canonical = if case == "writer refusal" {
+                    f.canonical.clone()
+                } else {
+                    next.clone()
+                };
+                assert_draft_kept_without_copy(&mut f, &canonical);
+            }
+            assert!(
+                !matches!(f.app.cards.get(&f.card), Some(CardRuntime::Chat(runtime)) if runtime.connected()),
+                "{case}: the pane never connects"
+            );
+            if case != "pane closed elsewhere before writer ACK" {
+                assert!(
+                    matches!(f.app.cards.get(&f.card), Some(CardRuntime::Failed(_))),
+                    "{case}: the pane stays detached and offers Retry"
+                );
+            }
         }
         assert!(!f.app.chat_start_pending(f.card));
         assert!(

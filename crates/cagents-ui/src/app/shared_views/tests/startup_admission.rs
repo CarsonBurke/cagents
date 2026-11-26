@@ -64,6 +64,8 @@ struct UpgradeScript {
     source: Session,
     canonical: Session,
     refuse_lineage: bool,
+    /// Other panes' exact sessions this daemon also attaches.
+    attachable: Vec<Session>,
 }
 
 fn scripted_proof() -> HostSessionProof {
@@ -109,6 +111,7 @@ impl ScriptedDaemon {
             source: session.clone(),
             canonical: session,
             refuse_lineage: false,
+            attachable: Vec::new(),
         }))
     }
 
@@ -225,7 +228,11 @@ impl ScriptedDaemon {
                             ClientRequest::ChatAttach { session } => {
                                 recorded.lock().unwrap().push(session.clone());
                                 if let Some(script) = &upgrade {
-                                    assert_eq!(session, script.canonical);
+                                    assert!(
+                                        session == script.canonical
+                                            || script.attachable.contains(&session),
+                                        "unexpected attachment: {session:?}"
+                                    );
                                     if refuse_attachment {
                                         ServerMessage::Error(ProtocolError::new(
                                             ProtocolErrorCode::TerminalUnavailable,
@@ -1208,6 +1215,7 @@ fn startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment() {
             source: expected.clone(),
             canonical: canonical.clone(),
             refuse_lineage: false,
+            attachable: Vec::new(),
         }),
         true,
     );
@@ -1325,6 +1333,7 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
         source: source.clone(),
         canonical: canonical.clone(),
         refuse_lineage,
+        attachable: Vec::new(),
     }));
     let text = "Draft stays here  ";
     app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(pane.id, text.into())]));
@@ -1515,26 +1524,21 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
             !receipt_seen,
             "refused lineage cannot receive a writer rebind receipt"
         );
-        let copy = *saved
-            .chat_drafts
-            .iter()
-            .find(|(_, draft)| draft.as_str() == text)
-            .unwrap()
-            .0;
-        assert_ne!(copy, pane.id);
-        assert!(app.chat_awaiting_admission(copy));
+        // Only the proof changed, so this is still the pane's conversation:
+        // its draft stays on it, and no copy is kept beside it.
         assert_eq!(
-            app.card_state(copy).unwrap().kind,
-            CardKind::Chat(source.clone())
+            saved
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open())
+                .count(),
+            1
         );
         assert_eq!(
-            saved.pending_chat_admissions.get(&copy),
-            match &app.card_state(copy).unwrap().kind {
-                CardKind::Chat(session) => Some(session),
-                _ => None,
-            }
+            saved.chat_drafts.get(&pane.id).map(String::as_str),
+            Some(text)
         );
-        assert!(!saved.chat_drafts.contains_key(&pane.id));
+        assert!(saved.pending_chat_admissions.is_empty());
         assert!(matches!(
             app.cards.get(&pane.id),
             Some(CardRuntime::Failed(_))
@@ -1613,23 +1617,11 @@ fn exercise_canonical_upgrade(refuse_lineage: bool, retire_before_ready: bool) {
             .load_workspace(saved.id, None)
             .unwrap()
             .unwrap();
-        let copy = *loaded
-            .chat_drafts
-            .iter()
-            .find(|(_, draft)| draft.as_str() == text)
-            .unwrap()
-            .0;
-        assert_ne!(copy, pane.id);
         assert_eq!(
-            loaded
-                .cards
-                .iter()
-                .find(|card| card.id == copy)
-                .unwrap()
-                .kind,
-            CardKind::Chat(source.clone())
+            loaded.chat_drafts.get(&pane.id).map(String::as_str),
+            Some(text)
         );
-        assert_eq!(loaded.pending_chat_admissions.get(&copy), Some(&source));
+        assert!(loaded.pending_chat_admissions.is_empty());
     }
     assert!(app.card_state(pane.id).unwrap().existence.is_open());
 }
@@ -1645,8 +1637,9 @@ fn canonical_upgrade_authenticates_lineage_and_preserves_original_content_throug
 }
 
 #[test]
-fn refused_canonical_upgrade_preserves_source_draft_without_provider_activation() {
-    if isolated("refused_canonical_upgrade_preserves_source_draft_without_provider_activation") {
+fn refused_canonical_upgrade_keeps_the_draft_on_its_pane_without_provider_activation() {
+    if isolated("refused_canonical_upgrade_keeps_the_draft_on_its_pane_without_provider_activation")
+    {
         return;
     }
     exercise_canonical_upgrade(true, false);
@@ -1713,6 +1706,7 @@ fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admissio
         source: source.clone(),
         canonical: canonical.clone(),
         refuse_lineage: false,
+        attachable: Vec::new(),
     }));
     // Darwin can still accept a peer write after a read-only shutdown.
     #[cfg(target_os = "linux")]
@@ -1818,4 +1812,424 @@ fn an_upgraded_visibility_reply_allows_peer_read_close_without_stopping_admissio
     ));
     // Drop must join both actual server connections without masking a panic.
     drop(daemon);
+}
+
+/// `cached_chat`'s pane, here the channel's "lead", with a sibling pane in
+/// the same channel whose saved descriptor is the one its agent runs now.
+fn channel_with_sibling() -> (Cagents, ChannelId, ChannelId, Pane, Pane, uuid::Uuid) {
+    let (mut app, active, hidden, lead, identity) = cached_chat();
+    let mut sibling = lead.clone();
+    sibling.id = CardId::new();
+    sibling.title = "Sibling".into();
+    let CardKind::Chat(session) = &mut sibling.kind else {
+        unreachable!()
+    };
+    session.id = TerminalId::new();
+    session.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+    current_owner(&mut sibling);
+    let durable = Arc::make_mut(&mut app.durable);
+    durable
+        .channels
+        .iter_mut()
+        .find(|c| c.id == hidden)
+        .unwrap()
+        .cards
+        .push(sibling.id);
+    durable.cards.push(CardState {
+        id: sibling.id,
+        generation: durable.generation,
+        title: sibling.title.clone(),
+        width_fraction: sibling.width_fraction,
+        kind: sibling.kind.clone(),
+        existence: Existence::Open,
+    });
+    durable.active_channel = Some(hidden);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.shared_views = State::for_workspace(&app.durable);
+    (app, active, hidden, lead, sibling, identity)
+}
+
+fn chat_session(pane: &Pane) -> Session {
+    match &pane.kind {
+        CardKind::Chat(session) => session.clone(),
+        _ => unreachable!(),
+    }
+}
+
+fn open_cards(app: &Cagents) -> HashSet<CardId> {
+    app.durable
+        .cards
+        .iter()
+        .filter(|card| card.existence.is_open())
+        .map(|card| card.id)
+        .collect()
+}
+
+/// A window opened on `saved` after saving and loading it through the real
+/// store.
+fn reload(saved: &crate::model::WorkspaceState) -> Cagents {
+    let disk = tempfile::tempdir().unwrap();
+    let store = crate::persistence::StateStore::open(
+        disk.path().join("reloaded.sqlite"),
+        crate::model::BootId::new("reloaded-startup"),
+    )
+    .unwrap();
+    store
+        .save_workspace(
+            saved,
+            crate::persistence::SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+    let (mut restored, _, _, _, _) = cached_chat();
+    restored.chat_ui = chat_ui::State::with_drafts(loaded.chat_drafts.clone());
+    restored.durable = Arc::new(loaded);
+    restored.workspace = Cagents::rebuild_workspace(&restored.durable);
+    restored.shared_views = State::for_workspace(&restored.durable);
+    restored.workspace_model = Default::default();
+    restored
+}
+
+/// The occurrence recorded on #4115: after a reboot the daemon relaunched
+/// the lead's conversation, so its descriptor changed only in its proof, and
+/// the daemon had no upgrade lineage to prove. The pane's draft stays on the
+/// pane, nothing is copied, and the channel's other pane is admitted, through
+/// later reconciliations and a reload.
+fn exercise_proof_only_relaunch(draft: &str) {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut lead, sibling, identity) = channel_with_sibling();
+    let saved_lead = chat_session(&lead);
+    let canonical_lead = current_owner(&mut lead);
+    assert_eq!(canonical_lead.id, saved_lead.id);
+    assert_eq!(
+        canonical_lead.launch.session_id,
+        saved_lead.launch.session_id
+    );
+    let daemon = ScriptedDaemon::with_upgrade(Some(UpgradeScript {
+        source: saved_lead,
+        canonical: canonical_lead.clone(),
+        refuse_lineage: true,
+        attachable: vec![chat_session(&sibling)],
+    }));
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(lead.id, draft.into())]));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let mut view = View::empty(hidden);
+    view.panes.push(lead.clone());
+    view.panes.push(sibling.clone());
+    let mut model = model(identity, active, hidden, view);
+    admit(&mut app, active, hidden, model.clone());
+    let expected = HashSet::from([lead.id, sibling.id]);
+    let check = |app: &mut Cagents| {
+        assert!(
+            app.shared_views.blocked.is_empty(),
+            "the channel is admitted"
+        );
+        assert!(app.status.is_none(), "no notice: {:?}", app.status);
+        assert_eq!(open_cards(app), expected, "no copy of the lead is kept");
+        assert!(app.durable.pending_chat_admissions.is_empty());
+        assert!(!app.chat_awaiting_admission(sibling.id));
+        assert!(daemon.requests().contains(&chat_session(&sibling)));
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&lead.id)
+                .map(String::as_str),
+            Some(draft),
+            "the draft stays on its own pane"
+        );
+    };
+    check(&mut app);
+    // The unproved lineage still leaves reconnecting the lead explicit, and
+    // says the draft comes back when it does.
+    let Some(CardRuntime::Failed(notice)) = app.cards.get(&lead.id) else {
+        panic!("the lead waits for Retry");
+    };
+    assert_eq!(
+        notice.contains("your unsent draft comes back"),
+        !draft.trim().is_empty(),
+        "{}",
+        notice.message()
+    );
+    for _ in 0..2 {
+        model.sequence += 1;
+        let read = app.apply_workspace_model_update(ModelUpdate::Read(model.clone()));
+        settle(&mut app, read);
+        check(&mut app);
+    }
+    let retry = app.update(Message::RetryCard(lead.id));
+    settle(&mut app, retry);
+    check(&mut app);
+    assert!(
+        daemon.requests().contains(&canonical_lead),
+        "Retry attaches the daemon's descriptor"
+    );
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&lead.id) else {
+        panic!("Retry opens the lead");
+    };
+    assert_eq!(
+        runtime.unsent_text(),
+        draft,
+        "the draft is back in its composer"
+    );
+    let mut restored = reload(&app.persistent_workspace());
+    let startup = restored.initialize_runtimes();
+    settle(&mut restored, startup);
+    model.sequence = 1;
+    admit(&mut restored, active, hidden, model);
+    check(&mut restored);
+    assert!(
+        !restored.chat_awaiting_admission(lead.id),
+        "reloaded, the lead attaches the daemon's descriptor"
+    );
+    assert!(daemon.requests().contains(&canonical_lead));
+}
+
+#[test]
+fn proof_only_relaunch_keeps_a_whitespace_draft_without_a_copy() {
+    if isolated("proof_only_relaunch_keeps_a_whitespace_draft_without_a_copy") {
+        return;
+    }
+    exercise_proof_only_relaunch(" ");
+}
+
+#[test]
+fn proof_only_relaunch_keeps_real_text_on_its_pane() {
+    if isolated("proof_only_relaunch_keeps_real_text_on_its_pane") {
+        return;
+    }
+    exercise_proof_only_relaunch("Check the leaderboard  ");
+}
+
+/// What becomes of a saved copy of the lead's draft, kept beside it before
+/// #4115, once the window opens again.
+#[derive(Clone, Copy)]
+enum Healed {
+    /// The copy goes, and the lead's draft is this.
+    Retired(Option<&'static str>),
+    /// The copy stays, closable, beside a lead with its own draft.
+    Kept,
+}
+
+/// Saves a local copy of `lead` holding its `old` descriptor, after it in
+/// channel `hidden`, as #4115 left one.
+fn add_saved_copy(
+    app: &mut Cagents,
+    hidden: ChannelId,
+    lead: &Pane,
+    old: &crate::chat::Session,
+) -> CardId {
+    let copy = CardId::new();
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards.push(CardState {
+        id: copy,
+        generation: durable.generation,
+        title: lead.title.clone(),
+        width_fraction: lead.width_fraction,
+        kind: CardKind::Chat(old.clone()),
+        existence: Existence::Open,
+    });
+    let channel = durable
+        .channels
+        .iter_mut()
+        .find(|c| c.id == hidden)
+        .unwrap();
+    let at = channel.cards.iter().position(|id| *id == lead.id).unwrap();
+    channel.cards.insert(at + 1, copy);
+    durable.local_only_cards.insert(copy);
+    durable.pending_chat_admissions.insert(copy, old.clone());
+    copy
+}
+
+/// A window saved with the state #4115 left: the lead attached to the
+/// daemon's descriptor, and a local copy of its old descriptor and draft that
+/// can never be admitted. Opening it again repairs the copy without holding
+/// back the channel.
+fn exercise_retained_copy(copy_draft: &'static str, lead_draft: &'static str, healed: Healed) {
+    use crate::app::workspace_model_sync::ModelUpdate;
+    let (mut app, active, hidden, mut lead, sibling, identity) = channel_with_sibling();
+    let old = chat_session(&lead);
+    let canonical_lead = current_owner(&mut lead);
+    app.card_state_mut(lead.id).unwrap().kind = lead.kind.clone();
+    let copy = add_saved_copy(&mut app, hidden, &lead, &old);
+    let mut drafts = HashMap::from([(copy, copy_draft.to_owned())]);
+    if !lead_draft.is_empty() {
+        drafts.insert(lead.id, lead_draft.to_owned());
+    }
+    app.chat_ui = chat_ui::State::with_drafts(drafts);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.shared_views = State::for_workspace(&app.durable);
+    let mut app = reload(&app.persistent_workspace());
+    assert!(app.is_retained_chat_copy(copy));
+    let daemon = ScriptedDaemon::with_upgrade(Some(UpgradeScript {
+        source: canonical_lead.clone(),
+        canonical: canonical_lead.clone(),
+        refuse_lineage: false,
+        attachable: vec![chat_session(&sibling)],
+    }));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    assert!(app.chat_awaiting_admission(copy));
+    let mut view = View::empty(hidden);
+    view.panes.push(lead.clone());
+    view.panes.push(sibling.clone());
+    let mut model = model(identity, active, hidden, view);
+    admit(&mut app, active, hidden, model.clone());
+    let check = |app: &mut Cagents| {
+        assert!(
+            app.shared_views.blocked.is_empty(),
+            "the channel is admitted"
+        );
+        assert!(app.status.is_none(), "no notice: {:?}", app.status);
+        assert!(!app.chat_awaiting_admission(lead.id));
+        assert!(!app.chat_awaiting_admission(sibling.id));
+        let requests = daemon.requests();
+        assert!(requests.contains(&canonical_lead));
+        assert!(requests.contains(&chat_session(&sibling)));
+        assert!(
+            !app.waits_on_update_recovery(),
+            "nothing waits on the daemon's restore"
+        );
+        let saved = app.persistent_workspace();
+        match healed {
+            Healed::Retired(lead_text) => {
+                assert!(!app.card_state(copy).unwrap().existence.is_open());
+                assert!(!app.workspace.order().any(|id| id == copy));
+                assert!(
+                    !saved
+                        .channels
+                        .iter()
+                        .any(|channel| channel.cards.contains(&copy))
+                );
+                assert!(!saved.pending_chat_admissions.contains_key(&copy));
+                assert!(!saved.local_only_cards.contains(&copy));
+                assert!(!saved.chat_drafts.contains_key(&copy));
+                assert_eq!(
+                    saved.chat_drafts.get(&lead.id).map(String::as_str),
+                    lead_text
+                );
+            }
+            Healed::Kept => {
+                assert!(app.card_state(copy).unwrap().existence.is_open());
+                assert!(app.chat_awaiting_admission(copy));
+                assert!(app.workspace.card(copy).is_some());
+                let visible = visible_text(app, copy);
+                assert!(
+                    visible.contains(chat_ui::RETAINED_COPY_TITLE)
+                        && visible.contains(copy_draft)
+                        && visible.contains("Close copy"),
+                    "{visible}"
+                );
+                assert_eq!(
+                    saved.chat_drafts.get(&lead.id).map(String::as_str),
+                    Some(lead_draft)
+                );
+                assert_eq!(
+                    saved.chat_drafts.get(&copy).map(String::as_str),
+                    Some(copy_draft)
+                );
+            }
+        }
+    };
+    check(&mut app);
+    model.sequence += 1;
+    let read = app.apply_workspace_model_update(ModelUpdate::Read(model));
+    settle(&mut app, read);
+    check(&mut app);
+    if matches!(healed, Healed::Kept) {
+        let attached = daemon.requests().len();
+        let close = app.update(Message::CloseCard(copy));
+        settle(&mut app, close);
+        assert!(!app.card_state(copy).unwrap().existence.is_open());
+        assert!(!app.durable.pending_chat_admissions.contains_key(&copy));
+        assert_eq!(
+            daemon.requests().len(),
+            attached,
+            "closing the copy asks nothing of the conversation"
+        );
+        assert!(app.card_state(lead.id).unwrap().existence.is_open());
+    }
+}
+
+#[test]
+fn saved_whitespace_copy_is_retired_and_its_channel_admitted() {
+    if isolated("saved_whitespace_copy_is_retired_and_its_channel_admitted") {
+        return;
+    }
+    exercise_retained_copy(" ", "", Healed::Retired(None));
+}
+
+#[test]
+fn saved_copy_text_moves_to_its_pane_when_that_draft_is_empty() {
+    if isolated("saved_copy_text_moves_to_its_pane_when_that_draft_is_empty") {
+        return;
+    }
+    exercise_retained_copy(
+        "Words typed before the reboot",
+        "",
+        Healed::Retired(Some("Words typed before the reboot")),
+    );
+}
+
+#[test]
+fn saved_copy_beside_a_pane_with_its_own_draft_stays_closable_without_blocking() {
+    if isolated("saved_copy_beside_a_pane_with_its_own_draft_stays_closable_without_blocking") {
+        return;
+    }
+    exercise_retained_copy(
+        "Words typed before the reboot",
+        "Words typed since",
+        Healed::Kept,
+    );
+}
+
+/// Two reboots can leave two copies beside one lead. Only one copy's text
+/// moves to the lead's empty draft; the other stays a copy, so neither text
+/// replaces the other.
+#[test]
+fn two_saved_copies_never_overwrite_each_others_text() {
+    if isolated("two_saved_copies_never_overwrite_each_others_text") {
+        return;
+    }
+    let (mut app, active, hidden, mut lead, sibling, identity) = channel_with_sibling();
+    let old = chat_session(&lead);
+    let canonical_lead = current_owner(&mut lead);
+    app.card_state_mut(lead.id).unwrap().kind = lead.kind.clone();
+    let first = add_saved_copy(&mut app, hidden, &lead, &old);
+    let second = add_saved_copy(&mut app, hidden, &lead, &old);
+    let texts = HashSet::from(["First kept text", "Second kept text"]);
+    app.chat_ui = chat_ui::State::with_drafts(HashMap::from([
+        (first, "First kept text".to_owned()),
+        (second, "Second kept text".to_owned()),
+    ]));
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.shared_views = State::for_workspace(&app.durable);
+    let mut app = reload(&app.persistent_workspace());
+    let _daemon = ScriptedDaemon::with_upgrade(Some(UpgradeScript {
+        source: canonical_lead.clone(),
+        canonical: canonical_lead,
+        refuse_lineage: false,
+        attachable: vec![chat_session(&sibling)],
+    }));
+    let startup = app.initialize_runtimes();
+    settle(&mut app, startup);
+    let mut view = View::empty(hidden);
+    view.panes.push(lead.clone());
+    view.panes.push(sibling.clone());
+    let model = model(identity, active, hidden, view);
+    admit(&mut app, active, hidden, model);
+    assert!(app.shared_views.blocked.is_empty());
+    let saved = app.persistent_workspace();
+    let open = [first, second]
+        .into_iter()
+        .filter(|copy| app.card_state(*copy).unwrap().existence.is_open())
+        .collect::<Vec<_>>();
+    assert_eq!(open.len(), 1, "one copy moved, one stays");
+    let kept = saved.chat_drafts.get(&open[0]).map(String::as_str).unwrap();
+    let moved = saved.chat_drafts.get(&lead.id).map(String::as_str).unwrap();
+    assert_eq!(HashSet::from([kept, moved]), texts, "no text is lost");
+    assert!(visible_text(&app, open[0]).contains(chat_ui::RETAINED_COPY_TITLE));
 }

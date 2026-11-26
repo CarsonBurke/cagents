@@ -612,12 +612,13 @@ impl Cagents {
             || self.completed_release == Some(card)
     }
 
-    /// Closes a fenced pane, whatever its kind, like any other pane - it
-    /// leaves the shared view and can be reopened from recently closed - but
-    /// asks nothing of its agent. Its saved session is unconfirmed, so no
+    /// Closes a fenced pane, whatever its kind, or a kept copy of a draft,
+    /// like any other pane - it leaves the shared view and can be reopened
+    /// from recently closed - but asks nothing of its agent. Its saved
+    /// session is unconfirmed, or belongs to the pane beside the copy, so no
     /// session may be stopped on its behalf.
     pub(super) fn close_fenced_card(&mut self, card: CardId) -> Option<Task<Message>> {
-        if !self.shared_views.quarantined.contains(&card) {
+        if !self.shared_views.quarantined.contains(&card) && !self.is_retained_chat_copy(card) {
             return None;
         }
         Arc::make_mut(&mut self.durable)
