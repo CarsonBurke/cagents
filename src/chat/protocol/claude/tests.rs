@@ -15730,3 +15730,84 @@ fn a_reopened_narration_reads_as_commentary_from_its_signature() {
         ]
     );
 }
+
+#[test]
+fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let homes = account::home::Homes::at(directory.path().join("accounts"));
+    let managed = homes.path(Provider::Claude, uuid::Uuid::new_v4());
+    let system = directory.path().join("system");
+    let project = directory.path().join("project");
+    for path in [&managed, &system, &project.join(".claude")] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let system_settings = system.join("settings.json");
+    std::fs::write(
+        managed.join("settings.json"),
+        r#"{"attribution":{"commit":"stale"}}"#,
+    )
+    .unwrap();
+    let mut launch = Launch {
+        provider: Provider::Claude,
+        recipe: crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: vec![],
+            working_directory: project.clone(),
+            environment: [("CLAUDE_CONFIG_DIR".into(), managed.display().to_string())].into(),
+            unset_environment: ["HOME".into(), "CLAUDE_CODE_PERMISSION_MODE".into()].into(),
+        },
+        session_id: None,
+        draft_model: None,
+    };
+    let settings = |launch: &Launch| {
+        arguments_with_attribution(launch, |recipe| {
+            chat::managed_claude_attribution(recipe, &homes, &system)
+        })
+        .unwrap()
+        .windows(2)
+        .find(|pair| pair[0] == "--settings")
+        .map(|pair| serde_json::from_str::<Value>(&pair[1]).unwrap())
+    };
+
+    std::fs::write(&system_settings, r#"{"attribution":false,"theme":"dark"}"#).unwrap();
+    assert_eq!(settings(&launch), Some(json!({"attribution": false})));
+    launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    std::fs::write(
+        &system_settings,
+        r#"{"attribution":{"commit":"","pr":"custom"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        settings(&launch),
+        Some(json!({"attribution": {"commit": "", "pr": "custom"}}))
+    );
+
+    for name in ["settings.json", "settings.local.json"] {
+        let path = project.join(".claude").join(name);
+        std::fs::write(&path, r#"{"attribution":false}"#).unwrap();
+        assert_eq!(settings(&launch), None, "{name}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    launch.recipe.arguments = vec![r#"--settings={"attribution":true}"#.into()];
+    assert_eq!(settings(&launch), Some(json!({"attribution": true})));
+    launch.recipe.arguments = vec!["--setting-sources=project,local".into()];
+    assert_eq!(settings(&launch), None);
+    launch.recipe.arguments.clear();
+
+    for invalid in ["{}", "malformed", "[]"] {
+        std::fs::write(&system_settings, invalid).unwrap();
+        assert_eq!(settings(&launch), None, "{invalid}");
+    }
+    std::fs::remove_file(&system_settings).unwrap();
+    assert_eq!(settings(&launch), None);
+    std::fs::create_dir(&system_settings).unwrap();
+    assert_eq!(settings(&launch), None);
+    std::fs::remove_dir(&system_settings).unwrap();
+    std::fs::write(&system_settings, r#"{"attribution":false}"#).unwrap();
+    launch.recipe.environment.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        directory.path().join("linked").display().to_string(),
+    );
+    assert_eq!(settings(&launch), None);
+}

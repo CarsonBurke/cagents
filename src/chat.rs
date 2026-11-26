@@ -5152,68 +5152,15 @@ fn claude_configured_default_mode_in(
         .ok_or(())
     }
 
-    let environment = |name: &str| {
-        (!recipe.unset_environment.contains(name))
-            .then(|| {
-                recipe
-                    .environment
-                    .get(name)
-                    .cloned()
-                    .or_else(|| std::env::var(name).ok())
-            })
-            .flatten()
-            .filter(|value| !value.is_empty())
-    };
-    if environment("CLAUDE_CODE_PERMISSION_MODE").is_some() {
-        // This explicit choice outranks settings; do not pin a CLI default
-        // during fresh creation or when converting an older launch.
+    if claude_launch_variable(recipe, "CLAUDE_CODE_PERMISSION_MODE").is_some() {
+        // An explicit environment choice outranks settings.
         return None;
     }
-    let resolve = |path: std::path::PathBuf| {
-        if path.is_absolute() {
-            path
-        } else {
-            recipe.working_directory.join(path)
-        }
-    };
-    let user_home = environment("HOME")
-        .map(std::path::PathBuf::from)
-        .map(resolve);
-    let root = environment("CLAUDE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .map(resolve)
-        .or_else(|| user_home.as_ref().map(|home| home.join(".claude")))?;
-    let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
-    for directory in recipe.working_directory.ancestors() {
-        if user_home.as_deref() == Some(directory) {
-            if recipe.working_directory == directory
-                && setting(&directory.join(".claude/settings.local.json"))
-                    .ok()
-                    .flatten()
-                    .is_some()
-            {
-                // HOME itself can be a project cwd. Its local setting then
-                // belongs to that session, but never to descendant projects.
-                return None;
-            }
-            break;
-        }
-        if ["settings.local.json", "settings.json"]
-            .into_iter()
-            .any(|name| {
-                let path = directory.join(".claude").join(name);
-                if account_settings.is_some()
-                    && std::fs::canonicalize(&path).ok() == account_settings
-                {
-                    return false;
-                }
-                setting(&path).ok().flatten().is_some()
-            })
-        {
-            // A project-specific choice belongs to Claude's own settings
-            // handling, not to a command-line override from another account.
-            return None;
-        }
+    let (user_home, root) = claude_launch_homes(recipe)?;
+    if claude_project_setting(recipe, user_home.as_deref(), &root, |path| {
+        setting(path).ok().flatten().is_some()
+    }) {
+        return None;
     }
 
     // A managed home isolates a login, not the user's permission preference.
@@ -5242,4 +5189,102 @@ fn claude_configured_default_mode_in(
     setting(&root.join("settings.json"))
         .ok()?
         .filter(|mode| mode != "default")
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_launch_variable(recipe: &LaunchRecipe, name: &str) -> Option<String> {
+    (!recipe.unset_environment.contains(name))
+        .then(|| {
+            recipe
+                .environment
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        })
+        .flatten()
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_launch_homes(
+    recipe: &LaunchRecipe,
+) -> Option<(Option<std::path::PathBuf>, std::path::PathBuf)> {
+    let resolve = |path: std::path::PathBuf| {
+        if path.is_absolute() {
+            path
+        } else {
+            recipe.working_directory.join(path)
+        }
+    };
+    let user_home = claude_launch_variable(recipe, "HOME")
+        .map(std::path::PathBuf::from)
+        .map(resolve);
+    let root = claude_launch_variable(recipe, "CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .map(resolve)
+        .or_else(|| user_home.as_ref().map(|home| home.join(".claude")))?;
+    Some((user_home, root))
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_project_setting(
+    recipe: &LaunchRecipe,
+    user_home: Option<&std::path::Path>,
+    root: &std::path::Path,
+    has_setting: impl Fn(&std::path::Path) -> bool,
+) -> bool {
+    let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
+    for directory in recipe.working_directory.ancestors() {
+        if user_home == Some(directory) {
+            if recipe.working_directory == directory
+                && has_setting(&directory.join(".claude/settings.local.json"))
+            {
+                // HOME itself can be a project cwd. Its local setting then
+                // belongs to that session, but never to descendant projects.
+                return true;
+            }
+            break;
+        }
+        if ["settings.local.json", "settings.json"]
+            .into_iter()
+            .any(|name| {
+                let path = directory.join(".claude").join(name);
+                if account_settings.is_some()
+                    && std::fs::canonicalize(&path).ok() == account_settings
+                {
+                    return false;
+                }
+                has_setting(&path)
+            })
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(feature = "host")]
+fn managed_claude_attribution(
+    recipe: &LaunchRecipe,
+    homes: &crate::account::home::Homes,
+    system_home: &std::path::Path,
+) -> Option<serde_json::Value> {
+    fn attribution(path: &std::path::Path) -> Option<serde_json::Value> {
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        settings.get("attribution").cloned()
+    }
+
+    let (user_home, root) = claude_launch_homes(recipe)?;
+    if !homes
+        .managed_identity(&root)
+        .is_some_and(|(provider, _)| provider == Provider::Claude)
+        || claude_project_setting(recipe, user_home.as_deref(), &root, |path| {
+            attribution(path).is_some()
+        })
+    {
+        return None;
+    }
+    attribution(&system_home.join("settings.json"))
 }

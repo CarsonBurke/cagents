@@ -322,7 +322,23 @@ pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), S
     Ok(())
 }
 
+fn managed_attribution(recipe: &crate::model::LaunchRecipe) -> Option<Value> {
+    if crate::device::is_remote() {
+        return None;
+    }
+    let homes = account::home::Homes::installation()?;
+    let system = account::Account::system(Provider::Claude).resolved_home()?;
+    chat::managed_claude_attribution(recipe, &homes, &system)
+}
+
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
+    arguments_with_attribution(launch, managed_attribution)
+}
+
+fn arguments_with_attribution(
+    launch: &Launch,
+    attribution: impl FnOnce(&crate::model::LaunchRecipe) -> Option<Value>,
+) -> Result<Vec<String>, String> {
     if launch.recipe.arguments.len() > 128
         || launch
             .recipe
@@ -341,6 +357,7 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
         validate_id(id)?;
     }
     let mut result = Vec::new();
+    let mut use_managed_attribution = true;
     let mut args = launch.recipe.arguments.iter().peekable();
     while let Some(arg) = args.next() {
         let (flag, inline) = arg
@@ -396,6 +413,12 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
             {
                 return Err(format!("Unknown Claude launch permission mode {value}"));
             }
+            if flag == "--settings"
+                || (flag == "--setting-sources"
+                    && !value.split(',').any(|source| source.trim() == "user"))
+            {
+                use_managed_attribution = false;
+            }
             result.extend([flag.into(), value.into()]);
         } else if crate::chat::fresh::claude_arity(flag)
             == Some(crate::chat::fresh::ArgumentArity::Values)
@@ -424,6 +447,14 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
                 "Claude option {flag} cannot safely transfer to native chat; remove it before connecting"
             ));
         }
+    }
+    // Resolve at process launch so fresh, resumed and recovered chats all
+    // read the current preference, without saving a flag into their recipe.
+    if use_managed_attribution && let Some(attribution) = attribution(&launch.recipe) {
+        result.extend([
+            "--settings".into(),
+            json!({ "attribution": attribution }).to_string(),
+        ]);
     }
     // Older stored chats and terminal conversions may predate native launch
     // defaults. Apply the account choice at the final transport boundary too.
