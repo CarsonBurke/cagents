@@ -69,14 +69,16 @@ REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
 JOBS = (
     Job("native evidence", shards=3, suites=(
         Suite("native evidence", "tests/native_evidence.py",
-              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/git-ancestry.sh", "scripts/native_slots.py",
+              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/offload_client.py",
+                       "scripts/cargo-gate-command.py", "scripts/git-ancestry.sh", "scripts/native_slots.py",
                        "scripts/run-development", "scripts/cargo-lane", "scripts/cargo_warnings.py"),
               syntax=(("bash", "scripts/native-evidence"), ("bash", "scripts/native-evidence-remote"),
                       ("bash", "scripts/git-ancestry.sh"))),
     )),
     Job("build offload", shards=2, suites=(
         Suite("build offload", "tests/cargo_offload.py",
-              sources=("scripts/cargo-offload", "scripts/git_ancestry.py", "scripts/cargo_artifacts.py", "scripts/build-host",
+              sources=("scripts/cargo-offload", "scripts/offload_client.py", "scripts/cargo-gate-command.py",
+                       "scripts/native_slots.py", "scripts/git_ancestry.py", "scripts/cargo_artifacts.py", "scripts/build-host",
                        "scripts/cargo-gate-rustc-guard", "scripts/cargo-incremental-retry.py")),
     )),
     Job("cargo gate", suites=(
@@ -84,6 +86,8 @@ JOBS = (
               sources=("scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo_artifacts.py",
                        "scripts/build-host", "scripts/memory-capped", "scripts/cargo-incremental-retry.py"),
               syntax=(("sh", "scripts/cargo-gate"),)),
+        Suite("offload client admission", "tests/offload_client.py",
+              sources=("scripts/offload_client.py", "scripts/native_slots.py")),
         Suite("build host admission and jobserver", "tests/build_host.py",
               sources=("scripts/build-host", "scripts/memory-capped", "scripts/cargo-gate-rustc-guard")),
     )),
