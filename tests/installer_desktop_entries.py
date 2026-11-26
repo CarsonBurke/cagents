@@ -38,13 +38,15 @@ class InstallerDesktopEntries(unittest.TestCase):
         helper_start = installer.index("desktop_exec_escape() {\n")
         helper_end = installer.index('\nINSTALL_STAGE=$PREFIX/.staging.$$',
                                      helper_start)
-        emitter_start = installer.index('\nAUTOSTART_EXEC=$(desktop_exec_escape "$BIN_TARGET")',
+        emitter_start = installer.index('\nDESKTOP_EXEC=$(desktop_exec_command "$BIN_TARGET")',
                                         helper_end) + 1
         emitter_end = installer.index('\nchmod 0755 "$INSTALL_STAGE/$TOP_LEVEL"', emitter_start)
         self.generator = self.directory / "desktop-generator.sh"
         # These source slices exclude installer admission, extraction and activation.
         self.generator.write_text(
             '#!/bin/sh\nset -eu\nBIN_TARGET=$1\nPREFIX=$2\nINSTALL_STAGE=$3\nTOP_LEVEL=fixture\n'
+            'EDITOR_LAUNCHER=$PREFIX/.ceditor-launcher\n'
+            'EDITOR_DESKTOP_MEMBER=share/applications/io.github.cagents.ceditor.desktop\n'
             'fail() { printf "%s\\n" "$*" >&2; exit 1; }\n'
             + installer[helper_start:helper_end] + "\n"
             + installer[emitter_start:emitter_end] + "\n"
@@ -64,10 +66,14 @@ class InstallerDesktopEntries(unittest.TestCase):
             "os.replace(receipt + '.tmp', receipt)\n"
         )
         executable.chmod(0o755)
+        launcher = prefix / ".ceditor-launcher"
+        shutil.copy2(executable, launcher)
         stage = case / "generated-files"
         application = stage / "fixture/share/applications/dev.cagents.Cagents.desktop"
         application.parent.mkdir(parents=True)
         shutil.copy2(ROOT / "packaging/dev.cagents.Cagents.desktop", application)
+        editor = application.with_name("io.github.cagents.ceditor.desktop")
+        shutil.copy2(ROOT / "packaging/io.github.cagents.ceditor.desktop", editor)
         autostart = stage / "fixture/share/autostart/dev.cagents.Cagents.Daemon.desktop"
         autostart.parent.mkdir(parents=True)
         result = subprocess.run(
@@ -75,22 +81,28 @@ class InstallerDesktopEntries(unittest.TestCase):
             cwd=self.directory, text=True, capture_output=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        return prefix, executable, {"application": application, "autostart": autostart}
+        return prefix, executable, {"application": application, "autostart": autostart,
+                                    "editor": editor}
 
     @unittest.skipUnless(shutil.which("gio"), "gio is required to exercise desktop Exec launch")
     def test_application_and_autostart_launch_exact_executable_and_arguments(self):
         gio = shutil.which("gio")
+        document = self.directory / "test file.rs"
+        document.touch()
         for name, suffix in CASES:
             prefix, executable, entries = self.make_entries(name, suffix)
-            for kind, arguments in (("application", ["ui"]),
-                                    ("autostart", ["daemon", "start"])):
+            for kind, program, arguments, files in (
+                ("application", executable, ["ui"], []),
+                ("autostart", executable, ["daemon", "start"], []),
+                ("editor", prefix / ".ceditor-launcher", [str(document)], [str(document)]),
+            ):
                 with self.subTest(prefix=suffix, entry=kind):
                     receipt = self.directory / f"{name}-{kind}-actual-launch.json"
                     environment = os.environ.copy()
                     environment["TRIAGE_LAUNCH"] = str(receipt)
                     environment["XDG_DATA_HOME"] = str(self.directory / "private-data")
                     result = subprocess.run(
-                        [gio, "launch", str(entries[kind])],
+                        [gio, "launch", str(entries[kind]), *files],
                         cwd=self.directory, env=environment,
                         text=True, capture_output=True, timeout=HANG_GUARD,
                     )
@@ -100,7 +112,7 @@ class InstallerDesktopEntries(unittest.TestCase):
                         time.sleep(0.01)
                     self.assertTrue(receipt.exists(), "fixture was not launched: " + result.stderr)
                     actual = json.loads(receipt.read_text())
-                    self.assertEqual(actual["argv"], [str(executable), *arguments])
+                    self.assertEqual(actual["argv"], [str(program), *arguments])
                     self.assertEqual(actual["cwd"], str(self.directory))
 
     @unittest.skipUnless(shutil.which("desktop-file-validate"),

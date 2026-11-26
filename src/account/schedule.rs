@@ -275,7 +275,7 @@ pub fn backoff(failures: u32) -> Millis {
     BACKOFF_BASE.saturating_mul(1 << doublings).min(BACKOFF_MAX)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

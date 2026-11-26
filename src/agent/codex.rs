@@ -112,7 +112,7 @@ pub fn rollout(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
 /// A rollout Codex archived, which it moves out of the dated tree into one
 /// flat directory.
 #[cfg(feature = "host")]
-pub(crate) fn archived_rollout(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
+pub fn archived_rollout(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
     let suffix = rollout_suffix(id)?;
     let mut found = Vec::new();
     let mut budget = ROLLOUT_SCAN;

@@ -7,12 +7,34 @@
 use serde::{Serialize, de::DeserializeOwned};
 use std::io::{self, Write};
 use std::mem::{size_of, size_of_val, zeroed};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
+/// Received rights arrive close-on-exec on Linux. Darwin has no such flag, so
+/// [`receive_part`] marks each one as soon as `recvmsg` returns. A child
+/// another thread forks in between keeps the right unless its spawn runs
+/// [`crate::daemon::seal_inherited_descriptors`]: holder and provider spawns
+/// do; `process::ProcessSpec` commands do not yet.
+#[cfg(target_os = "linux")]
+const RECEIVE_CLOEXEC: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(target_os = "macos")]
+const RECEIVE_CLOEXEC: libc::c_int = 0;
+
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+#[cfg(target_os = "macos")]
+const SEND_FLAGS: libc::c_int = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL | DARWIN_MSG_NBIO;
+/// XNU's send-buffer capacity check uses MSG_NBIO from socket_private.h.
+/// MSG_DONTWAIT only prevents waiting for its buffer lock. Pass both so an
+/// attached stream can keep its shared descriptor flags and timeouts.
+#[cfg(target_os = "macos")]
+const DARWIN_MSG_NBIO: libc::c_int = 0x20000;
+
 // Linux's SCM_MAX_FD. Receive enough space to own and close excess rights even
-// when a caller permits fewer. MSG_CTRUNC is still an error, never a partial set.
+// when a caller permits fewer. On Darwin sockargs limits control data to one
+// cluster even after expanding descriptor numbers to pointers. Use the full
+// buffer there: XNU installs rights before copying out ancillary bytes.
 const MAX_RIGHTS: usize = 253;
 const CONTROL_WORDS: usize = 256;
 // Linux UAPI SCM_PIDFD (not yet exported by our libc version). We reject this
@@ -22,6 +44,7 @@ const SCM_PIDFD: libc::c_int = 0x04;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FrameByteOrder {
     LittleEndian,
+    #[cfg(any(feature = "host", test))]
     BigEndian,
 }
 
@@ -29,6 +52,7 @@ impl FrameByteOrder {
     fn encode(self, length: u32) -> [u8; 4] {
         match self {
             Self::LittleEndian => length.to_le_bytes(),
+            #[cfg(any(feature = "host", test))]
             Self::BigEndian => length.to_be_bytes(),
         }
     }
@@ -36,6 +60,7 @@ impl FrameByteOrder {
     fn decode(self, bytes: [u8; 4]) -> u32 {
         match self {
             Self::LittleEndian => u32::from_le_bytes(bytes),
+            #[cfg(any(feature = "host", test))]
             Self::BigEndian => u32::from_be_bytes(bytes),
         }
     }
@@ -59,37 +84,13 @@ fn remaining(deadline: Instant) -> Result<std::time::Duration, String> {
 }
 
 fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<(), String> {
-    loop {
-        let left = remaining(deadline)?;
-        let milliseconds = left
-            .as_millis()
-            .saturating_add(u128::from(left.subsec_nanos() % 1_000_000 != 0));
-        let timeout = milliseconds.min(libc::c_int::MAX as u128) as libc::c_int;
-        let mut descriptor = libc::pollfd {
-            fd: control.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(format!("poll descriptor frame: {error}"));
-        }
-        remaining(deadline)?;
-        if result == 0 {
-            continue;
-        }
-        if descriptor.revents & libc::POLLNVAL != 0 {
-            return Err("invalid descriptor frame socket".into());
-        }
-        // HUP/ERR must reach recvmsg/sendmsg, which reports EOF/the actual error.
-        if descriptor.revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
-            return Ok(());
-        }
+    let ready = crate::descriptor::wait_for_activity(control.as_fd(), events, Some(deadline))
+        .map_err(|error| format!("poll descriptor frame: {error}"))?;
+    if !ready {
+        return Err("descriptor frame deadline expired".into());
     }
+    remaining(deadline)?;
+    Ok(())
 }
 
 struct BoundedJson {
@@ -162,7 +163,7 @@ pub(crate) fn send_json_with_fds_until(
             let space = unsafe { libc::CMSG_SPACE(bytes as _) } as usize;
             debug_assert!(space <= size_of_val(&ancillary));
             message.msg_control = ancillary.as_mut_ptr().cast();
-            message.msg_controllen = space;
+            message.msg_controllen = space as _;
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&message);
                 (*header).cmsg_level = libc::SOL_SOCKET;
@@ -174,13 +175,9 @@ pub(crate) fn send_json_with_fds_until(
                 }
             }
         }
-        let count = unsafe {
-            libc::sendmsg(
-                control.as_raw_fd(),
-                &message,
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
+        // SAFETY: the socket, frame and any aligned ancillary bytes remain
+        // valid for this call.
+        let count = unsafe { libc::sendmsg(control.as_raw_fd(), &message, SEND_FLAGS) };
         if count < 0 {
             let error = io::Error::last_os_error();
             match error.kind() {
@@ -206,7 +203,11 @@ pub(crate) fn send_json_with_fds_until(
 // checked before every header/payload read; unknown data is never treated as fds.
 fn take_rights(bytes: &[u8], descriptors: &mut Vec<OwnedFd>) -> Result<(), String> {
     let base_length = unsafe { libc::CMSG_LEN(0) } as usize;
+    // `CMSG_ALIGN`: Linux aligns ancillary records to a word, Darwin to 32 bits.
+    #[cfg(target_os = "linux")]
     let alignment = size_of::<usize>();
+    #[cfg(target_os = "macos")]
+    let alignment = size_of::<u32>();
     let mut offset = 0_usize;
     let mut invalid = false;
     while bytes.len().saturating_sub(offset) >= size_of::<libc::cmsghdr>() {
@@ -217,13 +218,18 @@ fn take_rights(bytes: &[u8], descriptors: &mut Vec<OwnedFd>) -> Result<(), Strin
                 .cast::<libc::cmsghdr>()
                 .read_unaligned()
         };
-        let length = header.cmsg_len;
+        // `socklen_t` on Darwin, `usize` on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let length = header.cmsg_len as usize;
         if length < base_length || length > bytes.len() - offset {
             return Err("malformed descriptor frame ancillary header".into());
         }
         let payload = &bytes[offset + base_length..offset + length];
         let rights = header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS;
-        let pidfd = header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == SCM_PIDFD;
+        // Darwin's type 4 is a timestamp, never a descriptor.
+        let pidfd = cfg!(target_os = "linux")
+            && header.cmsg_level == libc::SOL_SOCKET
+            && header.cmsg_type == SCM_PIDFD;
         if rights || pidfd {
             invalid |= !payload.len().is_multiple_of(size_of::<RawFd>()) || pidfd;
             for chunk in payload.chunks_exact(size_of::<RawFd>()) {
@@ -282,12 +288,12 @@ fn receive_part(
         message.msg_iov = &mut vector;
         message.msg_iovlen = 1;
         message.msg_control = ancillary.as_mut_ptr().cast();
-        message.msg_controllen = ancillary_capacity;
+        message.msg_controllen = ancillary_capacity as _;
         let count = unsafe {
             libc::recvmsg(
                 control.as_raw_fd(),
                 &mut message,
-                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+                libc::MSG_DONTWAIT | RECEIVE_CLOEXEC,
             )
         };
         if count < 0 {
@@ -302,11 +308,20 @@ fn receive_part(
             }
         }
         let before = descriptors.len();
-        let control_length = message.msg_controllen.min(ancillary_capacity);
+        // `socklen_t` on Darwin, `usize` on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let received = message.msg_controllen as usize;
+        let control_length = received.min(ancillary_capacity);
         let bytes =
             unsafe { std::slice::from_raw_parts(ancillary.as_ptr().cast::<u8>(), control_length) };
-        take_rights(bytes, descriptors)?;
-        if message.msg_controllen > ancillary_capacity {
+        let taken = take_rights(bytes, descriptors);
+        #[cfg(target_os = "macos")]
+        for descriptor in &descriptors[before..] {
+            crate::descriptor::set_close_on_exec(std::os::fd::AsFd::as_fd(descriptor))
+                .map_err(|error| format!("seal received descriptor: {error}"))?;
+        }
+        taken?;
+        if received > ancillary_capacity {
             return Err("oversized descriptor frame ancillary data".into());
         }
         if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
@@ -404,17 +419,21 @@ mod tests {
     }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
-        let mut descriptors = [-1; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
-        unsafe {
-            (
-                OwnedFd::from_raw_fd(descriptors[0]),
-                OwnedFd::from_raw_fd(descriptors[1]),
-            )
+        let (reader, writer) = std::io::pipe().unwrap();
+        let (reader, writer) = (OwnedFd::from(reader), OwnedFd::from(writer));
+        for end in [&reader, &writer] {
+            // SAFETY: F_GETFL and F_SETFL take no pointer, on a descriptor
+            // this test owns.
+            unsafe {
+                let flags = libc::fcntl(end.as_raw_fd(), libc::F_GETFL);
+                assert!(flags >= 0);
+                assert_eq!(
+                    libc::fcntl(end.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    0
+                );
+            }
         }
+        (reader, writer)
     }
 
     fn assert_pipe_closed(reader: &OwnedFd) {
@@ -514,11 +533,21 @@ mod tests {
                 (received.dev(), received.ino()),
                 (identity.dev(), identity.ino())
             );
-            assert_eq!(
-                std::fs::read_to_string(format!("/proc/self/fd/{}/identity", file.as_raw_fd()))
-                    .unwrap(),
-                "original"
-            );
+            // SAFETY: file is the retained directory and the name is a
+            // literal relative path. A successful open returns a fresh fd.
+            let identity_fd = unsafe {
+                libc::openat(
+                    file.as_raw_fd(),
+                    c"identity".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(identity_fd >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: the successful open transferred ownership to this test.
+            let mut identity_file = unsafe { File::from_raw_fd(identity_fd) };
+            let mut contents = String::new();
+            std::io::Read::read_to_string(&mut identity_file, &mut contents).unwrap();
+            assert_eq!(contents, "original");
             assert_ne!(
                 unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
                 0
@@ -626,6 +655,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // XNU installs even fd numbers lost to a short control buffer.
     fn truncated_or_unexpected_ancillary_closes_installed_rights() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let (reader, writer) = pipe();
@@ -649,7 +679,13 @@ mod tests {
         assert!(error.contains("truncated"));
         drop(descriptors);
         assert_pipe_closed(&reader);
+    }
 
+    /// Linux attaches credentials a socket asked for as a second control
+    /// message; Darwin has no such option for a socket pair.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credentials_beside_rights_are_unexpected_and_close_the_rights() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let enabled: libc::c_int = 1;
         assert_eq!(

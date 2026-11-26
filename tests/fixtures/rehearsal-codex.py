@@ -69,16 +69,20 @@ def listener_path(args, runtime):
     if not path.is_absolute() or path.name != "control.sock":
         raise ValueError("fixture requires an absolute control.sock path")
     parent = private_directory(path.parent)
-    if parent != path.parent:
+    legacy_root = Path("/private/var/tmp" if sys.platform == "darwin" else "/tmp")
+    darwin_system_alias = (sys.platform == "darwin"
+                           and path.parent.parent == Path("/var/tmp")
+                           and parent == legacy_root / path.parent.name)
+    if parent != path.parent and not darwin_system_alias:
         raise ValueError("fixture socket directory must not traverse symlinks")
     if not parent.is_relative_to(runtime):
         # Do not accept arbitrary /tmp sockets or use a fake XDG_RUNTIME_DIR:
         # this is the old build's exact per-conversation, owned private shape.
         prefix = "cagents-codex-"
         identifier = parent.name.removeprefix(prefix)
-        if (parent.parent != Path("/tmp") or not parent.name.startswith(prefix)
+        if (parent.parent != legacy_root or not parent.name.startswith(prefix)
                 or str(uuid.UUID(identifier)) != identifier):
-            raise ValueError("fixture socket must be beneath its private runtime or an old-build /tmp/cagents-codex-UUID directory")
+            raise ValueError(f"fixture socket must be beneath its private runtime or {legacy_root}/cagents-codex-UUID")
     if path.exists() or path.is_symlink():
         raise ValueError("fixture never replaces an existing socket")
     return path
@@ -113,8 +117,9 @@ def scenario_class(peer, storage, listener):
                 state = json.load(stream)
             if (not isinstance(state, dict)
                     or not {"thread", "child", "latest"} <= set(state)
-                    or set(state) - {"thread", "child", "grandchild", "latest", "child_latest",
-                                     "interrupting", "model", "reasoning"}):
+                    or set(state) - {"thread", "child", "grandchild", "second", "latest",
+                                     "child_latest", "second_latest", "interrupting", "model",
+                                     "reasoning"}):
                 raise ValueError("invalid persisted rehearsal app-server state")
             model = state.get("model", "fixture-mini")
             reasoning = state.get("reasoning")
@@ -124,9 +129,10 @@ def scenario_class(peer, storage, listener):
                 raise ValueError("invalid persisted rehearsal reasoning effort")
             thread_path(state["thread"])
             thread_path(state["child"])
-            if "grandchild" in state:
-                thread_path(state["grandchild"])
-            for turn in (state["latest"], state.get("child_latest")):
+            for thread in ("grandchild", "second"):
+                if thread in state:
+                    thread_path(state[thread])
+            for turn in (state["latest"], state.get("child_latest"), state.get("second_latest")):
                 if turn is not None and not isinstance(turn, dict):
                     raise ValueError("invalid persisted rehearsal turn")
             self.restore(state)

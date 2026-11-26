@@ -1,11 +1,7 @@
 //! Execution exit of an exact retained helper, independent of its parent's wait.
 //! This observer never signals, waits for, or acquires Child custody.
-use crate::daemon::holder_registry::Process;
-use std::{
-    fs::File,
-    io,
-    os::fd::{AsRawFd, FromRawFd},
-};
+use crate::{daemon::holder_registry::Process, pinned_process::PinnedProcess};
+use std::io;
 
 pub(super) enum Observation {
     Running,
@@ -15,7 +11,7 @@ pub(super) enum Observation {
 /// Keep a captured kernel identity pinned through retirement validation.
 /// An already absent original incarnation needs no descriptor.
 pub(super) struct ExecutionExit {
-    _pidfd: Option<File>,
+    _pidfd: Option<PinnedProcess>,
 }
 
 pub(super) fn identity_absent(expected: &Process) -> Result<bool, String> {
@@ -39,10 +35,14 @@ pub(super) fn identity_absent(expected: &Process) -> Result<bool, String> {
 /// that happens to reuse it); both refuse. Descendants that left the group on
 /// purpose are tool work, not writers of the provider's conversation, which
 /// only the provider process itself records.
-pub(crate) fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
-    abandoned_in(std::path::Path::new("/proc"), holder, root)
+pub fn abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    return abandoned_in(std::path::Path::new("/proc"), holder, root);
+    #[cfg(target_os = "macos")]
+    return observable_survivors(holder, root);
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Result<bool, String> {
     abandoned_with_policy(proc, holder, root, false)
 }
@@ -50,10 +50,30 @@ fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Res
 /// Codex execution needs a positive survivor tied to the pane. A reused PID
 /// proves its original group/session also ended: Linux cannot reuse the PID
 /// while that numeric group/session still has members.
-pub(crate) fn codex_abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
-    abandoned_with_policy(std::path::Path::new("/proc"), holder, root, true)
+pub fn codex_abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    return abandoned_with_policy(std::path::Path::new("/proc"), holder, root, true);
+    #[cfg(target_os = "macos")]
+    return observable_survivors(holder, root);
 }
 
+#[cfg(target_os = "macos")]
+fn observable_survivors(holder: &Process, root: &Process) -> Result<bool, String> {
+    if !identity_absent(holder)? || !identity_absent(root)? {
+        return Ok(false);
+    }
+    if crate::daemon::lost_processes::census(holder, root)?
+        .iter()
+        .any(|process| !process.zombie)
+    {
+        return Ok(false);
+    }
+    // A missing holder leaves no tracker that could exclude detached work.
+    // Preserve the unknown outcome when the visible session and group empty.
+    Err("Cannot confirm detached provider cleanup after the helper exited on macOS".into())
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn abandoned_with_policy(
     proc: &std::path::Path,
     holder: &Process,
@@ -122,62 +142,35 @@ pub(super) fn observe(expected: &Process) -> Result<Observation, String> {
     if expected.pid <= 0 || expected.start == 0 {
         return Err("Invalid retained helper execution identity".into());
     }
-    // Read before AND after pidfd_open. A recycled PID must never turn a
-    // descriptor for another incarnation into proof about this helper.
+    // Read before AND after pinning. A recycled PID must never turn a pin of
+    // another incarnation into proof about this helper.
     if identity_absent(expected)? {
         return Ok(Observation::Exited(ExecutionExit { _pidfd: None }));
     }
-    // SAFETY: scalar arguments; success returns a fresh owned descriptor.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, expected.pid, 0) };
-    if raw < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) && identity_absent(expected)? {
+    let pin = match PinnedProcess::open_unreaped(expected.pid as u32) {
+        Ok(pin) => pin,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && identity_absent(expected)? => {
             return Ok(Observation::Exited(ExecutionExit { _pidfd: None }));
         }
-        return Err(format!(
-            "Cannot pin exact retained helper execution: {error}"
-        ));
-    }
-    // SAFETY: successful pidfd_open above yielded a fresh owned descriptor.
-    let pidfd = unsafe { File::from_raw_fd(raw as libc::c_int) };
+        Err(error) => {
+            return Err(format!(
+                "Cannot pin exact retained helper execution: {error}"
+            ));
+        }
+    };
     if identity_absent(expected)? {
         // The expected incarnation disappeared during capture. Do not keep a
-        // descriptor that might now name a different incarnation of that PID.
-        drop(pidfd);
+        // pin that might now name a different incarnation of that PID.
+        drop(pin);
         return Ok(Observation::Exited(ExecutionExit { _pidfd: None }));
     }
-    let mut target = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one initialized pollfd, no blocking or ownership transfer.
-    let ready = unsafe { libc::poll(&mut target, 1, 0) };
-    if ready < 0 {
-        return Err(format!(
-            "Cannot observe exact retained helper exit: {}",
-            io::Error::last_os_error()
-        ));
+    match pin.exited() {
+        Ok(true) => Ok(Observation::Exited(ExecutionExit { _pidfd: Some(pin) })),
+        Ok(false) => Ok(Observation::Running),
+        Err(error) => Err(format!(
+            "Cannot observe exact retained helper exit: {error}"
+        )),
     }
-    if target.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
-        return Err("Retained helper exit descriptor reported an error".into());
-    }
-    if target.revents & libc::POLLIN != 0 {
-        return Ok(Observation::Exited(ExecutionExit {
-            _pidfd: Some(pidfd),
-        }));
-    }
-    if target.revents != 0 {
-        // A process reaped after capture is independently absent; unexpected
-        // readiness while that incarnation still exists remains unknown.
-        if identity_absent(expected)? {
-            return Ok(Observation::Exited(ExecutionExit {
-                _pidfd: Some(pidfd),
-            }));
-        }
-        return Err("Unexpected retained helper exit descriptor readiness".into());
-    }
-    Ok(Observation::Running)
 }
 
 #[cfg(test)]

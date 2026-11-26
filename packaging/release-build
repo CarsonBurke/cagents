@@ -153,9 +153,15 @@ umask 022
 # Every lane's tests gate a release before this runs: main's sentinel runs
 # them per commit in the ordinary test profile, and scripts/release requires
 # the tagged commit's passing verdict. This builds and checks what ships.
-./scripts/package-linux.sh --variant full
-./scripts/package-linux.sh --variant browserless
-./scripts/package-ceditor-linux.sh
+if [[ -x ./scripts/package-release-linux ]]; then
+    ./scripts/package-release-linux
+else
+    # An older source ref can be exported with this entrypoint. It has only
+    # the standalone packagers.
+    ./scripts/package-linux.sh --variant full
+    ./scripts/package-linux.sh --variant browserless
+    ./scripts/package-ceditor-linux.sh
+fi
 
 metric() {
     local value

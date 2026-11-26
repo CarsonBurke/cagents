@@ -7,6 +7,43 @@ use crate::app::workspace_model_sync::ModelUpdate;
 
 const WAIT: Duration = Duration::from_secs(5);
 
+/// Opens another chat, composes it so it is saved, and has storage refuse
+/// it: what storage holds for it is no longer the identity the window
+/// offers. A window barrier now fails; only that chat's own save is refused.
+fn refuse_another_chat(app: &mut Cagents) -> CardId {
+    drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+    let other = app.workspace.focused().expect("another chat opens");
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&other) else {
+        panic!("native draft")
+    };
+    let target = runtime.target;
+    compose_default_chat(app, target);
+    drop(app.reconcile_shared_views());
+    app.persist();
+    app.session.as_ref().unwrap().flush(WAIT).unwrap();
+    let CardKind::Chat(saved) = app.card_state(other).unwrap().kind.clone() else {
+        panic!("a chat card")
+    };
+    let store = app.session.as_ref().unwrap().operation_store();
+    let mut foreign = saved.clone();
+    foreign.id = TerminalId::new();
+    store
+        .replace_chat_identity(other, saved.id, &foreign)
+        .unwrap();
+    let mut refused = saved.clone();
+    refused.id = TerminalId::new();
+    let snapshot = app.persistent_workspace();
+    app.session
+        .as_ref()
+        .unwrap()
+        .replace_chat_identity(other, saved.id, refused, snapshot);
+    assert!(
+        app.session.as_ref().unwrap().flush(WAIT).is_err(),
+        "storage refuses the other chat"
+    );
+    other
+}
+
 /// The daemon trouble behind #2444: a composed draft is closed while its
 /// Insert is still unanswered. The Insert lands, but the Close does not -
 /// refused outright, or given up on as the daemon stopped answering. The
@@ -87,6 +124,17 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
             app.publish_view_changes();
         }
 
+        // A draft is named for its channel while it is open there. Closed,
+        // it is in no channel, yet the notice names it as its tab did.
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|candidate| candidate.id == channel)
+            .unwrap()
+            .title = "Release notes".into();
+        let shown = app.pane_notice_title(card).expect("the draft is named");
+        assert_eq!(shown, "Release notes", "{refusal}");
+
         // Closed while its Insert is unanswered.
         drop(app.begin_chat_close(card));
         app.publish_view_changes();
@@ -162,7 +210,7 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
         );
         assert_eq!(
             told,
-            vec![super::super::PANE_CLOSED_HERE_KEPT_ELSEWHERE.to_owned()],
+            vec![super::super::pane_closed_here_kept_elsewhere(Some(&shown))],
             "{refusal}"
         );
         app.persist();
@@ -172,10 +220,13 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
             .flush(WAIT)
             .unwrap_or_else(|error| panic!("{refusal}: nothing is refused: {error}"));
 
-        // A new chat's first message is saved, so it starts.
+        // A new chat's first message is saved, so it starts, even while
+        // storage refuses some other pane.
+        let other = refuse_another_chat(&mut app);
         drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
         let fresh = app.workspace.focused().expect("a new chat opens");
         assert_ne!(fresh, card);
+        assert_ne!(fresh, other);
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&fresh) else {
             panic!("native draft")
         };
@@ -187,6 +238,10 @@ fn a_draft_closed_during_daemon_trouble_stays_closed_and_new_chats_start() {
         assert!(
             matches!(&completion, Action::DraftStartCheckpointed(_, _, Ok(()))),
             "{refusal}: {completion:?}"
+        );
+        assert!(
+            app.session.as_ref().unwrap().flush(WAIT).is_err(),
+            "{refusal}: the other chat is still refused"
         );
         drop(app.handle_chat_ui(completion));
         assert!(app.chat_start_pending(fresh), "{refusal}");
@@ -247,12 +302,14 @@ fn a_closed_card_back_in_memory_blocks_neither_an_update_nor_a_new_chat() {
         "storage keeps the closed card closed"
     );
 
+    let other = refuse_another_chat(&mut app);
     drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
     let fresh = app
         .workspace
         .order()
         .find(|id| {
             *id != card
+                && *id != other
                 && app
                     .card_state(*id)
                     .is_some_and(|state| state.existence.is_open())
@@ -268,7 +325,12 @@ fn a_closed_card_back_in_memory_blocks_neither_an_update_nor_a_new_chat() {
     let completion = first_start_save_completion(save);
     assert!(
         matches!(&completion, Action::DraftStartCheckpointed(_, _, Ok(()))),
-        "the closed pane back in memory must not fail this draft's save: {completion:?}"
+        "neither the closed pane back in memory nor another pane's refusal fails this draft's save: \
+         {completion:?}"
+    );
+    assert!(
+        app.session.as_ref().unwrap().flush(WAIT).is_err(),
+        "the other chat is still refused"
     );
     let _ = channel;
 
@@ -293,4 +355,28 @@ fn a_closed_card_back_in_memory_blocks_neither_an_update_nor_a_new_chat() {
             .contains("this pane"),
         "a draft's own refusal speaks of this pane"
     );
+    // Storage holding another identity for the pane is not something an
+    // edit of the draft repairs, so the reader is not told to try one.
+    let identity = app.draft_start_save_failure(
+        fresh,
+        &crate::session::PaneSaveRefusal::Identity {
+            category: crate::session::SaveFailureCategory::InvalidData,
+            rule: crate::diagnostics::Check::new("a rule"),
+        },
+    );
+    assert!(
+        identity.contains("Copy it into a new conversation"),
+        "{identity}"
+    );
+    assert!(!identity.contains("Change the draft"), "{identity}");
+    let window = app.draft_start_save_failure(
+        fresh,
+        &crate::session::PaneSaveRefusal::Refused {
+            pane: None,
+            category: crate::session::SaveFailureCategory::DiskFull,
+            rule: crate::diagnostics::Check::new("a rule"),
+        },
+    );
+    assert!(window.contains("window's saved state"), "{window}");
+    assert!(window.contains("Free disk space"), "{window}");
 }

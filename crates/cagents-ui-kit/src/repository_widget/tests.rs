@@ -11995,3 +11995,61 @@ fn a_language_chosen_through_a_link_is_the_shown_files_choice() {
         Some(DocumentLanguage::PlainText)
     );
 }
+
+/// A one-page document has no pages to turn, so its toolbar offers no page
+/// controls; a longer one offers all four.
+#[test]
+fn a_one_page_document_draws_no_page_controls() {
+    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+    let renderer = headless_renderer();
+    let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+    let message = None;
+    let names = |pages: usize| -> Vec<String> {
+        let mut element = pdf_document_view(
+            CardId::new(),
+            pages,
+            rendering_view(0, crate::editor::PdfTone::Original),
+            &handle,
+            1,
+            1,
+            612.0,
+            false,
+            &message,
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 700.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(ToOwned::to_owned))
+            .collect()
+    };
+    let controls = ["First page", "Previous page", "Next page", "Last page"];
+    let one = names(1);
+    assert!(
+        one.iter().any(|name| name == "Draw the page larger"),
+        "{one:?}"
+    );
+    for control in controls {
+        assert!(
+            !one.iter().any(|name| name == control),
+            "{control}: {one:?}"
+        );
+    }
+    let three = names(3);
+    for control in controls {
+        assert!(
+            three.iter().any(|name| name == control),
+            "{control}: {three:?}"
+        );
+    }
+}

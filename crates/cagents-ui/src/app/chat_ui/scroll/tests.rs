@@ -3384,11 +3384,14 @@ fn native_layout_reports_fitting_content_and_anchors_real_column_children() {
         &mut Shell::new(&mut messages),
         &bounds,
     );
+    // On macOS the window system has already converted Shift-wheel to X.
+    #[cfg(target_os = "linux")]
+    let delta = mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 };
+    #[cfg(target_os = "macos")]
+    let delta = mouse::ScrollDelta::Lines { x: 1.0, y: 0.0 };
     replaced.as_widget_mut().update(
         &mut tree,
-        &Event::Mouse(mouse::Event::WheelScrolled {
-            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
-        }),
+        &Event::Mouse(mouse::Event::WheelScrolled { delta }),
         Layout::new(&node),
         mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
         &renderer,

@@ -12,12 +12,15 @@ const CHILD_HELPER_TEST: &str = "lsp::tests::child_helper_sleeps_until_terminate
 /// Holds the path the grandchild helper publishes its pid to, so its
 /// presence is proof the helper body ran.
 const GRANDCHILD_ENV: &str = "CAGENTS_LSP_GRANDCHILD_HELPER";
+#[cfg(target_os = "linux")]
 const GRANDCHILD_TEST: &str = "lsp::tests::child_helper_leaves_a_grandchild_behind";
 
 /// Holds the path the keystroke probe writes once its assertions have
 /// passed. A filter that matches no test makes `libtest` exit zero, so
 /// this marker is what tells the parent the probe actually ran.
+#[cfg(target_os = "linux")]
 const KEYSTROKE_PROBE_ENV: &str = "CAGENTS_LSP_KEYSTROKE_PROBE";
+#[cfg(target_os = "linux")]
 const KEYSTROKE_PROBE_TEST: &str = "lsp::tests::child_helper_converts_one_keystroke";
 
 /// This crate does not enable `tokio/macros`, so async tests drive their
@@ -2210,6 +2213,23 @@ fn a_manager_that_has_shut_down_starts_no_further_server() {
 }
 
 #[test]
+fn root_discovery_passes_an_empty_git_directory() {
+    let root = canonical_tempdir();
+    let worktree = root.path();
+    let project = worktree.join("project");
+    let nested = project.join("nested");
+    let file = nested.join("readme.txt");
+    std::fs::create_dir_all(nested.join(".git")).unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
+    std::fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let markers = vec![".git".to_owned()];
+    assert_eq!(discover_root(&file, worktree, &markers), project);
+
+    std::fs::write(nested.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert_eq!(discover_root(&file, worktree, &markers), nested);
+}
+
+#[test]
 fn root_discovery_stops_at_the_nearest_marker_and_never_leaves_the_worktree() {
     let root = canonical_tempdir();
     let worktree = root.path();
@@ -4273,6 +4293,10 @@ enum Helper<'a> {
     Sleeps,
     /// [`child_helper_leaves_a_grandchild_behind`], publishing the
     /// grandchild's pid to this path.
+    #[cfg_attr(
+        target_os = "macos",
+        expect(dead_code, reason = "its test reads the grandchild through /proc")
+    )]
     LeavesAGrandchild(&'a Path),
 }
 
@@ -4753,6 +4777,24 @@ async fn wait_until_gone(pid: u32) -> bool {
     let deadline = tokio::time::Instant::now() + WAIT;
     while tokio::time::Instant::now() < deadline {
         if !entry.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+/// Whether the process is gone entirely. Darwin answers signal 0 to a zombie
+/// as POSIX requires and refuses only a pid that names no process, so this
+/// also proves reaping.
+#[cfg(target_os = "macos")]
+async fn wait_until_gone(pid: u32) -> bool {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while tokio::time::Instant::now() < deadline {
+        // SAFETY: signal 0 only checks that the pid names a process.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;

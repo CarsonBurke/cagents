@@ -1,0 +1,1 @@
+cagents-mobile://pair?v=1&name=B%C3%BCro+station&user=person&port=2222&hostkey=SHA256%3AuNiVztksCs%2Bhcc0u9e8BujQXVUpKZIDTMczCvj3t%2F2s&host=workstation.tail1234.ts.net&host=100.101.102.103&host=192.168.1.20&key=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&expires=1800000300

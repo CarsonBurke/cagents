@@ -262,7 +262,7 @@ pub fn unlink_at(worktree: &Path) -> Result<(), Error> {
     write_stored_link(&root, None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

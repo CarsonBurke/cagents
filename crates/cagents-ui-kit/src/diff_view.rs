@@ -2095,6 +2095,8 @@ mod tests {
     /// What keeping the grammar costs the process, and whether letting it go
     /// gives that back: resident memory before a load, while kept after
     /// highlighting a few languages, and once the linger has passed.
+    // Reads glibc's resident set from `/proc` and trims glibc's heap.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "measurement; run with --ignored --nocapture"]
     fn what_a_kept_grammar_costs_the_process() {
@@ -3673,6 +3675,13 @@ mod tests {
                 let changed = vec![0..split];
                 let native = shaped_line_width(text, &changed, &syntax);
                 let cached = ShapeKey::new(text, &syntax, MONO).width(&mut words);
+                // Darwin's native paragraph can report an unbounded width
+                // for some glyph runs. The cached path must agree there too.
+                #[cfg(target_os = "macos")]
+                if native == f32::INFINITY {
+                    assert_eq!(cached, native, "{text:?}, font {font:?}");
+                    continue;
+                }
                 assert!(
                     (native - cached).abs() < 0.02,
                     "{text:?}: native {native}, cached {cached}, font {font:?}"

@@ -8,13 +8,14 @@
 zig = "0.15.2"
 
 # Each implementation graph is its own Cargo invocation. Cargo features are
-# package-wide, so no task combines `host` with `ui`. The UI lanes select the
-# cagents-ui package, which holds the application, and cagents-ui-kit, its
+# package-wide, so no task combines `host` with `ui`. The host lane selects the
+# shared library and cagents-host, the daemon built on it. The UI lanes select
+# the cagents-ui package, which holds the application, and cagents-ui-kit, its
 # widgets and views; `ui` also selects the shared library, so one invocation
 # covers every package's targets in that graph.
 [vars]
 cli = "--locked --no-default-features"
-host = "--locked --no-default-features --features host"
+host = "--locked --no-default-features --package cagents --package cagents-host --features cagents/host"
 ui = "--locked --no-default-features --package cagents --package cagents-ui --package cagents-ui-kit --features cagents/ui"
 # The integrated browser with its Wayland registry test server, which the
 # browser tests use, as main's build check selects it.
@@ -81,7 +82,7 @@ usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-t
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.cli}} "$@"'
 
 [tasks."check:host"]
-description = "Type-check and lint the terminal daemon lane"
+description = "Type-check and lint the terminal daemon lane: the daemon and the shared library it builds on"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.host}} "$@"'
 
@@ -104,6 +105,21 @@ run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.ed
 description = "Type-check and lint the dictation helper lane"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.dictate}} "$@"'
+
+[tasks."check:macos:cli"]
+description = "Type-check and lint the control CLI lane for Apple Silicon macOS on the build host, without a Mac"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/check-macos {{vars.cli}} "$@"'
+
+[tasks."check:macos:host"]
+description = "Type-check and lint the terminal daemon lane for Apple Silicon macOS on the build host, without a Mac"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/check-macos {{vars.host}} "$@"'
+
+[tasks."check:macos:ui"]
+description = "Type-check and lint the browserless UI lane for Apple Silicon macOS on the build host, without a Mac"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/check-macos {{vars.ui}} "$@"'
 
 [tasks.check]
 description = "Check that each lane resolves only its own graph, then type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
@@ -147,7 +163,7 @@ run = [
 ]
 
 [tasks."test:host"]
-description = "Test the terminal daemon lane"
+description = "Test the terminal daemon lane: the daemon and the shared library it builds on"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.host}} "$@"',
@@ -213,6 +229,37 @@ run = "scripts/check-format"
 description = "Run the checks GitHub CI runs: formatting, protocol contracts and script suites"
 usage = 'arg "[unexpected]..." var=#true hide=#true'
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["fmt:check", "check:protocol", "test:scripts"] }]
+
+# Mobile ---------------------------------------------------------------------
+# The Android app in mobile/ builds with Gradle on the build host, as Rust
+# does: scripts/gradle-remote mirrors mobile/ there, runs one Gradle build
+# with no daemon left behind, and brings back the test reports and APKs.
+# Installing runs adb here, where the phone is. CAGENTS_BUILD_REMOTE=local
+# builds here instead. See mobile/README.md.
+
+[tasks."mobile:test"]
+description = "Test the Android app on the build host: the protocol against the recorded API, the client against a fake bridge"
+run = 'exec scripts/gradle-remote -- :shared:jvmTest :androidApp:testDebugUnitTest'
+
+[tasks."mobile:build"]
+description = "Build the Android app's debug APK on the build host (mobile/androidApp/build/outputs/apk/debug)"
+run = 'exec scripts/gradle-remote --fetch androidApp/build/outputs/apk/debug -- :androidApp:assembleDebug'
+
+[tasks."mobile:install"]
+description = "Build the minified preview APK on the build host and install it on the connected phone, over the debug build (set ANDROID_SERIAL to choose one)"
+run = """
+set -e
+scripts/gradle-remote --fetch androidApp/build/outputs/apk/preview -- :androidApp:assemblePreview
+exec adb install -r "$(ls mobile/androidApp/build/outputs/apk/preview/*.apk | head -n 1)"
+"""
+
+[tasks."mobile:install-debug"]
+description = "Build the debuggable APK on the build host and install it on the connected phone, for run-as and the debugger; it runs slower"
+run = """
+set -e
+scripts/gradle-remote --fetch androidApp/build/outputs/apk/debug -- :androidApp:assembleDebug
+exec adb install -r "$(ls mobile/androidApp/build/outputs/apk/debug/*.apk | head -n 1)"
+"""
 
 # Packaging and release ------------------------------------------------------
 

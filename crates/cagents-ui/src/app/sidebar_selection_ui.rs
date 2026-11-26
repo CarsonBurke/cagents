@@ -117,7 +117,7 @@ pub(in crate::app) mod tests {
     }
 
     #[test]
-    fn project_keyboard_activation_matches_folder_review_and_retry_actions() {
+    fn project_keyboard_activation_matches_folder_and_retry_actions() {
         let (mut app, project, _) = fixture();
         let row = SelectionRow::Project(project);
         assert_eq!(
@@ -133,19 +133,12 @@ pub(in crate::app) mod tests {
             })
         );
         app.sidebar_model.projects[0].kind = ProjectKind::Git;
-        app.sidebar_state.apply(&SidebarAction::SetFilter(
-            sidebar::SidebarFilter::PullRequests,
-        ));
-        assert_eq!(
-            app.sidebar_navigation_action(row),
-            Some(SidebarAction::ToggleProject(project))
-        );
+        // A GitHub project's pull requests open from its Worktrees pane
+        // header; its sidebar header still only folds.
         app.sidebar_model.projects[0].github_ready = true;
         assert_eq!(
             app.sidebar_navigation_action(row),
-            Some(SidebarAction::BrowsePullRequests {
-                project_id: project
-            })
+            Some(SidebarAction::ToggleProject(project))
         );
         app.sidebar_model.projects[0].unreachable = Some("Missing folder".into());
         assert_eq!(
@@ -160,7 +153,7 @@ pub(in crate::app) mod tests {
     }
 
     #[test]
-    fn closing_search_clears_filters_and_restores_toggle_focus_in_both_densities() {
+    fn closing_search_clears_query_and_restores_toggle_focus_in_both_densities() {
         for compact in [false, true] {
             let (mut app, _, _) = fixture();
             app.chrome_ui.projects_collapsed = compact;
@@ -168,13 +161,9 @@ pub(in crate::app) mod tests {
             drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(
                 "channel".into(),
             ))));
-            drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
-                sidebar::SidebarFilter::PullRequests,
-            ))));
             let task = app.update(Message::Sidebar(SidebarAction::ToggleControls));
             assert!(!app.sidebar_state.controls_expanded());
             assert_eq!(app.sidebar_state.query(), "");
-            assert_eq!(app.sidebar_state.filter(), sidebar::SidebarFilter::All);
             assert_eq!(
                 super::super::tests::focused(&app, task),
                 Some(sidebar::search_toggle_focus_id())

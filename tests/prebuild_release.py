@@ -142,6 +142,9 @@ class Prebuild(unittest.TestCase):
     def verdict(self, sha, passed):
         (self.sentinel / "verdicts" / f"{sha}.json").write_text(json.dumps({"sha": sha, "passed": passed}))
 
+    def version(self, value):
+        (self.repository / "Cargo.toml").write_text(f'[package]\nname = "cagents"\nversion = "{value}"\n')
+
     def waiter(self):
         """A build waiting for shares, holding the gate's queue lock in a
         process of its own, as the host's lock table then shows."""
@@ -214,6 +217,95 @@ class Prebuild(unittest.TestCase):
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(len(self.builds()), 1)
 
+    def test_failed_tip_falls_back_to_the_newest_passing_commit_of_its_version(self):
+        self.version("0.2.4")
+        older = self.commit("earlier passing commit")
+        passing = self.commit("newest passing commit")
+        # An on-demand verdict from a branch merged into main is insufficient.
+        self.git("switch", "-qc", "fixture-branch")
+        side = self.commit("passing branch commit")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "fixture-branch", "-m", "passing code merged")
+        tip = self.commit("failing tip")
+        for sha in (passing, side, older):
+            self.verdict(sha, True)
+        self.compiled(tip)
+        self.verdict(tip, False)
+        with patch.object(prebuild, "pause", self.pause), self.assertRaises(Waited):
+            prebuild.wait(self.repository, self.store, self.sentinel, passing, timeout=None)
+        self.assertIn(f"start --no-block {prebuild.SERVICE}", (self.root / "systemctl").read_text())
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual([build[0] for build in self.builds()], [passing])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            prebuild.status(self.repository, self.store, self.sentinel, as_json=True)
+        self.assertEqual(json.loads(output.getvalue())["target"], passing)
+        self.assertEqual(prebuild.wait(self.repository, self.store, self.sentinel, passing, timeout=0), 0)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual([build[0] for build in self.builds()], [passing])
+
+    def test_a_failed_speculative_bundle_does_not_hide_a_passing_ancestor(self):
+        self.version("0.2.4")
+        passing = self.commit("passing predecessor")
+        self.verdict(passing, True)
+        newest_passing = self.commit("unavailable passing predecessor")
+        self.verdict(newest_passing, True)
+        tip = self.commit("speculative tip")
+        self.compiled(tip)
+        self.assertEqual(self.run_once(), 0)
+        self.assertTrue(self.store.built(tip))
+        self.store.fail(newest_passing, "build failed")
+        self.verdict(tip, False)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual([build[0] for build in self.builds()], [tip, passing])
+        self.assertTrue(self.store.built(passing))
+
+    def test_speculative_bundles_leave_a_slot_for_the_tested_candidate(self):
+        self.version("0.2.4")
+        passing = self.commit("passing release candidate")
+        self.compiled(passing)
+        self.verdict(passing, True)
+        self.assertEqual(self.run_once(keep=2), 0)
+        speculative = [self.commit(f"still testing {index}") for index in range(2)]
+        for sha in speculative:
+            self.compiled(sha)
+            self.assertEqual(self.run_once(keep=2), 0)
+        self.assertEqual([entry.name for entry in self.store.kept()], [speculative[-1], passing])
+        self.verdict(speculative[-1], False)
+        self.assertEqual(self.run_once(keep=2), 0)
+        self.assertEqual([build[0] for build in self.builds()], [passing, *speculative])
+
+    def test_fallback_never_selects_a_previous_version_or_a_pending_verdict(self):
+        self.version("0.2.3")
+        prior = self.commit("passing older version")
+        self.verdict(prior, True)
+        self.version("0.2.4")
+        self.commit("same version still testing")
+        tip = self.commit("failing tip of new version")
+        self.compiled(tip)
+        self.verdict(tip, False)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.builds(), [])
+
+    def test_exact_request_refuses_known_test_failure_and_can_retry_after_verdict_removal(self):
+        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root),
+                     "--sentinel-state", str(self.sentinel)]
+        self.verdict(self.first, False)
+        for command in ("request", "wait"):
+            with patch.object(sys, "argv", [*arguments, command, self.first]):
+                self.assertEqual(prebuild.main(), 1)
+        self.assertEqual(list(self.store.requests.iterdir()), [])
+        self.assertFalse((self.root / "systemctl").exists())
+        (self.sentinel / "verdicts" / f"{self.first}.json").unlink()
+        with patch.object(sys, "argv", [*arguments, "request", self.first]):
+            self.assertEqual(prebuild.main(), 0)
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual([build[:3] for build in self.builds()], [[self.first, self.first, "normal"]])
+        self.verdict(self.first, False)
+        with patch.object(sys, "argv", [*arguments, "wait", self.first]):
+            self.assertEqual(prebuild.main(), 1)
+
     def test_a_commit_of_a_released_version_waits_for_mains_bump(self):
         prebuild.UNRELEASED.clear()
         self.addCleanup(prebuild.UNRELEASED.clear)
@@ -234,9 +326,9 @@ class Prebuild(unittest.TestCase):
         self.assertEqual(self.builds(), [])
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            prebuild.status(self.store, self.sentinel, as_json=False)
+            prebuild.status(self.repository, self.store, self.sentinel, as_json=False)
         self.assertIn(f"skipped  {tagged}  0.2.3, released already", output.getvalue())
-        self.assertEqual(prebuild.wait(self.store, self.sentinel, tagged, timeout=None), 1)
+        self.assertEqual(prebuild.wait(self.repository, self.store, self.sentinel, tagged, timeout=None), 1)
         self.git("remote", "set-url", "origin", str(origin))
         # Requested, it builds all the same.
         with patch.object(sys, "argv", [PROGRAM_PATH, "--repository", str(self.repository),
@@ -380,7 +472,7 @@ class Prebuild(unittest.TestCase):
         self.assertEqual(state["starved"], "waited")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            prebuild.status(self.store, self.sentinel, as_json=False)
+            prebuild.status(self.repository, self.store, self.sentinel, as_json=False)
         self.assertIn(f"starved  {self.first}  (waited)", output.getvalue())
         # Starved, it takes no backoff: it queues again at once.
         self.assertEqual(state["retry_after"], 0)
@@ -539,6 +631,7 @@ class Prebuild(unittest.TestCase):
             thread.join(HANG_GUARD)
         self.assertEqual(outcome, [0])
         self.assertEqual(self.store.failure(self.first)["status"], "tests failed")
+        self.assertIn(prebuild.ADMITTED, (self.store.failures / f"{self.first}.log").read_text())
         self.assertFalse(self.store.built(self.first))
 
     def test_a_request_preempts_the_background_build_and_builds_at_normal_priority(self):
@@ -643,6 +736,20 @@ class Prebuild(unittest.TestCase):
         self.assertEqual([build[2] for build in self.builds()], ["1", "normal"])
         self.assertEqual(json.loads((self.store.bundle(self.first) / "bundle.json").read_text())["priority"],
                          "normal")
+
+    def test_a_starved_build_satisfies_the_first_request_without_restarting(self):
+        other = self.commit("earlier request")
+        arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root),
+                     "--sentinel-state", str(self.sentinel), "request"]
+        for sha in (other, self.first):
+            with patch.object(sys, "argv", [*arguments, sha]):
+                self.assertEqual(prebuild.main(), 0)
+        self.assertEqual(prebuild.why_stop(self.store, self.sentinel, self.first, "starved"),
+                         f"{other} was requested")
+        self.store.done(other)
+        self.assertIsNone(prebuild.why_stop(self.store, self.sentinel, self.first, "starved"))
+        self.assertEqual(prebuild.why_stop(self.store, self.sentinel, self.first, "background"),
+                         "it was requested at normal priority")
 
     def test_wait_for_a_commit_nothing_will_build_says_so(self):
         arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root),

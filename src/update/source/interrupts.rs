@@ -6,7 +6,7 @@
 use super::{Client, UpdateError, impact, invalid};
 use crate::{
     agent_execution::{self, directory},
-    chat::{Command, Session, Snapshot, ToolStatus},
+    chat::{Command, Session, Snapshot},
     control::ControlClient,
     model::{AgentId, RunId, TerminalId},
     terminal_ipc::{ClientRequest, ServerResponse},
@@ -73,13 +73,13 @@ impl Observation {
         let children: BTreeSet<_> = snapshot
             .subagents
             .iter()
-            .filter(|child| child.status == ToolStatus::Running)
+            .filter(|child| child.is_running())
             .map(|child| child.id.clone())
             .collect();
         let background: BTreeSet<_> = snapshot
             .subagents
             .iter()
-            .filter(|child| child.background && child.status == ToolStatus::Running)
+            .filter(|child| child.background && child.is_running())
             .map(|child| child.id.clone())
             .collect();
         if !background.is_subset(&self.permitted_children) {
@@ -553,9 +553,10 @@ fn poll_with(
     Ok((pending, idle))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+    use crate::chat::ToolStatus;
     use crate::{
         model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe},
         terminal_ipc::{ClientEnvelope, ServerEnvelope, ServerMessage, read_frame},
@@ -629,7 +630,7 @@ mod tests {
                 title: "Offline Codex".into(),
                 identity: "exact-owner".into(),
                 disposition: impact::Disposition::Interrupted,
-                reason: String::new(),
+                reason: "".into(),
                 interrupted_subagents: Vec::new(),
             }],
             blockers: Vec::new(),
@@ -1106,13 +1107,13 @@ mod tests {
         let mut replacement_owner = entry.clone();
         replacement_owner.delegation.as_mut().unwrap().agent = AgentId::new();
         assert!(observed.observe_run(&[replacement_owner]).is_err());
-        for change in 0..4 {
+        for change in 0..5 {
             let mut observed = observation(&session, &entry);
             let mut publication = snapshot(&session, 1);
             match change {
                 0 => publication.turn_generation += 1,
                 1 => publication.session_id = Some("replacement-thread".into()),
-                2 => publication.subagents.push(crate::chat::Subagent {
+                2 | 4 => publication.subagents.push(crate::chat::Subagent {
                     id: "unreviewed-child".into(),
                     status: ToolStatus::Running,
                     background: true,
@@ -1120,7 +1121,11 @@ mod tests {
                     description: String::new(),
                     model: None,
                     waiting: false,
-                    detail: String::new(),
+                    detail: if change == 4 {
+                        crate::chat::UNLOADED_CHILD_RUNNING.into()
+                    } else {
+                        String::new()
+                    },
                     items: Vec::new(),
                 }),
                 _ => publication
@@ -1130,13 +1135,16 @@ mod tests {
                         "new work".into(),
                     )),
             }
-            if change == 0 || change == 3 {
+            if matches!(change, 0 | 3 | 4) {
                 observed.project(publication, false).unwrap();
                 if change == 0 {
                     assert!(observed.late_turn);
                 }
                 if change == 3 {
                     assert!(!observed.activity.settled);
+                }
+                if change == 4 {
+                    assert!(observed.activity.separate_children.is_empty());
                 }
             } else {
                 assert!(observed.project(publication, false).is_err());

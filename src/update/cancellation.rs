@@ -1,10 +1,36 @@
 //! Interrupting or terminating the CLI must also cancel its detached update.
 use super::*;
+use std::{
+    os::unix::net::UnixStream,
+    sync::{OnceLock, atomic::AtomicI32},
+};
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
+static WAKE: OnceLock<(UnixStream, UnixStream)> = OnceLock::new();
+static WAKE_WRITER: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn interrupt(_: libc::c_int) {
-    REQUESTED.store(true, Ordering::Relaxed);
+    REQUESTED.store(true, Ordering::Release);
+    let writer = WAKE_WRITER.load(Ordering::Relaxed);
+    if writer >= 0 {
+        // The process-lifetime socket stays open and nonblocking. A full
+        // buffer already contains a wake; write is async-signal-safe.
+        let saved = errno::errno();
+        unsafe { libc::write(writer, b"i".as_ptr().cast(), 1) };
+        errno::set_errno(saved);
+    }
+}
+
+pub(super) fn wake_fd() -> i32 {
+    WAKE.get().map_or(-1, |(reader, _)| reader.as_raw_fd())
+}
+
+pub(super) fn drain_wake() {
+    if let Some((reader, _)) = WAKE.get() {
+        let mut reader = reader;
+        let mut bytes = [0; 64];
+        while reader.read(&mut bytes).is_ok_and(|count| count > 0) {}
+    }
 }
 
 pub(super) struct Interrupt {
@@ -14,9 +40,17 @@ pub(super) struct Interrupt {
 
 impl Interrupt {
     pub(super) fn install() -> io::Result<Self> {
+        if WAKE.get().is_none() {
+            let (reader, writer) = UnixStream::pair()?;
+            reader.set_nonblocking(true)?;
+            writer.set_nonblocking(true)?;
+            let _ = WAKE.set((reader, writer));
+        }
+        WAKE_WRITER.store(WAKE.get().unwrap().1.as_raw_fd(), Ordering::Relaxed);
         REQUESTED.store(false, Ordering::Relaxed);
-        // SAFETY: valid initialized sigactions; the handler only touches a
-        // lock-free atomic. Omitting SA_RESTART also wakes a blocked poll.
+        drain_wake();
+        // SAFETY: initialized sigactions. The handler touches lock-free
+        // atomics and writes to the process's nonblocking wake.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             let mut previous_int = std::mem::zeroed();
@@ -50,20 +84,90 @@ impl Drop for Interrupt {
 }
 
 pub(super) fn requested() -> bool {
-    REQUESTED.load(Ordering::Relaxed)
+    REQUESTED.load(Ordering::Acquire)
 }
 
 /// Read only available bytes instead of stdio, which can retry an interrupted
 /// read indefinitely. Avoid buffering past the newline so a pasted second
 /// answer remains visible to poll on the next prompt.
 pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
-    // Reopen instead of dup: O_NONBLOCK on a duplicate would also change the
-    // parent shell's shared stdin description. An owned description prevents
-    // a terminal SIGINT input flush between poll and read from blocking us.
-    let mut input = OpenOptions::new()
+    read_line_with(answer, |input| {
+        Ok(
+            progress::TerminalChanges::wait_with_input(None, Some(input), None)
+                == progress::TerminalWake::Input,
+        )
+    })
+}
+
+/// Standard input as a description of our own.
+///
+/// Reopen instead of dup: O_NONBLOCK on a duplicate would also change the
+/// parent shell's shared stdin description. An owned description prevents
+/// a terminal SIGINT input flush between poll and read from blocking us.
+#[cfg(target_os = "linux")]
+fn own_input() -> io::Result<std::fs::File> {
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open("/proc/self/fd/0")?;
+        .open("/proc/self/fd/0")
+}
+
+/// Standard input as a description of our own, where one can be had.
+///
+/// Darwin's `/dev/fd/0` duplicates the shell's description rather than
+/// opening a new one, so a terminal is reopened by the name `ttyname` gives
+/// it, as Linux reopens `/proc/self/fd/0`. Other input, such as a pipe, has
+/// no name to reopen. It is duplicated and left blocking, so the shell's
+/// description keeps its flags; it is read only once poll reports it ready,
+/// which a pipe or file then honours without blocking, and only a terminal
+/// can flush input between the two.
+#[cfg(target_os = "macos")]
+fn own_input() -> io::Result<std::fs::File> {
+    use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
+    // SAFETY: isatty only inspects the descriptor.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor this function owns.
+        let duplicate = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor was just created and nothing else owns it.
+        return Ok(unsafe { std::fs::File::from_raw_fd(duplicate) });
+    }
+    let mut name = [0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: the buffer is writable for its whole length.
+    let status = unsafe { libc::ttyname_r(libc::STDIN_FILENO, name.as_mut_ptr(), name.len()) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    // SAFETY: a successful ttyname_r NUL-terminated the name in the buffer.
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    let input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(std::ffi::OsStr::from_bytes(name.to_bytes()))?;
+    // The name must still be our terminal, not a device that took it since.
+    use std::os::unix::fs::MetadataExt;
+    let mut stdin = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes a whole stat into the buffer when it succeeds.
+    if unsafe { libc::fstat(libc::STDIN_FILENO, stdin.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, so the stat is initialized.
+    let stdin = unsafe { stdin.assume_init() };
+    if input.metadata()?.rdev() != stdin.st_rdev as u64 {
+        return Err(io::Error::other(
+            "standard input's terminal changed while it was reopened",
+        ));
+    }
+    Ok(input)
+}
+
+pub(super) fn read_line_with(
+    answer: &mut String,
+    mut input_ready: impl FnMut(i32) -> io::Result<bool>,
+) -> io::Result<usize> {
+    let mut input = own_input()?;
     let mut bytes = Vec::new();
     loop {
         if requested() {
@@ -72,22 +176,7 @@ pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
                 "Update cancellation requested",
             ));
         }
-        let mut poll = libc::pollfd {
-            fd: input.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd retained through the call.
-        let ready = unsafe { libc::poll(&mut poll, 1, 100) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        } else if ready > 0 {
-            if requested() {
-                continue;
-            }
+        if input_ready(input.as_raw_fd())? && !requested() {
             let mut byte = [0u8];
             match input.read(&mut byte) {
                 Err(error)
@@ -117,11 +206,75 @@ pub(super) fn read_line(answer: &mut String) -> io::Result<usize> {
     }
 }
 
-#[cfg(test)]
+/// A line typed for a retired prompt must not become an answer to the
+/// next preview, including a pending newline after a partially read line.
+pub(super) fn discard_terminal_input(input: i32) -> io::Result<()> {
+    // SAFETY: the caller retains the open stdin description.
+    if unsafe { libc::isatty(input) } != 1 {
+        return Ok(());
+    }
+    loop {
+        // SAFETY: the fd stays open and refers to a terminal.
+        if unsafe { libc::tcflush(input, libc::TCIFLUSH) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted || requested() {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 
     #[test]
+    fn retiring_a_terminal_prompt_discards_a_queued_old_answer() {
+        use std::os::fd::FromRawFd;
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: writable descriptors and optional defaults for the private PTY.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    // Darwin declares these `*mut`; a `*mut` also coerces to
+                    // the `*const` Linux declares.
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful openpty returned two new owned descriptors.
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let fd = slave.as_raw_fd();
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        let wait = || progress::TerminalChanges::wait_with_input(None, Some(fd), Some(deadline()));
+
+        master.write_all(b"y\n").unwrap();
+        assert_eq!(wait(), progress::TerminalWake::Input);
+        discard_terminal_input(fd).unwrap();
+        assert_eq!(
+            progress::TerminalChanges::wait_with_input(None, Some(fd), Some(Instant::now())),
+            progress::TerminalWake::Deadline
+        );
+        master.write_all(b"n\n").unwrap();
+        assert_eq!(wait(), progress::TerminalWake::Input);
+        let mut line = String::new();
+        (&slave).take(2).read_to_string(&mut line).unwrap();
+        assert_eq!(line, "n\n");
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn interrupt_signals_cancel_review_without_waiting_for_stdin() {
         const CHILD: &str = "CAGENTS_TEST_UPDATE_INTERRUPT";
         if let Some(ready) = std::env::var_os(CHILD) {

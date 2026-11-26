@@ -49,6 +49,30 @@ fn snapshot(items: Vec<chat::Item>) -> chat::Snapshot {
 }
 
 #[test]
+fn an_unloaded_codex_child_does_not_count_as_live_mobile_work() {
+    let child = |id: &str, detail: &str| chat::Subagent {
+        id: id.into(),
+        kind: "agent".into(),
+        description: String::new(),
+        status: chat::ToolStatus::Running,
+        model: None,
+        waiting: false,
+        detail: detail.into(),
+        background: true,
+        items: Vec::new(),
+    };
+    let mut snapshot = snapshot(Vec::new());
+    snapshot.subagents = vec![
+        child("listed", chat::UNLOADED_CHILD_RUNNING),
+        child("followed", ""),
+    ];
+    let state = conversation_state(&snapshot);
+    assert_eq!(state.subagents.len(), 1);
+    assert_eq!(state.subagents[0].id, "followed");
+    assert_eq!(state.subagents[0].status, api::ToolStatus::Running);
+}
+
+#[test]
 fn a_watch_starts_with_everything_and_then_streams_text_as_appends() {
     let mut mirror = Mirror::default();
     let first = mirror
@@ -207,7 +231,7 @@ fn a_pending_approval_reaches_the_phone_with_its_choices() {
 }
 
 #[test]
-fn a_delegated_agent_names_its_owner() {
+fn delegated_sessions_show_their_owners_and_own_task_titles() {
     let id = TerminalId::new();
     let owner = Lineage(TerminalId::new());
     let agent = AgentId::new();
@@ -242,19 +266,43 @@ fn a_delegated_agent_names_its_owner() {
         account: None,
         cache: None,
     };
-    let session = session(&member);
-    assert_eq!(session.id, id.to_string());
-    assert_eq!(session.provider.as_deref(), Some("codex"));
-    assert_eq!(session.activity, api::Activity::Working);
-    assert!(session.watchable);
+    let translated = session(&member, &HashMap::new());
+    assert_eq!(translated.id, id.to_string());
+    assert_eq!(translated.provider.as_deref(), Some("codex"));
+    assert_eq!(translated.activity, api::Activity::Working);
+    assert!(translated.watchable);
     assert_eq!(
-        session.agent,
+        translated.agent,
         Some(api::Agent {
             id: agent.to_string(),
             owner: api::AgentOwner::Session,
             owner_lineage: Some(owner.to_string()),
             run: Some(api::RunState::Running),
         })
+    );
+
+    // The phone sees the agent's own accepted task even when the directory
+    // title was inherited from its parent or supplied by a provider.
+    let mut other = member.clone();
+    let other_agent = AgentId::new();
+    other.session.delegation.as_mut().unwrap().agent = other_agent;
+    let mut parent = member.clone();
+    parent.session.delegation = None;
+    let labels = HashMap::from([
+        (agent, "rust · check the host lane".into()),
+        (other_agent, "android · review the fake bridge".into()),
+    ]);
+    assert_eq!(
+        session(&member, &labels).title.as_deref(),
+        Some("rust · check the host lane")
+    );
+    assert_eq!(
+        session(&other, &labels).title.as_deref(),
+        Some("android · review the fake bridge")
+    );
+    assert_eq!(
+        session(&parent, &labels).title.as_deref(),
+        Some("Fix the build")
     );
 }
 
@@ -298,4 +346,48 @@ fn only_unacknowledged_notices_reach_the_phone_newest_first() {
     assert_eq!(previews, ["newer", "older"]);
     assert_eq!(sent[0].request, Some(api::RequestKind::Approval));
     assert_eq!(sent[0].title, "Agent needs your attention");
+    assert!(sent.iter().all(|notice| notice.asks));
+
+    let mut finished = notice(false, "done");
+    finished.event.evidence.kind = notifications::Kind::Succeeded;
+    finished.event.content = None;
+    let finished_snapshot = notifications::Snapshot {
+        notices: vec![finished],
+        diagnostic: None,
+    };
+    assert!(!notices(&finished_snapshot)[0].asks);
+}
+
+#[test]
+fn tool_preview_flags_distinguish_clipped_input_and_output() {
+    let make_tool = |input: String, output: String| chat::Item {
+        id: "tool".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Tool {
+            name: "Build".into(),
+            input,
+            output,
+            status: chat::ToolStatus::Running,
+        },
+        at: None,
+        started_at: None,
+    };
+    let long_input = make_tool("args".repeat(INPUT_HEAD_BYTES), "ok".into());
+    assert!(matches!(
+        item(&long_input).body,
+        api::ItemBody::Tool {
+            clipped: true,
+            output_clipped: false,
+            ..
+        }
+    ));
+    let long_output = make_tool("args".into(), "output".repeat(OUTPUT_TAIL_BYTES));
+    assert!(matches!(
+        item(&long_output).body,
+        api::ItemBody::Tool {
+            clipped: true,
+            output_clipped: true,
+            ..
+        }
+    ));
 }

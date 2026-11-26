@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{BufWriter, Read, Write},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -46,6 +46,7 @@ use crate::{
         LaunchRecipe, TerminalId, TerminalOutputActivity, TerminalSession,
         agent_recovery::AgentProcess,
     },
+    pinned_process::PinnedProcess,
     secure_file::open_private_append_file,
 };
 
@@ -85,7 +86,8 @@ const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The wall-clock budget ordinary shutdown gives a terminal's family, and
 /// itself, to end and confirm that end. The product always runs with
-/// [`ShutdownBudget::PRODUCT`].
+/// [`ShutdownBudget::PRODUCT`]; a test terminal starts with
+/// [`ShutdownBudget::PATIENT_PRODUCT_GRACE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ShutdownBudget {
     /// Total for hangup, escalation and an authoritative holder exit report.
@@ -113,16 +115,40 @@ impl ShutdownBudget {
     /// For a test of what shutdown decides rather than how fast a shared,
     /// loaded host runs it. Each wait in shutdown ends as soon as its
     /// condition holds, so only a step that never finishes can exhaust these
-    /// budgets. The hangup grace stays the product's, since it decides when a
-    /// family that ignores its hangup is stopped.
-    #[cfg(test)]
+    /// budgets. That includes the hangup grace: a family that handles its
+    /// hangup and exits ends it early, however long a busy host takes to run
+    /// the handler. A family that ignores its hangup waits out the whole
+    /// grace, so a test with one keeps [`Self::PATIENT_PRODUCT_GRACE`].
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) const PATIENT: Self = Self {
-        deadline: Duration::from_secs(30),
-        hangup_grace: CHILD_HANGUP_GRACE,
+        deadline: Duration::from_secs(45),
+        hangup_grace: Duration::from_secs(15),
         confirmation_reserve: Duration::from_secs(15),
         census_reserve: Duration::from_secs(5),
-        join: Duration::from_secs(45),
+        join: Duration::from_secs(60),
     };
+
+    /// [`Self::PATIENT`], except that a family that ignores its hangup is
+    /// stopped after the product's grace. Every test terminal starts with it.
+    /// Only a lower bound on that grace is safe to assert, since a busy host
+    /// only makes it last longer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) const PATIENT_PRODUCT_GRACE: Self = Self {
+        hangup_grace: CHILD_HANGUP_GRACE,
+        ..Self::PATIENT
+    };
+
+    /// A new terminal's budget: [`Self::PATIENT_PRODUCT_GRACE`] in a test
+    /// binary, and the product's in a daemon built with test support, as the
+    /// daemon's integration tests run it.
+    #[cfg(any(test, feature = "test-support"))]
+    fn for_new_terminal() -> Self {
+        if crate::test_binary::is_test_binary() {
+            Self::PATIENT_PRODUCT_GRACE
+        } else {
+            Self::PRODUCT
+        }
+    }
 }
 
 /// How long shutdown waits for the PTY reader to leave its blocking read
@@ -221,26 +247,27 @@ enum Command {
         deadline: std::time::Instant,
         reply: Sender<super::ipc::TerminalCloseResult>,
     },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     Shutdown,
 }
 
 /// Reversible process freeze. Dropping an uncommitted snapshot resumes its
 /// exact pidfd-bound family; only committed handoff is allowed to kill it.
-pub(crate) struct UpgradeSnapshot {
-    pub(crate) hint: Option<String>,
-    pub(crate) active: bool,
-    pub(crate) size: TerminalSize,
-    pub(crate) theme: TerminalTheme,
+pub struct UpgradeSnapshot {
+    pub hint: Option<String>,
+    pub active: bool,
+    pub size: TerminalSize,
+    pub theme: TerminalTheme,
     family: FrozenFamily,
 }
 
 impl UpgradeSnapshot {
-    pub(crate) fn only_agent_tree(&self, pid: i32) -> bool {
+    pub fn only_agent_tree(&self, pid: i32) -> bool {
         self.family.only_agent_tree(pid)
     }
 
-    pub(crate) fn stop(&mut self) -> Result<(), String> {
+    pub fn stop(&mut self) -> Result<(), String> {
         self.family
             .kill(std::time::Instant::now() + std::time::Duration::from_secs(10))
     }
@@ -248,11 +275,11 @@ impl UpgradeSnapshot {
 
 /// What a successor needs to show a carried terminal as it was.
 #[derive(Clone, Debug)]
-pub(crate) struct Carried {
-    pub(crate) size: TerminalSize,
-    pub(crate) theme: TerminalTheme,
+pub struct Carried {
+    pub size: TerminalSize,
+    pub theme: TerminalTheme,
     /// The conversation its agent was last seen in, as of the carry.
-    pub(crate) hint: Option<String>,
+    pub hint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -471,8 +498,8 @@ fn notify_archived(notice: impl FnOnce() + Send + 'static) {
 }
 
 /// Returns once every notice queued before this call has run.
-#[cfg(test)]
-pub(crate) fn flush_archived_notices() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn flush_archived_notices() {
     let (done, flushed) = crossbeam_channel::bounded(1);
     notify_archived(move || {
         let _ = done.send(());
@@ -549,18 +576,18 @@ struct PublishedState {
     /// and parked reader remain on the original worker until explicit Close.
     startup_unresolved: AtomicBool,
     startup_diagnostic: Mutex<Option<String>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_fail_startup_commit: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_startup_probe: Mutex<Option<Sender<(Vec<u8>, bool, bool)>>>,
     shutdown_requested: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     shutdown_census_failure: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     shutdown_census_delay: Mutex<Option<Sender<Instant>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     shutdown_budget: Mutex<ShutdownBudget>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_holder_reservation: Mutex<Option<crate::daemon::child_reaper::Reservation>>,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
@@ -570,15 +597,15 @@ struct PublishedState {
     cleanup_pool: admission::CleanupPool,
     cleanup_commands: Mutex<VecDeque<(Arc<admission::Cleanup>, u64, Command)>>,
     priority_close: Mutex<Option<Command>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     close_inspection_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
-    #[cfg(test)]
-    test_input_root_pidfd: OnceLock<File>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_input_root_pidfd: OnceLock<PinnedProcess>,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
-    launch_directory: OnceLock<(holder::LaunchDirectoryPin, File)>,
-    original_holder_process: OnceLock<Arc<File>>,
+    launch_directory: OnceLock<(holder::LaunchDirectoryPin, PinnedProcess)>,
+    original_holder_process: OnceLock<Arc<PinnedProcess>>,
     original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
@@ -663,18 +690,21 @@ impl PublishedState {
             completed: AtomicBool::new(false),
             startup_unresolved: AtomicBool::new(false),
             startup_diagnostic: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_fail_startup_commit: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_startup_probe: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             shutdown_census_failure: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             shutdown_census_delay: Mutex::new(None),
-            #[cfg(test)]
-            shutdown_budget: Mutex::new(ShutdownBudget::PRODUCT),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
+            // Tests reach most terminals through code that creates and shuts
+            // them down itself, so every test binary's terminal starts patient.
+            // A test that needs another budget sets it before shutdown.
+            shutdown_budget: Mutex::new(ShutdownBudget::for_new_terminal()),
+            #[cfg(any(test, feature = "test-support"))]
             test_holder_reservation: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
@@ -686,9 +716,9 @@ impl PublishedState {
             cleanup_pool,
             cleanup_commands: Mutex::new(VecDeque::new()),
             priority_close: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             close_inspection_gate: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_input_root_pidfd: OnceLock::new(),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
@@ -758,13 +788,21 @@ impl PublishedState {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn use_product_shutdown_for_test(&self) {
+        *self
+            .shutdown_budget
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ShutdownBudget::PRODUCT;
+    }
+
     fn shutdown_budget(&self) -> ShutdownBudget {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         return *self
             .shutdown_budget
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         ShutdownBudget::PRODUCT
     }
 
@@ -1112,30 +1150,30 @@ pub struct TerminalHandle {
 
 /// Retirement observes actual join and the exact original holder's exit.
 /// Completion or transfer to the child reaper alone is not a release receipt.
-pub(crate) enum TerminalRetirement {
+pub enum TerminalRetirement {
     Pending,
-    WaitingForHolder(Arc<File>),
+    WaitingForHolder(Arc<PinnedProcess>),
     Released,
     Retained(String),
 }
 
 /// Callback identity without retaining the worker through its own wake closure.
-pub(crate) struct WeakTerminalHandle {
+pub struct WeakTerminalHandle {
     inner: Weak<HandleInner>,
 }
 
 /// Real publication and callback machinery without a PTY, child or worker thread.
 /// This fixture tests callback identity, not process retirement or native output.
-#[cfg(test)]
-pub(crate) struct RenderStreamFixture {
-    pub(crate) handle: TerminalHandle,
+#[cfg(any(test, feature = "test-support"))]
+pub struct RenderStreamFixture {
+    pub handle: TerminalHandle,
     events: Arc<Sender<TerminalEvent>>,
     commands: Receiver<Command>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl RenderStreamFixture {
-    pub(crate) fn new(wake: impl Fn(TerminalWake) + Send + Sync + 'static) -> Self {
+    pub fn new(wake: impl Fn(TerminalWake) + Send + Sync + 'static) -> Self {
         let (commands, pending) = command_channel(64);
         let (events, received) = crossbeam_channel::unbounded();
         let events = Arc::new(events);
@@ -1155,29 +1193,37 @@ impl RenderStreamFixture {
         }
     }
 
-    pub(crate) fn publish(&self, generation: u64) {
+    pub fn publish(&self, generation: u64) {
         let mut snapshot = RenderSnapshot::empty();
         snapshot.generation = generation;
         self.handle.inner.published.publish(Arc::new(snapshot));
     }
 
     /// Publishes a caller-built grid, so row identity can be controlled.
-    pub(crate) fn publish_snapshot(&self, snapshot: RenderSnapshot) {
+    pub fn publish_snapshot(&self, snapshot: RenderSnapshot) {
         self.handle.inner.published.publish(Arc::new(snapshot));
     }
 
-    pub(crate) fn emit(&self, event: TerminalEvent) {
+    pub fn emit(&self, event: TerminalEvent) {
         self.handle.inner.published.emit_event(&self.events, event);
     }
 
-    pub(crate) fn queued_commands(&self) -> usize {
+    pub fn acknowledged_generation(&self) -> u64 {
+        self.handle
+            .inner
+            .published
+            .acknowledged_generation
+            .load(Ordering::Acquire)
+    }
+
+    pub fn queued_commands(&self) -> usize {
         self.commands.len()
     }
 
     /// Takes what a worker would apply next: the host's pending visibility
     /// request, or else the last queued command that sets visibility. Returns
     /// whether it leaves the worker visible. Queued commands are drained.
-    pub(crate) fn drain_visibility(&self) -> Option<bool> {
+    pub fn drain_visibility(&self) -> Option<bool> {
         fn visibility(command: &Command) -> Option<bool> {
             match command {
                 Command::Admitted { command, .. } => visibility(command),
@@ -1201,7 +1247,7 @@ impl RenderStreamFixture {
     }
 
     /// Takes the host's visibility request the worker has not applied yet.
-    pub(crate) fn take_host_visibility(&self) -> Option<super::ipc::TerminalVisibility> {
+    pub fn take_host_visibility(&self) -> Option<super::ipc::TerminalVisibility> {
         use super::ipc::TerminalVisibility;
         self.handle
             .inner
@@ -1217,7 +1263,7 @@ impl RenderStreamFixture {
 }
 
 impl WeakTerminalHandle {
-    pub(crate) fn upgrade(&self) -> Option<TerminalHandle> {
+    pub fn upgrade(&self) -> Option<TerminalHandle> {
         self.inner.upgrade().map(|inner| TerminalHandle { inner })
     }
 }
@@ -1232,10 +1278,13 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
-    pub(crate) const SHUTDOWN_TIMEOUT: Duration = WORKER_JOIN_TIMEOUT;
+    /// The product's [`Self::shutdown_join_budget`], which the fixtures built
+    /// to run out a budget keep.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const SHUTDOWN_TIMEOUT: Duration = WORKER_JOIN_TIMEOUT;
     /// Captured from the authenticated original holder before worker startup;
     /// never rediscovered by a reusable terminal ID.
-    pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
+    pub fn holder_identity(&self) -> Option<&super::holder::Record> {
         self.inner.published.holder_identity.get()
     }
     /// Run this terminal's ordinary shutdown within `budget` instead of the
@@ -1249,15 +1298,40 @@ impl TerminalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = budget;
     }
-    #[cfg(test)]
-    pub(crate) fn original_root_pidfd_for_test(&self) -> std::io::Result<File> {
+    #[cfg(any(test, feature = "test-support"))]
+    /// A descriptor that polls readable once the original root exits: its
+    /// pidfd on Linux.
+    pub fn original_root_pidfd_for_test(&self) -> std::io::Result<File> {
         self.inner
             .published
             .test_input_root_pidfd
             .get()
-            .ok_or_else(|| std::io::Error::other("original root pidfd was not captured"))?
-            .try_clone()
+            .ok_or_else(|| std::io::Error::other("original root pin was not captured"))?
+            .exit_readiness()
+            .try_clone_to_owned()
+            .map(File::from)
     }
+    /// PID from the exact root pin retained by the test's input worker.
+    #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+    pub fn original_root_pid_for_test(&self) -> Option<u32> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .map(PinnedProcess::pid)
+    }
+
+    /// The original test terminal's executable while its retained pin is live.
+    #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+    pub fn original_root_executable_for_test(&self) -> std::io::Result<PathBuf> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .ok_or_else(|| std::io::Error::other("original root pin was not captured"))?
+            .executable()
+    }
+
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
     /// these atomic worker checks do not make a source mutation atomic.
@@ -1280,20 +1354,14 @@ impl TerminalHandle {
             .launch_directory
             .get()
             .ok_or("this terminal holder cannot attest its original launch directory")?;
-        let mut original = libc::pollfd {
-            fd: root.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll observes the already-held original root, never a PID
-        // lookup. A kernel exit must refuse even before Completed is published.
-        let ready = unsafe { libc::poll(&mut original, 1, 0) };
-        if ready != 0 {
+        // The already-held original root, never a PID lookup. A kernel exit
+        // must refuse even before Completed is published.
+        if !matches!(root.exited(), Ok(false)) {
             return Err("terminal original root is no longer live or cannot be observed".into());
         }
         holder::checked_launch_directory(*identity, Arc::clone(file))
     }
-    pub(crate) fn transcript_location(&self) -> Option<crate::model::TranscriptLocationReceipt> {
+    pub fn transcript_location(&self) -> Option<crate::model::TranscriptLocationReceipt> {
         self.inner
             .published
             .transcript_location
@@ -1310,7 +1378,7 @@ impl TerminalHandle {
 
     /// Only validated checkpoint/holder callers can separate the issued
     /// descriptor from the exact recipe the worker must execute and track.
-    pub(crate) fn spawn_with_execution(
+    pub fn spawn_with_execution(
         session: TerminalSession,
         config: TerminalConfig,
         execution_recipe: Option<LaunchRecipe>,
@@ -1322,7 +1390,7 @@ impl TerminalHandle {
     /// HOST installs an independent live custody slot before this method permits
     /// its original thread to prepare or commit adoption. Refusal before that
     /// installation has no adopted owner to unwind.
-    pub(crate) fn spawn_with_execution_installed(
+    pub fn spawn_with_execution_installed(
         session: TerminalSession,
         config: TerminalConfig,
         execution_recipe: Option<LaunchRecipe>,
@@ -1472,8 +1540,8 @@ impl TerminalHandle {
     }
 
     /// A viewport read needing no admission.
-    #[cfg(test)]
-    pub(crate) fn viewport_snapshot(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn viewport_snapshot(
         &self,
         offset: Option<u64>,
         rows: Option<u16>,
@@ -1488,7 +1556,7 @@ impl TerminalHandle {
     /// Such a read is answered on the worker, after the reveal queued ahead
     /// of it. What `admit` returns is held only while the read is queued to
     /// the worker, not while it waits for the frame.
-    pub(crate) fn viewport_snapshot_admitted<A>(
+    pub fn viewport_snapshot_admitted<A>(
         &self,
         offset: Option<u64>,
         rows: Option<u16>,
@@ -1554,7 +1622,7 @@ impl TerminalHandle {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    pub(crate) fn agent_activity(&self) -> Option<crate::agent::Activity> {
+    pub fn agent_activity(&self) -> Option<crate::agent::Activity> {
         *self
             .inner
             .published
@@ -1563,7 +1631,7 @@ impl TerminalHandle {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    pub(crate) fn observe_agent_process(&self) -> Option<AgentProcess> {
+    pub fn observe_agent_process(&self) -> Option<AgentProcess> {
         let (reply, result) = crossbeam_channel::bounded(1);
         let process = self
             .try_command(Command::ObserveAgentProcess(reply))
@@ -1577,7 +1645,7 @@ impl TerminalHandle {
     }
 
     /// Process discovery belongs to the PTY owner, independently of GUI clients.
-    pub(crate) fn cached_agent_process(&self) -> Option<AgentProcess> {
+    pub fn cached_agent_process(&self) -> Option<AgentProcess> {
         self.inner
             .published
             .agent_process
@@ -1586,14 +1654,14 @@ impl TerminalHandle {
             .clone()
     }
 
-    pub(crate) fn set_agent_process_observer(&self, observer: impl Fn() + Send + Sync + 'static) {
+    pub fn set_agent_process_observer(&self, observer: impl Fn() + Send + Sync + 'static) {
         let _ = self.inner.published.agent_observer.set(Arc::new(observer));
         if let Some(observer) = self.inner.published.agent_observer.get() {
             observer();
         }
     }
 
-    pub(crate) fn apply_agent_activity(
+    pub fn apply_agent_activity(
         &self,
         process: AgentProcess,
         activity: Option<crate::agent::Activity>,
@@ -1624,18 +1692,18 @@ impl TerminalHandle {
         self.inner.published.set_agent_activity(None);
     }
 
-    #[cfg(test)]
-    pub(crate) fn spawn_with_wedged_worker_for_test() -> (Self, Sender<()>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_with_wedged_worker_for_test() -> (Self, Sender<()>) {
         Self::spawn_with_blocked_worker_for_test(false)
     }
 
-    #[cfg(test)]
-    pub(crate) fn spawn_with_panicking_worker_for_test() -> (Self, Sender<()>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_with_panicking_worker_for_test() -> (Self, Sender<()>) {
         Self::spawn_with_blocked_worker_for_test(true)
     }
 
-    #[cfg(test)]
-    pub(crate) fn spawn_with_blocked_tls_for_test() -> (Self, Sender<()>, Receiver<()>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_with_blocked_tls_for_test() -> (Self, Sender<()>, Receiver<()>) {
         struct TlsWait {
             blocked: Receiver<()>,
             entered: Sender<()>,
@@ -1650,6 +1718,9 @@ impl TerminalHandle {
             static BLOCK: RefCell<Option<TlsWait>> = const { RefCell::new(None) };
         }
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        // This fixture exists to run out shutdown's budget; the product's
+        // keeps that short.
+        published.use_product_shutdown_for_test();
         let owner = joins::JoinOwner::new(
             published.clone(),
             joins::reserve().expect("test TLS cleanup admission"),
@@ -1684,9 +1755,12 @@ impl TerminalHandle {
         )
     }
 
-    #[cfg(test)]
-    fn spawn_with_blocked_worker_for_test(panic_after_release: bool) -> (Self, Sender<()>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_with_blocked_worker_for_test(panic_after_release: bool) -> (Self, Sender<()>) {
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        // This fixture exists to run out shutdown's budget; the product's
+        // keeps that short.
+        published.use_product_shutdown_for_test();
         let owner = joins::JoinOwner::new(
             published.clone(),
             joins::reserve().expect("test worker cleanup admission"),
@@ -1716,26 +1790,29 @@ impl TerminalHandle {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn worker_joined_for_test(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn worker_joined_for_test(&self) -> bool {
         self.inner.worker.joined()
     }
 
-    #[cfg(test)]
-    pub(crate) fn reserved_worker_joins_for_test() -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reserved_worker_joins_for_test() -> usize {
         joins::reserved()
     }
 
-    #[cfg(test)]
-    pub(crate) fn worker_join_capacity_for_test() -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn worker_join_capacity_for_test() -> usize {
         joins::CAPACITY
     }
 
-    #[cfg(test)]
-    pub(crate) fn spawn_with_missing_exit_report_for_test(session: TerminalSession) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_with_missing_exit_report_for_test(session: TerminalSession) -> Self {
         let (commands, receiver) = command_channel(1);
         let (events, event_receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        // This fixture exists to run out shutdown's budget; the product's
+        // keeps that short.
+        published.use_product_shutdown_for_test();
         let join_owner = joins::JoinOwner::new(
             published.clone(),
             joins::reserve().expect("test worker cleanup admission"),
@@ -1766,7 +1843,7 @@ impl TerminalHandle {
             worker.run();
         });
         join_owner.install(worker);
-        if let Err(error) = initialized.recv_timeout(Duration::from_secs(5)) {
+        if let Err(error) = initialized.recv_timeout(crate::terminal::SPAWN_START_TIMEOUT) {
             published.request_shutdown();
             joins::request(&join_owner, true, true);
             panic!("test terminal initialization did not finish: {error}");
@@ -1787,15 +1864,15 @@ impl TerminalHandle {
     pub fn is_completed(&self) -> bool {
         self.inner.published.completed.load(Ordering::Acquire)
     }
-    pub(crate) fn same_worker(&self, other: &Self) -> bool {
+    pub fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    pub(crate) fn execution_instance(&self) -> uuid::Uuid {
+    pub fn execution_instance(&self) -> uuid::Uuid {
         self.inner.published.execution_instance
     }
 
-    pub(crate) fn begin_completed_retirement(&self) -> Result<(), &'static str> {
+    pub fn begin_completed_retirement(&self) -> Result<(), &'static str> {
         if !self.is_completed() {
             return Err("The original terminal has not completed");
         }
@@ -1805,7 +1882,7 @@ impl TerminalHandle {
         Ok(())
     }
 
-    pub(crate) fn completed_retirement(
+    pub fn completed_retirement(
         &self,
         source: &TerminalSession,
         proof: &crate::model::HostSessionProof,
@@ -1825,24 +1902,14 @@ impl TerminalHandle {
                 "Original holder process evidence is unavailable".into(),
             );
         };
-        let mut event = libc::pollfd {
-            fd: original.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // The held pidfd cannot observe a reused numeric PID. Keep it alive
+        // The held pin cannot observe a reused numeric PID. Keep it alive
         // through the daemon's wait when an adopted or fsyncing holder remains.
-        match unsafe { libc::poll(&mut event, 1, 0) } {
-            0 => TerminalRetirement::WaitingForHolder(Arc::clone(original)),
-            n if n < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted =>
-            {
+        match original.exited() {
+            Ok(false) => TerminalRetirement::WaitingForHolder(Arc::clone(original)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                 TerminalRetirement::WaitingForHolder(Arc::clone(original))
             }
-            n if n > 0
-                && event.revents & libc::POLLIN != 0
-                && event.revents & (libc::POLLNVAL | libc::POLLERR) == 0 =>
-            {
+            Ok(true) => {
                 if let Some(record) = self.holder_identity() {
                     match super::holder::cleanup::confirmed_with_role(
                         source,
@@ -1864,7 +1931,7 @@ impl TerminalHandle {
         }
     }
 
-    pub(crate) fn downgrade(&self) -> WeakTerminalHandle {
+    pub fn downgrade(&self) -> WeakTerminalHandle {
         WeakTerminalHandle {
             inner: Arc::downgrade(&self.inner),
         }
@@ -1885,13 +1952,13 @@ impl TerminalHandle {
     }
 
     /// Install the host's lightweight observer before arming a subscription.
-    pub(crate) fn set_output_observer(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
+    pub fn set_output_observer(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
         let _ = self.inner.published.output_observer.set(Arc::new(observer));
     }
 
     /// Arm one output edge and return its history boundary atomically with PTY
     /// activity publication. Captures and redraw credit are deliberately unrelated.
-    pub(crate) fn observe_next_output(&self) -> u64 {
+    pub fn observe_next_output(&self) -> u64 {
         let published = &self.inner.published;
         let activity = published
             .activity
@@ -1901,7 +1968,7 @@ impl TerminalHandle {
         activity.map_or(0, |fact| fact.sequence)
     }
 
-    pub(crate) fn stop_observing_output(&self) {
+    pub fn stop_observing_output(&self) {
         self.inner
             .published
             .output_armed
@@ -1915,7 +1982,7 @@ impl TerminalHandle {
     /// Transfers this worker's semantic stream to a shared off-thread observer.
     /// Install once the Host record is published. Startup events are replayed
     /// before subsequent events, including an already-completed worker's tail.
-    pub(crate) fn set_event_observer(
+    pub fn set_event_observer(
         &self,
         observer: impl Fn(&TerminalHandle, TerminalEvent) + Send + Sync + 'static,
     ) {
@@ -2017,7 +2084,7 @@ impl TerminalHandle {
         self.search_for(None, request, query, case_sensitive)
     }
 
-    pub(crate) fn search_for(
+    pub fn search_for(
         &self,
         owner: Option<u64>,
         request: u64,
@@ -2057,7 +2124,7 @@ impl TerminalHandle {
     /// replaces any the worker has not applied yet, and the worker applies it
     /// before the next event it handles, including a command queued after
     /// this call. A worker that has stopped has nothing left to present.
-    pub(crate) fn set_host_visibility(&self, visibility: super::ipc::TerminalVisibility) {
+    pub fn set_host_visibility(&self, visibility: super::ipc::TerminalVisibility) {
         let visibility = match visibility {
             super::ipc::TerminalVisibility::Visible => Visibility::Visible,
             super::ipc::TerminalVisibility::Hidden => Visibility::Hidden,
@@ -2114,7 +2181,7 @@ impl TerminalHandle {
 
     /// Resolve fresh foreground evidence on the PTY owner thread. This never
     /// sends terminal input or starts a provider process.
-    pub(crate) fn observe_agent(&self) -> Result<Option<String>, String> {
+    pub fn observe_agent(&self) -> Result<Option<String>, String> {
         let (sender, receiver) = crossbeam_channel::bounded(1);
         self.try_command(Command::ObserveAgent(sender))
             .map_err(|error| error.to_string())?;
@@ -2125,7 +2192,7 @@ impl TerminalHandle {
 
     /// A reversible cut for an already admitted daemon upgrade. The caller
     /// owns this unique token until carry or emergency preservation settles.
-    pub(crate) fn prepare_input_handoff(
+    pub fn prepare_input_handoff(
         &self,
         token: Arc<AtomicBool>,
         resumed: Sender<Result<(), String>>,
@@ -2184,14 +2251,14 @@ impl TerminalHandle {
         answer?
     }
 
-    pub(crate) fn cancel_input_handoff(&self, token: &Arc<AtomicBool>) {
+    pub fn cancel_input_handoff(&self, token: &Arc<AtomicBool>) {
         token.store(false, Ordering::Release);
         // Out-of-band cancellation cannot be starved by a full command queue.
         // The matching worker alone confirms restart before reopening input.
         let _ = self.inner.published.capture_tx.try_send(());
     }
 
-    pub(crate) fn prepare_upgrade(&self) -> Result<UpgradeSnapshot, String> {
+    pub fn prepare_upgrade(&self) -> Result<UpgradeSnapshot, String> {
         let (sender, receiver) = crossbeam_channel::bounded(1);
         let prepared = self
             .inner
@@ -2224,7 +2291,7 @@ impl TerminalHandle {
     ///
     /// This waits for the worker's answer however long it takes: a caller that stopped
     /// waiting could not tell a terminal left here from one already carried.
-    pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
+    pub fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
         {
             let mut order = self
                 .inner
@@ -2275,7 +2342,7 @@ impl TerminalHandle {
     }
 
     /// Inspection and the close decision are one serialized PTY-owner command.
-    pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
+    pub fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
         use super::ipc::TerminalCloseResult;
         if self.is_completed() {
             return match self.shutdown() {
@@ -2344,7 +2411,7 @@ impl TerminalHandle {
             self.request_shutdown();
             if !joins::wait_until(
                 &self.inner.worker,
-                Some(std::time::Instant::now() + self.inner.published.shutdown_budget().join),
+                Some(std::time::Instant::now() + self.shutdown_join_budget()),
                 true,
             ) {
                 return TerminalCloseResult::Unknown(
@@ -2363,7 +2430,7 @@ impl TerminalHandle {
 
     /// Starts shutdown before joining any workers, so a daemon with many
     /// terminals lets all roots handle their hangups concurrently.
-    pub(crate) fn request_shutdown(&self) {
+    pub fn request_shutdown(&self) {
         if self.startup_unresolved() {
             return;
         }
@@ -2372,13 +2439,16 @@ impl TerminalHandle {
     }
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
-        self.shutdown_until(std::time::Instant::now() + self.inner.published.shutdown_budget().join)
+        self.shutdown_until(std::time::Instant::now() + self.shutdown_join_budget())
     }
 
-    pub(crate) fn shutdown_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Result<(), TerminalSendError> {
+    /// How long a caller waits for this worker to finish shutting down: five
+    /// seconds in the product.
+    pub fn shutdown_join_budget(&self) -> Duration {
+        self.inner.published.shutdown_budget().join
+    }
+
+    pub fn shutdown_until(&self, deadline: std::time::Instant) -> Result<(), TerminalSendError> {
         if self.startup_unresolved() {
             return Err(TerminalSendError::Closed);
         }
@@ -2396,7 +2466,7 @@ impl TerminalHandle {
     /// The caller first fences the exact source against this retained worker.
     /// A holder receipt, not an absent worker, proves the paired cleanup after
     /// a daemon restart or lost reply.
-    pub(crate) fn close_with_receipt(
+    pub fn close_with_receipt(
         &self,
         source: &TerminalSession,
         proof: &crate::model::HostSessionProof,
@@ -2426,7 +2496,7 @@ impl TerminalHandle {
         }
     }
 
-    pub(crate) fn preserve_completed_for_restart(&self) {
+    pub fn preserve_completed_for_restart(&self) {
         let holder = self
             .inner
             .published
@@ -2443,7 +2513,7 @@ impl TerminalHandle {
     /// Failed checkpoint restoration must never release an adopted registered
     /// holder. Serialize with completion, then transfer any final retained
     /// screen; a live parser that cannot serialize is honestly screen-lost.
-    pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
+    pub fn preserve_for_restart(&self) -> Result<(), String> {
         if !self.is_completed() {
             {
                 let mut order = self
@@ -2495,28 +2565,28 @@ impl TerminalHandle {
         Ok(())
     }
 
-    pub(crate) fn startup_unresolved(&self) -> bool {
+    pub fn startup_unresolved(&self) -> bool {
         self.inner
             .published
             .startup_unresolved
             .load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_startup_commit_after_ack_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_startup_commit_after_ack_for_test(&self) {
         self.inner
             .published
             .test_fail_startup_commit
             .store(true, Ordering::Release);
     }
 
-    #[cfg(test)]
-    pub(crate) fn retained_startup_bytes_for_test(&self) -> Vec<u8> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn retained_startup_bytes_for_test(&self) -> Vec<u8> {
         self.retained_startup_state_for_test().0
     }
 
-    #[cfg(test)]
-    pub(crate) fn retained_startup_state_for_test(&self) -> (Vec<u8>, bool, bool) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn retained_startup_state_for_test(&self) -> (Vec<u8>, bool, bool) {
         assert!(self.startup_unresolved());
         let (reply, result) = crossbeam_channel::bounded(1);
         *self.inner.published.test_startup_probe.lock().unwrap() = Some(reply);
@@ -2940,7 +3010,7 @@ struct Worker {
     writer: File,
     pending_input: input_queue::PendingInput,
     writer_failed: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_write_budget: Option<usize>,
     kernel_preservation_warned: bool,
     retained_commands: VecDeque<Command>,
@@ -2964,7 +3034,7 @@ struct Worker {
     /// Retained startup never lets this reader consume the PTY. The queued
     /// original replay prefix stays in pty_rx until explicit recovery.
     reader_start: Option<Sender<()>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_startup_queue: Option<Sender<PtyMessage>>,
     /// Write end of the reader's wake pipe. Closing it releases a read that a
     /// disowned grandchild would otherwise hold open indefinitely.
@@ -2986,7 +3056,7 @@ struct Reader {
     wake: OwnedFd,
     done: Receiver<()>,
     output: Receiver<PtyMessage>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_queue: Sender<PtyMessage>,
     discard_pending: Arc<AtomicBool>,
 }
@@ -3029,7 +3099,7 @@ impl Reader {
         if !pending.is_empty() {
             let _ = pty_tx.send(PtyMessage::Bytes(pending));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let test_queue = pty_tx.clone();
         let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
         let (start, started) = crossbeam_channel::bounded(1);
@@ -3056,7 +3126,7 @@ impl Reader {
             wake,
             done,
             output,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_queue,
             discard_pending,
         })
@@ -3146,6 +3216,34 @@ impl Worker {
         };
         for name in crate::account::launch_credential_overrides(&execution) {
             command.env_remove(name);
+        }
+        command.env_remove(crate::model::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY);
+        if config.adoption.is_none()
+            && crate::agent::Provider::from_program(&execution.program)
+                == Some(crate::agent::Provider::Claude)
+        {
+            let mut launch = execution.clone();
+            for name in ["HOME", "CLAUDE_CONFIG_DIR"] {
+                if let Some(value) = command.get_env(name).and_then(|value| value.to_str()) {
+                    launch.unset_environment.remove(name);
+                    launch.environment.insert(name.into(), value.into());
+                } else {
+                    launch.unset_environment.insert(name.into());
+                }
+            }
+            if let Some(overlay) = crate::model::agent_recovery::claude_attribution_overlay(&launch)
+                && let Ok(marker) = serde_json::to_string(&overlay)
+            {
+                let start = overlay.position + 1;
+                command.get_argv_mut().splice(
+                    start..start + overlay.original.len(),
+                    [overlay.argument.into()],
+                );
+                command.env(
+                    crate::model::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY,
+                    marker,
+                );
+            }
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
         match crate::instance::development_instance() {
@@ -3240,15 +3338,20 @@ impl Worker {
                 // Before the holder forks, so nothing this launch starts
                 // predates its record.
                 crate::lineage_birth::record_instance_launch(&session)?;
-                #[cfg(test)]
+                let isolate_codex_tmp = matches!(
+                    crate::agent::Provider::launched(&execution),
+                    Some((crate::agent::Provider::Codex, _))
+                );
+                #[cfg(any(test, feature = "test-support"))]
                 let reservation = published.test_holder_reservation.lock().unwrap().take();
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 let held = if let Some(reservation) = reservation {
                     holder::spawn_reserved(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        isolate_codex_tmp,
                         reservation,
                     )?
                 } else {
@@ -3257,20 +3360,22 @@ impl Worker {
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
+                        isolate_codex_tmp,
                     )?
                 };
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "test-support")))]
                 let held = holder::spawn_recoverable(
                     command,
                     pty_size(current_size),
                     child_exit_tx,
                     config.holder_recovery.clone(),
+                    isolate_codex_tmp,
                 )?;
                 (held, Vec::new())
             }
         };
         // The holder reaps the root, so its pid identifies it only while the
-        // pidfd still reaches an unreaped process: checked after the capture,
+        // pin still reaches an unreaped process: checked after the capture,
         // that proves the capture read the root and not a reused pid.
         let child_identity = RootIdentity::capture(held.child.pid(), executable)
             .ok()
@@ -3280,17 +3385,14 @@ impl Worker {
                 .duplicate()
                 .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
-            // The existing holder pidfd must still reach its original root
-            // after opening the fixture capability. A reaped/reused PID never
-            // reaches the failure guard. Quick natural exits need no fallback.
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, held.child.pid(), 0) };
-            if raw >= 0 {
-                let descriptor = unsafe { File::from_raw_fd(raw as i32) };
-                if held.child.unreaped() {
-                    let _ = published.test_input_root_pidfd.set(descriptor);
-                }
+            // A second pin of the exact root, never a reopened PID. Quick
+            // natural exits need no fallback.
+            if let Ok(pin) = held.child.duplicate_pin()
+                && held.child.unreaped()
+            {
+                let _ = published.test_input_root_pidfd.set(pin);
             }
         }
         let writer = File::from(duplicate("writing")?);
@@ -3352,7 +3454,7 @@ impl Worker {
             .as_ref()
             .map(|(identity, file)| {
                 held.child
-                    .duplicate_pidfd()
+                    .duplicate_pin()
                     .map(|root| ((*identity, Arc::clone(file)), root))
                     .map_err(|error| format!("pin original terminal root: {error}"))
             })
@@ -3415,7 +3517,7 @@ impl Worker {
             writer,
             pending_input: input_queue::PendingInput::default(),
             writer_failed: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_write_budget: None,
             kernel_preservation_warned: false,
             retained_commands: VecDeque::new(),
@@ -3434,7 +3536,7 @@ impl Worker {
             reply_backpressured: false,
             reader: Some(reader.thread),
             reader_start: reader.start.take(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_startup_queue: Some(reader.test_queue),
             reader_wake: Some(reader.wake),
             reader_done: reader.done,
@@ -3446,7 +3548,7 @@ impl Worker {
     /// Called only with the entire original Worker owned OUTSIDE the caller's
     /// panic guard. No error/panic can unwind its replay prefix out of custody.
     fn commit_start(&mut self) -> Option<String> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let retained = if self
             .published
             .test_fail_startup_commit
@@ -3456,7 +3558,7 @@ impl Worker {
         } else {
             self.holder.commit_adoption().err()
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let retained = self.holder.commit_adoption().err();
         let mut retained = retained;
         if retained.is_none()
@@ -3467,15 +3569,15 @@ impl Worker {
                 "The prepared reader did not accept activation; original replay is retained".into(),
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if retained.is_none() {
             drop(self.test_startup_queue.take());
         }
         retained
     }
 
-    #[cfg(test)]
-    fn start(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start(
         session: TerminalSession,
         config: TerminalConfig,
         execution_recipe: Option<LaunchRecipe>,
@@ -3501,7 +3603,7 @@ impl Worker {
 
     fn run_retained_startup(mut self) {
         loop {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 let probe = self.published.test_startup_probe.lock().unwrap().take();
                 if let Some(probe) = probe {
@@ -3569,8 +3671,8 @@ impl Worker {
         }
     }
 
-    #[cfg(test)]
-    fn disconnected_exit_report(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn disconnected_exit_report(&mut self) {
         let (sender, receiver) = crossbeam_channel::bounded(1);
         drop(sender);
         self.child_exit_rx = receiver;
@@ -3763,16 +3865,6 @@ impl Worker {
             }
         }
 
-        // A readable root pidfd only selected this reconciliation route. The
-        // actual holder report and PTY EOF together prove natural completion.
-        let natural_close = self.natural_close.take().map(|close| {
-            let drained = !shutting_down
-                && !self.checked_close_started
-                && self.pty_eof
-                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
-            (close, drained)
-        });
-
         // A last bell may still be waiting for its cadence deadline when the
         // PTY drains. Deliver its attention before completion, without holding
         // teardown open for a timer.
@@ -3798,7 +3890,21 @@ impl Worker {
             // Nothing will end a synchronized update the child left open.
             self.capture_when_ready(false);
         }
-        let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
+        // Darwin revokes the controlling tty when its session leader exits.
+        // EOF can arrive while other processes in that session are still live.
+        let natural_census = cfg!(target_os = "macos")
+            && !shutting_down
+            && self.pty_eof
+            && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+        let shutdown_cleanup_confirmed = if (shutting_down || natural_census) && !self.carried {
+            #[cfg(target_os = "macos")]
+            if shutting_down {
+                // XNU drains the controlling tty before notifying the root's
+                // exit. This worker has published its final grid and no longer
+                // consumes the reader queue. Drain through that backpressure
+                // until process cleanup has finished and the wake pipe closes.
+                self.reader_discard_pending.store(true, Ordering::Release);
+            }
             let budget = self.published.shutdown_budget();
             if exited {
                 let cleanup = if self.checked_shutdown {
@@ -3819,7 +3925,7 @@ impl Worker {
                     }
                 }
             } else {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if self
                     .published
                     .shutdown_census_failure
@@ -3827,7 +3933,7 @@ impl Worker {
                 {
                     close_processes::fail_next_census_for_test();
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(finished) = self.published.shutdown_census_delay.lock().unwrap().take()
                 {
                     close_processes::delay_next_census_for_test(finished);
@@ -3873,6 +3979,14 @@ impl Worker {
         // The shared input seal alone is insufficient: carry also uses it.
         let family_cleanup_confirmed =
             shutdown_cleanup_confirmed && (!self.checked_close_started || self.checked_shutdown);
+        let natural_close = self.natural_close.take().map(|close| {
+            let drained = !shutting_down
+                && !self.checked_close_started
+                && family_cleanup_confirmed
+                && self.pty_eof
+                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+            (close, drained)
+        });
         let completion = self.root_exit.take().and_then(|event| match event {
             TerminalEvent::Exited {
                 exit_code,
@@ -3941,7 +4055,7 @@ impl Worker {
             {
                 self.error("retain unconfirmed terminal screen", error);
             }
-            if shutting_down {
+            if shutting_down || natural_census {
                 self.holder.leave_after_unconfirmed_shutdown();
             } else {
                 self.holder.leave_for_successor();
@@ -4462,7 +4576,7 @@ impl Worker {
             Command::Reveal => self.reveal(),
             Command::Hibernate => self.hibernate_visuals(),
             Command::Restore { visible } => self.restore_visuals(visible),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Command::Shutdown => return true,
         }
         false
@@ -5347,7 +5461,7 @@ impl Worker {
             return CheckedClose::AwaitNaturalExit;
         }
         let inspection = self.inspect_close(deadline);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some((inspected, resume)) =
             self.published.close_inspection_gate.lock().unwrap().take()
         {
@@ -5398,11 +5512,9 @@ impl Worker {
             .as_ref()
             .ok_or("Child identity unavailable")?;
         let family = FrozenFamily::capture(root, deadline)?;
-        // SAFETY: this worker owns the live PTY throughout the frozen census.
-        let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        if foreground <= 0 {
-            return Err("Foreground process group unavailable".into());
-        }
+        let foreground = self
+            .foreground_group()
+            .ok_or("Foreground process group unavailable")?;
         // Process-only policy deliberately permits terminating shell builtins.
         // The original executable check still prevents an exec'd agent or
         // command from inheriting an idle shell's authority.
@@ -5427,9 +5539,14 @@ impl Worker {
     }
 
     fn foreground_group(&self) -> Option<libc::pid_t> {
-        // SAFETY: this worker owns the live master descriptor.
-        let group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        (group > 0).then_some(group)
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: this worker owns the live master descriptor.
+            let group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+            (group > 0).then_some(group)
+        }
+        #[cfg(target_os = "macos")]
+        self.child.foreground_group(&self.master)
     }
 
     fn observe_agent_process(&mut self) -> Option<&AgentProcess> {
@@ -5615,7 +5732,7 @@ impl Worker {
             return false;
         }
         let mut budget = PTY_BATCH_LIMIT;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(limit) = self.test_write_budget {
             budget = limit;
         }
@@ -5757,17 +5874,9 @@ impl Worker {
             self.handle_command(command);
         }
         let _admitted = if conventional_interrupt {
-            // TIOCSIG targets the foreground group bound to this exact PTY.
-            // Raw applications and extended key encodings retain their bytes.
-            let result =
-                unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
-            if result < 0 {
-                self.error(
-                    "interrupt terminal",
-                    std::io::Error::last_os_error().to_string(),
-                );
-            }
-            result >= 0
+            // Reply and cleanup sends above may have started a protocol
+            // frame since the original cancellation decision.
+            self.signal_interrupt(!can_flush_kernel || !self.pending_input.can_flush_kernel())
         } else if let Some(input) = interrupt_key {
             let mut release = input.clone();
             release.action = KeyAction::Release;
@@ -5796,6 +5905,116 @@ impl Worker {
         boundary
     }
 
+    fn signal_interrupt(&self, preserve_kernel: bool) -> bool {
+        #[cfg(target_os = "macos")]
+        if preserve_kernel {
+            // Darwin TIOCSIG can flush both tty queues. In particular, a
+            // bracketed paste must never lose the opener it already sent.
+            return match self.interrupt_foreground_without_flushing() {
+                Ok(()) => true,
+                Err(message) => {
+                    self.input_notice("interrupt terminal", message);
+                    false
+                }
+            };
+        }
+        #[cfg(target_os = "linux")]
+        let _ = preserve_kernel;
+        #[cfg(target_os = "linux")]
+        let request = libc::TIOCSIG;
+        #[cfg(target_os = "macos")]
+        let request = libc::c_ulong::from(libc::TIOCSIG);
+        // SAFETY: the live master targets its bound tty and TIOCSIG takes
+        // the signal number by value.
+        let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), request, libc::SIGINT) };
+        if result < 0 {
+            self.error(
+                "interrupt terminal",
+                std::io::Error::last_os_error().to_string(),
+            );
+        }
+        result >= 0
+    }
+
+    #[cfg(target_os = "macos")]
+    fn interrupt_foreground_without_flushing(&self) -> Result<(), String> {
+        use crate::process::{group_members, table};
+
+        // PROC_FLAG_CONTROLT from <sys/proc_info.h>. The tty driver also
+        // skips group members that have given up their controlling tty.
+        const CONTROLLING_TTY: u32 = 0x80;
+        const MAX_GROUP_MEMBERS: usize = 256;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let within_budget = || {
+            (Instant::now() < deadline)
+                .then_some(())
+                .ok_or("The foreground interrupt exceeded its process inspection budget")
+        };
+        let group = self
+            .foreground_group()
+            .ok_or("Cannot identify the terminal's foreground job")?;
+        let session = self.child.pid();
+        let matching_epoch = |pid| -> Result<Option<u64>, String> {
+            let record = match table::record(pid) {
+                Ok(record) => record,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            if record.bsd.pbsi_status == libc::SZOMB || record.bsd.pbsi_flags & CONTROLLING_TTY == 0
+            {
+                return Ok(None);
+            }
+            if record.bsd.pbsi_pgid != group as u32 || record.session != Some(session) {
+                return Err(
+                    "The terminal's foreground job changed before it could be interrupted".into(),
+                );
+            }
+            record
+                .start
+                .map(Some)
+                .ok_or_else(|| "Cannot verify a foreground process's identity".into())
+        };
+        let members = group_members(group as u32).map_err(|error| error.to_string())?;
+        if members.len() > MAX_GROUP_MEMBERS {
+            return Err("The foreground group is too large to interrupt without flushing".into());
+        }
+        let mut targets = Vec::new();
+        for pid in members {
+            within_budget()?;
+            if let Some(start) = matching_epoch(pid)? {
+                match crate::pinned_process::PinnedProcess::open_live_started(pid as u32, start) {
+                    Ok(pin) => targets.push((pid, start, pin)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        // A numeric group cannot authorize a broadcast. Only captured
+        // members that still belong to the exact held tty receive SIGINT.
+        // Older Darwin releases have no public atomic pin-to-signal call.
+        // Recheck membership and the pin as close to delivery as possible.
+        let mut delivered = false;
+        for (pid, start, pin) in targets {
+            within_budget()?;
+            if self.foreground_group() != Some(group) {
+                return Err(
+                    "The terminal's foreground job changed before the interrupt finished".into(),
+                );
+            }
+            if matching_epoch(pid)? == Some(start) {
+                within_budget()?;
+                delivered |= pin
+                    .signal(libc::SIGINT)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if !delivered {
+            return Err("No verified foreground process could be interrupted".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     fn cancel_kernel_input(&self) {
         // The peer ioctl opens this exact slave without a reusable path or a
         // controlling-terminal change. Flushing TCIFLUSH on the master would
@@ -5815,8 +6034,22 @@ impl Worker {
             return;
         }
         // SAFETY: the successful ioctl returned a fresh owned descriptor.
-        let peer = unsafe { OwnedFd::from_raw_fd(peer) };
+        let peer = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(peer) };
         if unsafe { libc::tcflush(peer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
+            self.error(
+                "cancel terminal input",
+                std::io::Error::last_os_error().to_string(),
+            );
+        }
+    }
+
+    /// XNU's master and slave share one tty, whose input queue is the
+    /// slave's, so flushing input through the master discards exactly what
+    /// the child has not read and leaves its output alone.
+    #[cfg(target_os = "macos")]
+    fn cancel_kernel_input(&self) {
+        // SAFETY: tcflush takes the live master descriptor and a scalar.
+        if unsafe { libc::tcflush(self.writer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
             self.error(
                 "cancel terminal input",
                 std::io::Error::last_os_error().to_string(),
@@ -6215,6 +6448,28 @@ fn confirm_exited_family(
             .map_err(|error| format!("observe child exit: {error}"))?
             && close_processes::session_is_empty(child.pid(), deadline)?)
     };
+    if cfg!(target_os = "macos") {
+        // Darwin's PTY EOF can precede the last job's exit, and the master
+        // does not wake a poll with no requested events. Wait for bounded
+        // session observations instead.
+        let deadline = deadline.min(Instant::now() + CHILD_SHUTDOWN_DEADLINE);
+        let mut delay = Duration::from_millis(20);
+        loop {
+            let result = ended(deadline);
+            if matches!(result, Ok(true)) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "could not confirm the terminal family's cleanup");
+                }
+                return Err("Terminal process cleanup remains unconfirmed".into());
+            }
+            std::thread::sleep(delay.min(remaining));
+            delay = (delay * 2).min(Duration::from_millis(250));
+        }
+    }
     // Usually the family is already gone. A process outside it (one that left
     // the session, such as `setsid -f`) may keep the PTY open indefinitely;
     // cleanup never claims or depends on it, so its PTY is no reason to wait.
@@ -6511,16 +6766,7 @@ fn pty_size(size: TerminalSize) -> PtySize {
 /// to it: dropping the write end hangs the read end up, which is the one event
 /// a blocking reader can always observe.
 fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
-    let mut ends = [0 as libc::c_int; 2];
-    // SAFETY: `ends` is the two-element array `pipe2` writes into.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(format!(
-            "create PTY reader wake pipe: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `pipe2` filled both entries with fresh owned descriptors.
-    unsafe { Ok((OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1]))) }
+    crate::descriptor::pipe(false).map_err(|error| format!("create PTY reader wake pipe: {error}"))
 }
 
 enum Readiness {
@@ -6653,6 +6899,8 @@ fn send_pty_message(
             if cancellation.revents != 0 {
                 return false;
             }
+            #[cfg(target_os = "macos")]
+            return true;
         }
         match sender.send_timeout(message, READER_SEND_POLL) {
             Ok(()) => return true,

@@ -242,10 +242,60 @@ def live_lock_held(path: Path) -> bool:
     return False
 
 
+class GitAncestry(unittest.TestCase):
+    def test_git_ancestry_skips_placeholders_and_keeps_markers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="git-ancestry-") as temporary:
+            root = Path(temporary).resolve()
+            inner = root / "inner" / ".git"
+            outer = root / ".git"
+            inner.mkdir(parents=True)
+            outer.mkdir()
+
+            def detect() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["/bin/bash", "-c",
+                     'source "$1"; find_git_marker_in_ancestry "$2"',
+                     "git-ancestry", str(REPOSITORY / "scripts/git-ancestry.sh"),
+                     str(inner.parent / "absent")],
+                    capture_output=True, text=True, timeout=HANG_GUARD,
+                )
+
+            def assert_marker(marker: Path) -> None:
+                result = detect()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), str(marker))
+
+            self.assertEqual(detect().returncode, 1)
+            (inner / "objects").mkdir()
+            head = outer / "HEAD"
+            head.write_text("ref: refs/heads/main\n")
+            assert_marker(outer)
+
+            head.unlink()
+            head.symlink_to("refs/heads/main")
+            assert_marker(outer)
+
+            head.unlink()
+            outer.rmdir()
+            outer.write_text("gitdir: /elsewhere/worktrees/outer\n")
+            assert_marker(outer)
+
+            outer.unlink()
+            outer.symlink_to(root / "absent-target")
+            assert_marker(outer)
+
+            outer.unlink()
+            inner.chmod(0o600)
+            try:
+                if not os.access(inner, os.X_OK):
+                    assert_marker(inner)
+            finally:
+                inner.chmod(0o700)
+
+
 class Evidence(unittest.TestCase):
     def setUp(self) -> None:
-        # Not /tmp, /var/tmp or ~/.cache: sandboxes leave empty .git stubs there,
-        # which the script rightly refuses, and this suite does not test that.
+        # Use the native evidence task's usual base, short enough for sockets.
         state = Path.home() / ".local" / "state"
         state.mkdir(parents=True, exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix="ne-", dir=state))
@@ -473,7 +523,18 @@ class Evidence(unittest.TestCase):
             self.assertNotRegex(source, rf"(unset|env -u|-u)\s+{name}")
 
     def test_task_directory_must_be_outside_git_ancestry(self) -> None:
-        (self.root / ".git").mkdir()
+        git = self.root / ".git"
+        # The empty mount point a sandbox leaves is no repository to Git.
+        git.mkdir()
+        self.run_tool("status")
+        (git / "HEAD").write_text("ref: refs/heads/main\n")
+        result = self.run_tool("status", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("outside Git ancestry", result.stderr)
+        # A linked worktree's gitfile is one too.
+        (git / "HEAD").unlink()
+        git.rmdir()
+        git.write_text("gitdir: /elsewhere/.git/worktrees/x\n")
         result = self.run_tool("status", check=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("outside Git ancestry", result.stderr)
@@ -870,9 +931,11 @@ class Evidence(unittest.TestCase):
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
-        # The runner builds the UI as its own package, as this repository lays it out.
-        (checkout / "crates" / "cagents-ui").mkdir(parents=True)
-        shutil.copy(REPOSITORY / "crates" / "cagents-ui" / "Cargo.toml", checkout / "crates" / "cagents-ui")
+        # The runner builds the UI and the daemon as their own packages, as this
+        # repository lays them out.
+        for package in ("cagents-ui", "cagents-host"):
+            (checkout / "crates" / package).mkdir(parents=True)
+            shutil.copy(REPOSITORY / "crates" / package / "Cargo.toml", checkout / "crates" / package)
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
         git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         subprocess.run([*git, "add", "."], check=True, env=self.env)
@@ -891,9 +954,11 @@ class Evidence(unittest.TestCase):
     def test_an_integrated_side_builds_and_runs_the_embedded_browser_lane(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
-        # The runner builds the UI as its own package, as this repository lays it out.
-        (checkout / "crates" / "cagents-ui").mkdir(parents=True)
-        shutil.copy(REPOSITORY / "crates" / "cagents-ui" / "Cargo.toml", checkout / "crates" / "cagents-ui")
+        # The runner builds the UI and the daemon as their own packages, as this
+        # repository lays them out.
+        for package in ("cagents-ui", "cagents-host"):
+            (checkout / "crates" / package).mkdir(parents=True)
+            shutil.copy(REPOSITORY / "crates" / package / "Cargo.toml", checkout / "crates" / package)
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
         git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         subprocess.run([*git, "add", "."], check=True, env=self.env)
@@ -2609,6 +2674,9 @@ class RemoteEvidence(unittest.TestCase):
         self.env.update({
             "CAGENTS_EVIDENCE_REMOTE_REPOSITORY": str(self.remote_repository),
             "CAGENTS_EVIDENCE_REMOTE_TOOL": str(self.tool),
+            "CAGENTS_BUILD_LOCAL_SYNC_LOCK": str(self.root / "sync.lock"),
+            "CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "1",
+            "TMPDIR": str(self.root),
         })
 
     def git(self, path: Path, *args: str) -> str:
@@ -2686,6 +2754,7 @@ class RemoteEvidence(unittest.TestCase):
         # which a user's multiplexing master would outlive.
         for invocation in (self.logs / "ssh").read_text().splitlines():
             self.assertIn("-o ControlMaster=no -o ControlPath=none", invocation)
+            self.assertIn("-o ServerAliveInterval=15 -o ServerAliveCountMax=4", invocation)
 
     def test_cancelling_the_wrapper_alone_ends_and_reaps_each_connection(self) -> None:
         checkout = self.checkout("after", {"src.rs": "old\n"})
@@ -2821,12 +2890,21 @@ class RemoteEvidence(unittest.TestCase):
         checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
+        ssh_input = self.logs / "ssh-input"
+        received = ssh_input.stat().st_size
+        self.run_tool("status")
+        script = ssh_input.read_bytes()[received:]
         (self.logs / "status-holds").touch()
+        # Exercise the exact host script independently of client-side
+        # supervision. The stand-in host shares the test's machine, so it
+        # would otherwise be a descendant the client supervisor can kill.
         with (self.logs / "lost-output").open("w") as output:
             process = subprocess.Popen(
-                [str(SCRIPT), "--remote", "buildhost", "--task", str(self.task), "status"],
-                env=self.env, stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True,
+                [str(self.bin / "ssh"), "buildhost", "bash", "-s"],
+                env=self.env, stdin=subprocess.PIPE, stdout=output, stderr=output, start_new_session=True,
             )
+            with process.stdin:
+                process.stdin.write(script)
 
         def wait_for(condition) -> None:
             deadline = time.monotonic() + HANG_GUARD
@@ -2941,6 +3019,102 @@ class RemoteEvidence(unittest.TestCase):
         write_executable(self.bin / "ssh", "#!/bin/sh\nexit 37\n", self.logs)
         result = self.run_tool("status", check=False)
         self.assertEqual(result.returncode, 37)
+
+    def test_a_wedged_upload_is_reaped_before_its_one_retry(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
+        intercept = """
+            if [[ "$*" = *git-receive-pack* ]] && [ ! -e "$STUB_LOG/proxy-pid" ]; then
+                # A different process cannot take the only local slot while Git uploads.
+                if flock -xn "$CAGENTS_BUILD_LOCAL_SYNC_LOCK.0" true; then exit 23; fi
+                sleep 600 &
+                printf '%s\\n' "$!" > "$STUB_LOG/proxy-pid"
+                wait
+            fi
+            if [ "$*" = "bash -s" ]; then
+                script=$(cat)
+                # The upload's slot is free again while the host does the build.
+                if [[ $script = *'remote_main build after '* ]]; then
+                    flock -xn "$CAGENTS_BUILD_LOCAL_SYNC_LOCK.0" true || exit 24
+                fi
+                exec 0<<<"$script"
+            fi
+        """
+        ssh = REMOTE_STUBS["ssh"].replace(
+            "        login=(", textwrap.indent(textwrap.dedent(intercept), "        ") + "\n        login=(", 1)
+        write_executable(self.bin / "ssh", ssh, self.logs)
+        result = self.run_tool("build", "after", str(checkout),
+                               extra={"CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS": "2"})
+        self.assertIn("transport deadline expired", result.stderr)
+        self.assertEqual(result.stderr.count("source upload failed (status 124), retrying once"), 1)
+        proxy = int((self.logs / "proxy-pid").read_text())
+        self.assertFalse(Path(f"/proc/{proxy}").exists(), "timed-out transfer left its proxy alive")
+        pushes = [line for line in (self.logs / "ssh").read_text().splitlines() if "git-receive-pack" in line]
+        self.assertEqual(len(pushes), 3)  # The tool push, its retry, then the side push.
+        self.assertIn("build after ", "\n".join(self.tool_calls()))
+
+    def test_a_failed_status_retry_has_no_partial_answer(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
+        self.run_tool("build", "after", str(checkout))
+        intercept = """
+            if [ "$*" = "bash -s" ] && [ ! -e "$STUB_LOG/partial-status" ]; then
+                touch "$STUB_LOG/partial-status"
+                sleep 600 </dev/null >/dev/null 2>&1 &
+                printf '%s\n' "$!" > "$STUB_LOG/status-proxy"
+                echo 'partial response'
+                exit 255
+            fi
+        """
+        ssh = REMOTE_STUBS["ssh"].replace(
+            "        login=(", textwrap.indent(textwrap.dedent(intercept), "        ") + "\n        login=(", 1)
+        write_executable(self.bin / "ssh", ssh, self.logs)
+        result = self.run_tool("status")
+        self.assertIn("status request failed (status 255), retrying once", result.stderr)
+        self.assertNotIn("partial response", result.stdout)
+        self.assertIn("session: none", result.stdout)
+        proxy = int((self.logs / "status-proxy").read_text())
+        self.assertFalse(Path(f"/proc/{proxy}").exists(), "failed SSH left its proxy alive")
+
+    def test_invoking_shell_death_reaps_the_connection_and_its_proxy(self) -> None:
+        pids_file = self.logs / "transport-pids"
+        write_executable(self.bin / "ssh", """
+            #!/bin/bash
+            sleep 600 &
+            printf '%s %s\\n' "$$" "$!" > "$STUB_LOG/transport-pids"
+            wait
+        """, self.logs)
+        parent = subprocess.Popen(
+            ["/bin/bash", "-c", '"$@" & wait', "native-evidence-caller",
+             str(SCRIPT), "--remote", "buildhost", "--task", str(self.task), "status"],
+            env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        pids, processes = [], []
+        try:
+            deadline = time.monotonic() + HANG_GUARD
+            while not pids and parent.poll() is None and time.monotonic() < deadline:
+                if pids_file.exists():
+                    pids = pids_file.read_text().split()
+                if not pids:
+                    time.sleep(0.02)
+            self.assertEqual(len(pids), 2, "the connection never reached its proxy")
+            for pid in pids:
+                processes.append(os.pidfd_open(int(pid)))
+            parent.kill()
+            parent.wait(timeout=HANG_GUARD)
+            deadline = time.monotonic() + HANG_GUARD
+            while any(Path(f"/proc/{pid}").exists() for pid in pids) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(any(Path(f"/proc/{pid}").exists() for pid in pids))
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=HANG_GUARD)
+            for process in processes:
+                try:
+                    signal.pidfd_send_signal(process, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                finally:
+                    os.close(process)
 
     def test_a_checkout_builds_through_its_own_gate_and_sends_what_it_built(self) -> None:
         checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})

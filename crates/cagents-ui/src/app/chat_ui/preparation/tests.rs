@@ -3964,7 +3964,7 @@ fn pending_status_is_not_copied_and_unrelated_selection_survives_ready() {
                         keyboard::key::NativeCode::Unidentified,
                     ),
                     location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::CTRL,
+                    modifiers: keyboard::Modifiers::COMMAND,
                     text: None,
                     repeat: false,
                 }),

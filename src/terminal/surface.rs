@@ -101,6 +101,11 @@ impl TerminalSurface {
         self.handle.acknowledge_updates()
     }
 
+    /// Acknowledge attention for the conversation the person has read.
+    pub fn acknowledge_conversation_attention(&self) -> Result<(), TerminalSendError> {
+        self.handle.acknowledge_conversation_attention()
+    }
+
     pub fn events(&self) -> Receiver<TerminalEvent> {
         self.handle.events()
     }

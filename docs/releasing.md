@@ -2,13 +2,15 @@
 
 - [Building a release](#building-a-release)
 - [Artifacts](#artifacts)
+- [macOS](#macos)
 - [Native platform roadmap](#native-platform-roadmap)
 - [Publishing](#publishing)
 - [Signing](#signing)
 - [Comparing package variants](#comparing-package-variants)
 
-Release builds and publication run **locally**, never in GitHub Actions.
-Pushing a tag does not start a hosted build.
+GitHub Actions builds and signs eligible releases. The release operator
+publishes the draft after rehearsing the update on fw16. Releases that need
+the recovery key are built and signed on the local release path.
 
 ## Building a release
 
@@ -26,6 +28,13 @@ linked against the sherpa-onnx libraries `scripts/sherpa-onnx-libs` verifies,
 with its third-party notices; the builder and the publisher refuse a package
 from a source with the helper that lacks either.
 
+The build stages one copy of the dictation helper for both cagents variants.
+The standalone editor ships the same CLI and daemon as the browserless
+package. Each cagents variant builds its own CLI, daemon and UI for its
+product identity. Cargo runs one build at a time while a single-CPU worker
+packages the previous variant. The package size reports count the shared
+helper's build time under the full variant.
+
 Before exposing the bundle, the builder installs and removes each Debian
 package and extracts each portable archive in a disposable Ubuntu 24.04 runtime
 image, all five at once. This runtime checks actual package dependencies, shipped commands,
@@ -34,9 +43,10 @@ binaries were built without debug assertions or the development feature, the
 setting their whole production identity follows) and safe shutdown, live-daemon removal guards, and
 preservation of unrelated files and saved app data. The compiler environment
 remains Ubuntu 22.04; runtime smoke does not replace the glibc baseline checks.
-The runtime image is prepared once with network access by
-`scripts/prepare-release-smoke-rootfs`; every artifact execution uses a separate
-networkless namespace with private user state. The runtime cache defaults to
+Before compiling, the builder validates the runtime cache or provisions it with
+network access using `scripts/prepare-release-smoke-rootfs`. Every artifact
+execution uses a separate networkless namespace with private user state. The
+runtime cache defaults to
 `$XDG_CACHE_HOME/cagents-release-smoke/ubuntu-24.04-amd64` (or under `~/.cache`),
 and `CAGENTS_RELEASE_SMOKE_CACHE` overrides it. Each cache keeps one pinned base
 archive and one provisioned runtime image. The next preparation reclaims scratch
@@ -75,14 +85,136 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
-- `release-metadata.json`: the version, source commit, daemon protocol,
+- with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
+  `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
+- `release-metadata-2.json`: the version, source commit, daemon protocol,
   release notes, and every other asset's size and SHA-256 (schema 2)
-- `release-metadata.json.sig`: its signature (see [Signing](#signing))
+- `release-metadata-2.json.sig`: its signature (see [Signing](#signing))
+- `release-metadata.json` and `release-metadata.json.sig`: what builds up to
+  0.2.3 read (see [Trust generations](#trust-generations))
 
-Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
-supported build and package lane today. Windows and macOS need their own native
-ports, validation, packaging, and signing before their targets can be enabled;
-the release tooling does not publish placeholder binaries for them.
+A bundle holds its metadata as `release-metadata.json` and its signature as
+`release-metadata.json.sig`; the publisher gives them their published names.
+
+Artifact selection is explicitly platform-aware. The metadata's `targets` lists
+Linux x86_64 GNU, and `aarch64-apple-darwin` when the release carries the
+macOS build; a release without it is exactly what one was before macOS builds
+existed, and builds that predate them ignore the macOS entry and its assets.
+Windows needs its own native port, validation, packaging, and signing before
+its target can be enabled; the release tooling does not publish placeholder
+binaries.
+
+## macOS
+
+`scripts/package-macos` builds the Apple Silicon release on a Mac:
+`cagents-${VERSION}-aarch64-apple-darwin.tar.gz`, `install-macos.sh` and
+`SHA256SUMS-macos`. It needs Xcode's command line tools and rustup; the
+toolchain comes from `rust-toolchain.toml`. It builds the four executables with
+the release profile for macOS 11 or newer: the CLI, the daemon, the UI with
+the production identity `dev.cagents.Cagents` and without the integrated
+browser, and the dictation helper, linked against the pinned sherpa-onnx static
+libraries. The UI and the helper carry an embedded `Info.plist` section, so the
+microphone permission prompt names cagents and its purpose.
+
+The archive holds one version tree laid out as on Linux, so the install guard
+reads it the same way, as companion lookup and the updater will once they
+support macOS:
+
+```
+cagents-VERSION/bin/{cagents,cagents-ui,cagentsd,cagents-dictate}
+cagents-VERSION/Cagents.app
+cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
+```
+
+`install-macos.sh` installs it under `~/Library/Application Support/cagents-install`
+(`--prefix` overrides it):
+
+- `versions/VERSION/` is the tree, and `current` links to the version that
+  serves. The installer switches it atomically, keeps the version it replaced
+  for rollback (named in `.previous`), and removes older trees that no running
+  process uses, or none when `lsof` cannot tell.
+- `Cagents.app` is a stable launcher bundle. Its executable, a small C program
+  (`packaging/macos/launcher.c`), runs the real path of `current/bin/cagents-ui`.
+  Launch Services and the Dock keep one application across updates, because
+  the bundle they know never moves. `~/Applications/Cagents.app` links
+  to it; Spotlight and Launchpad may not list a link, so open it from
+  `~/Applications` or keep it in the Dock.
+- `~/.local/bin/cagents` links to `current/bin/cagents`.
+- `~/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist` runs
+  `cagents daemon start` once at login. It resolves `current/bin` to the
+  selected version before starting the CLI, so the same login item works
+  after an update. The daemon outlives the job and `cagents daemon stop`
+  stops it.
+
+The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
+the release's members, refuses links in the tree, and checks every signature in
+a private staging directory. Quit all cagents windows and stop the daemon
+before replacing or removing an installation. The installer holds the
+application launch fence while it checks for a running daemon and changes the
+installation. A per-user publication lock also excludes a second installer
+even when it uses another runtime directory. The installer starts the selected
+daemon after releasing both locks, unless `--no-start` is set.
+
+The release tree and bundle are staged on the prefix's volume. The login item
+is staged beside the one it replaces, so it can be published by rename even when
+the prefix is on another volume. The installer checks that each program runs
+from its version tree before it switches `current`, the bundle, the links and
+the login item. Renaming the record of the previous version commits the
+installation. Before that commit, error handling and soft signals roll back
+the publication.
+
+`--uninstall` uses the installed CLI to acquire the fence, then removes the
+installation, its links and its login item. `--purge` also removes saved app
+data. Use an older release's own installer if its CLI predates this command.
+Only installations under the account's own home register `Cagents.app` with
+Launch Services. The installer unloads its previous login job during
+publication. The new job runs at the next login. The package smoke test
+installs under a private `HOME` and starts its isolated daemon directly.
+
+Every executable and the bundle are signed ad hoc (`codesign --sign -`), which
+Apple Silicon requires to run anything. Files that `curl`, `tar` or
+`install-macos.sh` download carry no quarantine attribute, so Gatekeeper does
+not assess them. A browser download is quarantined, and the installer clears
+the attribute on the tree it installs. Gatekeeper blocks an ad hoc signed app
+opened from a quarantined download, as from a disk image, which is why the
+release installs from a terminal.
+
+Notarization, which would let people open a downloaded app without a warning,
+needs an Apple Developer ID Application certificate and an App Store Connect
+API key for `notarytool`. Signing would use `codesign --options runtime
+--timestamp --sign "Developer ID Application: ..."` on each executable and
+then the bundle, with the `com.apple.security.device.audio-input` entitlement
+on the dictation helper, whose microphone the hardened runtime otherwise
+denies. The notary service takes a zip, disk image or package, not a tarball:
+the signed tree would be zipped with `ditto -c -k --keepParent`, submitted
+with `xcrun notarytool submit --wait`, and the ticket stapled to `Cagents.app`
+with `xcrun stapler staple` before the release archive is made. A bare
+executable cannot hold a stapled ticket, so Gatekeeper would look the CLI's up
+online. None of this is set up, and the credentials would stay outside source and build
+artifacts like the release signing key.
+
+To cut a release with the macOS build, give `cut` or `build` the Mac with
+`--macos-host MAC` (or `CAGENTS_RELEASE_MACOS_HOST`). The release exports the
+commit to a private staging directory on the Mac and runs that commit's
+`scripts/package-macos`. The packager builds, signs and installs the package in
+a private home and prefix to check the commands, bundle and login item. Cut
+brings the three files into the bundle before writing and signing the metadata.
+The Mac removes the staged source and keeps the shared Cargo target in
+`~/Library/Caches/cagents-release/target` for later builds. The publisher
+then requires all three files, checks `SHA256SUMS-macos` and the archive's
+members, and adds a macOS section to the release notes. GitHub Actions builds
+no macOS release yet.
+
+To build and smoke-test macOS while fw16 prepares Linux, run
+`scripts/release prepare-macos --commit SHA --macos-host macbook`. Use the
+same SHA and host for `scripts/release cut --commit SHA --macos-host macbook`.
+The prepared assets are under `$CAGENTS_RELEASE_BUNDLES/.prepared-macos`
+and remain available for later cuts. Cut checks the source commit and asset
+digests before using them. If preparation is missing or damaged, cut builds
+and smoke-tests macOS on the selected host. Cut still requires the passing
+fw16 verdict and Linux bundle for that same commit. When cut waits for main's
+tip and the exact tip already has a passing test verdict, it prepares macOS
+while waiting for the Linux bundle.
 
 ## Native platform roadmap
 
@@ -98,7 +230,7 @@ need to be established for each target.
 | Linux x86_64 GNU | Supported local build/package lane | Keep matched full, browserless and editor artifacts and native smoke coverage |
 | Windows x64 | No supported native application or package | Qualify runtime and companion discovery before choosing installer layout |
 | Windows ARM64 | Unqualified; inclusion undecided | Choose support policy and qualify dependencies/toolchains before enabling artifacts |
-| macOS Apple Silicon | No supported native application or bundle | Qualify runtime before implementing `.app` layout and installation |
+| macOS Apple Silicon | Packaging, installer and release lane ([macOS](#macos)); the daemon and UI ports are in progress | Qualify the native runtime, then publish the first release with the macOS build |
 | macOS Intel | Unqualified; inclusion undecided | Explicitly choose support policy; an Apple Silicon build does not validate Intel |
 
 Each new target progresses through the following gates. Passing an isolated
@@ -140,18 +272,21 @@ contract remain Linux-specific until a qualified target has its own contract.
 
 ## Publishing
 
-A release signs and publishes a bundle the build host has already built and
-smoke-tested: fw16 prebuilds main's newest compiled commit in the background
+For the local signing path, fw16 prebuilds and smoke-tests main's newest
+compiled commit in the background
 ([Prebuilding release bundles](development.md#prebuilding-release-bundles)).
 Main always declares the next version: publishing a release opens and lands the
 pull request that starts the next patch version. A release goes out in three
-steps, each through `mise run release` (`scripts/release --help`):
+steps, each through `mise run release` (`scripts/release --help`). From 0.2.5
+on, GitHub Actions builds and signs it instead, and it is published once its
+draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
 
 1. `mise run release -- cut --key KEY` picks the newest bundle of main whose
    tests passed in main's sentinel. It shows how many commits that bundle is
    behind main and offers to wait for a prebuild of the tip instead; `--wait`
    waits without asking, building the tip at normal priority while its tests
-   run beside it. `--commit SHA` picks a particular bundle. It then:
+   run beside it. A failed or unavailable test verdict ends that wait.
+   `--commit SHA` picks a particular bundle. It then:
    - copies the bundle to `~/.local/state/cagents-release/VERSION`, where
      VERSION is the one the commit declares;
    - checks every file against the size and digest recorded when it was built
@@ -163,7 +298,52 @@ steps, each through `mise run release` (`scripts/release --help`):
    - signs the metadata with KEY (or `CAGENTS_RELEASE_SIGNING_KEY`); touch the
      security key when it asks. Without a key, it prints the signing command
      (see [Signing](#signing)).
-2. Rehearse the update from the previous release through a file feed (below).
+2. `mise run release -- rehearse VERSION` rehearses installed cagents updating
+   from the newest published release to the signed cut, on the build host,
+   the way a person updates in the app. It uses the released commit's
+   `scripts/rehearse-update`
+   ([Rehearsing an update](development.md#rehearsing-an-update)):
+   - a private user with its own headless desktop installs the published
+     release;
+   - it opens three windows, one holding nothing, and seeds chats, agents, a
+     channel, terminals with a long-lived child and a chat whose provider has
+     already stopped;
+   - the published build's own updater finds the cut in a file feed made
+     from the cut bundle, checks its signature against the release keys, and
+     updates;
+   - it requires every pane, chat, agent and terminal to survive, NEW to
+     serve, the windows to reopen on NEW, and no reopened window to show
+     "Update failed" or "Update not installed";
+   - then, as after a reboot, it closes the windows, stops NEW's daemon and
+     reopens them, and requires the same again.
+
+   It takes about 12 minutes, plus the published release's download the
+   first time. Interrupting it stops the run on the host too. The options
+   it passes come from this checkout and the harness from the cut commit, so
+   a cut older than the harness options (#3919, #3938) is refused by them.
+
+   Either way the update must end `Complete` with no refusal. A reopened
+   window reports anything else as "Update failed" or "Update not installed",
+   even when the work survived. In the app it is the published build's worker
+   that writes that status, so a worker that refuses the cut's protocol after
+   a good install fails the rehearsal (#3877). With `--staged` it instead runs
+   the cut's own staged `cagents daemon upgrade`, which needs no signature.
+
+   The rehearsal's private user goes in `/var/tmp/cr/release-VERSION` on the
+   host. If `/var/tmp` has a `.git` above it, such as the empty mountpoints
+   a sandbox masking `.git` leaves behind, it goes in `/dev/shm/cr` instead.
+   It takes about 700 MB and is removed once the rehearsal passes; the
+   report is kept in `~/.cache/cagents-release-rehearsal/passed-VERSION.txt`,
+   headed, for the in-app update, by the SHA-256 of the metadata the update
+   read and the release it updated from; a staged pass has no such header.
+   A later rehearsal of the version removes it as soon as it starts on the
+   host, so only the latest outcome stands. If a
+   `.git` appears above the root while the rehearsal runs, a failure says
+   so instead of reporting it as a regression, and you rehearse again. A
+   rehearsal that fails in `/var/tmp` keeps its report, records and
+   screenshots there until the next rehearsal of that version replaces them.
+   One that fails in `/dev/shm`, which is memory, keeps only its report and
+   screenshots, in `~/.cache/cagents-release-rehearsal/failed-VERSION`.
 3. `mise run release -- publish VERSION` asks you to type the version, then
    runs `scripts/publish-release --push-tag`. It checks the signature against
    the keys the tag lists, the metadata against every asset, the checksums,
@@ -230,12 +410,189 @@ Prefer a security key: hosted agents run as the same user and can read a key
 file, but cannot touch a security key. Do not load a release key into a
 long-lived `ssh-agent`, which would sign for any process of the user.
 
-To replace a key, publish a release signed by the old key whose
-`release-keys.pub` lists the new one. To withdraw a compromised key, publish a
-release, signed by a remaining key, that no longer lists it. A build trusts
-exactly the keys it was built with, so builds that have not yet installed that
-release keep trusting the withdrawn key, and its holder can still sign updates
-for them until they do.
+`release-metadata.json.sig` may hold several signatures, one after another
+(at most four, nothing else). Builds from 0.2.4 on accept it when one is by a
+key they trust.
+
+### Trust generations
+
+Every release must be verifiable by every build that is offered it, or that
+build is stranded with no way to update. Releases therefore belong to trust
+generations, numbered by `GENERATION` in `src/update/feed.rs`. A build reads
+only its own generation's metadata name: `release-metadata.json` for
+generation 1 (up to 0.2.3, which also accepts only one signature),
+`release-metadata-2.json` for generation 2 (from 0.2.4), and so on.
+
+A release publishes its own metadata under its generation's name. Under each
+older generation's name it carries the metadata of the release that began the
+next generation, byte for byte. A build of an older generation is offered that
+release, installs it, and from there reaches the current one. Each step is
+signed with a key the build taking it already trusts. 0.2.4 begins generation
+2: every later release carries 0.2.4's metadata as `release-metadata.json`.
+Never delete a release that began a generation.
+
+`publish-release` refuses a release that would strand anyone. It counts the
+releases published on GitHub, read from their tags in the checkout;
+`--verify-only` counts every release tag in the tagged history.
+
+- Its signature must verify with the keys of its tagged source, and with those
+  of every earlier release tag of its generation.
+- A release that begins a generation must verify with the keys of every
+  release of the generation before. When that generation is 1, it must hold
+  exactly one signature.
+- A generation follows the one before it, never skipping one or going back.
+- The metadata it carries for older generations must be the one their
+  generation's successor published, signed as those builds read it. For
+  publication, it downloads them from GitHub and compares any `--bridge DIR`
+  copy. `--verify-only` reads them from `--bridge DIR`, which holds them under
+  their published names.
+
+`cagents upgrade VERSION` run on an older generation, for a version past its
+bridge, reads the bridge's metadata and refuses it; it updates to the bridge
+first. `release-metadata feed --generation G --bridge DIR` lays out a file
+feed the same way, for rehearsing the two-step update.
+
+Within a generation, every release must carry a signature by a key that
+every earlier release of the generation trusts. A key added partway through a
+generation is therefore only a co-signer: releases must still also be signed
+by an older key. A key is a sole signer only from the start of a generation,
+so the Actions key is listed from 0.2.4, the first release of generation 2.
+To drop a key,
+including a compromised one, begin a new generation: raise `GENERATION`, add
+its name to `GENERATIONS`, and remove the key from `release-keys.pub`. Sign
+that release with a key that every build of the current generation trusts,
+such as the security key, then sign later releases with the remaining keys.
+Builds that have not yet installed it still trust the dropped key, and its
+holder can sign updates for them until they do.
+
+### Signing in GitHub Actions
+
+From 0.2.5 on, releases are built and signed by the Release workflow
+(`.github/workflows/release.yml`) with a plain `ssh-ed25519` key that only
+GitHub holds, so releasing needs no touch. The workflow leaves the signed
+release as a draft, which is published only once its update has been
+rehearsed. The security key stays listed in `release-keys.pub` as the
+recovery key, and signs locally whatever Actions may not:
+
+1. `mise run release -- cut --actions` picks the commit as above and tags it
+   `vVERSION` locally. It copies and signs nothing.
+2. `mise run release -- publish VERSION --actions` checks the tag as the
+   workflow's admission will. If eligible, it requires the tagged commit's
+   passing test verdict on fw16 and records it as the `cagents/fw16-tests`
+   commit status before pushing the tag. The publishing account needs write
+   access to commit statuses. The push starts the workflow, and the command
+   prints its page and what to run next. It exits non-zero until the release
+   is published. If a pushed tag is missing its passing status, run this
+   command again to record it, then rerun the failed Release workflow.
+3. Once the workflow has left the draft, `mise run release -- rehearse
+   VERSION --from-draft` rehearses the in-app update to it, as
+   [Publishing](#publishing) describes. It refuses while the tag's workflow
+   run is still going, or if it did not succeed. The build host downloads the
+   draft itself, so `gh` there must be logged in with access to the
+   repository's drafts (push access). It serves the draft in a file feed under
+   its published names, so the published build reads the same metadata names,
+   signatures and bridges it will read from GitHub. A pass records the
+   SHA-256 of the draft's own metadata, which names every file's digest, and
+   the release it updated from.
+4. `mise run release -- publish VERSION --actions` again reads that record
+   from the build host and, after you type the version (or with `--yes`),
+   runs `scripts/publish-release --promote SHA256`. It refuses if the newest
+   published release is no longer the one the rehearsal updated from. It
+   downloads the draft, repeats every check on it except the smoke install,
+   which the workflow ran, and compares what it serves under the older
+   generations' names with what the bridge release publishes. It refuses unless the draft's metadata
+   has the rehearsed digest and its assets are unchanged since it read
+   them, then publishes the draft and lands the next version's bump as
+   `publish` does. With no passing rehearsal of that draft it refuses and
+   says to rehearse it.
+
+The workflow's jobs:
+
+- **admit** proceeds only for a tag on a commit on main whose manifests declare
+  the tag's version, which is newer than every published release and not
+  published itself. It admits the tag for signing only when all of these hold:
+  - the tag does not begin a trust generation;
+  - every published release of its generation trusts the Actions key, as
+    `publish-release` requires;
+  - the tagged `release-keys.pub` lists exactly the repository variable
+    `RELEASE_TRUSTED_KEYS`;
+  - the exact tagged commit has a passing `cagents/fw16-tests` status.
+
+  The release is cut, signed and published locally for 0.2.4, for any change
+  of trusted keys or generation, and when no Actions key is configured.
+- **build** has no secrets. It builds, packages and smoke-tests the tagged
+  source with `scripts/build-release-linux`, as fw16 does.
+- **sign** is the only job that can read the key: the environment secret
+  `RELEASE_SIGNING_KEY` of the `release` environment, which deploys only from
+  `v*` tags. It checks this run's bundle against its metadata, version and
+  commit, signs the metadata in memory-backed storage, and checks the signature
+  against `RELEASE_SIGNING_PUBLIC_KEY`.
+- **publish** runs `scripts/publish-release --draft` with the workflow's
+  token. It repeats every check, including the keys of every build that reads
+  the release and the bridges it carries, uploads the release as a draft,
+  compares the bytes GitHub serves, and publishes nothing.
+
+Run by hand (`gh workflow run release.yml --ref main`), the workflow only
+builds that commit, to rehearse a release build; nothing is signed.
+
+One-time setup, by the repository owner. First make a fine-grained personal
+access token at <https://github.com/settings/personal-access-tokens/new>:
+
+- Repository access: only `CarsonBurke/cagents`.
+- Expiration: one day.
+- Repository permissions: Environments and Variables, read and write.
+
+Then run:
+
+```sh
+repo=CarsonBurke/cagents
+# The environment that holds the key, usable only from release tags.
+gh api -X PUT repos/$repo/environments/release --input - <<< \
+  '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
+gh api -X POST repos/$repo/environments/release/deployment-branch-policies -f name='v*' -f type=tag
+# Release tags cannot be moved or deleted.
+gh api -X POST repos/$repo/rulesets --input - <<< \
+  '{"name":"Release tags","target":"tag","enforcement":"active","conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"update"}]}'
+# The token, usable only by a workflow on main.
+gh api -X PUT repos/$repo/environments/release-keygen --input - <<< \
+  '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
+gh api -X POST repos/$repo/environments/release-keygen/deployment-branch-policies -f name=main -f type=branch
+gh secret set RELEASE_KEYGEN_TOKEN --env release-keygen -R $repo   # paste the token
+# Make the key inside a workflow run, so nobody sees its private half.
+gh workflow run release-signing-key.yml -R $repo --ref main
+```
+
+The Release signing key workflow (`scripts/release-actions keygen`) refuses
+if a key exists. It stores the private key as the `release` environment's
+secret. It stores the public key, and the keys releases may trust, as the
+repository variables `RELEASE_SIGNING_PUBLIC_KEY` and `RELEASE_TRUSTED_KEYS`.
+However it ends, it deletes `RELEASE_KEYGEN_TOKEN`. It then prints the line to
+add to `release-keys.pub`. GITHUB_TOKEN cannot write secrets, hence the
+temporary token; revoke it once the run is done. Merge that line before
+cutting 0.2.4, which the security key signs. From 0.2.5 on, Actions signs.
+
+The rehearsal record lives on the build host, which agents running as the
+same user can write, and promotion uses your own `gh` login. It stops a
+release from being published before its update was rehearsed, or with other
+bytes than were rehearsed, by mistake; like the checks above, it does not stop
+someone who can already publish on GitHub.
+
+What this does not protect against: GitHub, and whoever can administer the
+repository, are trusted. A holder of an admin or write token can push a tag
+whose workflow is changed, change the environment's policy, or have a job
+print the secret, and so sign any release. The checks above stop mistakes
+and a tag off main, not a determined administrator.
+
+To recover from a leaked Actions key:
+
+1. Delete the secret and the variables.
+2. Run the key workflow again for a new key.
+3. Begin a new trust generation (above) whose `release-keys.pub` lists the
+   security key and the new key, but not the leaked one. Set
+   `RELEASE_TRUSTED_KEYS` to that list, then cut, sign with the security key,
+   and publish it locally.
+
+Releases after it are signed in Actions again.
 
 A signature proves who made a release, not that it is the newest. Whoever can
 publish on GitHub can point `latest` at an older signed release: installed

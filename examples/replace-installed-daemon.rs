@@ -179,6 +179,7 @@ fn verify_process(pid: u32, ticks: u64, executable: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(target_os = "linux")]
 fn socket_pid(socket: &Path) -> Result<u32> {
     let stream = UnixStream::connect(socket)?;
     let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
@@ -203,6 +204,39 @@ fn socket_pid(socket: &Path) -> Result<u32> {
         return Err(fail("daemon socket has invalid peer credentials"));
     }
     Ok(credentials.pid as u32)
+}
+/// Darwin has no `SO_PEERCRED`: the uid comes from `getpeereid` and the pid
+/// from `LOCAL_PEERPID`, both recorded when the peer connected.
+#[cfg(target_os = "macos")]
+fn socket_pid(socket: &Path) -> Result<u32> {
+    let stream = UnixStream::connect(socket)?;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid writes only into these two live integers.
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `length` bytes into this live pid.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    if length as usize != std::mem::size_of::<libc::pid_t>()
+        || uid != unsafe { libc::getuid() }
+        || pid <= 0
+    {
+        return Err(fail("daemon socket has invalid peer credentials"));
+    }
+    Ok(pid as u32)
 }
 fn verify_old(client: &mut ControlClient, socket: &Path, args: &Args) -> Result<()> {
     if socket_pid(socket)? != args.old_pid
@@ -332,7 +366,7 @@ fn log_impact(impact: &DaemonImpact) {
             "  {}: {}: {}",
             session.id,
             session.disposition.label(),
-            session.reason.escape_debug()
+            session.reason.as_str().escape_debug()
         );
     }
     for blocker in &impact.blockers {

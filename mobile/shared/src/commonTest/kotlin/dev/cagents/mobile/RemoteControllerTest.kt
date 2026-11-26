@@ -1,0 +1,939 @@
+package dev.cagents.mobile
+
+import dev.cagents.mobile.client.ConnectFailure
+import dev.cagents.mobile.client.ConnectionLost
+import dev.cagents.mobile.client.ConnectionState
+import dev.cagents.mobile.client.ControllerConfig
+import dev.cagents.mobile.client.RemoteController
+import dev.cagents.mobile.client.RemoteState
+import dev.cagents.mobile.client.RequestFailed
+import dev.cagents.mobile.protocol.Activity
+import dev.cagents.mobile.protocol.Call
+import dev.cagents.mobile.protocol.DetailKind
+import dev.cagents.mobile.protocol.ImageAttachment
+import dev.cagents.mobile.protocol.ErrorCode
+import dev.cagents.mobile.protocol.FieldAnswer
+import dev.cagents.mobile.protocol.ItemBody
+import dev.cagents.mobile.protocol.SendMode
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.long
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlin.random.Random
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertIs
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+private const val S = "8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"
+
+private fun sessionsEvent(activity: String) =
+    """{"type":"event","event":"sessions","data":{"sessions":[{"id":"$S","lineage":"$S","surface":"chat","title":"Fix the build","activity":"$activity","exited":false,"watchable":true,"new_field":{"x":1}}]}}"""
+
+private fun conversation(
+    reset: Boolean,
+    order: String?,
+    items: String,
+    appends: String = "[]",
+    busy: Boolean = true,
+    checkpoint: String? = null,
+) =
+    """{"type":"event","event":"conversation","data":{"session":"$S","reset":$reset,""" +
+        (checkpoint?.let { """"read_checkpoint":"$it",""" } ?: "") +
+        """"state":{"activity":"working","busy":$busy,"ready":true,"exited":false,"has_earlier":false,"loading_earlier":false},""" +
+        (order?.let { """"order":$it,""" } ?: "") +
+        """"items":$items,"appends":$appends}}"""
+
+private fun text(id: String, text: String, role: String = "assistant") =
+    """{"id":"$id","role":"$role","kind":"text","text":"$text","thinking":false,"commentary":false}"""
+
+@OptIn(ExperimentalCoroutinesApi::class) // runCurrent
+class RemoteControllerTest {
+    private val bridge = FakeBridge()
+
+    private fun TestScope.controller(config: ControllerConfig = ControllerConfig(pingInterval = 10.hours)) =
+        RemoteController(backgroundScope, bridge, config, Random(1), testScheduler.timeSource)
+
+    private suspend fun RemoteController.await(predicate: (RemoteState) -> Boolean): RemoteState =
+        state.first(predicate)
+
+    @Test
+    fun connectsAndFollowsSessionsAndNotifications() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.send(sessionsEvent("working"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.send("""{"type":"event","event":"notifications","data":{"notices":[{"id":"n1","kind":"waiting","title":"Agent needs your attention","session":"$S","request":"approval"}]}}""")
+        connection.send("""{"type":"event","event":"from_the_future","data":{}}""")
+
+        val state = controller.await { it.sessions != null && it.notices.isNotEmpty() }
+        assertEquals(ConnectionState.Connected, state.connection)
+        assertEquals("workstation", state.welcome?.host)
+        assertEquals(Activity.Working, state.sessions!!.single().activity)
+        assertEquals("n1", state.notices.single().id)
+
+        connection.send(sessionsEvent("waiting"))
+        controller.await { it.sessions?.single()?.activity == Activity.Waiting }
+    }
+
+    @Test
+    fun suspendsOverviewWatchesWhileTheAppIsInTheBackground() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.send(sessionsEvent("working"))
+        controller.await { it.sessions?.single()?.activity == Activity.Working }
+
+        controller.setForeground(false)
+        connection.ok(connection.expect("sessions.unwatch"))
+        connection.ok(connection.expect("notifications.unwatch"))
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        controller.setForeground(true)
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.send(sessionsEvent("idle"))
+        controller.await { it.sessions?.single()?.activity == Activity.Idle }
+        assertEquals(1, bridge.opens)
+    }
+
+    @Test
+    fun backgroundUnwatchesBothTopicsBeforeDelayedWatchReplies() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        val sessions = connection.expect("sessions.watch")
+        val notifications = connection.expect("notifications.watch")
+
+        controller.setForeground(false)
+        val stopSessions = connection.expect("sessions.unwatch")
+        val stopNotifications = connection.expect("notifications.unwatch")
+        // Both detaches were sent before any earlier acknowledgement arrived.
+        connection.ok(sessions)
+        connection.ok(notifications)
+        connection.ok(stopSessions)
+        connection.ok(stopNotifications)
+        runCurrent()
+        assertTrue(connection.isQuiet())
+    }
+
+    @Test
+    fun backgroundUnwatchesAConversationBeforeItsDelayedWatchReply() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        val watch = connection.expect("conversation.watch")
+
+        controller.setForeground(false)
+        val stop = connection.expect("conversation.unwatch")
+        assertEquals(S, stop.params["session"]!!.jsonPrimitive.content)
+        connection.error(watch, "not_watching", "The watch stopped before it opened.")
+        connection.ok(stop)
+        runCurrent()
+        assertNull(controller.state.value.conversations[S]?.ended)
+    }
+
+    @Test
+    fun followsAStreamingConversation() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        val watch = connection.expect("conversation.watch")
+        assertEquals(S, watch.params["session"]!!.jsonPrimitive.content)
+        connection.ok(watch)
+        connection.send(conversation(reset = true, order = """["u","a"]""", items = "[${text("u", "Fix it", "user")},${text("a", "On it")}]"))
+        connection.send(conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":5,"text":", done.","at":9}]"""))
+        connection.send(conversation(reset = false, order = """["u","a","c"]""", items = """[{"id":"c","role":"assistant","kind":"command","label":"","command":"ls","action":"list","status":"running","output":"","clipped":false}]"""))
+
+        val held = controller.await { (it.conversations[S]?.items?.size ?: 0) == 3 }.conversations.getValue(S)
+        assertEquals(listOf("u", "a", "c"), held.items.map { it.id })
+        assertEquals("On it, done.", (held.items[1].body as ItemBody.Text).text)
+        assertEquals(9L, held.items[1].at)
+        assertIs<ItemBody.Command>(held.items[2].body)
+    }
+
+    @Test
+    fun fetchesOnlyRequestedPagesAndNeverDropsAnAttachmentOnAnOldBridge() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        val detail = Call.ReadDetail(S, "command", DetailKind.Output)
+        val first = async { controller.readDetail(detail) }
+        val request = connection.expect("conversation.output")
+        assertNull(request.params["cursor"])
+        fun respond(request: kotlinx.serialization.json.JsonObject, body: String) {
+            val id = request["id"]!!.jsonPrimitive.long
+            connection.send("""{"type":"ok","id":$id,"page":$body}""")
+        }
+        respond(request, """{"kind":"output","text":"First","next":"two"}""")
+        val page = first.await()
+        assertEquals("First", page.text)
+        assertTrue(connection.isQuiet())
+
+        val second = async { controller.readDetail(detail.copy(cursor = page.next)) }
+        val next = connection.expect("conversation.output")
+        assertEquals("two", next.params["cursor"]!!.jsonPrimitive.content)
+        respond(next, """{"kind":"output","text":"Second"}""")
+        assertEquals("Second", second.await().text)
+
+        val sending = async {
+            runCatching { controller.send(S, "Look here", SendMode.Queue, ImageAttachment("image.png", "aW1hZ2U=")) }
+        }
+        val image = connection.expect("conversation.send_image")
+        assertEquals("aW1hZ2U=", image.params["png_base64"]!!.jsonPrimitive.content)
+        assertEquals("queue", image.params["mode"]!!.jsonPrimitive.content)
+        connection.error(image, "unknown_op", "Update cagents.")
+        assertEquals(ErrorCode.UnknownOp, assertIs<RequestFailed>(sending.await().exceptionOrNull()).code)
+        assertTrue(connection.isQuiet())
+    }
+
+    @Test
+    fun backgroundDetachesWhileADetailReadIsWaiting() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        val pending = async { runCatching { controller.readDetail(Call.ReadDetail(S, "command", DetailKind.Output)) } }
+        val detail = connection.expect("conversation.output")
+
+        controller.setForeground(false)
+        val unwatch = connection.expect("conversation.unwatch")
+        assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
+        connection.ok(unwatch)
+        connection.error(detail, "unavailable", "The conversation stopped being followed.")
+        assertEquals(ErrorCode.Unavailable, assertIs<RequestFailed>(pending.await().exceptionOrNull()).code)
+    }
+
+    @Test
+    fun watchesAgainWhenAnAppendDoesNotLineUp() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+
+        // The held text is 5 code units long, not 7: an update was missed.
+        connection.send(conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":7,"text":"!"}]"""))
+        val again = connection.expect("conversation.watch")
+        assertEquals(S, again.params["session"]!!.jsonPrimitive.content)
+        assertEquals("Hello", (controller.state.value.conversations.getValue(S).items.single().body as ItemBody.Text).text)
+    }
+
+    @Test
+    fun sendsSteersAnswersAndReportsErrors() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+
+        val send = async { controller.send(S, "Run clippy too", SendMode.Steer) }
+        val request = connection.expect("conversation.send")
+        assertEquals("steer", request.params["mode"]!!.jsonPrimitive.content)
+        assertEquals("Run clippy too", request.params["text"]!!.jsonPrimitive.content)
+        connection.ok(request)
+        send.await()
+
+        val answer = async { runCatching { controller.answer(S, "r1", "deny", listOf(FieldAnswer("reason", listOf("later")))) } }
+        val answerRequest = connection.expect("conversation.answer")
+        assertEquals("deny", answerRequest.params["action"]!!.jsonPrimitive.content)
+        val answers = answerRequest.params["answers"]!!.jsonArray
+        assertEquals("later", answers.single().jsonObject["values"]!!.jsonArray.single().jsonPrimitive.content)
+        connection.error(answerRequest, "not_watching", "Open the conversation before acting on it.")
+        val failure = assertIs<RequestFailed>(answer.await().exceptionOrNull())
+        assertEquals(ErrorCode.NotWatching, failure.code)
+        assertEquals("Open the conversation before acting on it.", failure.message)
+
+        val interrupt = async { runCatching { controller.interrupt(S) } }
+        connection.error(connection.expect("conversation.interrupt"), "something_new", "Not now.")
+        assertEquals(ErrorCode.Unknown, assertIs<RequestFailed>(interrupt.await().exceptionOrNull()).code)
+    }
+
+    @Test
+    fun reconnectsWithBackoffAndWatchesAgain() = runTest {
+        val controller = controller()
+        controller.open(S)
+        controller.start()
+        val first = bridge.acceptWelcomed()
+        first.ok(first.expect("conversation.watch"))
+        first.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+
+        first.send("""{"type":"event","event":"closing","data":{"message":"The computer's cagents daemon is stopping."}}""")
+        first.hangUp()
+        val retrying = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertEquals("The computer's cagents daemon is stopping.", retrying.message)
+        assertEquals(1, retrying.attempt)
+        assertTrue(retrying.delay in 0.8.seconds..1.2.seconds)
+
+        bridge.refusals += ConnectFailure.Network("No route to host")
+        val second = controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 2 }.connection
+        assertTrue((second as ConnectionState.Retrying).delay in 1.6.seconds..2.4.seconds)
+
+        val reconnected = bridge.acceptWelcomed()
+        reconnected.ok(reconnected.expect("conversation.watch"))
+        reconnected.send(conversation(reset = true, order = """["a","b"]""", items = "[${text("a", "Hello")},${text("b", "Back")}]"))
+        val state = controller.await { it.conversations[S]?.items?.size == 2 }
+        assertEquals(ConnectionState.Connected, state.connection)
+        assertEquals(3, bridge.opens)
+    }
+
+    @Test
+    fun keepsWhyTheLastAttemptFailedInViewWhileTheNextRuns() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Network("Couldn't reach fw16. Is this phone on Tailscale?")
+        controller.start()
+        controller.await { it.connection is ConnectionState.Retrying }
+
+        // The next attempt reaches the bridge, which hasn't answered yet.
+        val pending = bridge.accept()
+        assertEquals(
+            ConnectionState.Connecting("Couldn't reach fw16. Is this phone on Tailscale?"),
+            controller.state.value.connection,
+        )
+        pending.next()
+        pending.send("""{"type":"welcome","api":1,"server_version":"0.2.3","host":"workstation"}""")
+        controller.await { it.connection == ConnectionState.Connected }
+    }
+
+    @Test
+    fun aDroppedConnectionsReasonShowsWhileReconnecting() = runTest {
+        val controller = controller()
+        controller.start()
+        val first = bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+        first.send("""{"type":"event","event":"closing","data":{"message":"The computer's cagents daemon is stopping."}}""")
+        first.hangUp()
+
+        bridge.accept()
+        assertEquals(
+            ConnectionState.Connecting("The computer's cagents daemon is stopping."),
+            controller.state.value.connection,
+        )
+    }
+
+    @Test
+    fun aRetryAfterTheyActStartsWithoutTheOldFailure() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Unauthorized("marvin@fw16 didn't accept this phone's key.")
+        controller.start()
+        controller.await { it.connection is ConnectionState.NeedsAction }
+
+        controller.retryNow()
+        bridge.accept()
+        assertEquals(ConnectionState.Connecting(), controller.state.value.connection)
+    }
+
+    @Test
+    fun showsEveryReasonAsASentence() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Network("  ")
+        bridge.refusals += ConnectFailure.Network("No route to host")
+        controller.start()
+        val blank = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertEquals("The connection failed.", blank.message)
+        val bare = controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 2 }.connection
+        assertEquals("No route to host.", (bare as ConnectionState.Retrying).message)
+    }
+
+    @Test
+    fun firstAttemptHasNoFailureToShow() = runTest {
+        val controller = controller()
+        controller.start()
+        bridge.accept()
+        assertEquals(ConnectionState.Connecting(), controller.state.value.connection)
+    }
+
+    @Test
+    fun givesUpOnAComputerThatNeverAnswers() = runTest {
+        val controller = controller()
+        bridge.hangs = 1
+        controller.start()
+        val retrying = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertTrue("didn't answer within 30 seconds" in retrying.message, retrying.message)
+        assertEquals(30.seconds, testScheduler.currentTime.milliseconds)
+        // And tries again, as for any network failure.
+        bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+    }
+
+    @Test
+    fun givesUpOnABridgeThatNeverSaysWelcome() = runTest {
+        val controller = controller()
+        controller.start()
+        val silent = bridge.accept()
+        silent.next() // hello, never answered
+        val retrying = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertTrue("cagents there didn't answer within 20 seconds" in retrying.message, retrying.message)
+        assertEquals(20.seconds, testScheduler.currentTime.milliseconds)
+        // The silent connection is closed rather than left behind.
+        assertTrue(silent.isClosedByClient())
+    }
+
+    /** A controller connected to a computer, following its sessions, a notice and conversation [S]. */
+    private suspend fun TestScope.following(): RemoteController {
+        val controller = controller()
+        controller.open(S)
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.send(sessionsEvent("working"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.send("""{"type":"event","event":"notifications","data":{"notices":[{"id":"n1","kind":"waiting","title":"Agent needs your attention","session":"$S","request":"approval"}]}}""")
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.sessions != null && it.notices.isNotEmpty() && it.conversations[S]?.loaded == true }
+        return controller
+    }
+
+    @Test
+    fun anotherComputerStartsWithNothingFromTheLast() = runTest {
+        val controller = following()
+        controller.restart(computerChanged = true)
+        assertEquals(RemoteState(), controller.state.value.copy(connection = ConnectionState.Offline))
+
+        val other = bridge.acceptWelcomed()
+        other.ok(other.expect("sessions.watch"))
+        other.ok(other.expect("notifications.watch"))
+        runCurrent()
+        // The last computer's conversation isn't watched on this one.
+        assertTrue(other.isQuiet())
+        val state = controller.await { it.connection == ConnectionState.Connected }
+        assertNull(state.sessions)
+        assertTrue(state.notices.isEmpty())
+        assertTrue(state.conversations.isEmpty())
+    }
+
+    @Test
+    fun overlappingRestartsLeaveOneConnectionThatWorks() = runTest {
+        val controller = following()
+        val first = async { controller.restart(computerChanged = true) }
+        val second = async { controller.restart(computerChanged = true) }
+        first.await()
+        second.await()
+        runCurrent()
+        // The connection the second restart ended, if the first got to make it, then the one that stays.
+        repeat(bridge.opens - 2) { bridge.accept() }
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        controller.await { it.connection == ConnectionState.Connected }
+        // Requests go to this connection, not to one closed under it.
+        controller.open(S)
+        assertEquals(S, connection.expect("conversation.watch").params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun theSameComputerKeepsItsConversationsAcrossARestart() = runTest {
+        val controller = following()
+        controller.restart()
+        assertTrue(S in controller.state.value.conversations)
+        val again = bridge.acceptWelcomed()
+        again.ok(again.expect("conversation.watch"))
+    }
+
+    @Test
+    fun waitsForThePersonWhenTheHostKeyIsUnknown() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.UnknownHostKey("SHA256:abc", "ssh-ed25519")
+        controller.start()
+        val state = controller.await { it.connection is ConnectionState.NeedsAction }
+        assertIs<ConnectFailure.UnknownHostKey>((state.connection as ConnectionState.NeedsAction).failure)
+        assertEquals(1, bridge.opens)
+
+        controller.retryNow()
+        bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+    }
+
+    @Test
+    fun refusesAnUnsupportedApiWithoutRetrying() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.accept()
+        connection.next()
+        connection.send("""{"type":"error","error":{"code":"unsupported_api","message":"Update the app."}}""")
+        val state = controller.await { it.connection is ConnectionState.NeedsAction }
+        val failure = (state.connection as ConnectionState.NeedsAction).failure
+        assertIs<ConnectFailure.Refused>(failure)
+        assertEquals("Update the app.", failure.message)
+    }
+
+    @Test
+    fun aMissedPingDropsTheConnection() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 25.seconds, pingTimeout = 5.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        // Never answer the ping.
+        assertEquals("ping", connection.next()["op"]!!.jsonPrimitive.content)
+        controller.await { it.connection is ConnectionState.Retrying }
+        assertTrue(connection.isClosedByClient())
+    }
+
+    @Test
+    fun anEndedConversationSaysWhy() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.error(connection.expect("conversation.watch"), "not_watchable", "This session runs in a terminal.")
+        val ended = controller.await { it.conversations[S]?.ended != null }
+        assertEquals("This session runs in a terminal.", ended.conversations.getValue(S).ended)
+
+        // Nothing to unwatch: opening it again goes straight to a new watch.
+        controller.close(S)
+        assertNull(controller.state.value.conversations[S])
+        controller.open(S)
+        assertEquals("conversation.watch", connection.nextRequest().op)
+    }
+
+    @Test
+    fun aWatchAnsweredUnavailableEndsTheConversation() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.error(connection.expect("conversation.watch"), "unavailable", "The conversation couldn't be loaded.")
+        val ended = controller.await { it.conversations[S]?.ended != null }
+        assertEquals("The conversation couldn't be loaded.", ended.conversations.getValue(S).ended)
+
+        controller.rewatch(S)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = "[]", items = "[]"))
+        controller.await { it.conversations[S]?.let { c -> c.loaded && c.ended == null } == true }
+    }
+
+    @Test
+    fun closingAndReopeningQuicklyWatchesAfresh() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+
+        controller.close(S)
+        controller.open(S)
+        // The reopened conversation needs a reset, and no unwatch may land after its watch.
+        val again = connection.nextRequest()
+        assertEquals("conversation.watch", again.op)
+        connection.ok(again)
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+
+        controller.close(S)
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+    }
+
+    private fun unreadable(reset: Boolean) =
+        """{"type":"event","event":"conversation","data":{"session":"$S","reset":$reset,"state":"from a newer cagents","items":[],"appends":[]}}"""
+
+    /** Opens the conversation and loads it with one text item, "Hello". */
+    private suspend fun FakeConnection.loadHello(controller: RemoteController) {
+        controller.open(S)
+        ok(expect("conversation.watch"))
+        send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        controller.await { it.conversations[S]?.loaded == true }
+    }
+
+    @Test
+    fun anUnreadableUpdateWatchesAgainAndSetsAsideWhatWasInFlight() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        connection.send(unreadable(reset = false))
+        val again = connection.expect("conversation.watch")
+        // Sent before the reset: neither applied nor a reason to give up.
+        connection.send(unreadable(reset = false))
+        connection.send(conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":5,"text":" there"}]"""))
+        connection.ok(again)
+        connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello there")}]"))
+        connection.send(conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":11,"text":"!"}]"""))
+
+        val held = controller.await {
+            (it.conversations[S]?.items?.singleOrNull()?.body as? ItemBody.Text)?.text == "Hello there!"
+        }.conversations.getValue(S)
+        assertNull(held.ended)
+        assertEquals(ConnectionState.Connected, controller.state.value.connection)
+    }
+
+    @Test
+    fun anUnreadableResetGivesUp() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        connection.send(unreadable(reset = false))
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(unreadable(reset = true))
+        val ended = controller.await { it.conversations[S]?.ended != null }.conversations.getValue(S)
+        assertEquals("Hello", (ended.items.single().body as ItemBody.Text).text)
+        assertTrue(ended.ended!!.contains("Update the app"))
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+        assertEquals(ConnectionState.Connected, controller.state.value.connection)
+    }
+
+    @Test
+    fun aConversationThatKeepsFallingOutOfStepEnds() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        val misaligned = conversation(reset = false, order = null, items = "[]", appends = """[{"id":"a","offset":7,"text":"!"}]""")
+        repeat(3) {
+            connection.send(misaligned)
+            connection.ok(connection.expect("conversation.watch"))
+            connection.send(conversation(reset = true, order = """["a"]""", items = "[${text("a", "Hello")}]"))
+        }
+        connection.send(misaligned)
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+        assertTrue(controller.state.value.conversations.getValue(S).ended!!.contains("out of step"))
+    }
+
+    @Test
+    fun aFailedWatchAgainStillUnwatchesOnClose() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        controller.rewatch(S)
+        connection.error(connection.expect("conversation.watch"), "unavailable", "Busy.")
+        controller.await { it.conversations[S]?.ended != null }
+        // The first watch may still stand on the server.
+        controller.close(S)
+        assertEquals("conversation.unwatch", connection.nextRequest().op)
+    }
+
+    @Test
+    fun anUnreadableSessionListAsksForAnUpdate() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.send("""{"type":"event","event":"sessions","data":{"sessions":"from a newer cagents"}}""")
+        val state = controller.await { it.connection is ConnectionState.NeedsAction }
+        assertIs<ConnectFailure.Refused>((state.connection as ConnectionState.NeedsAction).failure)
+        // Past the requests already sent, the app has closed the connection.
+        while (!connection.isClosedByClient()) continue
+    }
+
+    @Test
+    fun aConnectionThatDropsAtOnceKeepsBackingOff() = runTest {
+        val controller = controller()
+        controller.start()
+        bridge.acceptWelcomed().hangUp()
+        controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 1 }
+        bridge.acceptWelcomed().hangUp()
+        controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 2 }
+
+        // One that held for a while starts over.
+        val held = bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+        delay(11.seconds)
+        held.hangUp()
+        controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 1 }
+    }
+
+    @Test
+    fun aRequestInFlightFailsWhenTheConnectionDrops() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        val send = async { runCatching { controller.send(S, "hello", SendMode.Queue) } }
+        connection.expect("conversation.send")
+        connection.hangUp()
+        assertIs<ConnectionLost>(send.await().exceptionOrNull())
+    }
+
+    @Test
+    fun goingToTheBackgroundDisconnectsAfterTheGrace() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+        controller.setForeground(false)
+        controller.await { it.connection == ConnectionState.Offline }
+
+        controller.setForeground(true)
+        bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+    }
+
+    @Test
+    fun goingToTheBackgroundUnwatchesConversationsAtOnceButKeepsTheConnection() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        controller.setForeground(false)
+        val unwatch = connection.expect("conversation.unwatch")
+        assertEquals("conversation.unwatch", unwatch.op)
+        assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
+        connection.ok(unwatch)
+        assertEquals(ConnectionState.Connected, controller.state.value.connection)
+        assertEquals("Hello", (controller.state.value.conversations.getValue(S).items.single().body as ItemBody.Text).text)
+
+        // Back within the grace: the same connection watches it again, for what was missed.
+        controller.setForeground(true)
+        val pending = mutableSetOf("ping", "sessions.watch", "notifications.watch", "conversation.watch")
+        while (pending.isNotEmpty()) {
+            val request = connection.next()
+            pending.remove(request.op)
+            connection.ok(request)
+        }
+        assertEquals(1, bridge.opens)
+        connection.send(conversation(reset = true, order = """["a","b"]""", items = "[${text("a", "Hello")},${text("b", "Missed")}]"))
+        controller.await { it.conversations[S]?.items?.size == 2 }
+    }
+
+    @Test
+    fun aQuickSwitchAwayAndBackLeavesConversationsWatched() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        controller.setForeground(false)
+        controller.setForeground(true)
+        controller.open("other")
+        val requests = List(2) { connection.next().also(connection::ok) }
+        assertEquals(setOf("ping", "conversation.watch"), requests.map { it.op }.toSet())
+        val watch = requests.single { it.op == "conversation.watch" }
+        assertEquals("other", watch.params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun aBackgroundDisconnectWaitsForReturnAndKeepsTheOpenConversation() = runTest {
+        val controller = controller(ControllerConfig(
+            pingInterval = 10.hours,
+            backgroundGrace = 30.seconds,
+        ))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        val leftAt = testScheduler.currentTime
+        controller.setForeground(false)
+        advanceTimeBy(5.seconds)
+        connection.hangUp()
+        controller.await { it.connection == ConnectionState.Offline }
+        assertEquals(5.seconds, (testScheduler.currentTime - leftAt).milliseconds)
+        advanceTimeBy(15.seconds)
+        assertEquals(1, bridge.opens)
+        assertTrue(controller.state.value.conversations.getValue(S).loaded)
+
+        val returnedAt = testScheduler.currentTime
+        controller.setForeground(true)
+        val again = bridge.acceptWelcomed()
+        assertEquals(returnedAt, testScheduler.currentTime)
+        val watches = List(3) { again.nextRequest().also(again::ok).op }
+        assertEquals(setOf("sessions.watch", "notifications.watch", "conversation.watch"), watches.toSet())
+        again.send(conversation(reset = true, order = """["a","b"]""", items = "[${text("a", "Hello")},${text("b", "Back")}]"))
+        controller.await { it.conversations[S]?.items?.size == 2 }
+    }
+
+    @Test
+    fun returningChecksAnUnresponsiveConnectionBeforeTheNextKeepalive() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+
+        controller.setForeground(false)
+        connection.ok(connection.expect("sessions.unwatch"))
+        connection.ok(connection.expect("notifications.unwatch"))
+        advanceTimeBy(5.seconds)
+        assertTrue(connection.isQuiet())
+        val returnedAt = testScheduler.currentTime
+        // The socket accepts the resume probe, then stalls in its write.
+        connection.stallPingWrite = true
+        controller.setForeground(true)
+        while (connection.next().op != "ping") {
+            // Overview reattaches can reach the write lock before the probe.
+        }
+        bridge.acceptWelcomed()
+        assertEquals(5.seconds, (testScheduler.currentTime - returnedAt).milliseconds)
+        assertTrue(connection.isClosedByClient())
+        assertEquals(2, bridge.opens)
+    }
+
+    @Test
+    fun returningShortensTheDeadlineOfAnOutstandingKeepalive() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 25.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        assertEquals("ping", connection.next().op)
+
+        controller.setForeground(false)
+        // The computer stops replying while a periodic ping is pending.
+        val unwatches = List(2) { connection.next().op }
+        assertEquals(setOf("sessions.unwatch", "notifications.unwatch"), unwatches.toSet())
+        advanceTimeBy(5.seconds)
+        val returnedAt = testScheduler.currentTime
+        controller.setForeground(true)
+
+        bridge.acceptWelcomed()
+        assertEquals(5.seconds, (testScheduler.currentTime - returnedAt).milliseconds)
+        assertEquals(2, bridge.opens)
+    }
+
+    @Test
+    fun anEndedBridgeClosesTheSocketBeforeWaitingForABlockedWriter() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 25.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.stallPingWrite = true
+        assertEquals("ping", connection.next().op)
+
+        val hungUpAt = testScheduler.currentTime
+        connection.hangUp()
+        controller.await { it.connection is ConnectionState.Retrying }
+        assertEquals(hungUpAt, testScheduler.currentTime)
+        assertTrue(connection.isClosedByClient())
+    }
+
+    @Test
+    fun returningToAConversationRefreshesItsReadCheckpointWithoutReplacingAPendingSend() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.loadHello(controller)
+        val sent = async { controller.send(S, "Fix it", SendMode.Queue) }
+        val send = connection.nextRequest()
+        assertEquals("conversation.send", send.op)
+
+        val refresh = async { controller.refreshConversationForRead(S) }
+        val request = connection.nextRequest()
+        assertEquals("conversation.read_checkpoint", request.op)
+        assertEquals(S, request.params["session"]!!.jsonPrimitive.content)
+        connection.ok(request)
+        refresh.await()
+        assertNull(controller.state.value.conversations[S]?.readCheckpoint)
+
+        connection.send(conversation(
+            reset = true,
+            order = """["b"]""",
+            items = "[${text("b", "Ready for review")}]",
+            checkpoint = "fresh",
+        ))
+        val displayed = controller.await { it.conversations[S]?.readCheckpoint == "fresh" }.conversations[S]
+        assertEquals(listOf("b"), displayed?.items?.map { it.id })
+        assertEquals(false, sent.isCompleted)
+
+        val read = async { controller.readConversation(S, "fresh") }
+        val acknowledge = connection.nextRequest()
+        assertEquals("conversation.read", acknowledge.op)
+        assertEquals("fresh", acknowledge.params["checkpoint"]!!.jsonPrimitive.content)
+        connection.ok(acknowledge)
+        read.await()
+
+        connection.ok(send)
+        sent.await()
+        runCurrent()
+        assertTrue(connection.isQuiet())
+    }
+
+    @Test
+    fun aConversationWithARequestInFlightIsUnwatchedOnceItIsAnswered() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+        val sent = async { controller.send(S, "Fix it", SendMode.Queue) }
+        val send = connection.expect("conversation.send")
+
+        // Sent, then straight to the home screen: unwatching now would fail the send.
+        controller.setForeground(false)
+        connection.ok(connection.expect("sessions.unwatch"))
+        connection.ok(connection.expect("notifications.unwatch"))
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        connection.ok(send)
+        sent.await()
+        val unwatch = connection.expect("conversation.unwatch")
+        assertEquals("conversation.unwatch", unwatch.op)
+        assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun askingAgainInTheBackgroundWatchesOnReturn() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.error(connection.expect("conversation.watch"), "unavailable", "The conversation couldn't be loaded.")
+        controller.await { it.conversations[S]?.ended != null }
+
+        // Try again, tapped as the app went to the background. Detach the
+        // earlier requested watch, even though the bridge refused it.
+        controller.setForeground(false)
+        controller.rewatch(S)
+        val stops = List(3) { connection.nextRequest().also(connection::ok).op }
+        assertEquals(setOf("sessions.unwatch", "notifications.unwatch", "conversation.unwatch"), stops.toSet())
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        controller.setForeground(true)
+        connection.ok(connection.expect("conversation.watch"))
+        connection.send(conversation(reset = true, order = "[]", items = "[]"))
+        controller.await { it.conversations[S]?.let { c -> c.loaded && c.ended == null } == true }
+    }
+
+    @Test
+    fun leavingTheAppDuringSetupStillWatchesOnceConnected() = runTest {
+        val controller = controller()
+        // Away to the computer to read its address, and back, with nothing to connect to yet.
+        controller.setForeground(false)
+        controller.setForeground(true, connect = false)
+        runCurrent()
+        assertEquals(0, bridge.opens, "nothing to connect to yet")
+
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+    }
+}

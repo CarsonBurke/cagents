@@ -128,7 +128,7 @@ pub(super) fn show(terminal: &TerminalDescriptor, proof: &HostSessionProof) -> C
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 

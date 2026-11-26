@@ -31,14 +31,81 @@ pub struct Process {
 }
 
 impl Process {
+    /// `start` is the kernel's start time for the process: clock ticks
+    /// since boot on Linux, microseconds since the epoch on Darwin. Records
+    /// carry their boot, so neither is compared across boots or systems.
+    #[cfg(target_os = "linux")]
     pub fn read(pid: i32) -> io::Result<Self> {
         let stat = fs::read(format!("/proc/{pid}/stat")).map_err(exited_as_absent)?;
         let (_, start) = crate::model::agent_recovery::process_identity(&stat)
             .ok_or_else(|| io::Error::other("invalid process identity"))?;
         Ok(Self { pid, start })
     }
+
+    /// As on Linux, a zombie still names its identity until its parent reaps it.
+    #[cfg(target_os = "macos")]
+    pub fn read(pid: i32) -> io::Result<Self> {
+        let number = u32::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        let start = crate::pinned_process::started_ticks_of(number)?;
+        Ok(Self { pid, start })
+    }
     pub fn is_current(&self) -> bool {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
+    }
+
+    /// A path that reaches the executable this process runs, for its
+    /// identity. Linux names the running image itself, which stays valid when
+    /// its pathname is replaced or removed; a caller confirms
+    /// [`Self::is_current`] once it has read through it, as the pid may name
+    /// a later process by then.
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    pub fn executable(&self) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(format!("/proc/{}/exe", self.pid)))
+    }
+
+    /// The pathname of the executable this process runs, read while it runs.
+    /// Darwin records only the image's pathname, so an executable replaced
+    /// there since this process started reads as a different file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` once this process has exited or its pid names a
+    /// later one.
+    #[cfg(all(feature = "host", target_os = "macos"))]
+    pub fn executable(&self) -> io::Result<PathBuf> {
+        let pid = u32::try_from(self.pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        crate::pinned_process::PinnedProcess::open_started(pid, self.start)?.executable()
+    }
+
+    /// Whether this exact process has exited: it is gone, its pid names a
+    /// later process, or it is a zombie its parent has not reaped yet, which
+    /// [`Self::is_current`] still counts. A process that cannot be inspected
+    /// counts as exited.
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    pub(crate) fn exited(&self) -> bool {
+        let Ok(stat) = fs::read(format!("/proc/{}/stat", self.pid)) else {
+            return true;
+        };
+        let zombie = std::str::from_utf8(&stat)
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')'))
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            .is_some_and(|state| state == "Z");
+        zombie
+            || crate::model::agent_recovery::process_identity(&stat)
+                .is_none_or(|(_, start)| start != self.start)
+    }
+
+    /// As on Linux. A pin refuses a process that has already exited, a zombie
+    /// included, and the start ticks tell a later process holding the pid.
+    #[cfg(all(feature = "host", target_os = "macos"))]
+    pub(crate) fn exited(&self) -> bool {
+        u32::try_from(self.pid)
+            .ok()
+            .and_then(|pid| crate::pinned_process::PinnedProcess::open(pid).ok())
+            .is_none_or(|process| process.started_ticks() != self.start)
     }
 
     /// Whether this exact process is gone within 15 seconds. Exit proofs, such
@@ -46,7 +113,7 @@ impl Process {
     /// process, and until then its `/proc` entry still names this identity.
     /// How soon the reaper runs depends on scheduling, so a test asserting
     /// absence after such a proof waits for it here.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reaped(&self) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while self.is_current() {
@@ -60,7 +127,10 @@ impl Process {
 }
 
 /// A process reaped between opening and reading its stat file fails the read
-/// with ESRCH. It is as absent as one whose entry is already gone.
+/// with ESRCH. It is as absent as one whose entry is already gone. Linux's
+/// [`Process::read`] needs it everywhere, and [`super::codex_temp`] in
+/// every lane that builds it.
+#[cfg(any(target_os = "linux", feature = "host", feature = "ui"))]
 pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::ESRCH) {
         io::Error::new(io::ErrorKind::NotFound, error)
@@ -72,7 +142,7 @@ pub(crate) fn exited_as_absent(error: io::Error) -> io::Error {
 /// Behavioural identity is separate from the wire protocol: additive fields
 /// keep existing durable helpers adoptable while exposing upgrades to users.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BuildIdentity {
+pub struct BuildIdentity {
     pub version: String,
     pub commit: Option<String>,
     pub capabilities: Vec<String>,
@@ -80,7 +150,7 @@ pub(crate) struct BuildIdentity {
 
 impl BuildIdentity {
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn current(kind: Kind) -> Self {
+    pub fn current(kind: Kind) -> Self {
         Self {
             version: crate::version().into(),
             commit: crate::version()
@@ -97,7 +167,7 @@ impl BuildIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Record {
+pub struct Record {
     pub version: u32,
     #[serde(default)]
     pub build: Option<BuildIdentity>,
@@ -113,13 +183,13 @@ pub(crate) struct Record {
 }
 
 #[cfg(feature = "host")]
-pub(crate) const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v2";
+pub const RETAINED_CLAUDE_CAPABILITY: &str = "claude-actor-v2";
 
 /// Retained Claude discovery visibility only. Attachment still requires the
 /// original record, authenticated peer, daemon lease and actor epoch. Ordinary
 /// terminal discovery and native Codex matching remain application-exact.
 #[cfg(feature = "host")]
-pub(crate) fn record_application_matches(record: &Record) -> bool {
+pub fn record_application_matches(record: &Record) -> bool {
     record_application_matches_for(
         record,
         crate::instance::APPLICATION_ID,
@@ -150,7 +220,7 @@ fn recovery_role(application: &str) -> bool {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
+pub fn production_role_pair(original: &str, successor: &str) -> bool {
     matches!(
         (original, successor),
         ("dev.cagents.Cagents", "dev.cagents.Cagents.Browserless")
@@ -162,7 +232,7 @@ pub(crate) fn production_role_pair(original: &str, successor: &str) -> bool {
 /// or an exact durable cleanup receipt, and exact issued-source matching. It never changes the original Record.
 #[cfg(feature = "host")]
 #[derive(Clone)]
-pub(crate) struct OriginalRole {
+pub struct OriginalRole {
     record: Record,
     original: crate::model::HostSessionProof,
     successor: crate::model::HostSessionProof,
@@ -171,7 +241,7 @@ pub(crate) struct OriginalRole {
 
 #[cfg(feature = "host")]
 impl OriginalRole {
-    pub(crate) fn authenticated(
+    pub fn authenticated(
         record: &Record,
         original: &crate::model::HostSessionProof,
         successor: &crate::model::HostSessionProof,
@@ -216,7 +286,7 @@ impl OriginalRole {
     }
 }
 
-pub(crate) fn directory(kind: Kind) -> Result<PathBuf, String> {
+pub fn directory(kind: Kind) -> Result<PathBuf, String> {
     crate::daemon::RuntimePaths::discover()
         .map(|paths| {
             paths.directory.join(match kind {
@@ -228,80 +298,21 @@ pub(crate) fn directory(kind: Kind) -> Result<PathBuf, String> {
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
+pub fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
     directory.join(terminal.to_string())
 }
 
-/// A Unix address includes its terminating NUL. Filesystem paths have no such
-/// small limit; Linux can resolve a long endpoint through a held directory FD.
 #[cfg(feature = "host")]
-pub(crate) fn socket_fits(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    // SAFETY: sockaddr_un is plain data and only its field length is read.
-    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
-        .sun_path
-        .len();
-    path.as_os_str().as_bytes().len() < capacity
-}
+pub use crate::descriptor::{socket_fits, with_socket_address};
 
 #[cfg(feature = "host")]
-pub(crate) fn with_socket_address<T>(
-    path: &Path,
-    operation: impl FnOnce(&Path) -> io::Result<T>,
-) -> io::Result<T> {
-    use std::os::fd::AsRawFd;
-    if socket_fits(path) {
-        return operation(path);
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "holder endpoint has no directory",
-            )
-        })?;
-    let name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "holder endpoint has no filename",
-        )
-    })?;
-    crate::secure_file::reject_symlink_components(parent)?;
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent)?;
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir()
-        || metadata.uid() != crate::daemon::current_uid()
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "unsafe holder socket directory",
-        ));
-    }
-    // Hold the FD until bind/connect completes. The endpoint remains at its
-    // original filesystem path, so discovery, authentication, and inode-based
-    // retirement retain their existing identity and survive daemon upgrades.
-    let address = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
-    operation(&address)
-}
-
-#[cfg(feature = "host")]
-pub(crate) fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
-    with_socket_address(path, |address| {
-        std::os::unix::net::UnixListener::bind(address)
-    })
+pub fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+    with_socket_address(path, |path| crate::descriptor::bind(path))
 }
 
 #[cfg(feature = "host")]
 pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
-    with_socket_address(path, |address| {
-        std::os::unix::net::UnixStream::connect(address)
-    })
+    with_socket_address(path, crate::descriptor::connect)
 }
 
 impl Record {
@@ -322,6 +333,22 @@ impl Record {
         if !self.holder.is_current() {
             return Err(io::Error::other("holder process identity changed"));
         }
+        let zombies = self.zombie_count()?;
+        if !self.holder.is_current() {
+            return Err(io::Error::other("holder process identity changed"));
+        }
+        Ok(zombies)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn zombie_count(&self) -> io::Result<usize> {
+        let pid = u32::try_from(self.holder.pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        crate::pinned_process::zombie_children_of(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn zombie_count(&self) -> io::Result<usize> {
         // Linux records children on the thread that created them, even though
         // their stat parent is the process leader. Inspect every live thread.
         let mut children = std::collections::BTreeSet::new();
@@ -354,9 +381,6 @@ impl Record {
                     .unwrap_or(false)
             })
             .count();
-        if !self.holder.is_current() {
-            return Err(io::Error::other("holder process identity changed"));
-        }
         Ok(zombies)
     }
 
@@ -482,7 +506,7 @@ fn read_checked(
 /// runs; reading that held inode still reports pending until the next poll.
 /// It never grants adoption authority or turns unsafe evidence into absence.
 #[cfg(feature = "host")]
-pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
+pub fn retirement_pending(expected: &Record) -> io::Result<bool> {
     let path = expected.path(&directory(expected.kind).map_err(io::Error::other)?);
     let file = match OpenOptions::new()
         .read(true)
@@ -497,14 +521,14 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+pub fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, false)
 }
 
 /// Untrusted routing evidence for the recovery Inspect handshake only. Ordinary
 /// discovery stays application-exact; no caller may infer adoption from this.
 #[cfg(feature = "host")]
-pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
+pub fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     evidence_inner(socket, kind, true)
 }
 
@@ -512,7 +536,7 @@ pub(crate) fn recovery_candidate(socket: &Path, kind: Kind) -> Result<Option<Rec
 /// Old boots and foreign holders still describe execution; callers must check
 /// the boot before interpreting process identities that the kernel can reuse.
 #[cfg(feature = "host")]
-pub(crate) fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
+pub fn execution_record(socket: &Path) -> io::Result<Option<Record>> {
     let record = match read(&socket.with_extension("json")) {
         Ok(record) => record,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -619,18 +643,25 @@ fn holding_process_in(directory: &Path, terminal: TerminalId) -> io::Result<Opti
 /// provider or tool of it runs on (see [`crate::daemon::lost_processes`]).
 #[cfg(feature = "host")]
 fn ended_with_holder(record: &Record) -> bool {
-    record.kind != Kind::Native
-        || crate::daemon::lost_processes::census(&record.holder, &record.root)
-            .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie))
+    if record.kind != Kind::Native {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    return crate::daemon::lost_processes::census(&record.holder, &record.root)
+        .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie));
+    // Darwin reparents escaped work to launchd. Keep the recorded
+    // boundaries for a later inspection, even when both are empty.
+    #[cfg(target_os = "macos")]
+    return false;
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
+pub fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, false)
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn recovery_candidates(
+pub fn recovery_candidates(
     directory: &Path,
     boot: &BootId,
     kind: Kind,
@@ -696,9 +727,11 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Linux only: Darwin has no stat file to hold open across the reap.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_process_reaped_while_its_stat_is_read_is_absent() {
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
         let mut stat = fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
         child.wait().unwrap();
         let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
@@ -1074,6 +1107,7 @@ mod tests {
     #[test]
     fn unix_address_boundary_preserves_full_endpoint_and_discovery_identity() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let working_directory = std::env::current_dir().unwrap();
         // SAFETY: plain data, only the array length is used.
         let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
             .sun_path
@@ -1086,9 +1120,26 @@ mod tests {
                 &fs::symlink_metadata(&endpoint).unwrap().file_type()
             ));
             let client = connect(&endpoint).unwrap();
-            let (server, _) = listener.accept().unwrap();
+            let (server, _) = crate::descriptor::accept(&listener).unwrap();
             assert!(client.peer_addr().unwrap().as_pathname().is_some());
-            drop((client, server, listener));
+            let deadline = connect_until(
+                &endpoint,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+            let (bounded, _) = crate::descriptor::accept(&listener).unwrap();
+            let socket = fs::metadata(&endpoint).unwrap();
+            let observed = with_socket_address(&endpoint, |address| {
+                crate::agent::observe::socket::connect(address, socket.dev(), socket.ino())
+                    .map_err(|error| io::Error::other(String::from(error)))
+            })
+            .unwrap();
+            let (observer, _) = crate::descriptor::accept(&listener).unwrap();
+            // Reaching a long endpoint leaves this thread where it was.
+            assert_eq!(std::env::current_dir().unwrap(), working_directory);
+            drop((
+                client, server, deadline, bounded, observed, observer, listener,
+            ));
             let mut proof = record();
             proof.terminal = endpoint
                 .file_name()
@@ -1343,7 +1394,7 @@ mod tests {
 
     #[test]
     fn zombie_count_observes_children_without_consuming_status() {
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };

@@ -54,7 +54,7 @@ fn a_window_never_hands_a_parent_session_to_the_daemon_it_starts() {
     // The stand-in daemon stays until the record is collected, so the window
     // keeps waiting for it instead of reporting a failed start.
     let installation = Installation::new(
-        env!("CARGO_BIN_EXE_cagents-ui"),
+        std::path::Path::new(env!("CARGO_BIN_EXE_cagents-ui")),
         "cagentsd",
         "for _ in $(seq 600); do [ -e \"$0.environ\" ] || exit 0; sleep 0.05; done",
     );

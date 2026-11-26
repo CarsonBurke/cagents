@@ -1,34 +1,33 @@
 use std::{
     fs::{self, File},
     io,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, OpenOptionsExt},
-        },
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use crate::pinned_process::PinnedProcess;
+
 const MAX_CENSUS_PASSES: usize = 16;
 const MAX_PROCESSES: usize = 65_536;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static FAIL_NEXT_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DELAY_NEXT_CENSUS: std::cell::RefCell<Option<crossbeam_channel::Sender<Instant>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
-pub(super) fn fail_next_census_for_test() {
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_next_census_for_test() {
     FAIL_NEXT_CENSUS.set(true);
 }
 
-#[cfg(test)]
-pub(super) fn delay_next_census_for_test(finished: crossbeam_channel::Sender<Instant>) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn delay_next_census_for_test(finished: crossbeam_channel::Sender<Instant>) {
     DELAY_NEXT_CENSUS.set(Some(finished));
 }
 
@@ -44,7 +43,7 @@ pub(super) struct CloseProcess {
 
 pub(super) struct RootIdentity {
     pub process: CloseProcess,
-    pidfd: File,
+    pidfd: PinnedProcess,
     executable: Option<File>,
     kill_receipt: Arc<Mutex<bool>>,
 }
@@ -93,7 +92,7 @@ impl RootIdentity {
         let identity = |path: &Path| {
             let file = fs::OpenOptions::new()
                 .read(true)
-                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .custom_flags(EXECUTABLE_HANDLE | libc::O_CLOEXEC)
                 .open(path)
                 .ok()?;
             let metadata = file.metadata().ok()?;
@@ -115,14 +114,29 @@ impl RootIdentity {
     }
 }
 
+/// Opens an executable to hold its identity without reading it: a path
+/// handle on Linux, an execute-only one on Darwin.
+#[cfg(target_os = "linux")]
+const EXECUTABLE_HANDLE: libc::c_int = libc::O_PATH;
+#[cfg(target_os = "macos")]
+const EXECUTABLE_HANDLE: libc::c_int = libc::O_EXEC;
+
+#[cfg(target_os = "linux")]
 fn executable_identity(pid: libc::pid_t) -> io::Result<(u64, u64)> {
     let metadata = fs::metadata(format!("/proc/{pid}/exe"))?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
+#[cfg(target_os = "macos")]
+fn executable_identity(_pid: libc::pid_t) -> io::Result<(u64, u64)> {
+    // proc_pidpath only reports a name that can be replaced. Without the
+    // mapped image's vnode, keep the terminal's explicit close confirmation.
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 struct FrozenProcess {
     identity: CloseProcess,
-    pidfd: File,
+    pidfd: PinnedProcess,
     resume: bool,
 }
 
@@ -146,7 +160,7 @@ pub(super) struct FrozenFamily {
 
 impl FrozenFamily {
     pub(super) fn capture(root: &RootIdentity, deadline: Instant) -> Result<Self, String> {
-        let current = read_process(root.process.pid).map_err(|error| error.to_string())?;
+        let current = reread_process(&root.process).map_err(|error| error.to_string())?;
         // The root's parent is its holder, and a holder that died left the
         // root reparented; the pidfd and start time already pin the root.
         let reparented = CloseProcess {
@@ -178,10 +192,24 @@ impl FrozenFamily {
                 {
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                if process.session != root.process.session
+                    && !family.targets.iter().any(|parent| {
+                        parent.identity.pid == process.parent
+                            && parent.identity.start <= process.start
+                            && matches!(parent.pidfd.reaped(), Ok(false))
+                    })
+                {
+                    // A deferred census row may name a descendant sampled
+                    // after a numeric parent PID was reused. An unreaped
+                    // stopped parent keeps its original PID across the read.
+                    return Err("Terminal job ancestry changed during close inspection".into());
+                }
                 let pidfd = match open_target(&process) {
                     Ok(pidfd) => pidfd,
                     Err(error)
-                        if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) =>
+                        if error.kind() == io::ErrorKind::NotFound
+                            || matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) =>
                     {
                         continue;
                     }
@@ -194,10 +222,10 @@ impl FrozenFamily {
             if family.targets.len() == before {
                 for target in &mut family.targets {
                     let process =
-                        read_process(target.identity.pid).map_err(|error| error.to_string())?;
+                        reread_process(&target.identity).map_err(|error| error.to_string())?;
                     if !same_identity(&process, &target.identity)
                         || !quiescent(process.state)
-                        || !threads_quiescent(process.pid, deadline)?
+                        || !threads_quiescent(&process, deadline)?
                     {
                         return Err("Terminal process changed while its family was stopped".into());
                     }
@@ -212,7 +240,7 @@ impl FrozenFamily {
     fn freeze(
         &mut self,
         process: CloseProcess,
-        pidfd: File,
+        pidfd: PinnedProcess,
         deadline: Instant,
     ) -> Result<(), String> {
         check_deadline(deadline)?;
@@ -230,11 +258,11 @@ impl FrozenFamily {
         // Drop releases the stop on timeout, disappearance, or any read error.
         loop {
             check_deadline(deadline)?;
-            let current = read_process(target.identity.pid).map_err(|error| error.to_string())?;
+            let current = reread_process(&target.identity).map_err(|error| error.to_string())?;
             if !same_identity(&current, &target.identity) {
                 return Err("Terminal job identity changed".into());
             }
-            if quiescent(current.state) && threads_quiescent(current.pid, deadline)? {
+            if quiescent(current.state) && threads_quiescent(&current, deadline)? {
                 target.identity.state = current.state;
                 break;
             }
@@ -336,11 +364,10 @@ impl FrozenFamily {
 
     pub(super) fn wait_until(&self, deadline: Instant) -> Result<bool, String> {
         for target in &self.targets {
-            if !super::holder::exits_within(
-                &target.pidfd,
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .map_err(|error| error.to_string())?
+            if !target
+                .pidfd
+                .wait_for_exit(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| error.to_string())?
             {
                 return Ok(false);
             }
@@ -354,7 +381,7 @@ impl FrozenFamily {
         // same handles across its graceful wait. Only survivors receive KILL.
         // Numeric PID reuse and reparenting cannot change that authority.
         for (index, target) in self.targets.iter_mut().enumerate() {
-            if super::holder::exits_within(&target.pidfd, Duration::ZERO).unwrap_or(false) {
+            if target.pidfd.exited().unwrap_or(false) {
                 target.resume = false;
                 continue;
             }
@@ -400,6 +427,7 @@ fn quiescent(state: u8) -> bool {
     matches!(state, b'T' | b't' | b'Z' | b'X')
 }
 
+#[cfg(target_os = "linux")]
 fn thread_ids(pid: libc::pid_t, deadline: Instant) -> Result<Vec<libc::pid_t>, String> {
     let mut ids = Vec::new();
     for entry in fs::read_dir(format!("/proc/{pid}/task")).map_err(|error| error.to_string())? {
@@ -419,7 +447,9 @@ fn thread_ids(pid: libc::pid_t, deadline: Instant) -> Result<Vec<libc::pid_t>, S
     Ok(ids)
 }
 
-fn threads_quiescent(pid: libc::pid_t, deadline: Instant) -> Result<bool, String> {
+#[cfg(target_os = "linux")]
+fn threads_quiescent(process: &CloseProcess, deadline: Instant) -> Result<bool, String> {
+    let pid = process.pid;
     let ids = thread_ids(pid, deadline)?;
     for &tid in &ids {
         check_deadline(deadline)?;
@@ -440,9 +470,27 @@ fn threads_quiescent(pid: libc::pid_t, deadline: Instant) -> Result<bool, String
     // Check the complete thread set again after every observed thread stopped.
     Ok(!ids.is_empty() && ids == thread_ids(pid, deadline)?)
 }
+
+#[cfg(target_os = "macos")]
+fn threads_quiescent(process: &CloseProcess, deadline: Instant) -> Result<bool, String> {
+    check_deadline(deadline)?;
+    if process.state != b'Z'
+        && !crate::process::table::task_stopped(process.pid).map_err(|error| error.to_string())?
+    {
+        return Ok(false);
+    }
+    let after = reread_process(process).map_err(|error| error.to_string())?;
+    if !same_identity(&after, process) {
+        return Err(changed().to_string());
+    }
+    Ok(quiescent(after.state))
+}
+
+const CLOSE_INSPECTION_EXPIRED: &str = "Close inspection expired; stopped processes were released";
+
 fn check_deadline(deadline: Instant) -> Result<(), String> {
     if Instant::now() >= deadline {
-        Err("Close inspection expired; stopped processes were released".into())
+        Err(CLOSE_INSPECTION_EXPIRED.into())
     } else {
         Ok(())
     }
@@ -461,10 +509,12 @@ fn same_identity(a: &CloseProcess, b: &CloseProcess) -> bool {
         && a.session == b.session
 }
 
+#[cfg(target_os = "linux")]
 fn read_process(pid: libc::pid_t) -> io::Result<CloseProcess> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     parse_process(pid, &stat).ok_or_else(changed)
 }
+#[cfg(target_os = "linux")]
 fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
     let (_, fields) = stat.rsplit_once(") ")?;
     let mut fields = fields.split_whitespace();
@@ -482,15 +532,51 @@ fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
         state,
     })
 }
+
+#[cfg(target_os = "macos")]
+fn read_process(pid: libc::pid_t) -> io::Result<CloseProcess> {
+    let record = crate::process::table::record(pid)?;
+    Ok(CloseProcess {
+        pid,
+        parent: record.bsd.pbsi_ppid as libc::pid_t,
+        group: record.bsd.pbsi_pgid as libc::pid_t,
+        // A zombie cannot run. Its session is unavailable, but its parent
+        // and group remain available until it is reaped.
+        session: record.session.unwrap_or_default(),
+        start: record.start.unwrap_or_default(),
+        state: match record.bsd.pbsi_status {
+            libc::SSTOP => b'T',
+            libc::SZOMB => b'Z',
+            _ => b'R',
+        },
+    })
+}
+
+fn reread_process(previous: &CloseProcess) -> io::Result<CloseProcess> {
+    let current = read_process(previous.pid)?;
+    // An unreaped session leader cannot have changing session membership,
+    // but on Darwin its session stops being readable at exit. Preserve the
+    // established session only for the same leader, as it cannot run again.
+    #[cfg(target_os = "macos")]
+    if current.state == b'Z' && previous.pid == previous.session && current.start == previous.start
+    {
+        return Ok(CloseProcess {
+            session: previous.session,
+            ..current
+        });
+    }
+    Ok(current)
+}
+
 fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(finished) = DELAY_NEXT_CENSUS.take() {
         // Exercise capture's deadline without a real uninterruptible process.
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
         let _ = finished.send(Instant::now());
         check_deadline(deadline)?;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if FAIL_NEXT_CENSUS.replace(false) {
         return Err("injected terminal process census failure".into());
     }
@@ -500,13 +586,59 @@ fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
 /// After the pinned root exits, a numeric session can only refuse cleanup;
 /// it never grants authority to signal a process discovered after that exit.
 pub(super) fn session_is_empty(session: libc::pid_t, deadline: Instant) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
     let processes = census(deadline)?;
+    #[cfg(target_os = "macos")]
+    let processes = session_members(session, deadline)?;
     let daemon = daemon_subtree(this_daemon(), &processes);
     Ok(processes.iter().all(|process| {
         process.session != session
             || matches!(process.state, b'Z' | b'X')
             || daemon.contains(&process.pid)
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn session_members(session: libc::pid_t, deadline: Instant) -> Result<Vec<CloseProcess>, String> {
+    let mut members = Vec::new();
+    // getsid observes active session membership even across UIDs. Unrelated
+    // processes do not need the destructive census's stronger identity reads.
+    let mut pids = crate::process::table::list_all().map_err(|error| error.to_string())?;
+    for &pid in &pids {
+        check_deadline(deadline)?;
+        let pid = pid as libc::pid_t;
+        // SAFETY: getsid takes a positive PID from the process table.
+        let observed = unsafe { libc::getsid(pid) };
+        if observed < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(error.to_string());
+        }
+        if observed != session {
+            continue;
+        }
+        match read_process(pid) {
+            Ok(process) if process.session == session && process.state != b'Z' => {
+                members.push(process);
+            }
+            // A member that departed after the initial list might have
+            // forked a successor. A fresh census must account for it.
+            Ok(_) => return Err(changed().to_string()),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    // Even a member that exited before getsid could have forked after the
+    // first list. Verify the PID set before accepting the observation.
+    let mut current = crate::process::table::list_all().map_err(|error| error.to_string())?;
+    pids.sort_unstable();
+    current.sort_unstable();
+    if pids != current {
+        return Err(changed().to_string());
+    }
+    check_deadline(deadline)?;
+    Ok(members)
 }
 
 fn this_daemon() -> libc::pid_t {
@@ -547,6 +679,7 @@ fn daemon_subtree(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn census_with(
     deadline: Instant,
     mut read_process: impl FnMut(libc::pid_t) -> io::Result<CloseProcess>,
@@ -575,6 +708,33 @@ fn census_with(
     }
     Ok(processes)
 }
+
+#[cfg(target_os = "macos")]
+fn census_with(
+    deadline: Instant,
+    mut read_process: impl FnMut(libc::pid_t) -> io::Result<CloseProcess>,
+) -> Result<Vec<CloseProcess>, String> {
+    use crate::process::table;
+    let pids = table::list_all().map_err(|error| error.to_string())?;
+    if pids.len() >= MAX_PROCESSES {
+        return Err("Process census exceeded its safety bound".into());
+    }
+    let read = |pid| match read_process(pid) {
+        Ok(process) => Ok(Some(process)),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
+        Err(error) => Err(error),
+    };
+    table::settled_rows(pids.into_iter().map(|pid| pid as i32), Some(deadline), read).map_err(
+        |(_, error)| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                CLOSE_INSPECTION_EXPIRED.into()
+            } else {
+                format!("Cannot inspect terminal jobs: {error}")
+            }
+        },
+    )
+}
+
 fn process_family(
     root: &CloseProcess,
     processes: &[CloseProcess],
@@ -614,39 +774,48 @@ fn process_family(
     }
     family
 }
-fn open_target(process: &CloseProcess) -> io::Result<File> {
-    // SAFETY: successful pidfd_open yields a fresh owned descriptor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
-    if fd == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let file = unsafe { File::from_raw_fd(fd as libc::c_int) };
-    if !same_identity(process, &read_process(process.pid)?) {
+fn open_target(process: &CloseProcess) -> io::Result<PinnedProcess> {
+    // A zombie member still needs its pin: the census already counts it, and
+    // the identity re-read below confirms the pin is of that very process.
+    #[cfg(target_os = "linux")]
+    let pin = PinnedProcess::open_unreaped(process.pid as u32)?;
+    #[cfg(target_os = "macos")]
+    let pin = {
+        if process.start == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Cannot prove the terminal process's start time",
+            ));
+        }
+        PinnedProcess::open_started(process.pid as u32, process.start)?
+    };
+    if !same_identity(process, &reread_process(process)?) {
         return Err(changed());
     }
-    Ok(file)
+    Ok(pin)
 }
-pub(super) fn signal(pidfd: &File, signal: libc::c_int) -> io::Result<()> {
-    // SAFETY: the owned pidfd pins one process and null siginfo uses ordinary delivery.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            signal,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
+
+/// Signals through the process pin and reports `ESRCH` for a known exit.
+/// Darwin has the check-to-signal interval documented by `PinnedProcess`.
+fn signal(pin: &PinnedProcess, signal: libc::c_int) -> io::Result<()> {
+    if pin.signal(signal)? {
         Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(libc::ESRCH))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pin of a process that is gone, which no signal reaches.
+    fn reaped_pin() -> PinnedProcess {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pin = crate::pinned_process::PinnedChild::of(&child).unwrap();
+        child.wait().unwrap();
+        pin.into_process()
+    }
 
     #[test]
     fn census_skips_candidates_that_disappear_before_or_during_stat_read() {
@@ -700,7 +869,7 @@ mod tests {
                 state: b'T',
                 start: 1,
             },
-            pidfd: File::open("/dev/null").unwrap(),
+            pidfd: reaped_pin(),
             resume: false,
         };
         let mut family = FrozenFamily {
@@ -749,7 +918,7 @@ mod tests {
                 .into_iter()
                 .map(|identity| FrozenProcess {
                     identity,
-                    pidfd: File::open("/dev/null").unwrap(),
+                    pidfd: reaped_pin(),
                     resume: false,
                 })
                 .collect(),
@@ -899,6 +1068,8 @@ mod tests {
         assert!(quiescent(b't'));
         assert!(!quiescent(b'S'));
     }
+    // This fixture exercises the Linux /proc text format.
+    #[cfg(target_os = "linux")]
     #[test]
     fn proc_parser_handles_parentheses_inside_names_and_rejects_partial_identity() {
         let mut fields = vec!["0"; 20];
@@ -952,6 +1123,10 @@ mod tests {
         assert_eq!(unsafe { info.si_pid() }, child.0.id() as libc::pid_t);
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "Darwin cannot prove a terminal's mapped executable identity"
+    )]
     #[test]
     fn launch_identity_is_not_the_transient_pre_exec_image() {
         let mut command = portable_pty::CommandBuilder::new("/bin/sleep");

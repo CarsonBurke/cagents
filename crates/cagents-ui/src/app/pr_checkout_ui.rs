@@ -170,6 +170,7 @@ impl Cagents {
                         base: plan.base,
                         destination: String::new(),
                         pr_checkout: Some(origin),
+                        recreates: None,
                     },
                     None,
                 );

@@ -36,8 +36,15 @@ const MAX_FINISHED_ENTRY_BYTES: usize = 6
     + 4096;
 const OVERFLOW_REASON: &str = "Claude holder outcome journal overflowed before the daemon committed its updates; the in-flight run outcome is unconfirmed";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum WaitingAttention {
+    Unknown,
+    Open(u64),
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct OutboxEntry {
+pub struct OutboxEntry {
     pub sequence: u64,
     pub update: Update,
     /// The conversation the helper had confirmed when it journaled this
@@ -50,7 +57,7 @@ pub(crate) struct OutboxEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InputIdentity {
+pub struct InputIdentity {
     pub sequence: u64,
     pub id: uuid::Uuid,
     pub hash: [u8; 32],
@@ -58,7 +65,8 @@ pub(crate) struct InputIdentity {
 
 /// Accepted includes a queued or partially written provider command. It never
 /// authorizes a retry. Acknowledged means the existing actor's reply, whose
-/// precise semantics remain the provider adapter's contract.
+/// precise semantics remain the provider adapter's contract. Unknown records
+/// a terminal outcome whose effect cannot be confirmed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum InputState {
     Accepted,
@@ -66,6 +74,10 @@ pub(crate) enum InputState {
     Unknown(String),
 }
 impl InputState {
+    pub(super) fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Accepted)
+    }
+
     /// Keep a stored outcome's error within a fixed size.
     fn bounded(mut self) -> Self {
         if let Self::Acknowledged(Err(error)) | Self::Unknown(error) = &mut self {
@@ -81,7 +93,7 @@ pub(crate) struct InputReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ContinuityLoss {
+pub struct ContinuityLoss {
     pub id: uuid::Uuid,
     pub affected_runs: Vec<crate::model::RunId>,
     pub reason: String,
@@ -97,8 +109,10 @@ pub(super) struct Journal {
     finished_runs: std::collections::BTreeMap<crate::model::RunId, u64>,
     input_sequence: u64,
     acknowledged_inputs: std::collections::BTreeSet<u64>,
+    unknown_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
+    pub(super) waiting_attention: Option<WaitingAttention>,
     published_sources: Vec<crate::chat::Session>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
@@ -160,8 +174,10 @@ impl Journal {
             finished_runs: Default::default(),
             input_sequence: 0,
             acknowledged_inputs: Default::default(),
+            unknown_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
+            waiting_attention: Some(WaitingAttention::Unknown),
             published_sources: Vec::new(),
         })
     }
@@ -274,6 +290,15 @@ impl Journal {
         update: &Update,
         confirmed_session: Option<&str>,
     ) -> Result<(), String> {
+        if matches!(
+            update,
+            Update::Activity {
+                state: crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle,
+                ..
+            }
+        ) {
+            self.waiting_attention = Some(WaitingAttention::Resolved);
+        }
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
@@ -359,6 +384,13 @@ impl Journal {
         }
         tx.commit().map_err(|error| error.to_string())?;
         self.outcome_latest = sequence;
+        if matches!(
+            update,
+            Update::Attention(evidence) | Update::AttentionContext { evidence, .. }
+                if evidence.kind == crate::notifications::Kind::Waiting
+        ) {
+            self.waiting_attention = Some(WaitingAttention::Open(sequence));
+        }
         if let Update::Execution {
             run,
             update: crate::agent_execution::Update::Finished { .. },
@@ -620,17 +652,31 @@ impl Journal {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if matches!(state, InputState::Acknowledged(_)) {
-            self.acknowledged_inputs.insert(identity.sequence);
-        }
+        match state {
+            InputState::Acknowledged(_) => self.acknowledged_inputs.insert(identity.sequence),
+            InputState::Unknown(_) => self.unknown_inputs.insert(identity.sequence),
+            InputState::Accepted => false,
+        };
         Ok(())
+    }
+    pub fn terminal_input_count(&self) -> usize {
+        self.acknowledged_inputs.len() + self.unknown_inputs.len()
+    }
+    pub fn terminal_input_page(&self) -> Result<Vec<InputReceipt>, String> {
+        self.input_receipt_page(self.acknowledged_inputs.union(&self.unknown_inputs))
     }
     pub fn acknowledged_input_count(&self) -> usize {
         self.acknowledged_inputs.len()
     }
     pub fn acknowledged_input_page(&self) -> Result<Vec<InputReceipt>, String> {
+        self.input_receipt_page(self.acknowledged_inputs.iter())
+    }
+    fn input_receipt_page<'a>(
+        &self,
+        sequences: impl Iterator<Item = &'a u64>,
+    ) -> Result<Vec<InputReceipt>, String> {
         let mut page = Vec::new();
-        for sequence in self.acknowledged_inputs.iter().take(64) {
+        for sequence in sequences.take(64) {
             let (id, hash, state): (String, Vec<u8>, Vec<u8>) = self
                 .db
                 .query_row(
@@ -646,21 +692,18 @@ impl Journal {
                     .try_into()
                     .map_err(|_| "Invalid retained input digest")?,
             };
-            let state = serde_json::from_slice(&state).map_err(|error| error.to_string())?;
-            if !matches!(state, InputState::Acknowledged(_)) {
-                return Err("Input acknowledgement cache lost its terminal-state proof".into());
+            let state: InputState =
+                serde_json::from_slice(&state).map_err(|error| error.to_string())?;
+            if !state.is_terminal() {
+                return Err("Input outcome index lost its terminal-state proof".into());
             }
             page.push(InputReceipt { identity, state });
         }
         Ok(page)
     }
-    /// Retire exact terminal receipts independently: an earlier unknown or
-    /// partially written input must not block cleanup of unrelated outcomes.
+    /// Retire exact terminal receipts independently of partially written inputs.
     /// The durable high-water sequence continues refusing all retired replay.
-    pub fn retire_acknowledged_inputs(
-        &mut self,
-        identities: &[InputIdentity],
-    ) -> Result<(), String> {
+    pub fn retire_terminal_inputs(&mut self, identities: &[InputIdentity]) -> Result<(), String> {
         self.ensure_writable()?;
         if identities.len() > 64 {
             return Err("Input retirement batch exceeds capacity".into());
@@ -683,12 +726,10 @@ impl Journal {
                             "Input retirement identity differs from its retained command".into(),
                         );
                     }
-                    if !matches!(
-                        serde_json::from_slice::<InputState>(&state)
-                            .map_err(|error| error.to_string())?,
-                        InputState::Acknowledged(_)
-                    ) {
-                        return Err("Accepted or unknown inputs must retain their receipt".into());
+                    let state: InputState =
+                        serde_json::from_slice(&state).map_err(|error| error.to_string())?;
+                    if !state.is_terminal() {
+                        return Err("Accepted inputs must retain their receipt".into());
                     }
                 }
                 None if identity.sequence > 0 && identity.sequence <= self.input_sequence => {}
@@ -704,6 +745,7 @@ impl Journal {
         transaction.commit().map_err(|error| error.to_string())?;
         for identity in identities {
             self.acknowledged_inputs.remove(&identity.sequence);
+            self.unknown_inputs.remove(&identity.sequence);
         }
         Ok(())
     }
@@ -1374,7 +1416,7 @@ mod tests {
         assert!(journal.retained_runs().unwrap().is_empty());
     }
     #[test]
-    fn exact_retirement_survives_more_than_capacity_and_preserves_uncertain_holes() {
+    fn exact_retirement_reclaims_unknown_outcomes_and_preserves_accepted_holes() {
         let directory = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(directory.path()).unwrap();
         let identity = |sequence| InputIdentity {
@@ -1384,71 +1426,60 @@ mod tests {
         };
         let accepted = identity(1);
         journal.admit(&accepted).unwrap();
-        let unknown = identity(2);
-        journal.admit(&unknown).unwrap();
-        journal
-            .finish(
-                &unknown,
-                InputState::Unknown("write outcome is unknown".into()),
-            )
-            .unwrap();
         let mut last = None;
-        for sequence in 3..(MAX_INPUTS as u64 + 35) {
+        for sequence in 2..(MAX_INPUTS as u64 + 35) {
             let input = identity(sequence);
             journal.admit(&input).unwrap();
-            journal
-                .finish(&input, InputState::Acknowledged(Ok(())))
-                .unwrap();
-            let page = journal.acknowledged_input_page().unwrap();
+            let state = if sequence % 2 == 0 {
+                InputState::Unknown("write outcome is unknown".into())
+            } else {
+                InputState::Acknowledged(Ok(()))
+            };
+            journal.finish(&input, state.clone()).unwrap();
+            let page = journal.terminal_input_page().unwrap();
             assert_eq!(page.len(), 1);
             assert_eq!(page[0].identity, input);
-            assert!(matches!(&page[0].state, InputState::Acknowledged(Ok(()))));
+            assert_eq!(page[0].state, state);
+            let expected_acknowledgements =
+                usize::from(matches!(state, InputState::Acknowledged(_)));
+            assert_eq!(
+                journal.acknowledged_input_count(),
+                expected_acknowledgements
+            );
+            assert_eq!(
+                journal.acknowledged_input_page().unwrap().len(),
+                expected_acknowledgements,
+                "older proxies only page acknowledged receipts"
+            );
             assert!(
                 journal
-                    .retire_acknowledged_inputs(&[input.clone(), unknown.clone()])
+                    .retire_terminal_inputs(&[input.clone(), accepted.clone()])
                     .is_err()
             );
             assert_eq!(
-                journal.acknowledged_input_count(),
+                journal.terminal_input_count(),
                 1,
                 "failed batch cannot remove an earlier terminal receipt"
             );
             let mut changed = input.clone();
             changed.hash = [8; 32];
-            assert!(journal.retire_acknowledged_inputs(&[changed]).is_err());
+            assert!(journal.retire_terminal_inputs(&[changed]).is_err());
             assert!(journal.input(&input).unwrap().is_some());
             journal
-                .retire_acknowledged_inputs(std::slice::from_ref(&input))
+                .retire_terminal_inputs(std::slice::from_ref(&input))
                 .unwrap();
             journal
-                .retire_acknowledged_inputs(std::slice::from_ref(&input))
+                .retire_terminal_inputs(std::slice::from_ref(&input))
                 .unwrap();
-            assert!(
-                journal.admit(&input).is_err(),
-                "a retired sequence must never invoke the command again"
-            );
+            assert_eq!(journal.admit(&input).unwrap_err(), RETIRED_RECEIPT);
             last = Some(input);
         }
-        assert!(
-            journal
-                .retire_acknowledged_inputs(std::slice::from_ref(&accepted))
-                .is_err()
-        );
-        assert!(
-            journal
-                .retire_acknowledged_inputs(std::slice::from_ref(&unknown))
-                .is_err()
-        );
         assert_eq!(
             journal.input(&accepted).unwrap().unwrap().state,
             InputState::Accepted
         );
-        assert!(matches!(
-            journal.input(&unknown).unwrap().unwrap().state,
-            InputState::Unknown(_)
-        ));
-        assert_eq!(journal.acknowledged_input_count(), 0);
-        assert!(journal.acknowledged_input_page().unwrap().is_empty());
+        assert_eq!(journal.terminal_input_count(), 0);
+        assert!(journal.terminal_input_page().unwrap().is_empty());
         let next = journal.next_input().unwrap();
         let retired = last.unwrap();
         drop(journal);
@@ -1528,7 +1559,7 @@ mod tests {
         };
         assert!(reason.len() <= 4096);
         journal
-            .retire_acknowledged_inputs(std::slice::from_ref(&lost))
+            .retire_terminal_inputs(std::slice::from_ref(&lost))
             .unwrap();
         assert!(
             journal.admit(&lost).is_err(),

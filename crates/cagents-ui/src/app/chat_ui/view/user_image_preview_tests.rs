@@ -456,3 +456,56 @@ fn an_attachment_read_again_keeps_its_room_until_its_pixels_return() {
         "the prompt keeps the size the returning picture gives it"
     );
 }
+
+/// An image attachment is named by the `[Image N]` reference its message
+/// holds and, beside that, where it came from, on the chip itself rather
+/// than over the picture or in a tooltip; a queued message and the queue
+/// use the same name, never the stored copy's file name.
+#[test]
+fn an_image_attachment_is_named_by_its_reference_and_its_source() {
+    let reference = |name: &str| chat::ImageReference {
+        id: uuid::Uuid::new_v4(),
+        number: 243,
+        device: uuid::Uuid::new_v4(),
+        name: name.into(),
+        sha256: "a".repeat(64),
+        extension: "png".into(),
+    };
+    let pasted = Attachment {
+        path: "/private/assets/3f9c-internal-digest.png".into(),
+        reference: Some(reference("Pasted image")),
+    };
+    assert_eq!(attachment_title(&pasted), "Image 243");
+    assert_eq!(attachment_source(&pasted), Some("Pasted image"));
+    let attached = Attachment {
+        reference: Some(reference("layout sketch.png")),
+        ..pasted.clone()
+    };
+    assert_eq!(attachment_source(&attached), Some("layout sketch.png"));
+    let file = Attachment::file("/work/notes.txt");
+    assert_eq!(attachment_title(&file), "notes.txt");
+    assert_eq!(attachment_source(&file), None);
+
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, value: &str) {
+            self.0.push(value.to_owned());
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let attachments = [pasted, file];
+    let mut row = queue_row(QueueTiming::NextTurn, "".into(), &attachments, Vec::new());
+    let mut tree = Tree::new(row.as_widget());
+    let node = row.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(600.0, 200.0)),
+    );
+    let mut texts = Texts(Vec::new());
+    row.as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    assert_eq!(texts.0, ["Image 243, notes.txt"]);
+}

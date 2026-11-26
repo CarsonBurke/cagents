@@ -71,6 +71,34 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertEqual(products["cagents"]["deb"], f"cagents_{VERSION}_amd64.deb")
         self.assertNotIn("deb", products["cagents-browserless"])
 
+    def test_a_linux_release_names_no_macos_target(self):
+        self.write()
+        targets = json.loads((self.release / "release-metadata.json").read_bytes())["targets"]
+        self.assertEqual([target["target"] for target in targets], ["x86_64-unknown-linux-gnu"])
+
+    def test_a_release_with_the_macos_archive_names_its_target(self):
+        darwin = f"cagents-{VERSION}-aarch64-apple-darwin.tar.gz"
+        for name in (darwin, "install-macos.sh", "SHA256SUMS-macos"):
+            (self.release / name).write_bytes(b"payload")
+        self.write()
+        written = json.loads((self.release / "release-metadata.json").read_bytes())
+        linux, macos = written["targets"]
+        self.assertEqual(linux["products"]["cagents"]["archive"], ARCHIVE)
+        self.assertEqual(macos, {
+            "target": "aarch64-apple-darwin", "os": "macos", "architecture": "aarch64",
+            "products": {"cagents": {"archive": darwin, "installer": "install-macos.sh",
+                                     "checksums": "SHA256SUMS-macos"}},
+        })
+        self.assertIn(darwin, written["assets"])
+        self.assertEqual(run("check", "--dir", str(self.release)).returncode, 0)
+
+    def test_a_partial_macos_release_is_refused(self):
+        (self.release / f"cagents-{VERSION}-aarch64-apple-darwin.tar.gz").write_bytes(b"payload")
+        refused = self.write(check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("install-macos.sh", refused.stderr)
+        self.assertFalse((self.release / "release-metadata.json").exists())
+
     def test_check_refuses_a_changed_added_or_removed_file(self):
         self.write()
         for change, message in (
@@ -153,8 +181,12 @@ class ReleaseMetadata(unittest.TestCase):
         feed = self.root / "feed"
         self.assertIn("now offers 1.2.3", run("feed", "--dir", str(self.release), "--feed", str(feed)).stdout)
         latest = feed / "latest/download"
-        self.assertEqual((latest / "release-metadata.json").read_bytes(),
-                         (self.release / "release-metadata.json").read_bytes())
+        for name in ("release-metadata.json", "release-metadata-2.json"):
+            self.assertEqual((latest / name).read_bytes(),
+                             (self.release / "release-metadata.json").read_bytes())
+            self.assertEqual((feed / "download/v1.2.3" / name).read_bytes(),
+                             (self.release / "release-metadata.json").read_bytes())
+        self.assertEqual((latest / "release-metadata-2.json.sig").read_text(), "signature")
         self.assertEqual((feed / "download/v1.2.3" / ARCHIVE).read_bytes(), b"archive")
         self.assertIn("never replaces", run("feed", "--dir", str(self.release), "--feed", str(feed),
                                             check=False).stderr)
@@ -169,6 +201,29 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertIn("now offers 1.2.3", run("feed", "--dir", str(older), "--feed", str(feed)).stdout)
         self.assertEqual(json.loads((latest / "release-metadata.json").read_bytes())["version"], VERSION)
         self.assertTrue((feed / "download/v1.2.0" / old_archive).is_file())
+
+    def test_feed_after_the_bridge_release_keeps_its_metadata_under_the_old_names(self):
+        bridge = self.root / "bridge"
+        bridge.mkdir()
+        bridge_archive = ARCHIVE.replace(VERSION, "1.2.0")
+        for name in (bridge_archive, "install.sh", "SHA256SUMS"):
+            (bridge / name).write_bytes(b"bridge")
+        run("write", "--dir", str(bridge), "--version", "1.2.0", "--source-commit", COMMIT, "--protocol", "190")
+        (bridge / "release-metadata.json.sig").write_text("old key")
+        self.write()
+        (self.release / "release-metadata.json.sig").write_text("new key")
+        feed = self.root / "feed"
+        run("feed", "--dir", str(self.release), "--feed", str(feed), "--bridge", str(bridge))
+        for directory in (feed / "latest/download", feed / "download/v1.2.3"):
+            self.assertEqual(json.loads((directory / "release-metadata-2.json").read_bytes())["version"], VERSION)
+            self.assertEqual((directory / "release-metadata-2.json.sig").read_text(), "new key")
+            self.assertEqual((directory / "release-metadata.json").read_bytes(),
+                             (bridge / "release-metadata.json").read_bytes())
+            self.assertEqual((directory / "release-metadata.json.sig").read_text(), "old key")
+        # A bridge is always older than the release that carries it.
+        result = run("feed", "--dir", str(bridge), "--feed", str(self.root / "other"),
+                     "--bridge", str(self.release), check=False)
+        self.assertIn("not older than", result.stderr)
 
     def test_feed_refuses_unsigned_metadata(self):
         self.write()

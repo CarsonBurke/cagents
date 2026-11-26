@@ -15,7 +15,7 @@ use super::{
 use crate::agent::Provider;
 
 #[derive(Debug)]
-pub(crate) enum ScopeError {
+pub enum ScopeError {
     Invalid(String),
     Unavailable(String),
 }
@@ -33,7 +33,7 @@ impl From<&str> for ScopeError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LaunchAccountScope {
+pub struct LaunchAccountScope {
     pub provider: Provider,
     #[serde(with = "crate::selected_file_path::required")]
     pub canonical_home: PathBuf,
@@ -50,7 +50,7 @@ pub(crate) struct LaunchAccountScope {
 impl LaunchAccountScope {
     /// `environment` must describe the actual child environment after explicit
     /// removals and captured inheritance. Do not consult a later UI selection.
-    pub(crate) fn resolve(
+    pub fn resolve(
         provider: Provider,
         cwd: &Path,
         environment: impl Fn(&str) -> Option<OsString>,
@@ -58,7 +58,7 @@ impl LaunchAccountScope {
         Self::resolve_for_start(provider, cwd, environment).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn resolve_for_start(
+    pub fn resolve_for_start(
         provider: Provider,
         cwd: &Path,
         environment: impl Fn(&str) -> Option<OsString>,
@@ -168,12 +168,12 @@ impl LaunchAccountScope {
     }
 
     /// Refuse retained launch use after this pathname was replaced by another home.
-    pub(crate) fn revalidate(&self) -> Result<(), String> {
+    pub fn revalidate(&self) -> Result<(), String> {
         self.revalidate_for_start()
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn revalidate_for_start(&self) -> Result<(), ScopeError> {
+    pub fn revalidate_for_start(&self) -> Result<(), ScopeError> {
         let metadata = std::fs::metadata(&self.canonical_home).map_err(|error| {
             ScopeError::Unavailable(format!(
                 "The captured provider home is unavailable: {error}"

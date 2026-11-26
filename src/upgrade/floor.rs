@@ -24,17 +24,17 @@ pub struct Record {
     #[serde(default)]
     pub service_stopped: bool,
     #[serde(default)]
-    pub(crate) snapshots: Vec<StoppedSnapshot>,
+    pub snapshots: Vec<StoppedSnapshot>,
     #[serde(default)]
     pub aliases: Vec<Session>,
     pub chats: Vec<Session>,
     pub terminals: Vec<TerminalId>,
     #[serde(default)]
-    pub(crate) presentations: Vec<Presentation>,
+    pub presentations: Vec<Presentation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct StoppedSnapshot {
+pub struct StoppedSnapshot {
     pub source: Session,
     pub snapshot: crate::chat::Snapshot,
     #[serde(default)]
@@ -42,7 +42,7 @@ pub(crate) struct StoppedSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Presentation {
+pub struct Presentation {
     pub agent: crate::model::AgentId,
     pub session: Session,
     pub scope: crate::workspace_model::views::Scope,
@@ -193,7 +193,7 @@ impl Record {
         ))
     }
 
-    pub(crate) fn encode_capture(&mut self) -> Result<Vec<u8>, String> {
+    pub fn encode_capture(&mut self) -> Result<Vec<u8>, String> {
         encode_record(self, LIMIT)
     }
 
@@ -319,11 +319,7 @@ impl Ledger {
     /// A discovery retry can waive only its own source's earlier pause. A
     /// different update's explicit stop for the same allocation still wins.
     #[cfg(feature = "host")]
-    pub(crate) fn blocks_id_except_source(
-        &self,
-        id: TerminalId,
-        source: &HostSessionProof,
-    ) -> bool {
+    pub fn blocks_id_except_source(&self, id: TerminalId, source: &HostSessionProof) -> bool {
         self.records.iter().any(|record| {
             &record.source != source
                 && (record.terminals.contains(&id)
@@ -338,19 +334,20 @@ impl Ledger {
     }
 }
 
-/// Drop allocations that are no longer in a saved pane. A resumed pane has a
-/// new allocation ID, so the old stop evidence cannot interfere with it. Keep
-/// the installed source's record while it serves: an aborted update may still
-/// have panes which its window has not flushed to disk yet.
+/// Drop allocations with no remaining pane or agent reference. Keep the
+/// installed source's record while its windows may still need to flush, and
+/// keep the source whose recovery is being verified by this startup.
 #[cfg(feature = "host")]
-pub(crate) fn prune_unreferenced(
+pub fn prune_unreferenced(
     referenced: &std::collections::BTreeSet<TerminalId>,
+    recovering: Option<&HostSessionProof>,
 ) -> Result<(), String> {
     let paths = crate::daemon::RuntimePaths::discover().ok();
     prune_at(&directory()?, referenced, |source| {
-        paths
-            .as_ref()
-            .is_some_and(|paths| crate::daemon::lease_owner(&paths.lock, source).is_ok())
+        recovering == Some(source)
+            || paths
+                .as_ref()
+                .is_some_and(|paths| crate::daemon::lease_owner(&paths.lock, source).is_ok())
     })
 }
 
@@ -358,7 +355,7 @@ pub(crate) fn prune_unreferenced(
 fn prune_at(
     directory: &Path,
     referenced: &std::collections::BTreeSet<TerminalId>,
-    mut installed: impl FnMut(&HostSessionProof) -> bool,
+    mut keep_source: impl FnMut(&HostSessionProof) -> bool,
 ) -> Result<(), String> {
     let Some(root) = open_directory(directory)? else {
         return Ok(());
@@ -366,7 +363,7 @@ fn prune_at(
     for path in record_paths(directory)? {
         let path = path?;
         let mut record = read_record(&root, &path, true)?;
-        if installed(&record.source) {
+        if keep_source(&record.source) {
             continue;
         }
         record.prune_allocations(referenced);
@@ -479,7 +476,7 @@ fn display_index() -> &'static std::sync::RwLock<std::sync::Arc<Ledger>> {
 
 /// Presentation reads the last published index without filesystem work.
 /// Recovery and lineage decisions call load() for current durable evidence.
-pub(crate) fn display_snapshot() -> std::sync::Arc<Ledger> {
+pub fn display_snapshot() -> std::sync::Arc<Ledger> {
     display_index()
         .read()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -649,7 +646,7 @@ fn load_at_with_cache(
     Ok(ledger)
 }
 
-pub(crate) fn record_for_source(source: &HostSessionProof) -> Result<Option<Record>, String> {
+pub fn record_for_source(source: &HostSessionProof) -> Result<Option<Record>, String> {
     let directory = directory()?;
     let Some(root) = open_directory(&directory)? else {
         return Ok(None);
@@ -666,7 +663,7 @@ pub(crate) fn record_for_source(source: &HostSessionProof) -> Result<Option<Reco
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn snapshot(source: &Session) -> Result<StoppedSnapshot, String> {
+pub fn snapshot(source: &Session) -> Result<StoppedSnapshot, String> {
     let proof = source
         .proof
         .as_ref()
@@ -1006,7 +1003,7 @@ mod tests {
     }
 }
 
-pub(crate) fn same_allocation(source: &Session, saved: &Session) -> bool {
+pub fn same_allocation(source: &Session, saved: &Session) -> bool {
     source.id == saved.id
         && source.launch.provider == saved.launch.provider
         && source.launch.recipe == saved.launch.recipe
@@ -1034,7 +1031,7 @@ impl Record {
     /// ChatClose's final publication may name a conversation which did not
     /// exist in ChatList yet. Bind that acknowledgement to the exact captured
     /// allocation and retain the old descriptor as its stopped-reader alias.
-    pub(crate) fn acknowledge_snapshot(
+    pub fn acknowledge_snapshot(
         &mut self,
         source: &Session,
         snapshot: crate::chat::Snapshot,
@@ -1079,7 +1076,7 @@ impl Record {
     /// Presentations were captured before ChatClose's final conversation ID.
     /// The source proof, allocation and launch still identify that same pane.
     #[cfg(feature = "host")]
-    pub(crate) fn contains_capture_source(&self, captured: &Session) -> bool {
+    pub fn contains_capture_source(&self, captured: &Session) -> bool {
         self.chats.iter().any(|source| {
             let mut captured = captured.clone();
             captured.launch.session_id = source.launch.session_id.clone();
@@ -1141,6 +1138,7 @@ pub(crate) fn retain_reader_fields(snapshot: &mut crate::chat::Snapshot) {
     take(&mut snapshot.subagents);
     take(&mut snapshot.queued_messages);
     take(&mut snapshot.queue_removals);
+    take(&mut snapshot.send_now);
     take(&mut snapshot.branch_points);
     take(&mut snapshot.file_changes);
 }
@@ -1213,7 +1211,7 @@ pub(crate) fn mark_omitted(saved: &mut StoppedSnapshot) {
 }
 
 /// Why a stopped page that records no limitation of its own is read-only.
-pub(crate) fn default_limitation(source: &Session) -> &'static str {
+pub fn default_limitation(source: &Session) -> &'static str {
     if source.launch.session_id.is_some() {
         "Stopped for the update. This saved page is a transcript preview; Resume loads the full conversation. Your draft is kept."
     } else {

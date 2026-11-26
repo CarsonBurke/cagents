@@ -64,8 +64,9 @@ fn directory(path: &Path) -> Result<File, Unavailable> {
     Ok(current)
 }
 
-/// Keeps both descriptors alive through desktop activation. The portal receives
-/// the transcript file descriptor: OpenDirectory opens its containing folder.
+/// Keeps both descriptors alive through desktop activation. On Linux the portal
+/// receives the transcript file descriptor and OpenDirectory opens its
+/// containing folder; on macOS Finder reveals the descriptor's current path.
 pub struct ValidatedTranscript {
     _root: File,
     _file: File,
@@ -206,17 +207,50 @@ impl ValidatedTranscript {
         if current.receipt != self.receipt {
             return Err(Unavailable::Changed);
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let request = ashpd::desktop::open_uri::OpenDirectoryRequest::default()
-                .send(&current._file)
-                .await
-                .map_err(|_| Unavailable::DesktopUnavailable)?;
-            request
-                .response()
-                .map_err(|_| Unavailable::DesktopUnavailable)
-        })
-        .await
-        .map_err(|_| Unavailable::DesktopUnavailable)?
+        tokio::time::timeout(Duration::from_secs(5), current.show_in_file_manager())
+            .await
+            .map_err(|_| Unavailable::DesktopUnavailable)?
+    }
+
+    /// The portal receives the validated descriptor itself, so the folder it
+    /// opens is the one this check approved, whatever the path names by then.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    async fn show_in_file_manager(&self) -> Result<(), Unavailable> {
+        let request = ashpd::desktop::open_uri::OpenDirectoryRequest::default()
+            .send(&self._file)
+            .await
+            .map_err(|_| Unavailable::DesktopUnavailable)?;
+        request
+            .response()
+            .map_err(|_| Unavailable::DesktopUnavailable)
+    }
+
+    /// Finder takes a path, not a descriptor, so this is weaker than the Linux
+    /// portal: the kernel's current path for the validated file is handed to
+    /// `open -R`, and a rename between that lookup and Finder's would reveal
+    /// whatever then holds the name. Finder only selects the item in its
+    /// folder, so the cost of that race is showing the wrong folder, never
+    /// opening or running the file.
+    #[cfg(all(feature = "ui", target_os = "macos"))]
+    async fn show_in_file_manager(&self) -> Result<(), Unavailable> {
+        let path =
+            crate::descriptor::path_of(&self._file).map_err(|_| Unavailable::DesktopUnavailable)?;
+        let status = tokio::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg("--")
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await
+            .map_err(|_| Unavailable::DesktopUnavailable)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Unavailable::DesktopUnavailable)
+        }
     }
 }
 
