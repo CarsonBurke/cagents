@@ -40,7 +40,12 @@ import kotlin.time.TimeSource
 sealed interface ConnectionState {
     /** Not connecting: not started, or stopped while the app is in the background. */
     data object Offline : ConnectionState
-    data object Connecting : ConnectionState
+    /**
+     * An attempt is under way. [lastFailure] is why the one before it failed,
+     * kept in view while this one runs, so the person learns what is wrong
+     * rather than watching an attempt that may take half a minute.
+     */
+    data class Connecting(val lastFailure: String? = null) : ConnectionState
     data object Connected : ConnectionState
 
     /** The last attempt failed; another follows after a backoff. */
@@ -73,6 +78,13 @@ data class ControllerConfig(
     val backgroundGrace: Duration = 30.seconds,
     /** A connection that lasted this long starts the backoff over when it drops. */
     val stableAfter: Duration = 10.seconds,
+    /**
+     * How long reaching the computer and starting the bridge may take,
+     * whatever it waits on, such as a name lookup that never answers.
+     */
+    val connectTimeout: Duration = 30.seconds,
+    /** How long the bridge, once started, has to answer `hello`. */
+    val handshakeTimeout: Duration = 20.seconds,
 )
 
 /**
@@ -221,7 +233,7 @@ class RemoteController(
         }
         // Hidden at once, while the old connection closes, so nothing of it
         // can be opened meanwhile.
-        if (computerChanged) _state.value = RemoteState(connection = ConnectionState.Connecting)
+        if (computerChanged) _state.value = RemoteState(connection = ConnectionState.Connecting())
         stopping.withLock {
             disconnect()
             locked {
@@ -333,8 +345,9 @@ class RemoteController(
 
     private suspend fun connectLoop() {
         var attempt = 0
+        var lastFailure: String? = null
         while (true) {
-            _state.update { it.copy(connection = ConnectionState.Connecting) }
+            _state.update { it.copy(connection = ConnectionState.Connecting(lastFailure)) }
             var connectedAt: TimeMark? = null
             val failure: ConnectFailure = try {
                 ConnectFailure.Network(connectOnce { connectedAt = timeSource.markNow() })
@@ -350,8 +363,11 @@ class RemoteController(
                 _state.update { it.copy(connection = ConnectionState.NeedsAction(failure)) }
                 wake.receive()
                 attempt = 0
+                lastFailure = null
                 continue
             }
+            val reason = sentence(failure.message)
+            lastFailure = reason
 
             // Only a connection that held starts over; one that drops straight
             // after connecting, again and again, keeps backing off.
@@ -359,7 +375,7 @@ class RemoteController(
             attempt++
             val backoff = backoff(attempt)
             _state.update {
-                it.copy(connection = ConnectionState.Retrying(failure.message.orEmpty(), attempt, backoff))
+                it.copy(connection = ConnectionState.Retrying(reason, attempt, backoff))
             }
             withTimeoutOrNull(backoff) { wake.receive() }
         }
@@ -367,11 +383,24 @@ class RemoteController(
 
     /** Connects, serves the connection until it ends and returns why it ended. */
     private suspend fun connectOnce(onConnected: () -> Unit): String {
-        val channel = transport.open()
+        // Kept as it opens: a timeout landing just as open() returns would otherwise drop it unclosed.
+        var opened: LineChannel? = null
+        val channel = withTimeoutOrNull(config.connectTimeout) { transport.open().also { opened = it } }
+            ?: run {
+                opened?.close()
+                throw ConnectFailure.Network(
+                    "The computer didn't answer within ${config.connectTimeout.inWholeSeconds} seconds. " +
+                        "Is it awake, and is this phone on its network or on Tailscale?",
+                )
+            }
         val bridge = BridgeSession(channel, config.clientName, config.clientVersion)
         var queue: Channel<Sync>? = null
         try {
-            val welcome = bridge.handshake()
+            val welcome = withTimeoutOrNull(config.handshakeTimeout) { bridge.handshake() }
+                ?: throw ConnectFailure.Network(
+                    "The computer accepted this phone, but cagents there didn't answer within ${config.handshakeTimeout.inWholeSeconds} seconds. " +
+                        "Check that cagents is running there, and the command in Settings.",
+                )
             onConnected()
             // Drain a wake that arrived while connecting, so it doesn't skip a later backoff.
             wake.tryReceive()
@@ -555,6 +584,12 @@ class RemoteController(
     }
 
     private companion object {
+        /** [message] as a sentence to show, with a stand-in when there is none. */
+        fun sentence(message: String?): String {
+            val text = message?.trim().orEmpty().ifEmpty { return "The connection failed." }
+            return if (text.last() in ".?!…") text else "$text."
+        }
+
         const val MAX_RECOVERIES = 3
         const val UNREADABLE = "This app can't read part of this conversation. Update the app."
     }

@@ -29,6 +29,7 @@ import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 private const val S = "8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"
@@ -170,6 +171,98 @@ class RemoteControllerTest {
         val state = controller.await { it.conversations[S]?.items?.size == 2 }
         assertEquals(ConnectionState.Connected, state.connection)
         assertEquals(3, bridge.opens)
+    }
+
+    @Test
+    fun keepsWhyTheLastAttemptFailedInViewWhileTheNextRuns() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Network("Couldn't reach fw16. Is this phone on Tailscale?")
+        controller.start()
+        controller.await { it.connection is ConnectionState.Retrying }
+
+        // The next attempt reaches the bridge, which hasn't answered yet.
+        val pending = bridge.accept()
+        assertEquals(
+            ConnectionState.Connecting("Couldn't reach fw16. Is this phone on Tailscale?"),
+            controller.state.value.connection,
+        )
+        pending.next()
+        pending.send("""{"type":"welcome","api":1,"server_version":"0.2.3","host":"workstation"}""")
+        controller.await { it.connection == ConnectionState.Connected }
+    }
+
+    @Test
+    fun aDroppedConnectionsReasonShowsWhileReconnecting() = runTest {
+        val controller = controller()
+        controller.start()
+        val first = bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+        first.send("""{"type":"event","event":"closing","data":{"message":"The computer's cagents daemon is stopping."}}""")
+        first.hangUp()
+
+        bridge.accept()
+        assertEquals(
+            ConnectionState.Connecting("The computer's cagents daemon is stopping."),
+            controller.state.value.connection,
+        )
+    }
+
+    @Test
+    fun aRetryAfterTheyActStartsWithoutTheOldFailure() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Unauthorized("marvin@fw16 didn't accept this phone's key.")
+        controller.start()
+        controller.await { it.connection is ConnectionState.NeedsAction }
+
+        controller.retryNow()
+        bridge.accept()
+        assertEquals(ConnectionState.Connecting(), controller.state.value.connection)
+    }
+
+    @Test
+    fun showsEveryReasonAsASentence() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Network("  ")
+        bridge.refusals += ConnectFailure.Network("No route to host")
+        controller.start()
+        val blank = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertEquals("The connection failed.", blank.message)
+        val bare = controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 2 }.connection
+        assertEquals("No route to host.", (bare as ConnectionState.Retrying).message)
+    }
+
+    @Test
+    fun firstAttemptHasNoFailureToShow() = runTest {
+        val controller = controller()
+        controller.start()
+        bridge.accept()
+        assertEquals(ConnectionState.Connecting(), controller.state.value.connection)
+    }
+
+    @Test
+    fun givesUpOnAComputerThatNeverAnswers() = runTest {
+        val controller = controller()
+        bridge.hangs = 1
+        controller.start()
+        val retrying = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertTrue("didn't answer within 30 seconds" in retrying.message, retrying.message)
+        assertEquals(30.seconds, testScheduler.currentTime.milliseconds)
+        // And tries again, as for any network failure.
+        bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+    }
+
+    @Test
+    fun givesUpOnABridgeThatNeverSaysWelcome() = runTest {
+        val controller = controller()
+        controller.start()
+        val silent = bridge.accept()
+        silent.next() // hello, never answered
+        val retrying = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertTrue("cagents there didn't answer within 20 seconds" in retrying.message, retrying.message)
+        assertEquals(20.seconds, testScheduler.currentTime.milliseconds)
+        // The silent connection is closed rather than left behind.
+        assertTrue(silent.isClosedByClient())
     }
 
     /** A controller connected to a computer, following its sessions, a notice and conversation [S]. */

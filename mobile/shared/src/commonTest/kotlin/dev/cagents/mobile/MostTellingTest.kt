@@ -33,6 +33,29 @@ class MostTellingTest {
         assertFalse("Tailscale" in elsewhere.message!!)
     }
 
+    private fun refused(host: String) = ConnectFailure.Network("$host refused the connection on port 2244.", refusedBy = host)
+
+    @Test
+    fun aComputerThatRefusesThePortSaysSoRatherThanUnreachable() {
+        // Its Tailscale address answered, so it is the computer, without SSH on that port.
+        val viaTailscale = refused("100.101.102.103")
+        assertSame(viaTailscale, mostTelling(listOf(unreachable, viaTailscale, unreachable), "workstation", hosts, paired = true))
+        // Set up by hand, the person chose the address.
+        val byHand = refused(lan)
+        assertSame(byHand, mostTelling(listOf(unreachable, byHand), "workstation", listOf(tailscale, lan), paired = false))
+        // Every address refused.
+        val all = hosts.map(::refused)
+        assertSame(all.first(), mostTelling(all, "workstation", hosts, paired = true))
+    }
+
+    @Test
+    fun aLocalAddressRefusingAwayFromHomeIsOnlyUnreachable() {
+        // Another network's machine at the home LAN address, with Tailscale off.
+        val stranger = refused(lan)
+        val reported = mostTelling(listOf(unreachable, unreachable, stranger), "workstation", hosts, paired = true)
+        assertTrue("any of its 3 addresses" in reported.message!!, reported.message)
+    }
+
     @Test
     fun aPairedComputerWithAWrongKeyEverywhereRaisesTheAlarm() {
         val failures = hosts.map(::changed)
