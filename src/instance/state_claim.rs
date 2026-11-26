@@ -57,7 +57,9 @@ struct Record {
 }
 
 const FORMAT: u64 = 1;
-const MAX_RECORD_BYTES: u64 = 4096;
+// The runtime path appears in both `guard` and `runtime`. Budget for
+// two full Linux PATH_MAX values with JSON escaping, plus the header.
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const POLL: Duration = Duration::from_millis(20);
 /// How long a claimant watches the runtime lock a claim records before it
 /// takes over from another runtime directory: many times the interval at
@@ -722,6 +724,12 @@ fn read_path(path: &Path) -> io::Result<Option<Record>> {
 /// the same lock, and will never treat an interrupted write as free state.
 fn write(file: &mut File, record: &Record) -> io::Result<()> {
     let bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "saved-data claim exceeds its record size limit",
+        ));
+    }
     file.write_all_at(&bytes, 0)?;
     file.set_len(bytes.len() as u64)
 }
@@ -1098,6 +1106,30 @@ mod tests {
         ] {
             assert!(failure.to_string().contains("unreadable"), "{failure}");
         }
+    }
+
+    #[test]
+    fn a_long_runtime_claim_can_be_reopened_and_oversize_writes_preserve_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = root.path().to_path_buf();
+        // PATH_MAX is 1024 on Darwin. This specifically crosses the old
+        // record cap on systems that accept long runtime directories.
+        let depth = if cfg!(target_os = "linux") { 24 } else { 6 };
+        for _ in 0..depth {
+            runtime.push("r".repeat(96));
+        }
+        fs::create_dir_all(&runtime).unwrap();
+        let guard = runtime.join("cagentsd.lock");
+        let _lock = owned_lock(&guard, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let claim = root.path().join(DAEMON_CLAIM);
+        let valid = record(&guard, None).unwrap();
+        drop(acquire(&claim, valid.clone(), Claimant::Daemon, Duration::ZERO).unwrap());
+        assert_eq!(read_path(&claim).unwrap(), Some(valid.clone()));
+        let mut oversize = valid.clone();
+        oversize.host_session = Some("x".repeat(MAX_RECORD_BYTES as usize));
+        assert!(acquire(&claim, oversize, Claimant::Daemon, Duration::ZERO).is_err());
+        assert_eq!(read_path(&claim).unwrap(), Some(valid.clone()));
+        acquire(&claim, valid, Claimant::Daemon, Duration::ZERO).unwrap();
     }
 
     #[test]
