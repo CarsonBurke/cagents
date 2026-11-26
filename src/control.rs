@@ -882,7 +882,10 @@ pub enum ControlError {
 }
 
 fn remote_display(code: ProtocolErrorCode, message: &str, retryable: bool) -> String {
-    if Refusal::recognize(message, retryable).is_some() {
+    if Refusal::recognize(message, retryable).is_some()
+        || crate::agent_execution::concurrency::LimitReached::recognize(message, retryable)
+            .is_some()
+    {
         message.to_owned()
     } else {
         format!("daemon rejected the request ({code:?}): {message}")
@@ -4294,7 +4297,10 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Ask(_)
         | TopCommand::Reply(_)
         | TopCommand::Inbox(_) => true,
-        TopCommand::Agent { command } => !matches!(command, AgentCommand::Console { .. }),
+        TopCommand::Agent { command } => !matches!(
+            command,
+            AgentCommand::Console { .. } | AgentCommand::Limits { .. }
+        ),
         // These paths do not call ensure_daemon_ready. Internal helpers and new
         // commands remain non-recovering until their actual contract requires it.
         _ => false,
@@ -4315,6 +4321,12 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             // while the updater still holds the installation launch fence.
             | TopCommand::Agent {
                 command: AgentCommand::Console { .. }
+            }
+            // The limits are a file in this installation's configuration,
+            // written without the daemon; an older owner's CLI has no verb
+            // for them.
+            | TopCommand::Agent {
+                command: AgentCommand::Limits { .. }
             }
 
             | TopCommand::CoordinateInstall { .. }
@@ -5802,6 +5814,16 @@ fn terminal_output(
 }
 
 fn protocol_error(error: ControlError) -> AppError {
+    if let ControlError::Remote {
+        code,
+        message,
+        retryable,
+    } = &error
+        && let Some(refusal) =
+            crate::agent_execution::concurrency::LimitReached::recognize(message, *retryable)
+    {
+        return limit_reached(*code, message.clone(), &refusal);
+    }
     let kind = match &error {
         ControlError::WaitTimeout { .. } | ControlError::SnapshotTimeout => "timeout",
         ControlError::DeviceAccess(_) => "permission_denied",
@@ -5828,6 +5850,28 @@ fn protocol_error(error: ControlError) -> AppError {
         kind,
         message: error.to_string(),
         details,
+    }
+}
+
+/// A submission the daemon refused because the runs holding agent slots
+/// reach a limit: `limit_reached`, with the counts and holders as details,
+/// and retryable, since nothing was accepted.
+fn limit_reached(
+    code: ProtocolErrorCode,
+    message: String,
+    refusal: &crate::agent_execution::concurrency::LimitReached,
+) -> AppError {
+    AppError {
+        kind: "limit_reached",
+        message,
+        details: Some(json!({
+            "code": code,
+            "retryable": true,
+            "scope": refusal.scope,
+            "running": refusal.running,
+            "limit": refusal.limit,
+            "holders": refusal.holders,
+        })),
     }
 }
 

@@ -164,7 +164,30 @@ pub enum AgentCommand {
     /// Stop and close an agent, including its background subagents.
     Close {
         #[arg(help = "Agent handle, ID, or unique ID prefix")]
-        agent: String,
+        #[arg(
+            required_unless_present = "interrupted",
+            conflicts_with = "interrupted"
+        )]
+        agent: Option<String>,
+        /// Close every open agent of yours with an interrupted run, releasing
+        /// the agent slots interrupted runs hold.
+        #[arg(long)]
+        interrupted: bool,
+    },
+    /// Show or change how many agent runs may be active at once.
+    #[command(
+        after_help = "A run holds a slot while it is accepted, running or waiting, and an \
+        interrupted run holds one until its agent is closed. A caller is a session and its \
+        successors, your shells together, or one automation. The daemon applies a change at \
+        its next submission."
+    )]
+    Limits {
+        /// Runs one caller may hold at once.
+        #[arg(long, value_name = "N")]
+        per_caller: Option<usize>,
+        /// Runs every caller may hold together.
+        #[arg(long, value_name = "N")]
+        total: Option<usize>,
     },
 }
 
@@ -1228,6 +1251,7 @@ pub(super) fn execute_with_context(
     let mut session = Session::new(context);
     match command {
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),
+        AgentCommand::Limits { per_caller, total } => limits(per_caller, total, context),
         AgentCommand::Spawn {
             prompt,
             name,
@@ -1697,7 +1721,17 @@ pub(super) fn execute_with_context(
                 ),
             })
         }
-        AgentCommand::Close { agent } => {
+        AgentCommand::Close {
+            agent: None,
+            interrupted: true,
+        } => close_interrupted(&mut session),
+        AgentCommand::Close { agent, .. } => {
+            let Some(agent) = agent else {
+                return Err(AppError::new(
+                    "agent.close",
+                    "Name an agent or pass --interrupted",
+                ));
+            };
             let agent = session.agent(&agent)?;
             let Reply::Closed(agent) = session.call(Operation::Close(agent))? else {
                 return Err(AppError::new("agent.close", "Unexpected close response"));
@@ -1712,6 +1746,143 @@ pub(super) fn execute_with_context(
             })
         }
     }
+}
+
+/// Closes each of the caller's open agents with an interrupted run, which
+/// holds its agent slot until then. One that cannot be closed does not stop
+/// the rest; the error names what was and was not closed.
+fn close_interrupted(session: &mut Session) -> Result<CommandOutput, AppError> {
+    let interrupted: Vec<AgentId> = session
+        .summaries()?
+        .iter()
+        .filter(|summary| summary.state == crate::agent_execution::State::Interrupted)
+        .map(|summary| summary.agent.id)
+        .collect();
+    let handles = session.handles(&[]);
+    let mut closed: Vec<crate::agent_execution::Agent> = Vec::with_capacity(interrupted.len());
+    let mut failed: Vec<(AgentId, AppError)> = Vec::new();
+    for agent in interrupted {
+        match session.call(Operation::Close(agent)) {
+            Ok(Reply::Closed(agent)) => closed.push(agent),
+            Ok(_) => failed.push((
+                agent,
+                AppError::new("agent.close", "Unexpected close response"),
+            )),
+            Err(error) => failed.push((agent, error)),
+        }
+    }
+    if !failed.is_empty() {
+        let names = |agents: &mut dyn Iterator<Item = AgentId>| {
+            agents
+                .map(|agent| handles.name(agent))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut message = format!(
+            "Could not close {}: {}",
+            names(&mut failed.iter().map(|(agent, _)| *agent)),
+            failed
+                .iter()
+                .map(|(_, error)| error.message.trim_end_matches('.'))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        if !closed.is_empty() {
+            message.push_str(&format!(
+                ". Closed: {}",
+                names(&mut closed.iter().map(|agent| agent.id))
+            ));
+        }
+        let failed_ids: Vec<AgentId> = failed.iter().map(|(agent, _)| *agent).collect();
+        let (_, first) = failed.swap_remove(0);
+        return Err(AppError {
+            kind: first.kind,
+            message,
+            details: Some(json!({
+                "closed": closed,
+                "failed": failed_ids,
+            })),
+        });
+    }
+    let human = match closed.as_slice() {
+        [] => "No open agent of yours has an interrupted run".to_owned(),
+        agents => format!(
+            "Closed {} interrupted agent{}: {}",
+            agents.len(),
+            if agents.len() == 1 { "" } else { "s" },
+            agents
+                .iter()
+                .map(|agent| handles.name(agent.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Ok(CommandOutput {
+        command: "agent.close",
+        human,
+        data: json!({ "agents": closed }),
+    })
+}
+
+/// Shows the agent concurrency limits, after changing those given. Only a
+/// person changes them: a session's agents are what they limit.
+fn limits(
+    per_caller: Option<usize>,
+    total: Option<usize>,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    use crate::agent_execution::concurrency;
+    let refused = |message: String| AppError::new("agent.limits", message);
+    if crate::device::is_remote() {
+        return Err(refused(
+            "Agent limits are set on the device itself; run this there".into(),
+        ));
+    }
+    let changed = per_caller.is_some() || total.is_some();
+    if changed && context.scoped() {
+        return Err(refused(
+            "Only a person can change the agent limits, from a shell cagents does not host".into(),
+        ));
+    }
+    let path = concurrency::path().map_err(|error| refused(error.to_string()))?;
+    let unreadable = |error: std::io::Error| refused(format!("{}: {error}", path.display()));
+    // Both given replace whatever the file holds, even a file that cannot be
+    // read, which is how a person repairs it.
+    let mut limits = match (per_caller, total) {
+        (Some(per_caller), Some(total)) => concurrency::Limits { per_caller, total },
+        _ => concurrency::load().map_err(|error| {
+            refused(format!(
+                "{}: {error}. The daemon is using the defaults; `--per-caller N --total N` together replace the file",
+                path.display()
+            ))
+        })?,
+    };
+    if changed {
+        limits = concurrency::Limits {
+            per_caller: per_caller.unwrap_or(limits.per_caller),
+            total: total.unwrap_or(limits.total),
+        }
+        .validate()
+        .map_err(refused)?;
+        concurrency::save(limits).map_err(unreadable)?;
+    }
+    Ok(CommandOutput {
+        command: "agent.limits",
+        human: if changed {
+            format!(
+                "Agents may now have {} runs at once per caller and {} in all; the daemon applies this at its next submission.",
+                limits.per_caller, limits.total
+            )
+        } else {
+            format!(
+                "Agents may have {} runs at once per caller and {} in all ({}).",
+                limits.per_caller,
+                limits.total,
+                path.display()
+            )
+        },
+        data: json!({ "limits": limits, "changed": changed, "path": path }),
+    })
 }
 
 /// The daemon's refusal of a follow-up for an agent a usage limit stops
@@ -1740,12 +1911,103 @@ fn is_limited_refusal(error: &AppError) -> bool {
         .starts_with(crate::agent_execution::LIMITED_REFUSAL)
 }
 
+/// A refusal for the runs holding agent slots, listing them for a person by
+/// the handles and names the caller knows them by, with what frees one.
+/// JSON output keeps the daemon's sentence and the structured details.
+fn limit_holders(session: &mut Session, mut error: AppError) -> AppError {
+    use crate::agent_execution::concurrency::LimitReached;
+    if error.kind != "limit_reached" || !super::human_output() {
+        return error;
+    }
+    let Some(refusal) = LimitReached::recognize(&error.message, true) else {
+        return error;
+    };
+    let ids: Vec<String> = refusal
+        .holders
+        .iter()
+        .map(|holder| holder.agent.to_string())
+        .collect();
+    let handles = session.handles(&ids);
+    let names: std::collections::HashMap<AgentId, String> = session
+        .summaries
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|summary| Some((summary.agent.id, summary.agent.name.clone()?)))
+        .collect();
+    error.message = limit_message(&refusal, handles, &names);
+    error
+}
+
+/// A person's account of `refusal`: what is full, which runs hold it, by
+/// handle and, for the caller's own agents, name, and what frees a slot.
+fn limit_message(
+    refusal: &crate::agent_execution::concurrency::LimitReached,
+    handles: Handles,
+    names: &std::collections::HashMap<AgentId, String>,
+) -> String {
+    use crate::agent_execution::{State, concurrency::Scope};
+    let program = super::format::program();
+    let (running, limit) = (refusal.running, refusal.limit);
+    let mut text = match refusal.scope {
+        Scope::Caller => format!(
+            "Agent limit reached: you have {running} agent runs active or unconfirmed, and may have {limit} at once. Nothing was started."
+        ),
+        Scope::Global => format!(
+            "Agent limit reached: {running} agent runs are active or unconfirmed across all callers, and the daemon allows {limit} at once. Nothing was started."
+        ),
+    };
+    if !refusal.holders.is_empty() {
+        text.push_str("\nYours:");
+        for holder in &refusal.holders {
+            let handle = handles.name(holder.agent);
+            let state = holder.state.key();
+            match names.get(&holder.agent) {
+                Some(name) => text.push_str(&format!("\n  {handle}  {name}  {state}")),
+                None => text.push_str(&format!("\n  {handle}  {state}")),
+            }
+        }
+        let others = running.saturating_sub(refusal.holders.len());
+        if others > 0 {
+            text.push_str(&format!(
+                "\n  and {others} {}",
+                match refusal.scope {
+                    Scope::Caller => "more",
+                    Scope::Global => "held by other callers",
+                }
+            ));
+        }
+        text.push_str(&format!(
+            "\nRetry once one finishes (`{program} agent wait AGENT`), or close one you no longer need (`{program} agent close AGENT`)."
+        ));
+    } else {
+        text.push_str("\nRetry once some of them finish.");
+    }
+    if refusal
+        .holders
+        .iter()
+        .any(|holder| holder.state == State::Interrupted)
+    {
+        text.push_str(&format!(
+            " An interrupted run keeps its slot until its agent is closed; `{program} agent close --interrupted` closes all of yours."
+        ));
+    }
+    let flag = match refusal.scope {
+        Scope::Caller => "--per-caller",
+        Scope::Global => "--total",
+    };
+    text.push_str(&format!(
+        "\nA person can raise the limit with `{program} agent limits {flag} N`."
+    ));
+    text
+}
+
 /// `error` with the key that makes retrying its submission safe, when a
 /// retry could still start the work.
 fn with_retry_key(mut error: AppError, key: &str) -> AppError {
     // A limit's refusal is definite: nothing was accepted to retry. A run
     // that ended has spent its key: retrying reports the same end.
-    if is_limited_refusal(&error) || ended_run(&error) {
+    if is_limited_refusal(&error) || ended_run(&error) || error.kind == "limit_reached" {
         return error;
     }
     error.message = format!(
@@ -1824,7 +2086,7 @@ fn submitted(
     };
     let (reply, retried) = session
         .submit(request, operation)
-        .map_err(|error| with_retry_key(error, &key))?;
+        .map_err(|error| with_retry_key(limit_holders(session, error), &key))?;
     let (accepted, start) = match reply {
         Reply::Accepted(accepted) => (accepted, None),
         Reply::Prompted { accepted, start } => (accepted, Some(start)),
@@ -2456,6 +2718,87 @@ mod tests {
             );
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         }
+    }
+
+    /// A submission refused for the runs holding agent slots reads as
+    /// `limit_reached`, retryable, with its counts and holders as details,
+    /// and a person sees the holders named and what frees a slot. No retry
+    /// key is attached: nothing was accepted.
+    #[test]
+    fn a_full_agent_limit_reports_its_counts_holders_and_remedy() {
+        use crate::agent_execution::{
+            State,
+            concurrency::{Holder, LimitReached, Scope},
+        };
+        use crate::terminal::ipc::ProtocolErrorCode;
+        let (mine, theirs) = (AgentId::new(), AgentId::new());
+        let refusal = LimitReached {
+            scope: Scope::Caller,
+            running: 3,
+            limit: 3,
+            holders: vec![
+                Holder {
+                    agent: mine,
+                    run: RunId::new(),
+                    state: State::Running,
+                },
+                Holder {
+                    agent: theirs,
+                    run: RunId::new(),
+                    state: State::Interrupted,
+                },
+            ],
+        };
+        let remote = |retryable| ControlError::Remote {
+            code: ProtocolErrorCode::QueueFull,
+            message: refusal.to_string(),
+            retryable,
+        };
+        assert_eq!(remote(true).to_string(), refusal.to_string());
+        let error = with_retry_key(protocol_error(remote(true)), "k1");
+        assert_eq!(error.kind, "limit_reached");
+        assert_eq!(error.message, refusal.to_string());
+        let details = error.details.unwrap();
+        assert_eq!(details["retryable"], true);
+        assert_eq!(details["scope"], "caller");
+        assert_eq!(details["running"], 3);
+        assert_eq!(details["limit"], 3);
+        assert_eq!(details["holders"][1]["agent"], theirs.to_string());
+        assert_eq!(details["holders"][1]["state"], "interrupted");
+        assert!(details.get("idempotency_key").is_none());
+
+        let names = std::collections::HashMap::from([(mine, "reviewer".to_owned())]);
+        let text = limit_message(&refusal, Handles::default(), &names);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "Agent limit reached: you have 3 agent runs active or unconfirmed, and may have 3 at once. Nothing was started."
+        );
+        assert_eq!(lines[1], "Yours:");
+        let handle = |id: AgentId| Handles::default().name(id);
+        assert_eq!(lines[2], format!("  {}  reviewer  running", handle(mine)));
+        assert_eq!(lines[3], format!("  {}  interrupted", handle(theirs)));
+        assert_eq!(lines[4], "  and 1 more");
+        assert!(lines[5].contains("agent close --interrupted"), "{text}");
+        assert!(lines[6].contains("agent limits --per-caller N"), "{text}");
+
+        // Another caller's runs are counted, never named.
+        let global = LimitReached {
+            scope: Scope::Global,
+            running: 32,
+            limit: 32,
+            holders: Vec::new(),
+        };
+        let text = limit_message(&global, Handles::default(), &names);
+        assert!(!text.contains("Yours"), "{text}");
+        assert!(
+            text.contains("32 agent runs are active or unconfirmed across all callers"),
+            "{text}"
+        );
+        assert!(text.contains("agent limits --total N"), "{text}");
+
+        // A sentence that only looks like one, or a final refusal, is not.
+        assert_eq!(protocol_error(remote(false)).kind, "protocol");
     }
 
     #[test]

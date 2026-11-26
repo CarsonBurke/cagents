@@ -1700,6 +1700,11 @@ fn process_admitted_request(
                     crate::agent_execution::AcceptanceError::MailboxFull(message) => {
                         ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
                     }
+                    // Its sentence carries the counts and holders, which the
+                    // CLI reads back out of it.
+                    crate::agent_execution::AcceptanceError::LimitReached(refusal) => {
+                        ProtocolError::new(ProtocolErrorCode::QueueFull, refusal.to_string(), true)
+                    }
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }

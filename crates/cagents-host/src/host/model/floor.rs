@@ -145,6 +145,9 @@ fn capture_presentations_at(path: &Path, record: &mut Record) -> Result<(), Stri
     let registry = Registry {
         db: super::schema::open_readonly(path)?,
         path: path.to_owned(),
+        concurrency: std::sync::Arc::new(crate::agent_execution::concurrency::Setting::fixed(
+            Default::default(),
+        )),
     };
     let snapshot = registry
         .db
@@ -405,6 +408,9 @@ mod tests {
             Registry {
                 db,
                 path: PathBuf::new(),
+                concurrency: std::sync::Arc::new(
+                    crate::agent_execution::concurrency::Setting::fixed(Default::default()),
+                ),
             },
             Record::new(proof, vec![session], vec![]),
             agent,

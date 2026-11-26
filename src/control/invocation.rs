@@ -141,9 +141,15 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 action,
             }),
             AgentCommand::Interrupt { agent, .. } => Kind::Act(Act::Interrupt { agent }),
-            AgentCommand::Close { agent } => Kind::Act(Act::Close {
+            AgentCommand::Close {
+                agent: Some(agent), ..
+            } => Kind::Act(Act::Close {
                 agents: vec![agent],
             }),
+            AgentCommand::Close { agent: None, .. } => {
+                Kind::Act(Act::Cli("agent close --interrupted".to_owned()))
+            }
+            AgentCommand::Limits { .. } => Kind::Act(Act::Cli(subcommand_path(argv))),
             AgentCommand::Console { .. } => return None,
         },
         // The rest manage the application rather than other agents, and are
@@ -485,6 +491,14 @@ mod tests {
             Some(Kind::Act(Act::Wait {
                 agents: vec!["a".into(), "b".into()]
             }))
+        );
+        assert_eq!(
+            parse("cagents agent close --interrupted", None),
+            Some(Kind::Act(Act::Cli("agent close --interrupted".into())))
+        );
+        assert_eq!(
+            parse("cagents agent limits --total 40", None),
+            Some(Kind::Act(Act::Cli("agent limits".into())))
         );
         // Global options read the same before or after the subcommand.
         for line in [

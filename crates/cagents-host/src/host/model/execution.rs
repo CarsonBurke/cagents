@@ -3,14 +3,18 @@
 use super::{Registry, repository_key, take_ordinal};
 use crate::{
     agent_execution::{
-        Accepted, Agent, Authority, Destination, HostedSession, Lineage, MAX_CHILDREN,
-        MAX_PARENT_DEPTH, MAX_PARENT_RUNNING, MAX_RUNNING, Origin, Placement, ResultSummary, Run,
-        State, Submit, Update,
+        AcceptanceError, Accepted, Agent, Authority, Destination, HostedSession, Lineage,
+        MAX_CHILDREN, MAX_PARENT_DEPTH, Origin, Placement, ResultSummary, Run, State, Submit,
+        Update,
+        concurrency::{self, Holder, LimitReached, Limits},
     },
     model::{AgentId, ChannelId, RunId, TerminalId},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeMap;
+
+/// The most agents an update names as holding it; it counts the rest.
+const MAX_UPDATE_HOLDS: usize = 32;
 
 pub(in crate::host) struct AgentRunUpdateRisk {
     pub session: crate::chat::Session,
@@ -318,7 +322,7 @@ impl Registry {
             ))
             .map_err(|error| error.to_string())?;
         let records = query
-            .query_map([MAX_RUNNING as u64 + 1], |row| {
+            .query_map([MAX_UPDATE_HOLDS as u64 + 1], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
@@ -330,7 +334,7 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let mut holds = records
             .iter()
-            .take(MAX_RUNNING)
+            .take(MAX_UPDATE_HOLDS)
             .map(|(record, session, launching)| {
                 let agent: Agent = decode(record)?;
                 Ok(AgentUpdateHold {
@@ -346,7 +350,7 @@ impl Registry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        if records.len() > MAX_RUNNING {
+        if records.len() > MAX_UPDATE_HOLDS {
             holds.push(AgentUpdateHold {
                 session: None,
                 blocker: "Additional agent launches must settle before updating".into(),
@@ -1410,7 +1414,7 @@ impl Registry {
         origin: &Origin,
         request: &Submit,
         now_ms: u64,
-    ) -> Result<Accepted, String> {
+    ) -> Result<Accepted, AcceptanceError> {
         self.submit_agent_with_spec(origin, request, None, now_ms)
     }
 
@@ -1420,12 +1424,14 @@ impl Registry {
         request: &Submit,
         selected: Option<&crate::agent_execution::Spec>,
         now_ms: u64,
-    ) -> Result<Accepted, String> {
+    ) -> Result<Accepted, AcceptanceError> {
+        let limits = self.concurrency();
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let accepted = Self::submit_agent_selected_in(&tx, origin, request, selected, now_ms)?;
+        let accepted =
+            Self::submit_agent_selected_in(&tx, origin, request, selected, now_ms, limits)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
@@ -1437,8 +1443,9 @@ impl Registry {
         origin: &Origin,
         request: &Submit,
         now_ms: u64,
-    ) -> Result<Accepted, String> {
-        Self::submit_agent_selected_in(tx, origin, request, None, now_ms)
+        limits: Limits,
+    ) -> Result<Accepted, AcceptanceError> {
+        Self::submit_agent_selected_in(tx, origin, request, None, now_ms, limits)
     }
 
     fn submit_agent_selected_in(
@@ -1447,7 +1454,8 @@ impl Registry {
         request: &Submit,
         selected: Option<&crate::agent_execution::Spec>,
         now_ms: u64,
-    ) -> Result<Accepted, String> {
+        limits: Limits,
+    ) -> Result<Accepted, AcceptanceError> {
         request.validate()?;
         let origin_json = encode(origin)?;
         let request_json = encode(request)?;
@@ -1481,24 +1489,6 @@ impl Registry {
             Destination::Existing(id) => active_run(tx, *id)?.is_some(),
             Destination::New(_) => false,
         };
-        if !behind {
-            // Queued runs wait behind their agent's head and are not counted.
-            let (running, owned): (usize, usize) = tx
-                .query_row(
-                    "SELECT count(*), coalesce(sum(r.origin = ?1), 0)
-                     FROM agent_runs r JOIN agents a ON a.id = r.agent
-                     WHERE (r.state IN ('accepted', 'running', 'waiting')
-                            AND NOT EXISTS(SELECT 1 FROM agent_runs e WHERE e.agent = r.agent
-                                AND e.rowid < r.rowid AND e.state IN ('accepted', 'running', 'waiting')))
-                        OR (r.state = 'interrupted' AND a.closed = 0)",
-                    [&origin_json],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|error| error.to_string())?;
-            if running >= MAX_RUNNING || owned >= MAX_PARENT_RUNNING {
-                return Err(CONCURRENCY_REFUSAL.into());
-            }
-        }
         let agent = match &request.destination {
             Destination::Existing(id) => {
                 let agent = read_agent(tx, *id)?;
@@ -1535,7 +1525,8 @@ impl Registry {
                 if queued >= MAX_QUEUED {
                     return Err(format!(
                         "{QUEUE_FULL}{MAX_QUEUED} prompts waiting for its current run; wait for them or close the agent"
-                    ));
+                    )
+                    .into());
                 }
                 // A client's follow-up goes behind messages to the agent
                 // that have not become runs yet, as a later message would.
@@ -1590,7 +1581,7 @@ impl Registry {
                 // keeping the caller's original request as its retry key.
                 let spec = selected.unwrap_or(spec);
                 // Fanout bounds delegated work, not the user's retained
-                // conversations. Every origin still pays the run limits above.
+                // conversations. Every origin still pays the run limits below.
                 if !matches!(origin, Origin::User) {
                     let children: usize = tx
                         .query_row(
@@ -1611,7 +1602,7 @@ impl Registry {
                         params![origin_json, name], |row| row.get(0),
                     ).map_err(|error| error.to_string())?;
                     if used {
-                        return Err(format!("You already have an open agent named {name}"));
+                        return Err(format!("You already have an open agent named {name}").into());
                     }
                 }
                 let repository = repository_key(&spec.target.repository)?;
@@ -1670,6 +1661,13 @@ impl Registry {
                 agent
             }
         };
+        // Last, so that a limit is reported only for a request that would be
+        // accepted once a slot frees; the transaction's owner drops what the
+        // request created so far. Queued runs wait behind their agent's head
+        // and are not counted.
+        if !behind && let Some(refusal) = concurrency_refusal(tx, &origin_json, limits)? {
+            return Err(AcceptanceError::LimitReached(refusal));
+        }
         let run = Run {
             id: RunId::new(),
             agent: agent.id,
@@ -1889,6 +1887,22 @@ impl Registry {
             .db
             .query_row(
                 "SELECT record FROM agent_runs WHERE agent = ?1 ORDER BY rowid DESC LIMIT 1",
+                [agent.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        decode(&record)
+    }
+
+    /// The run that says where an agent stands: an interrupted one, when it
+    /// has one, since then it takes no more work and holds an agent slot
+    /// until it is closed, whatever ran after; otherwise its latest.
+    pub(crate) fn standing_agent_run(&self, agent: AgentId) -> Result<Run, String> {
+        let record: String = self
+            .db
+            .query_row(
+                "SELECT record FROM agent_runs WHERE agent = ?1
+                 ORDER BY state = 'interrupted' DESC, rowid DESC LIMIT 1",
                 [agent.to_string()],
                 |row| row.get(0),
             )
@@ -2896,15 +2910,7 @@ pub(super) fn same_dispatch_agent(current: &Agent, accepted: &Agent) -> bool {
 }
 
 fn state_key(state: State) -> &'static str {
-    match state {
-        State::Accepted => "accepted",
-        State::Running => "running",
-        State::Waiting => "waiting",
-        State::Succeeded => "succeeded",
-        State::Failed => "failed",
-        State::Cancelled => "cancelled",
-        State::Interrupted => "interrupted",
-    }
+    state.key()
 }
 
 fn check_parent_depth(db: &Connection, origin: &Origin) -> Result<(), String> {
@@ -3039,9 +3045,67 @@ pub(super) fn agent_is_interactive_in(db: &Connection, id: AgentId) -> Result<bo
     .map_err(|error| error.to_string())
 }
 
-/// How a submission refuses work when every agent slot is taken.
-pub(crate) const CONCURRENCY_REFUSAL: &str =
-    "Agent concurrency limit reached; wait for or close existing work";
+/// The refusal of a submission by `origin_json` that would exceed `limits`,
+/// naming the caller's own runs among those that hold the slots of the limit
+/// it reached and counting the rest: another caller's agents are not this
+/// caller's to wait on or close. A run holds
+/// one while it is its agent's head and unfinished, or when it was
+/// interrupted and its agent is still open; runs queued behind a head wait
+/// for it and hold nothing.
+fn concurrency_refusal(
+    tx: &Transaction<'_>,
+    origin_json: &str,
+    limits: Limits,
+) -> Result<Option<LimitReached>, String> {
+    let mut query = tx
+        .prepare_cached(
+            "SELECT r.agent, r.id, r.state, r.origin = ?1
+             FROM agent_runs r JOIN agents a ON a.id = r.agent
+             WHERE (r.state IN ('accepted', 'running', 'waiting')
+                    AND NOT EXISTS(SELECT 1 FROM agent_runs e WHERE e.agent = r.agent
+                        AND e.rowid < r.rowid AND e.state IN ('accepted', 'running', 'waiting')))
+                OR (r.state = 'interrupted' AND a.closed = 0)
+             ORDER BY r.rowid",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = query
+        .query_map([origin_json], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    let all = rows.len();
+    let mut holders = Vec::new();
+    for (agent, run, state, _) in rows.into_iter().filter(|(.., mine)| *mine) {
+        holders.push(Holder {
+            agent: agent.parse().map_err(|_| "corrupt agent ID".to_owned())?,
+            run: run.parse().map_err(|_| "corrupt run ID".to_owned())?,
+            state: State::from_key(&state).ok_or_else(|| format!("corrupt run state {state}"))?,
+        });
+    }
+    // The caller's own limit first: closing one of its own runs frees both.
+    let (scope, limit, running) = if holders.len() >= limits.per_caller {
+        (concurrency::Scope::Caller, limits.per_caller, holders.len())
+    } else if all >= limits.total {
+        (concurrency::Scope::Global, limits.total, all)
+    } else {
+        return Ok(None);
+    };
+    holders.truncate(concurrency::MAX_NAMED_HOLDERS);
+    Ok(Some(LimitReached {
+        scope,
+        running,
+        limit,
+        holders,
+    }))
+}
+
 /// How a follow-up is refused when its agent's queue is full.
 pub(crate) const QUEUE_FULL: &str = "The agent already has ";
 /// How a client's follow-up is refused while messages to its agent wait.
@@ -4503,7 +4567,8 @@ mod tests {
         assert_eq!(
             registry
                 .submit_agent(&Origin::User, &follow_up(agent.id, "after"), 4)
-                .unwrap_err(),
+                .unwrap_err()
+                .to_string(),
             EARLIER_MESSAGES
         );
         assert_eq!(registry.model().unwrap(), before);
@@ -4570,7 +4635,8 @@ mod tests {
         assert_eq!(
             registry
                 .submit_agent(&Origin::User, &follow_up(agent.id, "held"), 5)
-                .unwrap_err(),
+                .unwrap_err()
+                .to_string(),
             EARLIER_MESSAGES
         );
     }
@@ -4660,7 +4726,7 @@ mod tests {
             .unwrap();
         // Other agents of the same owner take every slot.
         let mut others = Vec::new();
-        for index in 0..MAX_PARENT_RUNNING {
+        for index in 0..concurrency::DEFAULT_PER_CALLER {
             request.idempotency_key = format!("other-{index}");
             others.push(registry.submit_agent(&Origin::User, &request, 3).unwrap());
         }
@@ -4714,8 +4780,11 @@ mod tests {
         let refusal = registry
             .submit_agent(&Origin::User, &follow_up(first.agent.id, "one-too-many"), 4)
             .unwrap_err();
-        assert!(refusal.starts_with(QUEUE_FULL), "{refusal}");
-        assert!(refusal.contains(&MAX_QUEUED.to_string()), "{refusal}");
+        assert!(refusal.to_string().starts_with(QUEUE_FULL), "{refusal}");
+        assert!(
+            refusal.to_string().contains(&MAX_QUEUED.to_string()),
+            "{refusal}"
+        );
         assert_eq!(registry.model().unwrap(), before);
 
         // A message waits for room rather than being refused.
@@ -7022,7 +7091,7 @@ mod tests {
         let error = registry
             .submit_agent(&Origin::User, &request, 1)
             .unwrap_err();
-        assert!(error.contains("fixture run failure"));
+        assert!(error.to_string().contains("fixture run failure"));
         let after = registry.model().unwrap();
         assert_eq!(after.sequence, before.sequence);
         assert!(after.channels.is_empty() && after.agents.is_empty());
@@ -7257,6 +7326,7 @@ mod tests {
             registry
                 .submit_agent(&Origin::User, &request, 3)
                 .unwrap_err()
+                .to_string()
                 .contains("named reviewer")
         );
         assert_eq!(
@@ -7300,6 +7370,7 @@ mod tests {
             registry
                 .submit_agent(&Origin::User, &request, 10)
                 .unwrap_err()
+                .to_string()
                 .contains("fixture write failure")
         );
         assert_eq!(registry.model().unwrap(), before);
@@ -7377,6 +7448,7 @@ mod tests {
             registry
                 .submit_agent(&Origin::User, &request, 30)
                 .unwrap_err()
+                .to_string()
                 .contains("different")
         );
         assert_eq!(registry.model().unwrap().channels.len(), 1);
@@ -7405,7 +7477,7 @@ mod tests {
     #[test]
     fn rejected_capacity_and_missing_channel_leave_no_partial_acceptance() {
         let (mut registry, _directory, mut request) = fixture();
-        for index in 0..MAX_PARENT_RUNNING {
+        for index in 0..concurrency::DEFAULT_PER_CALLER {
             request.idempotency_key = index.to_string();
             registry.submit_agent(&Origin::User, &request, 10).unwrap();
         }
@@ -7415,6 +7487,7 @@ mod tests {
             registry
                 .submit_agent(&Origin::User, &request, 20)
                 .unwrap_err()
+                .to_string()
                 .contains("concurrency")
         );
         assert_eq!(registry.model().unwrap(), model);
@@ -7432,6 +7505,7 @@ mod tests {
                     20
                 )
                 .unwrap_err()
+                .to_string()
                 .contains("channel")
         );
         assert_eq!(registry.model().unwrap(), model);
@@ -7509,6 +7583,7 @@ mod tests {
             registry
                 .submit_agent(&origin, &changed, 41)
                 .unwrap_err()
+                .to_string()
                 .contains("idempotency")
         );
         let mut duplicate_name = first_request;
@@ -7517,6 +7592,7 @@ mod tests {
             registry
                 .submit_agent(&origin, &duplicate_name, 42)
                 .unwrap_err()
+                .to_string()
                 .contains("named conversation-0")
         );
         let child = capacity_child_origin(&mut registry);
@@ -7530,6 +7606,7 @@ mod tests {
             registry
                 .submit_agent(&child, &foreign, 43)
                 .unwrap_err()
+                .to_string()
                 .contains("does not own")
         );
         assert_eq!(registry.model().unwrap(), before);
@@ -7563,6 +7640,7 @@ mod tests {
                 registry
                     .submit_agent(&origin, &request, 41)
                     .unwrap_err()
+                    .to_string()
                     .contains("child limit")
             );
             assert_eq!(registry.agents(Some(&origin)).unwrap().len(), MAX_CHILDREN);
@@ -7595,9 +7673,20 @@ mod tests {
                     id: uuid::Uuid::new_v4(),
                 },
             };
-            for index in 0..MAX_PARENT_RUNNING {
+            let mut holders = Vec::new();
+            for index in 0..concurrency::DEFAULT_PER_CALLER {
                 request.idempotency_key = format!("active-{index}");
                 let accepted = registry.submit_agent(&origin, &request, 10).unwrap();
+                holders.push(Holder {
+                    agent: accepted.agent.id,
+                    run: accepted.run.id,
+                    state: [
+                        State::Accepted,
+                        State::Running,
+                        State::Waiting,
+                        State::Interrupted,
+                    ][index % 4],
+                });
                 match index % 4 {
                     0 => {} // Accepted work still has an owner.
                     1 | 2 => {
@@ -7640,16 +7729,24 @@ mod tests {
             );
             let before = registry.model().unwrap();
             request.idempotency_key = "ninth".into();
-            assert!(
-                registry
-                    .submit_agent(&origin, &request, 20)
-                    .unwrap_err()
-                    .contains("concurrency limit")
+            let AcceptanceError::LimitReached(refusal) =
+                registry.submit_agent(&origin, &request, 20).unwrap_err()
+            else {
+                panic!("the ninth run is refused for the caller's limit");
+            };
+            assert_eq!(
+                refusal,
+                LimitReached {
+                    scope: concurrency::Scope::Caller,
+                    running: concurrency::DEFAULT_PER_CALLER,
+                    limit: concurrency::DEFAULT_PER_CALLER,
+                    holders,
+                }
             );
             assert_eq!(registry.model().unwrap(), before);
             assert_eq!(
                 registry.agents(Some(&origin)).unwrap().len(),
-                MAX_PARENT_RUNNING
+                concurrency::DEFAULT_PER_CALLER
             );
         }
     }
@@ -7667,7 +7764,7 @@ mod tests {
         ];
         let mut first = None;
         for (scope, origin) in origins.iter().enumerate() {
-            for index in 0..MAX_PARENT_RUNNING {
+            for index in 0..concurrency::DEFAULT_PER_CALLER {
                 request.idempotency_key = format!("global-{scope}-{index}");
                 let accepted = registry.submit_agent(origin, &request, 10).unwrap();
                 if first.is_none() {
@@ -7675,23 +7772,141 @@ mod tests {
                 }
             }
         }
-        assert_eq!(registry.agents(None).unwrap().len(), MAX_RUNNING);
+        assert_eq!(
+            registry.agents(None).unwrap().len(),
+            concurrency::DEFAULT_TOTAL
+        );
         let other = Origin::Automation {
             id: uuid::Uuid::new_v4(),
         };
         let before = registry.model().unwrap();
         request.idempotency_key = "global-over-limit".into();
-        assert!(
-            registry
-                .submit_agent(&other, &request, 20)
-                .unwrap_err()
-                .contains("concurrency limit")
-        );
+        let AcceptanceError::LimitReached(refusal) =
+            registry.submit_agent(&other, &request, 20).unwrap_err()
+        else {
+            panic!("the 33rd run is refused for the global limit");
+        };
+        assert_eq!(refusal.scope, concurrency::Scope::Global);
+        assert_eq!(refusal.running, concurrency::DEFAULT_TOTAL);
+        assert_eq!(refusal.limit, concurrency::DEFAULT_TOTAL);
+        // The other callers' runs are counted, not named.
+        assert!(refusal.holders.is_empty());
         assert_eq!(registry.model().unwrap(), before);
         finish_capacity_run(&mut registry, &first.unwrap());
         assert!(registry.submit_agent(&other, &request, 40).unwrap().created);
         // Completed conversation remains open alongside the 32 owned runs.
-        assert_eq!(registry.agents(None).unwrap().len(), MAX_RUNNING + 1);
+        assert_eq!(
+            registry.agents(None).unwrap().len(),
+            concurrency::DEFAULT_TOTAL + 1
+        );
+    }
+
+    /// An agent whose run was interrupted stands at that run, though a
+    /// prompt queued behind it is later: the interrupted run keeps its slot
+    /// and the agent takes no more work until it is closed, which is what
+    /// `agent close --interrupted` looks for.
+    #[test]
+    fn an_interrupted_run_is_where_its_agent_stands_despite_a_later_queued_run() {
+        let (mut registry, _directory, request) = fixture();
+        let head = registry.submit_agent(&Origin::User, &request, 10).unwrap();
+        let follow_up = Submit {
+            name: None,
+            destination: Destination::Existing(head.agent.id),
+            prompt: "after".into(),
+            idempotency_key: "queued-behind".into(),
+        };
+        let queued = registry
+            .submit_agent(&Origin::User, &follow_up, 11)
+            .unwrap();
+        assert_eq!(
+            registry.standing_agent_run(head.agent.id).unwrap().id,
+            queued.run.id
+        );
+        registry
+            .update_agent_run(
+                head.run.id,
+                1,
+                Update::Finished {
+                    state: State::Interrupted,
+                    result: Default::default(),
+                },
+                12,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.latest_agent_run(head.agent.id).unwrap().id,
+            queued.run.id
+        );
+        let standing = registry.standing_agent_run(head.agent.id).unwrap();
+        assert_eq!(
+            (standing.id, standing.state),
+            (head.run.id, State::Interrupted)
+        );
+        assert!(has_unverified_run(&registry.db, head.agent.id).unwrap());
+    }
+
+    /// Configured limits replace the defaults in every connection opened
+    /// from the registry, as soon as they change.
+    #[test]
+    fn configured_limits_replace_the_defaults_in_every_connection() {
+        let (mut registry, directory, mut request) = fixture();
+        let configuration = directory.path().join("configuration");
+        registry.use_concurrency(concurrency::Setting::in_directory(configuration.clone()));
+        concurrency::save_to(
+            &configuration,
+            Limits {
+                per_caller: 2,
+                total: 3,
+            },
+        )
+        .unwrap();
+        let mut connection = registry.execution_connection().unwrap();
+        let automation = Origin::Automation {
+            id: uuid::Uuid::new_v4(),
+        };
+        for index in 0..2 {
+            request.idempotency_key = format!("configured-{index}");
+            registry.submit_agent(&Origin::User, &request, 10).unwrap();
+        }
+        request.idempotency_key = "configured-caller".into();
+        let refused = connection
+            .submit_agent(&Origin::User, &request, 11)
+            .unwrap_err();
+        assert!(
+            matches!(&refused, AcceptanceError::LimitReached(refusal)
+                if refusal.scope == concurrency::Scope::Caller && refusal.limit == 2),
+            "{refused}"
+        );
+        request.idempotency_key = "configured-third".into();
+        let third = connection.submit_agent(&automation, &request, 12).unwrap();
+        request.idempotency_key = "configured-total".into();
+        let refused = registry
+            .submit_agent(&automation, &request, 13)
+            .unwrap_err();
+        assert!(
+            matches!(&refused, AcceptanceError::LimitReached(refusal)
+                if refusal.scope == concurrency::Scope::Global
+                    && refusal.running == 3
+                    && refusal.limit == 3
+                    // Only the automation's own run is named.
+                    && refusal.holders.iter().map(|holder| holder.run).eq([third.run.id])),
+            "{refused}"
+        );
+        // Raising the limits admits the same request at once, unchanged.
+        concurrency::save_to(
+            &configuration,
+            Limits {
+                per_caller: 8,
+                total: 50,
+            },
+        )
+        .unwrap();
+        assert!(
+            connection
+                .submit_agent(&automation, &request, 14)
+                .unwrap()
+                .created
+        );
     }
 
     #[test]
@@ -7706,7 +7921,7 @@ mod tests {
             let count = if child_limit {
                 MAX_CHILDREN - 1
             } else {
-                MAX_PARENT_RUNNING - 1
+                concurrency::DEFAULT_PER_CALLER - 1
             };
             for index in 0..count {
                 request.idempotency_key = format!("before-race-{index}");
@@ -7739,7 +7954,7 @@ mod tests {
                 .iter()
                 .find_map(|result| result.as_ref().err())
                 .unwrap();
-            assert!(rejected.contains(if child_limit {
+            assert!(rejected.to_string().contains(if child_limit {
                 "child limit"
             } else {
                 "concurrency limit"
@@ -7822,6 +8037,7 @@ mod tests {
                     60
                 )
                 .unwrap_err()
+                .to_string()
                 .contains("own")
         );
     }

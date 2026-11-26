@@ -794,6 +794,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
         Ok(mut registry) => {
+            match crate::agent_execution::concurrency::Setting::configured() {
+                Ok(setting) => registry.use_concurrency(setting),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "the agent concurrency limits cannot be configured; the defaults apply"
+                ),
+            }
             // Before any client reads the model: a window must never see a
             // worktree's panes outside its checkout's channel.
             match registry.adopt_worktree_views() {
