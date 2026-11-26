@@ -888,6 +888,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         206,
         "#4227 protocol; main encoded the queue-hold capability at an unrecorded position and no installed update source was qualified",
     ),
+    (
+        207,
+        "intermediate #4235 protocol; no released install was qualified as a live-update source",
+    ),
 ];
 
 #[cfg(any(test, feature = "test-support"))]

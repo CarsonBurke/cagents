@@ -626,6 +626,12 @@ fn changed_for_instance(
         }
         return;
     }
+    if matches!(
+        update,
+        Update::Activity { .. } | Update::ConversationNameChanged | Update::FailureChanged
+    ) {
+        state.mobile_sessions_changed();
+    }
     if matches!(update, Update::ConversationNameChanged) {
         if let Some(titles) = &state.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
@@ -640,10 +646,9 @@ fn changed_for_instance(
     // Check the exact current producer under HostState; a failed/retained owner
     // must not masquerade as released work. Remote proxies publish Resident
     // metadata before this callback, so this reads no helper or transcript.
-    let wake_completed = instance.is_some()
-        && matches!(update, Update::Observed { .. })
-        && record.handle.is_completed()
-        && !record.handle.owns_work();
+    let completed = matches!(update, Update::Observed { .. }) && record.handle.is_completed();
+    let released = completed && !record.handle.owns_work();
+    let mobile_ended = released && !record.returning_terminal;
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
             &Update::Activity { state, generation } => ServerMessage::ChatActivity {
@@ -711,8 +716,15 @@ fn changed_for_instance(
     {
         record.handle.observe_next_update();
     }
+    // The completion flag is published after the final Activity event.
+    // An overview read triggered only by Activity can still see the old row.
+    if mobile_ended {
+        state.mobile_chat_ended(id);
+    } else if completed {
+        state.mobile_sessions_changed();
+    }
     drop(state);
-    if wake_completed {
+    if instance.is_some() && released {
         crate::daemon::wake();
     }
 }
@@ -4778,8 +4790,7 @@ fn process_inner(
                 }
                 let old_pair = owners.remove_pair(&mut state, &closing)?;
                 let mut record = state
-                    .chats
-                    .remove(&chat_id)
+                    .remove_chat(chat_id)
                     .expect("validated exact attachment");
                 state.chat_handoffs.insert(
                     chat_id,
@@ -5168,7 +5179,7 @@ pub(super) fn close_captured(
             ));
         }
         state.inventory_changed();
-        let record = state.chats.remove(&chat_id);
+        let record = state.remove_chat(chat_id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(chat_id);
         }
@@ -5732,7 +5743,7 @@ pub(super) fn stop_failed_upgrade_restore(
     let record = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_current(&state)?;
-        let record = state.chats.remove(&id);
+        let record = state.remove_chat(id);
         if record.is_some() {
             state.inventory_changed();
             if let Some(notifications) = &state.notifications {
@@ -5833,8 +5844,7 @@ pub(super) fn close_terminal_actor(
         // and the caller's exact-worker attention fence. A successful native
         // handoff removes the old pair when it publishes its replacement.
         let record = state
-            .chats
-            .remove(&terminal_id)
+            .remove_chat(terminal_id)
             .expect("validated exact attachment");
         state.inventory_changed();
         record

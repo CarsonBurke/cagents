@@ -18,35 +18,27 @@
 //! exits; reconnecting starts the bridge that matches the daemon then running.
 
 mod conversation;
+mod overview;
 pub mod pairing;
 mod translate;
 
 use std::{
     collections::HashMap,
     io::{self, BufRead, Write},
+    net::Shutdown,
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
 };
 
 use cagents_mobile_api as api;
 
-use crate::{
-    agent_execution::{Authority, Operation, Reply, directory::Scope},
-    chat,
-    control::ControlClient,
-    model::TerminalId,
-};
-
-/// How often the bridge rereads the session list and notices while the
-/// phone watches them. The daemon publishes neither as a change stream to a
-/// client that isn't a window, so the bridge compares and sends only changes.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+use crate::{chat, control::ControlClient, model::TerminalId, terminal::ipc::MobileWatch};
 
 /// How many lines may wait for the phone before conversations stop reading
 /// new publications. A slow link then gets fewer, larger updates rather than
@@ -111,7 +103,7 @@ fn serve(socket: &Path, input: &mut impl BufRead, outbox: &Outbox) -> Result<(),
         server_version: crate::version().into(),
         host: host_name(),
     }));
-    let bridge = Bridge::new(socket.to_owned(), control, outbox.clone());
+    let mut bridge = Bridge::new(socket.to_owned(), control, outbox.clone());
     loop {
         let line = match read_line(input) {
             Ok(Some(line)) => line,
@@ -216,7 +208,7 @@ enum Outgoing {
 /// The writer's end of an [`Outbox`].
 struct Lines {
     outgoing: Receiver<Outgoing>,
-    backlog: Arc<AtomicUsize>,
+    backlog: Arc<Backlog>,
 }
 
 /// Write each line to the phone in order until an exit, the phone going
@@ -230,7 +222,8 @@ fn write_lines(lines: Lines, mut output: impl Write) {
             bytes.push(b'\n');
             output.write_all(&bytes).and_then(|()| output.flush())
         });
-        lines.backlog.fetch_sub(1, Ordering::AcqRel);
+        *lines.backlog.count.lock().unwrap() -= 1;
+        lines.backlog.room.notify_all();
         match written {
             Ok(Ok(())) => {}
             // The phone is gone; nothing more can reach it.
@@ -243,18 +236,24 @@ fn write_lines(lines: Lines, mut output: impl Write) {
     let _ = output.flush();
 }
 
+#[derive(Default)]
+struct Backlog {
+    count: Mutex<usize>,
+    room: Condvar,
+}
+
 /// Where every thread's messages to the phone go, in order.
 #[derive(Clone)]
 pub struct Outbox {
     outgoing: Sender<Outgoing>,
     /// Lines sent but not yet written.
-    backlog: Arc<AtomicUsize>,
+    backlog: Arc<Backlog>,
 }
 
 impl Outbox {
     fn new() -> (Self, Lines) {
         let (outgoing, received) = mpsc::channel();
-        let backlog = Arc::new(AtomicUsize::new(0));
+        let backlog = Arc::new(Backlog::default());
         (
             Self {
                 outgoing,
@@ -268,15 +267,54 @@ impl Outbox {
     }
 
     fn send(&self, line: api::ServerLine) {
-        self.backlog.fetch_add(1, Ordering::AcqRel);
-        if self.outgoing.send(Outgoing::Line(line)).is_err() {
-            self.backlog.fetch_sub(1, Ordering::AcqRel);
+        self.enqueue(&mut self.backlog.count.lock().unwrap(), line);
+    }
+
+    fn enqueue(&self, backlog: &mut usize, line: api::ServerLine) {
+        if self.outgoing.send(Outgoing::Line(line)).is_ok() {
+            *backlog += 1;
         }
     }
 
     /// Whether the phone is behind enough that new publications should wait.
     pub fn congested(&self) -> bool {
-        self.backlog.load(Ordering::Acquire) >= MAX_BACKLOG
+        *self.backlog.count.lock().unwrap() >= MAX_BACKLOG
+    }
+
+    fn wait_for_room(&self, active: &AtomicBool) -> bool {
+        drop(
+            self.backlog
+                .room
+                .wait_while(self.backlog.count.lock().unwrap(), |count| {
+                    *count >= MAX_BACKLOG && active.load(Ordering::Relaxed)
+                })
+                .unwrap(),
+        );
+        active.load(Ordering::Relaxed)
+    }
+
+    fn send_while_watched(&self, active: &AtomicBool, line: api::ServerLine) {
+        let mut count = self.backlog.count.lock().unwrap();
+        if active.load(Ordering::Relaxed) {
+            self.enqueue(&mut count, line);
+        }
+    }
+
+    fn close_while_watched(&self, active: &AtomicBool, message: String) {
+        let mut count = self.backlog.count.lock().unwrap();
+        if active.load(Ordering::Relaxed) {
+            self.enqueue(
+                &mut count,
+                api::ServerLine::Event(api::Event::Closing { message }),
+            );
+            self.exit();
+        }
+    }
+
+    fn stop_watch(&self, active: &AtomicBool) {
+        let _count = self.backlog.count.lock().unwrap();
+        active.store(false, Ordering::Relaxed);
+        self.backlog.room.notify_all();
     }
 
     /// Tell the phone why the bridge stops, then stop it.
@@ -309,16 +347,34 @@ fn bad_request(message: &str) -> api::Error {
     }
 }
 
-/// What the phone watches and what it was last sent, shared with the thread
-/// that polls the daemon.
+/// A watcher can be stopped even before its socket finishes connecting.
+#[derive(Clone, Default)]
+struct WatchSocket(Arc<Mutex<WatchSocketState>>);
+
 #[derive(Default)]
-struct Watched {
-    sessions: bool,
-    notifications: bool,
-    sent_sessions: Option<Vec<api::Session>>,
-    sent_notices: Option<Vec<api::Notice>>,
-    /// Ask the poller to read now rather than at its next tick.
-    poll_now: bool,
+enum WatchSocketState {
+    #[default]
+    Connecting,
+    Connected(UnixStream),
+    Stopped,
+}
+
+impl WatchSocket {
+    fn register(&self, stream: &UnixStream) -> io::Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if matches!(*state, WatchSocketState::Stopped) {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        *state = WatchSocketState::Connected(stream.try_clone()?);
+        Ok(())
+    }
+
+    fn stop(&self) {
+        let previous = std::mem::replace(&mut *self.0.lock().unwrap(), WatchSocketState::Stopped);
+        if let WatchSocketState::Connected(stream) = previous {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 /// The conversations the phone watches, each with the generation that tells
@@ -327,37 +383,30 @@ type Conversations = Arc<Mutex<HashMap<TerminalId, (u64, conversation::Watch)>>>
 
 struct Bridge {
     socket: PathBuf,
-    control: Arc<Mutex<ControlClient>>,
-    watched: Arc<(Mutex<Watched>, Condvar)>,
+    control: ControlClient,
+    sessions: Option<overview::Watch>,
+    notifications: Option<overview::Watch>,
     conversations: Conversations,
-    next_watch: Mutex<u64>,
+    next_watch: u64,
     outbox: Outbox,
 }
 
 impl Bridge {
     fn new(socket: PathBuf, control: ControlClient, outbox: Outbox) -> Self {
-        let bridge = Self {
+        Self {
             socket,
-            control: Arc::new(Mutex::new(control)),
-            watched: Arc::default(),
+            control,
+            sessions: None,
+            notifications: None,
             conversations: Arc::default(),
-            next_watch: Mutex::new(0),
+            next_watch: 0,
             outbox,
-        };
-        let control = bridge.control.clone();
-        let watched = bridge.watched.clone();
-        let conversations = bridge.conversations.clone();
-        let outbox = bridge.outbox.clone();
-        thread::Builder::new()
-            .name("mobile-poll".into())
-            .spawn(move || poll(&control, &watched, &conversations, &outbox))
-            .expect("spawn mobile poll thread");
-        bridge
+        }
     }
 
     /// Answer one line from the phone. Returns why the bridge must stop, if
     /// it must.
-    fn handle(&self, line: &[u8]) -> Option<String> {
+    fn handle(&mut self, line: &[u8]) -> Option<String> {
         let request = match parse_request(line) {
             Ok(request) => request,
             Err((id, error)) => {
@@ -369,62 +418,50 @@ impl Bridge {
         match self.call(id, request.call) {
             Ok(Answered::Now) => self.outbox.ok(id),
             Ok(Answered::Later) => {}
-            Err(Failure::Refused(error)) => self.outbox.error(Some(id), error),
-            Err(Failure::DaemonLost(message)) => {
-                self.outbox.error(
-                    Some(id),
-                    api::Error {
-                        code: api::ErrorCode::Unavailable,
-                        message: message.clone(),
-                    },
-                );
-                return Some(message);
-            }
+            Err(failure) => return failure.reply(id, &self.outbox),
         }
         None
     }
 
-    fn call(&self, id: u64, call: api::Call) -> Result<Answered, Failure> {
+    fn call(&mut self, id: u64, call: api::Call) -> Result<Answered, Failure> {
         match call {
             api::Call::Ping {} => Ok(Answered::Now),
             api::Call::WatchSessions {} => {
-                self.watch(|watched| {
-                    watched.sessions = true;
-                    watched.sent_sessions = None;
-                });
-                Ok(Answered::Now)
+                drop(self.sessions.take());
+                self.sessions = Some(overview::Watch::start(
+                    &self.socket,
+                    self.control.proof(),
+                    MobileWatch::Sessions,
+                    id,
+                    &self.outbox,
+                )?);
+                Ok(Answered::Later)
             }
             api::Call::UnwatchSessions {} => {
-                self.watch(|watched| {
-                    watched.sessions = false;
-                    watched.sent_sessions = None;
-                });
+                drop(self.sessions.take());
                 Ok(Answered::Now)
             }
             api::Call::WatchNotifications {} => {
-                self.watch(|watched| {
-                    watched.notifications = true;
-                    watched.sent_notices = None;
-                });
-                Ok(Answered::Now)
+                drop(self.notifications.take());
+                self.notifications = Some(overview::Watch::start(
+                    &self.socket,
+                    self.control.proof(),
+                    MobileWatch::Notifications,
+                    id,
+                    &self.outbox,
+                )?);
+                Ok(Answered::Later)
             }
             api::Call::UnwatchNotifications {} => {
-                self.watch(|watched| {
-                    watched.notifications = false;
-                    watched.sent_notices = None;
-                });
+                drop(self.notifications.take());
                 Ok(Answered::Now)
             }
             api::Call::AcknowledgeNotification { id: notice } => {
                 let notice = uuid::Uuid::parse_str(&notice)
                     .map_err(|_| Failure::Refused(not_found("No such notice.")))?;
                 self.control
-                    .lock()
-                    .unwrap()
                     .acknowledge_notification(notice)
                     .map_err(daemon_lost)?;
-                // Reread so the phone sees the notice leave at once.
-                self.watch(|_| {});
                 Ok(Answered::Now)
             }
             api::Call::WatchConversation { session } => {
@@ -493,36 +530,9 @@ impl Bridge {
         }
     }
 
-    /// Change what the phone watches and have the poller read at once.
-    fn watch(&self, change: impl FnOnce(&mut Watched)) {
-        let (watched, wake) = &*self.watched;
-        let mut watched = watched.lock().unwrap();
-        change(&mut watched);
-        watched.poll_now = true;
-        wake.notify_all();
-    }
-
-    fn watch_conversation(&self, id: u64, session: TerminalId) -> Result<(), Failure> {
-        let chats = self
-            .control
-            .lock()
-            .unwrap()
-            .list_chats()
-            .map_err(daemon_lost)?;
-        let Some(chat) = chats.into_iter().find(|chat| chat.id == session) else {
-            return Err(Failure::Refused(api::Error {
-                code: api::ErrorCode::NotWatchable,
-                message: "Only a running native chat can be followed from the phone.".into(),
-            }));
-        };
-        let (stream, proof) = ControlClient::connect(&self.socket)
-            .map_err(daemon_lost)?
-            .into_handshaken_stream();
-        let generation = {
-            let mut next = self.next_watch.lock().unwrap();
-            *next += 1;
-            *next
-        };
+    fn watch_conversation(&mut self, id: u64, session: TerminalId) -> Result<(), Failure> {
+        self.next_watch += 1;
+        let generation = self.next_watch;
         // A second watch of the same conversation starts it over. The first
         // ends before the second starts, so nothing it sends can follow the
         // second's reset.
@@ -530,11 +540,11 @@ impl Bridge {
         drop(watching.remove(&session));
         let conversations = Arc::downgrade(&self.conversations);
         let outbox = self.outbox.clone();
-        let watch = conversation::Watch::start(
+        let watch = conversation::Watch::connect(
             id,
-            chat,
-            stream,
-            proof,
+            session,
+            self.socket.clone(),
+            self.control.proof().clone(),
             self.outbox.clone(),
             move |chat_id, unfollowable| {
                 // Forget the watch, unless the phone has already replaced or
@@ -558,7 +568,13 @@ impl Bridge {
                     });
                 }
             },
-        );
+        )
+        .map_err(|error| {
+            Failure::Refused(api::Error {
+                code: api::ErrorCode::Unavailable,
+                message: format!("Could not follow the conversation: {error}"),
+            })
+        })?;
         watching.insert(session, (generation, watch));
         Ok(())
     }
@@ -594,6 +610,28 @@ enum Failure {
     Refused(api::Error),
     /// The daemon connection failed; the bridge stops.
     DaemonLost(String),
+}
+
+impl Failure {
+    /// Answer the triggering request. Return why the bridge must exit, if lost.
+    fn reply(self, id: u64, outbox: &Outbox) -> Option<String> {
+        match self {
+            Self::Refused(error) => {
+                outbox.error(Some(id), error);
+                None
+            }
+            Self::DaemonLost(message) => {
+                outbox.error(
+                    Some(id),
+                    api::Error {
+                        code: api::ErrorCode::Unavailable,
+                        message: message.clone(),
+                    },
+                );
+                Some(message)
+            }
+        }
+    }
 }
 
 fn daemon_lost(error: crate::control::ControlError) -> Failure {
@@ -652,119 +690,6 @@ fn parse_request(line: &[u8]) -> Result<api::Request, (Option<u64>, api::Error)>
                 },
             ))
         }
-    }
-}
-
-/// Reread what the phone watches every [`POLL_INTERVAL`], or at once when
-/// asked, and send what changed.
-fn poll(
-    control: &Mutex<ControlClient>,
-    watched: &(Mutex<Watched>, Condvar),
-    conversations: &Conversations,
-    outbox: &Outbox,
-) {
-    let (state, wake) = watched;
-    loop {
-        let (sessions, notifications) = {
-            let mut state = state.lock().unwrap();
-            if !state.poll_now {
-                state = wake
-                    .wait_timeout_while(state, POLL_INTERVAL, |state| !state.poll_now)
-                    .unwrap()
-                    .0;
-            }
-            state.poll_now = false;
-            (state.sessions, state.notifications)
-        };
-        let following: Vec<(TerminalId, u64)> = conversations
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(chat, (generation, _))| (*chat, *generation))
-            .collect();
-        let read = (|| -> Result<_, crate::control::ControlError> {
-            let mut control = control.lock().unwrap();
-            let sessions = if sessions {
-                match control.agent(Authority::default(), Operation::Sessions(Scope::All))? {
-                    Reply::Sessions(listing) => {
-                        Some(listing.sessions.iter().map(translate::session).collect())
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let notices = if notifications {
-                Some(translate::notices(&control.read_notifications()?))
-            } else {
-                None
-            };
-            let chats = if following.is_empty() {
-                None
-            } else {
-                Some(control.list_chats()?)
-            };
-            Ok((sessions, notices, chats))
-        })();
-        let (sessions, notices, chats): (
-            Option<Vec<api::Session>>,
-            Option<Vec<api::Notice>>,
-            Option<Vec<chat::Session>>,
-        ) = match read {
-            Ok(read) => read,
-            Err(error) => {
-                outbox.close(format!(
-                    "Lost the connection to the computer's cagents daemon: {error}"
-                ));
-                return;
-            }
-        };
-        if let Some(chats) = chats {
-            end_closed(conversations, &following, &chats, outbox);
-        }
-        let mut state = state.lock().unwrap();
-        if let Some(sessions) = sessions
-            && state.sessions
-            && state.sent_sessions.as_ref() != Some(&sessions)
-        {
-            state.sent_sessions = Some(sessions.clone());
-            outbox.event(api::Event::Sessions(api::Sessions { sessions }));
-        }
-        if let Some(notices) = notices
-            && state.notifications
-            && state.sent_notices.as_ref() != Some(&notices)
-        {
-            state.sent_notices = Some(notices.clone());
-            outbox.event(api::Event::Notifications(api::Notifications { notices }));
-        }
-    }
-}
-
-/// End the watches of conversations that were closed elsewhere, such as on
-/// the desktop. The daemon tells only the window that closed a chat, so a
-/// watch would otherwise wait for changes that never come.
-fn end_closed(
-    conversations: &Conversations,
-    following: &[(TerminalId, u64)],
-    chats: &[chat::Session],
-    outbox: &Outbox,
-) {
-    let mut watching = conversations.lock().unwrap();
-    for (chat, generation) in following {
-        if chats.iter().any(|open| open.id == *chat)
-            || watching
-                .get(chat)
-                .is_none_or(|(current, _)| current != generation)
-        {
-            continue;
-        }
-        // Ending the watch first keeps anything it might still send from
-        // following the notice.
-        drop(watching.remove(chat));
-        outbox.event(api::Event::ConversationEnded {
-            session: chat.to_string(),
-            message: "The conversation was closed.".into(),
-        });
     }
 }
 

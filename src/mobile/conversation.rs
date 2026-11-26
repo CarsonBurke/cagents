@@ -16,6 +16,7 @@
 use std::{
     collections::HashMap,
     os::unix::net::UnixStream,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -26,12 +27,13 @@ use std::{
 
 use cagents_mobile_api as api;
 
-use super::{Outbox, translate::Mirror};
+use super::{Failure, Outbox, WatchSocket, daemon_lost, translate::Mirror};
 use crate::{
     chat,
+    control::ControlClient,
     model::{HostSessionProof, TerminalId},
     terminal::ipc::{
-        ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolError,
+        ClientEnvelope, ClientRequest, FrameError, MobileWatch, PROTOCOL_VERSION, ProtocolError,
         ProtocolErrorCode, ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
     },
 };
@@ -55,6 +57,7 @@ const CONGESTION_RECHECK: Duration = Duration::from_millis(100);
 /// A running watch. Dropping it ends the watch, and nothing about the
 /// conversation reaches the phone from it afterwards.
 pub struct Watch {
+    stop: WatchSocket,
     commands: Sender<Input>,
     current: Current,
 }
@@ -73,26 +76,79 @@ impl Current {
         *current
     }
 
+    fn active(&self) -> bool {
+        *self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn end(&self) {
         *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = false;
     }
 }
 
+struct Opening {
+    session: chat::Session,
+    stream: UnixStream,
+    proof: HostSessionProof,
+    next_request_id: u64,
+}
+
 impl Watch {
-    /// Attach to `session` over `stream`, a daemon connection that has asked
-    /// nothing since its handshake, and send the phone the whole conversation.
-    /// Answers the phone's request `id` once the conversation is attached.
-    /// `ended` runs when the watch ends, with why the conversation can't be
-    /// followed when that is the reason; it tells the phone, unless the watch
-    /// was replaced or stopped meanwhile.
-    pub fn start(
+    /// Resolve and attach on the watch's worker. The phone can issue an
+    /// unwatch before any of the daemon requests in setup has answered.
+    pub fn connect(
         id: u64,
-        session: chat::Session,
-        stream: UnixStream,
+        chat_id: TerminalId,
+        socket: PathBuf,
         proof: HostSessionProof,
         outbox: Outbox,
         ended: impl FnOnce(TerminalId, Option<String>) + Send + 'static,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
+        Self::start(
+            id,
+            chat_id,
+            outbox,
+            move |stop| {
+                let mut control = ControlClient::connect_observing_socket(&socket, |stream| {
+                    stop.register(stream)
+                })
+                .map_err(daemon_lost)?;
+                if control.proof() != &proof {
+                    return Err(Failure::DaemonLost(
+                        "The computer's cagents daemon was replaced.".into(),
+                    ));
+                }
+                let session = control
+                    .list_chats()
+                    .map_err(daemon_lost)?
+                    .into_iter()
+                    .find(|session| session.id == chat_id)
+                    .ok_or_else(|| {
+                        Failure::Refused(api_error(
+                            api::ErrorCode::NotWatchable,
+                            "Only a running native chat can be followed from the phone.",
+                        ))
+                    })?;
+                let (stream, proof, next_request_id) = control.into_unsubscribed_stream();
+                Ok(Opening {
+                    session,
+                    stream,
+                    proof,
+                    next_request_id,
+                })
+            },
+            ended,
+        )
+    }
+
+    fn start(
+        id: u64,
+        chat_id: TerminalId,
+        outbox: Outbox,
+        open: impl FnOnce(&WatchSocket) -> Result<Opening, Failure> + Send + 'static,
+        ended: impl FnOnce(TerminalId, Option<String>) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let stop = WatchSocket::default();
+        let worker_stop = stop.clone();
         let (commands, inputs) = mpsc::channel();
         let feed = commands.clone();
         let current = Current(Arc::new(Mutex::new(true)));
@@ -100,11 +156,37 @@ impl Watch {
         thread::Builder::new()
             .name("mobile-conversation".into())
             .spawn(move || {
-                let chat_id = session.id;
+                let Opening {
+                    session,
+                    stream,
+                    proof,
+                    next_request_id,
+                } = match open(&worker_stop) {
+                    Ok(opening) => opening,
+                    Err(failure) => {
+                        let failure = if speaking.active() {
+                            failure
+                        } else {
+                            Failure::Refused(stopped_during_attach())
+                        };
+                        let closing = failure.reply(id, &outbox);
+                        worker_stop.stop();
+                        ended(chat_id, None);
+                        fail_requests(
+                            waiting_requests(&inputs),
+                            &outbox,
+                            "The conversation stopped being followed before it opened.",
+                        );
+                        if let Some(message) = closing {
+                            outbox.close(message);
+                        }
+                        return;
+                    }
+                };
                 let mut connection = Connection {
                     stream,
                     proof,
-                    next_request_id: 2,
+                    next_request_id,
                     chat_id,
                     outbox,
                     current: speaking,
@@ -112,7 +194,14 @@ impl Watch {
                     pending: HashMap::new(),
                 };
                 let end = connection.run(id, session, feed);
-                let _ = connection.stream.shutdown(std::net::Shutdown::Both);
+                worker_stop.stop();
+                // Only a live watch can report an unexpected daemon loss.
+                // An unwatch also shuts down this stream to interrupt setup.
+                let end = if connection.current.active() {
+                    end
+                } else {
+                    End::Phone
+                };
                 let unfollowable = match &end {
                     End::Conversation(message) => Some(message.clone()),
                     End::Phone | End::Daemon(_) => None,
@@ -122,9 +211,12 @@ impl Watch {
                 if let End::Daemon(message) = end {
                     connection.outbox.close(message);
                 }
-            })
-            .expect("spawn mobile conversation thread");
-        Self { commands, current }
+            })?;
+        Ok(Self {
+            stop,
+            commands,
+            current,
+        })
     }
 
     /// Whether the watch was still running to take `command`.
@@ -136,6 +228,7 @@ impl Watch {
 impl Drop for Watch {
     fn drop(&mut self) {
         self.current.end();
+        self.stop.stop();
         let _ = self.commands.send(Input::Command(Command::Stop));
     }
 }
@@ -157,7 +250,7 @@ enum Input {
 
 /// What a daemon request in flight was for.
 enum Pending {
-    Read,
+    Read { final_read: bool },
     Chat { id: u64 },
 }
 
@@ -182,6 +275,9 @@ struct Followed {
     changed: bool,
     /// A publication read is in flight; one at a time keeps them in order.
     reading: bool,
+    /// The daemon removed the chat or its provider completed. Try one
+    /// final presentation read before ending the watch.
+    ending: bool,
 }
 
 impl Connection {
@@ -191,6 +287,11 @@ impl Connection {
         let snapshot = match self.attach(session) {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                let error = if self.current.active() {
+                    error
+                } else {
+                    stopped_during_attach()
+                };
                 self.outbox.error(Some(id), error);
                 return End::Phone;
             }
@@ -203,6 +304,7 @@ impl Connection {
             // so read once to begin with.
             changed: true,
             reading: false,
+            ending: false,
         };
         // The phone may have stopped or replaced this watch while it was
         // attaching; then neither the answer nor the conversation is wanted.
@@ -218,13 +320,7 @@ impl Connection {
             }
         });
         if !opened {
-            self.outbox.error(
-                Some(id),
-                api_error(
-                    api::ErrorCode::NotWatching,
-                    "The conversation was closed on the phone before it opened.",
-                ),
-            );
+            self.outbox.error(Some(id), stopped_during_attach());
             return End::Phone;
         }
         // From here on the reader thread waits for frames for as long as the
@@ -263,7 +359,12 @@ impl Connection {
                     after_generation,
                 }) {
                     Ok(request_id) => {
-                        self.pending.insert(request_id, Pending::Read);
+                        self.pending.insert(
+                            request_id,
+                            Pending::Read {
+                                final_read: followed.ending,
+                            },
+                        );
                         followed.reading = true;
                         followed.changed = false;
                     }
@@ -319,21 +420,14 @@ impl Connection {
             End::Daemon(_) => "The computer's cagents daemon stopped before it answered.",
         };
         let pending = std::mem::take(&mut self.pending);
-        let waiting = self.inputs.try_iter().filter_map(|input| match input {
-            Input::Command(Command::Chat { id, .. }) => Some(id),
-            _ => None,
-        });
-        for id in pending
+        let requests = pending
             .into_values()
             .filter_map(|pending| match pending {
                 Pending::Chat { id } => Some(id),
-                Pending::Read => None,
+                Pending::Read { .. } => None,
             })
-            .chain(waiting)
-        {
-            self.outbox
-                .error(Some(id), api_error(api::ErrorCode::Unavailable, message));
-        }
+            .chain(waiting_requests(&self.inputs));
+        fail_requests(requests, &self.outbox, message);
     }
 
     fn command(
@@ -376,6 +470,13 @@ impl Connection {
                     followed.changed = true;
                     Ok(())
                 }
+                ServerMessage::MobileChanged {
+                    topic: MobileWatch::Conversation(chat_id),
+                } if chat_id == self.chat_id => {
+                    followed.ending = true;
+                    followed.changed = true;
+                    Ok(())
+                }
                 ServerMessage::HostShuttingDown => Err(End::Daemon(
                     "The computer's cagents daemon is stopping.".into(),
                 )),
@@ -388,7 +489,7 @@ impl Connection {
             };
         };
         match self.pending.remove(&request_id) {
-            Some(Pending::Read) => {
+            Some(Pending::Read { final_read }) => {
                 followed.reading = false;
                 match envelope.message {
                     ServerMessage::Response {
@@ -410,9 +511,16 @@ impl Connection {
                         }
                     },
                     ServerMessage::Error(error)
-                        if error.code == ProtocolErrorCode::TerminalNotFound =>
+                        if error.code == ProtocolErrorCode::TerminalNotFound
+                            || (followed.ending
+                                && error.code == ProtocolErrorCode::TerminalUnavailable) =>
                     {
-                        return Err(End::Conversation(error.message));
+                        let message = if followed.ending {
+                            "The conversation was closed.".into()
+                        } else {
+                            error.message
+                        };
+                        return Err(End::Conversation(message));
                     }
                     // A read can fail and succeed next time, as when the
                     // provider is busy. As the desktop does, keep what is
@@ -431,6 +539,9 @@ impl Connection {
                     }
                 }
                 self.publish(followed);
+                if final_read && !followed.changed {
+                    return Err(End::Conversation("The conversation ended.".into()));
+                }
             }
             Some(Pending::Chat { id }) => match envelope.message {
                 ServerMessage::Response { .. } => self.outbox.ok(id),
@@ -458,8 +569,13 @@ impl Connection {
             chat_id: self.chat_id,
             visible: true,
         })? {
+            ServerResponse::Accepted => {}
+            _ => return Err(internal("The daemon answered visibility unexpectedly.")),
+        }
+        let topic = MobileWatch::Conversation(self.chat_id);
+        match self.call(ClientRequest::WatchMobile { topic })? {
             ServerResponse::Accepted => Ok(snapshot),
-            _ => Err(internal("The daemon answered unexpectedly.")),
+            _ => Err(internal("The daemon answered the watch unexpectedly.")),
         }
     }
 
@@ -484,6 +600,15 @@ impl Connection {
                 ));
             }
             if envelope.request_id != Some(request_id) {
+                if matches!(envelope.message,
+                    ServerMessage::MobileChanged { topic: MobileWatch::Conversation(chat_id) }
+                    if chat_id == self.chat_id
+                ) {
+                    return Err(api_error(
+                        api::ErrorCode::NotFound,
+                        "The conversation was closed.",
+                    ));
+                }
                 continue;
             }
             return match envelope.message {
@@ -508,6 +633,26 @@ impl Connection {
         )?;
         Ok(request_id)
     }
+}
+
+fn waiting_requests(inputs: &Receiver<Input>) -> impl Iterator<Item = u64> + '_ {
+    inputs.try_iter().filter_map(|input| match input {
+        Input::Command(Command::Chat { id, .. }) => Some(id),
+        _ => None,
+    })
+}
+
+fn fail_requests(requests: impl Iterator<Item = u64>, outbox: &Outbox, message: &str) {
+    for id in requests {
+        outbox.error(Some(id), api_error(api::ErrorCode::Unavailable, message));
+    }
+}
+
+fn stopped_during_attach() -> api::Error {
+    api_error(
+        api::ErrorCode::NotWatching,
+        "The conversation was closed on the phone before it opened.",
+    )
 }
 
 /// `command`, with an answer completed as the desktop completes it: the

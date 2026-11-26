@@ -9,18 +9,22 @@ import dev.cagents.mobile.protocol.Session
 import dev.cagents.mobile.protocol.Welcome
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
@@ -120,8 +124,7 @@ class RemoteController(
      * conversations watched: a watching phone counts as someone following
      * them on the computer.
      */
-    @kotlin.concurrent.Volatile
-    private var foreground = true
+    private val foreground = MutableStateFlow(true)
     private val wake = Channel<Unit>(Channel.CONFLATED)
 
     @kotlin.concurrent.Volatile
@@ -256,14 +259,14 @@ class RemoteController(
 
     /**
      * Follows the app going to the background and back. In the background
-     * the open conversations are unwatched at once, since nobody is looking
-     * at them, or once their requests are answered. The connection stays
+     * overview watches stop at once, and open conversations stop once their
+     * requests are answered. The connection stays
      * for [ControllerConfig.backgroundGrace], so a quick switch away doesn't
      * drop it, and then closes. Coming back watches them again and, if
      * [connect], connects.
      */
     fun setForeground(foreground: Boolean, connect: Boolean = true) {
-        this.foreground = foreground
+        this.foreground.value = foreground
         if (foreground) {
             if (connect) start()
         } else {
@@ -337,7 +340,7 @@ class RemoteController(
                 if (left == 0) inFlight -= session else inFlight[session] = left
                 left == 0
             }
-            if (last && !foreground) sync(session, SyncKind.Settle)
+            if (last && !foreground.value) sync(session, SyncKind.Settle)
         }
     }
 
@@ -414,8 +417,13 @@ class RemoteController(
                     current = bridge
                 }
                 _state.update { it.copy(connection = ConnectionState.Connected, welcome = welcome) }
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    watchOverview(bridge, Call.WatchSessions, Call.UnwatchSessions)
+                }
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    watchOverview(bridge, Call.WatchNotifications, Call.UnwatchNotifications)
+                }
                 launch {
-                    subscribe(bridge)
                     // Opened before this connection, or while it was being made.
                     _state.value.conversations.keys.forEach { syncQueue.trySend(Sync(it, SyncKind.Watch)) }
                     reconcile(bridge, syncQueue)
@@ -435,24 +443,39 @@ class RemoteController(
         }
     }
 
-    private suspend fun subscribe(bridge: BridgeSession) {
-        runCatching { bridge.call(Call.WatchSessions) }
-        runCatching { bridge.call(Call.WatchNotifications) }
+    private suspend fun watchOverview(bridge: BridgeSession, watch: Call, unwatch: Call) {
+        var requested = false
+        try {
+            foreground.collectLatest { looking ->
+                if (looking == requested) return@collectLatest
+                // A new foreground state supersedes a reply still in flight.
+                // Unwatch is sent even if the original watch has not answered.
+                requested = looking
+                try {
+                    bridge.call(if (looking) watch else unwatch)
+                } catch (_: RequestFailed) {
+                    // The other subscription and conversation watches can continue.
+                }
+            }
+        } catch (_: ConnectionLost) {
+            // The next connection starts with fresh subscriptions.
+        }
     }
 
     /**
-     * Works through [queue], one request at a time, watching the conversations
-     * the app holds and unwatching the ones it let go, until the connection ends.
+     * Reconciles the requested watch for each conversation. A new decision
+     * for one conversation can supersede a reply that is still pending.
      */
-    private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) {
+    private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) = coroutineScope {
         val watched = HashSet<String>()
+        val replies = HashMap<String, Job>()
         // Asked for again in the background, to be watched on return.
         val deferred = HashSet<String>()
         for ((session, kind) in queue) {
             // A recovery given up on, or closed, since it was queued.
             if (kind == SyncKind.Resync && locked { session !in resyncing }) continue
             val held = _state.value.conversations[session]
-            val looking = foreground || locked { session in inFlight }
+            val looking = foreground.value || locked { session in inFlight }
             val force = when {
                 held == null -> {
                     deferred -= session
@@ -468,26 +491,30 @@ class RemoteController(
             // let go unless asked for again; in the background, every one is
             // once its requests are answered.
             val wanted = held != null && looking && (force || held.ended == null)
-            try {
-                if (wanted && (force || session !in watched)) {
-                    try {
-                        bridge.call(Call.WatchConversation(session))
-                        watched += session
-                    } catch (e: RequestFailed) {
-                        // Whatever the reason, including `unavailable`, no updates follow.
-                        // An earlier watch may still stand on the server, so it stays
-                        // in `watched` to be unwatched; that is harmless if it doesn't.
+            val call = when {
+                wanted && (force || session !in watched) -> {
+                    watched += session
+                    Call.WatchConversation(session)
+                }
+                !wanted && watched.remove(session) -> Call.UnwatchConversation(session)
+                else -> continue
+            }
+            replies.entries.removeAll { it.value.isCompleted }
+            replies.remove(session)?.cancelAndJoin()
+            replies[session] = launch(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    bridge.call(call)
+                } catch (e: RequestFailed) {
+                    ensureActive()
+                    if (call is Call.WatchConversation) {
+                        // An earlier watch may still stand if a replacement
+                        // failed. Leave it eligible for an explicit unwatch.
                         locked { resyncing -= session }
                         markEnded(session, e.message ?: "This conversation can't be followed.")
                     }
-                } else if (!wanted && session in watched) {
-                    watched -= session
-                    runCatching { bridge.call(Call.UnwatchConversation(session)) }
-                        .onFailure { if (it is ConnectionLost) throw it }
+                } catch (_: ConnectionLost) {
+                    // Every held conversation is watched again after reconnect.
                 }
-            } catch (e: ConnectionLost) {
-                // Every held conversation is watched again after the reconnect.
-                return
             }
         }
     }

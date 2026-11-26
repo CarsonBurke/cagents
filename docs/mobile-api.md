@@ -221,7 +221,7 @@ approves only by choosing an action.
 | `sessions` | The whole session list. |
 | `notifications` | Every unacknowledged notice, newest first. |
 | `conversation` | A change to a watched conversation. |
-| `conversation_ended` | `session`, `message`: a watched conversation stopped being followable, such as when it was closed (noticed within two seconds). Watch again to retry. |
+| `conversation_ended` | `session`, `message`: a watched conversation stopped being followable, such as when it was closed. Watch again to retry. |
 | `closing` | `message`: the bridge is about to exit, such as when the daemon stops. |
 
 ### Sessions
@@ -235,7 +235,11 @@ session started as an agent has `agent`, with its `owner` (`user`, `session`
 or `automation`), the owning session's `owner_lineage`, and `run`, its run
 state.
 
-Sessions and notifications are checked every two seconds.
+A watch sends a complete snapshot first. Changes on the computer trigger
+fresh snapshots, and several changes may be reflected in one event. The
+bridge stops following a list on its matching `unwatch` or when the SSH
+connection closes. The wire format is the same on earlier v1 servers,
+which check every two seconds.
 
 ### Conversations
 

@@ -879,6 +879,49 @@ fn notification_activation_prefers_the_focused_owner_and_restores_closed_window_
 }
 
 #[test]
+fn mobile_watches_are_scoped_coalesced_and_do_not_register_window_presence() {
+    use crate::terminal_ipc::MobileWatch;
+    let mut host = test_host();
+    let sessions = host.register_client(1);
+    let notifications = host.register_client(2);
+    let other = host.register_client(3);
+    host.watch_mobile(1, MobileWatch::Sessions).unwrap();
+    host.watch_mobile(2, MobileWatch::Notifications).unwrap();
+    assert!(host.notification_watchers.is_empty());
+    assert_eq!(
+        host.watch_mobile(3, MobileWatch::Conversation(TerminalId::new()))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::TerminalNotFound,
+    );
+    host.inventory_changed();
+    host.inventory_changed();
+    assert!(host.mobile_watchers[&1].pending.get());
+    host.mobile_snapshot_started(1, MobileWatch::Notifications);
+    assert!(host.mobile_watchers[&1].pending.get());
+    host.mobile_snapshot_started(1, MobileWatch::Sessions);
+    assert!(!host.mobile_watchers[&1].pending.get());
+    host.inventory_changed();
+    host.notifications_changed();
+    host.unregister_client(2);
+    host.notifications_changed();
+    assert!(!host.mobile_watchers.contains_key(&2));
+    for (delivery, topic) in [
+        (&sessions, MobileWatch::Sessions),
+        (&notifications, MobileWatch::Notifications),
+    ] {
+        delivery.close_after_drain();
+        assert!(matches!(
+            delivery.pop().unwrap().message,
+            ServerMessage::MobileChanged { topic: actual } if actual == topic
+        ));
+        assert!(delivery.pop().is_none());
+    }
+    other.close_after_drain();
+    assert!(other.pop().is_none());
+}
+
+#[test]
 fn run_notification_routes_only_to_a_cagents_window_without_a_provider_pane() {
     let mut host = test_host();
     let delivery = host.register_client(1);
