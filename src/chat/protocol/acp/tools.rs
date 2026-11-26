@@ -45,12 +45,16 @@ pub(super) struct Calls {
 }
 
 impl Calls {
+    pub fn contains(&self, id: &str) -> bool {
+        self.calls.contains_key(id)
+    }
+
     /// Merges a `tool_call`, a `tool_call_update` or a permission request's
     /// `toolCall` into what is known of the call, and returns the step to
     /// show for it.
     pub fn merge(&mut self, update: &Value) -> Option<(String, ItemContent)> {
         let id = update["toolCallId"].as_str().filter(|id| !id.is_empty())?;
-        if !self.calls.contains_key(id) {
+        if !self.contains(id) {
             if self.order.len() == MAX_CALLS
                 && let Some(oldest) = self.order.pop_front()
             {

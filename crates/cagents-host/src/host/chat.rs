@@ -587,6 +587,14 @@ fn changed_for_instance(
             }
         }
     }
+    let predecessors = if matches!(update, Update::TurnStarted { .. }) {
+        super::notifications::predecessor_sessions(&host, id).unwrap_or_else(|error| {
+            tracing::debug!(%error, session = %id, "could not resolve attention lineage");
+            Default::default()
+        })
+    } else {
+        Default::default()
+    };
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     // Validate the producer under the same lock that publishes its update.
     // A retired callback must never target a replacement sharing this pane ID.
@@ -596,6 +604,14 @@ fn changed_for_instance(
             .get(&id)
             .is_none_or(|record| record.execution_instance != instance)
     }) {
+        return;
+    }
+    if matches!(update, Update::TurnStarted { .. }) {
+        if state.chats.contains_key(&id)
+            && let Some(notifications) = &state.notifications
+        {
+            notifications.session_started_turn(id, predecessors);
+        }
         return;
     }
     let proof = state.proof().clone();

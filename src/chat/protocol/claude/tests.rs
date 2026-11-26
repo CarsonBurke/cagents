@@ -2691,6 +2691,88 @@ fn stream(event: Value) -> Value {
 }
 
 #[test]
+fn claude_turn_confirmation_requires_correlated_lifecycle_or_a_new_root_stream() {
+    let mut adapter = Claude {
+        ready: true,
+        async_input: true,
+        ..Claude::default()
+    };
+    let sent = adapter
+        .send_prompt("start".into(), vec![], PromptMode::Send)
+        .unwrap();
+    assert!(sent.events.contains(&Event::TurnStarted));
+    assert!(!sent.events.contains(&Event::TurnStartConfirmed));
+    let lifecycle =
+        |id: &Value, state| json!({"type":"command_lifecycle","command_uuid":id,"state":state});
+    let id = &sent.writes[0]["uuid"];
+    let queued = adapter.receive(lifecycle(id, "queued")).unwrap();
+    assert!(!queued.events.contains(&Event::TurnStartConfirmed));
+    let wrong = adapter
+        .receive(lifecycle(&json!("unknown"), "started"))
+        .unwrap();
+    assert!(!wrong.events.contains(&Event::TurnStartConfirmed));
+    let first = adapter.receive(lifecycle(id, "started")).unwrap();
+    assert!(first.events.contains(&Event::TurnStartConfirmed));
+    assert!(!first.events.contains(&Event::TurnStarted));
+    let root = |id| stream(json!({"type":"message_start","message":{"id":id}}));
+    let same_turn = adapter.receive(root("first-root")).unwrap();
+    assert!(!same_turn.events.contains(&Event::TurnStartConfirmed));
+    adapter
+        .receive(json!({"type":"result","is_error":false}))
+        .unwrap();
+
+    let repeated = adapter.receive(root("first-root")).unwrap();
+    assert!(!repeated.events.contains(&Event::TurnStartConfirmed));
+    let mut history = root("history");
+    history["isReplay"] = json!(true);
+    assert!(
+        !adapter
+            .receive(history)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let mut child = root("child");
+    child["parent_tool_use_id"] = json!("background");
+    assert!(
+        !adapter
+            .receive(child)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let live = adapter.receive(root("second-root")).unwrap();
+    assert!(live.events.contains(&Event::TurnStartConfirmed));
+    let another_model_call = adapter.receive(root("third-root")).unwrap();
+    assert!(
+        !another_model_call
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    adapter
+        .receive(json!({"type":"result","is_error":false}))
+        .unwrap();
+    let reply = |id, replay| {
+        json!({"type":"assistant","uuid":id,"isReplay":replay,"message":{
+            "id":id,"content":[{"type":"text","text":"Done"}],"role":"assistant"
+        }})
+    };
+    let replayed_reply = adapter.receive(reply("older-reply", true)).unwrap();
+    assert!(!replayed_reply.events.contains(&Event::TurnStartConfirmed));
+    let mut refusal = reply("refused-reply", false);
+    refusal["error"] = json!("rate_limit");
+    assert!(
+        !adapter
+            .receive(refusal)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let actual_reply = adapter.receive(reply("fresh-reply", false)).unwrap();
+    assert!(actual_reply.events.contains(&Event::TurnStartConfirmed));
+}
+
+#[test]
 fn autonomous_parent_turns_publish_one_start_even_with_pending_decisions() {
     for pending in [false, true] {
         let mut adapter = Claude {

@@ -55,13 +55,33 @@ pub(in crate::host) type CommitAcknowledgement = std::sync::mpsc::Receiver<Resul
 struct CommitReceipt {
     reply: Option<std::sync::mpsc::Sender<Result<(), String>>>,
     resolved: bool,
+    admission: journal::Admission,
+}
+
+struct RetainedTurn {
+    session: TerminalId,
+    actor: Uuid,
+    generation: u64,
+    through: u64,
+    predecessors: BTreeSet<TerminalId>,
+    before_retirement: bool,
+    receipt: CommitReceipt,
+    _slot: OwnedSemaphorePermit,
 }
 
 impl CommitReceipt {
     fn new(reply: std::sync::mpsc::Sender<Result<(), String>>) -> Self {
+        Self::admitted(reply, journal::Admission::default())
+    }
+
+    fn admitted(
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+        admission: journal::Admission,
+    ) -> Self {
         Self {
             reply: Some(reply),
             resolved: false,
+            admission,
         }
     }
 
@@ -107,6 +127,8 @@ struct Pending {
     acknowledged: BTreeSet<Uuid>,
     predecessor_reads: BTreeMap<Uuid, TerminalId>,
     review_updates: VecDeque<QueuedReviewUpdate>,
+    started_turns: BTreeSet<TerminalId>,
+    retained_turns: VecDeque<RetainedTurn>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
     /// The portal service's latest owner, when it changed; `Some(None)` means
@@ -120,25 +142,104 @@ struct Pending {
 }
 
 impl Pending {
+    fn supersede(&mut self, sessions: &BTreeSet<TerminalId>) {
+        self.events
+            .retain(|target, _| !matches!(target, Target::Session(id) if sessions.contains(id)));
+        for (event, receipt) in &mut self.committed_events {
+            if matches!(event.target, Target::Session(id) if sessions.contains(&id)) {
+                receipt.admission.superseded = true;
+            }
+        }
+    }
+
+    fn start_turns(&mut self, sessions: BTreeSet<TerminalId>) {
+        self.supersede(&sessions);
+        // A confirmed provider boundary has no caller to retry it. Keep
+        // one settlement per session through a journal outage.
+        self.started_turns.extend(sessions);
+    }
+
+    fn flush_started_turns(
+        &mut self,
+        journal: &mut Journal,
+    ) -> Result<Vec<(String, String)>, String> {
+        if self.started_turns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = journal.acknowledge_sessions(&self.started_turns)?;
+        self.started_turns.clear();
+        Ok(rows)
+    }
+
+    fn mark_retained_predecessors_of_retirement(&mut self, target: &Target) {
+        if let Target::Session(session) = *target {
+            for turn in self
+                .retained_turns
+                .iter_mut()
+                .filter(|turn| turn.session == session)
+            {
+                turn.before_retirement = true;
+            }
+        }
+    }
+
+    fn flush_retained_turns(
+        &mut self,
+        journal: &mut Journal,
+        before_retirement: bool,
+        mut withdraw: impl FnMut(Vec<(String, String)>),
+    ) -> Result<(), String> {
+        while let Some(index) = self
+            .retained_turns
+            .iter()
+            .position(|turn| turn.before_retirement == before_retirement)
+        {
+            let turn = &self.retained_turns[index];
+            let rows = journal.acknowledge_retained_turn(
+                turn.session,
+                turn.actor,
+                turn.generation,
+                turn.through,
+                &turn.predecessors,
+            )?;
+            let turn = self
+                .retained_turns
+                .remove(index)
+                .expect("checked retained turn");
+            if let Some(rows) = rows {
+                self.supersede(&turn.predecessors);
+                withdraw(rows);
+            }
+            turn.receipt.finish(Ok(()));
+        }
+        Ok(())
+    }
+
+    fn commit_next_retirement(&mut self, journal: &mut Journal) -> Result<Option<Target>, String> {
+        let Some(target) = self.retired.first() else {
+            return Ok(None);
+        };
+        journal.retire(target.clone())?;
+        Ok(self.retired.pop_first())
+    }
+
     /// This batch's work with `newer`, a later batch, applied after it, as if
     /// both had been queued as one: a later retirement withdraws an earlier
     /// event for its session, and a later event replaces an earlier one.
     fn followed_by(mut self, newer: Pending) -> Pending {
-        for target in &newer.retired {
-            self.events.remove(target);
-        }
         for target in newer.retired {
-            if self.retired.len() < MAX_PENDING || self.retired.contains(&target) {
+            self.events.remove(&target);
+            if matches!(target, Target::Session(_)) || self.retired.len() < MAX_PENDING {
+                self.mark_retained_predecessors_of_retirement(&target);
                 self.retired.insert(target);
             }
         }
         for target in newer.cleared_waiting {
             self.clear_waiting(target);
         }
-        for (target, event) in newer.events {
-            if self.events.len() < MAX_PENDING || self.events.contains_key(&target) {
-                self.events.insert(target, event);
-            }
+        self.start_turns(newer.started_turns);
+        for event in newer.events.into_values() {
+            self.queue_event(event);
         }
         for id in newer.acknowledged {
             if self.acknowledged.len() < MAX_PENDING {
@@ -148,6 +249,7 @@ impl Pending {
         self.read_predecessors(newer.predecessor_reads);
         self.review_updates.extend(newer.review_updates);
         self.committed_events.extend(newer.committed_events);
+        self.retained_turns.extend(newer.retained_turns);
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
         }
@@ -163,6 +265,19 @@ impl Pending {
         self.tests.extend(newer.tests);
         self.stopped |= newer.stopped;
         self
+    }
+
+    fn queue_event(&mut self, event: Event) {
+        let target = event.target();
+        // Native callbacks have already fenced the exact session owner but
+        // cannot replay a dropped outcome. Coalesce each session across a
+        // journal outage rather than truncating it at the generic queue limit.
+        if matches!(target, Target::Session(_))
+            || self.events.len() < MAX_PENDING
+            || self.events.contains_key(&target)
+        {
+            self.events.insert(target, event);
+        }
     }
 
     fn clear_waiting(&mut self, target: Target) {
@@ -192,7 +307,8 @@ impl Pending {
 
     /// The work that waits for an unavailable journal rather than being lost:
     /// attention, retirements, acknowledgements and the settings and windows
-    /// they are judged by. Receipts and tests are answered at once, and a
+    /// they are judged by. Retained turn receipts stay with their fence.
+    /// Other receipts and tests are answered at once, and a
     /// click on a notice is not replayed long after the person made it.
     fn deferred(self) -> Pending {
         Pending {
@@ -203,6 +319,8 @@ impl Pending {
             acknowledged: self.acknowledged,
             predecessor_reads: self.predecessor_reads,
             review_updates: self.review_updates,
+            started_turns: self.started_turns,
+            retained_turns: self.retained_turns,
             presence_changed: self.presence_changed,
             reload: self.reload,
             preferences: self.preferences,
@@ -222,6 +340,7 @@ fn take_pending(core: &Shared) -> Pending {
 struct Shared {
     pending: Mutex<Pending>,
     review_slots: Arc<Semaphore>,
+    retained_turn_slots: Arc<Semaphore>,
     presence: Mutex<BTreeMap<ClientId, Presence>>,
     snapshot: Mutex<Snapshot>,
     wake: mpsc::Sender<()>,
@@ -278,6 +397,49 @@ impl Handle {
         let _ = self.0.wake.try_send(());
         Ok(())
     }
+
+    pub(super) fn session_started_turn(
+        &self,
+        session: TerminalId,
+        mut predecessors: BTreeSet<TerminalId>,
+    ) {
+        predecessors.insert(session);
+        self.change(|pending| pending.start_turns(predecessors));
+    }
+
+    pub(super) fn commit_retained_turn(
+        &self,
+        session: TerminalId,
+        actor: Uuid,
+        generation: u64,
+        through: u64,
+        predecessors: BTreeSet<TerminalId>,
+    ) -> Result<CommitAcknowledgement, String> {
+        let (reply, result) = std::sync::mpsc::channel();
+        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.stopped {
+            return Err("Notification journal cannot admit a retained turn".into());
+        }
+        let slot = self
+            .0
+            .retained_turn_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Notification journal cannot admit a retained turn")?;
+        pending.retained_turns.push_back(RetainedTurn {
+            session,
+            actor,
+            generation,
+            through,
+            predecessors,
+            before_retirement: false,
+            receipt: CommitReceipt::new(reply),
+            _slot: slot,
+        });
+        drop(pending);
+        let _ = self.0.wake.try_send(());
+        Ok(result)
+    }
     /// Real bounded enqueue state without a broker, portal, or worker thread.
     #[cfg(test)]
     pub(in crate::host) fn inert_for_test() -> (Self, impl Fn() -> Vec<Event>) {
@@ -285,6 +447,7 @@ impl Handle {
         let shared = Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -324,9 +487,7 @@ impl Handle {
             // Producers fence worker identity before enqueueing. A newer
             // worker may reuse this session while retirement is still queued;
             // apply that retirement first, then its new event in the broker.
-            if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
-                pending.events.insert(event.target(), event);
-            }
+            pending.queue_event(event);
         });
     }
 
@@ -335,20 +496,31 @@ impl Handle {
     pub(in crate::host) fn record_committed(
         &self,
         event: Event,
-    ) -> Result<CommitAcknowledgement, String> {
-        self.admit_committed(event, false)
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+        self.record_committed_admitted(event, journal::Admission::default(), false)
     }
 
-    pub(in crate::host) fn record_resolved_waiting(
+    pub(in crate::host) fn record_retained(
         &self,
         event: Event,
+        actor: Uuid,
+        sequence: u64,
+        resolved: bool,
     ) -> Result<CommitAcknowledgement, String> {
-        self.admit_committed(event, true)
+        self.record_committed_admitted(
+            event,
+            journal::Admission {
+                retained: Some((actor, sequence)),
+                ..journal::Admission::default()
+            },
+            resolved,
+        )
     }
 
-    fn admit_committed(
+    fn record_committed_admitted(
         &self,
         event: Event,
+        admission: journal::Admission,
         resolved: bool,
     ) -> Result<CommitAcknowledgement, String> {
         event.validate()?;
@@ -363,7 +535,7 @@ impl Handle {
         if resolved {
             pending.clear_waiting(event.target());
         }
-        let mut receipt = CommitReceipt::new(receipt);
+        let mut receipt = CommitReceipt::admitted(receipt, admission);
         receipt.resolved = resolved;
         pending.committed_events.push_back((event, receipt));
         drop(pending);
@@ -403,9 +575,8 @@ impl Handle {
             pending
                 .committed_events
                 .retain(|(event, _)| event.target() != session);
-            if pending.retired.len() < MAX_PENDING {
-                pending.retired.insert(session);
-            }
+            pending.mark_retained_predecessors_of_retirement(&session);
+            pending.retired.insert(session);
         });
     }
 
@@ -538,6 +709,15 @@ fn apply_predecessor_reads(
     failure.map_or(Ok(()), Err)
 }
 
+pub(super) fn predecessor_sessions(
+    host: &SharedHost,
+    session: TerminalId,
+) -> Result<BTreeSet<TerminalId>, String> {
+    let registry = super::agent_execution::registry(host)?;
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    registry.notice_predecessors(session)
+}
+
 pub(super) struct Broker {
     handle: Handle,
     thread: Option<JoinHandle<()>>,
@@ -552,6 +732,7 @@ impl Broker {
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -740,6 +921,20 @@ impl Shared {
 
 fn queue_withdrawal(queue: &mut Withdrawals, id: Uuid) {
     queue.legacy(id);
+}
+
+fn withdraw_sessions(
+    withdrawals: &mut Withdrawals,
+    delivery: &mut BTreeMap<Target, Notice>,
+    rows: Vec<(String, String)>,
+) {
+    for (session, id) in rows {
+        if let (Ok(session), Ok(id)) = (session.parse(), id.parse()) {
+            let target = Target::Session(session);
+            delivery.remove(&target);
+            withdraw_target(withdrawals, id, &target);
+        }
+    }
 }
 
 fn withdraw_notice(queue: &mut Withdrawals, notice: &Notice) {
@@ -1098,42 +1293,78 @@ fn commit_waiting_clears(
     Ok(())
 }
 
-/// Flush only settlement the broker accepted before ordinary shutdown.
+/// Flush accepted attention settlement and ensuing outcomes on ordinary exit.
 fn settle_attention_at_shutdown(
     shared: &Weak<Shared>,
     journal: &mut Journal,
-    local_waiting: &BTreeSet<Target>,
-    predecessor_reads: &mut BTreeMap<Uuid, TerminalId>,
-    review_updates: &mut VecDeque<QueuedReviewUpdate>,
+    pending: &mut Pending,
 ) -> bool {
-    let queued_waiting = if let Some(shared) = shared.upgrade() {
-        let mut pending = shared
+    if let Some(shared) = shared.upgrade() {
+        let mut queued = shared
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !pending.stopped {
+        if !queued.stopped {
             return false;
         }
-        predecessor_reads.append(&mut pending.predecessor_reads);
-        review_updates.append(&mut pending.review_updates);
-        std::mem::take(&mut pending.cleared_waiting)
-    } else {
-        BTreeSet::new()
-    };
-    let waiting = local_waiting.union(&queued_waiting).cloned().collect();
-    if let Err(error) = commit_waiting_clears(journal, &waiting, |_, _| {}) {
-        tracing::warn!(%error, "could not record waiting attention settlement at shutdown");
+        let last = std::mem::take(&mut *queued);
+        queued.stopped = true;
+        drop(queued);
+        *pending = std::mem::take(pending).followed_by(last);
     }
-    if !predecessor_reads.is_empty()
-        && let Err(error) =
-            apply_predecessor_reads(journal, predecessor_reads, &mut BTreeMap::new(), |_, _| {})
+    if !pending.review_updates.is_empty()
+        && let Err(error) = settle_review_updates_at_shutdown(journal, &mut pending.review_updates)
+    {
+        tracing::warn!(%error, "accepted review updates could not settle during shutdown");
+    }
+    if let Err(error) = commit_waiting_clears(journal, &pending.cleared_waiting, |_, _| {}) {
+        tracing::warn!(%error, "could not record waiting attention settlement at shutdown");
+        return true;
+    }
+    if !pending.predecessor_reads.is_empty()
+        && let Err(error) = apply_predecessor_reads(
+            journal,
+            &mut pending.predecessor_reads,
+            &mut BTreeMap::new(),
+            |_, _| {},
+        )
     {
         tracing::warn!(%error, "accepted conversation reads could not settle during shutdown");
     }
-    if !review_updates.is_empty()
-        && let Err(error) = settle_review_updates_at_shutdown(journal, review_updates)
-    {
-        tracing::warn!(%error, "accepted review updates could not settle during shutdown");
+    if let Err(error) = pending.flush_started_turns(journal) {
+        tracing::warn!(%error, "confirmed turn attention could not settle during shutdown");
+        return true;
+    }
+    if let Err(error) = pending.flush_retained_turns(journal, true, |_| {}) {
+        tracing::warn!(%error, "retiring retained turn attention could not settle during shutdown");
+        return true;
+    }
+    while !pending.retired.is_empty() {
+        if let Err(error) = pending.commit_next_retirement(journal) {
+            tracing::warn!(%error, "accepted notice retirement could not settle during shutdown");
+            return true;
+        }
+    }
+    if let Err(error) = pending.flush_retained_turns(journal, false, |_| {}) {
+        tracing::warn!(%error, "retained turn attention could not settle during shutdown");
+        return true;
+    }
+    // These accepted outcomes already follow the merged lifecycle boundaries.
+    // Leave new unread entries in the journal without attempting a toast.
+    for mut event in std::mem::take(&mut pending.events).into_values() {
+        if matches!(event.target, Target::Session(_)) {
+            event.content = None;
+            if let Err(error) = journal.record_admitted(
+                event,
+                true,
+                journal::Admission {
+                    withdraw_previous: true,
+                    ..journal::Admission::default()
+                },
+            ) {
+                tracing::warn!(%error, "accepted session attention could not settle during shutdown");
+            }
+        }
     }
     true
 }
@@ -1166,16 +1397,29 @@ fn settle_review_updates_at_shutdown(
     )
 }
 
-fn waiting_clear_admitted(shared: &Weak<Shared>, event: &Event) -> bool {
-    event.evidence.kind == Kind::Waiting
-        && shared.upgrade().is_some_and(|shared| {
-            shared
-                .pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .cleared_waiting
-                .contains(&event.target)
-        })
+fn session_settlement_admitted(shared: &Weak<Shared>, event: &Event) -> bool {
+    let Target::Session(session) = event.target else {
+        return false;
+    };
+    shared.upgrade().is_some_and(|shared| {
+        let pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending.started_turns.contains(&session)
+            || (event.evidence.kind == Kind::Waiting
+                && pending.cleared_waiting.contains(&event.target))
+    })
+}
+
+fn retained_turn_pending(shared: &Weak<Shared>, event: &Event) -> bool {
+    let Target::Session(session) = event.target else {
+        return false;
+    };
+    shared.upgrade().is_some_and(|shared| {
+        let pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending
+            .retained_turns
+            .iter()
+            .any(|turn| turn.session == session || turn.predecessors.contains(&session))
+    })
 }
 
 async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>) -> bool {
@@ -1205,7 +1449,11 @@ fn record_attention_committed_policy(
     }
     // The retained actor may discard its outbox entry as soon as it receives
     // this receipt. Persist replay evidence and the acknowledgement together.
-    let result = journal.record_with_resolution(event, suppressed, true);
+    let mut admission = receipt
+        .as_ref()
+        .map_or_else(journal::Admission::default, |receipt| receipt.admission);
+    admission.resolved_waiting = true;
+    let result = journal.record_admitted(event, suppressed, admission);
     finish_attention_receipt(&result, receipt);
     result
 }
@@ -1238,6 +1486,21 @@ fn record_broker_event(
         return recorded;
     }
     record_attention_committed_policy(journal, event, suppressed, receipt, policy, resolved)
+}
+
+fn record_session_outcome(
+    journal: &mut Journal,
+    pending: &mut Pending,
+    event: Event,
+    suppressed: bool,
+    policy: &Preferences,
+) -> Result<Option<Notice>, String> {
+    let result =
+        record_attention_committed_policy(journal, event.clone(), suppressed, None, policy, false);
+    if result.is_err() {
+        pending.queue_event(event);
+    }
+    result
 }
 
 fn protect_automation_toast(
@@ -1363,7 +1626,10 @@ fn record_attention_committed(
     suppressed: bool,
     receipt: Option<CommitReceipt>,
 ) -> Result<Option<crate::notifications::Notice>, String> {
-    let result = journal.record(event, suppressed);
+    let result = match &receipt {
+        Some(receipt) => journal.record_admitted(event, suppressed, receipt.admission),
+        None => journal.record(event, suppressed),
+    };
     finish_attention_receipt(&result, receipt);
     result
 }
@@ -1403,6 +1669,7 @@ impl JournalTestBridge {
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -1575,7 +1842,7 @@ async fn run(
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
     publish(&shared, &host, snapshot.clone());
-    while wait_for_work(
+    'broker: while wait_for_work(
         &mut receiver,
         store.retry_at().or_else(|| {
             if proxy.is_none() {
@@ -1614,16 +1881,17 @@ async fn run(
             if !pending.cleared_waiting.is_empty()
                 || !pending.predecessor_reads.is_empty()
                 || !pending.review_updates.is_empty()
+                || !pending.started_turns.is_empty()
+                || !pending.retained_turns.is_empty()
+                || !pending.retired.is_empty()
+                || pending
+                    .events
+                    .keys()
+                    .any(|target| matches!(target, Target::Session(_)))
             {
                 match store.journal_for_shutdown() {
                     Ok(journal) => {
-                        settle_attention_at_shutdown(
-                            &shared,
-                            journal,
-                            &pending.cleared_waiting,
-                            &mut pending.predecessor_reads,
-                            &mut pending.review_updates,
-                        );
+                        settle_attention_at_shutdown(&shared, journal, &mut pending);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "could not reopen attention journal at shutdown")
@@ -1713,13 +1981,7 @@ async fn run(
         pending.cleared_waiting.clear();
         if let Some(current) = current_presence {
             for (client, update) in &current {
-                if settle_attention_at_shutdown(
-                    &shared,
-                    journal,
-                    &pending.cleared_waiting,
-                    &mut pending.predecessor_reads,
-                    &mut pending.review_updates,
-                ) {
+                if settle_attention_at_shutdown(&shared, journal, &mut pending) {
                     return;
                 }
                 if presence.is_empty() {
@@ -1740,8 +2002,21 @@ async fn run(
             }
             presence = current;
         }
+        match pending.flush_started_turns(journal) {
+            Ok(rows) => withdraw_sessions(&mut withdrawals, &mut delivery, rows),
+            Err(error) => {
+                // A later outcome may replace the unread notice for this
+                // same session. Hold it until the earlier boundary commits.
+                snapshot.diagnostic = Some(error.clone());
+                publish(&shared, &host, snapshot.clone());
+                answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                store.suspend(error, Instant::now());
+                deferred = pending.deferred();
+                continue;
+            }
+        }
         if pending.reload {
-            match pending.preferences.map_or_else(preferences, Ok) {
+            match pending.preferences.take().map_or_else(preferences, Ok) {
                 Ok(settings) => policy = settings,
                 Err(error) => {
                     policy.enabled = false;
@@ -1797,26 +2072,43 @@ async fn run(
             }
             pending.events.extend(inboxes.events);
         }
-        for session in pending.retired {
-            if settle_attention_at_shutdown(
-                &shared,
-                journal,
-                &pending.cleared_waiting,
-                &mut pending.predecessor_reads,
-                &mut pending.review_updates,
-            ) {
+        // Finish any marker proved by the closing actor while its durable
+        // replay fence still exists. A replacement marker follows retirement.
+        if let Err(error) = pending.flush_retained_turns(journal, true, |rows| {
+            withdraw_sessions(&mut withdrawals, &mut delivery, rows);
+        }) {
+            snapshot.diagnostic = Some(error.clone());
+            publish(&shared, &host, snapshot.clone());
+            answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+            proxy = None;
+            next_attempt = store.retry_failed_write(error, Instant::now());
+            deferred = pending.deferred();
+            continue;
+        }
+        while !pending.retired.is_empty() {
+            if settle_attention_at_shutdown(&shared, journal, &mut pending) {
                 return;
             }
-            delivery.remove(&session);
+            let target = match pending.commit_next_retirement(journal) {
+                Ok(Some(target)) => target,
+                Ok(None) => break,
+                Err(error) => {
+                    snapshot.diagnostic = Some(error.clone());
+                    publish(&shared, &host, snapshot.clone());
+                    answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                    proxy = None;
+                    next_attempt = store.retry_failed_write(error, Instant::now());
+                    deferred = pending.deferred();
+                    continue 'broker;
+                }
+            };
+            delivery.remove(&target);
             if let Some(old) = snapshot
                 .notices
                 .iter()
-                .find(|notice| notice.event.target() == session)
+                .find(|notice| notice.event.target() == target)
             {
                 withdraw_notice(&mut withdrawals, old);
-            }
-            if let Err(error) = journal.retire(session) {
-                snapshot.diagnostic = Some(error);
             }
         }
         match apply_predecessor_reads(
@@ -1846,14 +2138,8 @@ async fn run(
                 predecessor_retry = Some((due, error));
             }
         }
-        for id in pending.acknowledged {
-            if settle_attention_at_shutdown(
-                &shared,
-                journal,
-                &pending.cleared_waiting,
-                &mut pending.predecessor_reads,
-                &mut pending.review_updates,
-            ) {
+        for id in std::mem::take(&mut pending.acknowledged) {
+            if settle_attention_at_shutdown(&shared, journal, &mut pending) {
                 return;
             }
             delivery.retain(|_, notice| notice.id != id);
@@ -1864,14 +2150,19 @@ async fn run(
                 withdraw_notice(&mut withdrawals, notice);
             }
         }
-        if settle_attention_at_shutdown(
-            &shared,
-            journal,
-            &pending.cleared_waiting,
-            &mut pending.predecessor_reads,
-            &mut pending.review_updates,
-        ) {
+        if settle_attention_at_shutdown(&shared, journal, &mut pending) {
             return;
+        }
+        if let Err(error) = pending.flush_retained_turns(journal, false, |rows| {
+            withdraw_sessions(&mut withdrawals, &mut delivery, rows);
+        }) {
+            snapshot.diagnostic = Some(error.clone());
+            publish(&shared, &host, snapshot.clone());
+            answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+            proxy = None;
+            next_attempt = store.retry_failed_write(error, Instant::now());
+            deferred = pending.deferred();
+            continue;
         }
         let now = Instant::now();
         if review_retry.as_ref().is_none_or(|(due, _)| *due <= now) {
@@ -1901,26 +2192,21 @@ async fn run(
                 }
             }
         }
-        let events = pending
-            .events
-            .into_values()
-            .map(|event| (event, None))
-            .chain(
-                pending
-                    .committed_events
-                    .into_iter()
-                    .map(|(event, receipt)| (event, Some(receipt))),
-            );
-        for (event, receipt) in events {
-            if settle_attention_at_shutdown(
-                &shared,
-                journal,
-                &pending.cleared_waiting,
-                &mut pending.predecessor_reads,
-                &mut pending.review_updates,
-            ) {
+        while !pending.events.is_empty() || !pending.committed_events.is_empty() {
+            if settle_attention_at_shutdown(&shared, journal, &mut pending) {
                 return;
             }
+            let (event, receipt) = pending
+                .events
+                .pop_first()
+                .map(|(_, event)| (event, None))
+                .or_else(|| {
+                    pending
+                        .committed_events
+                        .pop_front()
+                        .map(|(event, receipt)| (event, Some(receipt)))
+                })
+                .expect("checked that an event remains");
             let focused = presence.values().any(|window| {
                 event
                     .source_session()
@@ -1929,10 +2215,16 @@ async fn run(
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
             let resolved = receipt.as_ref().is_some_and(|receipt| receipt.resolved);
-            match record_broker_event(journal, event, suppressed, receipt, &policy, || {
-                let host = host.upgrade().ok_or("The daemon has stopped")?;
-                super::agent_execution::registry(&host)
-            }) {
+            let direct_session = receipt.is_none() && matches!(event.target, Target::Session(_));
+            let recorded = if direct_session {
+                record_session_outcome(journal, &mut pending, event, suppressed, &policy)
+            } else {
+                record_broker_event(journal, event, suppressed, receipt, &policy, || {
+                    let host = host.upgrade().ok_or("The daemon has stopped")?;
+                    super::agent_execution::registry(&host)
+                })
+            };
+            match recorded {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot.notices.iter().find(|old| {
@@ -1954,6 +2246,15 @@ async fn run(
                     }
                 }
                 Ok(None) => {}
+                Err(error) if direct_session => {
+                    snapshot.diagnostic = Some(error.clone());
+                    publish(&shared, &host, snapshot.clone());
+                    answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                    proxy = None;
+                    next_attempt = store.retry_failed_write(error, Instant::now());
+                    deferred = pending.deferred();
+                    continue 'broker;
+                }
                 Err(error) => snapshot.diagnostic = Some(error),
             }
         }
@@ -2099,13 +2400,7 @@ async fn run(
                 )
             };
             for notice in batch {
-                if settle_attention_at_shutdown(
-                    &shared,
-                    journal,
-                    &pending.cleared_waiting,
-                    &mut pending.predecessor_reads,
-                    &mut pending.review_updates,
-                ) {
+                if settle_attention_at_shutdown(&shared, journal, &mut pending) {
                     return;
                 }
                 // Portal connection and test delivery can each await.
@@ -2115,8 +2410,13 @@ async fn run(
                     // target until the journal retry. Leave delivery pending.
                     continue;
                 }
-                if waiting_clear_admitted(&shared, &notice.event) {
+                if session_settlement_admitted(&shared, &notice.event) {
                     delivery.remove(&notice.event.target);
+                    continue;
+                }
+                // A retained marker can be a replay. Let the journal admit it
+                // before sending, without discarding a potentially newer toast.
+                if retained_turn_pending(&shared, &notice.event) {
                     continue;
                 }
                 if let Target::Automation { id, sequence } = notice.event.target {
@@ -2169,13 +2469,7 @@ async fn run(
             // Cleanup is bounded like delivery. A desktop that stops answering
             // cannot hold daemon shutdown behind thousands of remove calls.
             for _ in 0..8 {
-                if settle_attention_at_shutdown(
-                    &shared,
-                    journal,
-                    &pending.cleared_waiting,
-                    &mut pending.predecessor_reads,
-                    &mut pending.review_updates,
-                ) {
+                if settle_attention_at_shutdown(&shared, journal, &mut pending) {
                     return;
                 }
                 if failed {
@@ -2443,9 +2737,7 @@ mod tests {
         assert!(settle_attention_at_shutdown(
             &Arc::downgrade(&shared),
             &mut journal,
-            &in_flight.cleared_waiting,
-            &mut in_flight.predecessor_reads,
-            &mut in_flight.review_updates,
+            &mut in_flight,
         ));
         drop(journal);
         let mut journal = Journal::open(&path).unwrap();
@@ -2601,15 +2893,19 @@ mod tests {
             .execute_batch("DROP TRIGGER interrupt_review_census")
             .unwrap();
         if let Some(handle) = handle {
+            let session = TerminalId::new();
+            let prior_turn = journal
+                .record(attention_event(session, "prior turn"), false)
+                .unwrap()
+                .unwrap();
             handle.observe_review_requests(legacy("after", 2)).unwrap();
+            handle.session_started_turn(session, BTreeSet::new());
             handle.change(|pending| pending.stopped = true);
             drop(handle);
             assert!(settle_attention_at_shutdown(
                 &Arc::downgrade(&shared),
                 &mut journal,
-                &pending.cleared_waiting,
-                &mut pending.predecessor_reads,
-                &mut pending.review_updates,
+                &mut pending,
             ));
             assert!(shared.pending.lock().unwrap().review_updates.is_empty());
             drop(journal);
@@ -2617,6 +2913,13 @@ mod tests {
             assert!(journal.list().unwrap().iter().any(|notice| {
                 notice.event.evidence.key == "after" && notice.delivered && !notice.acknowledged
             }));
+            assert!(
+                journal
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .any(|notice| notice.id == prior_turn.id && notice.acknowledged)
+            );
         } else {
             drop(shared);
             apply_review_updates(
@@ -2642,6 +2945,7 @@ mod tests {
                 .list()
                 .unwrap()
                 .into_iter()
+                .filter(|notice| matches!(notice.event.target, Target::PullRequest(_)))
                 .map(|notice| (notice.event.evidence.key, notice.acknowledged))
                 .collect::<BTreeMap<_, _>>(),
             BTreeMap::from([("after".into(), false), ("before".into(), true)])
@@ -3580,6 +3884,7 @@ mod tests {
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -3725,6 +4030,7 @@ mod tests {
         let shared = Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -3738,9 +4044,7 @@ mod tests {
         assert!(settle_attention_at_shutdown(
             &Arc::downgrade(&shared),
             &mut journal,
-            &batch.cleared_waiting,
-            &mut batch.predecessor_reads,
-            &mut batch.review_updates,
+            &mut batch,
         ));
         let notices = journal.list().unwrap();
         assert_eq!(notices.len(), 2);
@@ -3777,7 +4081,9 @@ mod tests {
             ..Pending::default()
         };
         handle.clear_session_waiting(direct);
-        let receipt = handle.record_resolved_waiting(retained).unwrap();
+        let receipt = handle
+            .record_retained(retained, Uuid::new_v4(), 1, true)
+            .unwrap();
         let merged = deferred.followed_by(take_pending(&handle.0));
         assert_eq!(merged.cleared_waiting.len(), MAX_PENDING + 2);
         assert_eq!(
@@ -3807,11 +4113,11 @@ mod tests {
         let mut waiting = attention_event(session, "pending");
         waiting.evidence.kind = Kind::Waiting;
         let reference = Arc::downgrade(&shared);
-        assert!(!waiting_clear_admitted(&reference, &waiting));
+        assert!(!session_settlement_admitted(&reference, &waiting));
 
         handle.clear_session_waiting(session);
-        assert!(waiting_clear_admitted(&reference, &waiting));
-        assert!(!waiting_clear_admitted(
+        assert!(session_settlement_admitted(&reference, &waiting));
+        assert!(!session_settlement_admitted(
             &reference,
             &attention_event(session, "done")
         ));
@@ -3971,6 +4277,7 @@ mod tests {
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -4006,6 +4313,7 @@ mod tests {
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -4050,11 +4358,589 @@ mod tests {
         let shared = Arc::new(Shared {
             pending: Mutex::default(),
             review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
+            retained_turn_slots: Arc::new(Semaphore::new(MAX_PENDING)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
         });
         (shared, receiver)
+    }
+
+    #[test]
+    fn a_failed_turn_boundary_retries_before_admitting_its_later_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let now = Instant::now();
+        let mut store = journal::Reopening::open(Some(path.clone()), now);
+        let session = TerminalId::new();
+        let prior = store
+            .journal()
+            .unwrap()
+            .record(attention_event(session, "earlier"), false)
+            .unwrap()
+            .unwrap();
+        let control = rusqlite::Connection::open(&path).unwrap();
+        control.execute_batch("CREATE TRIGGER refuse_turn_clear BEFORE UPDATE OF acknowledged ON notices BEGIN SELECT RAISE(FAIL, 'write refused'); END;").unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        handle.session_started_turn(session, BTreeSet::new());
+        handle.record(attention_event(session, "later"));
+        let mut pending = take_pending(&shared);
+        let error = pending
+            .flush_started_turns(store.journal().unwrap())
+            .unwrap_err();
+        assert!(error.contains("write refused"));
+        store.suspend(error, now);
+        let deferred = pending.deferred();
+        assert_eq!(store.reopen_if_due(now), None);
+        assert_eq!(deferred.started_turns, [session].into());
+        assert_eq!(deferred.events.len(), 1);
+        control
+            .execute_batch("DROP TRIGGER refuse_turn_clear;")
+            .unwrap();
+        assert!(store.reopen_if_due(store.retry_at().unwrap()).is_some());
+
+        let mut pending = deferred.followed_by(take_pending(&shared));
+        let journal = store.journal().unwrap();
+        assert_eq!(
+            pending.flush_started_turns(journal).unwrap(),
+            [(session.to_string(), prior.id.to_string())]
+        );
+        assert!(pending.started_turns.is_empty());
+        let outcome = pending.events.remove(&Target::Session(session)).unwrap();
+        let current = journal.record(outcome, false).unwrap().unwrap();
+        assert_eq!(journal.list().unwrap(), [current]);
+    }
+
+    #[test]
+    fn confirmed_turn_withdrawal_survives_replacement_before_portal_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let old = journal
+            .record(attention_event(session, "old"), false)
+            .unwrap()
+            .unwrap();
+        journal.acknowledge_sessions(&[session].into()).unwrap();
+        let later = journal
+            .record(attention_event(session, "later"), false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.list().unwrap().contains(&later));
+        let withdrawals = journal.group_withdrawals_for(&[]).unwrap();
+        assert!(withdrawals.contains(&old.id));
+        assert!(withdrawals.contains(&batching::desktop_id(&old.event.target())));
+    }
+
+    #[test]
+    fn a_turn_started_during_delivery_suppresses_only_its_earlier_notice() {
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let source = TerminalId::new();
+        let predecessor = TerminalId::new();
+        let earlier = attention_event(predecessor, "previous");
+        let unrelated = attention_event(TerminalId::new(), "unrelated");
+        let reference = Arc::downgrade(&shared);
+        assert!(!session_settlement_admitted(&reference, &earlier));
+
+        handle.session_started_turn(source, [predecessor].into());
+        assert!(session_settlement_admitted(&reference, &earlier));
+        assert!(!session_settlement_admitted(&reference, &unrelated));
+    }
+
+    #[test]
+    fn retained_turn_before_the_portal_send_defers_only_its_lineage() {
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let session = TerminalId::new();
+        let predecessor = TerminalId::new();
+        let unrelated = attention_event(TerminalId::new(), "unrelated");
+        let reference = Arc::downgrade(&shared);
+        let prior = attention_event(predecessor, "earlier");
+        let previous = attention_event(session, "previous");
+        assert!(!retained_turn_pending(&reference, &prior));
+
+        let receipt = handle
+            .commit_retained_turn(session, Uuid::new_v4(), 1, 2, [predecessor].into())
+            .unwrap();
+        assert!(retained_turn_pending(&reference, &prior));
+        assert!(retained_turn_pending(&reference, &previous));
+        assert!(!retained_turn_pending(&reference, &unrelated));
+        assert!(!session_settlement_admitted(&reference, &prior));
+        let batch = take_pending(&shared);
+        assert_eq!(batch.retained_turns.len(), 1);
+        assert!(!retained_turn_pending(&reference, &prior));
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+    }
+
+    #[test]
+    fn retained_turn_keeps_its_delivery_fence_across_failed_and_suspended_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let now = Instant::now();
+        let mut store = journal::Reopening::open(Some(path.clone()), now);
+        let session = TerminalId::new();
+        let predecessor = TerminalId::new();
+        let prior = store
+            .journal()
+            .unwrap()
+            .record(attention_event(predecessor, "old"), false)
+            .unwrap()
+            .unwrap();
+        let unrelated = store
+            .journal()
+            .unwrap()
+            .record(attention_event(TerminalId::new(), "unrelated"), false)
+            .unwrap()
+            .unwrap();
+        let control = rusqlite::Connection::open(&path).unwrap();
+        control.execute_batch("CREATE TRIGGER refuse_retained_turn BEFORE INSERT ON retained_attention_turns BEGIN SELECT RAISE(FAIL, 'write refused'); END;").unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let actor = Uuid::new_v4();
+        let receipt = handle
+            .commit_retained_turn(session, actor, 1, 2, [predecessor].into())
+            .unwrap();
+
+        let mut pending = take_pending(&shared);
+        let error = pending
+            .flush_retained_turns(store.journal().unwrap(), false, |_| panic!("uncommitted"))
+            .unwrap_err();
+        assert!(error.contains("write refused"));
+        store.retry_failed_write(error, now);
+        let mut pending = pending.deferred().followed_by(take_pending(&shared));
+        assert!(store.journal().is_err());
+        assert_eq!(
+            shared.retained_turn_slots.available_permits(),
+            MAX_PENDING - 1
+        );
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+
+        let mut delivery = BTreeMap::from([
+            (prior.event.target(), prior.clone()),
+            (unrelated.event.target(), unrelated.clone()),
+        ]);
+        let mut withdrawals = Withdrawals::default();
+        control
+            .execute_batch("DROP TRIGGER refuse_retained_turn;")
+            .unwrap();
+        assert!(store.reopen_if_due(store.retry_at().unwrap()).is_some());
+        let journal = store.journal().unwrap();
+        pending
+            .flush_retained_turns(journal, false, |rows| {
+                withdraw_sessions(&mut withdrawals, &mut delivery, rows);
+            })
+            .unwrap();
+        assert_eq!(receipt.try_recv(), Ok(Ok(())));
+        assert_eq!(shared.retained_turn_slots.available_permits(), MAX_PENDING);
+        assert_eq!(
+            delivery,
+            BTreeMap::from([(unrelated.event.target(), unrelated.clone())])
+        );
+        let notices = journal.list().unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.id == prior.id && notice.acknowledged)
+        );
+        assert!(notices.contains(&unrelated));
+
+        let newer = journal
+            .record(attention_event(predecessor, "new"), false)
+            .unwrap()
+            .unwrap();
+        let retry = handle
+            .commit_retained_turn(session, actor, 1, 2, [predecessor].into())
+            .unwrap();
+        take_pending(&shared)
+            .flush_retained_turns(journal, false, |_| {
+                panic!("duplicate turn withdrew a newer notice")
+            })
+            .unwrap();
+        assert_eq!(retry.try_recv(), Ok(Ok(())));
+        assert!(journal.list().unwrap().contains(&newer));
+    }
+
+    #[test]
+    fn a_detached_retained_turn_settles_during_ordinary_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        let session = TerminalId::new();
+        let prior = journal
+            .record(attention_event(session, "old"), false)
+            .unwrap()
+            .unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        drop(
+            handle
+                .commit_retained_turn(session, Uuid::new_v4(), 1, 2, BTreeSet::new())
+                .unwrap(),
+        );
+        let mut pending = take_pending(&shared).deferred();
+        handle.change(|pending| pending.stopped = true);
+        assert!(settle_attention_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &mut pending,
+        ));
+        let notices = journal.list().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, prior.id);
+        assert!(notices[0].acknowledged);
+        assert_eq!(shared.retained_turn_slots.available_permits(), MAX_PENDING);
+    }
+
+    #[test]
+    fn retirement_settles_older_retained_markers_before_releasing_their_replay_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let session = TerminalId::new();
+        let predecessor = TerminalId::new();
+        let old_actor = Uuid::new_v4();
+        journal
+            .acknowledge_retained_turn(session, old_actor, 1, 2, &[predecessor].into())
+            .unwrap();
+        let latest = journal
+            .record(attention_event(predecessor, "later"), false)
+            .unwrap()
+            .unwrap();
+
+        let queued = handle
+            .commit_retained_turn(session, old_actor, 1, 2, [predecessor].into())
+            .unwrap();
+        let deferred = take_pending(&shared).deferred();
+        let shared_duplicate = handle
+            .commit_retained_turn(session, old_actor, 1, 2, [predecessor].into())
+            .unwrap();
+        // A first genuine start from another retiring actor also has to
+        // commit even though the original actor no longer owns a pane.
+        let another_session = TerminalId::new();
+        let another_predecessor = TerminalId::new();
+        let previous = journal
+            .record(attention_event(another_predecessor, "previous"), false)
+            .unwrap()
+            .unwrap();
+        let first_turn = handle
+            .commit_retained_turn(
+                another_session,
+                Uuid::new_v4(),
+                1,
+                2,
+                [another_predecessor].into(),
+            )
+            .unwrap();
+        handle.retire(another_session);
+        handle.retire(session);
+        let replacement = handle
+            .commit_retained_turn(session, Uuid::new_v4(), 1, 2, BTreeSet::new())
+            .unwrap();
+
+        let mut pending = deferred.followed_by(take_pending(&shared));
+        pending
+            .flush_retained_turns(&mut journal, true, |_| {})
+            .unwrap();
+        for finished in [queued, shared_duplicate, first_turn] {
+            assert_eq!(finished.try_recv(), Ok(Ok(())));
+        }
+        assert_eq!(
+            replacement.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        for target in std::mem::take(&mut pending.retired) {
+            journal.retire(target).unwrap();
+        }
+        pending
+            .flush_retained_turns(&mut journal, false, |_| {})
+            .unwrap();
+        assert_eq!(replacement.try_recv(), Ok(Ok(())));
+        let rows = journal.list().unwrap();
+        assert!(rows.contains(&latest));
+        assert!(
+            rows.iter()
+                .any(|notice| notice.id == previous.id && notice.acknowledged)
+        );
+    }
+
+    #[test]
+    fn shutdown_finishes_every_retirement_still_in_the_broker_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let notices: Vec<_> = [TerminalId::new(), TerminalId::new(), TerminalId::new()]
+            .into_iter()
+            .map(|session| {
+                let notice = journal
+                    .record(attention_event(session, "prior"), false)
+                    .unwrap()
+                    .unwrap();
+                handle.retire(session);
+                notice
+            })
+            .collect();
+        let mut pending = take_pending(&shared);
+        assert!(
+            pending
+                .commit_next_retirement(&mut journal)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(pending.retired.len(), 2);
+        handle.change(|pending| pending.stopped = true);
+        assert!(settle_attention_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &mut pending,
+        ));
+        assert!(pending.retired.is_empty());
+        assert!(journal.list().unwrap().is_empty());
+        let withdrawals = journal.group_withdrawals_for(&[]).unwrap();
+        for notice in notices {
+            assert!(withdrawals.contains(&notice.id));
+            assert!(withdrawals.contains(&batching::desktop_id(&notice.event.target())));
+        }
+    }
+
+    #[test]
+    fn a_direct_outcome_retries_when_its_notice_insert_fails_after_turn_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let earlier = journal
+            .record(attention_event(session, "old"), false)
+            .unwrap()
+            .unwrap();
+        let mut pending = Pending::default();
+        pending.start_turns([session].into());
+        pending.flush_started_turns(&mut journal).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refuse_new_notice BEFORE INSERT ON notices
+            BEGIN SELECT raise(ABORT, 'transient fixture error'); END;",
+        )
+        .unwrap();
+
+        assert!(
+            record_session_outcome(
+                &mut journal,
+                &mut pending,
+                attention_event(session, "new"),
+                false,
+                &Preferences::default(),
+            )
+            .is_err()
+        );
+        assert!(
+            journal
+                .list()
+                .unwrap()
+                .iter()
+                .any(|notice| notice.id == earlier.id && notice.acknowledged)
+        );
+        db.execute_batch("DROP TRIGGER refuse_new_notice").unwrap();
+        let mut pending = pending.deferred().followed_by(Pending::default());
+        let event = pending.events.remove(&Target::Session(session)).unwrap();
+        let outcome = record_session_outcome(
+            &mut journal,
+            &mut pending,
+            event,
+            false,
+            &Preferences::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.event.evidence.key, "new");
+        assert!(!outcome.acknowledged);
+        assert!(pending.events.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_turn_survives_a_full_deferred_batch_without_hiding_its_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        let session = TerminalId::new();
+        let previous = journal
+            .record(attention_event(session, "previous"), false)
+            .unwrap()
+            .unwrap();
+        let deferred = Pending {
+            started_turns: (0..MAX_PENDING).map(|_| TerminalId::new()).collect(),
+            events: (0..MAX_PENDING)
+                .map(|_| attention_event(TerminalId::new(), "unrelated"))
+                .map(|event| (event.target(), event))
+                .collect(),
+            ..Pending::default()
+        };
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        handle.session_started_turn(session, BTreeSet::new());
+        handle.record(attention_event(session, "new"));
+        let mut merged = deferred.followed_by(take_pending(&shared));
+
+        merged.flush_started_turns(&mut journal).unwrap();
+        assert!(
+            journal
+                .list()
+                .unwrap()
+                .iter()
+                .any(|notice| { notice.id == previous.id && notice.acknowledged })
+        );
+        let new = merged.events.remove(&Target::Session(session)).unwrap();
+        let next = journal.record(new, false).unwrap().unwrap();
+        assert!(!next.acknowledged);
+    }
+
+    #[test]
+    fn shutdown_flushes_local_and_queued_confirmed_turns() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let first = TerminalId::new();
+        let second = TerminalId::new();
+        journal
+            .record(attention_event(first, "old one"), false)
+            .unwrap();
+        journal
+            .record(attention_event(second, "old two"), false)
+            .unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        handle.session_started_turn(first, BTreeSet::new());
+        let mut in_flight = take_pending(&shared);
+        handle.session_started_turn(second, BTreeSet::new());
+        shared.pending.lock().unwrap().stopped = true;
+        assert!(settle_attention_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &mut in_flight,
+        ));
+        assert!(
+            journal
+                .list()
+                .unwrap()
+                .iter()
+                .all(|notice| notice.acknowledged)
+        );
+    }
+
+    #[test]
+    fn shutdown_records_the_outcome_that_follows_an_accepted_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        journal
+            .record(attention_event(session, "old"), false)
+            .unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        handle.record(attention_event(session, "earlier queued"));
+        let mut in_flight = take_pending(&shared);
+        handle.session_started_turn(session, BTreeSet::new());
+        handle.record(attention_event(session, "new"));
+        shared.pending.lock().unwrap().stopped = true;
+
+        assert!(settle_attention_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &mut in_flight
+        ));
+        drop(journal);
+        let notices = Journal::open(&path).unwrap().list().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].event.evidence.key, "new");
+        assert!(!notices[0].acknowledged);
+    }
+
+    #[test]
+    fn shutdown_replacement_keeps_the_preexisting_toast_withdrawal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let previous = journal
+            .record(attention_event(session, "old delivered"), false)
+            .unwrap()
+            .unwrap();
+        journal.delivered(previous.id).unwrap();
+
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        handle.record(attention_event(session, "new"));
+        shared.pending.lock().unwrap().stopped = true;
+        assert!(settle_attention_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &mut Pending::default(),
+        ));
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        let withdrawals = reopened.group_withdrawals_for(&[]).unwrap();
+        assert!(withdrawals.contains(&previous.id));
+        assert!(withdrawals.contains(&batching::desktop_id(&previous.event.target())));
+        let notices = reopened.list().unwrap();
+        assert_eq!(notices[0].event.evidence.key, "new");
+        assert!(!notices[0].acknowledged);
+    }
+
+    #[test]
+    fn a_started_turn_discards_earlier_pending_attention_but_keeps_its_new_outcome() {
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let (session, predecessor, unrelated) =
+            (TerminalId::new(), TerminalId::new(), TerminalId::new());
+        handle.record(attention_event(session, "earlier"));
+        handle.record(attention_event(predecessor, "prior-owner"));
+        handle.record(attention_event(unrelated, "unrelated"));
+        let receipt = handle
+            .record_retained(
+                attention_event(predecessor, "prior-helper"),
+                Uuid::new_v4(),
+                4,
+                false,
+            )
+            .unwrap();
+        let deferred = take_pending(&shared);
+        handle.session_started_turn(session, [predecessor].into());
+        handle.record(attention_event(session, "this-turn"));
+        let mut pending = deferred.followed_by(take_pending(&shared));
+        assert_eq!(pending.started_turns, [session, predecessor].into());
+        assert!(!pending.events.contains_key(&Target::Session(predecessor)));
+        assert!(pending.events.contains_key(&Target::Session(unrelated)));
+        assert_eq!(
+            pending.events[&Target::Session(session)].evidence.key,
+            "this-turn"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        let (event, commit) = pending.committed_events.pop_front().unwrap();
+        assert!(
+            record_attention_committed(&mut journal, event.clone(), false, Some(commit))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(receipt.recv().unwrap(), Ok(()));
+        journal
+            .record(attention_event(unrelated, "new-event"), false)
+            .unwrap();
+        assert!(journal.record(event, false).unwrap().is_none());
+
+        handle.session_started_turn(session, BTreeSet::new());
+        let pending = pending.followed_by(take_pending(&shared));
+        assert!(!pending.events.contains_key(&Target::Session(session)));
     }
 
     #[test]

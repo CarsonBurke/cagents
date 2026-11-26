@@ -3875,13 +3875,18 @@ pub enum Event {
     /// while it connects or loads a conversation, and says so only by
     /// refusing, which a sender cannot tell from a refusal of the command.
     Ready(bool),
-    /// Authoritative live turn completion; never emitted for transcript history,
-    /// tool results, compaction or a change in presentation status.
-    /// A new main turn, independently of aggregate subagent/tool activity.
+    /// A new main turn for presentation, independently of aggregate subagent
+    /// activity. An adapter may emit this while sending the prompt.
     TurnStarted,
+    /// A live provider confirmed the new main turn, after any optimistic start.
+    /// Consumed by the actor without exposing it in the protocol or transcript.
+    #[serde(skip)]
+    TurnStartConfirmed,
     /// The provider's current turn settled; its final attention outcome may
     /// still await a correlated control acknowledgement.
     TurnSettled,
+    /// Authoritative live turn completion, independent of ordinary history,
+    /// tool results, compaction and presentation status.
     TurnFinished {
         key: Option<String>,
         outcome: crate::notifications::Kind,

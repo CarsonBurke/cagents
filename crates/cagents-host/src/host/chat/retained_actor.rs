@@ -464,16 +464,15 @@ struct SemanticTarget {
 
 impl SemanticTarget {
     fn require_current(&self, host: &SharedHost) -> Result<(), String> {
-        let current = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .chats
-            .get(&self.source.id)
-            .is_some_and(|record| {
-                record.handle.same_attachment(&self.handle)
-                    && record.session == self.source
-                    && record.execution_instance == self.identity.instance
-            });
+        self.require_current_state(&host.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn require_current_state(&self, state: &super::HostState) -> Result<(), String> {
+        let current = state.chats.get(&self.source.id).is_some_and(|record| {
+            record.handle.same_attachment(&self.handle)
+                && record.session == self.source
+                && record.execution_instance == self.identity.instance
+        });
         if current {
             Ok(())
         } else {
@@ -857,6 +856,9 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         persist_confirmed_identity(host, &target, &registry)?;
     }
     if !more {
+        // An empty outbox has no outcome to acknowledge. The broker owns the
+        // fence after admission, so its journal cannot stall unrelated actors.
+        drop(enqueue_retained_turn(host, &target, None)?);
         reconcile_waiting(host, &target, None)?;
     }
     // One bounded page per actor per pass. A detached actor can have many
@@ -952,6 +954,56 @@ fn waiting_resolution(
         .ok_or_else(|| "The latest retained outcome is awaiting its actor publication".into())
 }
 
+/// The helper samples the outcome sequence at the real turn start. Register
+/// that boundary while the exact actor attachment is still current.
+fn enqueue_retained_turn(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    outcome: Option<u64>,
+) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
+    let Some(notifications) = &target.notifications else {
+        return Ok(None);
+    };
+    if target.handle.retained_attention_turn(outcome)?.is_none() {
+        return Ok(None);
+    }
+    let predecessors = super::super::notifications::predecessor_sessions(host, target.source.id)?;
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    target.require_current_state(&state)?;
+    let Some((generation, through)) = target.handle.retained_attention_turn(outcome)? else {
+        return Ok(None);
+    };
+    notifications
+        .commit_retained_turn(
+            target.source.id,
+            target.identity.instance,
+            generation,
+            through,
+            predecessors,
+        )
+        .map(Some)
+}
+
+/// An outcome acknowledgement or final close releases the helper's evidence,
+/// so those paths wait for the fence to commit first.
+fn acknowledge_retained_turn(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    outcome: Option<u64>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let Some(receipt) = enqueue_retained_turn(host, target, outcome)? else {
+        return Ok(());
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or("Retained turn acknowledgement deadline expired")?;
+    receipt
+        .recv_timeout(remaining.min(Duration::from_secs(10)))
+        .map_err(|_| "The notification journal has not acknowledged this turn")??;
+    Ok(())
+}
+
 fn queue_attention(
     host: &SharedHost,
     target: &SemanticTarget,
@@ -962,26 +1014,23 @@ fn queue_attention(
     let resolution = if event.evidence.kind == crate::notifications::Kind::Waiting {
         waiting_resolution(&state, target, Some(sequence))?
     } else {
-        if state.chats.get(&target.source.id).is_none_or(|record| {
-            record.execution_instance != target.identity.instance
-                || !record.handle.same_attachment(&target.handle)
-        }) {
-            return Err("Retained actor ownership changed before notification admission".into());
-        }
+        target.require_current_state(&state)?;
         RetainedWaiting::Current
     };
     if resolution == RetainedWaiting::Superseded {
         return Ok(None);
     }
-    let notifications = target
+    target
         .notifications
         .as_ref()
-        .ok_or("The notification journal is unavailable; attention remains retained")?;
-    if resolution == RetainedWaiting::Resolved {
-        notifications.record_resolved_waiting(event).map(Some)
-    } else {
-        notifications.record_committed(event).map(Some)
-    }
+        .ok_or("The notification journal is unavailable; attention remains retained")?
+        .record_retained(
+            event,
+            target.identity.instance,
+            sequence,
+            resolution == RetainedWaiting::Resolved,
+        )
+        .map(Some)
 }
 
 /// The broker and synchronous Answer boundary share the same semantic writes,
@@ -1060,6 +1109,7 @@ fn commit_semantic_entry(
         && !automation
         && !(lost && evidence.kind == crate::notifications::Kind::Succeeded)
     {
+        acknowledge_retained_turn(host, target, Some(sequence), deadline)?;
         let mut event = crate::notifications::Event::session(
             target.source.id,
             target.source.launch.provider,
@@ -3980,6 +4030,7 @@ pub(in crate::host) fn finish_close(
                 && !automation
                 && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded)
             {
+                acknowledge_retained_turn(host, &target, Some(entry.sequence), deadline)?;
                 let mut notification = crate::notifications::Event::session(
                     source.id,
                     source.launch.provider,
@@ -4013,6 +4064,9 @@ pub(in crate::host) fn finish_close(
     }
     // An outcome that followed a conversation since reset republished it.
     persist_confirmed_identity(host, &target, &registry)?;
+    // A confirmed turn can be interrupted without ever adding an attention
+    // outcome. Its marker must survive retirement even with an empty outbox.
+    acknowledge_retained_turn(host, &target, None, deadline)?;
     publish_retirement(host, handle, &source)
 }
 
