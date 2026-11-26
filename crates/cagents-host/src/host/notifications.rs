@@ -9,12 +9,14 @@ pub(super) mod orphaned;
 mod osascript;
 #[cfg(target_os = "linux")]
 mod portal;
+mod review_monitor;
 mod withdrawals;
 use journal::Journal;
 #[cfg(target_os = "macos")]
 use osascript::{Activation, PortalOwner, connect, remove, send, send_test};
 #[cfg(target_os = "linux")]
 use portal::{Activation, PortalOwner, connect, remove, send, send_test};
+use review_monitor::ReviewMonitor;
 use withdrawals::Withdrawals;
 
 use std::{
@@ -24,7 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use uuid::Uuid;
 
 use super::state::{ClientId, HostLock, SharedHost};
@@ -34,6 +36,7 @@ use crate::{
 };
 
 const MAX_PENDING: usize = 2048;
+const MAX_REVIEW_UPDATES: usize = 16;
 // One stable portal ID and one legacy journal ID per retained notice.
 const MAX_WITHDRAWALS: usize = MAX_PENDING * 2;
 const MAX_ACTIONS: usize = 32;
@@ -79,6 +82,19 @@ impl Drop for CommitReceipt {
     }
 }
 
+enum ReviewUpdate {
+    Monitor(crate::notifications::review::MonitorUpdate),
+    Observed(VecDeque<(Event, Option<crate::notifications::review::ScanPoint>)>),
+}
+
+struct QueuedReviewUpdate {
+    update: ReviewUpdate,
+    received_at: i64,
+    // Admission includes updates detached by the broker and deferred on a
+    // journal failure. Moving the item between queues keeps its slot.
+    _slot: OwnedSemaphorePermit,
+}
+
 #[derive(Default)]
 struct Pending {
     events: BTreeMap<Target, Event>,
@@ -90,6 +106,7 @@ struct Pending {
     cleared_waiting: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
     predecessor_reads: BTreeMap<Uuid, TerminalId>,
+    review_updates: VecDeque<QueuedReviewUpdate>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
     /// The portal service's latest owner, when it changed; `Some(None)` means
@@ -129,6 +146,7 @@ impl Pending {
             }
         }
         self.read_predecessors(newer.predecessor_reads);
+        self.review_updates.extend(newer.review_updates);
         self.committed_events.extend(newer.committed_events);
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
@@ -184,6 +202,7 @@ impl Pending {
             cleared_waiting: self.cleared_waiting,
             acknowledged: self.acknowledged,
             predecessor_reads: self.predecessor_reads,
+            review_updates: self.review_updates,
             presence_changed: self.presence_changed,
             reload: self.reload,
             preferences: self.preferences,
@@ -202,6 +221,7 @@ fn take_pending(core: &Shared) -> Pending {
 
 struct Shared {
     pending: Mutex<Pending>,
+    review_slots: Arc<Semaphore>,
     presence: Mutex<BTreeMap<ClientId, Presence>>,
     snapshot: Mutex<Snapshot>,
     wake: mpsc::Sender<()>,
@@ -211,12 +231,60 @@ struct Shared {
 pub(super) struct Handle(Arc<Shared>);
 
 impl Handle {
+    pub(super) fn observe_review_monitor(
+        &self,
+        update: crate::notifications::review::MonitorUpdate,
+    ) -> Result<(), String> {
+        use crate::notifications::review::MonitorUpdate;
+        match update {
+            MonitorUpdate::Observations(observed) => {
+                self.enqueue_review_update(ReviewUpdate::Observed(
+                    observed
+                        .events()
+                        .map(|(event, point)| (event, Some(point)))
+                        .collect(),
+                ))
+            }
+            update => self.enqueue_review_update(ReviewUpdate::Monitor(update)),
+        }
+    }
+
+    pub(super) fn observe_review_requests(
+        &self,
+        observed: crate::notifications::review::ObservedRequests,
+    ) -> Result<(), String> {
+        self.enqueue_review_update(ReviewUpdate::Observed(
+            observed.events().map(|event| (event, None)).collect(),
+        ))
+    }
+
+    fn enqueue_review_update(&self, update: ReviewUpdate) -> Result<(), String> {
+        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.stopped || self.0.wake.is_closed() {
+            return Err("Review reconciliation is unavailable".into());
+        }
+        let slot = self
+            .0
+            .review_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Review reconciliation is busy".to_owned())?;
+        pending.review_updates.push_back(QueuedReviewUpdate {
+            update,
+            received_at: review_clock(),
+            _slot: slot,
+        });
+        drop(pending);
+        let _ = self.0.wake.try_send(());
+        Ok(())
+    }
     /// Real bounded enqueue state without a broker, portal, or worker thread.
     #[cfg(test)]
     pub(in crate::host) fn inert_for_test() -> (Self, impl Fn() -> Vec<Event>) {
         let (wake, _receiver) = mpsc::channel(1);
         let shared = Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -483,6 +551,7 @@ impl Broker {
         let (wake, receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -717,6 +786,54 @@ fn restore(
     reserve_withdrawals(journal, snapshot, withdrawals).map(|_| ())
 }
 
+fn review_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn expire_review_notices(
+    monitor: &mut ReviewMonitor,
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+) -> BTreeSet<Uuid> {
+    match monitor.expire(journal, &snapshot.notices, Instant::now(), review_clock()) {
+        Ok(ids) => acknowledge_review_notices(snapshot, withdrawals, ids, |id| {
+            journal.acknowledge(id).map(|_| ())
+        }),
+        Err(error) => {
+            snapshot.diagnostic = Some(error);
+            BTreeSet::new()
+        }
+    }
+}
+
+fn acknowledge_review_notices(
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    candidates: Vec<Uuid>,
+    mut persist: impl FnMut(Uuid) -> Result<(), String>,
+) -> BTreeSet<Uuid> {
+    let candidates: BTreeSet<_> = candidates.into_iter().collect();
+    let mut acknowledged = BTreeSet::new();
+    for notice in &mut snapshot.notices {
+        if candidates.contains(&notice.id) && !notice.acknowledged {
+            match persist(notice.id) {
+                Ok(()) => {
+                    notice.acknowledged = true;
+                    acknowledged.insert(notice.id);
+                    withdraw_notice(withdrawals, notice);
+                }
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
+    }
+    acknowledged
+}
+
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
 /// exact attention IDs while removing rich context from the published snapshot.
 fn revoke_previews(snapshot: &mut Snapshot, withdrawals: &mut Withdrawals) {
@@ -827,10 +944,126 @@ fn discard_resolved_delivery(
     Ok(())
 }
 
+struct ReviewDelivery<'a> {
+    pending: &'a mut BTreeMap<Target, Notice>,
+    schedule: &'a mut batching::Schedule,
+    presence: &'a BTreeMap<ClientId, Presence>,
+    policy: &'a Preferences,
+}
+
+fn apply_review_updates(
+    monitor: &mut ReviewMonitor,
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    updates: &mut VecDeque<QueuedReviewUpdate>,
+    delivery: ReviewDelivery<'_>,
+) -> Result<(), String> {
+    while let Some(queued) = updates.front_mut() {
+        match &mut queued.update {
+            ReviewUpdate::Observed(observed) => {
+                while let Some((event, point)) = observed.front() {
+                    let focused = delivery
+                        .presence
+                        .values()
+                        .any(|window| window.focused_target.as_ref() == Some(&event.target));
+                    let suppressed = !delivery.policy.allows(event.evidence.kind, focused);
+                    if let Some(notice) = ReviewMonitor::record(
+                        journal,
+                        event.clone(),
+                        point.clone(),
+                        suppressed,
+                        queued.received_at,
+                    )? {
+                        if !suppressed {
+                            delivery.schedule.update(
+                                notice.event.target(),
+                                notice.event.evidence.kind,
+                                Instant::now(),
+                            );
+                            delivery
+                                .pending
+                                .insert(notice.event.target(), notice.clone());
+                        }
+                        // Later censuses in this FIFO see earlier committed observations.
+                        snapshot.notices.push(notice);
+                    }
+                    // A partial page retries only its unfinished suffix.
+                    observed.pop_front();
+                }
+            }
+            ReviewUpdate::Monitor(update) => {
+                let ids = monitor.apply(
+                    update.clone(),
+                    journal,
+                    &snapshot.notices,
+                    queued.received_at,
+                )?;
+                let cleared = acknowledge_review_notices(snapshot, withdrawals, ids, |_| Ok(()));
+                if !cleared.is_empty() {
+                    delivery
+                        .pending
+                        .retain(|_, notice| !cleared.contains(&notice.id));
+                }
+            }
+        }
+        updates.pop_front();
+    }
+    Ok(())
+}
+
+/// Defer a toast if an accepted census can retire that exact review request.
+fn review_census_pending(updates: &VecDeque<QueuedReviewUpdate>, target: &Target) -> bool {
+    use crate::notifications::review::MonitorUpdate;
+
+    let Target::PullRequest(request) = target else {
+        return false;
+    };
+    if updates.is_empty() {
+        return false;
+    }
+    let repository = request.repository_key();
+    updates.iter().any(|queued| match &queued.update {
+        ReviewUpdate::Monitor(MonitorUpdate::Completed(census)) => {
+            census.viewer == request.viewer
+                && census.repository.same_repository(&repository)
+                && census.current.get(&request.number) != Some(&request.request)
+        }
+        _ => false,
+    })
+}
+
+fn shared_review_census_pending(shared: &Weak<Shared>, target: &Target) -> bool {
+    matches!(target, Target::PullRequest(_))
+        && shared.upgrade().is_some_and(|shared| {
+            review_census_pending(
+                &shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .review_updates,
+                target,
+            )
+        })
+}
+
+fn delivery_deadline(
+    delivery: &BTreeMap<Target, Notice>,
+    schedule: &batching::Schedule,
+    review_updates: &VecDeque<QueuedReviewUpdate>,
+) -> Option<Instant> {
+    delivery
+        .keys()
+        .filter(|target| !review_census_pending(review_updates, target))
+        .filter_map(|target| schedule.due(target))
+        .min()
+}
+
 fn delivery_batch(
     delivery: &BTreeMap<Target, Notice>,
     schedule: &batching::Schedule,
     withdrawals: &Withdrawals,
+    review_updates: &VecDeque<QueuedReviewUpdate>,
     now: Instant,
 ) -> Vec<Notice> {
     delivery
@@ -838,6 +1071,7 @@ fn delivery_batch(
         .filter(|notice| {
             schedule.ready(&notice.event.target(), now)
                 && !withdrawals.contains(&batching::desktop_id(&notice.event.target))
+                && !review_census_pending(review_updates, &notice.event.target)
         })
         .take(8)
         .cloned()
@@ -870,6 +1104,7 @@ fn settle_attention_at_shutdown(
     journal: &mut Journal,
     local_waiting: &BTreeSet<Target>,
     predecessor_reads: &mut BTreeMap<Uuid, TerminalId>,
+    review_updates: &mut VecDeque<QueuedReviewUpdate>,
 ) -> bool {
     let queued_waiting = if let Some(shared) = shared.upgrade() {
         let mut pending = shared
@@ -880,6 +1115,7 @@ fn settle_attention_at_shutdown(
             return false;
         }
         predecessor_reads.append(&mut pending.predecessor_reads);
+        review_updates.append(&mut pending.review_updates);
         std::mem::take(&mut pending.cleared_waiting)
     } else {
         BTreeSet::new()
@@ -894,7 +1130,40 @@ fn settle_attention_at_shutdown(
     {
         tracing::warn!(%error, "accepted conversation reads could not settle during shutdown");
     }
+    if !review_updates.is_empty()
+        && let Err(error) = settle_review_updates_at_shutdown(journal, review_updates)
+    {
+        tracing::warn!(%error, "accepted review updates could not settle during shutdown");
+    }
     true
+}
+
+fn settle_review_updates_at_shutdown(
+    journal: &mut Journal,
+    updates: &mut VecDeque<QueuedReviewUpdate>,
+) -> Result<(), String> {
+    // The journal can have a committed prefix from a previous retry or from
+    // another batch. Reconcile pending censuses against its current contents.
+    let mut snapshot = Snapshot {
+        notices: journal.list()?,
+        ..Default::default()
+    };
+    apply_review_updates(
+        &mut ReviewMonitor::default(),
+        journal,
+        &mut snapshot,
+        &mut Withdrawals::default(),
+        updates,
+        ReviewDelivery {
+            pending: &mut BTreeMap::new(),
+            schedule: &mut batching::Schedule::default(),
+            presence: &BTreeMap::new(),
+            policy: &Preferences {
+                enabled: false,
+                ..Default::default()
+            },
+        },
+    )
 }
 
 fn waiting_clear_admitted(shared: &Weak<Shared>, event: &Event) -> bool {
@@ -1133,6 +1402,7 @@ impl JournalTestBridge {
         let (wake, receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -1256,6 +1526,7 @@ async fn run(
     // Work held while the journal is unavailable, applied before the next batch.
     let mut deferred = Pending::default();
     let mut predecessor_retry = None;
+    let mut review_retry = None;
     let settings = preferences();
     let settings_error = settings.as_ref().err().cloned();
     let mut policy = settings.unwrap_or_else(|_| Preferences {
@@ -1278,6 +1549,7 @@ async fn run(
         diagnostic: settings_error.clone(),
         ..Default::default()
     };
+    let mut review_monitor = ReviewMonitor::default();
     match store.journal() {
         Ok(journal) => {
             if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
@@ -1293,6 +1565,12 @@ async fn run(
                 true,
                 &mut automation_retry,
             );
+            expire_review_notices(
+                &mut review_monitor,
+                journal,
+                &mut snapshot,
+                &mut withdrawals,
+            );
         }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
@@ -1304,17 +1582,18 @@ async fn run(
                 if !withdrawals.is_empty() {
                     Some(next_attempt)
                 } else {
-                    delivery_schedule
-                        .deadline()
+                    delivery_deadline(&delivery, &delivery_schedule, &deferred.review_updates)
                         .map(|due| due.max(next_attempt))
                 }
             } else {
-                delivery_schedule.deadline()
+                delivery_deadline(&delivery, &delivery_schedule, &deferred.review_updates)
             }
             .into_iter()
             .chain(predecessor_retry.as_ref().map(|(due, _)| *due))
             .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
             .chain(automation_retry.deadline())
+            .chain(review_retry.as_ref().map(|(due, _)| *due))
+            .chain(review_monitor.deadline().filter(|_| review_retry.is_none()))
             .min()
         }),
     )
@@ -1332,7 +1611,10 @@ async fn run(
         });
         drop(core);
         if pending.stopped {
-            if !pending.cleared_waiting.is_empty() || !pending.predecessor_reads.is_empty() {
+            if !pending.cleared_waiting.is_empty()
+                || !pending.predecessor_reads.is_empty()
+                || !pending.review_updates.is_empty()
+            {
                 match store.journal_for_shutdown() {
                     Ok(journal) => {
                         settle_attention_at_shutdown(
@@ -1340,6 +1622,7 @@ async fn run(
                             journal,
                             &pending.cleared_waiting,
                             &mut pending.predecessor_reads,
+                            &mut pending.review_updates,
                         );
                     }
                     Err(error) => {
@@ -1435,6 +1718,7 @@ async fn run(
                     journal,
                     &pending.cleared_waiting,
                     &mut pending.predecessor_reads,
+                    &mut pending.review_updates,
                 ) {
                     return;
                 }
@@ -1519,6 +1803,7 @@ async fn run(
                 journal,
                 &pending.cleared_waiting,
                 &mut pending.predecessor_reads,
+                &mut pending.review_updates,
             ) {
                 return;
             }
@@ -1567,6 +1852,7 @@ async fn run(
                 journal,
                 &pending.cleared_waiting,
                 &mut pending.predecessor_reads,
+                &mut pending.review_updates,
             ) {
                 return;
             }
@@ -1576,6 +1862,43 @@ async fn run(
             }
             if let Some(notice) = snapshot.notices.iter().find(|notice| notice.id == id) {
                 withdraw_notice(&mut withdrawals, notice);
+            }
+        }
+        if settle_attention_at_shutdown(
+            &shared,
+            journal,
+            &pending.cleared_waiting,
+            &mut pending.predecessor_reads,
+            &mut pending.review_updates,
+        ) {
+            return;
+        }
+        let now = Instant::now();
+        if review_retry.as_ref().is_none_or(|(due, _)| *due <= now) {
+            match apply_review_updates(
+                &mut review_monitor,
+                journal,
+                &mut snapshot,
+                &mut withdrawals,
+                &mut pending.review_updates,
+                ReviewDelivery {
+                    pending: &mut delivery,
+                    schedule: &mut delivery_schedule,
+                    presence: &presence,
+                    policy: &policy,
+                },
+            ) {
+                Ok(()) => {
+                    if let Some((_, error)) = review_retry.take()
+                        && snapshot.diagnostic.as_ref() == Some(&error)
+                    {
+                        snapshot.diagnostic.clone_from(&settings_error);
+                    }
+                }
+                Err(error) => {
+                    snapshot.diagnostic = Some(error.clone());
+                    review_retry = Some((Instant::now() + RETRY_DELAY, error));
+                }
             }
         }
         let events = pending
@@ -1594,6 +1917,7 @@ async fn run(
                 journal,
                 &pending.cleared_waiting,
                 &mut pending.predecessor_reads,
+                &mut pending.review_updates,
             ) {
                 return;
             }
@@ -1637,6 +1961,18 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
+        // An admitted watcher renewal must reach the journal before expiry.
+        if review_retry.is_none() {
+            let retired_review_ids = expire_review_notices(
+                &mut review_monitor,
+                journal,
+                &mut snapshot,
+                &mut withdrawals,
+            );
+            if !retired_review_ids.is_empty() {
+                delivery.retain(|_, notice| !retired_review_ids.contains(&notice.id));
+            }
+        }
         restore_automation_attention(
             journal,
             &host,
@@ -1671,6 +2007,7 @@ async fn run(
                 next_attempt = Instant::now() + retry_delay;
                 withdrawal_retry = Some((next_attempt, error));
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                deferred.review_updates = std::mem::take(&mut pending.review_updates);
                 continue;
             }
         };
@@ -1711,11 +2048,12 @@ async fn run(
             });
             policy.allows(notice.event.evidence.kind, focused)
         });
-        let backlog_due = (delivery
-            .keys()
-            .any(|target| delivery_schedule.ready(target, Instant::now()))
-            || !withdrawals.is_empty())
-            && Instant::now() >= next_attempt;
+        let now = Instant::now();
+        let backlog_due =
+            (delivery_deadline(&delivery, &delivery_schedule, &pending.review_updates)
+                .is_some_and(|due| due <= now)
+                || !withdrawals.is_empty())
+                && now >= next_attempt;
         // A test is a person asking right now, so it retries a portal that
         // the backlog is still backing off from. Its failure is answered to
         // that person rather than raised as every window's diagnostic, and
@@ -1752,7 +2090,13 @@ async fn run(
             let batch: Vec<_> = if failed {
                 Vec::new()
             } else {
-                delivery_batch(&delivery, &delivery_schedule, &withdrawals, Instant::now())
+                delivery_batch(
+                    &delivery,
+                    &delivery_schedule,
+                    &withdrawals,
+                    &pending.review_updates,
+                    Instant::now(),
+                )
             };
             for notice in batch {
                 if settle_attention_at_shutdown(
@@ -1760,11 +2104,17 @@ async fn run(
                     journal,
                     &pending.cleared_waiting,
                     &mut pending.predecessor_reads,
+                    &mut pending.review_updates,
                 ) {
                     return;
                 }
                 // Portal connection and test delivery can each await.
                 // Check for settlements accepted while this batch was paused.
+                if shared_review_census_pending(&shared, &notice.event.target) {
+                    // Its queued wake will apply the census, or defer this
+                    // target until the journal retry. Leave delivery pending.
+                    continue;
+                }
                 if waiting_clear_admitted(&shared, &notice.event) {
                     delivery.remove(&notice.event.target);
                     continue;
@@ -1824,6 +2174,7 @@ async fn run(
                     journal,
                     &pending.cleared_waiting,
                     &mut pending.predecessor_reads,
+                    &mut pending.review_updates,
                 ) {
                     return;
                 }
@@ -1847,9 +2198,8 @@ async fn run(
                 proxy = None;
                 next_attempt = Instant::now() + retry_delay;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
-            } else if (delivery
-                .keys()
-                .any(|target| delivery_schedule.ready(target, Instant::now()))
+            } else if (delivery_deadline(&delivery, &delivery_schedule, &pending.review_updates)
+                .is_some_and(|due| due <= Instant::now())
                 || !withdrawals.is_empty())
                 && let Some(shared) = shared.upgrade()
             {
@@ -1919,6 +2269,8 @@ async fn run(
             .map(batching::desktop_id)
             .collect::<BTreeSet<_>>();
         delivery_schedule.retain(|group| delivery_groups.contains(group));
+        // Keep the unfinished FIFO in this batch until all shutdown checks are done.
+        deferred.review_updates = std::mem::take(&mut pending.review_updates);
         publish(&shared, &host, snapshot.clone());
     }
 }
@@ -2093,6 +2445,7 @@ mod tests {
             &mut journal,
             &in_flight.cleared_waiting,
             &mut in_flight.predecessor_reads,
+            &mut in_flight.review_updates,
         ));
         drop(journal);
         let mut journal = Journal::open(&path).unwrap();
@@ -2103,6 +2456,336 @@ mod tests {
                 .iter()
                 .filter(|notice| notice.id == before_first.id || notice.id == before_second.id)
                 .all(|notice| notice.acknowledged)
+        );
+    }
+
+    #[test]
+    fn review_admission_counts_detached_and_deferred_updates() {
+        use crate::notifications::review::{Census, MonitorUpdate};
+        use review_monitor::tests::{point, repo};
+
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let census = |revision| {
+            MonitorUpdate::Completed(Census {
+                repository: repo(None),
+                start: point(revision, 100),
+                viewer: "alice".into(),
+                current: BTreeMap::new(),
+            })
+        };
+        let limit = MAX_REVIEW_UPDATES as u64;
+        for revision in 1..=limit / 2 {
+            handle.observe_review_monitor(census(revision)).unwrap();
+        }
+        let in_flight = take_pending(&shared);
+        for revision in limit / 2 + 1..=limit {
+            handle.observe_review_monitor(census(revision)).unwrap();
+        }
+        assert!(handle.observe_review_monitor(census(limit + 1)).is_err());
+
+        let mut pending = in_flight.deferred().followed_by(take_pending(&shared));
+        assert!(handle.observe_review_monitor(census(limit + 1)).is_err());
+        assert_eq!(
+            pending
+                .review_updates
+                .iter()
+                .map(|queued| match &queued.update {
+                    ReviewUpdate::Monitor(MonitorUpdate::Completed(census)) =>
+                        census.start.revision,
+                    _ => panic!("expected an admitted census"),
+                })
+                .collect::<Vec<_>>(),
+            (1..=limit).collect::<Vec<_>>()
+        );
+
+        pending.review_updates.pop_front();
+        handle.observe_review_monitor(census(limit + 1)).unwrap();
+        pending = pending.followed_by(take_pending(&shared));
+        assert_eq!(pending.review_updates.len(), MAX_REVIEW_UPDATES);
+        assert!(matches!(
+            &pending.review_updates.back().unwrap().update,
+            ReviewUpdate::Monitor(MonitorUpdate::Completed(census))
+                if census.start.revision == limit + 1
+        ));
+    }
+
+    #[test]
+    fn a_failed_accepted_census_retries_in_order_without_a_live_sender() {
+        exercise_accepted_review_retry(false);
+    }
+
+    #[test]
+    fn shutdown_retries_a_detached_census_before_newer_shared_review_work() {
+        exercise_accepted_review_retry(true);
+    }
+
+    fn exercise_accepted_review_retry(shutdown: bool) {
+        use crate::notifications::review::{Census, MonitorUpdate, ObservedRequests};
+        use review_monitor::tests::{observed, point, repo};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER interrupt_review_census BEFORE INSERT ON review_censuses
+                 BEGIN SELECT RAISE(ABORT, 'temporary census write failure'); END;",
+            )
+            .unwrap();
+
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let repository = repo(None);
+        let seconds = review_clock() as u64;
+        let legacy = |key, number| {
+            let request = observed(&repository, "alice", key, number, point(1, seconds));
+            ObservedRequests {
+                destination: request.destination,
+                requests: request
+                    .requests
+                    .into_iter()
+                    .map(|entry| entry.request)
+                    .collect(),
+            }
+        };
+        handle.observe_review_requests(legacy("before", 1)).unwrap();
+        handle
+            .observe_review_monitor(MonitorUpdate::Completed(Census {
+                repository: repository.clone(),
+                start: point(1, seconds),
+                viewer: "alice".into(),
+                current: BTreeMap::new(),
+            }))
+            .unwrap();
+        if !shutdown {
+            handle.observe_review_requests(legacy("after", 2)).unwrap();
+        }
+        let mut pending = take_pending(&shared);
+        let handle = if shutdown {
+            Some(handle)
+        } else {
+            drop(handle);
+            None
+        };
+
+        let mut monitor = ReviewMonitor::default();
+        let mut snapshot = Snapshot::default();
+        let mut withdrawals = Withdrawals::default();
+        let failed = apply_review_updates(
+            &mut monitor,
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            &mut pending.review_updates,
+            ReviewDelivery {
+                pending: &mut BTreeMap::new(),
+                schedule: &mut batching::Schedule::default(),
+                presence: &BTreeMap::new(),
+                policy: &Preferences::default(),
+            },
+        );
+        assert!(
+            failed
+                .unwrap_err()
+                .contains("temporary census write failure")
+        );
+        assert_eq!(pending.review_updates.len(), if shutdown { 1 } else { 2 });
+        let before = journal.list().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].event.evidence.key, "before");
+        assert!(!before[0].acknowledged);
+
+        connection
+            .execute_batch("DROP TRIGGER interrupt_review_census")
+            .unwrap();
+        if let Some(handle) = handle {
+            handle.observe_review_requests(legacy("after", 2)).unwrap();
+            handle.change(|pending| pending.stopped = true);
+            drop(handle);
+            assert!(settle_attention_at_shutdown(
+                &Arc::downgrade(&shared),
+                &mut journal,
+                &pending.cleared_waiting,
+                &mut pending.predecessor_reads,
+                &mut pending.review_updates,
+            ));
+            assert!(shared.pending.lock().unwrap().review_updates.is_empty());
+            drop(journal);
+            journal = Journal::open(&path).unwrap();
+            assert!(journal.list().unwrap().iter().any(|notice| {
+                notice.event.evidence.key == "after" && notice.delivered && !notice.acknowledged
+            }));
+        } else {
+            drop(shared);
+            apply_review_updates(
+                &mut monitor,
+                &mut journal,
+                &mut snapshot,
+                &mut withdrawals,
+                &mut pending.review_updates,
+                ReviewDelivery {
+                    pending: &mut BTreeMap::new(),
+                    schedule: &mut batching::Schedule::default(),
+                    presence: &BTreeMap::new(),
+                    policy: &Preferences::default(),
+                },
+            )
+            .unwrap();
+            assert!(withdrawals.contains(&batching::desktop_id(&before[0].event.target)));
+        }
+        assert!(pending.review_updates.is_empty());
+        assert!(journal.group_withdrawals().unwrap().contains(&before[0].id));
+        assert_eq!(
+            journal
+                .list()
+                .unwrap()
+                .into_iter()
+                .map(|notice| (notice.event.evidence.key, notice.acknowledged))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([("after".into(), false), ("before".into(), true)])
+        );
+    }
+
+    #[test]
+    fn a_pending_review_census_blocks_only_its_missing_requests_from_portal_delivery() {
+        use crate::notifications::review::{Census, MonitorUpdate};
+        use review_monitor::tests::{observed, point, repo};
+
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let repository = repo(None);
+        let start = point(1, review_clock() as u64);
+        let make = |repository, viewer, key, number| {
+            let (event, _) = observed(repository, viewer, key, number, start.clone())
+                .events()
+                .next()
+                .unwrap();
+            Notice {
+                id: Uuid::new_v4(),
+                event,
+                delivered: false,
+                acknowledged: false,
+                window: None,
+            }
+        };
+        let missing = make(&repository, "alice", "missing", 1);
+        let current = make(&repository, "alice", "current", 2);
+        let other_viewer = make(&repository, "bob", "missing", 1);
+        let other_repository = make(&repo(Some(1234)), "alice", "missing", 1);
+        handle
+            .observe_review_monitor(MonitorUpdate::Completed(Census {
+                repository,
+                start,
+                viewer: "alice".into(),
+                current: [(2, "current".into())].into(),
+            }))
+            .unwrap();
+
+        let shared = Arc::downgrade(&shared);
+        for notice in [&current, &other_viewer, &other_repository] {
+            assert!(!shared_review_census_pending(&shared, &notice.event.target));
+        }
+        assert!(shared_review_census_pending(&shared, &missing.event.target));
+        let detached = take_pending(&handle.0);
+        assert!(!shared_review_census_pending(
+            &shared,
+            &missing.event.target
+        ));
+
+        let now = Instant::now();
+        let mut schedule = batching::Schedule::default();
+        schedule.update(missing.event.target(), Kind::ReviewRequested, now);
+        let mut delivery = BTreeMap::from([(missing.event.target(), missing)]);
+        assert_eq!(
+            delivery_deadline(&delivery, &schedule, &detached.review_updates),
+            None
+        );
+
+        for notice in [&current, &other_viewer, &other_repository] {
+            schedule.update(
+                notice.event.target(),
+                Kind::ReviewRequested,
+                now + Duration::from_secs(1),
+            );
+            delivery.insert(notice.event.target(), notice.clone());
+        }
+        assert_eq!(
+            delivery_deadline(&delivery, &schedule, &detached.review_updates),
+            Some(now + Duration::from_millis(1600)),
+        );
+        let eligible = delivery_batch(
+            &delivery,
+            &schedule,
+            &Withdrawals::default(),
+            &detached.review_updates,
+            now + Duration::from_secs(2),
+        )
+        .into_iter()
+        .map(|notice| notice.id)
+        .collect::<BTreeSet<_>>();
+        assert_eq!(
+            eligible,
+            [current.id, other_viewer.id, other_repository.id].into()
+        );
+    }
+
+    #[test]
+    fn an_old_client_positive_after_an_accepted_census_survives_its_replay() {
+        use crate::notifications::review::{Census, MonitorUpdate, ObservedRequests};
+        use review_monitor::tests::{observed, point, repo};
+        let directory = tempfile::tempdir().unwrap();
+        let (handle, mut bridge) =
+            JournalTestBridge::new(&directory.path().join("attention.sqlite")).unwrap();
+        let repository = repo(None);
+        let seconds = review_clock() as u64;
+        for (number, key) in [(1, "before"), (2, "after")] {
+            let stamped = observed(&repository, "alice", key, number, point(1, seconds));
+            handle
+                .observe_review_requests(ObservedRequests {
+                    destination: stamped.destination,
+                    requests: stamped
+                        .requests
+                        .into_iter()
+                        .map(|entry| entry.request)
+                        .collect(),
+                })
+                .unwrap();
+            handle
+                .observe_review_monitor(MonitorUpdate::Completed(Census {
+                    repository: repository.clone(),
+                    start: point(1, seconds),
+                    viewer: "alice".into(),
+                    current: BTreeMap::new(),
+                }))
+                .unwrap();
+        }
+        let mut pending = take_pending(&handle.0);
+        apply_review_updates(
+            &mut ReviewMonitor::default(),
+            &mut bridge.journal,
+            &mut Snapshot::default(),
+            &mut Withdrawals::default(),
+            &mut pending.review_updates,
+            ReviewDelivery {
+                pending: &mut BTreeMap::new(),
+                schedule: &mut batching::Schedule::default(),
+                presence: &BTreeMap::new(),
+                policy: &Preferences::default(),
+            },
+        )
+        .unwrap();
+        let exact = bridge
+            .journal
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|notice| (notice.event.evidence.key, notice.acknowledged))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            exact,
+            BTreeMap::from([("after".into(), false), ("before".into(), true)])
         );
     }
 
@@ -2151,6 +2834,87 @@ mod tests {
 
         assert_eq!(published.notices, [current]);
         assert!(published.notices.iter().all(|notice| notice.id != old.id));
+    }
+
+    #[test]
+    fn queued_review_observation_is_cleared_by_the_same_batch_and_delayed_earlier_evidence_is_refused()
+     {
+        use crate::notifications::review::{Census, MonitorUpdate};
+        use review_monitor::tests::{observed, point, repo};
+        let directory = tempfile::tempdir().unwrap();
+        let (handle, mut bridge) =
+            JournalTestBridge::new(&directory.path().join("attention.sqlite")).unwrap();
+        let repository = repo(None);
+        let seconds = review_clock() as u64;
+        handle
+            .observe_review_monitor(MonitorUpdate::Observations(observed(
+                &repository,
+                "alice",
+                "queued",
+                1,
+                point(1, seconds),
+            )))
+            .unwrap();
+        handle
+            .observe_review_monitor(MonitorUpdate::Completed(Census {
+                repository: repository.clone(),
+                start: point(1, seconds),
+                viewer: "alice".into(),
+                current: BTreeMap::new(),
+            }))
+            .unwrap();
+        handle
+            .observe_review_monitor(MonitorUpdate::Observations(observed(
+                &repository,
+                "alice",
+                "delayed",
+                2,
+                point(1, seconds),
+            )))
+            .unwrap();
+        handle
+            .observe_review_monitor(MonitorUpdate::Observations(observed(
+                &repository,
+                "alice",
+                "fresh",
+                3,
+                point(2, seconds),
+            )))
+            .unwrap();
+        let mut pending = take_pending(&handle.0);
+        let mut delivery = BTreeMap::new();
+        apply_review_updates(
+            &mut ReviewMonitor::default(),
+            &mut bridge.journal,
+            &mut Snapshot::default(),
+            &mut Withdrawals::default(),
+            &mut pending.review_updates,
+            ReviewDelivery {
+                pending: &mut delivery,
+                schedule: &mut batching::Schedule::default(),
+                presence: &BTreeMap::new(),
+                policy: &Preferences::default(),
+            },
+        )
+        .unwrap();
+        let exact = bridge
+            .journal
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|notice| (notice.event.evidence.key, notice.acknowledged))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            exact,
+            BTreeMap::from([("fresh".into(), false), ("queued".into(), true)])
+        );
+        assert_eq!(
+            delivery
+                .into_values()
+                .map(|notice| notice.event.evidence.key)
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
     }
 
     #[test]
@@ -2815,6 +3579,7 @@ mod tests {
         let (wake, _receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -2959,6 +3724,7 @@ mod tests {
         let (wake, _receiver) = mpsc::channel(1);
         let shared = Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -2974,6 +3740,7 @@ mod tests {
             &mut journal,
             &batch.cleared_waiting,
             &mut batch.predecessor_reads,
+            &mut batch.review_updates,
         ));
         let notices = journal.list().unwrap();
         assert_eq!(notices.len(), 2);
@@ -3203,6 +3970,7 @@ mod tests {
         let (wake, _receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -3237,6 +4005,7 @@ mod tests {
         let (wake, _receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -3280,6 +4049,7 @@ mod tests {
         let (wake, receiver) = mpsc::channel(1);
         let shared = Arc::new(Shared {
             pending: Mutex::default(),
+            review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
             presence: Mutex::default(),
             snapshot: Mutex::default(),
             wake,
@@ -3411,7 +4181,7 @@ mod tests {
         let mut withdrawals = Withdrawals::default();
         withdraw_notice(&mut withdrawals, &old);
         let due = now + Duration::from_secs(1);
-        let batch = delivery_batch(&delivery, &schedule, &withdrawals, due);
+        let batch = delivery_batch(&delivery, &schedule, &withdrawals, &VecDeque::new(), due);
         assert_eq!(batch.len(), 1);
         assert_eq!(
             batch[0].id, other.id,
@@ -3419,7 +4189,7 @@ mod tests {
         );
         withdrawals.remove_group(&group);
         assert_eq!(
-            delivery_batch(&delivery, &schedule, &withdrawals, due).len(),
+            delivery_batch(&delivery, &schedule, &withdrawals, &VecDeque::new(), due).len(),
             2,
             "new delivery must follow withdrawal, otherwise cleanup would delete its replacement"
         );

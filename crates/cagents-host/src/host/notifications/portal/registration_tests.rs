@@ -159,6 +159,7 @@ fn exercise(refuse: bool) {
             let (wake, _receiver) = mpsc::channel(1);
             let shared = Arc::new(Shared {
                 pending: Mutex::default(),
+                review_slots: Arc::new(Semaphore::new(MAX_REVIEW_UPDATES)),
                 presence: Mutex::default(),
                 snapshot: Mutex::default(),
                 wake,

@@ -1964,16 +1964,10 @@ mod tests {
             request: "request-node".into(),
         };
         let target = Target::PullRequest(request.clone());
-        let event = crate::notifications::review::ObservedRequests {
-            destination: crate::notifications::Destination {
-                application: Default::default(),
-                window: instance::window_slot().into(),
-            },
-            requests: vec![request],
-        }
-        .events()
-        .next()
-        .unwrap();
+        let event = request.notification(crate::notifications::Destination {
+            application: Default::default(),
+            window: instance::window_slot().into(),
+        });
         let clicked = uuid::Uuid::new_v4();
         let other = uuid::Uuid::new_v4();
         let mut unrelated = event.clone();

@@ -176,7 +176,7 @@ impl Editor {
             Task::none()
         } else {
             iced::Task::perform(
-                notifications::review::report(notifications::review::ObservedRequests {
+                notifications::review::report(notifications::review::StampedRequests {
                     destination: self.notifications.observer.destination(),
                     requests,
                 }),
