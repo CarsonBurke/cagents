@@ -550,7 +550,7 @@ impl LocalHandle {
     /// when it published each update. A frame's confirmation is installed
     /// before the outcomes it settles are published.
     pub(super) fn start_retained(
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
@@ -566,6 +566,7 @@ impl LocalHandle {
             &spec.working_directory,
             |name| spec.environment.get(name).map(std::ffi::OsString::from),
         )?;
+        super::protocol::claude::apply_spawn_attribution(&mut spec, store.directory());
         let confirmed_session = Arc::new(Mutex::new(None));
         let followed = confirmed_session.clone();
         Self::start_with_scope(

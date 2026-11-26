@@ -322,6 +322,227 @@ pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), S
     Ok(())
 }
 
+pub(crate) fn managed_attribution(
+    recipe: &crate::model::LaunchRecipe,
+    sources: &str,
+) -> Option<Value> {
+    if crate::device::is_remote() {
+        return None;
+    }
+    let homes = account::home::Homes::installation()?;
+    let system = account::Account::system(Provider::Claude).resolved_home()?;
+    chat::managed_claude_attribution(recipe, &homes, &system, sources)
+}
+
+pub(crate) fn attribution_settings(
+    explicit: Option<&str>,
+    attribution: impl FnOnce() -> Option<Value>,
+) -> Option<String> {
+    let mut settings: serde_json::Map<String, Value> = match explicit {
+        Some(value) => serde_json::from_str(value).ok()?,
+        None => serde_json::Map::new(),
+    };
+    if settings.contains_key("attribution") {
+        return None;
+    }
+    settings.insert("attribution".into(), attribution()?);
+    Some(Value::Object(settings).to_string())
+}
+
+/// The common inline case stays small. Larger settings travel via Claude's
+/// file option so their content cannot exceed an OS argument or environment
+/// entry limit.
+pub(crate) const MAX_INLINE_ATTRIBUTION: usize = 4 * 1024;
+const MAX_SETTINGS_FILE: u64 = 2 * 1024 * 1024;
+
+fn attribution_filename(settings: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(".claude-attribution-{:x}.json", Sha256::digest(settings))
+}
+
+fn write_attribution_file(directory: &Path, settings: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    if settings.len() as u64 > MAX_SETTINGS_FILE {
+        return Err(std::io::Error::other(
+            "Claude settings exceed the file option limit",
+        ));
+    }
+    let path = directory.join(attribution_filename(settings));
+    let argument = path
+        .to_str()
+        .filter(|value| value.len() <= MAX_INLINE_ATTRIBUTION)
+        .ok_or_else(|| {
+            std::io::Error::other("The Claude settings path cannot be passed in argv")
+        })?;
+    if !path.exists() {
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(settings.as_bytes())?;
+        match file.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error),
+        }
+    }
+    if read_attribution_file(directory, argument).as_deref() != Some(settings) {
+        return Err(std::io::Error::other(
+            "Cannot verify the private Claude settings override",
+        ));
+    }
+    Ok(argument.to_owned())
+}
+
+fn read_attribution_file(directory: &Path, argument: &str) -> Option<String> {
+    use std::io::Read;
+    let path = Path::new(argument);
+    if path.parent() != Some(directory)
+        || !path
+            .file_name()?
+            .to_str()?
+            .starts_with(".claude-attribution-")
+    {
+        return None;
+    }
+    let mut value = String::new();
+    crate::secure_file::open_existing_private_file_readonly(path)
+        .ok()?
+        .take(MAX_SETTINGS_FILE + 1)
+        .read_to_string(&mut value)
+        .ok()?;
+    (value.len() as u64 <= MAX_SETTINGS_FILE
+        && path.file_name()?.to_str()? == attribution_filename(&value))
+    .then_some(value)
+}
+
+/// Apply an override to an inline settings value or an otherwise bare
+/// launch. Explicit file settings stay with Claude. Only a bare launch may
+/// write a large standalone attribution value to process-owned storage.
+pub(crate) fn launch_attribution_argument(
+    explicit: Option<&str>,
+    attribution: impl FnOnce() -> Option<Value>,
+    directory: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Option<String> {
+    let value = attribution_settings(explicit, attribution)?;
+    let existing = explicit.map_or(0, str::len);
+    if value.len() <= existing + MAX_INLINE_ATTRIBUTION {
+        return Some(value);
+    }
+    if explicit.is_some() {
+        return None;
+    }
+    match directory().and_then(|directory| write_attribution_file(&directory, &value)) {
+        Ok(argument) => Some(argument),
+        Err(error) => {
+            tracing::warn!(%error, "cannot stage the managed Claude attribution setting");
+            None
+        }
+    }
+}
+
+pub(crate) fn terminal_attribution_directory() -> std::io::Result<PathBuf> {
+    let root = crate::instance::runtime_directory()?;
+    let boot = crate::daemon::read_boot_id()?;
+    Ok(root.join(format!(".claude-attribution-boot-{}", boot.as_str())))
+}
+
+pub(crate) fn prepare_terminal_attribution_directory() -> std::io::Result<PathBuf> {
+    let directory = terminal_attribution_directory()?;
+    crate::secure_file::prepare_private_directory(&directory)?;
+    // The runtime can be persistent on Darwin. No terminal from a past
+    // kernel boot can still use these generated attribution-only files.
+    if let Some(root) = directory.parent() {
+        for entry in std::fs::read_dir(root)?.flatten() {
+            if entry.path() != directory
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.file_name().to_str().is_some_and(|name| {
+                    name.strip_prefix(".claude-attribution-boot-")
+                        .is_some_and(|boot| uuid::Uuid::parse_str(boot).is_ok())
+                })
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    Ok(directory)
+}
+
+pub(crate) fn decode_attribution_argument(argument: &str) -> Option<String> {
+    let candidate = argument.strip_prefix("--settings=")?;
+    if candidate.starts_with('{') {
+        return Some(candidate.to_owned());
+    }
+    read_attribution_file(&terminal_attribution_directory().ok()?, candidate)
+}
+
+pub(crate) fn apply_spawn_attribution(spec: &mut ProcessSpec, store: &Path) {
+    let recipe = spawn_attribution_recipe(spec);
+    apply_spawn_attribution_with(
+        &mut spec.arguments,
+        &recipe,
+        || Ok(store.to_path_buf()),
+        managed_attribution,
+    );
+}
+
+fn spawn_attribution_recipe(spec: &ProcessSpec) -> crate::model::LaunchRecipe {
+    // The provider's spawn clears the inherited environment. A missing
+    // key belongs to this exact execution, never the helper's own account.
+    let mut unset_environment = spec.unset_environment.clone();
+    for name in ["HOME", "CLAUDE_CONFIG_DIR"] {
+        if !spec.environment.contains_key(name) {
+            unset_environment.insert(name.to_owned());
+        }
+    }
+    crate::model::LaunchRecipe {
+        program: spec.program.clone(),
+        arguments: Vec::new(),
+        working_directory: spec.working_directory.clone(),
+        environment: spec.environment.clone(),
+        unset_environment,
+    }
+}
+
+fn apply_spawn_attribution_with(
+    arguments: &mut Vec<String>,
+    recipe: &crate::model::LaunchRecipe,
+    directory: impl FnOnce() -> std::io::Result<PathBuf>,
+    attribution: impl FnOnce(&crate::model::LaunchRecipe, &str) -> Option<Value>,
+) {
+    use crate::chat::fresh::{ArgumentArity, claude_arity};
+
+    let mut settings = None;
+    let mut sources = "user,project,local";
+    let mut args = arguments.iter().enumerate().peekable();
+    while let Some((_, flag)) = args.next() {
+        match claude_arity(flag) {
+            Some(ArgumentArity::Value) => {
+                let Some((index, value)) = args.next() else {
+                    break;
+                };
+                match flag.as_str() {
+                    "--settings" => settings = Some(index),
+                    "--setting-sources" => sources = value,
+                    _ => {}
+                }
+            }
+            Some(ArgumentArity::Values) => {
+                while args.next_if(|(_, value)| !value.starts_with('-')).is_some() {}
+            }
+            _ => {}
+        }
+    }
+    if let Some(value) = launch_attribution_argument(
+        settings.map(|index| arguments[index].as_str()),
+        || attribution(recipe, sources),
+        directory,
+    ) {
+        if let Some(index) = settings {
+            arguments[index] = value;
+        } else {
+            arguments.extend(["--settings".into(), value]);
+        }
+    }
+}
+
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
     if launch.recipe.arguments.len() > 128
         || launch
@@ -400,10 +621,11 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
         } else if crate::chat::fresh::claude_arity(flag)
             == Some(crate::chat::fresh::ArgumentArity::Values)
         {
-            result.push(flag.into());
-            if let Some(value) = inline {
-                result.push(value.into());
+            if inline.is_some() {
+                // Keep variadic inline values distinct from subsequent options.
+                result.push(arg.clone());
             } else {
+                result.push(flag.into());
                 let start = result.len();
                 while args.peek().is_some_and(|value| !value.starts_with('-')) {
                     result.push(args.next().unwrap().clone());
@@ -10619,11 +10841,7 @@ mod fresh_recipe_constructor_tests {
                         .windows(2)
                         .any(|pair| pair == ["--system-prompt", system])
                 );
-                assert!(
-                    spec.arguments
-                        .windows(2)
-                        .any(|pair| pair == ["--tools", tool])
-                );
+                assert!(spec.arguments.contains(&format!("--tools={tool}")));
                 let generated: Vec<_> = spec
                     .arguments
                     .iter()
