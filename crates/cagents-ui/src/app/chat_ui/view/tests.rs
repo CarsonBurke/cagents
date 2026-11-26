@@ -14201,3 +14201,46 @@ fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
         assert_eq!(node.size().width, width);
     }
 }
+
+/// A transcript row is kept for as long as its fingerprint holds, and it is
+/// built with the accent its links are drawn in. An accent change keeps the
+/// theme's darkness, so it has to change the fingerprint itself (#3583).
+#[test]
+fn a_new_accent_builds_the_transcript_rows_again() {
+    use cosmic::cosmic_theme::palette::Srgba;
+    let (runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(2));
+    let system = |accent: Srgba| {
+        let mut theme = cosmic::Theme::dark().cosmic().clone();
+        theme.accent.base = accent;
+        theme.accent_text = Some(accent);
+        cosmic::Theme::system(Arc::new(theme))
+    };
+    let revisions = |theme: &cosmic::Theme| {
+        let mut rows = VirtualRows::new();
+        runtime.push_turn_rows(
+            &mut rows,
+            &runtime.turns[0],
+            super::super::layout::READING_COLUMN,
+            design::markdown_settings(theme, design::TEXT_TRANSCRIPT),
+            true,
+        );
+        rows.children
+            .iter()
+            .map(|row| row.revision)
+            .collect::<Vec<_>>()
+    };
+    let blue = system(Srgba::new(0.2, 0.4, 0.9, 1.0));
+    let orange = system(Srgba::new(0.9, 0.5, 0.1, 1.0));
+    let kept = revisions(&blue);
+    assert!(!kept.is_empty());
+    assert_eq!(
+        kept,
+        revisions(&blue.clone()),
+        "the same theme keeps every row"
+    );
+    let accented = revisions(&orange);
+    assert_eq!(kept.len(), accented.len());
+    for (before, after) in kept.iter().zip(&accented) {
+        assert_ne!(before, after, "every row is built again in the new accent");
+    }
+}

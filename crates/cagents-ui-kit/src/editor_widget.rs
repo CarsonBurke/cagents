@@ -776,7 +776,7 @@ where
 
     fn input_method<'b>(
         &self,
-        state: &'b State<Highlighter>,
+        state: &'b State<Highlighter, Theme>,
         renderer: &Renderer,
         layout: Layout<'_>,
     ) -> InputMethod<&'b str> {
@@ -1893,7 +1893,7 @@ where
 
 /// The state of a [`TextEditor`].
 #[derive(Debug)]
-pub struct State<Highlighter: text::Highlighter> {
+pub struct State<Highlighter: text::Highlighter, Theme = cosmic::Theme> {
     focus: Option<Focus>,
     preedit: Option<input_method::Preedit>,
     last_click: Option<mouse::Click>,
@@ -1905,7 +1905,10 @@ pub struct State<Highlighter: text::Highlighter> {
     scrollbar_grab: Option<f32>,
     horizontal_grab: Option<f32>,
     scrollbar_target: Option<ScrollTarget>,
-    last_theme: RefCell<Option<String>>,
+    /// The theme the buffer's highlights were last formatted against. Its
+    /// name alone does not identify its colours: a system theme keeps its
+    /// name when the accent changes (#3583).
+    last_theme: RefCell<Option<Theme>>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
@@ -1938,7 +1941,7 @@ impl Focus {
     }
 }
 
-impl<Highlighter: text::Highlighter> State<Highlighter> {
+impl<Highlighter: text::Highlighter, Theme> State<Highlighter, Theme> {
     /// Leaves native focus without turning an outside pointer press into an
     /// editor action. External result controls still own the selected buffer.
     fn blur(&mut self) {
@@ -1954,7 +1957,7 @@ impl<Highlighter: text::Highlighter> State<Highlighter> {
     }
 }
 
-impl<Highlighter: text::Highlighter> operation::Focusable for State<Highlighter> {
+impl<Highlighter: text::Highlighter, Theme> operation::Focusable for State<Highlighter, Theme> {
     fn is_focused(&self) -> bool {
         self.focus.is_some()
     }
@@ -1972,15 +1975,15 @@ impl<Highlighter, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for TextEditor<'_, Highlighter, Message, Theme, Renderer>
 where
     Highlighter: text::Highlighter,
-    Theme: Catalog,
+    Theme: Catalog + Clone + PartialEq + 'static,
     Renderer: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
     fn tag(&self) -> widget::tree::Tag {
-        widget::tree::Tag::of::<State<Highlighter>>()
+        widget::tree::Tag::of::<State<Highlighter, Theme>>()
     }
 
     fn state(&self) -> widget::tree::State {
-        widget::tree::State::new(State {
+        widget::tree::State::new(State::<Highlighter, Theme> {
             focus: None,
             preedit: None,
             last_click: None,
@@ -2031,7 +2034,7 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let mut internal = self.content.0.borrow_mut();
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
 
         if state.highlighter_format_address != self.highlighter_format as usize {
             state.highlighter.borrow_mut().change_line(0);
@@ -2161,7 +2164,7 @@ where
         _viewport: &Rectangle,
     ) {
         let geometry = self.scroll_geometry(layout.bounds());
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
         // Every later branch may return early, and the wheel needs the current
         // modifiers no matter which one does, so record them first. Losing
         // window focus also loses the key release that would clear Shift, so a
@@ -2353,7 +2356,7 @@ where
         }
         // Handle context menu and focus-loss on clicks outside.
         {
-            let state = tree.state.downcast_mut::<State<Highlighter>>();
+            let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
             let text_bounds = layout.bounds();
 
             if matches!(
@@ -2389,7 +2392,7 @@ where
         // Process pending edits from context menu
         // publishes via on_edit so the app calls content.perform().
         {
-            let state = tree.state.downcast_mut::<State<Highlighter>>();
+            let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
             if let Some(action) = state.pending_edit.take()
                 && let Some(on_edit) = self.on_edit.as_ref()
             {
@@ -2401,7 +2404,7 @@ where
             return;
         };
 
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
         let is_redraw = matches!(event, Event::Window(window::Event::RedrawRequested(_now)),);
 
         match event {
@@ -2547,10 +2550,11 @@ where
                         H: text::Highlighter,
                         R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
                         Message,
+                        T,
                     >(
                         binding: Binding<Message>,
                         content: &Content<R>,
-                        state: &mut State<H>,
+                        state: &mut State<H, T>,
                         on_edit: &dyn Fn(Action) -> Message,
                         clipboard: &mut dyn Clipboard,
                         shell: &mut Shell<'_, Message>,
@@ -2672,20 +2676,12 @@ where
         let bounds = layout.bounds();
 
         let mut internal = self.content.0.borrow_mut();
-        let state = tree.state.downcast_ref::<State<Highlighter>>();
+        let state = tree.state.downcast_ref::<State<Highlighter, Theme>>();
 
         let font = self.font.unwrap_or_else(|| renderer.default_font());
 
-        let theme_name = theme.name();
-
-        if state
-            .last_theme
-            .borrow()
-            .as_ref()
-            .is_none_or(|last_theme| last_theme != theme_name)
-        {
+        if theme_changed(&state.last_theme, theme) {
             state.highlighter.borrow_mut().change_line(0);
-            let _ = state.last_theme.borrow_mut().replace(theme_name.to_owned());
         }
 
         internal.editor.highlight(
@@ -3026,7 +3022,7 @@ where
         _renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
 
         operation.focusable(self.id.as_ref(), layout.bounds(), state);
     }
@@ -3069,7 +3065,10 @@ where
         Some(overlay::Element::new(Box::new(EditorPopup {
             content: popup,
             tree: &mut tree.children[0],
-            bounds: &mut tree.state.downcast_mut::<State<Highlighter>>().popup_bounds,
+            bounds: &mut tree
+                .state
+                .downcast_mut::<State<Highlighter, Theme>>()
+                .popup_bounds,
             anchor: Rectangle::new(anchor, Size::new(1.0, height)),
         })))
     }
@@ -3185,7 +3184,7 @@ impl<'a, Highlighter, Message, Theme, Renderer>
 where
     Highlighter: text::Highlighter,
     Message: 'a,
-    Theme: Catalog + 'a,
+    Theme: Catalog + Clone + PartialEq + 'static,
     Renderer: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
     fn from(text_editor: TextEditor<'a, Highlighter, Message, Theme, Renderer>) -> Self {
@@ -3228,9 +3227,9 @@ enum Ime {
 }
 
 impl<Message> Update<Message> {
-    fn from_event<H: Highlighter>(
+    fn from_event<H: Highlighter, Theme>(
         event: &Event,
-        state: &State<H>,
+        state: &State<H, Theme>,
         bounds: Rectangle,
         padding: Padding,
         cursor: mouse::Cursor,
@@ -3509,9 +3508,86 @@ impl ScrollGeometry {
     }
 }
 
+/// Whether `theme` differs from the one the buffer was last highlighted
+/// against, remembering it when it does.
+///
+/// The highlights' formats are resolved from the theme and stored in the
+/// buffer, so they are formatted again whenever anything they could have read
+/// changes. A theme's name is not enough: a system theme keeps it when its
+/// accent or another colour changes. Comparing the theme costs a few hundred
+/// colour comparisons a frame, which is nothing beside shaping the text.
+fn theme_changed<Theme: Clone + PartialEq>(last: &RefCell<Option<Theme>>, theme: &Theme) -> bool {
+    let mut last = last.borrow_mut();
+    if last.as_ref() == Some(theme) {
+        return false;
+    }
+    *last = Some(theme.clone());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Changing the system accent keeps the theme's name, and a Markdown
+    /// buffer's bullets and links are drawn in that accent, so the buffer must
+    /// be highlighted again when the accent changes (#3583).
+    #[test]
+    fn an_accent_change_under_the_same_theme_name_highlights_again() {
+        use crate::editor_highlight::{self, Highlight, Settings};
+        use cosmic::cosmic_theme::palette::Srgba;
+        use cosmic::iced::theme::Base as _;
+        use std::sync::Arc;
+
+        let system = |accent: Srgba| {
+            let mut theme = cosmic::Theme::dark().cosmic().clone();
+            theme.accent.base = accent;
+            theme.accent_text = Some(accent);
+            cosmic::Theme::system(Arc::new(theme))
+        };
+        let blue = system(Srgba::new(0.2, 0.4, 0.9, 1.0));
+        let orange = system(Srgba::new(0.9, 0.5, 0.1, 1.0));
+        assert_eq!(blue.name(), orange.name(), "the accent keeps the name");
+
+        let mut highlighter = editor_highlight::Highlighter::new(&Settings {
+            code: cosmic::iced::highlighter::Settings {
+                theme: cosmic::iced::highlighter::Theme::Base16Ocean,
+                token: "md".to_owned(),
+            },
+            markdown: true,
+            font: cosmic::iced::Font::MONOSPACE,
+        });
+        let bullet: Vec<(std::ops::Range<usize>, Highlight)> = highlighter
+            .highlight_line("- [link](https://example.com)")
+            .collect();
+        let inks = |theme: &cosmic::Theme| {
+            bullet
+                .iter()
+                .map(|(_, highlight)| editor_highlight::format(highlight, theme).color)
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            inks(&blue),
+            inks(&orange),
+            "the Markdown inks follow the accent"
+        );
+
+        let last = RefCell::<Option<cosmic::Theme>>::default();
+        assert!(theme_changed(&last, &blue), "the first draw highlights");
+        assert!(
+            !theme_changed(&last, &blue.clone()),
+            "an unchanged theme keeps the highlights"
+        );
+        assert!(
+            theme_changed(&last, &orange),
+            "a new accent highlights again"
+        );
+        assert!(!theme_changed(&last, &orange));
+        assert!(
+            theme_changed(&last, &cosmic::Theme::light()),
+            "so does a new theme"
+        );
+    }
 
     fn native_state(editor: &NativeEditor) -> Vec<(String, String)> {
         editor

@@ -446,6 +446,25 @@ pub(super) fn palettes(blocks: &HashMap<u64, CodeBlock>) -> Palettes {
         )
     })
 }
+/// The theme's colours that Markdown settings carry into what they build.
+///
+/// A row or block built once per fingerprint keeps these until its
+/// fingerprint changes, so the fingerprint has to hold them: an accent change,
+/// or a switch between two dark app themes, leaves `dark` as it was (#3583).
+pub(super) fn inks(style: &markdown::Style) -> impl std::hash::Hash + use<> {
+    let rgba = |color: iced::Color| color.into_rgba8();
+    let highlight = &style.inline_code_highlight;
+    (
+        rgba(style.link_color),
+        style.inline_code_color.map(rgba),
+        match highlight.background {
+            iced::Background::Color(color) => Some(rgba(color)),
+            iced::Background::Gradient(_) => None,
+        },
+        rgba(highlight.border.color),
+    )
+}
+
 fn palette(cached: &CachedItem, dark: bool) -> Arc<PaletteMap> {
     cached
         .palette_views
@@ -689,6 +708,7 @@ impl Renderer {
                     settings.style.font,
                     &self.find,
                     self.dark,
+                    inks(&settings.style),
                 )
                     .hash(&mut revision);
                 // A block showing an image draws again once its preview is
