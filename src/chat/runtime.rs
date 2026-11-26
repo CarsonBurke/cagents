@@ -150,6 +150,8 @@ enum ActorCommand {
         closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
+    #[cfg(target_os = "macos")]
+    VerifyUpdateRelease,
     PinnedLaunchDirectory(
         crossbeam_channel::Sender<
             Result<
@@ -946,10 +948,9 @@ impl LocalHandle {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
-                    } else if let Err(error) = holder.close_inner(
-                        retain_cleanup_receipt.load(Ordering::Acquire),
-                        detached_work.holder(),
-                    ) {
+                    } else if let Err(error) = detached_work
+                        .close_holder(&mut holder, retain_cleanup_receipt.load(Ordering::Acquire))
+                    {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
                         false
@@ -1292,6 +1293,16 @@ impl LocalHandle {
         response
             .try_recv()
             .map_err(|error| format!("Provider update readiness was not acknowledged: {error}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn verify_update_release(&self) -> Result<(), String> {
+        self.ownership_command(ActorCommand::VerifyUpdateRelease)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn commit_update_release(&self) {
+        self.0.detached_work.commit_update_release();
     }
 
     pub(crate) fn interrupt_owned(
@@ -1993,9 +2004,9 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(holder) = retained.as_mut() {
-                holder.close_inner(
+                self.0.detached_work.close_holder(
+                    holder,
                     self.0.retain_cleanup_receipt.load(Ordering::Acquire),
-                    self.0.detached_work.holder(),
                 )?;
                 retained.take();
                 self.0.completed.store(true, Ordering::Release);
@@ -2362,15 +2373,41 @@ impl DetachedDecision {
     }
     const STOP: u8 = 1;
     const SPARE: u8 = 2;
-    fn decide(&self, detached: DetachedWork) {
-        self.0.store(
-            match detached {
-                DetachedWork::Stop => Self::STOP,
-                DetachedWork::Spare => Self::SPARE,
-            },
-            Ordering::Release,
-        );
+    #[cfg(target_os = "macos")]
+    const UPDATE: u8 = 3;
+
+    #[cfg(target_os = "macos")]
+    fn commit_update_release(&self) {
+        self.0.store(Self::UPDATE, Ordering::Release);
     }
+
+    fn decide(&self, detached: DetachedWork) {
+        let value = match detached {
+            DetachedWork::Stop => Self::STOP,
+            DetachedWork::Spare => Self::SPARE,
+        };
+        #[cfg(target_os = "linux")]
+        self.0.store(value, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != Self::UPDATE).then_some(value)
+            });
+    }
+
+    fn close_holder(
+        &self,
+        holder: &mut super::native_holder::Holder,
+        retain: bool,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if self.0.load(Ordering::Acquire) == Self::UPDATE {
+            return holder.close_for_update();
+        }
+        holder.close_inner(retain, self.holder())
+    }
+
     fn get(&self) -> Option<DetachedWork> {
         match self.0.load(Ordering::Acquire) {
             Self::STOP => Some(DetachedWork::Stop),
@@ -3657,6 +3694,16 @@ impl Actor {
                     let _ = reply.send(Ok(()));
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                ActorCommand::VerifyUpdateRelease => {
+                    let result = self
+                        .native_holder
+                        .as_ref()
+                        .ok_or_else(|| "Missing native holder".to_owned())
+                        .and_then(super::native_holder::Holder::verify_update_release);
+                    let _ = reply.send(result.map_err(Rejection::Refused));
+                    continue;
+                }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let _ = readiness.send(self.update_readiness(&state));
@@ -3897,6 +3944,18 @@ impl Actor {
             Event::Reset { .. } => Some(None),
             _ => None,
         });
+        #[cfg(target_os = "macos")]
+        if let Some(Some(_)) = &identity
+            && let Some(peer) = self.native_peer.as_ref()
+            && let Some(holder) = self.native_holder.as_mut()
+            && self.adapter.server_identity().is_some_and(|server| {
+                super::native_holder::verified_codex_version(&server.user_agent).is_none()
+            })
+            && !self.reconnect_only_reported
+            && let Err(error) = holder.observe_update_server(peer)
+        {
+            tracing::warn!(%error, "native app-server did not provide update release evidence");
+        }
         if let Some(Some(thread)) = &identity
             && self.native_holder.is_some()
             && let Some(identity) = self.adapter.server_identity()

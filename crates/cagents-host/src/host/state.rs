@@ -2946,6 +2946,8 @@ fn prepare_upgrade_with_carry_policy(
                 .is_ok()
         })
     };
+    #[cfg(target_os = "macos")]
+    let mut native_releases = Vec::new();
     let (proof, terminals, carried, chats, paired_codex) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -3119,6 +3121,19 @@ fn prepare_upgrade_with_carry_policy(
                     ),
                 );
             }
+            #[cfg(target_os = "macos")]
+            if require_continuity
+                && !source.native_continuity.retains_provider()
+                && super::chat::owns_codex_listener(&source)
+                && source.terminal.is_none()
+                && record.paired_terminal.is_none()
+                && state
+                    .terminals
+                    .get(&id)
+                    .is_none_or(|terminal| terminal.handle.is_completed())
+            {
+                native_releases.push(record.handle.clone());
+            }
             chats.push(Chat {
                 previous_sources: state
                     .upgrade_chats
@@ -3266,6 +3281,10 @@ fn prepare_upgrade_with_carry_policy(
         (checkpoint.terminals.len() + checkpoint.carried.len()) as u64,
         checkpoint.chats.len() as u64,
     );
+    #[cfg(target_os = "macos")]
+    for handle in &native_releases {
+        handle.verify_update_release().map_err(upgrade_error)?;
+    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     state
         .validate_upgrade_capability(&capability, Instant::now())
@@ -3289,6 +3308,10 @@ fn prepare_upgrade_with_carry_policy(
     };
     // Failure leaves control enabled and drops reversible pidfd freeze guards.
     store.save(&checkpoint).map_err(upgrade_error)?;
+    #[cfg(target_os = "macos")]
+    for handle in native_releases {
+        handle.commit_update_release();
+    }
     state.upgrade = Some(PreparedUpgrade {
         store,
         checkpoint,
