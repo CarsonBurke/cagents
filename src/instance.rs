@@ -799,6 +799,11 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         crate::diagnostics::initialize(product, version);
     }
     crate::diagnostics::record(crate::diagnostics::Event::Startup);
+    // The default hook prints a backtrace only when RUST_BACKTRACE asks for
+    // one. A local debug capture is the record of a crash that may not
+    // happen again, so it gets one unless RUST_BACKTRACE was set either way.
+    // Read once, as the standard library reads it.
+    let force_backtrace = env::var_os("RUST_BACKTRACE").is_none();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         let Some(recovered) = crate::runtime_state::begin_panic_report() else {
@@ -808,7 +813,22 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         // Payloads/backtraces can contain secrets. Only a user-requested local
         // debug capture invokes the raw default hook.
         if crate::diagnostics::local_debug() {
-            previous(panic);
+            if force_backtrace {
+                // Written whole, in place of the default hook's report, so a
+                // panic on another thread cannot land between this message
+                // and its backtrace, and no "run with RUST_BACKTRACE" note
+                // contradicts it. Symbolized before stderr is locked, so
+                // tracing on other threads does not wait for it.
+                let thread = std::thread::current();
+                let report = format!(
+                    "\nthread '{}' {panic}\nstack backtrace:\n{}\n",
+                    thread.name().unwrap_or("<unnamed>"),
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                let _ = io::stderr().lock().write_all(report.as_bytes());
+            } else {
+                previous(panic);
+            }
         }
         crate::runtime_state::finish_panic_report();
     }));
