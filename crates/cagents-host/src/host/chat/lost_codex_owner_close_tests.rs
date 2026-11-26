@@ -1497,7 +1497,6 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
     assert_codex_started(&fixture, &root);
 }
 
-#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_legacy_pane_without_a_surviving_process_starts() {
     let Some(root) = isolated("codex_start_legacy_pane_without_a_surviving_process_starts") else {
@@ -1683,7 +1682,6 @@ fn codex_picker_reports_unreadable_console_evidence() {
     assert!(!root.join("started-argv").exists());
 }
 
-#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_legacy_equals_endpoint_without_survivors_starts() {
     let Some(root) = isolated("codex_start_legacy_equals_endpoint_without_survivors_starts") else {
@@ -1958,7 +1956,6 @@ fn codex_picker_resume_refuses_a_live_terminals_recorded_conversation() {
     assert_codex_started(&fixture, &root);
 }
 
-#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_ignores_an_ordinary_process_merely_mentioning_the_listener() {
     let Some(root) =
