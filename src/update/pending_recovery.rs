@@ -185,6 +185,7 @@ pub(crate) fn run(
             &saved_windows,
         )
         .map_err(invalid)?;
+    let saved_windows = receipt.saved_windows().to_vec();
     let mut job = UpdateJob {
         id: id.clone(),
         version: crate::version().into(),

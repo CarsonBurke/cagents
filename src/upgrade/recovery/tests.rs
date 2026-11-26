@@ -220,6 +220,43 @@ fn pending_recovery_rejects_reduced_index_with_missing_host_options_without_muta
 }
 
 #[test]
+fn recovery_retries_carry_slots_closed_before_the_previous_claim() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let authority = preparation(root.path()).authority;
+    let request = ManualRequest {
+        version: 1,
+        job: uuid::Uuid::new_v4().to_string(),
+        checkpoint: "a".repeat(64),
+        source: authority.source,
+        target: PathBuf::from("/candidate/bin/cagentsd"),
+        target_hash: "b".repeat(64),
+        census_hash: digest(&serde_json::to_vec(&authority.census).unwrap()),
+        windows: vec!["primary".into()],
+    };
+    let mut earlier: ManualRequest =
+        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    earlier.job = uuid::Uuid::new_v4().to_string();
+    earlier.windows.push("closed-before-claim".into());
+    let old_path = root.path().join(format!("{}.request", earlier.job));
+    let old_bytes = serde_json::to_vec(&earlier).unwrap();
+    save(&old_path, &old_bytes);
+
+    earlier.job = uuid::Uuid::new_v4().to_string();
+    earlier.target_hash = "c".repeat(64);
+    earlier.windows = vec!["other-build".into()];
+    save(
+        &root.path().join(format!("{}.request", earlier.job)),
+        &serde_json::to_vec(&earlier).unwrap(),
+    );
+
+    assert_eq!(
+        request.carried_windows(root.path()).unwrap(),
+        BTreeSet::from(["closed-before-claim".into()])
+    );
+    assert_eq!(fs::read(old_path).unwrap(), old_bytes);
+}
+
+#[test]
 fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
     let root = crate::test_fixture::tempdir().unwrap();
     let mut authority = preparation(root.path()).authority;
