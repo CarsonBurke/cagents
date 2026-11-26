@@ -513,7 +513,20 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
             (Default::default(), Outcome::Failed)
         }
     };
-    if let Some(evidence) = observation.attention {
+    use crate::agent::observe::AttentionClear;
+    let predecessors = if observation.clear_attention == Some(AttentionClear::TurnStarted) {
+        super::agent_execution::registry(&host)
+            .and_then(|registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .notice_predecessors(candidate.id)
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeSet::new()
+    };
+    if observation.attention.is_some() || observation.clear_attention.is_some() {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !state.shutting_down
             && !state.notification_closed.contains(&candidate.id)
@@ -525,26 +538,37 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
             && candidate.handle.cached_agent_process().as_ref() == Some(&candidate.process)
             && let Some(notifications) = &state.notifications
         {
-            let mut event = crate::notifications::Event::session(
-                candidate.id,
-                candidate.process.provider,
-                candidate.process.launch.working_directory.clone(),
-                evidence,
-            );
-            let title = observation.title.as_deref().or_else(|| {
-                state
-                    .terminals
-                    .get(&candidate.id)
-                    .and_then(|record| record.conversation_title())
-            });
-            if let Some(title) = title {
-                event.content = Some(crate::notifications::Content {
-                    conversation: crate::notifications::presentation::title(title),
-                    preview: String::new(),
-                    request: None,
-                });
+            match observation.clear_attention {
+                Some(AttentionClear::TurnStarted) => {
+                    notifications.session_started_turn(candidate.id, predecessors)
+                }
+                Some(AttentionClear::RequestResolved) => {
+                    notifications.clear_session_waiting(candidate.id)
+                }
+                None => {}
             }
-            notifications.record(event);
+            if let Some(evidence) = observation.attention {
+                let mut event = crate::notifications::Event::session(
+                    candidate.id,
+                    candidate.process.provider,
+                    candidate.process.launch.working_directory.clone(),
+                    evidence,
+                );
+                let title = observation.title.as_deref().or_else(|| {
+                    state
+                        .terminals
+                        .get(&candidate.id)
+                        .and_then(|record| record.conversation_title())
+                });
+                if let Some(title) = title {
+                    event.content = Some(crate::notifications::Content {
+                        conversation: crate::notifications::presentation::title(title),
+                        preview: String::new(),
+                        request: None,
+                    });
+                }
+                notifications.record(event);
+            }
         }
     }
     candidate.handle.apply_agent_activity(
