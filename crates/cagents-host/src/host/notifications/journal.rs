@@ -608,7 +608,7 @@ mod tests {
                     directory: None,
                     destination: None,
                     evidence: Evidence {
-                        key: "automation pause".into(),
+                        key: format!("automation:{automation}:lifecycle:1"),
                         kind: Kind::AutomationPaused,
                     },
                     content: None,
