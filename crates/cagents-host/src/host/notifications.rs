@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::state::{ClientId, HostLock, SharedHost};
 use crate::{
     model::TerminalId,
-    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target, TestOutcome},
+    notifications::{Event, Kind, Notice, Preferences, Presence, Snapshot, Target, TestOutcome},
 };
 
 const MAX_PENDING: usize = 2048;
@@ -43,6 +43,8 @@ struct InboxAttention {
     pending: BTreeSet<crate::agent_execution::Lineage>,
     events: BTreeMap<Target, Event>,
 }
+
+pub(in crate::host) type CommitAcknowledgement = std::sync::mpsc::Receiver<Result<(), String>>;
 
 /// An in-flight commit is unacknowledged until the FULL journal transaction
 /// returns. Early shutdown or unwinding must explicitly fail the waiter.
@@ -72,6 +74,7 @@ struct Pending {
     committed_events: VecDeque<(Event, CommitReceipt)>,
     inboxes: Option<InboxAttention>,
     retired: BTreeSet<Target>,
+    cleared_waiting: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
@@ -96,6 +99,20 @@ impl Pending {
         for target in newer.retired {
             if self.retired.len() < MAX_PENDING || self.retired.contains(&target) {
                 self.retired.insert(target);
+            }
+        }
+        for target in newer.cleared_waiting.iter().cloned() {
+            self.clear_waiting(target);
+        }
+        for event in newer
+            .events
+            .values()
+            .chain(newer.committed_events.iter().map(|(event, _)| event))
+        {
+            if event.evidence.kind == Kind::Waiting
+                && !newer.cleared_waiting.contains(&event.target)
+            {
+                self.cleared_waiting.remove(&event.target);
             }
         }
         for (target, event) in newer.events {
@@ -126,6 +143,19 @@ impl Pending {
         self
     }
 
+    fn clear_waiting(&mut self, target: Target) {
+        if self
+            .events
+            .get(&target)
+            .is_some_and(|event| event.evidence.kind == Kind::Waiting)
+        {
+            self.events.remove(&target);
+        }
+        if self.cleared_waiting.len() < MAX_PENDING {
+            self.cleared_waiting.insert(target);
+        }
+    }
+
     /// The work that waits for an unavailable journal rather than being lost:
     /// attention, retirements, acknowledgements and the settings and windows
     /// they are judged by. Receipts and tests are answered at once, and a
@@ -135,6 +165,7 @@ impl Pending {
             events: self.events,
             inboxes: self.inboxes,
             retired: self.retired,
+            cleared_waiting: self.cleared_waiting,
             acknowledged: self.acknowledged,
             presence_changed: self.presence_changed,
             reload: self.reload,
@@ -205,6 +236,9 @@ impl Handle {
             // worker may reuse this session while retirement is still queued;
             // apply that retirement first, then its new event in the broker.
             if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
+                if event.evidence.kind == Kind::Waiting {
+                    pending.cleared_waiting.remove(&event.target);
+                }
                 pending.events.insert(event.target(), event);
             }
         });
@@ -215,7 +249,7 @@ impl Handle {
     pub(in crate::host) fn record_committed(
         &self,
         event: Event,
-    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+    ) -> Result<CommitAcknowledgement, String> {
         event.validate()?;
         let (receipt, result) = std::sync::mpsc::channel();
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -224,6 +258,9 @@ impl Handle {
         }
         if pending.committed_events.len() >= MAX_PENDING {
             return Err("Notification commit queue is full; outcome remains unacknowledged".into());
+        }
+        if event.evidence.kind == Kind::Waiting {
+            pending.cleared_waiting.remove(&event.target);
         }
         pending
             .committed_events
@@ -252,6 +289,10 @@ impl Handle {
                 events,
             })
         });
+    }
+
+    pub fn clear_session_waiting(&self, session: TerminalId) {
+        self.change(|pending| pending.clear_waiting(Target::Session(session)));
     }
 
     pub fn retire(&self, session: TerminalId) {
@@ -984,6 +1025,21 @@ async fn run(
                 Err(error) => snapshot.diagnostic = Some(error),
             }
         }
+        for target in pending.cleared_waiting {
+            if stopped(&shared) {
+                return;
+            }
+            match journal.acknowledge_waiting(&target) {
+                Ok(Some(id)) => {
+                    if delivery.get(&target).is_some_and(|notice| notice.id == id) {
+                        delivery.remove(&target);
+                    }
+                    withdraw_target(&mut withdrawals, id, &target);
+                }
+                Ok(None) => {}
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
         match journal.list() {
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
@@ -1665,6 +1721,37 @@ mod tests {
             handle.test().recv_timeout(Duration::from_secs(1)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn waiting_resolution_keeps_a_newer_open_request() {
+        let session = TerminalId::new();
+        let target = Target::Session(session);
+        let request = |key: &str| {
+            Event::session(
+                session,
+                crate::agent::Provider::Claude,
+                "/work".into(),
+                crate::notifications::Evidence {
+                    key: key.into(),
+                    kind: Kind::Waiting,
+                },
+            )
+        };
+        let pending = |event: Event| Pending {
+            events: [(target.clone(), event)].into(),
+            ..Pending::default()
+        };
+
+        let mut settled = Pending::default();
+        settled.clear_waiting(target.clone());
+        let combined = pending(request("old")).followed_by(settled);
+        assert!(combined.events.is_empty());
+        assert!(combined.cleared_waiting.contains(&target));
+
+        let combined = combined.followed_by(pending(request("new")));
+        assert!(!combined.cleared_waiting.contains(&target));
+        assert_eq!(combined.events.get(&target), Some(&request("new")));
     }
 
     #[test]

@@ -1813,6 +1813,14 @@ fn shared_gate<T: Default>(
     gate
 }
 
+fn retire_closed_agent_attention(host: &SharedHost, session: Option<&HostedSession>) {
+    if let Some(session) = session
+        && let Some(notifications) = &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+    {
+        notifications.retire(session.id());
+    }
+}
+
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
     let origin = origin(host, authority)?;
     let gate = agent_gate(host, id);
@@ -1826,12 +1834,13 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         // Older daemons closed the worker without retiring its shared pane.
         // Repeating close repairs only that retained presentation; it does not
         // start or contact a provider, and keeps the completed run history.
-        let agent = registry
+        let closed = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .close_agent(&origin, id)?;
+        retire_closed_agent_attention(host, agent.session.as_ref());
         announce(host, &registry);
-        return Ok(agent);
+        return Ok(closed);
     }
     let (pending, ended) = {
         let store = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -1939,6 +1948,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .unwrap_or_else(|p| p.into_inner())
         .execution_startups
         .remove(&id);
+    retire_closed_agent_attention(host, agent.session.as_ref().or(pending.as_ref()));
     announce(host, &registry);
     Ok(result)
 }

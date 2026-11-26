@@ -288,6 +288,28 @@ impl Journal {
             .map_err(|error| error.to_string())
     }
 
+    /// Keep replay evidence and ownership. Only the request that still
+    /// supplies this target's attention may lose its unread state.
+    pub fn acknowledge_waiting(&mut self, target: &Target) -> Result<Option<Uuid>, String> {
+        let row = notices::table
+            .find(target.storage_key())
+            .filter(notices::acknowledged.eq(false))
+            .select((notices::id, notices::event))
+            .first::<(String, String)>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((id, event)) = row else {
+            return Ok(None);
+        };
+        let event = Event::from_journal(&event).map_err(|error| error.to_string())?;
+        if event.evidence.kind != crate::notifications::Kind::Waiting {
+            return Ok(None);
+        }
+        let id = id.parse::<Uuid>().map_err(|error| error.to_string())?;
+        self.acknowledge(id)?;
+        Ok(Some(id))
+    }
+
     pub fn retire(&mut self, target: Target) -> Result<(), String> {
         let key = target.storage_key();
         self.0
@@ -523,6 +545,30 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].id, second.id);
         assert!(!notices[0].acknowledged);
+    }
+
+    #[test]
+    fn settling_a_request_clears_waiting_without_retiring_replay_evidence_or_outcomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("notifications.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        let mut waiting = event(session, "turn:waiting:1");
+        waiting.evidence.kind = Kind::Waiting;
+        let first = journal.record(waiting.clone(), false).unwrap().unwrap();
+        let target = Target::Session(session);
+        assert_eq!(
+            journal.acknowledge_waiting(&target).unwrap(),
+            Some(first.id)
+        );
+        assert!(journal.list().unwrap()[0].acknowledged);
+        assert!(journal.record(waiting, false).unwrap().is_none());
+
+        let finished = journal
+            .record(event(session, "turn:finished"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.acknowledge_waiting(&target).unwrap(), None);
+        assert_eq!(journal.list().unwrap(), [finished]);
     }
 
     fn seed_owners(journal: &mut Journal) {

@@ -914,6 +914,37 @@ pub(in crate::host) mod drain_fence {
     }
 }
 
+/// Read the actor's latest activity under the same ownership lock that
+/// queues its resolution. A delayed retained outbox entry cannot bring
+/// back a waiting notice after that resolution.
+fn queue_attention(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    event: crate::notifications::Event,
+) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.chats.get(&target.source.id).is_none_or(|record| {
+        record.execution_instance != target.identity.instance
+            || !record.handle.same_attachment(&target.handle)
+    }) {
+        return Err("Retained actor ownership changed before notification admission".into());
+    }
+    if event.evidence.kind == crate::notifications::Kind::Waiting
+        && matches!(
+            target.handle.activity(),
+            crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle
+        )
+    {
+        return Ok(None);
+    }
+    target
+        .notifications
+        .as_ref()
+        .ok_or("The notification journal is unavailable; attention remains retained")?
+        .record_committed(event)
+        .map(Some)
+}
+
 /// The broker and synchronous Answer boundary share the same semantic writes,
 /// exact owner checks, notification receipts and commit-before-ACK ordering.
 fn commit_semantic_entry(
@@ -997,17 +1028,16 @@ fn commit_semantic_entry(
             evidence,
         );
         event.content = content;
-        let receipt = target
-            .notifications
-            .as_ref()
-            .ok_or("The notification journal is unavailable; attention remains retained")?
-            .record_committed(event)?;
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or("Retained semantic acknowledgement deadline expired")?;
-        receipt
-            .recv_timeout(remaining.min(Duration::from_secs(10)))
-            .map_err(|_| "The notification journal has not confirmed this attention outcome")??;
+        if let Some(receipt) = queue_attention(host, target, event)? {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("Retained semantic acknowledgement deadline expired")?;
+            receipt
+                .recv_timeout(remaining.min(Duration::from_secs(10)))
+                .map_err(
+                    |_| "The notification journal has not confirmed this attention outcome",
+                )??;
+        }
     }
     target.require_current(host)?;
     let confirmed = target.confirmed_projection();
@@ -3801,12 +3831,11 @@ pub(in crate::host) fn finish_close(
                     evidence,
                 );
                 notification.content = content;
-                notifications
-                    .as_ref()
-                    .ok_or("Final attention journal is unavailable; helper is retained")?
-                    .record_committed(notification)?
-                    .recv_timeout(Duration::from_secs(10))
-                    .map_err(|_| "Final attention has not committed; helper is retained")??;
+                if let Some(receipt) = queue_attention(host, &target, notification)? {
+                    receipt
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|_| "Final attention has not committed; helper is retained")??;
+                }
             }
             let current = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
