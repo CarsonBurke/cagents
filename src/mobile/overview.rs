@@ -298,7 +298,7 @@ mod tests {
             Outgoing::Line(line) => line,
             Outgoing::Exit => panic!("the bridge exited"),
         };
-        assert_eq!(line(), api::ServerLine::Ok { id: 1 });
+        assert_eq!(line(), api::ServerLine::Ok { id: 1, page: None });
         assert!(
             matches!(line(), api::ServerLine::Event(api::Event::Notifications(event))
             if event.notices.is_empty())

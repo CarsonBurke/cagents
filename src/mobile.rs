@@ -18,6 +18,7 @@
 //! exits; reconnecting starts the bridge that matches the daemon then running.
 
 mod conversation;
+mod details;
 mod overview;
 pub mod pairing;
 mod translate;
@@ -102,6 +103,7 @@ fn serve(socket: &Path, input: &mut impl BufRead, outbox: &Outbox) -> Result<(),
         api: api_version,
         server_version: crate::version().into(),
         host: host_name(),
+        conversation_details: true,
     }));
     let mut bridge = Bridge::new(socket.to_owned(), control, outbox.clone());
     loop {
@@ -328,7 +330,7 @@ impl Outbox {
     }
 
     pub fn ok(&self, id: u64) {
-        self.send(api::ServerLine::Ok { id });
+        self.send(api::ServerLine::Ok { id, page: None });
     }
 
     pub fn error(&self, id: Option<u64>, error: api::Error) {
@@ -388,6 +390,7 @@ struct Bridge {
     notifications: Option<overview::Watch>,
     conversations: Conversations,
     next_watch: u64,
+    upload_slot: Arc<()>,
     outbox: Outbox,
 }
 
@@ -400,6 +403,7 @@ impl Bridge {
             notifications: None,
             conversations: Arc::default(),
             next_watch: 0,
+            upload_slot: Arc::new(()),
             outbox,
         }
     }
@@ -476,6 +480,72 @@ impl Bridge {
             }
             api::Call::LoadEarlier { session } => {
                 self.command(id, &session, chat::Command::LoadEarlier)
+            }
+            api::Call::ReadOutput {
+                session,
+                item,
+                cursor,
+            } => self.to_conversation(
+                &session,
+                conversation::Command::Detail {
+                    id,
+                    request: details::Request::Output { item, cursor },
+                },
+            ),
+            api::Call::ReadDiff {
+                session,
+                item,
+                path,
+                cursor,
+            } => self.to_conversation(
+                &session,
+                conversation::Command::Detail {
+                    id,
+                    request: details::Request::Diff { item, path, cursor },
+                },
+            ),
+            api::Call::ReadImage {
+                session,
+                item,
+                cursor,
+            } => self.to_conversation(
+                &session,
+                conversation::Command::Detail {
+                    id,
+                    request: details::Request::Image { item, cursor },
+                },
+            ),
+            api::Call::SendImage {
+                session,
+                text,
+                name,
+                png_base64,
+                mode,
+            } => {
+                if mode == api::SendMode::Unknown {
+                    return Err(Failure::Refused(bad_request(
+                        "This computer doesn't support that way of sending.",
+                    )));
+                }
+                // Only the input thread starts uploads. A watch holds this
+                // slot until the daemon replies or the watch ends.
+                if Arc::strong_count(&self.upload_slot) != 1 {
+                    return Err(Failure::Refused(api::Error {
+                        code: api::ErrorCode::Unavailable,
+                        message: "Another image is still sending.".into(),
+                    }));
+                }
+                self.to_conversation(
+                    &session,
+                    conversation::Command::ImagePrompt {
+                        id,
+                        text,
+                        name,
+                        png_base64,
+                        mode,
+                        slot: self.upload_slot.clone(),
+                    },
+                )
             }
             api::Call::Send {
                 session,
@@ -581,6 +651,14 @@ impl Bridge {
 
     /// Send `command` to a watched conversation; its watch answers.
     fn command(&self, id: u64, session: &str, command: chat::Command) -> Result<Answered, Failure> {
+        self.to_conversation(session, conversation::Command::Chat { id, command })
+    }
+
+    fn to_conversation(
+        &self,
+        session: &str,
+        command: conversation::Command,
+    ) -> Result<Answered, Failure> {
         let session = parse_session(session)?;
         let conversations = self.conversations.lock().unwrap();
         let Some((_, watch)) = conversations.get(&session) else {
@@ -589,7 +667,7 @@ impl Bridge {
                 message: "Open the conversation before acting on it.".into(),
             }));
         };
-        if !watch.send(conversation::Command::Chat { id, command }) {
+        if !watch.send(command) {
             return Err(Failure::Refused(api::Error {
                 code: api::ErrorCode::NotWatching,
                 message: "The conversation is no longer followed; open it again.".into(),

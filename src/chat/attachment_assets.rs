@@ -14,11 +14,6 @@ use crate::fs_safety::{self, Root};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(any(
-    feature = "ui",
-    all(any(test, feature = "test-support"), feature = "host")
-))]
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
@@ -26,6 +21,7 @@ use std::{
     io::Write,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -37,20 +33,8 @@ const STORE_DIRECTORY: &str = "chat-image-assets";
 const REGISTRY: &str = "receipts.json";
 const LOCK: &str = "receipts.lock";
 const REGISTRY_FULL: &str = "Image storage metadata is full.";
-#[cfg(any(
-    feature = "ui",
-    all(any(test, feature = "test-support"), feature = "host")
-))]
 const STORE_FULL: &str = "Image storage is full (2 GiB or 4096 images). No images were removed. Run cagents chat image-assets list, then explicitly remove an image you no longer need before attaching another.";
-#[cfg(any(
-    feature = "ui",
-    all(any(test, feature = "test-support"), feature = "host")
-))]
 const NUMBERING_EXHAUSTED: &str = "Image numbering is exhausted; no identity was reused.";
-#[cfg(any(
-    feature = "ui",
-    all(any(test, feature = "test-support"), feature = "host")
-))]
 const UNSTAGEABLE: &str =
     "Image exceeds this provider's image size limit or has an unsupported type.";
 
@@ -181,10 +165,7 @@ impl Store {
         }
         self.write(REGISTRY, &bytes, true)
     }
-    #[cfg(any(
-        feature = "ui",
-        all(any(test, feature = "test-support"), feature = "host")
-    ))]
+
     fn initialize(&self) -> Result<Registry, String> {
         match fs_safety::metadata_beneath(&self.root, Path::new(REGISTRY)) {
             Ok(_) => return self.read_registry(),
@@ -363,11 +344,7 @@ impl Store {
         self.restore_with(registry, &receipt.reference, source)
     }
 
-    /// Caller has validated real image decoding under UI's shared budgets.
-    #[cfg(any(
-        feature = "ui",
-        all(any(test, feature = "test-support"), feature = "host")
-    ))]
+    /// Caller has verified that the image decodes within its pixel budget.
     pub(crate) fn stage_validated(
         &self,
         bytes: &[u8],
@@ -425,18 +402,12 @@ impl Store {
             reference: Some(reference),
         })
     }
-    #[cfg(any(
-        feature = "ui",
-        all(any(test, feature = "test-support"), feature = "host")
-    ))]
+
     fn remove_private_temporary(&self, name: &OsStr) -> Result<(), String> {
         self.private_file(name.to_str().ok_or("Invalid temporary image filename")?)?;
         fs_safety::unlink_within(&self.root, name).map_err(storage_error)
     }
-    #[cfg(any(
-        feature = "ui",
-        all(any(test, feature = "test-support"), feature = "host")
-    ))]
+
     fn remove_orphans(&self, registry: &Registry) -> Result<(), String> {
         let mut unrecognized = false;
         // The entry one past the bound is the first this ever refuses.
@@ -494,10 +465,6 @@ impl Store {
 /// Exact create_temporary_in naming contract: 128 random bits as lowercase
 /// hex. Recognition is limited to our private store while its writer lock is
 /// held, followed by nofollow/singly-linked/private validation before unlink.
-#[cfg(any(
-    feature = "ui",
-    all(any(test, feature = "test-support"), feature = "host")
-))]
 fn is_staging_temporary(name: &OsStr) -> bool {
     name.to_str()
         .and_then(|s| s.strip_prefix(".cagents-tmp-"))
@@ -627,10 +594,7 @@ fn storage_error(error: impl std::fmt::Display) -> String {
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-#[cfg(any(
-    feature = "ui",
-    all(any(test, feature = "test-support"), feature = "host")
-))]
+
 fn now_ms() -> Result<u64, String> {
     u64::try_from(
         SystemTime::now()
@@ -725,7 +689,6 @@ pub fn is_stored_image_path(path: &Path) -> bool {
                     && matches!(extension, "png" | "jpg" | "gif" | "webp")
             })
 }
-#[cfg(feature = "ui")]
 pub fn stage_validated(
     bytes: &[u8],
     name: &str,

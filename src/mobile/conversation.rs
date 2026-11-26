@@ -27,7 +27,7 @@ use std::{
 
 use cagents_mobile_api as api;
 
-use super::{Failure, Outbox, WatchSocket, daemon_lost, translate::Mirror};
+use super::{Failure, Outbox, WatchSocket, daemon_lost, details, translate::Mirror};
 use crate::{
     chat,
     control::ControlClient,
@@ -41,7 +41,22 @@ use crate::{
 /// What the phone asked of a watched conversation.
 pub enum Command {
     /// A chat command, answered on the phone's request `id`.
-    Chat { id: u64, command: chat::Command },
+    Chat {
+        id: u64,
+        command: chat::Command,
+    },
+    Detail {
+        id: u64,
+        request: details::Request,
+    },
+    ImagePrompt {
+        id: u64,
+        text: String,
+        name: String,
+        png_base64: String,
+        mode: api::SendMode,
+        slot: Arc<()>,
+    },
     /// End the watch.
     Stop,
 }
@@ -251,7 +266,14 @@ enum Input {
 /// What a daemon request in flight was for.
 enum Pending {
     Read { final_read: bool },
-    Chat { id: u64 },
+    Chat {
+        id: u64,
+        _upload_slot: Option<Arc<()>>,
+    },
+    Detail {
+        id: u64,
+        read: details::Read,
+    },
 }
 
 struct Connection {
@@ -271,6 +293,7 @@ struct Followed {
     session: String,
     snapshot: chat::Snapshot,
     mirror: Mirror,
+    image: Option<details::ImageTransfer>,
     /// A change the held snapshot may predate.
     changed: bool,
     /// A publication read is in flight; one at a time keeps them in order.
@@ -300,6 +323,7 @@ impl Connection {
             session: self.chat_id.to_string(),
             snapshot,
             mirror: Mirror::default(),
+            image: None,
             // Attaching dropped the change notices that arrived during it,
             // so read once to begin with.
             changed: true,
@@ -383,8 +407,25 @@ impl Connection {
             let handled = match input {
                 Err(()) | Ok(Input::Command(Command::Stop)) => return End::Phone,
                 Ok(Input::Command(Command::Chat { id, command })) => {
-                    self.command(&mut followed, id, command)
+                    self.command(&mut followed, id, command, None)
                 }
+                Ok(Input::Command(Command::Detail { id, request })) => {
+                    self.detail(&mut followed, id, request)
+                }
+                Ok(Input::Command(Command::ImagePrompt {
+                    id,
+                    text,
+                    name,
+                    png_base64,
+                    mode,
+                    slot,
+                })) => match details::upload(&followed.snapshot, text, name, &png_base64, mode) {
+                    Ok(command) => self.command(&mut followed, id, command, Some(slot)),
+                    Err(error) => {
+                        self.outbox.error(Some(id), error);
+                        Ok(())
+                    }
+                },
                 Ok(Input::Frame(frame)) => match *frame {
                     Ok(Some(envelope)) => self.envelope(&mut followed, envelope),
                     Ok(None) => Err(End::Daemon("The computer's cagents daemon stopped.".into())),
@@ -423,7 +464,7 @@ impl Connection {
         let requests = pending
             .into_values()
             .filter_map(|pending| match pending {
-                Pending::Chat { id } => Some(id),
+                Pending::Chat { id, .. } | Pending::Detail { id, .. } => Some(id),
                 Pending::Read { .. } => None,
             })
             .chain(waiting_requests(&self.inputs));
@@ -435,6 +476,7 @@ impl Connection {
         followed: &mut Followed,
         id: u64,
         command: chat::Command,
+        upload_slot: Option<Arc<()>>,
     ) -> Result<(), End> {
         let command = match answerable(&followed.snapshot, command) {
             Ok(command) => command,
@@ -448,7 +490,13 @@ impl Connection {
             command,
         }) {
             Ok(request_id) => {
-                self.pending.insert(request_id, Pending::Chat { id });
+                self.pending.insert(
+                    request_id,
+                    Pending::Chat {
+                        id,
+                        _upload_slot: upload_slot,
+                    },
+                );
                 Ok(())
             }
             Err(error) => {
@@ -456,6 +504,50 @@ impl Connection {
                 Err(End::Daemon(lost(&error)))
             }
         }
+    }
+
+    fn detail(
+        &mut self,
+        followed: &mut Followed,
+        id: u64,
+        request: details::Request,
+    ) -> Result<(), End> {
+        if self.outbox.congested()
+            || self
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Detail { .. }))
+        {
+            self.outbox.error(
+                Some(id),
+                api_error(
+                    api::ErrorCode::Unavailable,
+                    "Another transcript detail is still loading.",
+                ),
+            );
+            return Ok(());
+        }
+        match details::read(request, &followed.snapshot, &mut followed.image) {
+            Ok(details::Page::Local(page)) => self.outbox.send(api::ServerLine::Ok {
+                id,
+                page: Some(page),
+            }),
+            Ok(details::Page::Daemon(read)) => match self.request(ClientRequest::ChatCommand {
+                chat_id: self.chat_id,
+                command: read.command(),
+            }) {
+                Ok(request_id) => {
+                    self.pending
+                        .insert(request_id, Pending::Detail { id, read });
+                }
+                Err(error) => {
+                    self.outbox.error(Some(id), unavailable(&error));
+                    return Err(End::Daemon(lost(&error)));
+                }
+            },
+            Err(error) => self.outbox.error(Some(id), error),
+        }
+        Ok(())
     }
 
     fn envelope(&mut self, followed: &mut Followed, envelope: ServerEnvelope) -> Result<(), End> {
@@ -543,13 +635,27 @@ impl Connection {
                     return Err(End::Conversation("The conversation ended.".into()));
                 }
             }
-            Some(Pending::Chat { id }) => match envelope.message {
+            Some(Pending::Chat { id, _upload_slot }) => match envelope.message {
                 ServerMessage::Response { .. } => self.outbox.ok(id),
                 ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),
                 _ => self
                     .outbox
                     .error(Some(id), internal("The daemon answered unexpectedly.")),
             },
+            Some(Pending::Detail { id, read }) => {
+                let result = match envelope.message {
+                    ServerMessage::Response { response } => read.finish(response),
+                    ServerMessage::Error(error) => Err(refused(&error)),
+                    _ => Err(internal("The daemon answered unexpectedly.")),
+                };
+                match result {
+                    Ok(page) => self.outbox.send(api::ServerLine::Ok {
+                        id,
+                        page: Some(page),
+                    }),
+                    Err(error) => self.outbox.error(Some(id), error),
+                }
+            }
             None => {}
         }
         Ok(())
@@ -637,7 +743,11 @@ impl Connection {
 
 fn waiting_requests(inputs: &Receiver<Input>) -> impl Iterator<Item = u64> + '_ {
     inputs.try_iter().filter_map(|input| match input {
-        Input::Command(Command::Chat { id, .. }) => Some(id),
+        Input::Command(
+            Command::Chat { id, .. }
+            | Command::Detail { id, .. }
+            | Command::ImagePrompt { id, .. },
+        ) => Some(id),
         _ => None,
     })
 }
