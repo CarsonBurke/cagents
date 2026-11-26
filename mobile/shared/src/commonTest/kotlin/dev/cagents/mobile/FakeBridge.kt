@@ -3,6 +3,7 @@ package dev.cagents.mobile
 import dev.cagents.mobile.client.BridgeTransport
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.LineChannel
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.serialization.json.Json
@@ -26,8 +27,15 @@ class FakeBridge : BridgeTransport {
     var opens = 0
         private set
 
+    /** How many of the next opens never return, as one stuck looking up a name would. */
+    var hangs = 0
+
     override suspend fun open(): LineChannel {
         opens++
+        if (hangs > 0) {
+            hangs--
+            awaitCancellation()
+        }
         refusals.removeFirstOrNull()?.let { throw it }
         return FakeConnection().also { incoming.send(it) }.clientSide
     }

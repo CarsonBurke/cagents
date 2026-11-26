@@ -128,7 +128,11 @@ fun SessionsScreen(
     ) { padding ->
         when {
             sessions == null -> Box(Modifier.fillMaxSize().padding(padding), Alignment.Center) {
-                if (remote.connection == ConnectionState.Connecting || remote.connection == ConnectionState.Connected) {
+                // Only while nothing has gone wrong yet; after a failure the banner says why and what to do.
+                val connection = remote.connection
+                if (connection == ConnectionState.Connected ||
+                    (connection is ConnectionState.Connecting && connection.lastFailure == null)
+                ) {
                     CircularProgressIndicator()
                 }
             }
