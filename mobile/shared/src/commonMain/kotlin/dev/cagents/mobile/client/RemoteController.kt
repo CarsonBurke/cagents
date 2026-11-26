@@ -1,6 +1,10 @@
 package dev.cagents.mobile.client
 
 import dev.cagents.mobile.protocol.Call
+import dev.cagents.mobile.protocol.DetailPage
+import dev.cagents.mobile.protocol.ErrorCode
+import dev.cagents.mobile.protocol.ImageAttachment
+import dev.cagents.mobile.protocol.RemoteError
 import dev.cagents.mobile.protocol.Event
 import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.Notice
@@ -317,23 +321,34 @@ class RemoteController(
         syncs?.trySend(Sync(session, kind))
     }
 
-    suspend fun send(session: String, text: String, mode: SendMode) = call(Call.Send(session, text, mode))
-    suspend fun interrupt(session: String) = call(Call.Interrupt(session))
-    suspend fun loadEarlier(session: String) = call(Call.LoadEarlier(session))
-    suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) =
+    suspend fun send(session: String, text: String, mode: SendMode, image: ImageAttachment? = null) {
+        call(if (image == null) Call.Send(session, text, mode) else Call.SendImage(session, text, mode, image))
+    }
+
+    suspend fun readDetail(request: Call.ReadDetail): DetailPage {
+        val page = call(request)
+        if (page == null || page.kind != request.kind || (page.next != null && page.next == request.cursor)) {
+            throw RequestFailed(RemoteError(ErrorCode.Internal, "The computer sent an unexpected transcript page."))
+        }
+        return page
+    }
+    suspend fun interrupt(session: String) { call(Call.Interrupt(session)) }
+    suspend fun loadEarlier(session: String) { call(Call.LoadEarlier(session)) }
+    suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) {
         call(Call.Answer(session, request, action, answers))
+    }
 
     suspend fun acknowledge(notice: String) {
         call(Call.AcknowledgeNotification(notice))
         _state.update { state -> state.copy(notices = state.notices.filterNot { it.id == notice }) }
     }
 
-    private suspend fun call(call: Call) {
+    private suspend fun call(call: Call): DetailPage? {
         val bridge = current ?: throw ConnectionLost("Not connected to the computer.")
         val session = (call as? Call.OnSession)?.session ?: return bridge.call(call)
         locked { inFlight[session] = (inFlight[session] ?: 0) + 1 }
         try {
-            bridge.call(call)
+            return bridge.call(call)
         } finally {
             val last = locked {
                 val left = inFlight.getValue(session) - 1

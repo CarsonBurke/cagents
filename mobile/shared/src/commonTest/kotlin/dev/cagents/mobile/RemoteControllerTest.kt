@@ -8,6 +8,9 @@ import dev.cagents.mobile.client.RemoteController
 import dev.cagents.mobile.client.RemoteState
 import dev.cagents.mobile.client.RequestFailed
 import dev.cagents.mobile.protocol.Activity
+import dev.cagents.mobile.protocol.Call
+import dev.cagents.mobile.protocol.DetailKind
+import dev.cagents.mobile.protocol.ImageAttachment
 import dev.cagents.mobile.protocol.ErrorCode
 import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.ItemBody
@@ -20,6 +23,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.long
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.random.Random
@@ -156,6 +160,46 @@ class RemoteControllerTest {
         assertEquals("On it, done.", (held.items[1].body as ItemBody.Text).text)
         assertEquals(9L, held.items[1].at)
         assertIs<ItemBody.Command>(held.items[2].body)
+    }
+
+    @Test
+    fun fetchesOnlyRequestedPagesAndNeverDropsAnAttachmentOnAnOldBridge() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        val detail = Call.ReadDetail(S, "command", DetailKind.Output)
+        val first = async { controller.readDetail(detail) }
+        val request = connection.expect("conversation.output")
+        assertNull(request.params["cursor"])
+        fun respond(request: kotlinx.serialization.json.JsonObject, body: String) {
+            val id = request["id"]!!.jsonPrimitive.long
+            connection.send("""{"type":"ok","id":$id,"page":$body}""")
+        }
+        respond(request, """{"kind":"output","text":"First","next":"two"}""")
+        val page = first.await()
+        assertEquals("First", page.text)
+        assertTrue(connection.isQuiet())
+
+        val second = async { controller.readDetail(detail.copy(cursor = page.next)) }
+        val next = connection.expect("conversation.output")
+        assertEquals("two", next.params["cursor"]!!.jsonPrimitive.content)
+        respond(next, """{"kind":"output","text":"Second"}""")
+        assertEquals("Second", second.await().text)
+
+        val sending = async {
+            runCatching { controller.send(S, "Look here", SendMode.Queue, ImageAttachment("image.png", "aW1hZ2U=")) }
+        }
+        val image = connection.expect("conversation.send_image")
+        assertEquals("aW1hZ2U=", image.params["png_base64"]!!.jsonPrimitive.content)
+        assertEquals("queue", image.params["mode"]!!.jsonPrimitive.content)
+        connection.error(image, "unknown_op", "Update cagents.")
+        assertEquals(ErrorCode.UnknownOp, assertIs<RequestFailed>(sending.await().exceptionOrNull()).code)
+        assertTrue(connection.isQuiet())
     }
 
     @Test
