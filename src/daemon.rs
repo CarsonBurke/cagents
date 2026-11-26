@@ -249,7 +249,7 @@ impl RuntimePaths {
         let directory = base.join(instance::runtime_subdirectory());
         Ok(Self {
             socket: directory.join(SOCKET_FILE_NAME),
-            lock: directory.join("cagentsd.lock"),
+            lock: instance::daemon_lock_in(&base),
             directory,
         })
     }

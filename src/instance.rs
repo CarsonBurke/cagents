@@ -466,8 +466,7 @@ impl WindowLease {
         // data a daemon in another runtime directory serves. Say so first:
         // that daemon's session, not this window, is what is in the way.
         if !crate::device::is_remote() {
-            match state_claim::daemon_served_elsewhere(&runtime_directory()?.join("cagentsd.lock"))
-            {
+            match state_claim::daemon_served_elsewhere(&daemon_lock_in(&runtime_directory()?)) {
                 Ok(None) => {}
                 Ok(Some(refusal)) => return Err(io::Error::other(refusal)),
                 Err(error) => {
@@ -3412,6 +3411,14 @@ pub fn runtime_subdirectory() -> &'static str {
     namespace()
 }
 
+/// The daemon's runtime lock under the session runtime directory `runtime`.
+/// The daemon takes it and records it in its saved-data claim; a window asking
+/// whether a daemon elsewhere serves this data must name the same file, or it
+/// mistakes this session's daemon for another session's.
+pub fn daemon_lock_in(runtime: &Path) -> PathBuf {
+    runtime.join(runtime_subdirectory()).join("cagentsd.lock")
+}
+
 pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("dev", "cagents", storage_name())
 }
@@ -5634,6 +5641,64 @@ mod startup_update_tests {
         // open instead.
         let (_second, slot) = open(&runtimes[1], true).unwrap();
         assert_eq!(slot, "window-2");
+    }
+
+    #[test]
+    fn a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        const DAEMON_RUNTIME: &str = "CAGENTS_TEST_WINDOW_DAEMON_RUNTIME";
+        if let Some(daemon_runtime) = env::var_os(DAEMON_RUNTIME).map(PathBuf::from) {
+            let lock = daemon_lock_in(&daemon_runtime);
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let _held = owned_lock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+            let _claim = state_claim::claim_daemon_state(&lock, "test-session").unwrap();
+
+            let lease = WindowLease::acquire(false, None);
+            if runtime_directory().unwrap().canonicalize().unwrap() == daemon_runtime {
+                lease.unwrap_or_else(|error| panic!("window refused its own daemon: {error}"));
+            } else {
+                let error = lease.err().expect("window accepted a foreign daemon");
+                assert_eq!(
+                    state_claim::state_in_use(&error).and_then(|refusal| refusal.pid()),
+                    Some(process::id()),
+                    "{error}"
+                );
+            }
+            return;
+        }
+
+        // Each child gets its own environment and window slot.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let daemon_runtime = root.join("daemon");
+        let foreign_runtime = root.join("foreign");
+        for directory in [&home, &daemon_runtime, &foreign_runtime] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+        }
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        for runtime in [alias.join("daemon"), foreign_runtime] {
+            let output = process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::startup_update_tests::a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere",
+                ])
+                .env(DAEMON_RUNTIME, &daemon_runtime)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "window launch with runtime {} failed: {}{}",
+                runtime.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]
