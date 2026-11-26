@@ -4902,6 +4902,47 @@ impl SidebarState {
                     collapsed.insert(path.clone());
                 }
             }
+            SidebarAction::OpenFile { path, .. } => {
+                self.panel_selection = Some(PanelSelection {
+                    path: path.clone(),
+                    basis: None,
+                });
+            }
+            SidebarAction::OpenChange { path, area, .. } => {
+                self.panel_selection = Some(PanelSelection {
+                    path: path.clone(),
+                    basis: Some(if *area == ChangeArea::Staged {
+                        DiffBasis::HeadToIndex
+                    } else {
+                        DiffBasis::IndexToWorktree
+                    }),
+                });
+            }
+            SidebarAction::OpenBranchFile {
+                path,
+                base_ref,
+                head,
+                merge_base,
+                ..
+            } => {
+                self.panel_selection = Some(PanelSelection {
+                    path: path.clone(),
+                    basis: Some(DiffBasis::MergeBaseToHead {
+                        base_ref: base_ref.clone(),
+                        head: head.clone(),
+                        merge_base: merge_base.clone(),
+                    }),
+                });
+            }
+            SidebarAction::OpenCommitFile { oid, path, .. } => {
+                self.panel_selection = Some(PanelSelection {
+                    path: path.clone(),
+                    basis: Some(DiffBasis::CommitToParent {
+                        oid: oid.clone(),
+                        parent: None,
+                    }),
+                });
+            }
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.revise_commit_draft();
                 self.commit_draft.message.clone_from(message);
@@ -4995,10 +5036,6 @@ impl SidebarState {
             | SidebarAction::RetryWorktreeDeletion { .. }
             | SidebarAction::RetryChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
-            | SidebarAction::OpenFile { .. }
-            | SidebarAction::OpenChange { .. }
-            | SidebarAction::OpenBranchFile { .. }
-            | SidebarAction::OpenCommitFile { .. }
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
             | SidebarAction::NewWorktree { .. }
