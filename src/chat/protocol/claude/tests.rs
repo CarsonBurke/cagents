@@ -15777,6 +15777,17 @@ fn large_managed_attribution_uses_private_settings_and_explicit_files_stay_in_pl
         "identical launches reuse the file"
     );
 
+    let inline = json!({"unrelated": "x".repeat(5 * 1024)}).to_string();
+    let merged = launch_attribution_argument(
+        Some(&inline),
+        || Some(json!(false)),
+        || panic!("the additional attribution is small"),
+    )
+    .unwrap();
+    let merged = serde_json::from_str::<Value>(&merged).unwrap();
+    assert_eq!(merged["attribution"], json!(false));
+    assert_eq!(merged["unrelated"], json!("x".repeat(5 * 1024)));
+
     let path = directory.path().join("settings.json");
     std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
     assert!(

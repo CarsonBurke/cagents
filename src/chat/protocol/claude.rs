@@ -422,7 +422,8 @@ pub(crate) fn launch_attribution_argument(
     directory: impl FnOnce() -> std::io::Result<PathBuf>,
 ) -> Option<String> {
     let value = attribution_settings(explicit, attribution)?;
-    if value.len() <= MAX_INLINE_ATTRIBUTION {
+    let existing = explicit.map_or(0, str::len);
+    if value.len() <= existing + MAX_INLINE_ATTRIBUTION {
         return Some(value);
     }
     if explicit.is_some() {
