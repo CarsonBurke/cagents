@@ -42,7 +42,7 @@ pub fn connect_ui_launcher() -> io::Result<()> {
         &stream,
         &Identity {
             started: crate::pinned_process::started_ticks_of(std::process::id())?,
-            address: crate::process::own_code_address(),
+            address: connect_ui_launcher as fn() -> io::Result<()> as usize as u64,
         },
         &[],
         deadline,
