@@ -4,7 +4,9 @@ use super::*;
 use crate::{
     daemon::lease_handoff::LeaseHandoff,
     model::HostSessionProof,
-    upgrade::recovery::{PendingRecovery, pending_retirement},
+    upgrade::recovery::{
+        PendingRecovery, RetirementAcquisition, RetirementGuard, pending_retirement,
+    },
 };
 
 /// Run only through the exact retained candidate named in the recovery command.
@@ -28,6 +30,31 @@ pub(crate) fn run(
     let layout = locate(&cli)?;
     let daemon = layout.version_root.join("bin/cagentsd");
     let ui = layout.version_root.join("bin/cagents-ui");
+    let state = layout.prefix.join(".update");
+    crate::secure_file::prepare_private_directory(&state)?;
+    // Global ordering matches ordinary updates: worker, UI, then daemon lease.
+    // Convert to File so dropping a coordinator never LOCK_UNs shared custody.
+    let worker = acquire_lock(&state)?.into_file();
+    retention::before_start(&state);
+    let _reserved_worker = reserve_worker_descriptor(&worker)?;
+    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    // Arm Drop before any fallible close: reopening a saved recovery pane is
+    // an attachment, never permission to resume or start its provider.
+    guard.set_recovery_restore_only();
+    guard.set_fallback_executable(ui.clone());
+    let store = crate::upgrade::handoff::Store::existing()
+        .map_err(invalid)?
+        .ok_or_else(|| invalid("There is no retained update checkpoint"))?;
+    // Protect the checkpoint-to-archive rename across the first verification
+    // and the decision to close existing windows. The update lease already
+    // excludes a new preparation for this installation.
+    let RetirementAcquisition::Acquired(retirement) =
+        RetirementGuard::acquire(&store.path).map_err(invalid)?
+    else {
+        return Err(invalid(
+            "The serving daemon is finishing the previous update. Your saved work was kept; retry after it finishes",
+        ));
+    };
     let (pending, archived) = match PendingRecovery::inspect().map_err(invalid)? {
         Some(pending) => (pending, false),
         None => (
@@ -48,31 +75,9 @@ pub(crate) fn run(
             "The retained checkpoint differs from the explicitly authorized hash; nothing was started",
         ));
     }
-    let state = layout.prefix.join(".update");
-    crate::secure_file::prepare_private_directory(&state)?;
-    // Global ordering matches ordinary updates: worker, UI, then daemon lease.
-    // Convert to File so dropping a coordinator never LOCK_UNs shared custody.
-    let worker = acquire_lock(&state)?.into_file();
-    retention::before_start(&state);
-    let _reserved_worker = reserve_worker_descriptor(&worker)?;
-    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    // Arm Drop before any fallible close: reopening a saved recovery pane is
-    // an attachment, never permission to resume or start its provider.
-    guard.set_recovery_restore_only();
-    guard.set_fallback_executable(ui.clone());
-    let before = candidate_stamp(&layout.version_root)?;
-    let local_stage = fs::symlink_metadata(layout.version_root.join(installed::LOCAL_STAGE_MARKER));
-    let selection = match local_stage {
-        Ok(_) => Some(installed::Selection::capture(&layout)?),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let previous_link = selection
-        .as_ref()
-        .and_then(installed::Selection::previous_link);
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
-    let settled_job = match verify_settled(&pending, &daemon) {
+    let settled_job = match verify_settled(&pending, &daemon, &store.path) {
         Ok(job) => Some(job),
         // A daemon is serving but would not answer the check. Nothing has
         // been closed or started yet, so this recovery can simply be repeated.
@@ -88,32 +93,40 @@ pub(crate) fn run(
         }
         Err(_) => None,
     };
-    if let Some(settled_job) = settled_job {
-        let switch = selection
-            .as_ref()
-            .map(|selection| selection.prepare(&layout))
-            .transpose()?
-            .flatten();
-        installed::complete_selection(switch, &layout)?;
-        let outcome = if archived {
-            guard.relaunch_missing_windows(&pending.windows, &ui)?;
-            verify(&pending, &daemon)
-        } else {
-            // A pre-existing UI may have ordinary restore policy. Close and
-            // reopen it under the same guarded policy as the active recovery.
+    if let Some(settled) = settled_job {
+        let Some(mut job) = incomplete_settled_job(&state, &settled.job)? else {
+            // Another update or a completed job owns the current window state.
+            return Ok(report(&settled.outcome));
+        };
+        let outcome = if !archived {
+            let selection = staged_selection(&layout)?;
+            let switch = selection
+                .as_ref()
+                .map(|selection| selection.prepare(&layout))
+                .transpose()?
+                .flatten();
+            installed::complete_selection(switch, &layout)?;
+            // Only a still-canonical recovery may replace already open windows.
             let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
             let windows = recovery_window_slots(&pending.windows, &current_windows);
             guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
+            drop(retirement);
             guard.relaunch_windows(&windows, &ui)?;
             verify(&pending, &daemon).and_then(|_| {
                 recovery::retire_current_service(source::BusyPatience::for_one_run())?;
                 verify(&pending, &daemon)
             })
+        } else {
+            // Archived records cannot publish a version or replace a live window.
+            installed::selected_candidate(&layout.prefix, &layout.version_root)?;
+            drop(retirement);
+            guard.relaunch_missing_windows(&pending.windows, &ui)?;
+            verify(&pending, &daemon)
         };
         return match outcome {
             Ok((_, outcome)) => {
                 let message = report(&outcome);
-                finish_settled_job(&state, &settled_job, &message)?;
+                record_completion(&state, &mut job, &message)?;
                 Ok(message)
             }
             Err(error @ UpdateError::SourceBusy { .. }) => Err(invalid(format!(
@@ -122,6 +135,12 @@ pub(crate) fn run(
             Err(error) => Err(error),
         };
     }
+    drop(retirement);
+    let before = candidate_stamp(&layout.version_root)?;
+    let selection = staged_selection(&layout)?;
+    let previous_link = selection
+        .as_ref()
+        .and_then(installed::Selection::previous_link);
     let paths = crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
     let handoff = LeaseHandoff::try_acquire(&paths).map_err(|e| invalid(e.to_string()))?
         .ok_or_else(|| invalid("A daemon is serving or starting. It was kept running; inspect `cagents --no-start daemon status` before repeating recovery"))?;
@@ -280,17 +299,22 @@ pub(crate) fn run(
     }
 }
 
-fn finish_settled_job(state: &Path, id: &str, message: &str) -> Result<(), UpdateError> {
-    // The caller retains the update lock. Leave any later job's status alone.
-    let mut job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
+fn incomplete_settled_job(state: &Path, id: &str) -> Result<Option<UpdateJob>, UpdateError> {
+    // The caller retains the update lock through any window and status changes.
+    let job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if job.id == id && job.phase != UpdatePhase::Complete {
-        record_completion(state, &mut job, message)?;
+    Ok((job.id == id && job.phase != UpdatePhase::Complete).then_some(job))
+}
+
+fn staged_selection(layout: &InstallLayout) -> Result<Option<installed::Selection>, UpdateError> {
+    match fs::symlink_metadata(layout.version_root.join(installed::LOCAL_STAGE_MARKER)) {
+        Ok(_) => installed::Selection::capture(layout).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 fn record_completion(state: &Path, job: &mut UpdateJob, message: &str) -> Result<(), UpdateError> {
@@ -313,19 +337,25 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
     windows
 }
 
-fn verify_settled(pending: &PendingRecovery, daemon: &Path) -> Result<String, UpdateError> {
-    verify(pending, daemon)?;
-    let store = crate::upgrade::handoff::Store::existing()
-        .map_err(invalid)?
-        .ok_or_else(|| invalid("The retained checkpoint disappeared during recovery"))?;
-    // A serving replacement can finish retiring its canonical checkpoint
-    // while the census is in flight. The verified archive supplies the same
-    // exact scope in that case.
-    let settled = pending_retirement(&store.path, daemon)
+struct Settled {
+    job: String,
+    outcome: recovery::Receipt,
+}
+
+fn verify_settled(
+    pending: &PendingRecovery,
+    daemon: &Path,
+    checkpoint: &Path,
+) -> Result<Settled, UpdateError> {
+    let (_, outcome) = verify(pending, daemon)?;
+    let settled = pending_retirement(checkpoint, daemon)
         .map_err(invalid)?
         .ok_or_else(|| invalid("The installed recovery has no settled Prepared record"))?;
     recovery::require_prepared_scope(pending, &settled, daemon)?;
-    Ok(settled.job)
+    Ok(Settled {
+        job: settled.job,
+        outcome,
+    })
 }
 
 /// One recovery check. Its fences and census share one busy patience, so a
@@ -471,7 +501,7 @@ fn reserve_worker_descriptor(worker: &File) -> Result<File, UpdateError> {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     #[test]
-    fn completing_an_archived_recovery_only_updates_its_own_job() {
+    fn an_archived_recovery_only_changes_its_own_incomplete_job() {
         use super::*;
 
         let state = tempfile::tempdir().unwrap();
@@ -490,10 +520,16 @@ mod tests {
         write_job(state.path(), &failed).unwrap();
         let status = state.path().join("status.json");
         let before = fs::read(&status).unwrap();
-        finish_settled_job(state.path(), &uuid::Uuid::new_v4().to_string(), "Ready").unwrap();
+        assert!(
+            incomplete_settled_job(state.path(), &uuid::Uuid::new_v4().to_string())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(fs::read(&status).unwrap(), before);
 
-        finish_settled_job(state.path(), &id, "Ready").unwrap();
+        let mut job = incomplete_settled_job(state.path(), &id).unwrap().unwrap();
+        record_completion(state.path(), &mut job, "Ready").unwrap();
+        assert!(incomplete_settled_job(state.path(), &id).unwrap().is_none());
         let completed: UpdateJob = serde_json::from_slice(&fs::read(&status).unwrap()).unwrap();
         assert_eq!(completed.phase, UpdatePhase::Complete);
         assert_eq!(completed.log_path, failed.log_path);
