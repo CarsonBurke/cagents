@@ -99,8 +99,10 @@ impl Journal {
     /// Read only committed entries. The broker remains the sole writer
     /// and can still be working on desktop delivery for these entries.
     pub(super) fn committed_notices(path: &Path) -> Result<Vec<Notice>, String> {
-        crate::secure_file::open_existing_private_file_readonly(path)
-            .map_err(|error| error.to_string())?;
+        drop(
+            crate::secure_file::open_existing_private_file_readonly(path)
+                .map_err(|error| error.to_string())?,
+        );
         let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
         let mut url = url::Url::from_file_path(absolute)
             .map_err(|()| "Notification journal path cannot be represented as a file URI")?;

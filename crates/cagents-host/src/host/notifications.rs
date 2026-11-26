@@ -421,7 +421,9 @@ fn combine_committed_notices(published: &mut Snapshot, mut notices: Vec<Notice>)
         .filter_map(|notice| notice.event.content.map(|preview| (notice.id, preview)))
         .collect::<std::collections::HashMap<_, _>>();
     for notice in &mut notices {
-        notice.event.content = previews.get(&notice.id).cloned();
+        if notice.event.content.is_some() {
+            notice.event.content = previews.get(&notice.id).cloned();
+        }
     }
     published.notices = notices;
 }
