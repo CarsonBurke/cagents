@@ -746,9 +746,7 @@ impl Connection {
 fn waiting_requests(inputs: &Receiver<Input>) -> impl Iterator<Item = u64> + '_ {
     inputs.try_iter().filter_map(|input| match input {
         Input::Command(
-            Command::Chat { id, .. }
-            | Command::Detail { id, .. }
-            | Command::ImagePrompt { id, .. },
+            Command::Chat { id, .. } | Command::Detail { id, .. } | Command::ImagePrompt { id, .. },
         ) => Some(id),
         _ => None,
     })

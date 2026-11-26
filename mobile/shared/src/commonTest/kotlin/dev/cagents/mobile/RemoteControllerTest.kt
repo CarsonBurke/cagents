@@ -203,6 +203,24 @@ class RemoteControllerTest {
     }
 
     @Test
+    fun backgroundDetachesWhileADetailReadIsWaiting() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        connection.ok(connection.expect("conversation.watch"))
+        val pending = async { runCatching { controller.readDetail(Call.ReadDetail(S, "command", DetailKind.Output)) } }
+        val detail = connection.expect("conversation.output")
+
+        controller.setForeground(false)
+        val unwatch = connection.expect("conversation.unwatch")
+        assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
+        connection.ok(unwatch)
+        connection.error(detail, "unavailable", "The conversation stopped being followed.")
+        assertEquals(ErrorCode.Unavailable, assertIs<RequestFailed>(pending.await().exceptionOrNull()).code)
+    }
+
+    @Test
     fun watchesAgainWhenAnAppendDoesNotLineUp() = runTest {
         val controller = controller()
         controller.start()
