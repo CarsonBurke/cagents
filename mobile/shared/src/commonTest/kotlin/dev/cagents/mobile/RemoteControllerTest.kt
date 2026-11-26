@@ -192,6 +192,46 @@ class RemoteControllerTest {
     }
 
     @Test
+    fun aDroppedConnectionsReasonShowsWhileReconnecting() = runTest {
+        val controller = controller()
+        controller.start()
+        val first = bridge.acceptWelcomed()
+        controller.await { it.connection == ConnectionState.Connected }
+        first.send("""{"type":"event","event":"closing","data":{"message":"The computer's cagents daemon is stopping."}}""")
+        first.hangUp()
+
+        bridge.accept()
+        assertEquals(
+            ConnectionState.Connecting("The computer's cagents daemon is stopping."),
+            controller.state.value.connection,
+        )
+    }
+
+    @Test
+    fun aRetryAfterTheyActStartsWithoutTheOldFailure() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Unauthorized("marvin@fw16 didn't accept this phone's key.")
+        controller.start()
+        controller.await { it.connection is ConnectionState.NeedsAction }
+
+        controller.retryNow()
+        bridge.accept()
+        assertEquals(ConnectionState.Connecting(), controller.state.value.connection)
+    }
+
+    @Test
+    fun showsEveryReasonAsASentence() = runTest {
+        val controller = controller()
+        bridge.refusals += ConnectFailure.Network("  ")
+        bridge.refusals += ConnectFailure.Network("No route to host")
+        controller.start()
+        val blank = controller.await { it.connection is ConnectionState.Retrying }.connection as ConnectionState.Retrying
+        assertEquals("The connection failed.", blank.message)
+        val bare = controller.await { (it.connection as? ConnectionState.Retrying)?.attempt == 2 }.connection
+        assertEquals("No route to host.", (bare as ConnectionState.Retrying).message)
+    }
+
+    @Test
     fun firstAttemptHasNoFailureToShow() = runTest {
         val controller = controller()
         controller.start()

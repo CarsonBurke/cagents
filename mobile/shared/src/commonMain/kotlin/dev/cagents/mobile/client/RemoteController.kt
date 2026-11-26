@@ -366,7 +366,8 @@ class RemoteController(
                 lastFailure = null
                 continue
             }
-            lastFailure = failure.message?.takeIf { it.isNotBlank() }
+            val reason = sentence(failure.message)
+            lastFailure = reason
 
             // Only a connection that held starts over; one that drops straight
             // after connecting, again and again, keeps backing off.
@@ -374,7 +375,7 @@ class RemoteController(
             attempt++
             val backoff = backoff(attempt)
             _state.update {
-                it.copy(connection = ConnectionState.Retrying(failure.message.orEmpty(), attempt, backoff))
+                it.copy(connection = ConnectionState.Retrying(reason, attempt, backoff))
             }
             withTimeoutOrNull(backoff) { wake.receive() }
         }
@@ -382,11 +383,16 @@ class RemoteController(
 
     /** Connects, serves the connection until it ends and returns why it ended. */
     private suspend fun connectOnce(onConnected: () -> Unit): String {
-        val channel = withTimeoutOrNull(config.connectTimeout) { transport.open() }
-            ?: throw ConnectFailure.Network(
+        // Kept as it opens: a timeout landing just as open() returns would otherwise drop it unclosed.
+        var opened: LineChannel? = null
+        val channel = withTimeoutOrNull(config.connectTimeout) { transport.open().also { opened = it } }
+            ?: run {
+                opened?.close()
+                throw ConnectFailure.Network(
                 "The computer didn't answer within ${config.connectTimeout.inWholeSeconds} seconds. " +
                     "Is it awake, and is this phone on its network or on Tailscale?",
-            )
+                )
+            }
         val bridge = BridgeSession(channel, config.clientName, config.clientVersion)
         var queue: Channel<Sync>? = null
         try {
@@ -578,6 +584,12 @@ class RemoteController(
     }
 
     private companion object {
+        /** [message] as a sentence to show, with a stand-in when there is none. */
+        fun sentence(message: String?): String {
+            val text = message?.trim().orEmpty().ifEmpty { return "The connection failed." }
+            return if (text.last() in ".?!…") text else "$text."
+        }
+
         const val MAX_RECOVERIES = 3
         const val UNREADABLE = "This app can't read part of this conversation. Update the app."
     }

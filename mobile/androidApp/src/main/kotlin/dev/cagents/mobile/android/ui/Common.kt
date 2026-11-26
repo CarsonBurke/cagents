@@ -1,6 +1,7 @@
 package dev.cagents.mobile.android.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
@@ -62,14 +63,16 @@ fun ConnectionBanner(
     ) {
         when (connection) {
             ConnectionState.Connected -> Unit
+            // A failed attempt and the next one share one layout, so the banner
+            // doesn't jump as it moves between them every few seconds.
             is ConnectionState.Connecting -> when {
-                // The last attempt failed: say why while this one runs, since it may take a while.
                 connection.lastFailure != null ->
                     Banner(
                         icon = null,
                         text = "${connection.lastFailure} Trying again…",
                         progress = true,
                         actions = listOf("Settings" to onSettings),
+                        actionsBelow = true,
                     )
                 hasData -> LinearProgressIndicator(Modifier.fillMaxWidth())
                 else -> Banner(icon = null, text = "Connecting…", progress = true)
@@ -79,8 +82,9 @@ fun ConnectionBanner(
             is ConnectionState.Retrying ->
                 Banner(
                     Icons.Outlined.CloudOff,
-                    connection.message.ifBlank { "Connection lost." } + " Trying again…",
+                    "${connection.message} Trying again…",
                     actions = listOf("Settings" to onSettings, "Retry now" to onRetry),
+                    actionsBelow = true,
                 )
             is ConnectionState.NeedsAction -> when (val failure = connection.failure) {
                 is ConnectFailure.UnknownHostKey, is ConnectFailure.HostKeyChanged ->
@@ -100,8 +104,8 @@ fun ConnectionBanner(
 }
 
 /**
- * One line of status with what the person can do about it. A single action
- * sits beside the text; several go beneath it, so a long reason keeps its width.
+ * One line of status with what the person can do about it. Actions sit
+ * beside the text, or beneath it with [actionsBelow], so a long reason keeps its width.
  */
 @Composable
 private fun Banner(
@@ -110,16 +114,20 @@ private fun Banner(
     actions: List<Pair<String, () -> Unit>> = emptyList(),
     progress: Boolean = false,
     error: Boolean = false,
+    actionsBelow: Boolean = false,
 ) {
     val container = if (error) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer
     val content = if (error) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer
-    val beside = actions.singleOrNull()
-    Surface(color = container, contentColor = content, modifier = Modifier.fillMaxWidth()) {
+    val beside = actions.singleOrNull()?.takeUnless { actionsBelow }
+    Surface(color = container, contentColor = content, modifier = Modifier.fillMaxWidth().animateContentSize()) {
         Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                when {
-                    progress -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = content)
-                    icon != null -> Icon(icon, contentDescription = null, Modifier.size(20.dp))
+                // One size for both, so the text starts in the same place.
+                Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+                    when {
+                        progress -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = content)
+                        icon != null -> Icon(icon, contentDescription = null, Modifier.size(20.dp))
+                    }
                 }
                 Spacer(Modifier.width(12.dp))
                 Text(
@@ -129,7 +137,7 @@ private fun Banner(
                 )
                 beside?.let { (label, onClick) -> TextButton(onClick = onClick) { Text(label, color = content) } }
             }
-            if (actions.size > 1) {
+            if (beside == null && actions.isNotEmpty()) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     actions.forEach { (label, onClick) -> TextButton(onClick = onClick) { Text(label, color = content) } }
                 }
