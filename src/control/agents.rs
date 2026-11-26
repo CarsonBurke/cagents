@@ -4493,6 +4493,18 @@ mod tests {
         assert!(account_needs_attention(account), "not reset yet");
         account.remaining = vec![spent(true)];
         assert!(!account_needs_attention(account), "reset since the reading");
+        account.remaining = vec![spent(true), spent(false)];
+        assert!(
+            account_needs_attention(account),
+            "another window still spent"
+        );
+        let mut unspent = spent(false);
+        unspent.remaining_fraction = 0.9;
+        account.remaining = vec![spent(true), unspent];
+        assert!(
+            !account_needs_attention(account),
+            "the other window has room"
+        );
         // A reading that is only old, with no window reset, is believed:
         // a provider's own Limited or Warning, or its refusal of ordinary
         // use, needs no spent window behind it.
