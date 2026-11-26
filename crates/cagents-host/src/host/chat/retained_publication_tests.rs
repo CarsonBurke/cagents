@@ -3,61 +3,14 @@ use super::*;
 use std::{fs, path::Path};
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
-    const CHILD: &str = "CAGENTS_RETAINED_PUBLICATION_TEST";
-    if std::env::var_os(CHILD).is_none() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let root = directory.path();
-        for path in [
-            "home/.claude",
-            "run",
-            "data",
-            "config",
-            "cache",
-            "bin",
-            "project",
-        ] {
-            fs::create_dir_all(root.join(path)).unwrap();
-        }
-        let exact = thread::current().name().unwrap().to_owned();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &exact, "--nocapture"])
-            .env_clear()
-            .envs(crate::retained_fixture::owner_env())
-            .env(CHILD, "1")
-            .env(
-                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
-                retained_actor_tests::retained_helper_executable(),
-            )
-            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-            .env("CAGENTS_HOLDER_ROOT", root)
-            .env("HOME", root.join("home"))
-            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", root.join("bin").display()),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let Some(root) = super::retained_resolution_tests::isolated() else {
         return;
-    }
+    };
     fn wait(mut condition: impl FnMut() -> bool, reason: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !condition() {
@@ -82,7 +35,6 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
         host.lock().unwrap().notifications = Some(notifications.handle());
         (host, notifications)
     }
-    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
     retained_actor_tests::install_provider(&root.join("bin/claude"));
     let proof = |name| HostSessionProof {
         host_session_id: crate::model::HostSessionId::new("publication-fixture"),
@@ -114,11 +66,7 @@ fn unpaired_fresh_authority_survives_confirmation_and_publication_crash() {
     impl Drop for Cleanup {
         fn drop(&mut self) {
             for process in [&self.0.root, &self.0.holder] {
-                if process.is_current() {
-                    unsafe {
-                        libc::kill(process.pid, libc::SIGKILL);
-                    }
-                }
+                super::retained_resolution_tests::stop_fixture_process(process);
             }
         }
     }

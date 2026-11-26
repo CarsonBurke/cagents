@@ -3,61 +3,14 @@ use super::*;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
-    const MODE: &str = "CAGENTS_RETAINED_PREPARED_ID_TEST";
-    if std::env::var_os(MODE).is_none() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let root = directory.path();
-        for path in [
-            "home/.claude",
-            "run",
-            "data",
-            "config",
-            "cache",
-            "bin",
-            "project",
-        ] {
-            fs::create_dir_all(root.join(path)).unwrap();
-        }
-        let test = thread::current().name().unwrap().to_owned();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test, "--nocapture"])
-            .env_clear()
-            .envs(crate::retained_fixture::owner_env())
-            .env(MODE, "1")
-            .env(
-                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
-                retained_actor_tests::retained_helper_executable(),
-            )
-            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-            .env("CAGENTS_HOLDER_ROOT", root)
-            .env("HOME", root.join("home"))
-            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", root.join("bin").display()),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let Some(root) = super::retained_resolution_tests::isolated() else {
         return;
-    }
+    };
     fn wait(mut condition: impl FnMut() -> bool, reason: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !condition() {
@@ -65,7 +18,6 @@ fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames
             thread::sleep(Duration::from_millis(10));
         }
     }
-    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
     install_provider(&root.join("bin/claude"));
     let proof = HostSessionProof {
         host_session_id: crate::model::HostSessionId::new("prepared-identity-fixture"),
@@ -106,11 +58,7 @@ fn fresh_host_launch_keeps_prepared_identity_and_rejects_foreign_provider_frames
             // Failed fixtures kill only their own exact process incarnations;
             // this is teardown, not evidence of semantic retirement.
             for process in [&self.record.root, &self.record.holder] {
-                if process.is_current() {
-                    unsafe {
-                        libc::kill(process.pid, libc::SIGKILL);
-                    }
-                }
+                super::retained_resolution_tests::stop_fixture_process(process);
             }
         }
     }
