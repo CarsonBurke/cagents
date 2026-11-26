@@ -1770,6 +1770,13 @@ impl UiUpdateGuard {
         }
     }
 
+    /// An already committed close is recorded in the retained checkpoint.
+    /// Leave those windows there when no launch can yet reach the successor.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn defer_reopening_to_recovery(&mut self) {
+        self.closed.clear();
+    }
+
     pub fn has_running_windows(&self) -> io::Result<bool> {
         running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
     }

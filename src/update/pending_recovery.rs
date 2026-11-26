@@ -261,10 +261,14 @@ pub(crate) fn run(
                     started
                 };
             if ready.is_err() && standby.may_own_runtime() {
+                #[cfg(target_os = "macos")]
+                guard.defer_reopening_to_recovery();
                 guard.leave_launch_fence_with_successor();
             }
             ready?;
             installed::selected_candidate(&layout.prefix, &layout.version_root)?;
+            #[cfg(target_os = "macos")]
+            guard.set_fallback_executable(ui.clone());
             Some(standby.pid())
         } else {
             None
@@ -280,8 +284,6 @@ pub(crate) fn run(
             .ok_or_else(|| invalid("The Prepared evidence disappeared after recovery"))?;
         let (serving, _) = verify(&pending, &daemon, pid)?;
         receipt.verify_successor(&serving).map_err(invalid)?;
-        #[cfg(target_os = "macos")]
-        guard.set_fallback_executable(ui.clone());
         receipt.release_daemon_reservation();
         Ok::<_, UpdateError>(windows)
     })();
