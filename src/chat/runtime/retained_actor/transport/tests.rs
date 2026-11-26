@@ -1944,16 +1944,10 @@ fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_c
         .push(CAPABILITY.into());
     let socket = fixture._root.path().join("deadline-inspect.sock");
     let listener = crate::descriptor::bind(&socket).unwrap();
-    let (release, wait) = crossbeam_channel::bounded(1);
-    let peer = thread::spawn(move || {
-        let (control, _) = crate::descriptor::accept(&listener).unwrap();
-        let request: Invocation = receive(&control, TIMEOUT).unwrap();
-        assert_eq!(request.method, "inspect");
-        assert!(request.epoch.is_none());
-        // SO_PEERCRED has identified this exact Record.holder process, but
-        // its inspection response stalls until the client has returned.
-        let _ = wait.recv();
-    });
+    listener.set_nonblocking(true).unwrap();
+    // The listener authenticates as this process and the kernel queues the
+    // connection and request. Leaving them queued stalls the response without
+    // a peer thread that could block forever if the client never connects.
     let epoch = fixture.server.epoch;
     let source = fixture.server.source.clone();
     let proof = fixture.server.proof.clone();
@@ -1963,14 +1957,23 @@ fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_c
             &record,
             proof,
             &socket,
-            Instant::now() + Duration::from_millis(40),
+            Instant::now() + Duration::from_millis(250),
         )
         .err()
         .expect("stalled inspection must time out")
     });
-    let _ = release.send(());
-    peer.join().unwrap();
-    assert!(error.contains("deadline"), "{error}");
+    assert_eq!(
+        error,
+        interrupted_request(
+            "inspect",
+            crate::chat::failure::actor_transport::DEADLINE.into()
+        ),
+    );
+    let (control, _) =
+        crate::descriptor::accept(&listener).expect("inspection must reach the peer");
+    let request: Invocation = receive(&control, TIMEOUT).expect("inspection must send its request");
+    assert_eq!(request.method, "inspect");
+    assert!(request.epoch.is_none());
     assert!(started.elapsed() < TIMEOUT);
     assert_eq!(fixture.server.epoch, epoch);
     assert_eq!(fixture.server.source, source);
