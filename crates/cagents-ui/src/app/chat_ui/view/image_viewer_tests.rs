@@ -851,3 +851,49 @@ fn a_picture_of_another_gallery_stays_out_of_the_viewer() {
         "the next picture after the gallery's last is its first again"
     );
 }
+
+/// A lone picture has nothing to browse to, so its toolbar draws no "1 / 1"
+/// between arrows that could never be pressed; a gallery of two counts them.
+#[test]
+fn a_lone_picture_draws_no_gallery_counter() {
+    use iced::advanced::widget::{Operation, Tree, operation::Focusable};
+    use iced::advanced::{Layout, layout::Limits};
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn container(&mut self, _: Option<&widget::Id>, _: iced::Rectangle) {}
+        fn focusable(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, _: &mut dyn Focusable) {
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let texts = |count: u8| {
+        let (mut runtime, _handle) = super::tests::furnished_runtime();
+        let images = show_images(&mut runtime, count);
+        let gallery = Gallery::new(&runtime, &images[0].0).unwrap();
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = gallery.pane_view(runtime.target, 640.0, 0.0);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 600.0)),
+        );
+        let mut texts = Texts(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        texts.0
+    };
+    let lone = texts(1);
+    assert!(
+        lone.iter().any(|text| text == "Open externally"),
+        "{lone:?}"
+    );
+    assert!(!lone.iter().any(|text| text.contains(" / ")), "{lone:?}");
+    let pair = texts(2);
+    assert!(pair.iter().any(|text| text == "1 / 2"), "{pair:?}");
+}

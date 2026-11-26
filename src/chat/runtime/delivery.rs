@@ -299,7 +299,7 @@ impl Ledger {
                 .map_err(|error| error.to_string())?,
         );
         let db = Connection::open_with_flags(
-            path,
+            crate::secure_file::sqlite_path(path),
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,

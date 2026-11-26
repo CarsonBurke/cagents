@@ -9,8 +9,9 @@ fn prepared() -> (
     ModelEdit,
 ) {
     let (directory, host, _) = fixture();
-    edit(&host, 1, open_project(directory.path())).unwrap();
-    let launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    edit(&host, 1, open_project(&root)).unwrap();
+    let launch = LaunchRecipe::shell(root.clone()).unwrap();
     let session = TerminalSession {
         id: TerminalId::new(),
         launch: launch.clone(),
@@ -41,8 +42,8 @@ fn prepared() -> (
         kind: CardKind::Terminal(descriptor.session),
     };
     let scope = Scope::Worktree {
-        repository: directory.path().to_owned(),
-        path: directory.path().to_owned(),
+        repository: root.clone(),
+        path: root.clone(),
     };
     let model = edit(
         &host,
@@ -60,7 +61,7 @@ fn prepared() -> (
         operation: uuid::Uuid::new_v4(),
         change: Change::RemoveSource {
             registry: model.identity,
-            repository: directory.path().to_owned(),
+            repository: root.clone(),
             before: pane.clone(),
             terminal: Some(TerminalRemovalBasis::Worker {
                 owner: host.lock().unwrap().proof().clone(),
@@ -68,7 +69,7 @@ fn prepared() -> (
             }),
             capture: Some(crate::workspace_model::views::CapturedTerminalSource {
                 registry: model.identity,
-                repository: directory.path().to_owned(),
+                repository: root.clone(),
                 scope,
                 view_revision: model.views[0].revision,
                 model_sequence: model.sequence,

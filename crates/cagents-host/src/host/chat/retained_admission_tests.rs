@@ -24,6 +24,11 @@ fn isolated(name: &str) -> Option<PathBuf> {
     } else {
         tempfile::tempdir_in("/var/tmp").unwrap()
     };
+    #[cfg(target_os = "macos")]
+    let canonical = directory.path().canonicalize().unwrap();
+    #[cfg(target_os = "macos")]
+    let root = canonical.as_path();
+    #[cfg(target_os = "linux")]
     let root = directory.path();
     // SDK fixtures and private helper authority require a private root;
     // tempfile's directory mode can inherit a broader caller policy.
@@ -58,6 +63,10 @@ fn isolated(name: &str) -> Option<PathBuf> {
         ])
         .env_clear()
         .envs(crate::retained_fixture::owner_env())
+        .envs(
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .map(|authority| (crate::agent_execution::AUTHORITY_ENV, authority)),
+        )
         .env(MODE, name)
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
         .env("CAGENTS_HOLDER_ROOT", root)
@@ -94,10 +103,12 @@ fn isolated(name: &str) -> Option<PathBuf> {
     };
     // Failed assertions or a hung child must not retain these private helpers.
     cleanup_discoveries(&root.join("run"));
+    let output = fs::read_to_string(stdout).unwrap();
     assert!(
-        status.is_some_and(|status| status.success()),
-        "isolated admission fixture failed or exceeded 90 seconds:\n{}\n{}",
-        fs::read_to_string(stdout).unwrap(),
+        status.is_some_and(|status| status.success())
+            && output.contains("test result: ok. 1 passed"),
+        "isolated admission fixture failed, selected no test, or exceeded 90 seconds:\n{}\n{}",
+        output,
         fs::read_to_string(stderr).unwrap()
     );
     None
@@ -184,6 +195,10 @@ pub(super) fn pause_failed_confirmation(id: TerminalId) {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_failure_preserves_replacement_attachment() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -196,6 +211,10 @@ fn named_claude_resume_failure_preserves_replacement_attachment() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_failure_retires_before_exact_retry() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -208,6 +227,10 @@ fn named_claude_resume_failure_retires_before_exact_retry() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_retry_finishes_failed_retirement_write() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -220,6 +243,10 @@ fn named_claude_resume_retry_finishes_failed_retirement_write() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn named_claude_resume_normal_close_finishes_failed_retirement_write() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -671,7 +698,7 @@ impl HostClientWire {
         };
         use std::sync::atomic::{AtomicBool, Ordering};
         let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let listener = crate::descriptor::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -683,7 +710,7 @@ impl HostClientWire {
             let mut workers = Vec::new();
             let mut next_client = 1;
             while !stopped.load(Ordering::Acquire) {
-                let (mut stream, _) = match listener.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&listener) {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -793,6 +820,7 @@ impl Drop for HostClientWire {
 
 #[test]
 fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -845,7 +873,7 @@ fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
         "discovery must fence recipe execution"
     );
     assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "unsupported protocol must refuse before RPC"
     );
     assert_eq!(
@@ -862,6 +890,10 @@ fn unsupported_live_owner_fences_reconnect_only_original_alias_before_rpc() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
     if crate::retained_fixture::run_isolated() {
         return;

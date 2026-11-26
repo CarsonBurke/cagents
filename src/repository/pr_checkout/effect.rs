@@ -32,8 +32,51 @@ impl PinnedDirectories {
         })
     }
 
-    fn path(&self, index: usize) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.files[index].as_raw_fd()))
+    /// A path that reaches retained directory `index` itself, which Git and
+    /// the transaction script enter. Commands inherit the descriptor at the
+    /// same number, so Linux names it, and a pathname swapped since cannot
+    /// redirect them.
+    #[cfg(target_os = "linux")]
+    fn path(&self, index: usize) -> Result<PathBuf, String> {
+        Ok(PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            self.files[index].as_raw_fd()
+        )))
+    }
+
+    /// A path that reaches retained directory `index` itself, which Git and
+    /// the transaction script enter.
+    ///
+    /// Darwin cannot name a descriptor's directory, so this is where the
+    /// directory is now, confirmed to still reach it. Unlike a descriptor path
+    /// it can be redirected after this check, so on Darwin no Git command is
+    /// bound to the confirmed directories as on Linux: a process of this user
+    /// that swaps one in that window can point a fetch or read at another
+    /// repository. Each command takes a freshly checked name, and the
+    /// transaction script verifies every identity again before it commits.
+    #[cfg(target_os = "macos")]
+    fn path(&self, index: usize) -> Result<PathBuf, String> {
+        crate::fs_safety::reaching_path(&self.files[index]).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                "A selected directory moved or was replaced; refresh the checkout confirmation"
+                    .into()
+            } else {
+                error.to_string()
+            }
+        })
+    }
+
+    /// Where retained directory `index` is now, as a name for people.
+    fn location(&self, index: usize) -> io::Result<PathBuf> {
+        let descriptor = self.files[index].as_raw_fd();
+        #[cfg(target_os = "linux")]
+        {
+            fs::read_link(format!("/proc/self/fd/{descriptor}"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::fs_safety::descriptor_path(descriptor)
+        }
     }
 
     fn check(&self, plan: &ExistingPrCheckoutPlan) -> Result<(), String> {
@@ -62,16 +105,17 @@ impl PinnedDirectories {
         service: &RepositoryService<E>,
         read: bool,
     ) -> Result<CommandSpec, String> {
+        let [worktree, git_dir, common_dir] = [self.path(0)?, self.path(1)?, self.path(2)?];
         let arguments = [
-            OsString::from(format!("--git-dir={}", self.path(1).display())),
-            OsString::from(format!("--work-tree={}", self.path(0).display())),
+            OsString::from(format!("--git-dir={}", git_dir.display())),
+            OsString::from(format!("--work-tree={}", worktree.display())),
         ];
         let mut command = (if read {
-            service.git_read(&self.path(0), arguments)
+            service.git_read(&worktree, arguments)
         } else {
-            service.git_mutation(&self.path(0), arguments)
+            service.git_mutation(&worktree, arguments)
         })
-        .env("GIT_COMMON_DIR", self.path(2));
+        .env("GIT_COMMON_DIR", common_dir);
         for file in self.files.iter().chain(&self.protection_files) {
             command = command
                 .inherit_file(file.clone())
@@ -418,9 +462,9 @@ fn transaction<E: ProcessExecutor>(
         .env("CAGENTS_PR_WORKTREE", &plan.worktree.path)
         .env("CAGENTS_PR_GITDIR", &plan.git_dir.path)
         .env("CAGENTS_PR_COMMON", &plan.common_dir.path)
-        .env("CAGENTS_PR_WORKTREE_FD", pinned.path(0))
-        .env("CAGENTS_PR_GITDIR_FD", pinned.path(1))
-        .env("CAGENTS_PR_COMMON_FD", pinned.path(2))
+        .env("CAGENTS_PR_WORKTREE_FD", pinned.path(0)?)
+        .env("CAGENTS_PR_GITDIR_FD", pinned.path(1)?)
+        .env("CAGENTS_PR_COMMON_FD", pinned.path(2)?)
         .env(
             "CAGENTS_PR_WORKTREE_ID",
             format!("{}:{}", plan.worktree.device, plan.worktree.inode),
@@ -631,7 +675,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     let private = tempfile::Builder::new()
         .prefix("cagents-pr-checkout-")
         .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(pinned.path(2))
+        .tempdir_in(pinned.path(2).map_err(refuse)?)
         .map_err(|error| refuse(error.to_string()))?;
     let private_name = private
         .path()
@@ -843,7 +887,8 @@ pub(super) fn reconcile<E: ProcessExecutor>(
         expected_final = current;
         Ok(())
     })();
-    let retained_directory = fs::read_link(pinned.path(2))
+    let retained_directory = pinned
+        .location(2)
         .unwrap_or_else(|_| plan.common_dir.path.clone())
         .join(private_name);
     drop(lease);

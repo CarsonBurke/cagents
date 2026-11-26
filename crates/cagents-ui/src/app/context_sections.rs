@@ -17,6 +17,7 @@
 //! rows they have. Nothing loads or polls for a section that is collapsed.
 
 use super::*;
+use crate::ui_controls::CountTone;
 
 /// One of the context inspector's sections, in the order they stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -153,8 +154,9 @@ fn lead_list_height(panel: f32, sections: usize, own: f32, others: f32) -> f32 {
     (panel - headers - others).max(own)
 }
 
-/// A header's count and the text style that says what kind of count it is.
-type Count = (String, fn(&cosmic::Theme) -> iced::widget::text::Style);
+/// A header's count and the tone of its badge, which says what kind of
+/// count it is.
+type Count = (String, crate::ui_controls::CountTone);
 
 struct Pane<'a> {
     section: Section,
@@ -424,16 +426,10 @@ impl Cagents {
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
         );
-        if let Some((count, style)) = count {
+        if let Some((count, tone)) = count {
             name.push_str(", ");
             name.push_str(description.as_deref().unwrap_or(&count));
-            label.push(
-                design::section_heading(count)
-                    .font(cosmic::font::default())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .class(cosmic::theme::Text::Custom(style))
-                    .into(),
-            );
+            label.push(crate::ui_controls::count_badge(count, tone));
         }
         if let Some((icon, scope)) = scope {
             name.push_str(", for ");
@@ -515,7 +511,7 @@ impl Cagents {
         Pane {
             section: Section::Work,
             title: "Work".into(),
-            count: (count > 0).then(|| (count.to_string(), design::faint_text as _)),
+            count: (count > 0).then(|| (count.to_string(), CountTone::Neutral)),
             scope: None,
             description: None,
             controls: Vec::new(),
@@ -539,7 +535,7 @@ impl Cagents {
         Pane {
             section: Section::Mentioned,
             title: "Mentioned".into(),
-            count: Some((count.to_string(), design::faint_text as _)),
+            count: Some((count.to_string(), CountTone::Neutral)),
             scope: None,
             description: Some(format!(
                 "{count} mentioned pull request{}",
@@ -588,7 +584,7 @@ impl Cagents {
                 dirty_count: Some(count),
                 ..
             }) if view == WorkspaceView::SourceControl => (
-                Some((count.to_string(), design::faint_text as _)),
+                Some((count.to_string(), CountTone::Neutral)),
                 Some(dirty.to_owned()),
             ),
             _ => (None, None),
@@ -900,16 +896,15 @@ impl Cagents {
         if inspector::has_problems(lsp) {
             let open = self.context_sections.is_open(Section::Problems);
             let count = lsp.diagnostics.len();
-            let style: fn(&cosmic::Theme) -> iced::widget::text::Style =
-                match inspector::worst_severity(lsp) {
-                    Some(crate::lsp::LspSeverity::Error) => design::destructive_text,
-                    Some(crate::lsp::LspSeverity::Warning) => design::warning_text,
-                    _ => design::muted_text,
-                };
+            let tone = match inspector::worst_severity(lsp) {
+                Some(crate::lsp::LspSeverity::Error) => CountTone::Danger,
+                Some(crate::lsp::LspSeverity::Warning) => CountTone::Warning,
+                _ => CountTone::Neutral,
+            };
             panes.push(Pane {
                 section: Section::Problems,
                 title: "Problems".into(),
-                count: (count > 0).then(|| (count.to_string(), style)),
+                count: (count > 0).then(|| (count.to_string(), tone)),
                 scope: None,
                 description: None,
                 // A request's failure notice lingers until it is dismissed.
@@ -924,7 +919,8 @@ impl Cagents {
             panes.push(Pane {
                 section: Section::Locations,
                 title: inspector::locations_title(*kind).into(),
-                count: Some((locations.len().to_string(), design::muted_text as _)),
+                // Folded, "0" is how the header says the request found none.
+                count: Some((locations.len().to_string(), CountTone::Neutral)),
                 scope: None,
                 description: None,
                 controls: vec![dismiss()],

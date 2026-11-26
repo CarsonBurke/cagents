@@ -17,7 +17,7 @@ mod widget;
 #[cfg(feature = "ui")]
 pub use widget::SnapshotPreview;
 #[cfg(feature = "ui")]
-pub use widget::monospace_font;
+pub use widget::{drop_faces_without_advances, monospace_font};
 #[cfg(feature = "host")]
 mod worker;
 

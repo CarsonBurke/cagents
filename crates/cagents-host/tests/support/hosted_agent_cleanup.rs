@@ -227,9 +227,9 @@ fn quiesce_automations(
     Ok(())
 }
 
-/// The only executable is this integration target's matched CLI. All inherited
-/// environment is removed before selecting the fixture profile. --no-start is
-/// a public flag: cleanup cannot create a replacement daemon after a failure.
+/// The only executable is this integration target's matched CLI. The fixture
+/// profile retains the caller's delegated authority. The public --no-start
+/// flag prevents cleanup from creating a replacement daemon after a failure.
 pub fn cli(root: &Path, arguments: &[&str], deadline: Instant) -> Result<Value, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -243,7 +243,9 @@ pub fn cli(root: &Path, arguments: &[&str], deadline: Instant) -> Result<Value, 
         .timeout(remaining)
         .output_limits(128 * 1024, 64 * 1024);
     for (name, _) in std::env::vars_os() {
-        spec = spec.env_remove(name);
+        if name != cagents::agent_execution::AUTHORITY_ENV {
+            spec = spec.env_remove(name);
+        }
     }
     for (name, path) in [
         ("HOME", "home"),

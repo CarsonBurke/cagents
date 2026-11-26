@@ -354,9 +354,9 @@ impl Original {
         }
     }
     fn retain(&mut self, reservation: child_reaper::Reservation) {
-        let pidfd = self.pidfd.try_clone().unwrap();
         let child = self.child.take().unwrap();
-        if let Err((error, child, _, reservation)) = reservation.retain(child, pidfd) {
+        let pin = child_reaper::PinnedChild::of(&child).unwrap();
+        if let Err((error, child, _, reservation)) = reservation.retain(child, pin) {
             self.child = Some(child);
             drop(reservation);
             panic!("original ownership transfer: {error}");
@@ -576,12 +576,9 @@ fn quarantined_and_suspended_originals_keep_the_empty_inventory_refused() {
     let reservation = child_reaper::reserve().unwrap();
     let mut original = Original::spawn(&root);
     original.assert_live();
-    let pidfd = original.pidfd.try_clone().unwrap();
-    reservation.preserve_suspended(
-        original.child.take().unwrap(),
-        Some(pidfd),
-        "private admission regression",
-    );
+    let child = original.child.take().unwrap();
+    let pin = child_reaper::PinnedChild::of(&child).unwrap();
+    reservation.preserve_suspended(child, Some(pin), "private admission regression");
     refuse_all(&host, &capability);
     drop(original.input.take());
     original.wait_exit();

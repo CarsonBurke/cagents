@@ -8,11 +8,7 @@ use crate::{
     terminal_ipc::{ClientRequest, ServerResponse, TerminalCloseResult},
     upgrade::handoff::{Phase, Store},
 };
-use std::{
-    fs::File,
-    os::fd::{AsRawFd, FromRawFd},
-    os::unix::fs::PermissionsExt,
-};
+use std::{fs::File, os::unix::fs::PermissionsExt};
 
 const FIXTURE: &str = "CAGENTS_INPUT_UPGRADE_FIXTURE";
 const FIXTURE_TEST: &str = "CAGENTS_INPUT_UPGRADE_TEST";
@@ -132,36 +128,22 @@ fn isolated(name: &str) -> bool {
 // Capabilities are opened for recorded original processes, then their complete
 // process epochs are rechecked. Normal success disarms only after actual exit.
 struct OriginalProcesses {
-    fds: Vec<File>,
+    pins: Vec<crate::daemon::PinnedProcess>,
     armed: bool,
-}
-fn exited(fd: &File) -> bool {
-    let mut poll = libc::pollfd {
-        fd: fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        let result = unsafe { libc::poll(&mut poll, 1, 0) };
-        if result >= 0 {
-            return poll.revents & libc::POLLIN != 0;
-        }
-        assert_eq!(
-            std::io::Error::last_os_error().kind(),
-            std::io::ErrorKind::Interrupted
-        );
-    }
 }
 impl OriginalProcesses {
     fn pin(record: &Record) -> Self {
         let mut pins = Self {
-            fds: Vec::new(),
+            pins: Vec::new(),
             armed: true,
         };
         for process in [&record.root, &record.holder] {
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
-            assert!(fd >= 0, "cannot pin original fixture process");
-            pins.fds.push(unsafe { File::from_raw_fd(fd as i32) });
+            pins.pins.push(
+                u32::try_from(process.pid)
+                    .ok()
+                    .and_then(|pid| crate::daemon::PinnedProcess::open(pid).ok())
+                    .expect("cannot pin original fixture process"),
+            );
             assert!(
                 process.is_current(),
                 "fixture epoch changed during capability capture"
@@ -171,7 +153,7 @@ impl OriginalProcesses {
     }
     fn settle(&mut self) {
         crate::test_timing::eventually("the original root and holder's exit", || {
-            self.fds.iter().all(exited)
+            self.pins.iter().all(|pin| pin.exited().unwrap())
         });
         self.armed = false;
     }
@@ -179,27 +161,11 @@ impl OriginalProcesses {
 impl Drop for OriginalProcesses {
     fn drop(&mut self) {
         if self.armed {
-            for fd in &self.fds {
-                if !exited(fd) {
+            for pin in &self.pins {
+                if !pin.exited().unwrap_or(true) {
                     // Failure-only cleanup for the original pinned fixture.
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            fd.as_raw_fd(),
-                            libc::SIGCONT,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                    }
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            fd.as_raw_fd(),
-                            libc::SIGKILL,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                    }
+                    let _ = pin.signal(libc::SIGCONT);
+                    let _ = pin.signal(libc::SIGKILL);
                 }
             }
         }

@@ -61,6 +61,22 @@ directory. The sessions it launches find `cagents` there first, so a later
 update gives them the new daemon's CLI. A daemon without a matched CLI removes
 the link instead.
 
+The runtime lease excludes a second daemon only within one runtime directory,
+but two sessions can name different runtime directories while sharing one data
+directory: a nested compositor session, for one, gives itself a private
+`XDG_RUNTIME_DIR` and keeps your `HOME`. So a daemon also claims the saved data,
+with a lock file in `claims/` under the data directory that records the
+runtime lease it serves from. A daemon from another runtime directory refuses to
+start while that lease is held, before it restores or saves anything, and its
+error names the serving daemon's process and runtime directory. A window that
+would have started such a daemon shows that error instead. An update keeps the
+claim for its successor without handing over another descriptor: the updater
+holds the outgoing daemon's lease, and the successor inherits it. A daemon that
+can't take the claim for any other reason, such as a read-only data directory,
+starts without it and logs a warning. A window
+claims its own saved window the same way, so a window in another session cannot
+open it twice; a new window there takes the next free one.
+
 Each window holds an exclusive slot lease and its own session database, and a
 shared compatibility fence excludes older single-window UIs. Startup rejects an
 older running UI or Debian peer package that predates the lease marker; upgrade

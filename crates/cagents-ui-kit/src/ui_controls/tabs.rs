@@ -20,12 +20,11 @@ pub struct ViewTab<'a, Message> {
     pub label: Cow<'a, str>,
     /// The accessible name and tooltip, which say what the label cannot fit.
     pub description: Cow<'a, str>,
-    /// A quiet trailing figure, such as how many rows the view holds, and the
-    /// text style it draws in, e.g. [`crate::design::muted_text`].
-    pub count: Option<(
-        Cow<'a, str>,
-        fn(&cosmic::Theme) -> iced::widget::text::Style,
-    )>,
+    /// How many rows the view holds, drawn as a [`count_badge`] after the
+    /// label, in its tone.
+    ///
+    /// [`count_badge`]: crate::ui_controls::count_badge
+    pub count: Option<(Cow<'a, str>, crate::ui_controls::CountTone)>,
     pub selected: bool,
     pub id: Option<widget::Id>,
     /// What choosing the tab raises. The selected tab publishes nothing:
@@ -120,12 +119,8 @@ fn tab_button<'a, Message: Clone + 'a>(
         Some((count, _)) => format!("{description}: {count}").into(),
         None => description,
     };
-    if let Some((count, style)) = count {
-        content = content.push(
-            design::caption(count)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .class(cosmic::theme::Text::Custom(style)),
-        );
+    if let Some((count, tone)) = count {
+        content = content.push(crate::ui_controls::count_badge(count, tone));
     }
     let mut button = widget::button::custom(widget::container(content).center_y(Length::Fill))
         .class(view_tab_style(selected))

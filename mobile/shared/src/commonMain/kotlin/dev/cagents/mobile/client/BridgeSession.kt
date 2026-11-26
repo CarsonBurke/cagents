@@ -1,6 +1,7 @@
 package dev.cagents.mobile.client
 
 import dev.cagents.mobile.protocol.Call
+import dev.cagents.mobile.protocol.DetailPage
 import dev.cagents.mobile.protocol.ErrorCode
 import dev.cagents.mobile.protocol.Event
 import dev.cagents.mobile.protocol.RemoteError
@@ -43,7 +44,7 @@ class BridgeSession(
 ) {
     private val lock = Mutex()
     private var nextId = 1L
-    private val pending = HashMap<Long, CompletableDeferred<Unit>>()
+    private val pending = HashMap<Long, CompletableDeferred<DetailPage?>>()
     private var ended: String? = null
 
     /** Sends `hello` and reads `welcome`, or throws [ConnectFailure.Refused] or [ConnectFailure.Network]. */
@@ -65,8 +66,8 @@ class BridgeSession(
      * Sends [call] and waits for its answer. Throws [RequestFailed] for an
      * `error` answer and [ConnectionLost] when the connection ends first.
      */
-    suspend fun call(call: Call) {
-        val answer = CompletableDeferred<Unit>()
+    suspend fun call(call: Call): DetailPage? {
+        val answer = CompletableDeferred<DetailPage?>()
         val id = lock.withLock {
             ended?.let { throw ConnectionLost(it) }
             val id = nextId++
@@ -83,7 +84,7 @@ class BridgeSession(
                 channel.close()
                 throw ConnectionLost(e.message ?: "The connection was lost.")
             }
-            answer.await()
+            return answer.await()
         } finally {
             // A caller that stopped waiting, such as a timed-out ping, leaves nothing behind.
             if (!answer.isCompleted) withContext(NonCancellable) { lock.withLock { pending.remove(id) } }
@@ -127,7 +128,7 @@ class BridgeSession(
                 continue
             }
             when (decoded) {
-                is ServerLine.Ok -> resolve(decoded.id, null)
+                is ServerLine.Ok -> resolve(decoded.id, null, decoded.page)
                 is ServerLine.Error -> {
                     val id = decoded.id
                     if (id != null) resolve(id, decoded.error)
@@ -159,9 +160,9 @@ class BridgeSession(
         session to ((data["reset"] as? JsonPrimitive)?.booleanOrNull ?: false)
     }.getOrNull()
 
-    private suspend fun resolve(id: Long, error: RemoteError?) {
+    private suspend fun resolve(id: Long, error: RemoteError?, page: DetailPage? = null) {
         val answer = lock.withLock { pending.remove(id) } ?: return
-        if (error == null) answer.complete(Unit) else answer.completeExceptionally(RequestFailed(error))
+        if (error == null) answer.complete(page) else answer.completeExceptionally(RequestFailed(error))
     }
 
     private suspend fun end(reason: String) = withContext(NonCancellable) {

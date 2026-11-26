@@ -139,6 +139,22 @@ impl Fixture {
         &self.source.owned_codex_listener.as_ref().unwrap().socket
     }
 
+    fn close_after_unproved_loss(&self) {
+        let result = close_retained_from_pane(&self.host, &self.source);
+        #[cfg(target_os = "linux")]
+        result.unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let refusal = result.unwrap_err();
+            assert!(
+                refusal.contains(LOST_EXECUTION_UNPROVED)
+                    || refusal.contains("Cannot confirm detached provider cleanup"),
+                "{refusal}"
+            );
+            assert!(self.socket().parent().unwrap().exists());
+        }
+    }
+
     /// A discovery record for this conversation's holder, as the holder writes
     /// it, naming `holder` and the provider `root`.
     fn record(&self, holder: registry::Process, root: registry::Process) -> Record {
@@ -166,6 +182,7 @@ impl Fixture {
         record
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_settled(&self) {
         let state = self.host.lock().unwrap();
         assert!(!state.native_closing.contains_key(&self.source.id));
@@ -176,6 +193,7 @@ impl Fixture {
 /// A finished local actor: it read its history, exited and closed, so it owns
 /// no work and inventory hides it. A stand-in for a Codex actor whose provider
 /// ended with its turn, which a test cannot start without a provider.
+#[cfg(target_os = "linux")]
 fn finished_actor(root: &std::path::Path) -> chat::runtime::Handle {
     let session_id = "12345678-1234-4234-8234-123456789abc";
     let project = root.join("missing-project");
@@ -287,6 +305,7 @@ fn exited(pid: i32) -> registry::Process {
 /// its record, so exact cleanup has nothing to adopt. Before, every Close was
 /// refused with "No exact native holder or confirmed close receipt is
 /// available" and the pane stayed open for good.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pane_whose_codex_owner_left_no_trace_closes() {
     let Some(root) = isolated("a_pane_whose_codex_owner_left_no_trace_closes") else {
@@ -303,6 +322,7 @@ fn a_pane_whose_codex_owner_left_no_trace_closes() {
 
 /// A holder that died with its provider: its record outlives both until
 /// discovery runs, and names nothing that could still be stopped.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pane_whose_holder_and_provider_both_exited_closes_and_retires_their_record() {
     let Some(root) =
@@ -315,6 +335,32 @@ fn a_pane_whose_holder_and_provider_both_exited_closes_and_retires_their_record(
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
     assert!(!has_native_owner(&fixture.source).unwrap());
     fixture.assert_settled();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_missing_native_owner_keeps_its_allocation_without_exact_retirement() {
+    let Some(root) =
+        isolated("a_missing_native_owner_keeps_its_allocation_without_exact_retirement")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let result = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(result.contains(LOST_EXECUTION_UNPROVED), "{result}");
+    assert!(fixture.socket().parent().unwrap().exists());
+
+    let record = fixture.record(exited(i32::MAX - 1), exited(i32::MAX - 2));
+    let result = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(
+        result.contains("Cannot confirm detached provider cleanup"),
+        "{result}"
+    );
+    assert_eq!(
+        registered_native_owner(&fixture.source).unwrap(),
+        Some(record)
+    );
+    assert!(fixture.socket().parent().unwrap().exists());
 }
 
 /// A provider that outlived its holder may still be running a turn. Nothing
@@ -353,17 +399,77 @@ fn a_provider_that_outlived_its_holder_keeps_the_refusal() {
 /// and every Close of the pane waits on the dead holder until it times out.
 #[test]
 fn a_provider_inherits_nothing_from_its_holder() {
+    const READY: &str = "CAGENTS_TEST_PROVIDER_DESCRIPTORS_READY";
+    if let Some(ready) = std::env::var_os(READY) {
+        // mkdir publishes readiness without opening a descriptor. Leave
+        // the table alone so the parent can inspect it after exec and startup.
+        std::fs::create_dir(ready).unwrap();
+        thread::sleep(Duration::from_secs(60));
+        return;
+    }
     let Some(root) = isolated("a_provider_inherits_nothing_from_its_holder") else {
         return;
     };
     let fixture = Fixture::new(&root);
-    let _spawned = Spawned::new(&fixture.source);
+    let ready = root.join("provider-ready");
+    let executable = std::env::current_exe().unwrap();
+    let _spawned = Spawned::running(
+        &fixture.source,
+        "/usr/bin/env",
+        &[
+            &format!("{READY}={}", ready.display()),
+            executable.to_str().unwrap(),
+            "--exact",
+            "host::chat::lost_codex_owner_close_tests::a_provider_inherits_nothing_from_its_holder",
+        ],
+    );
     let record = Spawned::record(&fixture.source);
+    // The holder reports successful exec before the dynamic loader has
+    // necessarily closed its own files. Wait for the provider's test body.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.is_dir() {
+        assert!(record.root.is_current(), "the descriptor probe exited");
+        assert!(
+            Instant::now() < deadline,
+            "the descriptor probe never started"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(record.root.is_current());
+    #[cfg(target_os = "linux")]
     let descriptors = std::fs::read_dir(format!("/proc/{}/fd", record.root.pid))
         .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|fd| !["0", "1", "2"].contains(&fd.as_str()))
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let fd = entry.file_name().into_string().unwrap();
+            (!["0", "1", "2"].contains(&fd.as_str()))
+                .then(|| (fd, entry.path().read_link().unwrap()))
+        })
         .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    let descriptors = {
+        // SAFETY: the kernel record contains only integers.
+        let mut entries: [libc::proc_fdinfo; 64] = unsafe { std::mem::zeroed() };
+        let bytes = std::mem::size_of_val(&entries) as libc::c_int;
+        // SAFETY: entries describes a writable buffer of exactly bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                record.root.pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast(),
+                bytes,
+            )
+        };
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        assert!(written > 0 && written < bytes && (written as usize).is_multiple_of(entry));
+        entries[..written as usize / entry]
+            .iter()
+            .filter(|fd| fd.proc_fd > 2)
+            .map(|fd| fd.proc_fd)
+            .collect::<Vec<_>>()
+    };
+    assert!(record.root.is_current());
     assert!(descriptors.is_empty(), "inherited {descriptors:?}");
 }
 
@@ -375,7 +481,7 @@ fn a_listener_still_being_served_keeps_the_refusal() {
         return;
     };
     let fixture = Fixture::new(&root);
-    let _server = std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap();
+    let _server = crate::descriptor::bind(fixture.socket()).unwrap();
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().exists());
 }
@@ -396,7 +502,7 @@ fn a_start_holding_the_allocation_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().parent().unwrap().exists());
     drop(reservation);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
 }
 
 /// A terminal about to run Codex's CLI on the conversation launches a writer
@@ -454,7 +560,8 @@ fn a_terminal_spawning_codex_on_the_conversation_keeps_the_refusal() {
         .unwrap_err();
     assert!(refused.retryable, "{refused:?}");
     drop(closing);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
+    #[cfg(target_os = "linux")]
     fixture.assert_settled();
     // Once it closed, the terminal may resume the conversation.
     fixture
@@ -480,12 +587,17 @@ fn a_lost_execution_settles_only_under_its_close_claim() {
         let mut state = fixture.host.lock().unwrap();
         capacity::Reservation::closing(&fixture.host, &mut state, &fixture.source).unwrap()
     };
-    settle_lost_execution(&fixture.host, &fixture.source, &proof).unwrap();
+    let outcome = settle_lost_execution(&fixture.host, &fixture.source, &proof);
+    #[cfg(target_os = "linux")]
+    outcome.unwrap();
+    #[cfg(target_os = "macos")]
+    assert!(outcome.unwrap_err().contains(LOST_EXECUTION_UNPROVED));
     drop(closing);
 }
 
 /// The state the report left: the same daemon, no record, no receipt, and the
 /// allocation itself already given back.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pane_whose_allocation_is_already_gone_closes() {
     let Some(root) = isolated("a_pane_whose_allocation_is_already_gone_closes") else {
@@ -509,13 +621,14 @@ fn a_process_naming_the_listener_keeps_the_refusal() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().parent().unwrap().exists());
     drop(named);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
 }
 
 /// A receipt shows how this terminal's owner closed another descriptor of
 /// its conversation. It proves nothing about this one either way, so this
 /// one's Close asks what can still run, as it would with no receipt: once
 /// nothing can, it closes, and the receipt stays for the close it confirms.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_receipt_for_another_descriptor_does_not_hold_the_close() {
     let Some(root) = isolated("a_receipt_for_another_descriptor_does_not_hold_the_close") else {
@@ -622,6 +735,7 @@ fn kill(process: &registry::Process) {
 /// "The native cleanup receipt is unavailable"; it now settles as the lost
 /// owner it is. `released` is whether the earlier attempt's Release had
 /// already settled, leaving only the confirmation to fail.
+#[cfg(target_os = "linux")]
 fn pending_close_whose_owner_then_ended(root: &std::path::Path, released: bool) {
     let fixture = Fixture::new(root);
     let spawned = Spawned::new(&fixture.source);
@@ -724,6 +838,7 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
     assert!(!record.holder.is_current() && !record.root.is_current());
 }
 
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_pending_close_whose_owner_then_ended_closes() {
     let Some(root) = isolated("a_pending_close_whose_owner_then_ended_closes") else {
@@ -732,6 +847,7 @@ fn a_pending_close_whose_owner_then_ended_closes() {
     pending_close_whose_owner_then_ended(&root, false);
 }
 
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_released_close_whose_owner_then_ended_closes() {
     let Some(root) = isolated("a_released_close_whose_owner_then_ended_closes") else {
@@ -771,7 +887,8 @@ fn a_pending_close_whose_provider_outlived_its_holder_waits_for_it() {
     );
     assert!(has_native_owner(&fixture.source).unwrap());
     kill(&record.root);
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.close_after_unproved_loss();
+    #[cfg(target_os = "linux")]
     fixture.assert_settled();
 }
 
@@ -846,19 +963,41 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
         []
     );
     assert!(record.root.reaped(), "ending left the provider running");
-    close().unwrap();
-    fixture.assert_settled();
-    assert!(!has_native_owner(&fixture.source).unwrap());
-    assert!(!fixture.socket().parent().unwrap().exists());
+    #[cfg(target_os = "linux")]
+    {
+        close().unwrap();
+        fixture.assert_settled();
+        assert!(!has_native_owner(&fixture.source).unwrap());
+        assert!(!fixture.socket().parent().unwrap().exists());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let refusal = close().expect_err("a lost watch cannot prove teardown");
+        assert!(
+            refusal
+                .message
+                .contains("Cannot confirm detached provider cleanup"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            fixture
+                .host
+                .lock()
+                .unwrap()
+                .chats
+                .contains_key(&fixture.source.id)
+        );
+    }
 }
 
-/// A tool Codex started stays in its process group after Codex and the
-/// helper die, and still holds the conversation. Its pane names it, though it
-/// names no listener, and ends it, and the conversation then closes.
+/// A tool that outlives Codex and its helper still blocks the conversation.
+/// Linux can prove the adopted process group; Darwin only has numeric
+/// membership once both leaders are gone and must decline to signal it.
 #[test]
-fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
+fn a_codex_tool_left_after_its_provider_and_helper_died_requires_signal_proof() {
     let Some(root) =
-        isolated("a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes")
+        isolated("a_codex_tool_left_after_its_provider_and_helper_died_requires_signal_proof")
     else {
         return;
     };
@@ -891,6 +1030,15 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
         }
     };
     let tool = registry::Process::read(tool_pid).unwrap();
+    struct ToolGuard(crate::daemon::PinnedProcess);
+    impl Drop for ToolGuard {
+        fn drop(&mut self) {
+            let _ = self.0.signal(libc::SIGKILL);
+        }
+    }
+    let pin = crate::daemon::PinnedProcess::open(tool.pid as u32).unwrap();
+    assert!(tool.is_current());
+    let tool_guard = ToolGuard(pin);
     kill(&record.holder);
     kill(&record.root);
     assert!(tool.is_current(), "the tool outlived its provider");
@@ -905,16 +1053,44 @@ fn a_codex_tool_left_after_its_provider_and_helper_died_is_ended_then_closes() {
             .iter()
             .map(|process| (process.process.pid, process.name.as_str(), process.proved))
             .collect::<Vec<_>>(),
-        [(tool_pid, "sleep", true)]
+        [(tool_pid, "sleep", cfg!(target_os = "linux"))]
     );
-    assert_eq!(
-        lost_processes(&fixture.host, &fixture.source, &shown(&found)).unwrap(),
-        []
+    #[cfg(target_os = "linux")]
+    {
+        let remaining = lost_processes(&fixture.host, &fixture.source, &shown(&found)).unwrap();
+        assert!(remaining.is_empty());
+        assert!(tool.reaped(), "ending left the tool running");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let remaining =
+            lost_processes(&fixture.host, &fixture.source, &[found[0].process]).unwrap();
+        assert_eq!(remaining, found);
+        assert!(
+            !tool_guard.0.exited().unwrap(),
+            "the unproved tool was signaled"
+        );
+        assert!(tool_guard.0.signal(libc::SIGKILL).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tool_guard.0.exited().unwrap() {
+            assert!(Instant::now() < deadline, "the fixture tool never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    drop(tool_guard);
+    fixture.close_after_unproved_loss();
+    #[cfg(target_os = "linux")]
+    {
+        fixture.assert_settled();
+        assert!(!has_native_owner(&fixture.source).unwrap());
+    }
+    #[cfg(target_os = "macos")]
+    assert!(
+        has_native_owner(&fixture.source)
+            .unwrap_err()
+            .message
+            .contains("Cannot confirm detached provider cleanup")
     );
-    assert!(tool.reaped(), "ending left the tool running");
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
-    fixture.assert_settled();
-    assert!(!has_native_owner(&fixture.source).unwrap());
 }
 
 /// While anything of the old conversation may still run, reopening it keeps
@@ -925,7 +1101,7 @@ fn a_conversation_whose_listener_is_served_does_not_reopen() {
         return;
     };
     let fixture = Fixture::new(&root);
-    let _server = std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap();
+    let _server = crate::descriptor::bind(fixture.socket()).unwrap();
     process_inner(
         &fixture.host,
         0,
@@ -941,6 +1117,7 @@ fn a_conversation_whose_listener_is_served_does_not_reopen() {
 /// pane's inventory no longer lists it and Close goes to exact cleanup, which
 /// refused it with "No exact native holder or confirmed close receipt is
 /// available". The pane now closes, and the resident goes with it.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_finished_resident_whose_owner_ended_closes() {
     let Some(root) = isolated("a_finished_resident_whose_owner_ended_closes") else {
@@ -1020,6 +1197,7 @@ fn bound_agent(fixture: &Fixture, root: &std::path::Path) -> crate::agent_execut
     accepted
 }
 
+#[cfg(target_os = "linux")]
 fn agent_closed(fixture: &Fixture, id: crate::model::AgentId) -> bool {
     let registry = fixture
         .host
@@ -1040,6 +1218,7 @@ fn agent_closed(fixture: &Fixture, id: crate::model::AgentId) -> bool {
 /// Nothing settled it: the lost-owner proof refused any conversation an
 /// agent claimed, and the agent's own close found no receipt either. Its
 /// Close now ends the agent with the pane.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_lost_codex_agents_pane_closes_and_ends_the_agent() {
     let Some(root) = isolated("a_lost_codex_agents_pane_closes_and_ends_the_agent") else {
@@ -1055,6 +1234,7 @@ fn a_lost_codex_agents_pane_closes_and_ends_the_agent() {
 }
 
 /// `cagents agent close` takes the same route for that agent.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn a_lost_codex_agent_closes_by_command() {
     let Some(root) = isolated("a_lost_codex_agent_closes_by_command") else {
@@ -1102,27 +1282,72 @@ fn a_codex_agent_whose_provider_survives_keeps_the_refusal() {
     assert!(has_native_owner(&fixture.source).unwrap());
 }
 
+#[cfg(target_os = "macos")]
+const CODEX_FIXTURE_MARKER: &str = "FIXTURE_STARTED_ARGV";
+
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static OFFLINE_CODEX_SERVER: extern "C" fn() = {
+    extern "C" fn serve_fixture() {
+        let Some(marker) = std::env::var_os(CODEX_FIXTURE_MARKER) else {
+            return;
+        };
+        let Ok(arguments) = std::env::args_os()
+            .skip(1)
+            .map(std::ffi::OsString::into_string)
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return;
+        };
+        if !matches!(arguments.as_slice(), [server, listen, endpoint]
+            if server == "app-server" && listen == "--listen" && endpoint.starts_with("unix://"))
+        {
+            return;
+        }
+        // Only a private fixture with the exact app-server argv enters.
+        // The holder gives it null stdin and owns the shutdown signal.
+        let notes = arguments.join("\n") + "\n";
+        if let Err(error) = std::fs::write(marker, notes) {
+            eprintln!("offline Codex fixture: {error}");
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(0);
+    }
+    serve_fixture
+};
+
 /// A fake app-server records its actual launch, then waits without speaking the
 /// provider protocol. These tests cover execution admission, not provider RPC.
 fn codex_start_fixture(root: &std::path::Path) -> Fixture {
     let mut fixture = Fixture::new(root);
     let program = root.join("codex");
-    std::fs::write(
-        &program,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAGENTS_START_PROOF_ARGV\"\nexec /bin/sleep 60\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"${0%/*}/started-argv\"\nexec /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &program).unwrap();
     let home = root.join("codex-home");
     std::fs::create_dir(&home).unwrap();
     fixture.source.launch.recipe.program = program.to_str().unwrap().into();
-    fixture.source.launch.recipe.environment = BTreeMap::from([
-        ("CODEX_HOME".into(), home.to_str().unwrap().into()),
-        (
-            "CAGENTS_START_PROOF_ARGV".into(),
+    let environment = BTreeMap::from([("CODEX_HOME".into(), home.to_str().unwrap().into())]);
+    #[cfg(target_os = "macos")]
+    let environment = {
+        let mut environment = environment;
+        environment.insert(
+            CODEX_FIXTURE_MARKER.into(),
             root.join("started-argv").to_str().unwrap().into(),
-        ),
-    ]);
+        );
+        environment
+    };
+    fixture.source.launch.recipe.environment = environment;
     fixture.host.lock().unwrap().codex_listeners = CodexListenerRoots::at(root.into());
     fixture
 }
@@ -1161,45 +1386,46 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
             "the resumed allocation must pass the saved pane's checkpoint contract"
         );
     }
-    let expected = format!(
-        "app-server\n--listen\nunix://{}\n",
-        fixture.host.lock().unwrap().chats[&fixture.source.id]
-            .session
-            .owned_codex_listener
-            .as_ref()
-            .unwrap()
-            .socket
-            .display()
+    let (expected, handle) = {
+        let state = fixture.host.lock().unwrap();
+        let chat = &state.chats[&fixture.source.id];
+        let endpoint = &chat.session.owned_codex_listener.as_ref().unwrap().socket;
+        (
+            format!("app-server\n--listen\nunix://{}\n", endpoint.display()),
+            chat.handle.clone(),
+        )
+    };
+    let holder_socket = registry::socket(
+        &registry::directory(Kind::Native).unwrap(),
+        fixture.source.id,
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let argv = loop {
-        if let Ok(argv) = std::fs::read_to_string(root.join("started-argv"))
-            && argv == expected
-        {
-            break argv;
+        let observed = std::fs::read_to_string(root.join("started-argv"));
+        if observed.as_ref().is_ok_and(|argv| argv == &expected) {
+            break observed.unwrap();
         }
-        assert!(
-            Instant::now() < deadline,
-            "the fake app-server never launched"
-        );
+        if Instant::now() >= deadline {
+            let holder = registry::execution_record(&holder_socket);
+            let image = holder
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map(|record| record.root.executable());
+            let failure = handle.failure();
+            let cleanup = handle.close();
+            panic!(
+                "the fake app-server never recorded {expected:?}: {observed:?}; failure {failure:?}; holder {holder:?}; image {image:?}; cleanup {cleanup:?}"
+            );
+        }
         thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(
         argv.lines().collect::<Vec<_>>(),
         ["app-server", "--listen", expected.lines().nth(2).unwrap()]
     );
-    let handle = fixture.host.lock().unwrap().chats[&fixture.source.id]
-        .handle
-        .clone();
     handle.close().unwrap();
-    let record = registry::recovery_candidate(
-        &registry::socket(
-            &registry::directory(Kind::Native).unwrap(),
-            fixture.source.id,
-        ),
-        Kind::Native,
-    )
-    .unwrap();
+    let record = registry::recovery_candidate(&holder_socket, Kind::Native).unwrap();
     assert!(
         record.is_none(),
         "closing must reap the fake app-server's holder"
@@ -1210,12 +1436,29 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
 /// arguments. It never contacts a provider; stdin keeps it alive until drop.
 struct CodexProcess(std::process::Child);
 
+#[cfg(target_os = "macos")]
+fn sign_fixture_program(program: &std::path::Path) {
+    // An Apple system signature hides the fixture's identifying environment.
+    let signed = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(program)
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+}
+
 impl CodexProcess {
     fn new(root: &std::path::Path, arguments: &[&str]) -> Self {
         use std::io::Read;
         let program = root.join("writer/codex");
         std::fs::create_dir_all(program.parent().unwrap()).unwrap();
         std::fs::copy("/bin/bash", &program).unwrap();
+        #[cfg(target_os = "macos")]
+        sign_fixture_program(&program);
         let mut child = std::process::Command::new(&program)
             .args(["-c", "printf ready; IFS= read -r release", "codex"])
             .args(arguments)
@@ -1315,6 +1558,7 @@ fn codex_start_earlier_boot_legacy_pane_starts() {
     assert_codex_started(&fixture, &root);
 }
 
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_legacy_pane_with_an_ended_holder_record_starts() {
     let Some(root) = isolated("codex_start_legacy_pane_with_an_ended_holder_record_starts") else {
@@ -1331,6 +1575,7 @@ fn codex_start_legacy_pane_with_an_ended_holder_record_starts() {
     assert_codex_started(&fixture, &root);
 }
 
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_start_paired_console_without_surviving_execution_starts() {
     let Some(root) = isolated("codex_start_paired_console_without_surviving_execution_starts")
@@ -1353,6 +1598,7 @@ fn codex_start_paired_console_without_surviving_execution_starts() {
 /// Reopening a conversation whose pane closed after losing its owner: that
 /// owner left no receipt, and the old refusal asked the user to restore the
 /// pane they had just closed and close it again. It reopens, and starts.
+#[cfg(target_os = "linux")] // Darwin requires exact same-boot retirement evidence.
 #[test]
 fn codex_picker_resume_of_an_ended_pane_starts() {
     let Some(root) = isolated("codex_picker_resume_of_an_ended_pane_starts") else {
@@ -1542,15 +1788,24 @@ fn codex_start_refuses_a_bound_unlinked_published_target() {
     };
     let fixture = codex_start_fixture(&root);
     let target = root.join("published.sock");
-    let _server = std::os::unix::net::UnixListener::bind(&target).unwrap();
+    let _server = crate::descriptor::bind(&target).unwrap();
     std::os::unix::fs::symlink(&target, fixture.socket()).unwrap();
     std::fs::remove_file(&target).unwrap();
     let failure = codex_start(&fixture).unwrap_err();
+    #[cfg(target_os = "linux")]
     assert!(
         failure.message.ends_with(&format!(
             "Codex is still serving this conversation at {}. Stop that server, then try again.",
             target.display()
         )),
+        "{}",
+        failure.message
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        failure
+            .message
+            .contains("previous Codex execution still has live processes"),
         "{}",
         failure.message
     );
@@ -1570,7 +1825,7 @@ fn codex_start_joins_a_served_listener_without_launching() {
     };
     let mut fixture = codex_start_fixture(&root);
     let target = root.join("published.sock");
-    let _server = std::os::unix::net::UnixListener::bind(&target).unwrap();
+    let _server = crate::descriptor::bind(&target).unwrap();
     std::os::unix::fs::symlink(&target, fixture.socket()).unwrap();
     // Missing old ownership evidence must not block an existing attachment.
     fixture.source.owned_codex_listener = None;
@@ -1619,17 +1874,18 @@ fn codex_picker_resume_refuses_the_old_panes_surviving_marked_process() {
     assert!(!root.join("started-argv").exists());
     assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
     drop(writer);
-    assert!(matches!(
-        process_inner(
-            &fixture.host,
-            1,
-            ClientRequest::ChatPrepareResume {
-                source: fixture.source.clone(),
-            },
-        )
-        .unwrap(),
-        ServerResponse::ChatResumePrepared { .. }
-    ));
+    let retry = process_inner(
+        &fixture.host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    );
+    let ServerResponse::ChatResumePrepared { session } = retry.unwrap() else {
+        panic!("the old allocation was not prepared after its writer exited");
+    };
+    assert_ne!(session.id, fixture.source.id);
+    assert_eq!(session.launch.session_id, fixture.source.launch.session_id);
     assert!(!root.join("started-argv").exists());
 }
 
@@ -1802,7 +2058,9 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
     );
     let failure = codex_start(&fixture).unwrap_err();
     assert!(
-        failure.message.contains("could not be checked"),
+        failure
+            .message
+            .contains("The paired Codex console is still live"),
         "{}",
         failure.message
     );
@@ -1817,11 +2075,27 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
     }
     let stale_failure = codex_start(&fixture).unwrap_err();
     assert!(
-        stale_failure.message.contains("could not be checked"),
+        stale_failure
+            .message
+            .contains("The paired Codex console is still live"),
         "{}",
         stale_failure.message
     );
     assert!(!root.join("started-argv").exists());
+    assert!(fixture.socket().parent().unwrap().is_dir());
+    assert!(
+        registry::execution_record(&registry::socket(
+            &registry::directory(Kind::Native).unwrap(),
+            id
+        ))
+        .unwrap()
+        .is_none()
+    );
+    {
+        let state = fixture.host.lock().unwrap();
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats.is_empty());
+    }
     handle.shutdown().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !handle.is_completed() {

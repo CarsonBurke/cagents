@@ -6,6 +6,11 @@ its agent record nor, unless a window showed it, its pane; this puts a fixture
 back in that state. Run `forget` through `native-evidence env` between
 sessions, with the fixture daemon stopped.
 
+`forget-pane` forgets them in the panes alone, which also lose the continuity
+the provider's confirmation saved with the ID: the agents keep theirs, as when a
+window wrote an agent's pane from the agent it read before the provider named
+the thread, and nothing put the ID in the pane before its process ended.
+
 `listeners` prints the Codex listener socket each forgotten agent's pane owns,
 one per line, for a stand-in provider that outlived its daemon.
 """
@@ -34,28 +39,32 @@ def registry_path():
     return paths[0].resolve(strict=True)
 
 
-def forget(db):
+def forget(db, panes_only=False):
     forgotten = []
     for agent, record in db.execute("SELECT id, record FROM agents WHERE closed = 0").fetchall():
         record = json.loads(record)
         chat = (record.get("session") or {}).get("Chat")
         if not chat or chat["launch"]["provider"] != "Codex":
             continue
-        chat["launch"]["session_id"] = None
-        db.execute("UPDATE agents SET record = ? WHERE id = ?", (json.dumps(record), agent))
-        for token, source in db.execute(
-            "SELECT token, source FROM agent_authorities WHERE session_id = ?", (chat["id"],)
-        ).fetchall():
-            source = json.loads(source)
-            source["Chat"]["launch"]["session_id"] = None
-            db.execute(
-                "UPDATE agent_authorities SET source = ? WHERE token = ?", (json.dumps(source), token)
-            )
+        if not panes_only:
+            chat["launch"]["session_id"] = None
+            db.execute("UPDATE agents SET record = ? WHERE id = ?", (json.dumps(record), agent))
+            for token, source in db.execute(
+                "SELECT token, source FROM agent_authorities WHERE session_id = ?", (chat["id"],)
+            ).fetchall():
+                source = json.loads(source)
+                source["Chat"]["launch"]["session_id"] = None
+                db.execute(
+                    "UPDATE agent_authorities SET source = ? WHERE token = ?",
+                    (json.dumps(source), token),
+                )
         for pane, descriptor in db.execute(
             "SELECT id, descriptor FROM panes WHERE kind = 'chat' AND resource = ?", (chat["id"],)
         ).fetchall():
             descriptor = json.loads(descriptor)
             descriptor["launch"]["session_id"] = None
+            if panes_only:
+                descriptor["native_continuity"] = "ReconnectOnly"
             db.execute(
                 "UPDATE panes SET descriptor = ?, provider_session = NULL WHERE id = ?",
                 (json.dumps(descriptor), pane),
@@ -84,7 +93,7 @@ def listeners(db):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["forget", "listeners"])
+    parser.add_argument("action", choices=["forget", "forget-pane", "listeners"])
     action = parser.parse_args().action
     if action == "listeners":
         db = sqlite3.connect(f"file:{registry_path()}?mode=ro", uri=True, timeout=5)
@@ -92,7 +101,7 @@ def main():
         return
     db = sqlite3.connect(f"file:{registry_path()}?mode=rw", uri=True, timeout=5)
     with db:
-        print(json.dumps({"forgotten": forget(db)}))
+        print(json.dumps({"forgotten": forget(db, panes_only=action == "forget-pane")}))
 
 
 if __name__ == "__main__":

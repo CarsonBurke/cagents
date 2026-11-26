@@ -97,6 +97,7 @@ impl Peer {
                     Err(error) => panic!("private notification listener: {error}"),
                 }
             };
+            peer.set_nonblocking(false).unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             peer.set_write_timeout(Some(Duration::from_secs(3)))
                 .unwrap();

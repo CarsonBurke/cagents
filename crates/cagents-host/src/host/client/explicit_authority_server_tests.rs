@@ -17,10 +17,7 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     fs,
-    os::{
-        fd::AsRawFd,
-        unix::{fs::PermissionsExt, net::UnixListener},
-    },
+    os::{fd::AsRawFd, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -165,7 +162,7 @@ impl PrivateServer {
         state.enable_holder_recovery();
         state.install_model(crate::host::model::Registry::at(&root.join("model.sqlite3")).unwrap());
         let host = Arc::new(HostLock::new(state));
-        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let listener = crate::descriptor::bind(&paths.socket).unwrap();
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (gate_tx, gated) = crossbeam_channel::bounded(1);
@@ -195,7 +192,7 @@ impl PrivateServer {
             thread::spawn(move || {
                 let mut clients = Vec::new();
                 while !stop.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match crate::descriptor::accept(&listener) {
                         Ok((stream, _)) => {
                             assert!(clients.len() < 12, "unexpected reconnect loop");
                             let client = clients.len() as ClientId + 1;

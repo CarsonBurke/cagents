@@ -14,6 +14,57 @@ fn test_host() -> HostState {
 }
 
 #[test]
+fn restore_keeps_the_checkpoint_until_ready_publication_is_finalized() {
+    use crate::upgrade::handoff::{Checkpoint, Phase, Store};
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(HostLock::new(test_host_with_incarnation("successor")));
+    let source = test_host_with_incarnation("source").proof().clone();
+    let mut checkpoint = Checkpoint::new(source, Vec::new(), Vec::new(), Vec::new());
+    checkpoint.phase = Phase::Ready;
+    let store = Store::open(directory.path()).unwrap();
+    let path = store.path.clone();
+    store.save(&checkpoint).unwrap();
+    let restore = |store| {
+        restore_upgrade_checkpoint(
+            &host,
+            store,
+            Some(checkpoint.clone()),
+            directory.path(),
+            None,
+        )
+        .unwrap()
+    };
+    let interrupted = restore(store);
+    let evidence = std::fs::read(&path).unwrap();
+    drop(interrupted);
+    assert_eq!(std::fs::read(&path).unwrap(), evidence);
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(store.load().unwrap().unwrap().phase, Phase::Restoring);
+
+    // Simulate a fresh startup from another acknowledged Ready checkpoint.
+    store.save(&checkpoint).unwrap();
+    let mut restored = restore(store);
+    restored.finish(&host).unwrap();
+    assert!(!path.exists());
+    assert!(host.lock().unwrap().retained_startup_checkpoint().is_none());
+
+    let store = Store::open(directory.path()).unwrap();
+    store.save(&checkpoint).unwrap();
+    let mut restored = restore(store);
+    // A failed retirement must keep the original identities protected even
+    // if the canonical name is already gone or can no longer be read.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(restored.finish(&host).is_err());
+    let state = host.lock().unwrap();
+    let retained = state.retained_startup_checkpoint().unwrap();
+    assert_eq!(retained.proof, checkpoint.proof);
+    assert_eq!(retained.phase, Phase::Restoring);
+    assert!(state.startup_recovery().is_some());
+}
+
+#[test]
 fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
     use crate::terminal_ipc::{ClientRequest, ServerResponse};
     let host = Arc::new(HostLock::new(test_host()));
@@ -51,6 +102,46 @@ fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
         .retain_startup_recovery("a later failure".into());
     assert_eq!(inspect(), retained);
     assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn local_startup_reports_ready_only_after_public_selection() {
+    let host = Arc::new(HostLock::new(test_host()));
+    let mut state = host.lock().unwrap();
+    state.publishing_startup = true;
+    assert_eq!(
+        state.startup_state_before_publication(),
+        StartupState::Ready
+    );
+    assert_eq!(
+        state.startup_state(),
+        StartupState::Restoring { awaiting: 0 }
+    );
+    assert_eq!(state.startup_recovery(), None);
+    assert!(state.startup_blocks_shutdown());
+    drop(state);
+    assert_eq!(
+        crate::host::recovery_admission::admit(
+            &host,
+            &crate::terminal_ipc::ClientRequest::ChatCapacitySet { limit: 1 },
+        )
+        .unwrap_err()
+        .code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable
+    );
+    let mut state = host.lock().unwrap();
+    state.publishing_startup = false;
+    assert_eq!(state.startup_state(), StartupState::Ready);
+    assert!(!state.startup_blocks_shutdown());
+    state.publishing_startup = true;
+    state.retain_startup_recovery("Original work remains retained".into());
+    let retained = StartupState::Retained {
+        detail: "Original work remains retained".into(),
+    };
+    assert_eq!(state.startup_state(), retained);
+    state.publishing_startup = false;
+    assert_eq!(state.startup_state(), retained);
 }
 
 #[test]
@@ -850,6 +941,49 @@ fn notification_activation_prefers_the_focused_owner_and_restores_closed_window_
 }
 
 #[test]
+fn mobile_watches_are_scoped_coalesced_and_do_not_register_window_presence() {
+    use crate::terminal_ipc::MobileWatch;
+    let mut host = test_host();
+    let sessions = host.register_client(1);
+    let notifications = host.register_client(2);
+    let other = host.register_client(3);
+    host.watch_mobile(1, MobileWatch::Sessions).unwrap();
+    host.watch_mobile(2, MobileWatch::Notifications).unwrap();
+    assert!(host.notification_watchers.is_empty());
+    assert_eq!(
+        host.watch_mobile(3, MobileWatch::Conversation(TerminalId::new()))
+            .unwrap_err()
+            .code,
+        ProtocolErrorCode::TerminalNotFound,
+    );
+    host.inventory_changed();
+    host.inventory_changed();
+    assert!(host.mobile_watchers[&1].pending.get());
+    host.mobile_snapshot_started(1, MobileWatch::Notifications);
+    assert!(host.mobile_watchers[&1].pending.get());
+    host.mobile_snapshot_started(1, MobileWatch::Sessions);
+    assert!(!host.mobile_watchers[&1].pending.get());
+    host.inventory_changed();
+    host.notifications_changed();
+    host.unregister_client(2);
+    host.notifications_changed();
+    assert!(!host.mobile_watchers.contains_key(&2));
+    for (delivery, topic) in [
+        (&sessions, MobileWatch::Sessions),
+        (&notifications, MobileWatch::Notifications),
+    ] {
+        delivery.close_after_drain();
+        assert!(matches!(
+            delivery.pop().unwrap().message,
+            ServerMessage::MobileChanged { topic: actual } if actual == topic
+        ));
+        assert!(delivery.pop().is_none());
+    }
+    other.close_after_drain();
+    assert!(other.pop().is_none());
+}
+
+#[test]
 fn run_notification_routes_only_to_a_cagents_window_without_a_provider_pane() {
     let mut host = test_host();
     let delivery = host.register_client(1);
@@ -1056,8 +1190,33 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
     // A real foreground process, recognized by its provider argv. Its
     // executable is deliberately different from the recovery command, and
     // it ignores the resume picker selector a relaunch adds.
-    let executable = directory.path().join("claude");
-    fs::write(&executable, "#!/bin/bash\nexec -a \"$0\" /bin/cat\n").unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    let executable = cwd.join("claude");
+    #[cfg(target_os = "linux")]
+    let reader = "/bin/cat";
+    #[cfg(target_os = "macos")]
+    let reader = {
+        // The system cat's protected environment cannot establish the
+        // provider account. Keep the binary behavior with a local signature.
+        let reader = cwd.join("fixture-cat");
+        fs::copy("/bin/cat", &reader).unwrap();
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&reader)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        "./fixture-cat"
+    };
+    fs::write(
+        &executable,
+        format!("#!/bin/bash\nexec -a \"$0\" {reader}\n"),
+    )
+    .unwrap();
     fs::set_permissions(
         &executable,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1067,20 +1226,13 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
         unset_environment: Default::default(),
         program: executable.to_string_lossy().into_owned(),
         arguments: Vec::new(),
-        working_directory: directory.path().into(),
+        working_directory: cwd.clone(),
         environment: BTreeMap::from([
-            (
-                "HOME".into(),
-                directory.path().to_string_lossy().into_owned(),
-            ),
+            ("HOME".into(), cwd.to_string_lossy().into_owned()),
             // Keep Claude's account state in this fixture, not the real home.
             (
                 "CLAUDE_CONFIG_DIR".into(),
-                directory
-                    .path()
-                    .join(".claude")
-                    .to_string_lossy()
-                    .into_owned(),
+                cwd.join(".claude").to_string_lossy().into_owned(),
             ),
         ]),
     };
@@ -1170,6 +1322,33 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
 /// The real CLI names its session only on the frames of a turn, and a
 /// provider can stop on its own. Neither an idle resumed conversation nor
 /// one that already ended may hold an update hostage.
+fn wait_for_local_fixture_identity(
+    handle: &crate::chat::runtime::Handle,
+    expected: &str,
+    trace: &std::path::Path,
+) {
+    #[cfg(target_os = "linux")]
+    let timeout = Duration::from_secs(5);
+    #[cfg(target_os = "macos")]
+    let timeout = Duration::from_secs(15);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let confirmed = handle.confirmed_session_id();
+        if confirmed.as_deref() == Some(expected) {
+            return;
+        }
+        if handle.is_completed() || Instant::now() >= deadline {
+            let snapshot_error = handle.snapshot(None).and_then(|snapshot| snapshot.error);
+            panic!(
+                "local provider failed to confirm {expected}; confirmed {confirmed:?}; failure {:?}; snapshot error {snapshot_error:?}; fixture trace {:?}",
+                handle.failure(),
+                fs::read_to_string(trace)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 pub(super) fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
     if !upgrade_fixture_in_fresh_process() {
@@ -1194,8 +1373,14 @@ pub(super) fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
     // different conversation, which the adapter refuses as a failure.
     fs::write(&executable, r#"#!/usr/bin/python3
 import json, os, sys
+def trace(event):
+    with open(__file__ + ".trace", "a") as out:
+        out.write(str(os.getpid()) + " " + event + "\n")
+trace("started")
 for line in sys.stdin:
     request = json.loads(line)
+    if request["request"]["subtype"] == "initialize":
+        trace("received initialize")
     if request["request"]["subtype"] == "interrupt":
         print(json.dumps({"type": "system", "subtype": "init", "session_id": os.environ["OTHER_SESSION"]}), flush=True)
     print(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"], "response": {}}}), flush=True)
@@ -1270,11 +1455,9 @@ for line in sys.stdin:
     };
     let (idle, idle_handle) = start(IDLE);
     let (ended, ended_handle) = start(ENDED);
+    let trace = executable.with_extension("trace");
     for (handle, id) in [(&idle_handle, IDLE), (&ended_handle, ENDED)] {
-        wait(
-            &|| handle.confirmed_session_id().as_deref() == Some(id),
-            "an idle resumed conversation was never confirmed",
-        );
+        wait_for_local_fixture_identity(handle, id, &trace);
     }
     ended_handle.command(Command::Interrupt).unwrap();
     wait(
@@ -1375,12 +1558,18 @@ pub(super) fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_co
     let log = cwd.join("launches");
     fs::write(&executable, r#"#!/usr/bin/python3
 import json, os, sys
+def trace(event):
+    with open(__file__ + ".trace", "a") as out:
+        out.write(str(os.getpid()) + " " + event + "\n")
+trace("started")
 identity = next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--resume="))
 with open(os.environ["LAUNCH_LOG"], "a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\n")
 print(json.dumps({"type": "system", "subtype": "init", "session_id": identity}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
+    if request["request"]["subtype"] == "initialize":
+        trace("received initialize")
     if request["request"]["subtype"] == "interrupt":
         print(json.dumps({"type": "conversation_reset", "session_id": identity}), flush=True)
         identity = os.environ["NEXT_SESSION"]
@@ -1446,21 +1635,12 @@ for line in sys.stdin:
     let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&source.id]
         .handle
         .clone();
-    let wait_for_identity = |expected: &str| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.confirmed_session_id().as_deref() != Some(expected) {
-            assert!(
-                Instant::now() < deadline,
-                "provider failed to confirm {expected}"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    };
-    wait_for_identity(A);
+    let trace = executable.with_extension("trace");
+    wait_for_local_fixture_identity(&handle, A, &trace);
     // The hidden actor changes conversations without a presentation read
     // refreshing its persisted card's original launch or cached identity.
     handle.command(Command::Interrupt).unwrap();
-    wait_for_identity(B);
+    wait_for_local_fixture_identity(&handle, B, &trace);
     let store = Store::open(&cwd.join("checkpoint")).unwrap();
     let capability = host
         .lock()
@@ -2022,6 +2202,61 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         thread::sleep(Duration::from_millis(10));
     };
     let original_root = crate::terminal::holder::Process::read(pid).unwrap();
+    let root_pin = |handle: &crate::terminal::TerminalHandle| {
+        let descriptor = handle.original_root_pidfd_for_test().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let fdinfo =
+                fs::read_to_string(format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd()))
+                    .unwrap();
+            let pinned_pid = fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(pinned_pid, original_root.pid);
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            handle.original_root_pid_for_test(),
+            Some(original_root.pid as u32)
+        );
+        descriptor
+    };
+    let assert_pin_readiness = |descriptor: &fs::File, ready: bool| {
+        let mut readiness = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the same owned exit descriptor stays live across both polls.
+        assert_eq!(
+            unsafe { libc::poll(&mut readiness, 1, 0) },
+            i32::from(ready)
+        );
+        if ready {
+            assert_ne!(readiness.revents & libc::POLLIN, 0);
+        }
+    };
+    let assert_sleep = || {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim(),
+            "sleep"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            crate::process::program_of(pid as u32)
+                .unwrap()
+                .0
+                .file_name(),
+            Some(std::ffi::OsStr::new("sleep"))
+        );
+    };
     let old = host.lock().unwrap().terminals[&source.id].handle.clone();
     let carried_source = host
         .lock()
@@ -2121,24 +2356,8 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
             state.terminals[&source.id].handle.clone()
         };
         assert!(!handle.is_completed());
-        let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
-        let fdinfo =
-            fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd())).unwrap();
-        let pinned_pid = fdinfo
-            .lines()
-            .find_map(|line| line.strip_prefix("Pid:"))
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
-        assert_eq!(pinned_pid, original_root.pid);
-        let mut readiness = libc::pollfd {
-            fd: root_pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: the cloned original pidfd stays owned across poll.
-        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+        let descriptor = root_pin(&handle);
+        assert_pin_readiness(&descriptor, false);
         assert!(original_root.is_current());
         // Anonymous adoption intentionally unlinks its old listener;
         // the retained current worker is the reachable Close surface.
@@ -2152,17 +2371,13 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         let actual_retained: serde_json::Value =
             serde_json::from_slice(&fs::read(&retained_store.path).unwrap()).unwrap();
         assert_eq!(actual_retained, expected_retained);
-        assert_eq!(
-            fs::read_to_string(format!("/proc/{pid}/comm"))
-                .unwrap()
-                .trim(),
-            "sleep"
-        );
+        assert_sleep();
         assert_eq!(
             handle.close_checked(true),
             crate::terminal_ipc::TerminalCloseResult::Closed
         );
-        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!original_root.is_current());
+        assert_pin_readiness(&descriptor, true);
         return;
     }
 
@@ -2194,41 +2409,20 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         .unwrap();
     assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
     assert_eq!(descriptor.session.launch, source.launch);
-    assert_eq!(
-        fs::read_to_string(format!("/proc/{pid}/comm"))
-            .unwrap()
-            .trim(),
-        "sleep",
-        "the successor adopted the same process rather than starting another"
-    );
+    assert_sleep();
     let handle = replacement.lock().unwrap().terminals[&source.id]
         .handle
         .clone();
     assert!(!handle.is_completed());
-    let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
-    let fdinfo =
-        fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd())).unwrap();
-    let pinned_pid = fdinfo
-        .lines()
-        .find_map(|line| line.strip_prefix("Pid:"))
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
-    assert_eq!(pinned_pid, original_root.pid);
-    let mut readiness = libc::pollfd {
-        fd: root_pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: the cloned original pidfd stays owned across poll.
-    assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+    let original_exit = root_pin(&handle);
+    assert_pin_readiness(&original_exit, false);
     assert!(original_root.is_current());
     assert_eq!(
         handle.close_checked(true),
         crate::terminal_ipc::TerminalCloseResult::Closed
     );
-    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    assert!(!original_root.is_current());
+    assert_pin_readiness(&original_exit, true);
 }
 
 #[test]
@@ -2340,6 +2534,7 @@ pub(super) fn restored_shell_links_exact_old_source_and_does_not_replay_consumed
     assert_eq!(descriptor.upgrade_sources, vec![source.clone()]);
     assert_eq!(descriptor.session.continuity.live_proof(), Some(expected));
     assert_eq!(descriptor.session.transcript_path, source.transcript_path);
+    let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
     restore_upgrade_from(
         &host,
         Store::open(directory.path()).unwrap(),
@@ -2350,85 +2545,102 @@ pub(super) fn restored_shell_links_exact_old_source_and_does_not_replay_consumed
     // Restore enqueues startup visibility controls; a descriptor and an
     // empty checkpoint read do not acknowledge their worker-side completion.
     // This existing synchronous observation follows them on the same FIFO.
-    let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
     restored.observe_agent().unwrap();
-    // A separate idle probe can resume the shell before host preparation
-    // observes it again. Retry only this exact fixture's active-shell
-    // refusal; success keeps the actual preparation snapshot frozen.
-    let expected_active = upgrade_error(upgrade_blockers_message(
-        &[describe_upgrade_blocker(&descriptor.session)],
-        false,
-    ));
-    let prepare_started = Instant::now();
-    let mut prepare_attempts = 0;
-    loop {
-        assert!(
-            // This waits on the passwd shell's own startup in a fresh HOME.
-            prepare_started.elapsed() < Duration::from_secs(60),
-            "restored shell never became eligible after {prepare_attempts} preparation attempts"
-        );
-        prepare_attempts += 1;
-        let capability = {
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            assert_eq!(state.terminals.len(), 1);
-            assert!(state.chats.is_empty());
-            assert!(state.terminals[&source.id].handle.same_worker(&restored));
-            state.shutdown_preflight(Instant::now()).unwrap().capability
-        };
-        match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
-            Ok(counts) => {
-                assert_eq!(counts, (1, 0));
-                break;
-            }
-            Err(error) if error == expected_active => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!(
-                "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
-            ),
-        }
-    }
-    finish_upgrade(&host).unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let second = store.load().unwrap().unwrap();
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0].id = TerminalId::new();
-    assert!(forged.validate().is_err());
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0]
-        .launch
-        .environment
-        .insert("UNRELATED".into(), "1".into());
-    assert!(forged.validate().is_err());
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0].continuity =
-        second.terminals[0].source.continuity.clone();
-    assert!(forged.validate().is_err());
-    let third = test_host_with_incarnation("third-incarnation");
-    let host = Arc::new(HostLock::new(third));
-    restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
-    let third = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .descriptor(0, source.id)
-        .unwrap();
-    assert_eq!(
-        third.upgrade_sources,
-        vec![source.clone(), second.terminals[0].source.clone()]
-    );
-    assert_ne!(
-        third.session.continuity.live_proof(),
-        descriptor.session.continuity.live_proof()
-    );
-    let handle = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let state = host.lock().unwrap();
         assert_eq!(state.terminals.len(), 1);
-        state.terminals[&source.id].handle.clone()
-    };
-    assert_eq!(
-        handle.close_checked(true),
-        crate::terminal_ipc::TerminalCloseResult::Closed
-    );
+        assert!(state.terminals[&source.id].handle.same_worker(&restored));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin can restore the checkpoint's authorized recipe. Repeating
+        // automatic shell retirement requires the mapped executable proof
+        // that the Linux implementation obtains from /proc/PID/exe.
+        assert_eq!(
+            restored.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // A separate idle probe can resume the shell before host preparation
+        // observes it again. Retry only this exact fixture's active-shell
+        // refusal; success keeps the actual preparation snapshot frozen.
+        let expected_active = upgrade_error(upgrade_blockers_message(
+            &[describe_upgrade_blocker(&descriptor.session)],
+            false,
+        ));
+        let prepare_started = Instant::now();
+        let mut prepare_attempts = 0;
+        loop {
+            assert!(
+                // This waits on the passwd shell's own startup in a fresh HOME.
+                prepare_started.elapsed() < Duration::from_secs(60),
+                "restored shell never became eligible after {prepare_attempts} preparation attempts"
+            );
+            prepare_attempts += 1;
+            let capability = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                assert_eq!(state.terminals.len(), 1);
+                assert!(state.chats.is_empty());
+                assert!(state.terminals[&source.id].handle.same_worker(&restored));
+                state.shutdown_preflight(Instant::now()).unwrap().capability
+            };
+            match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
+                Ok(counts) => {
+                    assert_eq!(counts, (1, 0));
+                    break;
+                }
+                Err(error) if error == expected_active => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
+                ),
+            }
+        }
+        finish_upgrade(&host).unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let second = store.load().unwrap().unwrap();
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].id = TerminalId::new();
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0]
+            .launch
+            .environment
+            .insert("UNRELATED".into(), "1".into());
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].continuity =
+            second.terminals[0].source.continuity.clone();
+        assert!(forged.validate().is_err());
+        let third = test_host_with_incarnation("third-incarnation");
+        let host = Arc::new(HostLock::new(third));
+        restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
+        let third = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .descriptor(0, source.id)
+            .unwrap();
+        assert_eq!(
+            third.upgrade_sources,
+            vec![source.clone(), second.terminals[0].source.clone()]
+        );
+        assert_ne!(
+            third.session.continuity.live_proof(),
+            descriptor.session.continuity.live_proof()
+        );
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(state.terminals.len(), 1);
+            state.terminals[&source.id].handle.clone()
+        };
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
 }
 
 #[test]
@@ -3465,7 +3677,8 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
             })
         }
     }
-    let directory = tempfile::tempdir().unwrap();
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = tempfile::tempdir_in(parent).unwrap();
     let config = directory.path().join("claude-config");
     let project: String = directory
         .path()
@@ -3517,7 +3730,8 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         handle.check_update_readiness().unwrap(),
         chat::runtime::UpdateReadiness::Busy
     );
-    let mut state = test_host();
+    let host = Arc::new(HostLock::new(test_host()));
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let session = chat::Session {
         id: TerminalId::new(),
         native_continuity: Default::default(),
@@ -3564,7 +3778,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
     assert_eq!(interrupt.sessions[0].disposition, Disposition::Interrupted);
     assert_eq!(interrupt.sessions[0].interrupted_subagents, ["first"]);
     assert!(
-        interrupt.sessions[0].reason.starts_with(
+        interrupt.sessions[0].reason.as_str().starts_with(
             "The update will stop 1 running background subagent (\u{201c}first\u{201d})"
         ),
         "only a turn under way is called the active turn: {}",
@@ -3573,6 +3787,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
     assert!(
         waiting.sessions[0]
             .reason
+            .as_str()
             .contains("Background subagent \u{201c}first\u{201d} is still running"),
         "{}",
         waiting.sessions[0].reason
@@ -3587,19 +3802,113 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         interrupt.sessions[0].identity
     );
     assert!(interrupt.preserves_consent(&elsewhere));
-    // Messages accepted for it but not yet delivered cannot survive a restart:
-    // the update waits for them under either policy, attributed to this
+    // A busy lead holds its team's messages queued unsent until its turn
+    // ends. They are durable and the successor's courier delivers them, so
+    // they hold nothing: interruption updates now, and an idle wait waits
+    // only for the turn, not for deliveries that start another one.
+    {
+        use crate::agent_execution::{
+            Destination, HostedSession, Origin, Spec, Submit, Surface, Target, Update,
+        };
+        let mut registry =
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let repository = directory.path().to_owned();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        let submit = |destination, key: &str| Submit {
+            name: None,
+            destination,
+            prompt: "fixture".into(),
+            idempotency_key: key.into(),
+        };
+        let lead = registry
+            .submit_agent(
+                &Origin::User,
+                &submit(
+                    Destination::New(Spec {
+                        provider: Provider::Claude,
+                        account: None,
+                        target: Target {
+                            repository: repository.clone(),
+                            directory: repository,
+                            placement: None,
+                        },
+                        surface: Surface::Chat,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    "lead",
+                ),
+                1,
+            )
+            .unwrap();
+        let hosted = HostedSession::Chat(state.chats[&interrupt.sessions[0].id].session.clone());
+        registry
+            .reserve_agent_launch(lead.agent.id, &hosted)
+            .unwrap();
+        registry.bind_agent(lead.agent.id, None, hosted).unwrap();
+        registry
+            .update_agent_run(
+                lead.run.id,
+                lead.run.revision,
+                Update::Started {
+                    provider_key: "turn".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let message = registry
+            .submit_agent(
+                &Origin::User,
+                &submit(Destination::Existing(lead.agent.id), "from-a-child"),
+                3,
+            )
+            .unwrap();
+        assert!(registry.agent_run_is_queued(message.run.id).unwrap());
+        state.install_model(registry);
+    }
+    drop(state);
+    for (policy, disposition) in [
+        (Policy::Interrupt, Disposition::Interrupted),
+        (Policy::WhenIdle, Disposition::WaitsForIdle),
+    ] {
+        let impact = update::inspect(&host, policy, false).unwrap();
+        assert!(impact.blockers.is_empty(), "{:?}", impact.blockers);
+        assert_eq!(impact.sessions[0].disposition, disposition);
+        assert_eq!(
+            impact.sessions[0].reason,
+            crate::update::impact::SessionCause::AgentRunUnconfirmed {
+                queued_prompts: true
+            }
+        );
+        let reason = impact.sessions[0].review().reason;
+        assert!(reason.contains("without a confirmed result"), "{reason}");
+        assert!(reason.contains("queued prompts unsent"), "{reason}");
+    }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    // A delivery already in flight is never redispatched after a restart:
+    // the update waits for it under either policy, attributed to this
     // conversation rather than to an anonymous blocker.
     for policy in [Policy::WhenIdle, Policy::Interrupt] {
         let queued = state
-            .upgrade_impact_with_queued(policy, &BTreeSet::from([interrupt.sessions[0].id]))
+            .upgrade_impact_with_agent_work(
+                policy,
+                &BTreeSet::from([interrupt.sessions[0].id]),
+                &BTreeMap::new(),
+            )
             .unwrap();
         assert!(queued.blockers.is_empty());
         assert_eq!(queued.sessions[0].disposition, Disposition::WaitsForIdle);
         assert!(queued.sessions[0].interrupted_subagents.is_empty());
         // The review shows why it waits, not that it is finishing a turn.
         let shown = queued.sessions[0].review().reason;
-        assert!(shown.contains("still waiting to be delivered"), "{shown}");
+        assert!(shown.contains("still being delivered"), "{shown}");
     }
     let capability = state.shutdown_preflight(now).unwrap().capability;
     assert_eq!(capability.background_subagents, 1);

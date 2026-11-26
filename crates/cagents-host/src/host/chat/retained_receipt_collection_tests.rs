@@ -4,7 +4,10 @@
 //! receipts are published by the writers a helper uses, over processes that
 //! have ended or, where a stage needs one, the test process itself.
 use super::*;
-use crate::chat::runtime::retained_receipt_fixture::{self as fixture, Stage};
+use crate::{
+    chat::runtime::retained_receipt_fixture::{self as fixture, Stage},
+    process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
+};
 use std::{fs, path::PathBuf};
 
 /// Where an actor stands with the daemon and its receipts.
@@ -71,8 +74,7 @@ fn reaped_process() -> crate::daemon::holder_registry::Process {
 
 #[test]
 fn collection_compacts_every_committed_verified_retirement_and_nothing_else() {
-    // A supervisor refuses an --exact that selects nothing, bounds a hang and
-    // reaps whatever the body leaves behind.
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -81,25 +83,36 @@ fn collection_compacts_every_committed_verified_retirement_and_nothing_else() {
         // The receipts live in the runtime directory and the reader must hold
         // the daemon lease, so the body runs in a process of its own.
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        for path in ["home", "run", "data", "config", "cache"] {
-            fs::create_dir_all(directory.path().join(path)).unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for child in ["home", "run", "data", "config", "cache"] {
+            fs::create_dir_all(root.join(child)).unwrap();
         }
         let exact = thread::current().name().unwrap().to_owned();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = CommandSpec::new(std::env::current_exe().unwrap());
+        for (key, _) in std::env::vars_os() {
+            if key != std::ffi::OsStr::new(crate::retained_fixture::OWNER_ENV)
+                && key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            {
+                command = command.env_remove(key);
+            }
+        }
+        // The body only spawns and waits for a direct child. A bounded private
+        // subprocess is sufficient even on systems without a subreaper.
+        let command = command
             .args(["--exact", &exact, "--nocapture"])
-            .env_clear()
-            .envs(crate::retained_fixture::owner_env())
-            .env(ROOT, directory.path())
-            .env("HOME", directory.path().join("home"))
-            .env("XDG_RUNTIME_DIR", directory.path().join("run"))
-            .env("XDG_DATA_HOME", directory.path().join("data"))
-            .env("XDG_CONFIG_HOME", directory.path().join("config"))
-            .env("XDG_CACHE_HOME", directory.path().join("cache"))
+            .env(ROOT, &root)
+            .env("HOME", root.join("home"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
             .env("PATH", "/usr/bin:/bin")
-            .output()
+            .timeout(Duration::from_secs(90));
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
             .unwrap();
         assert!(
-            output.status.success(),
+            output.success,
             "isolated receipt collection failed:\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)

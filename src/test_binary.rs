@@ -1,7 +1,7 @@
 //! Process setup shared by every library test binary in the workspace.
 //!
 //! libtest gives no setup hook, so each test binary installs these as
-//! `.init_array` constructors with [`test_binary_setup!`](crate::test_binary_setup).
+//! constructors (ELF `.init_array`, Mach-O `__mod_init_func`) with [`test_binary_setup!`](crate::test_binary_setup).
 //! The constructors are expanded into the test binary itself: a static in
 //! this library would not be linked into a binary that never names it.
 
@@ -13,9 +13,10 @@ macro_rules! test_binary_setup {
     () => {
         // Name enclosing Git checkout markers before fixtures refuse to run
         // beneath them, so one fixture-root problem appears as one diagnostic.
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         #[used]
-        #[unsafe(link_section = ".init_array")]
+        #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+        #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
         static REPORT_ENCLOSING_GIT: extern "C" fn() = {
             extern "C" fn report() {
                 $crate::test_binary::report_enclosing_git();
@@ -25,9 +26,10 @@ macro_rules! test_binary_setup {
 
         // Test-support code paths that differ between a test binary and a
         // daemon built with test support, as integration tests run it, ask.
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         #[used]
-        #[unsafe(link_section = ".init_array")]
+        #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+        #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
         static MARK_TEST_BINARY: extern "C" fn() = {
             extern "C" fn mark() {
                 $crate::test_binary::mark_test_binary();
@@ -36,11 +38,12 @@ macro_rules! test_binary_setup {
         };
 
         // With many test threads the descriptor-heavy fixtures exhaust the
-        // customary soft limit of 1024. Fixtures that test the limit lower it
-        // themselves.
-        #[cfg(all(test, target_os = "linux"))]
+        // customary soft limit of 1024 (256 on Darwin). Fixtures that test the
+        // limit lower it themselves.
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         #[used]
-        #[unsafe(link_section = ".init_array")]
+        #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+        #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
         static RAISE_TEST_DESCRIPTOR_LIMIT: extern "C" fn() = {
             extern "C" fn raise() {
                 $crate::test_binary::raise_descriptor_limit();
@@ -76,7 +79,7 @@ pub fn is_test_binary() -> bool {
 
 // The binary re-executes as a holder or actor, whose own `.init_array` hook may run
 // after these in link order, and whose limit is the one under test.
-#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+#[cfg(any(test, feature = "test-support"))]
 fn is_reexecution() -> bool {
     std::env::args_os().nth(1).is_some_and(|argument| {
         let argument = argument.to_string_lossy();
@@ -86,7 +89,7 @@ fn is_reexecution() -> bool {
 
 // A fixture re-runs this binary for one `--exact` test and may check that child's
 // output. `scripts/test-lib` also passes `--exact`, so its runs skip the report too.
-#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+#[cfg(any(test, feature = "test-support"))]
 fn is_fixture_child() -> bool {
     is_reexecution()
         || std::env::args_os()
@@ -94,7 +97,7 @@ fn is_fixture_child() -> bool {
             .any(|argument| argument == "--exact")
 }
 
-#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+#[cfg(any(test, feature = "test-support"))]
 pub fn report_enclosing_git() {
     if is_fixture_child() {
         return;
@@ -115,7 +118,7 @@ pub fn report_enclosing_git() {
     }
 }
 
-#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+#[cfg(any(test, feature = "test-support"))]
 pub fn raise_descriptor_limit() {
     if is_reexecution() {
         return;
@@ -127,7 +130,13 @@ pub fn raise_descriptor_limit() {
     // SAFETY: both calls only read or write this live rlimit.
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_cur.max(limit.rlim_max.min(16 * 1024));
+            // Darwin refuses a soft limit above OPEN_MAX, 10240 in
+            // <sys/syslimits.h>, which libc does not export.
+            #[cfg(target_os = "macos")]
+            let ceiling = 10240;
+            #[cfg(target_os = "linux")]
+            let ceiling = 16 * 1024;
+            limit.rlim_cur = limit.rlim_cur.max(limit.rlim_max.min(ceiling));
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
     }

@@ -114,7 +114,11 @@ fn models() -> ExitCode {
         let status = match store::status(&root, model) {
             store::Status::Installed => "installed".to_owned(),
             store::Status::Partial { downloaded } => {
-                format!("{} of {} MB downloaded", downloaded >> 20, model.size() >> 20)
+                format!(
+                    "{} of {} MB downloaded",
+                    downloaded >> 20,
+                    model.size() >> 20
+                )
             }
             store::Status::Absent => format!("{} MB to download", model.size() >> 20),
         };
@@ -178,7 +182,10 @@ fn remove(id: &str) -> ExitCode {
     match store::remove(&root, model) {
         Ok(()) => ExitCode::SUCCESS,
         Err(store::LeaseError::Busy) => {
-            eprintln!("cagents-dictate: {} is being installed elsewhere", model.name);
+            eprintln!(
+                "cagents-dictate: {} is being installed elsewhere",
+                model.name
+            );
             ExitCode::FAILURE
         }
         Err(store::LeaseError::Io(error)) => {

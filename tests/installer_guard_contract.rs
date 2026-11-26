@@ -1377,6 +1377,162 @@ fn staged_candidate_startup_authenticates_the_inherited_coordinator_fence() {
 }
 
 #[test]
+fn staged_agent_source_fixture() {
+    use cagents::{
+        model::{HostIncarnation, HostSessionId, HostSessionProof},
+        terminal_ipc::{
+            ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse,
+        },
+    };
+    let Some(ready) = std::env::var_os("CAGENTS_TEST_SCOPED_SOURCE_READY") else {
+        return;
+    };
+    let paths = cagents::daemon::RuntimePaths::discover().unwrap();
+    fs::create_dir_all(&paths.directory).unwrap();
+    fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = file(&paths.lock);
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("staged-agent-source"),
+        boot_id: cagents::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("staged-agent-incarnation"),
+    };
+    fs::write(
+        &paths.lock,
+        serde_json::to_vec(&serde_json::json!({"pid": std::process::id(), "proof": proof}))
+            .unwrap(),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    fs::write(ready, []).unwrap();
+    for connection in listener.incoming() {
+        let mut stream = connection.unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request: ClientEnvelope = cagents::terminal_ipc::read_frame(&mut stream)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(request.request, ClientRequest::Connect { .. }));
+        cagents::terminal_ipc::write_frame(
+            &mut stream,
+            &ServerEnvelope {
+                version: 198,
+                request_id: Some(request.request_id),
+                proof: proof.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn public_staged_launcher_routes_scoped_agent_calls_only_to_the_verified_source() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    if !user_fixture::enter() {
+        return;
+    }
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let prefix = home.join(".local/share/cagents-install");
+    let old = prefix.join("versions/old/bin");
+    let new = prefix.join("versions/new/bin");
+    for bin in [&old, &new] {
+        fs::create_dir_all(bin).unwrap();
+        fs::write(bin.join("cagents-ui"), "matched application fixture").unwrap();
+    }
+    fs::write(
+        prefix.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("versions/new", prefix.join("current")).unwrap();
+    let public = home.join(".local/bin/cagents");
+    fs::create_dir_all(public.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(prefix.join("current/bin/cagents"), &public).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), new.join("cagents")).unwrap();
+    fs::copy(std::env::current_exe().unwrap(), old.join("cagentsd")).unwrap();
+    fs::copy("/bin/false", new.join("cagentsd")).unwrap();
+    let old_cli = old.join("cagents");
+    fs::write(
+        &old_cli,
+        r#"#!/bin/sh
+if [ "$*" = '--json daemon protocol-version' ]; then
+    [ "${CAGENTS_AGENT_AUTHORITY+x}" != x ] || exit 8
+    printf '%s\n' '{"data":{"protocol_version":198}}'
+    exit
+fi
+printf '%s\n' "${CAGENTS_AGENT_AUTHORITY-unset}" "$*"
+case "$*" in *'agent spawn -') cat ;; esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(old_cli, fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = prefix.join("versions/new/.deferred-owner.json");
+    fs::write(&marker, r#"{"version":1,"owner_version":"old"}"#).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let ready = home.join("agent-source-ready");
+    let mut daemon = OwnedProcess(
+        Command::new(old.join("cagentsd"))
+            .args(["--exact", "staged_agent_source_fixture", "--nocapture"])
+            .env("CAGENTS_TEST_SCOPED_SOURCE_READY", &ready)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let scoped = || {
+        let mut command = Command::new(&public);
+        command.env(
+            cagents::agent_execution::AUTHORITY_ENV,
+            "synthetic-agent-token",
+        );
+        command
+    };
+    let output = scoped().args(["agent", "list"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "synthetic-agent-token\n--no-start agent list\n"
+    );
+    let mut spawn = scoped()
+        .args(["agent", "spawn", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    spawn
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"original stdin\n")
+        .unwrap();
+    let output = spawn.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "synthetic-agent-token\n--no-start agent spawn -\noriginal stdin\n"
+    );
+    fs::write(&marker, r#"{"version":1,"owner_version":"new"}"#).unwrap();
+    let output = scoped().args(["agent", "list"]).output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+#[test]
 fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() {
     // The User child is another process with its own mutex. Hold this one for
     // its whole run: a sibling's fixture window is also named cagents-ui, and

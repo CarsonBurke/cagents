@@ -8,7 +8,7 @@ use crate::{
 
 pub(super) fn session(id: TerminalId) -> TerminalSession {
     let recipe = LaunchRecipe {
-        program: "/bin/true".into(),
+        program: "/usr/bin/true".into(),
         arguments: Vec::new(),
         working_directory: PathBuf::from("/"),
         environment: Default::default(),

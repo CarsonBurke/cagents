@@ -287,6 +287,31 @@ class Provider(unittest.TestCase):
                         and frame["response"]["request_id"] == "now-1")
         return output, output[answered]["response"]["response"], output[answered + 1:]
 
+    def test_a_first_turn_that_finishes_by_itself_then_starts_what_was_queued(self):
+        (self.config / "fixture-first-turn-seconds").write_text("1\n")
+        queued = [dict(prompt(2), uuid="queued-a"), dict(prompt(3), uuid="queued-b")]
+        provider = subprocess.Popen(
+            [str(SCRIPT)], cwd=self.project, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            env={"HOME": str(self.root / "home"), "CLAUDE_CONFIG_DIR": str(self.config),
+                 "PATH": "/usr/local/bin:/usr/bin:/bin"})
+        self.addCleanup(provider.kill)
+        provider.stdin.write("".join(json.dumps(frame) + "\n" for frame in (prompt(1), *queued)))
+        provider.stdin.flush()
+        # The input stays open past the first turn's end, as the app keeps it.
+        time.sleep(2)
+        stdout, stderr = provider.communicate(timeout=HANG_GUARD)
+        self.assertEqual(provider.returncode, 0, stderr)
+        output = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        lifecycle = [(frame["command_uuid"], frame["state"]) for frame in output
+                     if frame.get("type") == "command_lifecycle"]
+        self.assertEqual(lifecycle[-4:], [("queued-a", "started"), ("queued-b", "started"),
+                                          ("queued-a", "completed"), ("queued-b", "completed")])
+        results = [frame for frame in output if frame.get("type") == "result"]
+        self.assertEqual(len(results), 2)
+        self.assertEqual([frame["uuid"] for frame in output if frame.get("isReplay")],
+                         ["queued-a", "queued-b"])
+
     def test_send_now_is_advertised_only_with_its_switch(self):
         _, output, _ = self.run_provider()
         init = next(frame for frame in output if frame.get("subtype") == "init")

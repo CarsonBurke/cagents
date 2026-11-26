@@ -97,12 +97,12 @@ fn server_with_handshake(
 ) -> (tempfile::TempDir, PathBuf, JoinHandle<UnixListener>) {
     let directory = tempfile::Builder::new().prefix("dv-").tempdir().unwrap();
     let socket = directory.path().join("selected.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let worker = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut peer = loop {
-            match listener.accept() {
+            match crate::descriptor::accept(&listener) {
                 Ok((peer, _)) => break peer,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "selected peer was not connected");
@@ -130,7 +130,7 @@ fn server_with_handshake(
 fn finished(worker: JoinHandle<UnixListener>) {
     let listener = worker.join().unwrap();
     assert!(
-        matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+        matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
         "the helper must not open a retry connection"
     );
 }

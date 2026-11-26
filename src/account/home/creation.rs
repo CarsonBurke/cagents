@@ -68,7 +68,10 @@ impl NewHomeCreationReceipt {
         }
         // SAFETY: fstatat succeeded, so it wrote the whole structure.
         let named = unsafe { named.assume_init() };
-        if (named.st_dev, named.st_ino) != (held.dev(), held.ino()) {
+        // `dev_t` is signed on Darwin; std widens it the same way.
+        #[allow(clippy::unnecessary_cast)]
+        let named = (named.st_dev as u64, named.st_ino);
+        if named != (held.dev(), held.ino()) {
             return Err(io::Error::other(
                 "The newly created account directory changed; files were retained",
             ));
@@ -222,7 +225,9 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(Some(result.clone()), captured);
+        // The creation receipt records the canonical spelling of the
+        // retained directory, including Darwin's sealed temporary alias.
+        assert_eq!(Some((result.0, result.1.canonicalize().unwrap())), captured);
         assert_eq!(store.load().unwrap().pending().len(), 1);
         assert_eq!(
             fs::read_to_string(result.1.join("settings.json")).unwrap(),

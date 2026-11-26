@@ -30,6 +30,8 @@ use std::{
 mod branch_census;
 pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
+#[cfg(target_os = "macos")]
+pub(crate) use complete_inventory::resolved_git_executable;
 mod pr_checkout;
 mod pr_creation;
 #[cfg(any(test, feature = "test-support"))]
@@ -7997,11 +7999,14 @@ mod tests {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
         }
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         mod scale_support {
             include!("../tests/support/repository_scale.rs");
         }
+        #[cfg(target_os = "linux")]
         use scale_support::isolated_large_pathspec_test;
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         #[test]
         fn small_membership_queries_do_not_enumerate_large_index_or_head_tree() {
             isolated_large_pathspec_test(
@@ -8385,7 +8390,10 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             git(root, &["init", "-b", "feature"]);
+            #[cfg(target_os = "linux")]
             let unusual = RepoPath::from_bytes(b":(glob)*\n\xff").unwrap();
+            #[cfg(target_os = "macos")] // APFS requires valid UTF-8.
+            let unusual = RepoPath::from_bytes(":(glob)*\n雪".as_bytes()).unwrap();
             for name in ["old.txt", "deleted.txt", "unselected.txt"] {
                 fs::write(root.join(name), b"base\n").unwrap();
             }
@@ -15893,7 +15901,7 @@ mod worktree_journal_tests {
         let mut intended_child = intended_command.spawn().unwrap();
         let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
         let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
-        let mut unrelated = Command::new("/bin/true");
+        let mut unrelated = Command::new("true");
         // SAFETY: only async-signal-safe read/write on live inherited fds.
         unsafe {
             unrelated.pre_exec(move || {

@@ -1,6 +1,7 @@
 package dev.cagents.mobile.android.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
@@ -40,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.ConnectionState
+import dev.cagents.mobile.client.hostKeyFile
 import dev.cagents.mobile.protocol.Activity
 
 /**
@@ -61,55 +63,85 @@ fun ConnectionBanner(
     ) {
         when (connection) {
             ConnectionState.Connected -> Unit
-            ConnectionState.Connecting ->
-                if (hasData) {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
-                } else {
-                    Banner(icon = null, text = "Connecting…", progress = true)
-                }
+            // A failed attempt and the next one share one layout, so the banner
+            // doesn't jump as it moves between them every few seconds.
+            is ConnectionState.Connecting -> when {
+                connection.lastFailure != null ->
+                    Banner(
+                        icon = null,
+                        text = "${connection.lastFailure} Trying again…",
+                        progress = true,
+                        actions = listOf("Settings" to onSettings),
+                        actionsBelow = true,
+                    )
+                hasData -> LinearProgressIndicator(Modifier.fillMaxWidth())
+                else -> Banner(icon = null, text = "Connecting…", progress = true)
+            }
             ConnectionState.Offline ->
-                Banner(Icons.Outlined.CloudOff, "Offline", action = "Connect" to onRetry)
+                Banner(Icons.Outlined.CloudOff, "Offline", actions = listOf("Connect" to onRetry))
             is ConnectionState.Retrying ->
                 Banner(
                     Icons.Outlined.CloudOff,
-                    connection.message.ifBlank { "Connection lost." } + " Reconnecting…",
-                    action = "Retry now" to onRetry,
+                    "${connection.message} Trying again…",
+                    // Settings stays at the right edge, where the attempt shows it too.
+                    actions = listOf("Retry now" to onRetry, "Settings" to onSettings),
+                    actionsBelow = true,
                 )
             is ConnectionState.NeedsAction -> when (val failure = connection.failure) {
                 is ConnectFailure.UnknownHostKey, is ConnectFailure.HostKeyChanged ->
-                    Banner(Icons.Outlined.Key, failure.message.orEmpty(), action = "Review" to onReviewHostKey)
+                    Banner(Icons.Outlined.Key, failure.message.orEmpty(), actions = listOf("Review" to onReviewHostKey))
                 is ConnectFailure.Unauthorized ->
-                    Banner(Icons.Outlined.Key, failure.message.orEmpty(), action = "Settings" to onSettings)
+                    Banner(Icons.Outlined.Key, failure.message.orEmpty(), actions = listOf("Settings" to onSettings))
                 else ->
-                    Banner(Icons.Outlined.Error, failure.message.orEmpty(), action = "Settings" to onSettings, error = true)
+                    Banner(
+                        Icons.Outlined.Error,
+                        failure.message.orEmpty(),
+                        actions = listOf("Settings" to onSettings),
+                        error = true,
+                    )
             }
         }
     }
 }
 
+/**
+ * One line of status with what the person can do about it. Actions sit
+ * beside the text, or beneath it with [actionsBelow], so a long reason keeps its width.
+ */
 @Composable
 private fun Banner(
     icon: ImageVector?,
     text: String,
-    action: Pair<String, () -> Unit>? = null,
+    actions: List<Pair<String, () -> Unit>> = emptyList(),
     progress: Boolean = false,
     error: Boolean = false,
+    actionsBelow: Boolean = false,
 ) {
     val container = if (error) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer
     val content = if (error) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer
-    Surface(color = container, contentColor = content, modifier = Modifier.fillMaxWidth()) {
-        Row(
-            Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            when {
-                progress -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = content)
-                icon != null -> Icon(icon, contentDescription = null, Modifier.size(20.dp))
+    val beside = actions.singleOrNull()?.takeUnless { actionsBelow }
+    Surface(color = container, contentColor = content, modifier = Modifier.fillMaxWidth().animateContentSize()) {
+        Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // One size for both, so the text starts in the same place.
+                Box(Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+                    when {
+                        progress -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = content)
+                        icon != null -> Icon(icon, contentDescription = null, Modifier.size(20.dp))
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f).padding(vertical = 6.dp),
+                )
+                beside?.let { (label, onClick) -> TextButton(onClick = onClick) { Text(label, color = content) } }
             }
-            Spacer(Modifier.width(12.dp))
-            Text(text, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(vertical = 6.dp))
-            action?.let { (label, onClick) ->
-                TextButton(onClick = onClick) { Text(label, color = content) }
+            if (beside == null && actions.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    actions.forEach { (label, onClick) -> TextButton(onClick = onClick) { Text(label, color = content) } }
+                }
             }
         }
     }
@@ -120,7 +152,7 @@ private fun Banner(
  * a trusted one presents a different key.
  */
 @Composable
-fun HostKeyDialogs(vm: MainViewModel) {
+fun HostKeyDialogs(vm: MainViewModel, onPairAgain: () -> Unit) {
     val remote by vm.remote.collectAsStateWithLifecycle()
     val settings by vm.settings.collectAsStateWithLifecycle()
     val failure = (remote.connection as? ConnectionState.NeedsAction)?.failure
@@ -131,13 +163,14 @@ fun HostKeyDialogs(vm: MainViewModel) {
             AlertDialog(
                 onDismissRequest = { vm.dismissHostKey(failure.fingerprint) },
                 icon = { Icon(Icons.Outlined.Key, contentDescription = null) },
-                title = { Text("Trust ${settings.host}?") },
+                title = { Text("Trust ${failure.host.ifEmpty { settings.host }}?") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("This is the first connection to this computer. Check that its fingerprint matches before trusting it.")
                         Fingerprint(failure.fingerprint)
                         Text(
-                            "On the computer: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub",
+                            hostKeyFile(failure.keyType)?.let { "On the computer: ssh-keygen -lf $it" }
+                                ?: "On the computer: ssh-keygen -lf on its host key in /etc/ssh",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -151,10 +184,13 @@ fun HostKeyDialogs(vm: MainViewModel) {
             AlertDialog(
                 onDismissRequest = { vm.dismissHostKey(failure.fingerprint) },
                 icon = { Icon(Icons.Outlined.WarningAmber, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
-                title = { Text("${settings.host} changed its identity") },
+                title = { Text("${failure.host.ifEmpty { settings.host }} changed its identity") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Its host key differs from the one you trusted. If you didn't reinstall the computer or its SSH server, someone may be impersonating it.")
+                        if (settings.name.isNotEmpty()) {
+                            Text("If you did, pair again from the computer to trust its new key.")
+                        }
                         Text("Now", style = MaterialTheme.typography.labelMedium)
                         Fingerprint(failure.fingerprint)
                         Text("Trusted", style = MaterialTheme.typography.labelMedium)
@@ -165,8 +201,16 @@ fun HostKeyDialogs(vm: MainViewModel) {
                     TextButton(onClick = { vm.dismissHostKey(failure.fingerprint) }) { Text("Keep the old key") }
                 },
                 dismissButton = {
-                    TextButton(onClick = vm::forgetHostKey) {
-                        Text("Forget old key", color = MaterialTheme.colorScheme.error)
+                    // A paired computer's key came from its pairing code, so a new one comes from a new code.
+                    if (settings.name.isNotEmpty()) {
+                        TextButton(onClick = {
+                            vm.dismissHostKey(failure.fingerprint)
+                            onPairAgain()
+                        }) { Text("Pair again") }
+                    } else {
+                        TextButton(onClick = { vm.forgetHostKey(failure.host.ifEmpty { null }) }) {
+                            Text("Forget old key", color = MaterialTheme.colorScheme.error)
+                        }
                     }
                 },
             )

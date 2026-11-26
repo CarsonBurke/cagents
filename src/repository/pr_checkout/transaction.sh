@@ -36,13 +36,20 @@ head_locked_git() {
     [ "$(/usr/bin/wc -c < "$CAGENTS_PR_PRIVATE/$receipt-errors")" -le 65536 ]
 }
 
+# The device and inode a path reaches, through GNU or BSD stat.
+if /usr/bin/stat -Lc '%d:%i' -- / >/dev/null 2>&1; then
+    identity() { /usr/bin/stat -Lc '%d:%i' -- "$1"; }
+else
+    identity() { /usr/bin/stat -L -f '%d:%i' -- "$1"; }
+fi
+
 verify_identity() {
-    [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_WORKTREE")" = "$CAGENTS_PR_WORKTREE_ID" ]
-    [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_GITDIR")" = "$CAGENTS_PR_GITDIR_ID" ]
-    [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_COMMON")" = "$CAGENTS_PR_COMMON_ID" ]
-    [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_WORKTREE_FD")" = "$CAGENTS_PR_WORKTREE_ID" ]
-    [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_GITDIR_FD")" = "$CAGENTS_PR_GITDIR_ID" ]
-    [ "$(/usr/bin/stat -Lc '%d:%i' -- "$CAGENTS_PR_COMMON_FD")" = "$CAGENTS_PR_COMMON_ID" ]
+    [ "$(identity "$CAGENTS_PR_WORKTREE")" = "$CAGENTS_PR_WORKTREE_ID" ]
+    [ "$(identity "$CAGENTS_PR_GITDIR")" = "$CAGENTS_PR_GITDIR_ID" ]
+    [ "$(identity "$CAGENTS_PR_COMMON")" = "$CAGENTS_PR_COMMON_ID" ]
+    [ "$(identity "$CAGENTS_PR_WORKTREE_FD")" = "$CAGENTS_PR_WORKTREE_ID" ]
+    [ "$(identity "$CAGENTS_PR_GITDIR_FD")" = "$CAGENTS_PR_GITDIR_ID" ]
+    [ "$(identity "$CAGENTS_PR_COMMON_FD")" = "$CAGENTS_PR_COMMON_ID" ]
     [ "$(repo_git symbolic-ref --quiet HEAD)" = "$CAGENTS_PR_BRANCH" ]
     [ "$(repo_git rev-parse --verify HEAD)" = "$CAGENTS_PR_OLD" ]
     for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer MERGE_AUTOSTASH; do

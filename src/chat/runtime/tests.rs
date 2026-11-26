@@ -1410,7 +1410,58 @@ fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
 
 use super::super::Role;
 use super::*;
+
+#[test]
+fn unloaded_catalog_rows_do_not_take_followed_history_slots() {
+    let mut state = Snapshot::default();
+    let mut indices = Default::default();
+    for index in 0..32 {
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: format!("child-{index}"),
+                kind: String::new(),
+                description: String::new(),
+                model: None,
+                status: Some(ToolStatus::Running),
+                waiting: None,
+                detail: None,
+                background: None,
+            },
+        );
+    }
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SubagentItem {
+            id: "child-0".into(),
+            item: text("first", "Followed transcript"),
+        },
+    );
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Subagent {
+            id: "unloaded".into(),
+            kind: String::new(),
+            description: String::new(),
+            model: None,
+            status: Some(ToolStatus::Running),
+            waiting: None,
+            detail: Some(crate::chat::UNLOADED_CHILD_RUNNING.into()),
+            background: None,
+        },
+    );
+    state.subagents[0].status = ToolStatus::Succeeded;
+    trim_subagents(&mut state);
+    assert_eq!(state.subagents.len(), 33);
+    assert_eq!(state.subagents[0].id, "child-0");
+    assert_eq!(state.subagents[0].items.len(), 1);
+    assert!(state.subagents.last().unwrap().last_seen_running());
+}
 use serde_json::{Value, json};
+use std::os::fd::FromRawFd;
 
 #[test]
 fn a_settled_actor_releases_large_json_frame_slack() {
@@ -2917,7 +2968,7 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         (false, true, false, false, true),
         (false, true, true, true, true),
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let original = root.path().join("original");
         let moved = root.path().join("moved");
         std::fs::create_dir(&original).unwrap();
@@ -2991,6 +3042,8 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         std::fs::write(original.join("marker"), "replacement").unwrap();
         let (identity, pin) = handle.pinned_launch_directory().unwrap();
         assert_eq!(identity, expected);
+        // Only Linux reports a path-only handle among a descriptor's flags.
+        #[cfg(target_os = "linux")]
         if !admitted {
             assert_ne!(
                 unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
@@ -3933,6 +3986,20 @@ fn native_child_receives_only_the_preserved_source_environment() {
         working_directory: std::env::temp_dir(),
         environment: environment.clone(),
     };
+    // The Command Line Tools Python launcher may set SDK variables before
+    // invoking Python. Measure its output from the same exact clean input.
+    #[cfg(target_os = "macos")]
+    let environment = {
+        let output = std::process::Command::new(&spec.program)
+            .args(["-c", "import json,os; print(json.dumps(dict(os.environ)))"])
+            .current_dir(&spec.working_directory)
+            .env_clear()
+            .envs(&environment)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<BTreeMap<String, String>>(&output.stdout).unwrap()
+    };
     let mut adapter: Box<dyn Adapter> = Box::new(Echo);
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
@@ -4063,7 +4130,7 @@ fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory
         transport: TransportSpec::OwnedUnixWebSocket {
             socket: socket.clone(),
         },
-        program: "/bin/false".into(),
+        program: "/usr/bin/false".into(),
         arguments: Vec::new(),
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
@@ -4450,11 +4517,11 @@ impl Adapter for WebSocketFixture {
 
 #[test]
 fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_close() {
-    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    use std::os::unix::fs::MetadataExt;
     use tungstenite::Message;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = crate::descriptor::bind(&path).unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
@@ -4475,7 +4542,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
     };
     let (pong, pong_received) = crossbeam_channel::bounded(1);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -4571,6 +4638,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
             | Update::PromptAvailable
             | Update::RetainedOutcomes
             | Update::ConversationNameChanged
+            | Update::FailureChanged
             | Update::Execution { .. } => None,
         })
         .collect();
@@ -4589,10 +4657,10 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
 
 #[test]
 fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
-    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    use std::os::unix::fs::MetadataExt;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = crate::descriptor::bind(&path).unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
@@ -4612,7 +4680,7 @@ fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
     };
     let (release, released) = crossbeam_channel::bounded(1);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -5552,7 +5620,7 @@ fn direct_provider_teardown_never_signals_a_reused_process_group() {
         "only the isolated namespace init may reset PID allocation"
     );
     std::fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
-    let mut original = Process::new("/bin/true");
+    let mut original = Process::new("true");
     // SAFETY: only the async-signal-safe setsid syscall runs after fork.
     unsafe {
         original.pre_exec(|| {
@@ -5927,12 +5995,23 @@ fn direct_provider_non_reaping_observation_preserves_exit_status() {
 
 #[test]
 fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
-    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    };
+
+    #[cfg(target_os = "linux")]
+    if crate::daemon::codex_temp::cleanup_fixture::run() {
+        return;
+    }
 
     let working = tempfile::tempdir().unwrap();
     let recipe = crate::model::LaunchRecipe {
-        program: "/usr/bin/printenv".into(),
-        arguments: ["TMPDIR", "TMP", "TEMP"].map(str::to_owned).to_vec(),
+        program: "/bin/sh".into(),
+        arguments: vec![
+            "-c".into(),
+            r#"printf '%s\n' "$TMPDIR" "$TMP" "$TEMP"; read -r line"#.into(),
+        ],
         working_directory: working.path().to_path_buf(),
         environment: BTreeMap::from([
             ("TMPDIR".into(), ".".into()),
@@ -5945,15 +6024,16 @@ fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
     let mut child = spawn_provider(&spec, &AtomicBool::new(false), None, true)
         .unwrap()
         .unwrap();
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut child.child.stdout.take().unwrap(), &mut bytes).unwrap();
-    let paths: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
-    let [first, second, third, []] = paths.as_slice() else {
-        panic!("expected three environment paths");
-    };
+    #[cfg(target_os = "linux")]
+    crate::daemon::codex_temp::cleanup_fixture::include_provider(
+        child.child.id().try_into().unwrap(),
+    );
+    let mut paths = BufReader::new(child.child.stdout.take().unwrap()).split(b'\n');
+    let [first, second, third] =
+        std::array::from_fn(|_| paths.next().expect("expected an environment path").unwrap());
     assert_eq!(first, second);
     assert_eq!(first, third);
-    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(first.to_vec()));
+    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(first));
     assert_eq!(
         temp.parent(),
         Some(working.path().canonicalize().unwrap().as_path())
@@ -5964,7 +6044,13 @@ fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
     );
     std::fs::create_dir(temp.join(".git")).unwrap();
     drop(child);
+    #[cfg(target_os = "linux")]
     assert!(!temp.exists());
+    #[cfg(target_os = "macos")]
+    assert!(
+        temp.is_dir(),
+        "Darwin retains potentially occupied directories"
+    );
 }
 
 #[test]
@@ -6054,6 +6140,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
 /// memory kill of the provider itself is named as one when it exits.
 /// The kills are made the way systemd-oomd makes them: it marks the
 /// cgroup, then kills every process in it.
+#[cfg(target_os = "linux")] // cgroups and systemd-oomd are Linux's.
 #[test]
 fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
     use std::io::{BufRead, Read, Write};
@@ -6392,7 +6479,7 @@ fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after
         messages: None,
         unset_environment: Default::default(),
         transport: TransportSpec::JsonLines,
-        program: "/bin/true".into(),
+        program: "/usr/bin/true".into(),
         arguments: vec![],
         working_directory: std::env::temp_dir(),
         environment: BTreeMap::new(),
@@ -6621,7 +6708,7 @@ fn file_changes_cache_queries_remain_available_after_provider_exit() {
         messages: None,
         unset_environment: Default::default(),
         transport: TransportSpec::JsonLines,
-        program: "/bin/true".into(),
+        program: "/usr/bin/true".into(),
         arguments: vec![],
         working_directory: std::env::temp_dir(),
         environment: BTreeMap::new(),
@@ -6773,4 +6860,72 @@ fn repeated_failed_verifications_keep_only_bounded_latest_detail_and_history() {
     );
     assert_eq!(state.error, None);
     assert_eq!(state.items, retained);
+}
+
+#[test]
+fn a_message_given_to_a_running_turn_keeps_what_the_provider_said_it_is_doing() {
+    struct Turns;
+    impl Adapter for Turns {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            Ok(match command {
+                Command::Compact => Step {
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                },
+                Command::Refresh => Step {
+                    events: vec![Event::Status {
+                        busy: true,
+                        detail: crate::chat::WAITING_ON_BACKGROUND_WORK.into(),
+                    }],
+                    ..Step::default()
+                },
+                _ => Step::default(),
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let mut initial = Step::default();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, Box::new(Turns), initial, store, None, |_| {}).unwrap();
+    let prompt = |mode| Command::Prompt {
+        text: "more".into(),
+        attachments: Vec::new(),
+        mode,
+    };
+    handle.command(Command::Compact).unwrap();
+    handle
+        .command(prompt(super::super::PromptMode::Send))
+        .unwrap();
+    let started = handle.snapshot(None).unwrap();
+    assert!(started.busy);
+    assert_eq!(started.detail, "Waiting for provider turn");
+
+    handle.command(Command::Refresh).unwrap();
+    for mode in [
+        super::super::PromptMode::Queue,
+        super::super::PromptMode::Steer,
+    ] {
+        handle.command(prompt(mode)).unwrap();
+        let running = handle.snapshot(None).unwrap();
+        assert!(running.busy);
+        assert_eq!(running.detail, crate::chat::WAITING_ON_BACKGROUND_WORK);
+    }
+    handle.close().unwrap();
 }

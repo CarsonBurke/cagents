@@ -1479,6 +1479,11 @@ mod tests {
         for mode in [0o755, 0o664, 0o4755, 0o2755] {
             std::fs::write(&path, "before").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let original_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            #[cfg(target_os = "linux")]
+            assert_eq!(original_mode, mode);
+            #[cfg(target_os = "macos")]
+            assert_eq!(original_mode & 0o777, mode & 0o777);
             execute(Operation::Write {
                 root: directory.path().to_owned(),
                 path: "file".into(),
@@ -1489,11 +1494,13 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
-                mode
+                original_mode
             );
         }
     }
 
+    // The fixture writes Linux's POSIX ACL extended attribute.
+    #[cfg(target_os = "linux")]
     #[test]
     fn device_save_preserves_access_acl() {
         use std::os::fd::AsRawFd;

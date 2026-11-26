@@ -1,0 +1,134 @@
+{
+ "threadList": {
+  "data": [
+   {
+    "id": "01a2142a-ab4f-7361-8a6d-5f43bc4850c0",
+    "extra": null,
+    "sessionId": "01a2142a-ab4f-7361-8a6d-5f43bc4850c0",
+    "forkedFromId": null,
+    "attachedToThreadId": null,
+    "parentThreadId": "01a2142a-9e64-7492-a3fc-7c4b358aabaf",
+    "preview": "",
+    "ephemeral": false,
+    "section": null,
+    "sectionEnteredAt": null,
+    "projectId": null,
+    "historyMode": "paginated",
+    "modelProvider": "openai",
+    "model": "gpt-6-luna",
+    "reasoningEffort": "low",
+    "createdAt": 1795634670,
+    "updatedAt": 1795634672,
+    "recencyAt": 1795634670,
+    "status": {
+     "type": "idle"
+    },
+    "cwd": "/repo",
+    "cliVersion": "0.172.0",
+    "originator": "cagents-probe",
+    "source": {
+     "subAgent": {
+      "thread_spawn": {
+       "parent_thread_id": "01a2142a-9e64-7492-a3fc-7c4b358aabaf",
+       "depth": 1,
+       "agent_path": "/root/single_word",
+       "agent_nickname": "Arendt",
+       "agent_role": null
+      }
+     }
+    },
+    "canAcceptDirectInput": false,
+    "threadSource": null,
+    "agentNickname": "Arendt",
+    "agentRole": null,
+    "name": null,
+    "daybreakEnabled": null,
+    "daybreakProgramPropagationEnrolled": false,
+    "turns": []
+   }
+  ],
+  "readStates": {},
+  "nextCursor": null,
+  "backwardsCursor": "2026-11-25T19:24:29.999Z"
+ },
+ "turnsList": {
+  "data": [
+   {
+    "id": "01a2142a-9ff4-76b2-bfc6-f2d78ce3ec67",
+    "rootTurnId": "01a2142a-9ff4-76b2-bfc6-f2d78ce3ec67",
+    "items": [
+     {
+      "type": "userMessage",
+      "id": "01a2142a-a5a5-77c3-916a-ea80ef78cd84",
+      "clientId": null,
+      "content": [
+       {
+        "type": "text",
+        "text": "Use your spawn_agent tool to start exactly one subagent with the task: 'Reply with the single word ok.' Give it model gpt-6-luna and low reasoning effort if the tool allows. Then wait for it to finish and reply 'done'. Do not run any commands.",
+        "text_elements": []
+       }
+      ],
+      "startedAtMs": 1795634668965,
+      "completedAtMs": 1795634668965
+     },
+     {
+      "type": "subAgentActivity",
+      "model": "gpt-6-luna",
+      "reasoningEffort": "low",
+      "id": "call_30018f6209cc40ecb82200f491959fce",
+      "kind": "started",
+      "agentThreadId": "01a2142a-ab4f-7361-8a6d-5f43bc4850c0",
+      "agentPath": "/root/single_word",
+      "startedAtMs": 1795634670419,
+      "completedAtMs": 1795634670419
+     },
+     {
+      "type": "subAgentActivity",
+      "model": null,
+      "reasoningEffort": null,
+      "id": "subagent-completed-01a2142a-ab53-7952-b7a0-5605c20ff1a5",
+      "kind": "completed",
+      "agentThreadId": "01a2142a-ab4f-7361-8a6d-5f43bc4850c0",
+      "agentPath": "/root/single_word",
+      "startedAtMs": 1795634672461,
+      "completedAtMs": 1795634672461
+     },
+     {
+      "type": "collabAgentToolCall",
+      "id": "call_587a18d0152040bf8092c91260d83990",
+      "tool": "wait",
+      "status": "completed",
+      "senderThreadId": "01a2142a-9e64-7492-a3fc-7c4b358aabaf",
+      "receiverThreadIds": [],
+      "prompt": null,
+      "model": null,
+      "reasoningEffort": null,
+      "agentsStates": {},
+      "startedAtMs": 1795634671469,
+      "completedAtMs": 1795634672463
+     },
+     {
+      "type": "agentMessage",
+      "moderation": null,
+      "id": "msg_04c39cbf46900809016b0735f1921887d0b2b8442d1c6a6f9b",
+      "text": "done",
+      "phase": "final_answer",
+      "memoryCitation": null,
+      "delivery": null,
+      "questions": null,
+      "startedAtMs": 1795634673610,
+      "completedAtMs": 1795634673708
+     }
+    ],
+    "itemsView": "full",
+    "status": "completed",
+    "error": null,
+    "startedAt": 1795634667,
+    "completedAt": 1795634673,
+    "durationMs": 6201
+   }
+  ],
+  "nextCursor": null,
+  "backwardsCursor": "{\"requestedThreadId\":\"01a2142a-9e64-7492-a3fc-7c4b358aabaf\",\"rolloutOrdinal\":1,\"includeAnchor\":true,\"scope\":{\"kind\":\"turns\"}}"
+ }
+}

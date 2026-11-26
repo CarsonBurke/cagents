@@ -1717,13 +1717,15 @@ mod tests {
                     }),
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                    Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+                    Event::Keyboard(keyboard::Event::ModifiersChanged(
+                        keyboard::Modifiers::COMMAND,
+                    )),
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Character("a".into()),
                         modified_key: keyboard::Key::Character("a".into()),
                         physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
                         location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::CTRL,
+                        modifiers: keyboard::Modifiers::COMMAND,
                         text: None,
                         repeat: false,
                     }),
@@ -2034,6 +2036,8 @@ enum Popup {
     NewTab,
     Notices,
     Attention,
+    /// The waiting update's list of who it waits for.
+    Update,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2092,6 +2096,8 @@ pub enum Action {
     ToggleNewTab,
     ToggleNotices,
     ToggleAttention,
+    /// Opens or closes the waiting update's popover.
+    ToggleUpdate,
     AttentionPage(usize),
     ShowNoticesFor(CardId),
     Close,
@@ -2471,7 +2477,30 @@ impl Cagents {
                 }
                 ring
             }
+            Popup::Update => self.waiting_focus_ring(),
         }
+    }
+
+    /// Whether the waiting update's popover is open.
+    pub(super) fn update_popup_is_open(&self) -> bool {
+        self.chrome_ui.popup == Some(Popup::Update)
+    }
+
+    /// Closes the waiting update's popover once the wait has ended, keeping
+    /// the keyboard on the header rather than on a control that is gone.
+    pub(super) fn reconcile_update_popup(&mut self) -> Task<Message> {
+        if !self.update_popup_is_open() {
+            return Task::none();
+        }
+        if self.modal_is_open() {
+            // The dialog that opened over it takes the keyboard itself.
+            self.chrome_ui.close();
+        } else if self.idle_wait().is_none() {
+            self.chrome_ui.close();
+            return iced::widget::operation::focus(self.notice_focus_fallback())
+                .map(cosmic::Action::App);
+        }
+        Task::none()
     }
 
     /// Focuses the ring's control at `focus_index`, or its last one when the
@@ -2808,11 +2837,17 @@ impl Cagents {
             Action::ToggleNewTab
             | Action::ToggleNotices
             | Action::ToggleAttention
+            | Action::ToggleUpdate
             | Action::ShowNoticesFor(_) => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
                     Popup::NewTab
                 } else if matches!(action, Action::ToggleAttention) {
                     Popup::Attention
+                } else if matches!(action, Action::ToggleUpdate) {
+                    if self.idle_wait().is_none() {
+                        return Task::none();
+                    }
+                    Popup::Update
                 } else {
                     Popup::Notices
                 };
@@ -2835,6 +2870,11 @@ impl Cagents {
                         .iter()
                         .position(|id| id == NOTICES_CLOSE_ID)
                         .unwrap_or_default(),
+                    // Opens on its way forward; Enter would only review it.
+                    Popup::Update => ring
+                        .iter()
+                        .position(|id| id == super::update_ui::WAITING_NOW_ID)
+                        .unwrap_or_default(),
                 };
                 self.focus_popup_control(ring)
             }
@@ -2852,6 +2892,7 @@ impl Cagents {
                         Popup::NewTab => TOOLBAR_FOCUS_ID,
                         Popup::Notices => NOTICES_CONTROL_ID,
                         Popup::Attention => "attention.control",
+                        Popup::Update => super::update_ui::WAITING_CONTROL_ID,
                     }))
                     .map(cosmic::Action::App)
                 })
@@ -3456,7 +3497,7 @@ impl Cagents {
             .density(cosmic::cosmic_theme::Density::Compact)
             .focused(focused)
             .maximized(self.core.window.is_maximized)
-            .sharp_corners(self.core.window.sharp_corners)
+            .sharp_corners(self.window_corners_sharp())
             .start(start)
             .on_drag(Message::NativeWindowAction(cosmic::app::Action::Drag))
             .on_double_click(Message::NativeWindowAction(cosmic::app::Action::Maximize))
@@ -3486,12 +3527,19 @@ impl Cagents {
         // resize border.
         let inset = if window_controls {
             self.trailing_edge_inset()
+                .max(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing))
         } else {
             0.0
         };
+        // The header starts where the traffic lights end, should they reach
+        // past the projects pane.
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
-            .padding(Padding::ZERO.right(inset))
+            .padding(
+                Padding::ZERO
+                    .left(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading))
+                    .right(inset),
+            )
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
             .into()
@@ -3506,11 +3554,7 @@ impl Cagents {
             // desktop's density, so this gap has to follow it too.
             + count.saturating_sub(1) as f32 * f32::from(cosmic::theme::spacing().space_xxs)
             + 12.0;
-        let update = if self.has_update_control() {
-            design::PRIMARY_CONTROL_SIZE + 4.0
-        } else {
-            0.0
-        };
+        let update = self.update_control_width();
         // Same predicate `workflow_header` mounts the notice control behind.
         let notice = if self.has_chrome_notices() {
             design::PRIMARY_CONTROL_SIZE + 2.0
@@ -3530,6 +3574,8 @@ impl Cagents {
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
             - self.workspace_header_width()
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading)
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing)
             - design::PRIMARY_CONTROL_SIZE
             - space::XXS)
             .max(0.0);

@@ -36,7 +36,9 @@ pub use trailing::trailing;
 mod yielding;
 pub use yielding::yielding;
 
-pub use display::{badge, bounded_badge, change_counts, comment_card, display_path};
+pub use display::{
+    CountTone, badge, bounded_badge, change_counts, comment_card, count_badge, display_path,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use gauge::activity_animates;
 pub use gauge::{
@@ -59,9 +61,9 @@ pub use popover::{
     SCROLLING_FRAME, popover, popover_item, popover_scroll, scrolling_popover, scrolling_width,
 };
 pub use pull_request_state::{
-    ChecksSummary, WorktreePullRequestState, check_state_glyph, check_state_label,
+    ChecksSummary, UNPUSHED_LABEL, WorktreePullRequestState, check_state_glyph, check_state_label,
     check_state_look, checks_glyph, pull_request_review_glyph, pull_request_state_glyph,
-    review_label, review_look,
+    review_label, review_look, uncommitted_glyph, uncommitted_label, unpushed_glyph,
 };
 pub use reserved::reserved;
 pub use responsive::responsive;

@@ -36,7 +36,7 @@ fn failed_upgrade_stop_requires_its_listener_to_be_unserved() {
         .mode(0o700)
         .create(allocation)
         .unwrap();
-    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let listener = crate::descriptor::bind(socket).unwrap();
 
     assert_eq!(
         return_listener_allocation_checked(&session, true).unwrap_err(),

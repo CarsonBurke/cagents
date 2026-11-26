@@ -274,8 +274,9 @@ pub fn may_recognize(item: &Item, provider: Provider) -> bool {
                     | "listAgents"
             ),
             Provider::Omp => name == "task",
-            // Their coordination tools aren't read yet.
-            Provider::Antigravity | Provider::Muse => false,
+            Provider::Antigravity => name == ANTIGRAVITY_SUBAGENT,
+            // Its coordination tools aren't read yet.
+            Provider::Muse => false,
         },
         _ => false,
     }
@@ -779,9 +780,14 @@ fn native(
         Provider::Claude => claude(id, name, input, output),
         Provider::Codex => codex(name, input, output),
         Provider::Omp => omp(name, input),
-        Provider::Antigravity | Provider::Muse => None,
+        Provider::Antigravity => antigravity(id, name, input),
+        Provider::Muse => None,
     }
 }
+
+/// The title Antigravity gives its `invoke_subagent` call, which the ACP
+/// adapter shows as the step's name.
+const ANTIGRAVITY_SUBAGENT: &str = "Run invoke_subagent";
 
 fn field<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or_default()
@@ -959,20 +965,33 @@ fn claude_report(output: &str) -> Option<String> {
 
 /// Codex reports a collaboration call with its prompt as the input and, as
 /// the output, the state of every agent it addressed keyed by thread ID,
-/// which is also the ID its subagents are listed under.
+/// which is also the ID its subagents are listed under. A spawn its second
+/// multi-agent version recorded has no prompt to show, as Codex keeps it
+/// encrypted, and its one agent's state is what Codex said of the agent it
+/// started: its path, model and reasoning effort.
 fn codex(name: &str, input: &str, output: &str) -> Option<Coordination> {
-    let receivers: Vec<String> = serde_json::from_str::<Value>(output)
-        .ok()
+    let states = serde_json::from_str::<Value>(output).ok();
+    let receivers: Vec<String> = states
+        .as_ref()
         .and_then(|states| states.as_object().map(|map| map.keys().cloned().collect()))
         .unwrap_or_default();
+    let started = match (&states, receivers.as_slice()) {
+        (Some(states), [only]) => &states[only],
+        _ => &Value::Null,
+    };
     let kind = match name {
         "spawnAgent" | "spawn_agent" => Kind::Spawn(Spawn {
             agents: vec![Delegate {
                 name: String::new(),
                 kind: String::new(),
-                description: String::new(),
+                description: started["agentPath"]
+                    .as_str()
+                    .and_then(super::codex_agent_task)
+                    .unwrap_or_default(),
                 prompt: Text::Inline(input.into()),
             }],
+            model: field(started, "model").into(),
+            effort: field(started, "reasoningEffort").into(),
             ..Spawn::default()
         }),
         "sendInput" | "send_input" => Kind::Message(Outbound {
@@ -1063,6 +1082,33 @@ fn omp(name: &str, input: &str) -> Option<Coordination> {
         kind: Kind::Spawn(spawn),
         outcome: Outcome::default(),
         subagents,
+        cli: false,
+    })
+}
+
+/// Antigravity's `invoke_subagent` starts one subagent in the `Role` it
+/// names, and its call ends once the subagent has started: the subagent's
+/// own state is how the step stands. The ACP adapter lists the subagent
+/// under the step's ID.
+fn antigravity(id: &str, name: &str, input: &str) -> Option<Coordination> {
+    if name != ANTIGRAVITY_SUBAGENT {
+        return None;
+    }
+    let input: Value = serde_json::from_str(input).ok()?;
+    let model = field(&input, "Model");
+    Some(Coordination {
+        kind: Kind::Spawn(Spawn {
+            agents: vec![Delegate {
+                name: String::new(),
+                kind: field(&input, "Role").trim().into(),
+                description: String::new(),
+                prompt: Text::Inline(field(&input, "Prompt").trim().into()),
+            }],
+            model: if model == "inherit" { "" } else { model }.into(),
+            ..Spawn::default()
+        }),
+        outcome: Outcome::default(),
+        subagents: vec![id.to_owned()],
         cli: false,
     })
 }
@@ -1288,6 +1334,53 @@ mod tests {
         );
     }
 
+    /// The step that started an Antigravity subagent links to it, and the
+    /// subagent's own state, not the call's, says how it stands.
+    #[test]
+    fn an_antigravity_subagent_is_started_by_its_invoke_call() {
+        let input = r#"{"Model":"inherit","Prompt":"Run make check","Role":"Release Checker","TypeName":"self"}"#;
+        let started = native(
+            Provider::Antigravity,
+            "tool:call_1",
+            ANTIGRAVITY_SUBAGENT,
+            input,
+            "",
+        )
+        .unwrap();
+        assert_eq!(started.subagents, ["tool:call_1"]);
+        let Kind::Spawn(spawn) = &started.kind else {
+            panic!("an invoke call is a spawn");
+        };
+        assert!(!spawn.waits);
+        assert_eq!(spawn.model, "");
+        assert_eq!(
+            (spawn.agents[0].kind.as_str(), &spawn.agents[0].prompt),
+            ("Release Checker", &Text::Inline("Run make check".into()))
+        );
+        // Another provider's tool of that title is not one, nor is another
+        // of Antigravity's tools.
+        assert!(
+            native(
+                Provider::Muse,
+                "tool:call_1",
+                ANTIGRAVITY_SUBAGENT,
+                input,
+                ""
+            )
+            .is_none()
+        );
+        assert!(
+            native(
+                Provider::Antigravity,
+                "tool:call_2",
+                "Run list_dir",
+                "{}",
+                ""
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn claude_agents_and_messages_read_their_input() {
         let input =
@@ -1410,6 +1503,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stopped.subagents, ["a1892b93e88999a7d"]);
+    }
+
+    #[test]
+    fn a_codex_spawn_without_a_prompt_reads_its_task_model_and_effort_from_its_agent() {
+        let spawned = native(
+            Provider::Codex,
+            "call",
+            "spawnAgent",
+            "",
+            r#"{"thread-a":{"agentPath":"/root/descendants_design","model":"gpt-6-luna","reasoningEffort":"low"}}"#,
+        )
+        .unwrap();
+        assert_eq!(spawned.subagents, ["thread-a"]);
+        let Kind::Spawn(spawn) = spawned.kind else {
+            panic!("a spawn");
+        };
+        assert_eq!(spawn.agents[0].description, "Descendants design");
+        assert_eq!(spawn.agents[0].prompt, Text::Inline(String::new()));
+        assert_eq!(
+            (spawn.model.as_str(), spawn.effort.as_str()),
+            ("gpt-6-luna", "low")
+        );
+        for (path, task) in [
+            ("/root/survey/check-links", Some("Check links")),
+            ("/root/x", Some("X")),
+            ("/root", None),
+            ("/root/", None),
+            ("/root/__", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                crate::chat::codex_agent_task(path).as_deref(),
+                task,
+                "{path}"
+            );
+        }
     }
 
     #[test]

@@ -78,6 +78,13 @@ impl Adapter for GatedAdapter {
                 }],
                 "unready" => vec![Event::Ready(false)],
                 "waiting" => vec![Event::Waiting(true)],
+                // What the person queued with the provider during a turn, and
+                // the provider taking it.
+                "queued" => vec![Event::QueueChanged(vec![super::super::QueuedMessage::new(
+                    "person-1".into(),
+                    "the person's next message".into(),
+                )])],
+                "dequeued" => vec![Event::QueueChanged(Vec::new())],
                 _ => return Err("unknown fixture state".into()),
             },
             Command::Prompt {
@@ -245,11 +252,29 @@ impl RequestRaceFixture {
         assert!(self.handle.requests().is_empty());
     }
 
+    /// Has the provider hold a message the person queued, or let it go.
+    pub fn set_persons_queue(&self, queued: bool) {
+        self.handle
+            .command(Command::SetModel {
+                model: if queued { "queued" } else { "dequeued" }.into(),
+                reasoning: None,
+            })
+            .unwrap();
+        assert_eq!(
+            self.handle
+                .snapshot(None)
+                .unwrap()
+                .queued_messages
+                .is_empty(),
+            !queued
+        );
+    }
+
     pub fn prompt_count(&self) -> usize {
         self.observed.prompts.lock().unwrap().len()
     }
 
-    pub(crate) fn prompt_texts(&self) -> Vec<String> {
+    pub fn prompt_texts(&self) -> Vec<String> {
         self.observed.prompts.lock().unwrap().clone()
     }
 
@@ -396,6 +421,28 @@ fn courier_prompt_refuses_busy_unready_waiting_and_exited_actors() {
     assert!(fixture.handle.is_completed());
     refused(fixture.handle.try_idle_prompt("courier delivery".into()));
     assert_eq!(fixture.prompt_count(), 0);
+}
+
+#[test]
+fn courier_prompt_waits_behind_a_message_the_person_queued_with_the_provider() {
+    let mut fixture = RequestRaceFixture::new();
+    fixture.set_persons_queue(true);
+    // Idle for the person, who may still send or start what they queued,
+    // but not for the courier.
+    assert!(fixture.handle.is_idle());
+    assert!(!fixture.handle.takes_courier());
+    refused(fixture.handle.try_idle_prompt("courier delivery".into()));
+    assert_eq!(fixture.prompt_count(), 0);
+    assert_eq!(fixture.provider_write_count(), 0);
+    fixture.set_persons_queue(false);
+    assert!(fixture.handle.takes_courier());
+    fixture
+        .handle
+        .try_idle_prompt("courier delivery".into())
+        .unwrap();
+    fixture.wait_for_provider_writes(1);
+    assert_eq!(fixture.prompt_texts(), ["courier delivery"]);
+    fixture.close();
 }
 
 #[test]
