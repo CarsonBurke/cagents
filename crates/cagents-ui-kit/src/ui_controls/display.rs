@@ -104,9 +104,13 @@ pub const COUNT_BADGE_HEIGHT: f32 = 16.0;
 ///
 /// A bare number after a heading reads as part of the heading, or as stray
 /// text; a filled pill reads at once as a count. Counts beside a name use
-/// this one shape, so a reader learns it once; the rail's and avatars'
-/// overlaid counts keep their own ringed pills. Callers say the count in the
-/// accessible name of the control it labels.
+/// this one shape, so a reader learns it once; the projects rail's and
+/// avatars' overlaid counts keep their own ringed pills. Callers say the
+/// count in the accessible name of the control it labels.
+///
+/// Leave the badge out at zero when the body beneath already says it is
+/// empty, as an empty Work board lane does; show "0" when the zero is the
+/// news, as for a search that found nothing.
 pub fn count_badge<'a, Message: 'a>(
     count: impl Into<Cow<'a, str>> + 'a,
     tone: CountTone,
