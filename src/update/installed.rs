@@ -121,15 +121,24 @@ pub(super) fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     Ok(Stamp(entries))
 }
 
-fn digest(root: &Path) -> Result<String, UpdateError> {
+pub(super) fn digest(root: &Path, binaries: &[&str]) -> Result<String, UpdateError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
-    for binary in BINARIES {
+    for binary in binaries {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(root.join("bin").join(binary))?;
-        let size = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(invalid("installed binary is not an owned regular file"));
+        }
+        let size = metadata.len();
         if size > ARCHIVE_LIMIT {
             return Err(invalid("installed binary exceeds update size limit"));
         }
@@ -182,7 +191,7 @@ pub(super) fn perform(
         "Verifying the installed application set",
     )?;
     let before = stamp(root)?;
-    let identity = digest(root)?;
+    let identity = digest(root, &BINARIES)?;
     let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged = candidate::Staged::from_installed(
         root.join("bin/cagents"),
@@ -251,7 +260,7 @@ pub(super) fn perform(
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
         if !confirmed.preserves_consent(&context.apply(latest))
-            || digest(root).map_err(io::Error::other)? != staged.identity.digest
+            || digest(root, &BINARIES).map_err(io::Error::other)? != staged.identity.digest
         {
             return Err(invalid(
                 "The installed build or session ownership changed during pane inspection; existing windows were kept open",

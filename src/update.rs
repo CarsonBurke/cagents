@@ -24,6 +24,8 @@ pub use publication::LocalPublication;
 mod pending_recovery;
 pub mod progress;
 pub mod recovery;
+#[cfg(target_os = "macos")]
+mod release_stage;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
 mod review_fixture;
@@ -2358,7 +2360,8 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     let _lock = inherited_lock(&state)?;
     let mut job: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
-    if job.id != job_id || job.phase != UpdatePhase::Starting {
+    let resume_stage = cfg!(target_os = "macos") && job.phase == UpdatePhase::Verifying;
+    if job.id != job_id || (job.phase != UpdatePhase::Starting && !resume_stage) {
         return Err(invalid("update job is no longer pending"));
     }
     // Reserve startup until readiness or a recorded failure. Success closes
@@ -2477,6 +2480,26 @@ fn perform_update(
         SMALL_ASSET_LIMIT,
     )?)?;
     let terminal = matches!(request, UpdateRequest::ReleaseFromTerminal(_));
+    #[cfg(target_os = "macos")]
+    if job.phase == UpdatePhase::Verifying {
+        let (UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release)) =
+            &request
+        else {
+            return Err(invalid(
+                "Only a verified release can transfer its update worker",
+            ));
+        };
+        let root = release_stage::resume(installation, state, job, release)?;
+        return installed::perform(
+            installation,
+            state,
+            job,
+            &root,
+            handoff,
+            survivors,
+            terminal,
+        );
+    }
     let selected = match request {
         UpdateRequest::Release(release) | UpdateRequest::ReleaseFromTerminal(release) => {
             Installation::detect()?;
@@ -2503,18 +2526,30 @@ fn perform_update(
         UpdatePhase::Downloading,
         "Downloading the release",
     )?;
-    let feed::VerifiedAssets {
-        installer,
-        archive,
-        checksums,
-    } = feed.verified_assets(&release, &cancellation)?;
-    let archive_hash = release.archive.sha256;
+    let assets = feed.verified_assets(&release, &cancellation)?;
     set_phase(
         state,
         job,
         UpdatePhase::Verifying,
         "Verifying the downloaded release",
     )?;
+    #[cfg(target_os = "macos")]
+    if cfg!(target_os = "macos") {
+        return release_stage::extract_and_exec(
+            installation,
+            state,
+            job,
+            release,
+            &assets,
+            &cancellation,
+        );
+    }
+    let feed::VerifiedAssets {
+        installer,
+        archive,
+        checksums,
+    } = assets;
+    let archive_hash = release.archive.sha256;
     let daemon_digest = archive_daemon_digest(&release, &archive, &cancellation)?;
     let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
@@ -4154,6 +4189,8 @@ fn checksum_for(manifest: &str, name: &str) -> Result<[u8; 32], UpdateError> {
     found.ok_or_else(|| invalid(format!("release lacks checksum for {name}")))
 }
 fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -4164,7 +4201,7 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
         }
         hasher.update(&buffer[..length]);
     }
-    if hasher.finalize().as_slice() != expected {
+    if &hasher.finalize()[..] != expected {
         return Err(invalid(
             "release SHA-256 verification failed; installation was not changed",
         ));
