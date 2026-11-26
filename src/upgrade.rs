@@ -1,6 +1,8 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
 pub mod floor;
-pub(crate) mod recovery;
+pub mod recovery;
+#[cfg(all(target_os = "macos", any(feature = "host", feature = "ui")))]
+mod surviving_darwin;
 #[cfg(any(feature = "host", feature = "ui"))]
 use crate::lineage_birth::LineageBirth;
 use crate::model::HostSessionProof;
@@ -59,7 +61,7 @@ impl RecoveryKind {
 }
 
 /// Automatic recovery never replays arbitrary command recipes.
-pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
+pub fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
     recovery_plan(session).map(|(recipe, _)| recipe)
 }
 
@@ -107,14 +109,14 @@ fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
 
 /// Setup recipes are retained for an explicit reviewed run, never automatic
 /// upgrade replay. The marker is classification, not execution authority.
-pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
+pub fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
     recipe
         .environment
         .get("CAGENTS_WORKTREE_SETUP")
         .is_some_and(|value| value == "1")
 }
 
-pub(crate) fn checkpoint_recipe(
+pub fn checkpoint_recipe(
     session: &TerminalSession,
     relaunches: &[crate::terminal_ipc::UpgradeRelaunch],
 ) -> Result<LaunchRecipe, String> {
@@ -183,17 +185,17 @@ pub enum SurvivorLink {
     Lineage,
 }
 
-/// A process of this user whose environment the kernel won't show, because it
-/// made itself undumpable (ssh-agent) or changed credentials (an SSH login's
-/// `sshd-session`). Its arguments and cgroup were read and don't tie it to the
-/// terminal; only the terminal's markers could, and they can't be read.
+/// A process of this user whose lineage markers could not be read. No known
+/// conversation argument or other process evidence ties it to the terminal.
 #[cfg(any(feature = "host", feature = "ui"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadableProcess {
     pub pid: u32,
-    /// Clock ticks after boot. With the PID it names one process, so leaving
-    /// it running can't extend to a later process given the same PID.
+    /// Kernel start ticks in the current boot. Along with the PID they name
+    /// one process lifetime.
     start: Option<u64>,
+    #[cfg(target_os = "macos")]
+    boot: Option<crate::model::BootId>,
     /// The kernel's short name for it, unless it exited during the scan.
     pub name: Option<String>,
     /// Its unified-hierarchy cgroup, which anyone can read.
@@ -208,6 +210,8 @@ impl UnreadableProcess {
         Self {
             pid,
             start: Some(start),
+            #[cfg(target_os = "macos")]
+            boot: None,
             name: Some(name.into()),
             cgroup: None,
         }
@@ -240,6 +244,10 @@ impl UnreadableProcess {
     }
 
     fn same_process(&self, other: &Self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.boot != other.boot {
+            return false;
+        }
         self.pid == other.pid && self.start.is_some() && self.start == other.start
     }
 }
@@ -291,6 +299,10 @@ pub fn surviving_process(
 ) -> Result<Option<SurvivingProcess>, ScanError> {
     // Only the real process table goes with this instance's records.
     let real = proc_root == Path::new("/proc");
+    #[cfg(target_os = "macos")]
+    if real {
+        return surviving_darwin::scan(session, owner, leave);
+    }
     scan_for_survivor(
         session,
         owner,
@@ -304,13 +316,56 @@ pub fn surviving_process(
     )
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
+struct SurvivorEvidence {
+    exact_identity: Option<(crate::agent::Provider, uuid::Uuid)>,
+    markers: [String; 2],
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl SurvivorEvidence {
+    fn new(session: &TerminalSession) -> Self {
+        Self {
+            exact_identity: session
+                .agent_resume_recipe()
+                .as_ref()
+                .and_then(exact_conversation),
+            markers: [
+                format!("CAGENTS_TERMINAL_ID={}", session.id),
+                format!(
+                    "CAGENTS_RECOVERY_ORIGIN={}",
+                    session.recovery_origin.unwrap_or(session.id)
+                ),
+            ],
+        }
+    }
+
+    fn names_conversation<'a>(&self, mut arguments: impl Iterator<Item = &'a [u8]>) -> bool {
+        self.exact_identity.is_some_and(|(provider, id)| {
+            arguments.any(|argument| {
+                std::str::from_utf8(argument).ok().is_some_and(|argument| {
+                    uuid::Uuid::parse_str(argument).ok() == Some(id)
+                        || provider
+                            .session_file_id(Path::new(argument))
+                            .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
+                            == Some(id)
+                })
+            })
+        })
+    }
+
+    fn carries_marker<'a>(&self, mut entries: impl Iterator<Item = &'a [u8]>) -> bool {
+        entries.any(|entry| self.markers.iter().any(|marker| entry == marker.as_bytes()))
+    }
+}
+
 /// A process shows no arguments for a moment while it execs or exits, which on a
 /// machine that's building happens often enough that one read alone would turn
 /// people away. Only the read that failed is repeated: repeating the whole scan
 /// let several processes that keep re-execing each fail a different attempt.
 /// A process that stays unreadable still fails: unknown is not absent.
 #[cfg(any(feature = "host", feature = "ui"))]
-fn settle<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+fn settle<T, E>(mut read: impl FnMut() -> Result<T, E>) -> Result<T, E> {
     const ATTEMPTS: usize = 4;
     const WAIT: std::time::Duration = if cfg!(any(test, feature = "test-support")) {
         std::time::Duration::from_millis(1)
@@ -470,10 +525,9 @@ struct Scan<'a> {
     session: &'a TerminalSession,
     proc_root: &'a Path,
     table: &'a ProcessTable,
+    #[cfg(target_os = "linux")]
     manager: Option<UserManagerSession>,
-    exact_identity: Option<(crate::agent::Provider, uuid::Uuid)>,
-    terminal_marker: String,
-    origin_marker: String,
+    evidence: SurvivorEvidence,
     unit: Option<&'a str>,
 }
 
@@ -484,24 +538,30 @@ impl<'a> Scan<'a> {
             session,
             proc_root,
             table,
+            #[cfg(target_os = "linux")]
             manager: UserManagerSession::connect(),
-            exact_identity: session
-                .agent_resume_recipe()
-                .as_ref()
-                .and_then(exact_conversation),
-            terminal_marker: format!("CAGENTS_TERMINAL_ID={}", session.id),
-            origin_marker: format!(
-                "CAGENTS_RECOVERY_ORIGIN={}",
-                session.recovery_origin.unwrap_or(session.id)
-            ),
+            evidence: SurvivorEvidence::new(session),
             unit: systemd_unit(&session.launch),
         }
     }
 
+    /// Whether `pid` belongs to the systemd user manager's own session.
+    #[cfg(target_os = "linux")]
+    fn in_user_manager(&self, pid: u32) -> bool {
+        self.manager
+            .as_ref()
+            .is_some_and(|manager| manager.contains(pid))
+    }
+
+    /// Darwin runs no systemd user manager; launchd's sessions are not one.
+    #[cfg(target_os = "macos")]
+    fn in_user_manager(&self, _pid: u32) -> bool {
+        false
+    }
+
     fn carries_marker(&self, environment: &[u8]) -> bool {
-        environment.split(|byte| *byte == 0).any(|entry| {
-            entry == self.terminal_marker.as_bytes() || entry == self.origin_marker.as_bytes()
-        })
+        self.evidence
+            .carries_marker(environment.split(|byte| *byte == 0))
     }
 
     fn inspect(&self, pid: u32) -> Result<Inspected, String> {
@@ -546,17 +606,10 @@ impl<'a> Scan<'a> {
             }
             return Err(format!("cannot inspect process invocation ({pid})"));
         }
-        if argv.split(|byte| *byte == 0).any(|arg| {
-            self.exact_identity.is_some_and(|(provider, id)| {
-                std::str::from_utf8(arg).ok().is_some_and(|arg| {
-                    uuid::Uuid::parse_str(arg).ok() == Some(id)
-                        || provider
-                            .session_file_id(Path::new(arg))
-                            .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
-                            == Some(id)
-                })
-            })
-        }) {
+        if self
+            .evidence
+            .names_conversation(argv.split(|byte| *byte == 0))
+        {
             return Ok(Inspected::Survivor(survivor(
                 &path,
                 pid,
@@ -605,17 +658,14 @@ impl<'a> Scan<'a> {
                 return Ok(Inspected::Unrelated);
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                if self
-                    .manager
-                    .as_ref()
-                    .is_some_and(|manager| manager.contains(pid))
-                    || self.in_unmarked_session(pid)
-                {
+                if self.in_user_manager(pid) || self.in_unmarked_session(pid) {
                     return Ok(Inspected::Unrelated);
                 }
                 return Ok(Inspected::Unreadable(UnreadableProcess {
                     pid,
                     start: self.table.starts.get(&pid).copied(),
+                    #[cfg(target_os = "macos")]
+                    boot: None,
                     name: process_name(&path),
                     cgroup: fs::read_to_string(path.join("cgroup"))
                         .ok()
@@ -839,13 +889,13 @@ fn detached_browser_helper(process: &Path) -> bool {
 /// The user manager and PAM helper can deny environ reads even to their owner.
 /// A hosted PTY always starts a new POSIX session; its descendants cannot join
 /// this pre-existing service session. Authenticate it, never trust process names.
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(all(any(feature = "host", feature = "ui"), target_os = "linux"))]
 struct UserManagerSession {
     id: i32,
     process: fs::File,
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
+#[cfg(all(any(feature = "host", feature = "ui"), target_os = "linux"))]
 impl UserManagerSession {
     fn connect() -> Option<Self> {
         use std::os::{
@@ -945,7 +995,7 @@ pub(crate) fn process_error(error: io::Error) -> String {
     format!("cannot rule out surviving terminal processes; automatic recovery is unsafe: {error}")
 }
 
-pub(crate) mod handoff {
+pub mod handoff {
     use super::*;
     use crate::chat;
     use crate::fs_safety;
@@ -961,8 +1011,8 @@ pub(crate) mod handoff {
     const VERSION: u16 = 5;
     const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
-    pub(crate) const MAX_TERMINALS: usize = 1024;
-    pub(crate) const MAX_CHATS: usize = crate::native_chat_capacity::MAX_LIMIT as usize;
+    pub const MAX_TERMINALS: usize = 1024;
+    pub const MAX_CHATS: usize = crate::native_chat_capacity::MAX_LIMIT as usize;
     pub(crate) const MAX_SESSIONS: usize = MAX_TERMINALS + MAX_CHATS;
     const FILE: &str = "daemon-upgrade.json";
     const ABANDONED_FILE: &str = "daemon-upgrade.abandoned.json";
@@ -996,7 +1046,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub(crate) enum Phase {
+    pub enum Phase {
         /// Persisted before any irreversible stop. Provider closure is unproven.
         Prepared,
         /// All old writers were confirmed closed and latest identities saved.
@@ -1015,7 +1065,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Terminal {
+    pub struct Terminal {
         pub source: TerminalSession,
         /// Oldest first; each source's safe restart is the next issued launch.
         #[serde(default)]
@@ -1030,7 +1080,7 @@ pub(crate) mod handoff {
     /// processes, screen and all. Its launch is unchanged, so its lineage
     /// records the carry as a source whose successor launched the same way.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Carried {
+    pub struct Carried {
         pub source: TerminalSession,
         /// Oldest first, as for [`Terminal`].
         #[serde(default)]
@@ -1041,7 +1091,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Chat {
+    pub struct Chat {
         /// Immutable issued launch and former daemon ownership, independent of
         /// any visible-only session identity cached by a client.
         pub source: chat::Session,
@@ -1052,7 +1102,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct ChatSource {
+    pub struct ChatSource {
         pub source: chat::Session,
         /// Provider-confirmed continuation. Durable native aliases all retain
         /// the same live thread; ordinary restarts use the next daemon's launch.
@@ -1060,7 +1110,7 @@ pub(crate) mod handoff {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct Checkpoint {
+    pub struct Checkpoint {
         /// Read and checked here; the host writer derives it from what the
         /// checkpoint holds.
         #[serde(skip_serializing)]
@@ -1078,7 +1128,7 @@ pub(crate) mod handoff {
     }
 
     impl Checkpoint {
-        #[cfg(any(feature = "host", test))]
+        #[cfg(any(feature = "host", test, feature = "test-support"))]
         pub fn new(
             proof: HostSessionProof,
             terminals: Vec<Terminal>,
@@ -1434,7 +1484,7 @@ pub(crate) mod handoff {
     /// Keep the descriptor already issued to the chat while validating the
     /// separate exact execution selected by its original daemon. Older writers
     /// stored the derived resume hint on the checkpoint's terminal copy.
-    pub(crate) fn paired_terminal_source(
+    pub fn paired_terminal_source(
         chat: &Chat,
         terminal: &Terminal,
     ) -> Result<TerminalSession, String> {
@@ -1470,7 +1520,7 @@ pub(crate) mod handoff {
 
     /// Check the immutable descriptor against the separate effective restart.
     /// Call while the old provider and windows are still usable, before handoff.
-    pub(crate) fn validate_chat_source(
+    pub fn validate_chat_source(
         source: &chat::Session,
         launch: &chat::Launch,
     ) -> Result<(), String> {
@@ -1522,7 +1572,7 @@ pub(crate) mod handoff {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
+    pub fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
         // Actor aliases are an explicit helper journal. A known issued source
         // cannot synthesize an earlier unnamed capability.
         (!matches!(
@@ -1549,7 +1599,7 @@ pub(crate) mod handoff {
     /// immutable descriptor was issued. Only identities recorded by this
     /// authenticated source or its effective restart qualify as that alias.
     #[cfg(feature = "host")]
-    pub(crate) fn issued_chat_source_matches(saved: &ChatSource, source: &chat::Session) -> bool {
+    pub fn issued_chat_source_matches(saved: &ChatSource, source: &chat::Session) -> bool {
         if issued_chat_matches(&saved.source, source) {
             return true;
         }
@@ -1561,7 +1611,7 @@ pub(crate) mod handoff {
     /// Publish the descriptor windows were issued, with only its confirmed
     /// presentation identity advanced. Resume argv belongs to `launch` alone.
     #[cfg(feature = "host")]
-    pub(crate) fn restored_chat(
+    pub fn restored_chat(
         source: &chat::Session,
         launch: &chat::Launch,
     ) -> Result<chat::Session, String> {
@@ -1581,7 +1631,7 @@ pub(crate) mod handoff {
     /// A conversation whose provider-confirmed ID only an update checkpoint
     /// records.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-    pub(crate) struct CheckpointIdentity {
+    pub struct CheckpointIdentity {
         pub id: crate::model::TerminalId,
         pub provider: crate::agent::Provider,
         pub conversation: String,
@@ -1591,7 +1641,7 @@ pub(crate) mod handoff {
     /// What any client may read about an unattached conversation. The host
     /// writes the exact evidence beside it; readers ignore that payload.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
-    pub(crate) struct UnattachedSummary {
+    pub struct UnattachedSummary {
         pub id: crate::model::TerminalId,
         pub provider: crate::agent::Provider,
         /// The provider's confirmed conversation (Codex thread) identity.
@@ -1608,7 +1658,7 @@ pub(crate) mod handoff {
     /// What became of an unattached conversation's provider.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
-    pub(crate) enum UnattachedDisposition {
+    pub enum UnattachedDisposition {
         /// It outlived the previous daemon and was left exactly as it was:
         /// nothing was restarted or resent for it.
         #[default]
@@ -1621,7 +1671,7 @@ pub(crate) mod handoff {
 
     #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct UnattachedChat {
+    pub struct UnattachedChat {
         #[serde(flatten)]
         pub summary: UnattachedSummary,
         /// The checkpoint entry exactly as the previous daemon issued it.
@@ -1673,7 +1723,7 @@ pub(crate) mod handoff {
     // attached or the conversation is explicitly closed.
     const RECOVERED_FILE: &str = "daemon-upgrade.recovered.json";
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(crate) struct RecoveredChat {
+    pub struct RecoveredChat {
         pub evidence: Chat,
         pub replacement: chat::Session,
         #[serde(default)]
@@ -1683,7 +1733,7 @@ pub(crate) mod handoff {
     /// Completed checkpoint lineage is evidence about a listed replacement,
     /// never authority to restore or attach a conversation.
     #[derive(Debug, Default)]
-    pub(crate) struct RecoveredChats {
+    pub struct RecoveredChats {
         entries: Vec<RecoveredChat>,
     }
 
@@ -1707,7 +1757,7 @@ pub(crate) mod handoff {
     }
 
     impl RecoveredChats {
-        pub(crate) fn proves(
+        pub fn proves(
             &self,
             source: &chat::Session,
             current: &chat::Session,
@@ -1749,6 +1799,46 @@ pub(crate) mod handoff {
         Store::existing()?.map_or(Ok(STARTUP_BASE), |store| store.startup_timeout())
     }
 
+    /// The daemon can consume the checkpoint before answering hello. Keep its
+    /// file open so the client can still estimate the budget if hello stalls.
+    pub(crate) struct StartupInventory(Option<std::fs::File>);
+
+    impl StartupInventory {
+        pub(crate) fn capture() -> Result<Self, String> {
+            let directory = Store::directory()?;
+            // A serving daemon usually has no checkpoint. In that case there
+            // is no need to open or prepare the upgrade storage directory.
+            match std::fs::symlink_metadata(directory.join(FILE)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+                Err(error) => Err(error.to_string()),
+                Ok(_) => Store::open(&directory)?.startup_inventory(),
+            }
+        }
+
+        pub(crate) fn timeout(self) -> Result<std::time::Duration, String> {
+            let Some(file) = self.0 else {
+                return Ok(STARTUP_BASE);
+            };
+            let bytes = Store::read_evidence(file)?;
+            let inventory: Inventory =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if !VERSIONS.contains(&inventory.version) {
+                return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
+            }
+            if inventory.terminals + inventory.carried > MAX_TERMINALS
+                || inventory.chats > MAX_CHATS
+            {
+                return Err("Upgrade checkpoint exceeds session limits".into());
+            }
+            // Adopting a carried terminal is a local handshake with its holder.
+            Ok(STARTUP_BASE
+                + std::time::Duration::from_secs(
+                    30 * (inventory.terminals + inventory.chats) as u64
+                        + 5 * inventory.carried as u64,
+                ))
+        }
+    }
+
     #[derive(Deserialize)]
     struct Inventory {
         version: u16,
@@ -1781,7 +1871,7 @@ pub(crate) mod handoff {
         deserializer.deserialize_seq(Count)
     }
 
-    pub(crate) struct Store {
+    pub struct Store {
         root: fs_safety::Root,
         pub path: PathBuf,
         /// Serializes this daemon's read-modify-write updates of the
@@ -1791,18 +1881,20 @@ pub(crate) mod handoff {
     }
 
     impl Store {
-        pub fn discover() -> Result<Self, String> {
+        fn directory() -> Result<PathBuf, String> {
             let dirs =
                 crate::instance::project_dirs().ok_or("Cannot discover durable upgrade storage")?;
-            Self::open(&dirs.data_local_dir().join("daemon-upgrade"))
+            Ok(dirs.data_local_dir().join("daemon-upgrade"))
+        }
+
+        pub fn discover() -> Result<Self, String> {
+            Self::open(&Self::directory()?)
         }
 
         /// Opens the durable storage only if some daemon already created it,
         /// so read-only callers never create it.
         pub fn existing() -> Result<Option<Self>, String> {
-            let dirs =
-                crate::instance::project_dirs().ok_or("Cannot discover durable upgrade storage")?;
-            let directory = dirs.data_local_dir().join("daemon-upgrade");
+            let directory = Self::directory()?;
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error.to_string()),
@@ -1849,7 +1941,13 @@ pub(crate) mod handoff {
         }
 
         fn read_named(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
-            let mut file = match fs_safety::open_beneath(&self.root, Path::new(name)) {
+            self.open_evidence(name)?
+                .map(Self::read_evidence)
+                .transpose()
+        }
+
+        fn open_evidence(&self, name: &str) -> Result<Option<std::fs::File>, String> {
+            let file = match fs_safety::open_beneath(&self.root, Path::new(name)) {
                 Ok(file) => file,
                 Err(error) if error.is_not_found() => return Ok(None),
                 Err(error) => return Err(error.to_string()),
@@ -1865,12 +1963,16 @@ pub(crate) mod handoff {
                     self.path.with_file_name(name).display()
                 ));
             }
+            Ok(Some(file))
+        }
+
+        fn read_evidence(mut file: std::fs::File) -> Result<Vec<u8>, String> {
             let bytes =
                 fs_safety::read_bounded(&mut file, MAX_BYTES).map_err(|error| error.to_string())?;
             if bytes.len() as u64 > MAX_BYTES {
                 return Err("Upgrade evidence exceeds durable byte limit".into());
             }
-            Ok(Some(bytes))
+            Ok(bytes)
         }
 
         /// Inspect only the common envelope, retaining the exact private-byte
@@ -1904,33 +2006,39 @@ pub(crate) mod handoff {
             }))
         }
 
+        fn startup_inventory(&self) -> Result<StartupInventory, String> {
+            self.open_evidence(FILE).map(StartupInventory)
+        }
+
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
-            let Some(bytes) = self.read_bytes()? else {
-                return Ok(STARTUP_BASE);
-            };
-            let inventory: Inventory =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            if !VERSIONS.contains(&inventory.version) {
-                return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
-            }
-            if inventory.terminals + inventory.carried > MAX_TERMINALS
-                || inventory.chats > MAX_CHATS
-            {
-                return Err("Upgrade checkpoint exceeds session limits".into());
-            }
-            // Adopting a carried terminal is a local handshake with its holder.
-            Ok(STARTUP_BASE
-                + std::time::Duration::from_secs(
-                    30 * (inventory.terminals + inventory.chats) as u64
-                        + 5 * inventory.carried as u64,
-                ))
+            self.startup_inventory()?.timeout()
         }
 
         #[cfg(any(feature = "host", test))]
         pub fn load(&self) -> Result<Option<Checkpoint>, String> {
+            self.load_for_restore(None)
+        }
+
+        /// Restore the same bytes that were acknowledged, when an update
+        /// supplied that identity. Decode from the read used for verification.
+        #[cfg(any(feature = "host", test))]
+        pub fn load_for_restore(
+            &self,
+            expected_digest: Option<&str>,
+        ) -> Result<Option<Checkpoint>, String> {
             let Some(bytes) = self.read_bytes()? else {
+                if expected_digest.is_some() {
+                    return Err(
+                        "The acknowledged Ready checkpoint disappeared before restoration".into(),
+                    );
+                }
                 return Ok(None);
             };
+            if expected_digest
+                .is_some_and(|expected| format!("{:x}", Sha256::digest(&bytes)) != expected)
+            {
+                return Err("The acknowledged Ready checkpoint changed before restoration".into());
+            }
             decode_checkpoint(&bytes).map(Some)
         }
 
@@ -1957,12 +2065,28 @@ pub(crate) mod handoff {
         /// Atomically and durably replaces `name` with `bytes`.
         #[cfg(any(feature = "host", test))]
         pub(super) fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+            self.publish_named(name, bytes, fs_safety::rename_within)
+        }
+
+        /// Atomically and durably creates `name`, preserving any prior evidence.
+        #[cfg(any(feature = "host", test))]
+        pub(super) fn create_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+            self.publish_named(name, bytes, fs_safety::rename_new_within)
+        }
+
+        #[cfg(any(feature = "host", test))]
+        fn publish_named(
+            &self,
+            name: &str,
+            bytes: &[u8],
+            rename: impl FnOnce(&fs_safety::Root, &OsStr, &OsStr) -> Result<(), fs_safety::ResolveError>,
+        ) -> Result<(), String> {
             let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
             let result = (|| {
                 file.write_all(bytes).map_err(|error| error.to_string())?;
                 file.sync_all().map_err(|error| error.to_string())?;
-                fs_safety::rename_within(&self.root, &temporary, OsStr::new(name))
+                rename(&self.root, &temporary, OsStr::new(name))
                     .map_err(|error| error.to_string())?;
                 fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
             })();
@@ -1987,7 +2111,7 @@ pub(crate) mod handoff {
         /// Read immutable issued lineage once for a fenced daemon inventory.
         /// Missing evidence grants no continuity; unsafe or ambiguous evidence
         /// is an error and remains untouched.
-        pub(crate) fn recovered_chats(&self) -> Result<RecoveredChats, String> {
+        pub fn recovered_chats(&self) -> Result<RecoveredChats, String> {
             let entries = self.read_recovered()?;
             let mut ids = std::collections::BTreeSet::new();
             if entries
@@ -2005,14 +2129,14 @@ pub(crate) mod handoff {
         /// Preserve aliases after the replay checkpoint is consumed. This file
         /// is read only to verify a live replacement, never to start a writer.
         #[cfg(any(feature = "host", test))]
-        pub(crate) fn record_recovered(&self, entries: &[RecoveredChat]) -> Result<(), String> {
+        pub fn record_recovered(&self, entries: &[RecoveredChat]) -> Result<(), String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             let bytes = self.recovered_bytes(entries)?;
             self.write_named(RECOVERED_FILE, &bytes)
         }
 
         #[cfg(feature = "host")]
-        pub(crate) fn preflight_recovered(&self, chats: &[Chat]) -> Result<(), String> {
+        pub fn preflight_recovered(&self, chats: &[Chat]) -> Result<(), String> {
             let entries = chats
                 .iter()
                 .map(|chat| {
@@ -2110,7 +2234,7 @@ pub(crate) mod handoff {
         }
 
         #[cfg(feature = "host")]
-        pub(crate) fn recovered_sources(
+        pub fn recovered_sources(
             &self,
             source: &chat::Session,
             replacement: &chat::Session,
@@ -2136,7 +2260,7 @@ pub(crate) mod handoff {
         }
 
         #[cfg(feature = "host")]
-        pub(crate) fn retire_recovered(&self, id: crate::model::TerminalId) -> Result<(), String> {
+        pub fn retire_recovered(&self, id: crate::model::TerminalId) -> Result<(), String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
             let mut entries = self.read_recovered()?;
             let before = entries.len();
@@ -2427,6 +2551,27 @@ pub(crate) mod handoff {
     mod timeout_tests {
         use super::*;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        #[test]
+        fn a_claim_is_published_complete_and_preserves_an_existing_claim() {
+            let directory = crate::test_fixture::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let claim = "recovery.json";
+            let evidence = br#"{"settled":false}"#;
+            store
+                .publish_named(claim, evidence, |root, temporary, destination| {
+                    assert!(store.read_named(claim).unwrap().is_none());
+                    assert_eq!(
+                        std::fs::read(directory.path().join(temporary)).unwrap(),
+                        evidence
+                    );
+                    fs_safety::rename_new_within(root, temporary, destination)
+                })
+                .unwrap();
+            assert!(store.create_named(claim, br#"{"settled":true}"#).is_err());
+            assert_eq!(store.read_named(claim).unwrap().unwrap(), evidence);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
 
         #[test]
         fn evidence_encoding_stops_before_serializing_the_tail_of_an_oversized_report() {
@@ -3363,7 +3508,7 @@ mod tests {
     #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
     fn detached_browser_helpers_do_not_own_inherited_terminal_markers() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{FileTypeExt, symlink};
 
         let directory = tempfile::tempdir().unwrap();
         let mut source = checkpoint(directory.path()).terminals.remove(0).source;
@@ -3403,23 +3548,22 @@ mod tests {
         symlink("/tools/chrome_crashpad_handler", process.join("exe")).unwrap();
 
         // A diagnostic pipe is normal for detached crash handlers.
-        let (reader, _writer) = std::io::pipe().unwrap();
-        use std::os::fd::AsRawFd;
-        fs::remove_file(process.join("fd/2")).unwrap();
-        symlink(
-            format!("/proc/self/fd/{}", reader.as_raw_fd()),
-            process.join("fd/2"),
-        )
-        .unwrap();
+        let stderr = process.join("fd/2");
+        fs::remove_file(&stderr).unwrap();
+        let path = std::ffi::CString::new(stderr.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: path is a live, NUL-terminated name inside the fixture.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
 
         fs::write(process.join("stat"), "42 (helper) S 1 41 41 34816").unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
         fs::write(process.join("stat"), "42 (helper) S 1 41 41 0").unwrap();
-        // Retaining a terminal on any descriptor must prevent the exemption.
-        symlink("/dev/ptmx", process.join("fd/7")).unwrap();
+        // A non-null character device on any descriptor prevents the exemption.
+        let device = process.join("fd/7");
+        symlink("/dev/zero", &device).unwrap();
+        assert!(fs::metadata(&device).unwrap().file_type().is_char_device());
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
-        fs::remove_file(process.join("fd/7")).unwrap();
+        fs::remove_file(device).unwrap();
         fs::remove_file(process.join("fd/0")).unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
         symlink("/dev/null", process.join("fd/0")).unwrap();
@@ -3779,7 +3923,7 @@ mod tests {
         assert_eq!(scans, 3);
 
         let mut scans = 0;
-        let unknown = settle::<()>(|| {
+        let unknown = settle::<(), _>(|| {
             scans += 1;
             Err("cannot inspect process invocation (42)".to_owned())
         });
@@ -4269,6 +4413,41 @@ mod tests {
         assert!(store.load().unwrap().unwrap().require_ready().is_err());
         // A second load cannot convert an uncertain partial restore into replay.
         assert!(store.load().unwrap().unwrap().require_ready().is_err());
+    }
+
+    #[test]
+    fn ready_restore_uses_only_the_acknowledged_checkpoint_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        checkpoint.phase = Phase::Ready;
+        store.save(&checkpoint).unwrap();
+        let captured = store.checkpoint_status().unwrap().unwrap();
+        let restored = store
+            .load_for_restore(Some(&captured.digest))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.proof, checkpoint.proof);
+        assert_eq!(restored.phase, Phase::Ready);
+
+        // A different valid Ready checkpoint from the same daemon still has
+        // no authority under the acknowledged capture.
+        checkpoint.terminals.clear();
+        store.save(&checkpoint).unwrap();
+        let changed = fs::read(&store.path).unwrap();
+        assert_eq!(
+            store.load_for_restore(Some(&captured.digest)).unwrap_err(),
+            "The acknowledged Ready checkpoint changed before restoration"
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), changed);
+        assert!(store.load().unwrap().unwrap().terminals.is_empty());
+
+        fs::remove_file(&store.path).unwrap();
+        assert_eq!(
+            store.load_for_restore(Some(&captured.digest)).unwrap_err(),
+            "The acknowledged Ready checkpoint disappeared before restoration"
+        );
+        assert!(store.load().unwrap().is_none());
     }
 
     #[test]

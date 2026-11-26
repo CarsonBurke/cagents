@@ -4,10 +4,7 @@
 //! A parent completion must leave the idle wait, but cannot authorize ending
 //! those children. Present them for explicit stop review instead.
 use super::{Client, UpdateError, impact, invalid};
-use crate::{
-    chat::{Snapshot, ToolStatus},
-    model::TerminalId,
-};
+use crate::{chat::Snapshot, model::TerminalId};
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -78,7 +75,7 @@ impl From<Snapshot> for TurnActivity {
             background: snapshot
                 .subagents
                 .into_iter()
-                .filter(|child| child.background && child.status == ToolStatus::Running)
+                .filter(|child| child.background && child.is_running())
                 .map(|child| child.id)
                 .collect(),
             interrupted,
@@ -94,14 +91,14 @@ impl TurnActivity {
             // individually to settle the conversation for a legacy prepare.
             item.interrupted_subagents = self.background.clone();
             if !self.background.is_empty() {
-                item.reason = format!(
+                item.reason = impact::SessionCause::Detail(format!(
                     "The active turn and {} running background subagent(s) will stop; background work will not resume automatically.",
                     self.background.len()
-                );
+                ));
             }
         } else if self.parent_finished && !self.background.is_empty() {
             item.disposition = impact::Disposition::Blocked;
-            item.reason = "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into();
+            item.reason = impact::SessionCause::BackgroundWork;
             item.interrupted_subagents = self.background.clone();
         } else if !self.parent_finished {
             // Disclose interruption's complete scope before offering `i`.
@@ -199,9 +196,10 @@ impl TurnReview {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+    use crate::chat::ToolStatus;
     use crate::{
         control::ControlClient,
         model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe},
@@ -277,15 +275,22 @@ mod tests {
         assert_eq!(impact.disposition, impact::Disposition::Blocked);
         assert_eq!(impact.identity, "exact-source-owner");
         assert_eq!(impact.interrupted_subagents, ["background-child"]);
-        assert!(impact.reason.contains("turn finished"));
+        assert_eq!(impact.reason, impact::SessionCause::BackgroundWork);
     }
 
     #[test]
     fn working_review_discloses_exact_background_interruption_before_the_choice() {
+        let mut unloaded = child(ToolStatus::Running);
+        unloaded.id = "unloaded-child".into();
+        unloaded.detail = crate::chat::UNLOADED_CHILD_RUNNING.into();
         let mut snapshot = Snapshot {
             ready: true,
             busy: true,
-            subagents: vec![child(ToolStatus::Running), child(ToolStatus::Succeeded)],
+            subagents: vec![
+                child(ToolStatus::Running),
+                unloaded,
+                child(ToolStatus::Succeeded),
+            ],
             ..Default::default()
         };
         snapshot.capabilities.interrupt_stops_background = true;
@@ -360,7 +365,12 @@ mod tests {
         .review(&mut impact);
         assert_eq!(impact.disposition, impact::Disposition::Interrupted);
         assert_eq!(impact.interrupted_subagents, ["background-child"]);
-        assert!(impact.reason.contains("background work will not resume"));
+        assert!(
+            impact
+                .reason
+                .as_str()
+                .contains("background work will not resume")
+        );
         assert_eq!(impact.identity, "exact-source-owner");
     }
 

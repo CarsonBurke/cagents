@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Prepares a GitHub-hosted Ubuntu 24.04 runner for scripts/build-release-linux
+# and the offline smoke install: bubblewrap, unprivileged user namespaces
+# (Ubuntu restricts them through AppArmor), disk space for a cold release
+# build under /mnt/cagents, and swap for its largest links.
+set -euo pipefail
+sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+sudo apt-get -qq update
+sudo apt-get -qq install -y bubblewrap >/dev/null
+# Toolchains this workflow never uses take most of the root disk.
+sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost \
+    /usr/local/share/powershell /usr/share/swift
+# The larger disk, when the runner has one, holds the build.
+if mountpoint -q /mnt && (($(df --output=avail -k /mnt | tail -n1) > $(df --output=avail -k / | tail -n1))); then
+    work=/mnt/cagents
+else
+    work=/var/cagents
+    sudo ln -sfn "$work" /mnt/cagents 2>/dev/null || :
+fi
+sudo mkdir -p "$work/tmp"
+sudo chown -R "$(id -u):$(id -g)" "$work"
+if [[ ! -e $work.swap ]]; then
+    sudo fallocate -l 8G "$work.swap" && sudo chmod 600 "$work.swap" && sudo mkswap -q "$work.swap" && sudo swapon "$work.swap"
+fi
+df -h / /mnt 2>/dev/null || :
+free -g

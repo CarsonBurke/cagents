@@ -72,7 +72,7 @@ fn issue_key(value: &str) -> Option<String> {
     .then(|| value.to_ascii_uppercase())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
 
@@ -157,7 +157,7 @@ impl IssuePreview {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod preview_tests {
     use super::*;
     #[test]

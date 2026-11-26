@@ -1,0 +1,32 @@
+{
+  "workspace": {
+    "alt": "The cagents window. The sidebar lists the acme-api project's worktrees with each agent's provider and status. A Muse conversation that wrote a changelog entry sits beside a Claude Code conversation, running on a work account, that fixed a token refresh race.",
+    "themes": [
+      "dark"
+    ]
+  },
+  "accounts": {
+    "alt": "The Accounts pane: three Claude Code accounts (side project, personal and work) and a Codex account, each with its own session and weekly allowance left and its reset time.",
+    "themes": [
+      "dark"
+    ]
+  },
+  "agents": {
+    "alt": "Codex, Antigravity, Muse and Claude Code conversations as tabs in one strip. A Codex chat that added a regression test sits beside an Antigravity chat reviewing the same branch.",
+    "themes": [
+      "dark"
+    ]
+  },
+  "worktrees": {
+    "alt": "The sidebar for the acme-api project: worktrees named feat-webhook-retries, docs-runbook, feat-rate-limits and fix-token-refresh, each with its agent's provider and a working or unread marker.",
+    "themes": [
+      "dark"
+    ]
+  },
+  "review": {
+    "alt": "Source control for the fix-token-refresh worktree, listing one modified and one untracked file, next to a unified diff of src/auth/refresh.rs."
+  },
+  "editor": {
+    "alt": "A Claude Code chat next to the Rust file it edited, open in the built-in editor with syntax highlighting."
+  }
+}

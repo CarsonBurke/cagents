@@ -59,11 +59,22 @@ if auth:
     with open(root / "jobserver.jsonl", "a") as output:
         output.write(json.dumps([arguments[0], all(map(pipe, auth.split(",")))]) + "\\n")
 if arguments[0] == "metadata":
-    print(json.dumps({"workspace_root": str(root), "workspace_default_members": ["cagents-id"],
-        "packages": [{"name": "cagents", "version": "0.1.3", "id": "cagents-id",
+    features = {"default": ["full"], "full": [], "host": [], "test-alias": ["host"], "test-support": []}
+    if os.environ.get("FIXTURE_LAYOUT") == "split":
+        # The daemon in its own package beside the shared library's CLI.
+        packages = [{"name": "cagents", "version": "0.1.3", "id": "cagents-id",
+            "manifest_path": str(root / "Cargo.toml"), "targets": [{"name": "cagents",
+            "kind": ["bin"]}, {"name": "cagents", "kind": ["lib"]}], "features": features},
+            {"name": "cagents-host", "version": "0.1.3", "id": "cagents-host-id",
+            "manifest_path": str(root / "crates/cagents-host/Cargo.toml"), "targets": [
+            {"name": "cagentsd", "kind": ["bin"]}], "features": {"default": ["full"],
+            "full": ["cagents/full"]}}]
+    else:
+        packages = [{"name": "cagents", "version": "0.1.3", "id": "cagents-id",
             "manifest_path": str(root / "Cargo.toml"), "targets": [{"name": "cagentsd",
-            "kind": ["bin"]}], "features": {"default": ["full"], "full": [],
-            "host": [], "test-alias": ["host"]}}]}))
+            "kind": ["bin"]}], "features": features}]
+    print(json.dumps({"workspace_root": str(root), "workspace_default_members": ["cagents-id"],
+        "packages": packages}))
 elif arguments[0] == "build":
     mode = os.environ.get("FIXTURE_MODE")
     if mode == "blocking-build":
@@ -85,6 +96,9 @@ elif arguments[0] == "build":
     if mode != "missing-artifact":
         print(json.dumps({"reason": "compiler-artifact", "target": {"name": "cagentsd",
             "kind": ["bin"]}, "executable": os.environ["FIXTURE_PRODUCT"]}))
+    if "cagents" in arguments:
+        print(json.dumps({"reason": "compiler-artifact", "target": {"name": "cagents",
+            "kind": ["bin"]}, "executable": os.environ["FIXTURE_PRODUCT"] + "-cli"}))
 elif arguments[0] in ("test", "t"):
     if os.environ.get("CAGENTS_TEST_RETAINED_ACTOR_HELPER") != os.environ["FIXTURE_PRODUCT"]:
         print("test did not receive exact helper", file=sys.stderr)
@@ -183,6 +197,63 @@ elif arguments[0] in ("test", "t"):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertTrue(all(event["args"][0] == "metadata" for event in events))
+
+    def test_split_daemon_package_builds_the_daemon_and_the_cli_it_runs(self):
+        # The host lane selects the shared library and the daemon's package.
+        arguments = ["test", "--locked", "--no-default-features", "-p", "cagents", "--package",
+                     "cagents-host", "--features", "cagents/host", "--test", "account_default_contract"]
+        result, events = self.invoke(arguments, gate=True, extra={"FIXTURE_LAYOUT": "split"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = compiled(events)
+        self.assertEqual([event["args"][0] for event in events], ["build", "test", "test"])
+        self.assertEqual(events[0]["args"], ["build", "--locked", "--no-default-features",
+            "--features", "cagents/host", "--profile", "test", "--features", "cagents/test-support",
+            "--package", "cagents-host-id", "--package", "cagents-id", "--bin", "cagentsd",
+            "--bin", "cagents", "--message-format=json-render-diagnostics"])
+        self.assertEqual(events[2], {"args": arguments, "helper": str(self.product)})
+
+    def test_split_daemon_package_alone_or_by_manifest_still_gets_the_cli(self):
+        manifest = self.root / "crates/cagents-host/Cargo.toml"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("[package]\nname='cagents-host'\nversion='0.1.3'\n")
+        for arguments in (["test", "-pcagents-host", "--lib"],
+                          ["test", "--manifest-path", str(manifest), "--lib"],
+                          ["test", "--workspace", "--exclude", "ceditor"]):
+            with self.subTest(arguments=arguments):
+                self.events.unlink(missing_ok=True)
+                result, events = self.invoke(arguments, extra={"FIXTURE_LAYOUT": "split"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, str(self.product) + "\n")
+                build = compiled(events)[0]["args"]
+                self.assertEqual(build[build.index("--bin"):-1], ["--bin", "cagentsd", "--bin", "cagents"])
+
+    def test_split_library_host_tests_build_the_daemon_alone(self):
+        # The shared library's own `host` tests, as `test-lib shared-host`
+        # runs them, start cagentsd as a retained helper. The daemon's package
+        # names none of the library's features and always builds it with `host`.
+        for arguments in (["test", "--no-default-features", "--features", "host", "--lib"],
+                          ["test", "-p", "cagents", "--features", "cagents/host"]):
+            with self.subTest(arguments=arguments):
+                self.events.unlink(missing_ok=True)
+                result, events = self.invoke(arguments, extra={"FIXTURE_LAYOUT": "split"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, str(self.product) + "\n")
+                build = compiled(events)[0]["args"]
+                self.assertNotIn("--features", build)
+                self.assertNotIn("cagents-id", build)
+                self.assertEqual(build[build.index("--package"):-1],
+                                 ["--package", "cagents-host-id", "--bin", "cagentsd"])
+                self.assertEqual("--no-default-features" in build, "--no-default-features" in arguments)
+
+    def test_split_layout_without_the_daemon_or_host_builds_no_helper(self):
+        for arguments in (["test", "--workspace", "--exclude", "cagents-host"],
+                          ["test", "-p", "cagents"]):
+            with self.subTest(arguments=arguments):
+                self.events.unlink(missing_ok=True)
+                result, events = self.invoke(arguments, extra={"FIXTURE_LAYOUT": "split"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(compiled(events), [])
 
     def test_explicit_helper_is_preserved_without_building(self):
         result, events = self.invoke(["test", "--features=host"], gate=True,

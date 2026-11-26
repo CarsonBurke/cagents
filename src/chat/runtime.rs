@@ -1,18 +1,18 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
     AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
-    protocol::{Adapter, HeldStop, ProcessSpec, SetupError, Step, TransportSpec},
+    protocol::{Adapter, HeldStop, MetadataWake, ProcessSpec, SetupError, Step, TransportSpec},
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
 use crate::daemon::owned_children::DetachedWork;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+#[cfg(any(test, feature = "test-support"))]
+pub use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command as Process, Stdio},
@@ -25,35 +25,34 @@ use std::{
 };
 mod child_diagnostics;
 mod child_text_copy;
-#[cfg(test)]
-pub(crate) mod courier_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod courier_tests;
 mod delivery;
 use crate::chat::DeliveryKey;
+pub use delivery::Deliveries;
 mod execution;
 mod handle;
 pub use handle::Handle;
-pub(crate) use handle::ReadFailure;
-#[cfg(test)]
-pub(crate) use handle::RetainedInputOutcome;
+pub use handle::ReadFailure;
+#[cfg(any(test, feature = "test-support"))]
+pub use handle::RetainedInputOutcome;
 /// Process evidence only, without the reader lease: no retirement authority.
-pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
-pub(crate) use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
-#[cfg(test)]
-pub(crate) use retained_actor::journal::ContinuityLoss;
-pub(crate) use retained_actor::journal::OutboxEntry;
-#[cfg(test)]
-pub(crate) use retained_actor::transport::scripted_helper::{Script, ScriptedHelper};
-pub(crate) use retained_actor::transport::{
-    ActorIdentity, RetirementInspection, VerifiedRetirement,
-};
+pub use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
+pub use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
+#[cfg(any(test, feature = "test-support"))]
+pub use retained_actor::journal::ContinuityLoss;
+pub use retained_actor::journal::OutboxEntry;
+#[cfg(any(test, feature = "test-support"))]
+pub use retained_actor::transport::scripted_helper::{Script, ScriptedHelper};
+pub use retained_actor::transport::{ActorIdentity, RetirementInspection, VerifiedRetirement};
 mod retained_actor;
 /// Synthetic retained-actor receipts for the daemon's collection tests.
-#[cfg(test)]
-pub(crate) use retained_actor::receipt_fixture as retained_receipt_fixture;
+#[cfg(any(test, feature = "test-support"))]
+pub use retained_actor::receipt_fixture as retained_receipt_fixture;
 mod store;
 pub use store::Unread;
 mod websocket;
-pub(crate) use store::Store;
+pub use store::Store;
 
 /// How long a caller waits for the actor to acknowledge a command before its
 /// outcome is unknown.
@@ -91,14 +90,14 @@ const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 /// Start returns once the worker is running, before it applies that frame, so
 /// a caller can observe a reader with nothing applied yet. Holding one makes
 /// that interleaving certain rather than occasional.
-#[cfg(test)]
-static HELD_HISTORY_READERS: Mutex<Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>> =
+#[cfg(any(test, feature = "test-support"))]
+pub static HELD_HISTORY_READERS: Mutex<Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>> =
     Mutex::new(Vec::new());
 
 /// Hold the next history reader started in `directory` before it applies its
 /// initial frame, until the returned sender sends or is dropped.
-#[cfg(test)]
-pub(crate) fn hold_history_reader(directory: &std::path::Path) -> std::sync::mpsc::Sender<()> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_history_reader(directory: &std::path::Path) -> std::sync::mpsc::Sender<()> {
     let (release, held) = std::sync::mpsc::channel();
     HELD_HISTORY_READERS
         .lock()
@@ -107,8 +106,8 @@ pub(crate) fn hold_history_reader(directory: &std::path::Path) -> std::sync::mps
     release
 }
 
-#[cfg(test)]
-fn await_history_release(directory: &std::path::Path) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn await_history_release(directory: &std::path::Path) {
     let held = {
         let mut held = HELD_HISTORY_READERS
             .lock()
@@ -124,7 +123,7 @@ fn await_history_release(directory: &std::path::Path) {
 
 /// The refusal of a decline-only answer whose action the provider doesn't
 /// read as turning the request down, or whose request is no longer pending.
-pub(crate) const NOT_A_DECLINE: &str = "A settled run may only decline a current pending request";
+pub const NOT_A_DECLINE: &str = "A settled run may only decline a current pending request";
 
 enum ActorCommand {
     RetainedProvider {
@@ -151,6 +150,8 @@ enum ActorCommand {
         closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
+    #[cfg(target_os = "macos")]
+    VerifyUpdateRelease,
     PinnedLaunchDirectory(
         crossbeam_channel::Sender<
             Result<
@@ -199,7 +200,7 @@ type CommandRequest = (
 
 /// Why a provider command may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Rejection {
+pub enum Rejection {
     /// The actor never took the command, or refused it before effects were possible.
     Refused(String),
     /// The actor did not answer in time, or failed after effects became possible;
@@ -216,14 +217,21 @@ impl From<Rejection> for String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum UpdateReadiness {
+pub enum UpdateReadiness {
     Idle,
     Busy,
     Unready,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedWaiting {
+    Current,
+    Superseded,
+    Resolved,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum Update {
+pub enum Update {
     /// Helper outbox has uncommitted semantic evidence; wake the host broker.
     RetainedOutcomes,
     Execution {
@@ -265,6 +273,33 @@ pub(crate) enum Update {
         revision: u64,
         model: Option<super::ActiveModel>,
     },
+    ConversationNameChanged,
+    /// Local edge for directory readers. Retained helpers carry the failure
+    /// in resident metadata, from which the host emits its own edge.
+    #[serde(skip)]
+    FailureChanged,
+}
+
+pub struct ConversationNaming {
+    pub session: Option<String>,
+    pub provider: Option<String>,
+    pub provider_cleared: bool,
+    pub opening: Option<super::OpeningTitle>,
+}
+
+impl ConversationNaming {
+    pub fn title(&self) -> Option<(String, crate::model::ChannelTitleSource)> {
+        use crate::model::ChannelTitleSource::{Prompt, Provider};
+        self.provider
+            .as_deref()
+            .and_then(crate::workspace_model::channel_title)
+            .map(|title| (title, Provider))
+            .or_else(|| {
+                self.opening
+                    .as_ref()
+                    .map(|title| (title.text().to_owned(), Prompt))
+            })
+    }
 }
 
 /// The conversation's prompt cache activity, which the actor records and
@@ -316,7 +351,7 @@ impl LocalHandle {
     }
 }
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TitleUnavailable {
+pub enum TitleUnavailable {
     Busy,
     Poisoned,
 }
@@ -375,6 +410,8 @@ struct Inner {
     /// What closing does with the work the provider already detached, once
     /// its owner decides. See [`DetachedDecision`].
     detached_work: Arc<DetachedDecision>,
+    #[cfg(target_os = "macos")]
+    completed_descendants: Arc<Mutex<Option<crate::daemon::descendants::Tracker>>>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
@@ -384,9 +421,8 @@ struct Inner {
     /// file lock before accepting. See [`Handle::startup_lock_wait`].
     startup_lock_wait: Arc<AtomicU64>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
-    /// What became of the messages sent under a key.
-    deliveries: delivery::Deliveries,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
 
@@ -421,8 +457,8 @@ impl LocalHandle {
         self.0.idle_frame_buffer_capacity.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
-    pub(crate) fn start(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
@@ -435,8 +471,8 @@ impl LocalHandle {
 
     /// Retain an actual native holder after closing the fixture's local actor.
     /// Cleanup still requires the real holder protocol and receipt.
-    #[cfg(test)]
-    pub(crate) fn fixture_retained_native_holder(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_retained_native_holder(
         &self,
         holder: super::native_holder::Holder,
         reason: String,
@@ -523,7 +559,7 @@ impl LocalHandle {
     /// when it published each update. A frame's confirmation is installed
     /// before the outcomes it settles are published.
     pub(super) fn start_retained(
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
@@ -539,6 +575,7 @@ impl LocalHandle {
             &spec.working_directory,
             |name| spec.environment.get(name).map(std::ffi::OsString::from),
         )?;
+        super::protocol::claude::apply_spawn_attribution(&mut spec, store.directory());
         let confirmed_session = Arc::new(Mutex::new(None));
         let followed = confirmed_session.clone();
         Self::start_with_scope(
@@ -633,7 +670,7 @@ impl LocalHandle {
         let provider_process = Arc::new(Mutex::new(None));
         let startup_lock_wait = Arc::new(AtomicU64::new(0));
         let startup_budget = StartupBudget::current();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(usize::MAX));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
@@ -667,6 +704,8 @@ impl LocalHandle {
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
         let detached_work = Arc::new(DetachedDecision::default());
+        #[cfg(target_os = "macos")]
+        let completed_descendants = Arc::new(Mutex::new(None));
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
@@ -694,6 +733,8 @@ impl LocalHandle {
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_work: detached_work.clone(),
+            #[cfg(target_os = "macos")]
+            completed_descendants: completed_descendants.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
@@ -703,8 +744,7 @@ impl LocalHandle {
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
-            deliveries: delivery::Deliveries::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             idle_frame_buffer_capacity: idle_frame_buffer_capacity.clone(),
         });
         let launch_context = spec.execution.clone();
@@ -760,13 +800,14 @@ impl LocalHandle {
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
                     waiting_fingerprint: None,
+                    published_error: None,
                     last_present: Instant::now(),
                     first_frame: false,
                     stdout_noise: spec.stdout_noise,
                     started: Instant::now(),
                     startup: startup_budget,
                     write_started: None,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     idle_frame_buffer_capacity,
                 };
                 let result = {
@@ -782,7 +823,12 @@ impl LocalHandle {
                         let child = if actor.native_holder.is_some() {
                             Ok(None)
                         } else {
-                            spawn_provider(&spec, &actor.stop, scope_wake)
+                            spawn_provider(
+                                &spec,
+                                &actor.stop,
+                                scope_wake,
+                                actor.adapter.needs_private_temp(),
+                            )
                         };
                         let child = child.and_then(|child| {
                             if let Some(child) = &child {
@@ -799,7 +845,7 @@ impl LocalHandle {
                         actor.child = child?;
                         match spec.transport {
                             TransportSpec::History => {
-                                #[cfg(test)]
+                                #[cfg(any(test, feature = "test-support"))]
                                 await_history_release(&spec.working_directory);
                                 actor.run_history(initial)
                             }
@@ -865,8 +911,28 @@ impl LocalHandle {
                         .ok()
                         .flatten()
                         .and_then(|s| s.code());
-                    child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    #[cfg(target_os = "linux")]
+                    {
+                        child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(disposition) = detached_work.get() {
+                            child.stop_detached = disposition == DetachedWork::Stop;
+                        }
+                    }
                     let result = child.terminate();
+                    #[cfg(target_os = "macos")]
+                    if child.terminated
+                        && let Some(mut tracker) = child.descendants.take()
+                    {
+                        if result.is_err() {
+                            tracker.mark_incomplete();
+                        }
+                        *completed_descendants
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(tracker);
+                    }
                     if child.force_stopped == Some(true) {
                         detached_work.force_stopped();
                     }
@@ -882,10 +948,9 @@ impl LocalHandle {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
-                    } else if let Err(error) = holder.close_inner(
-                        retain_cleanup_receipt.load(Ordering::Acquire),
-                        detached_work.holder(),
-                    ) {
+                    } else if let Err(error) = detached_work
+                        .close_holder(&mut holder, retain_cleanup_receipt.load(Ordering::Acquire))
+                    {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
                         false
@@ -1092,17 +1157,28 @@ impl LocalHandle {
         })
     }
 
-    /// Sends `command` once under `key`, as [`delivery`] describes.
-    pub(crate) fn deliver(&self, command: Command, key: DeliveryKey) -> Result<(), Rejection> {
-        self.0
-            .deliveries
-            .deliver(key, COMMAND_ACKNOWLEDGEMENT, unacknowledged_command, || {
+    fn deliver(
+        &self,
+        deliveries: &Deliveries,
+        chat: crate::model::TerminalId,
+        command: Command,
+        key: DeliveryKey,
+        given_work: impl FnOnce(),
+    ) -> Result<(), Rejection> {
+        deliveries.deliver(
+            chat,
+            key,
+            COMMAND_ACKNOWLEDGEMENT,
+            unacknowledged_command,
+            || {
+                given_work();
                 self.enqueue_actor_command(ActorCommand::Provider {
                     run: None,
                     command,
                     decline_only: false,
                 })
-            })
+            },
+        )
     }
 
     fn submit_actor_command(&self, command: ActorCommand) -> Result<(), Rejection> {
@@ -1217,6 +1293,16 @@ impl LocalHandle {
         response
             .try_recv()
             .map_err(|error| format!("Provider update readiness was not acknowledged: {error}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn verify_update_release(&self) -> Result<(), String> {
+        self.ownership_command(ActorCommand::VerifyUpdateRelease)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn commit_update_release(&self) {
+        self.0.detached_work.commit_update_release();
     }
 
     pub(crate) fn interrupt_owned(
@@ -1698,6 +1784,12 @@ impl LocalHandle {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         accepts_prompt(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
     }
+    /// [`Self::is_idle`], and the provider holds nothing the person queued:
+    /// whether the courier may start a turn now.
+    pub(crate) fn takes_courier(&self) -> bool {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        accepts_courier(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
+    }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
         self.0
@@ -1742,7 +1834,7 @@ impl LocalHandle {
         state
             .subagents
             .iter()
-            .filter(|agent| agent.background && agent.status.is_live())
+            .filter(|agent| agent.background && agent.is_live())
             .map(|agent| agent.id.clone())
             .collect()
     }
@@ -1767,14 +1859,25 @@ impl LocalHandle {
     }
     /// A coherent resident naming projection. Never opens the transcript Store,
     /// pages history or touches the filesystem; safe at host admission points.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn conversation_title(
         &self,
     ) -> Result<(Option<String>, Option<String>), TitleUnavailable> {
+        self.conversation_naming()
+            .map(|naming| (naming.session, naming.provider))
+    }
+
+    pub(crate) fn conversation_naming(&self) -> Result<ConversationNaming, TitleUnavailable> {
         let state = self.0.state.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => TitleUnavailable::Busy,
             std::sync::TryLockError::Poisoned(_) => TitleUnavailable::Poisoned,
         })?;
-        Ok((state.session_id.clone(), state.title.clone()))
+        Ok(ConversationNaming {
+            session: state.session_id.clone(),
+            provider: state.title.clone(),
+            provider_cleared: state.provider_title_cleared,
+            opening: state.opening_title.clone(),
+        })
     }
 
     /// The provider-reported title, read without loading the transcript.
@@ -1786,8 +1889,8 @@ impl LocalHandle {
             .title
             .clone()
     }
-    #[cfg(test)]
-    pub(crate) fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
         let inner = Arc::downgrade(&self.0);
         move || inner.upgrade().is_some()
     }
@@ -1840,6 +1943,34 @@ impl LocalHandle {
         self.0.detached_work.was_force_stopped()
     }
 
+    fn detached_cleanup_proved(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return true;
+        #[cfg(target_os = "macos")]
+        return self
+            .0
+            .completed_descendants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .is_some_and(|tracker| tracker.prove_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stop_observed_detached(&self) -> Result<(), String> {
+        let mut completed = self
+            .0
+            .completed_descendants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match &mut *completed {
+            Some(tracker) => tracker
+                .stop_known(Duration::from_secs(2))
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
@@ -1873,9 +2004,9 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(holder) = retained.as_mut() {
-                holder.close_inner(
+                self.0.detached_work.close_holder(
+                    holder,
                     self.0.retain_cleanup_receipt.load(Ordering::Acquire),
-                    self.0.detached_work.holder(),
                 )?;
                 retained.take();
                 self.0.completed.store(true, Ordering::Release);
@@ -1914,21 +2045,18 @@ impl LocalHandle {
 }
 
 /// Validate local launch and adapter initialization before stopping an existing CLI.
-pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+pub fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
     preflight_for_start(spec, initial).map_err(|error| error.to_string())
 }
 
-pub(crate) fn preflight_for_start(
-    spec: &ProcessSpec,
-    initial: &mut Step,
-) -> Result<Store, SetupError> {
+pub fn preflight_for_start(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, SetupError> {
     preflight_inner(spec, initial, false)
 }
 
 /// Only an authenticated retained server can restore its read-only connection
 /// after the original directory was removed. Authorizing commands still check
 /// the retained execution policy in the actor before any provider write.
-pub(crate) fn preflight_retained_for_start(
+pub fn preflight_retained_for_start(
     spec: &ProcessSpec,
     initial: &mut Step,
 ) -> Result<Store, SetupError> {
@@ -2057,6 +2185,10 @@ impl Drop for Inner {
 }
 impl super::protocol::LaunchCleanup for LocalHandle {
     fn cleanup(&self) -> Result<super::protocol::LaunchOutcome, String> {
+        #[cfg(target_os = "macos")]
+        if self.0.detached_work.get() == Some(DetachedWork::Spare) {
+            return Err("Launch cleanup requires an exact detached-work stop".into());
+        }
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         let deadline = Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE;
@@ -2076,6 +2208,10 @@ impl super::protocol::LaunchCleanup for LocalHandle {
             thread::sleep(Duration::from_millis(10));
         }
         self.close()?;
+        #[cfg(target_os = "macos")]
+        if crate::daemon::adopted_orphans::sweeping() && !self.detached_cleanup_proved() {
+            return Err("Retained launch did not prove detached provider cleanup".into());
+        }
         Ok(super::protocol::LaunchOutcome::TeardownProved)
     }
 }
@@ -2086,6 +2222,7 @@ fn spawn_provider(
     spec: &ProcessSpec,
     stop: &AtomicBool,
     wake: Option<UnixStream>,
+    private_temp: bool,
 ) -> Result<Option<ChildGuard>, String> {
     if matches!(
         spec.transport,
@@ -2100,7 +2237,6 @@ fn spawn_provider(
     let mut process = Process::new(&spec.program);
     process
         .args(&spec.arguments)
-        .current_dir(&spec.working_directory)
         .env_clear()
         // Callers withhold these already; no path may hand a provider the
         // session its daemon or a saved recipe came from.
@@ -2113,7 +2249,9 @@ fn spawn_provider(
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
         .process_group(0);
-    crate::host::descriptor_limit::inherit(&mut process);
+    #[cfg(target_os = "linux")]
+    process.current_dir(&spec.working_directory);
+    crate::descriptor_limit::inherit(&mut process);
     let original = spec
         .execution
         .as_ref()
@@ -2135,7 +2273,7 @@ fn spawn_provider(
             Arc::new(
                 std::fs::OpenOptions::new()
                     .read(true)
-                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .custom_flags(crate::fs_safety::DIRECTORY_HANDLE | libc::O_CLOEXEC)
                     .open(&spec.working_directory)
                     .map_err(|error| error.to_string())?,
             )
@@ -2160,13 +2298,48 @@ fn spawn_provider(
     if stop.load(Ordering::Acquire) {
         return Err("Provider startup was cancelled before process creation".into());
     }
+    let mut temp = if private_temp {
+        use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
+
+        let inherited = spec.environment.get("TMPDIR").map(std::ffi::OsStr::new);
+        let temporary =
+            PrivateDir::create_for_launch(inherited, Some(&directory), &spec.working_directory)
+                .map_err(|error| {
+                    format!("Cannot create private Codex temporary directory: {error}")
+                })?;
+        process.envs(TEMP_ENV_KEYS.map(|key| (key, temporary.path())));
+        Some(temporary)
+    } else {
+        None
+    };
     // A retained actor sweeps its unregistered exited children; this
     // registration keeps the provider's status for its ChildGuard.
-    let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
-        .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+    let failure = |e| format!("Cannot start {}: {e}", spec.program);
+    #[cfg(target_os = "linux")]
+    let (child, registration) =
+        crate::daemon::adopted_orphans::spawn_owned(&mut process).map_err(failure)?;
+    #[cfg(target_os = "macos")]
+    let (child, registration, descendants) = if crate::daemon::adopted_orphans::sweeping() {
+        let (child, registration, tracker) =
+            crate::daemon::adopted_orphans::spawn_tracked(process).map_err(failure)?;
+        (child, registration, Some(tracker))
+    } else {
+        let (child, registration) =
+            crate::daemon::adopted_orphans::spawn_owned(&mut process).map_err(failure)?;
+        (child, registration, None)
+    };
+    if let Some(temporary) = &mut temp {
+        temporary.launched();
+    }
     let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
+    #[cfg(target_os = "macos")]
+    {
+        child.stop_detached = descendants.is_some();
+        child.descendants = descendants;
+    }
     child.directory = Some(directory);
+    child._temp = temp;
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
@@ -2200,15 +2373,41 @@ impl DetachedDecision {
     }
     const STOP: u8 = 1;
     const SPARE: u8 = 2;
-    fn decide(&self, detached: DetachedWork) {
-        self.0.store(
-            match detached {
-                DetachedWork::Stop => Self::STOP,
-                DetachedWork::Spare => Self::SPARE,
-            },
-            Ordering::Release,
-        );
+    #[cfg(target_os = "macos")]
+    const UPDATE: u8 = 3;
+
+    #[cfg(target_os = "macos")]
+    fn commit_update_release(&self) {
+        self.0.store(Self::UPDATE, Ordering::Release);
     }
+
+    fn decide(&self, detached: DetachedWork) {
+        let value = match detached {
+            DetachedWork::Stop => Self::STOP,
+            DetachedWork::Spare => Self::SPARE,
+        };
+        #[cfg(target_os = "linux")]
+        self.0.store(value, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != Self::UPDATE).then_some(value)
+            });
+    }
+
+    fn close_holder(
+        &self,
+        holder: &mut super::native_holder::Holder,
+        retain: bool,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if self.0.load(Ordering::Acquire) == Self::UPDATE {
+            return holder.close_for_update();
+        }
+        holder.close_inner(retain, self.holder())
+    }
+
     fn get(&self) -> Option<DetachedWork> {
         match self.0.load(Ordering::Acquire) {
             Self::STOP => Some(DetachedWork::Stop),
@@ -2222,7 +2421,7 @@ impl DetachedDecision {
 }
 struct ChildGuard {
     child: Child,
-    identity: OwnedFd,
+    identity: crate::pinned_process::PinnedChild,
     terminated: bool,
     directory: Option<Arc<std::fs::File>>,
     /// The provider's cgroup scope, when the OS user manager provided one.
@@ -2233,8 +2432,11 @@ struct ChildGuard {
     /// Whether teardown also ends the commands the provider detached, as
     /// when its owner decided to stop them.
     stop_detached: bool,
+    #[cfg(target_os = "macos")]
+    descendants: Option<crate::daemon::descendants::Tracker>,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
+    _temp: Option<crate::daemon::codex_temp::PrivateDir>,
 }
 impl ChildGuard {
     /// Wait on the original child capability without reaping it or releasing
@@ -2244,6 +2446,7 @@ impl ChildGuard {
         grace: Duration,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
         let deadline = Instant::now() + grace;
+        let mut announced = false;
         loop {
             if let Some(status) = self.observed_exit_status()? {
                 return Ok(Some(status));
@@ -2252,27 +2455,22 @@ impl ChildGuard {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            let mut descriptor = libc::pollfd {
-                fd: self.identity.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout = remaining
-                .as_nanos()
-                .div_ceil(1_000_000)
-                .min(i32::MAX as u128) as i32;
-            // SAFETY: descriptor points to one initialized pollfd and the
-            // owned pidfd stays open throughout this non-reaping observation.
-            if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            } else if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
-                return Err(std::io::Error::other(
-                    "Provider exit capability became unavailable",
-                ));
+            if announced {
+                // Darwin announces an exit a moment before the child can be
+                // waited for, and the pin stays ready, so pause, not spin.
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                continue;
             }
+            // The pin stays open throughout this non-reaping observation.
+            announced = self
+                .identity
+                .process()
+                .wait_for_exit(remaining)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Provider exit capability became unavailable: {error}"
+                    ))
+                })?;
         }
     }
 
@@ -2281,49 +2479,54 @@ impl ChildGuard {
         mut child: Child,
         registration: crate::daemon::adopted_orphans::Registration,
     ) -> std::io::Result<Self> {
-        // SAFETY: pidfd_open obtains a capability for our freshly spawned,
-        // unreaped child. Its PID remains reserved even if it has exited.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-        if descriptor < 0 {
-            let error = std::io::Error::last_os_error();
-            // Startup has not handed the child to another owner. Keep the
-            // leader unreaped while cleaning its original process group.
-            let group_cleanup = if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
-                Ok(())
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
+        // Our freshly spawned, unreaped child: its PID remains reserved even
+        // if it has exited.
+        let identity = match crate::pinned_process::PinnedChild::of(&child) {
+            Ok(identity) => identity,
+            Err(error) => {
+                // Startup has not handed the child to another owner. Keep the
+                // leader unreaped while cleaning its original process group.
+                // SAFETY: kill takes scalar arguments. The unreaped leader
+                // keeps its pid, and so its group's, from being reused.
+                let group_cleanup =
+                    if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+                        Ok(())
+                    } else {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ESRCH) {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(
+                                error.kind(),
+                                format!("process group: {error}"),
+                            ))
+                        }
+                    };
+                let cleanup = child
+                    .kill()
+                    .and_then(|()| child.wait().map(|_| ()))
+                    .and(group_cleanup);
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => std::io::Error::new(
                         error.kind(),
-                        format!("process group: {error}"),
-                    ))
-                }
-            };
-            let cleanup = child
-                .kill()
-                .and_then(|()| child.wait().map(|_| ()))
-                .and(group_cleanup);
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => std::io::Error::new(
-                    error.kind(),
-                    format!("{error}; provider startup cleanup is unconfirmed: {cleanup}"),
-                ),
-            });
-        }
-        // SAFETY: successful pidfd_open returned a new descriptor owned here.
-        let identity = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+                        format!("{error}; provider startup cleanup is unconfirmed: {cleanup}"),
+                    ),
+                });
+            }
+        };
         Ok(Self {
             child,
             identity,
             terminated: false,
             force_stopped: None,
             stop_detached: false,
+            #[cfg(target_os = "macos")]
+            descendants: None,
             directory: None,
             scope: None,
             _registration: registration,
+            _temp: None,
         })
     }
 
@@ -2335,49 +2538,10 @@ impl ChildGuard {
     }
 
     fn observed_exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        use std::os::unix::process::ExitStatusExt;
-        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: the pidfd identifies the original child despite numeric PID
-            // reuse and initializes the siginfo buffer. WNOWAIT leaves all
-            // reaping to terminate below.
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.identity.as_raw_fd() as libc::id_t,
-                    &mut information,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        // SAFETY: successful waitid initialized the child status fields.
-        let (pid, status) = unsafe { (information.si_pid(), information.si_status()) };
-        if pid == 0 {
-            return Ok(None);
-        }
-        if pid as u32 != self.child.id() {
-            return Err(std::io::Error::other(
-                "Provider exit observation returned another child",
-            ));
-        }
-        let raw = match information.si_code {
-            libc::CLD_EXITED => status << 8,
-            libc::CLD_KILLED => status,
-            libc::CLD_DUMPED => status | 0x80,
-            _ => {
-                return Err(std::io::Error::other(
-                    "Provider exit observation returned an unexpected status",
-                ));
-            }
-        };
-        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+        // The pin identifies the original child despite numeric PID reuse.
+        // WNOWAIT leaves all reaping to terminate below.
+        self.identity
+            .exit_status(libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
@@ -2396,6 +2560,9 @@ impl ChildGuard {
             })
         });
         let pid = self.child.id() as i32;
+        #[cfg(target_os = "macos")]
+        let signal_group = |signal| crate::process::identity::signal_unreaped_group(pid, signal);
+        #[cfg(target_os = "linux")]
         let signal_group = |signal| {
             // SAFETY: the sole-reaper guard keeps our leader unreaped until
             // after both signals, reserving its numeric group identity.
@@ -2420,6 +2587,23 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
+        #[cfg(target_os = "macos")]
+        let descendants = {
+            let timeout = Duration::from_secs(2);
+            // While the leader still reserves its ID, attempt cleanup of
+            // both the original group and exact known descendants. Failure in
+            // either path must not stop the other from ending known work.
+            self.identity.signal(libc::SIGKILL)?;
+            let group = crate::process::identity::finish_unreaped_group(pid, timeout);
+            let detached = if let Some(tracker) = &mut self.descendants
+                && (force_stopped || self.stop_detached)
+            {
+                tracker.stop_known(timeout)
+            } else {
+                Ok(())
+            };
+            group.and(detached)
+        };
         // Commands in process groups of their own outlive that signal. A
         // force-stopped provider's would hold memory the system needed, with
         // no agent left to use them, so they end with it, as do those of an
@@ -2433,6 +2617,8 @@ impl ChildGuard {
         }
         self.child.wait()?;
         self.terminated = true;
+        #[cfg(target_os = "macos")]
+        descendants?;
         Ok(())
     }
 }
@@ -2450,6 +2636,13 @@ fn next_newline(bytes: &[u8], scanned: &mut usize) -> Option<usize> {
             None
         }
     }
+}
+
+/// One serialized frame waiting for the provider's stdin.
+struct QueuedWrite {
+    bytes: Vec<u8>,
+    /// See [`Adapter::expendable_write`].
+    expendable: bool,
 }
 
 fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
@@ -2496,7 +2689,7 @@ struct Actor {
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
-    pending: VecDeque<Vec<u8>>,
+    pending: VecDeque<QueuedWrite>,
     offset: usize,
     queued: usize,
     stderr: VecDeque<u8>,
@@ -2515,13 +2708,14 @@ struct Actor {
     execution: execution::Tracker,
     attention_baselined: bool,
     waiting_fingerprint: Option<String>,
+    published_error: Option<String>,
     last_present: Instant,
     first_frame: bool,
     stdout_noise: Option<fn(&[u8]) -> bool>,
     started: Instant,
     startup: StartupBudget,
     write_started: Option<Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
 
@@ -2571,7 +2765,7 @@ impl StartupBudget {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_STARTUP_BUDGET: std::cell::Cell<StartupBudget> =
         const { std::cell::Cell::new(StartupBudget::PRODUCTION) };
@@ -2752,7 +2946,49 @@ fn accepts_prompt(state: &Snapshot) -> bool {
     state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty()
 }
 
+/// Whether the courier may start a turn: the conversation takes a prompt,
+/// and the provider holds nothing the person queued, which goes first.
+fn accepts_courier(state: &Snapshot) -> bool {
+    accepts_prompt(state) && state.queued_messages.is_empty()
+}
+
 impl Actor {
+    fn metadata_poll(&self, timeout: i32) -> (libc::pollfd, i32) {
+        let mut watch = libc::pollfd {
+            fd: -1,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match self.adapter.metadata_wake() {
+            Some(MetadataWake::Changed(fd)) => watch.fd = fd.as_raw_fd(),
+            Some(MetadataWake::RetryAt(at)) => {
+                let delay = at.saturating_duration_since(Instant::now());
+                let millis = delay.as_nanos().div_ceil(1_000_000);
+                let retry = i32::try_from(millis).unwrap_or(i32::MAX);
+                return (
+                    watch,
+                    if timeout < 0 {
+                        retry
+                    } else {
+                        timeout.min(retry)
+                    },
+                );
+            }
+            None => {}
+        }
+        (watch, timeout)
+    }
+
+    fn refresh_metadata(&mut self, changed: bool) -> Result<(), String> {
+        if (changed
+            || matches!(self.adapter.metadata_wake(), Some(MetadataWake::RetryAt(at)) if at <= Instant::now()))
+            && let Some(step) = self.adapter.refresh_metadata()
+        {
+            self.step(step)?;
+        }
+        Ok(())
+    }
+
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -2773,14 +3009,17 @@ impl Actor {
             if !self.incoming.is_empty() {
                 continue;
             }
-            let mut fd = libc::pollfd {
-                fd: self.wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: poll receives one initialized entry whose descriptor is
-            // held by this actor for the entire call.
-            if unsafe { libc::poll(&mut fd, 1, -1) } < 0 {
+            let (watch, timeout) = self.metadata_poll(-1);
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                watch,
+            ];
+            // SAFETY: poll receives initialized entries held by this actor.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
                     return Err(error.to_string());
@@ -2788,6 +3027,7 @@ impl Actor {
             }
             let mut buffer = [0; 64];
             while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
+            self.refresh_metadata(fds[1].revents != 0)?;
         }
         Ok(())
     }
@@ -2897,12 +3137,14 @@ impl Actor {
             // framing; a stalled write has its own `write_started` deadline below.
             let mut frames_ready = false;
             let mut parsed = 0usize;
+            let mut consumed = 0;
             loop {
-                let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
+                let unread = &self.output[consumed..];
+                let Some(newline) = next_newline(unread, &mut self.scanned) else {
                     break;
                 };
                 if newline == 0 {
-                    self.output.drain(..1);
+                    consumed += 1;
                     self.scanned = 0;
                     continue;
                 }
@@ -2910,7 +3152,8 @@ impl Actor {
                     frames_ready = true;
                     break;
                 }
-                let frame = match serde_json::from_slice(&self.output[..newline]) {
+                let line = &unread[..newline];
+                let frame = match serde_json::from_slice(line) {
                     Ok(frame) => {
                         garbage_lines = 0;
                         Some(frame)
@@ -2921,9 +3164,8 @@ impl Actor {
                                 "Unsupported provider stdout (expected JSON-lines): {error}"
                             ));
                         };
-                        let preview =
-                            super::protocol::diagnostic_preview(&self.output[..newline], 200);
-                        if hides_frame(&self.output[..newline]) {
+                        let preview = super::protocol::diagnostic_preview(line, 200);
+                        if hides_frame(line) {
                             return Err(format!(
                                 "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
                             ));
@@ -2946,8 +3188,14 @@ impl Actor {
                         None
                     }
                 };
-                self.output.drain(..=newline);
+                consumed += newline + 1;
                 self.scanned = 0;
+                // Let a prompt-ready step release the allocation immediately
+                // when it consumes the last frame. Clearing moves no bytes.
+                if consumed == self.output.len() {
+                    self.output.clear();
+                    consumed = 0;
+                }
                 partial_started = None;
                 parsed += 1;
                 let Some(frame) = frame else {
@@ -2957,6 +3205,11 @@ impl Actor {
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
                 startup_progress = Instant::now();
+            }
+            // Move any unread suffix once per poll. `scanned` is already
+            // relative to this suffix, including when it holds a partial line.
+            if consumed != 0 {
+                self.output.drain(..consumed);
             }
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
@@ -2997,8 +3250,15 @@ impl Actor {
                                 &last_ignored,
                             ));
                         }
-                        // A clean exit still lost any input it never read.
-                        return stdin_closed.map_or(Ok(()), Err);
+                        // A clean exit still lost any input it never read,
+                        // unless all it left unread was the adapter's own
+                        // requests for display data.
+                        return match stdin_closed {
+                            Some(error) if self.pending.iter().any(|write| !write.expendable) => {
+                                Err(error)
+                            }
+                            _ => Ok(()),
+                        };
                     }
                     let report = exit_report(
                         self.child.as_ref().ok_or("Provider process unavailable")?,
@@ -3042,6 +3302,23 @@ impl Actor {
                 (self.notify)(Update::Presentation);
             }
             self.publish_resident_metadata();
+            let timeout = if frames_ready
+                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+            {
+                0
+            } else if self.dirty && self.visible.load(Ordering::Acquire) {
+                50
+            } else if !self.first_frame
+                || self.adapter.initialization_pending()
+                || !self.output.is_empty()
+                || self.write_started.is_some()
+                || closing.is_some()
+            {
+                250
+            } else {
+                -1
+            };
+            let (watch, poll_timeout) = self.metadata_poll(timeout);
             let mut fds = [
                 libc::pollfd {
                     fd: self.wake.as_raw_fd(),
@@ -3071,42 +3348,48 @@ impl Actor {
                     events: libc::POLLOUT,
                     revents: 0,
                 },
+                watch,
+                #[cfg(target_os = "macos")]
+                libc::pollfd {
+                    fd: self
+                        .child
+                        .as_ref()
+                        .and_then(|child| child.descendants.as_ref())
+                        .map_or(-1, |tracker| tracker.fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
-            let timeout = if frames_ready
-                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
-            {
-                0
-            } else if self.dirty && self.visible.load(Ordering::Acquire) {
-                50
-            } else if !self.first_frame
-                || self.adapter.initialization_pending()
-                || !self.output.is_empty()
-                || self.write_started.is_some()
-                || closing.is_some()
-            {
-                250
-            } else {
-                -1
-            };
             // The -1 branch proves the parser drained every complete frame
             // and no partial line remains. It also covers a conversation
             // parked on a permission request, which cannot become prompt-ready.
             if timeout == -1 {
                 self.reclaim_idle_frame_buffer();
             }
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, poll_timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
                     return Err(error.to_string());
                 }
             }
             let mut buffer = [0u8; 8192];
+            #[cfg(target_os = "macos")]
+            if fds[5].revents != 0
+                && let Some(tracker) = self
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.descendants.as_mut())
+            {
+                // The tracker remembers incomplete observation. The provider
+                // transport can continue, with teardown proof unavailable.
+                let _ = tracker.observe();
+            }
             if fds[0].revents != 0 {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
             self.report_command_stops();
             if fds[3].revents != 0
-                && let Some(line) = self.pending.front()
+                && let Some(QueuedWrite { bytes: line, .. }) = self.pending.front()
             {
                 match stdin.write(&line[self.offset..]) {
                     Ok(0) => return Err("Provider closed stdin".into()),
@@ -3130,7 +3413,10 @@ impl Actor {
                     // The provider closed its input, ordinarily by exiting.
                     // Drain its output to EOF so its exit status, and any
                     // final frames, explain the failure instead of EPIPE.
+                    // Nobody waits on the adapter's own requests for display
+                    // data, so they no longer hold the actor busy either.
                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                        self.drop_expendable_writes();
                         stdin_closed = Some(format!("Provider stdin: {e}"));
                     }
                     Err(e) => return Err(format!("Provider stdin: {e}")),
@@ -3166,6 +3452,28 @@ impl Actor {
                     Err(e) => return Err(format!("Provider stderr: {e}")),
                 }
             }
+            self.refresh_metadata(fds[4].revents != 0)?;
+        }
+    }
+    /// Forgets the queued writes the provider can no longer read and nobody
+    /// waits on: see [`Adapter::expendable_write`].
+    fn drop_expendable_writes(&mut self) {
+        // The front write may be partly sent, and only its rest is queued.
+        let mut sent = self.offset;
+        if self.pending.front().is_some_and(|write| write.expendable) {
+            self.offset = 0;
+        }
+        let mut unsent = 0;
+        self.pending.retain(|write| {
+            let already = std::mem::take(&mut sent);
+            if write.expendable {
+                unsent += write.bytes.len() - already;
+            }
+            !write.expendable
+        });
+        self.queued -= unsent;
+        if self.pending.is_empty() {
+            self.write_started = None;
         }
     }
     /// The provider read input or wrote output, so it may be about to start
@@ -3294,9 +3602,9 @@ impl Actor {
                     (run, command)
                 }
                 ActorCommand::IdlePrompt(text) => {
-                    if !accepts_prompt(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
+                    if !accepts_courier(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
                         let _ = refuse(
-                            "The conversation is no longer idle for courier delivery".into(),
+                            "The conversation is no longer idle for courier delivery, or the person's queued message goes first".into(),
                         );
                         continue;
                     }
@@ -3386,6 +3694,16 @@ impl Actor {
                     let _ = reply.send(Ok(()));
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                ActorCommand::VerifyUpdateRelease => {
+                    let result = self
+                        .native_holder
+                        .as_ref()
+                        .ok_or_else(|| "Missing native holder".to_owned())
+                        .and_then(super::native_holder::Holder::verify_update_release);
+                    let _ = reply.send(result.map_err(Rejection::Refused));
+                    continue;
+                }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let _ = readiness.send(self.update_readiness(&state));
@@ -3449,10 +3767,16 @@ impl Actor {
             } else {
                 None
             };
-            let starts_turn = matches!(&command, Command::Prompt { .. });
-            if run.is_some() && starts_turn {
+            // A prompt made during a turn steers or queues into it; only one
+            // made between turns starts a turn, and only that one may say the
+            // conversation is waiting for it over what the provider last said.
+            let starts_turn = matches!(&command, Command::Prompt { .. })
+                && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+            if run.is_some() {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
+                if matches!(&command, Command::Prompt { .. })
+                    && (!state.ready || state.busy || state.waiting || !state.requests.is_empty())
+                {
                     let _ = refuse("The provider is no longer idle for the accepted run".into());
                     continue;
                 }
@@ -3462,6 +3786,7 @@ impl Actor {
                 | Command::Compact
                 | Command::Slash { .. }
                 | Command::StartQueued { .. }
+                | Command::SendQueuedNow
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
@@ -3619,6 +3944,18 @@ impl Actor {
             Event::Reset { .. } => Some(None),
             _ => None,
         });
+        #[cfg(target_os = "macos")]
+        if let Some(Some(_)) = &identity
+            && let Some(peer) = self.native_peer.as_ref()
+            && let Some(holder) = self.native_holder.as_mut()
+            && self.adapter.server_identity().is_some_and(|server| {
+                super::native_holder::verified_codex_version(&server.user_agent).is_none()
+            })
+            && !self.reconnect_only_reported
+            && let Err(error) = holder.observe_update_server(peer)
+        {
+            tracing::warn!(%error, "native app-server did not provide update release evidence");
+        }
         if let Some(Some(thread)) = &identity
             && self.native_holder.is_some()
             && let Some(identity) = self.adapter.server_identity()
@@ -3695,6 +4032,7 @@ impl Actor {
             context.verify_directory(&self.working_directory)?;
         }
         for value in step.writes {
+            let expendable = self.adapter.expendable_write(&value);
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)
                 .map_err(|error| format!("Provider JSON request: {error}"))?;
@@ -3707,7 +4045,7 @@ impl Actor {
                 return Err("Provider stdin queue exceeds 64 MiB; no frames discarded".into());
             }
             self.queued += bytes.len();
-            self.pending.push_back(bytes);
+            self.pending.push_back(QueuedWrite { bytes, expendable });
             if self.write_started.is_none() {
                 self.write_started = Some(Instant::now());
             }
@@ -3720,14 +4058,19 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
-        let frame_context = {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            super::notification::FrameContext::capture(&state)
-        };
-        let mut frame_contents = if suppress_current_notification {
-            Default::default()
-        } else {
+        let mut frame_contents = if !suppress_current_notification
+            && step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        {
+            let frame_context = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                super::notification::FrameContext::capture(&state)
+            };
             frame_context.project(&step.events)
+        } else {
+            Default::default()
         };
         // Preserve decoded outcomes even when the transcript cache fails.
         // Stop further Store writes, then report the original error after
@@ -3996,6 +4339,20 @@ impl Actor {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         recover_login_error(&mut state.error, &mut self.login_recovery, &event);
         recover_history_error(&mut state.error, &mut self.history_error, &event);
+        let name_changed = match &event {
+            Event::OpeningTitle(title) => state.opening_title.as_ref() != Some(title),
+            Event::ProviderTitleCleared { id } => {
+                state.session_id.as_ref() == Some(id) && !state.provider_title_cleared
+            }
+            Event::Session { id, title } => {
+                state.session_id.as_ref() != Some(id)
+                    || title
+                        .as_ref()
+                        .is_some_and(|title| state.title.as_ref() != Some(title))
+            }
+            Event::Reset { .. } => state.session_id.is_some() || state.opening_title.is_some(),
+            _ => false,
+        };
         apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
         if let Some(store) = &mut diagnostic_store {
             let owners = store.diagnostics.owners(&state);
@@ -4024,9 +4381,20 @@ impl Actor {
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
         }
+        let error_changed = self.published_error != state.error;
+        if error_changed {
+            self.published_error.clone_from(&state.error);
+        }
         self.retained = counter.0;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
+        drop(state);
+        if name_changed {
+            (self.notify)(Update::ConversationNameChanged);
+        }
+        if error_changed {
+            (self.notify)(Update::FailureChanged);
+        }
     }
     fn publish_activity(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -4107,7 +4475,7 @@ impl Actor {
             // Do not call process-wide malloc_trim here: ordinary ACP/OMP
             // actors share cagentsd's allocator and would serialize its
             // unrelated arenas.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.idle_frame_buffer_capacity
                 .store(self.output.capacity(), Ordering::Release);
         }
@@ -4314,6 +4682,7 @@ fn apply_projected_event(
             );
         }
         Event::QueueChanged(messages) => state.queued_messages = messages,
+        Event::SendNow(send_now) => state.send_now = send_now,
         Event::QueueRemoval(removal) => {
             state.queue_removals.push(removal);
             let excess = state
@@ -4337,6 +4706,7 @@ fn apply_projected_event(
             state.interrupt_mode = None;
             state.queued_messages.clear();
             state.queue_removals.clear();
+            state.send_now = None;
             state.items.clear();
             state.subagents.clear();
             indices.clear();
@@ -4349,6 +4719,8 @@ fn apply_projected_event(
             };
             state.session_id = None;
             state.title = None;
+            state.provider_title_cleared = false;
+            state.opening_title = None;
             state.has_earlier = false;
             state.has_later = false;
             state.history_loading = false;
@@ -4365,13 +4737,26 @@ fn apply_projected_event(
         Event::Session { id, title } => {
             if state.session_id.as_deref() != Some(id.as_str()) {
                 state.prompt_suggestion = None;
+                if state.session_id.is_some() {
+                    state.opening_title = None;
+                }
                 state.title = title;
+                state.provider_title_cleared = false;
             } else if title.is_some() {
                 // Identity-only frames carry no new naming information.
                 state.title = title;
+                state.provider_title_cleared = false;
             }
             state.session_id = Some(id);
         }
+        Event::ProviderTitleCleared { id } => {
+            if state.session_id.as_ref() == Some(&id) {
+                state.title = None;
+                state.provider_title_cleared = true;
+            }
+        }
+        Event::OpeningTitle(title) => state.opening_title = Some(title),
+        Event::OpeningHistoryComplete => {}
         Event::Plan { steps } => state.plan = steps,
         // About the account rather than the conversation: `step` forwards it
         // to the surfaces before the store, so it never reaches a snapshot.
@@ -4721,6 +5106,8 @@ fn apply_projected_event(
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
             state.exited = true;
+            // No turn is left to take what is queued.
+            state.send_now = None;
             for agent in &mut state.subagents {
                 if agent.status == ToolStatus::Waiting {
                     agent.status = ToolStatus::Stopped;
@@ -4755,7 +5142,7 @@ fn apply_projected_event(
 fn stop_snapshot_steps(state: &mut Snapshot) {
     stop_running_steps(&mut state.items);
     for agent in &mut state.subagents {
-        if agent.status == ToolStatus::Running {
+        if agent.is_running() {
             agent.status = ToolStatus::Stopped;
             agent.waiting = false;
         }
@@ -4784,17 +5171,31 @@ fn stop_running_steps(items: &mut [Arc<Item>]) {
 /// available for status and selective Stop.
 fn trim_subagents(state: &mut Snapshot) {
     const RICH_HISTORY: usize = 32;
-    while state.subagents.len() > RICH_HISTORY {
+    // The provider bounds its unloaded listing separately. A catalog row
+    // does not buy history by evicting a followed child's transcript.
+    let mut followed = state
+        .subagents
+        .iter()
+        .filter(|agent| !agent.last_seen_running())
+        .count();
+    while followed > RICH_HISTORY {
         let Some(finished) = state
             .subagents
             .iter()
-            .position(|agent| !agent.status.is_live())
+            .position(|agent| !agent.last_seen_running() && !agent.is_live())
         else {
             break;
         };
         state.subagents.remove(finished);
+        followed -= 1;
     }
-    for agent in state.subagents.iter_mut().rev().skip(RICH_HISTORY) {
+    for agent in state
+        .subagents
+        .iter_mut()
+        .rev()
+        .filter(|agent| !agent.last_seen_running())
+        .skip(RICH_HISTORY)
+    {
         agent.items.clear();
     }
 }
@@ -5043,6 +5444,6 @@ pub(crate) fn notification_frames_with_probe_for_test<R>(
 mod tests;
 
 /// Explicit retained-helper dispatch after Rust runtime initialization.
-pub(crate) fn run_retained_helper_if_requested() -> Option<Result<(), String>> {
+pub fn run_retained_helper_if_requested() -> Option<Result<(), String>> {
     retained_actor::transport::run_helper_if_requested()
 }

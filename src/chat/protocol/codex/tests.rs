@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::Provider;
 
+#[cfg(target_os = "linux")]
 fn owned_listener_test_launch(home: &std::path::Path) -> Launch {
     Launch {
         provider: crate::agent::Provider::Codex,
@@ -89,7 +90,7 @@ fn shared_long_listener_keeps_its_existing_verified_alias_and_never_launches() {
     use std::os::unix::fs::{MetadataExt, symlink};
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("s");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _listener = crate::descriptor::bind(&socket).unwrap();
     let original = std::fs::metadata(&socket).unwrap();
     let long = home
         .path()
@@ -988,6 +989,7 @@ fn supported_thread_names_follow_only_the_exact_codex_conversation() {
     adapter
         .thread_state(
             &json!({"id":"thread-exact","name":"Encrypted bundle review","status":{"type":"idle"}}),
+            true,
             &mut restored,
         )
         .unwrap();
@@ -1004,6 +1006,10 @@ fn supported_thread_names_follow_only_the_exact_codex_conversation() {
             .iter()
             .any(|event| matches!(event, Event::Session { .. }))
     );
+    let unbound = adapter
+        .receive(json!({"method":"thread/name/updated","params":{"threadName":"Unbound name"}}))
+        .unwrap();
+    assert!(unbound.events.is_empty());
     for name in [
         Some("Bundle throughput audit"),
         Some("My custom bundle review"),
@@ -1031,6 +1037,168 @@ fn supported_thread_names_follow_only_the_exact_codex_conversation() {
     }
     // Identity-only None preservation is covered at the actual Runtime
     // boundary, which owns the current displayed name and Reset behavior.
+}
+
+#[test]
+fn codex_live_rename_wins_over_an_in_flight_resume_or_metadata_read() {
+    let mut adapter = adapter();
+    adapter.attached = false;
+    let attach = Pending::Attach { renamed: None };
+    adapter.pending.insert(json!("attach").to_string(), attach);
+    let rename = |name| json!({"method":"thread/name/updated","params":{"threadId":"thread-exact","threadName":name}});
+    let metadata = |id, name| json!({"id":id,"result":{"thread":{"id":"thread-exact","name":name,"status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}});
+    let session = |title: Option<&str>| Event::Session {
+        id: "thread-exact".into(),
+        title: title.map(str::to_owned),
+    };
+    let renamed = adapter.receive(rename("Renamed during resume")).unwrap();
+    assert!(
+        renamed.events.is_empty(),
+        "rename cannot confirm attachment"
+    );
+    let resumed = adapter
+        .receive(metadata(json!("attach"), "Stale resume name"))
+        .unwrap();
+    assert!(
+        resumed
+            .events
+            .contains(&session(Some("Renamed during resume")))
+    );
+    assert!(!resumed.events.contains(&session(Some("Stale resume name"))));
+
+    let refresh = adapter.command(Command::Refresh).unwrap();
+    let renamed = adapter.receive(rename("Renamed during refresh")).unwrap();
+    assert_eq!(renamed.events, [session(Some("Renamed during refresh"))]);
+    let read = adapter
+        .receive(metadata(refresh.writes[0]["id"].clone(), "Stale read name"))
+        .unwrap();
+    assert!(read.events.contains(&session(None)));
+    assert!(!read.events.contains(&session(Some("Stale read name"))));
+    adapter
+        .receive(json!({"id":refresh.writes[1]["id"],"result":{"data":[],"nextCursor":null}}))
+        .unwrap();
+
+    let refresh = adapter.command(Command::Refresh).unwrap();
+    let read = adapter
+        .receive(metadata(
+            refresh.writes[0]["id"].clone(),
+            "Current read name",
+        ))
+        .unwrap();
+    assert!(read.events.contains(&session(Some("Current read name"))));
+}
+
+#[test]
+fn codex_explicit_name_removal_falls_back_and_fences_stale_metadata() {
+    let mut adapter = adapter();
+    adapter.attached = false;
+    adapter.pending.insert(
+        json!("attach").to_string(),
+        Pending::Attach { renamed: None },
+    );
+    let clear =
+        |id| json!({"method":"thread/name/updated","params":{"threadId":id,"threadName":null}});
+    let metadata = |id| json!({"id":id,"result":{"thread":{"id":"thread-exact","name":"Stale title","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}});
+    let clear_event = Event::ProviderTitleCleared {
+        id: "thread-exact".into(),
+    };
+    assert!(adapter.receive(clear("other")).unwrap().events.is_empty());
+    assert!(
+        adapter
+            .receive(clear("thread-exact"))
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let attached = adapter.receive(metadata(json!("attach"))).unwrap();
+    assert!(attached.events.contains(&clear_event));
+    assert!(
+        !attached
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+    );
+
+    let explicit_name = "My provider title";
+    let renamed = adapter.receive(json!({"method":"thread/name/updated","params":{"threadId":"thread-exact","threadName":explicit_name}})).unwrap();
+    let mut state = chat::Snapshot::default();
+    crate::chat::runtime::project_events_for_test(&mut state, renamed.events);
+    let opening = chat::OpeningTitle::Prompt("Fix the channel naming race".into());
+    state.opening_title = Some(opening.clone());
+    assert_eq!(state.title.as_deref(), Some(explicit_name));
+
+    let refresh = adapter.command(Command::Refresh).unwrap();
+    let omitted = adapter
+        .receive(json!({"method":"thread/name/updated","params":{"threadId":"thread-exact"}}))
+        .unwrap();
+    crate::chat::runtime::project_events_for_test(&mut state, omitted.events);
+    assert_eq!(state.title.as_deref(), Some(explicit_name));
+    let cleared = adapter.receive(clear("thread-exact")).unwrap();
+    assert_eq!(cleared.events, [clear_event]);
+    crate::chat::runtime::project_events_for_test(&mut state, cleared.events);
+    assert!(state.title.is_none());
+    assert!(state.provider_title_cleared);
+    assert_eq!(state.opening_title, Some(opening));
+
+    let read = adapter
+        .receive(metadata(refresh.writes[0]["id"].clone()))
+        .unwrap();
+    crate::chat::runtime::project_events_for_test(&mut state, read.events);
+    assert!(
+        state.title.is_none(),
+        "an in-flight read must not restore the cleared title"
+    );
+    assert!(state.provider_title_cleared);
+}
+
+#[test]
+fn codex_paginated_resume_reads_the_first_meaningful_prompt_from_exact_rollout() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("codex-config");
+    let paths = config.join("sessions/2026/11/23");
+    std::fs::create_dir_all(&paths).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let records = [
+        json!({"type":"session_meta","payload":{"id":id,"cwd":directory.path(),"source":"cli"}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\nDo not name this from instructions"}]}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"[Image 236]"},{"type":"input_image","image_url":"fixture"}]}}),
+        json!({"type":"event_msg","payload":{"type":"user_message","message":"[Image 237] see why the upload stalls"}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"A much later prompt"}]}}),
+    ];
+    let transcript = paths.join(format!("rollout-2026-11-23T11-12-13-{id}.jsonl"));
+    let write_rollout = |records: &[Value]| {
+        let content: String = records.iter().map(|record| format!("{record}\n")).collect();
+        std::fs::write(&transcript, content).unwrap();
+    };
+    write_rollout(&records);
+
+    let resume = || {
+        let mut adapter = adapter();
+        adapter.expected_home = config.clone();
+        adapter.thread = Some(id.clone());
+        adapter.pending.insert(
+            json!("attach").to_string(),
+            Pending::Attach { renamed: None },
+        );
+        adapter
+            .receive(json!({"id":"attach","result":{"thread":{"id":id,"status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":"earlier"}}}))
+            .unwrap()
+    };
+    assert!(
+        resume()
+            .events
+            .contains(&Event::OpeningTitle(crate::chat::OpeningTitle::Prompt(
+                "see why the upload stalls".into()
+            )))
+    );
+
+    let mut mismatched = records;
+    mismatched[0]["payload"]["id"] = json!(uuid::Uuid::new_v4().to_string());
+    write_rollout(&mismatched);
+    assert!(!resume().events.iter().any(|event| matches!(
+        event,
+        Event::OpeningTitle(_) | Event::OpeningHistoryComplete
+    )));
 }
 
 #[test]
@@ -1412,9 +1580,10 @@ fn a_history_page_requested_before_a_lifecycle_change_names_no_turn() {
 #[test]
 fn attach_still_names_its_active_turn() {
     let mut adapter = adapter();
-    adapter
-        .pending
-        .insert(json!("attach").to_string(), Pending::Attach);
+    adapter.pending.insert(
+        json!("attach").to_string(),
+        Pending::Attach { renamed: None },
+    );
     adapter.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"newer","status":"inProgress","items":[]}],"nextCursor":null}}})).unwrap();
     assert_eq!(adapter.turn.as_deref(), Some("newer"));
 }
@@ -1685,7 +1854,7 @@ fn an_explicit_default_remote_starts_new_threads_on_the_shared_server() {
     let directory = home.path().join("app-server-control");
     std::fs::create_dir(&directory).unwrap();
     let socket = directory.join("app-server-control.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _listener = crate::descriptor::bind(&socket).unwrap();
     let launch = Launch {
         provider: crate::agent::Provider::Codex,
         session_id: None,
@@ -2019,6 +2188,7 @@ fn adapter() -> Codex {
         server_identity: None,
         retained_identity: None,
         thread: Some("thread-exact".into()),
+        name_revision: 0,
         start: json!({}),
         alias: None,
         cwd: PathBuf::from("/tmp"),
@@ -2064,6 +2234,7 @@ fn adapter() -> Codex {
         subagent_status: None,
         subagent_waiting: false,
         subagent_detail: String::new(),
+        unloaded_notice_pending: false,
         ready: true,
         attached: true,
         direct_input: true,
@@ -2086,6 +2257,10 @@ fn adapter() -> Codex {
         child_failure: None,
         child_buffer: BTreeMap::new(),
         waiting_child_resumes: BTreeMap::new(),
+        listing_generation: 0,
+        parent_child: None,
+        listed_unloaded: BTreeMap::new(),
+        spawn_calls: std::collections::BTreeSet::new(),
         turn_diffs: BTreeMap::new(),
         repo_root: None,
     }
@@ -2861,9 +3036,10 @@ fn failed_initial_history_request_can_initialize_its_cursor_on_retry() {
 #[test]
 fn reattachment_requests_subagent_sources_explicitly() {
     let mut parent = adapter();
-    parent
-        .pending
-        .insert(json!("attach").to_string(), Pending::Attach);
+    parent.pending.insert(
+        json!("attach").to_string(),
+        Pending::Attach { renamed: None },
+    );
     let attached = parent.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
     let list = attached
         .writes
@@ -3422,7 +3598,7 @@ fn child_listing_recovers_newest_first_descendants_without_trusting_foreign_thre
     let mut adapter = adapter();
     let mut request = Step::default();
     adapter
-        .call(&mut request, "thread/list", json!({}), Pending::ChildList)
+        .call(&mut request, "thread/list", json!({}), child_list())
         .unwrap();
     adapter
         .receive(json!({"id":request.writes[0]["id"],"result":{"data":[
@@ -3436,6 +3612,748 @@ fn child_listing_recovers_newest_first_descendants_without_trusting_foreign_thre
     assert!(!adapter.children.contains_key("foreign"));
 }
 
+fn child_list() -> Pending {
+    Pending::ChildList {
+        listed: 0,
+        deferred: Vec::new(),
+        generation: 0,
+    }
+}
+
+/// What Codex 0.172 sent while a turn on `gpt-6-luna` spawned one subagent
+/// with its second multi-agent version: the spawn is only a
+/// `subAgentActivity` item, and no `thread/started` or collaboration call
+/// names the child. Recorded from a live app-server, keeping the turn's
+/// frames and leaving out usage, rate limit and startup notices.
+const MULTI_AGENT_V2_LIVE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/codex/multi-agent-v2-live.jsonl"
+));
+/// The same conversation's subagent listing and latest turns page, read
+/// once the turn had finished.
+const MULTI_AGENT_V2_HISTORY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/codex/multi-agent-v2-history.json"
+));
+const V2_PARENT: &str = "01a2142a-9e64-7492-a3fc-7c4b358aabaf";
+const V2_CHILD: &str = "01a2142a-ab4f-7361-8a6d-5f43bc4850c0";
+
+fn v2_parent() -> Codex {
+    let mut parent = adapter();
+    parent.thread = Some(V2_PARENT.into());
+    parent
+}
+
+fn resumes(step: &Step) -> Vec<(Value, String)> {
+    step.writes
+        .iter()
+        .filter(|write| write["method"] == "thread/resume")
+        .map(|write| {
+            (
+                write["id"].clone(),
+                write["params"]["threadId"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The spawn row the turn shows where it started `child`: a spawn call
+/// addressed to the child's thread, as the conversation's own coordination
+/// reader links a row to its agent.
+fn spawn_row_for<'a>(events: &'a [Event], child: &str) -> Option<&'a Item> {
+    events.iter().find_map(|event| match event {
+        Event::Item(
+            item @ Item {
+                content: ItemContent::Tool { name, output, .. },
+                ..
+            },
+        ) if name == "spawnAgent"
+            && serde_json::from_str::<Value>(output)
+                .is_ok_and(|states| states.get(child).is_some()) =>
+        {
+            Some(item)
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn a_started_subagent_activity_discovers_its_child_and_routes_the_childs_frames() {
+    let mut parent = v2_parent();
+    let mut frames = MULTI_AGENT_V2_LIVE
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap());
+    assert!(
+        MULTI_AGENT_V2_LIVE
+            .lines()
+            .all(|line| !line.contains("\"thread/started\"")),
+        "the recording has no thread/started for the child"
+    );
+    // Up to and including the item that announces the spawn.
+    let mut seen = Vec::new();
+    for frame in frames.by_ref() {
+        let announces = frame["params"]["item"]["type"] == "subAgentActivity";
+        seen.push(parent.receive(frame).unwrap());
+        if announces {
+            break;
+        }
+    }
+    let spawned = seen.last().unwrap();
+    assert!(parent.children.contains_key(V2_CHILD));
+    let reads = resumes(spawned);
+    assert_eq!(
+        reads.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>(),
+        [V2_CHILD]
+    );
+    assert!(spawned.events.iter().any(|event| matches!(event,
+        Event::Subagent { id, kind, description, model, status: Some(ToolStatus::Running), background: Some(true), .. }
+            if id == V2_CHILD && kind.is_empty() && description == "Single word"
+                && model.as_deref() == Some("gpt-6-luna"))));
+    // What the UI's coordination reader links to the child, and reads its
+    // task, model and effort from.
+    let row = spawn_row_for(&spawned.events, V2_CHILD).expect("a spawn row at the spawn point");
+    let ItemContent::Tool { output, .. } = &row.content else {
+        unreachable!("a tool row")
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(output).unwrap(),
+        json!({V2_CHILD:{"agentPath":"/root/single_word","model":"gpt-6-luna","reasoningEffort":"low"}})
+    );
+
+    // The child's read names it; its frames meanwhile wait for the read and
+    // then reach its own transcript.
+    let mut rest: Vec<Step> = frames.map(|frame| parent.receive(frame).unwrap()).collect();
+    let (read, _) = &reads[0];
+    rest.push(
+        parent
+            .receive(
+                json!({"id":read,"result":{"thread":{"id":V2_CHILD,"parentThreadId":V2_PARENT,
+                "agentNickname":"Arendt","status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}}}),
+            )
+            .unwrap(),
+    );
+    let events: Vec<&Event> = rest.iter().flat_map(|step| &step.events).collect();
+    assert!(events.iter().any(|event| matches!(event,
+        Event::SubagentItem { id, item: Item { content: ItemContent::Text { text, .. }, .. } }
+            if id == V2_CHILD && text == "ok")));
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Subagent { id, kind, .. } if id == V2_CHILD && kind == "Arendt")));
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == V2_CHILD)));
+    // The start's completion updates its row; the later activity is no
+    // second row and no second read.
+    assert!(rest.iter().all(|step| {
+        spawn_row_for(&step.events, V2_CHILD).is_none_or(|settled| settled.id == row.id)
+    }));
+    assert!(rest.iter().all(|step| resumes(step).is_empty()));
+    assert_eq!(parent.children.len(), 1);
+}
+
+#[test]
+fn a_history_page_of_activity_items_alone_discovers_its_children() {
+    let recorded: Value = serde_json::from_str(MULTI_AGENT_V2_HISTORY).unwrap();
+    let page = &recorded["turnsList"];
+    assert!(
+        page["data"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| {
+                item["type"] != "collabAgentToolCall" || item["receiverThreadIds"] == json!([])
+            })
+    );
+    let mut parent = v2_parent();
+    let mut step = Step::default();
+    parent.page(page, &mut step, false).unwrap();
+    assert!(parent.children.contains_key(V2_CHILD));
+    assert_eq!(resumes(&step).len(), 1);
+    // A record says nothing of how the child stands now; its read does.
+    assert!(step.events.iter().any(|event| matches!(event,
+        Event::Subagent { id, description, status: None, .. }
+            if id == V2_CHILD && description == "Single word")));
+    let Some(Event::LatestHistory { items, .. }) = step
+        .events
+        .iter()
+        .find(|event| matches!(event, Event::LatestHistory { .. }))
+    else {
+        panic!("the latest history page");
+    };
+    let rows: Vec<&Item> = items
+        .iter()
+        .filter(
+            |item| matches!(&item.content, ItemContent::Tool { name, .. } if name == "spawnAgent"),
+        )
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one row for the start, none for its completion"
+    );
+
+    // The listing names the same child after a restart, with its nickname
+    // and the task its path names.
+    let mut restarted = v2_parent();
+    let mut request = Step::default();
+    restarted
+        .call(&mut request, "thread/list", json!({}), child_list())
+        .unwrap();
+    let listed = restarted
+        .receive(json!({"id":request.writes[0]["id"],"result":recorded["threadList"]}))
+        .unwrap();
+    assert!(listed.events.iter().any(|event| matches!(event,
+        Event::Subagent { id, kind, description, .. }
+            if id == V2_CHILD && kind == "Arendt" && description == "Single word")));
+}
+
+#[test]
+fn a_later_thread_started_or_activity_does_not_duplicate_an_activity_child() {
+    let mut parent = v2_parent();
+    let activity = |kind: &str, id: &str| {
+        json!({"method":"item/completed","params":{"threadId":V2_PARENT,"turnId":"turn",
+            "item":{"type":"subAgentActivity","id":id,"kind":kind,"agentThreadId":V2_CHILD,
+                "agentPath":"/root/single_word","model":null}}})
+    };
+    let first = parent.receive(activity("started", "spawn")).unwrap();
+    assert_eq!(resumes(&first).len(), 1);
+    let started = parent
+        .receive(
+            json!({"method":"thread/started","params":{"thread":{"id":V2_CHILD,
+            "parentThreadId":V2_PARENT,"agentNickname":"Arendt","status":{"type":"active"}}}}),
+        )
+        .unwrap();
+    assert!(resumes(&started).is_empty());
+    // The live start names the child once; a later activity keeps that name.
+    assert!(started.events.iter().any(|event| matches!(event,
+        Event::Subagent { id, kind, .. } if id == V2_CHILD && kind == "Arendt")));
+    let later = parent.receive(activity("interacted", "message")).unwrap();
+    assert!(resumes(&later).is_empty());
+    assert!(later.events.iter().all(|event| !matches!(event,
+        Event::Subagent { kind, .. } if !kind.is_empty())));
+    assert!(spawn_row_for(&later.events, V2_CHILD).is_none());
+    assert_eq!(parent.children.len(), 1);
+}
+
+#[test]
+fn a_childs_own_activity_discovers_the_subagent_it_started_after_its_read() {
+    let mut parent = v2_parent();
+    let spawned = parent
+        .receive(
+            json!({"method":"item/started","params":{"threadId":V2_PARENT,"turnId":"turn",
+            "item":{"type":"subAgentActivity","id":"spawn","kind":"started","agentThreadId":"child",
+                "agentPath":"/root/survey"}}}),
+        )
+        .unwrap();
+    let nested = parent
+        .receive(json!({"method":"item/started","params":{"threadId":"child","turnId":"child-turn",
+            "item":{"type":"subAgentActivity","id":"nested","kind":"started","agentThreadId":"grandchild",
+                "agentPath":"/root/survey/check_links"}}}))
+        .unwrap();
+    assert!(parent.children.contains_key("grandchild"));
+    // Codex reads a nested child only through its loaded parent.
+    assert!(resumes(&nested).is_empty());
+    assert!(nested.events.iter().any(|event| matches!(event,
+        Event::Subagent { id, description, .. } if id == "grandchild" && description == "Check links")));
+    let (read, _) = &resumes(&spawned)[0];
+    let child_read = parent
+        .receive(
+            json!({"id":read,"result":{"thread":{"id":"child","status":{"type":"active"}},
+            "initialTurnsPage":{"data":[],"nextCursor":null}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        resumes(&child_read)
+            .iter()
+            .map(|(_, id)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["grandchild"]
+    );
+}
+
+fn listing(step: &Step) -> Option<&Value> {
+    step.writes
+        .iter()
+        .find(|write| write["method"] == "thread/list")
+}
+
+fn unloaded_notice(events: &[Event], child: &str) -> bool {
+    events.iter().any(|event| {
+        matches!(event,
+        Event::SubagentItem { id, item } if id == child
+            && item.id == format!("codex-notice:unloaded:{child}"))
+    })
+}
+
+#[test]
+fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
+    let mut parent = adapter();
+    let thread = |id: &str, parent: &str| json!({"id":id,"parentThreadId":parent,"agentNickname":id,"status":{"type":"notLoaded"}});
+    let child = |index: usize| thread(&format!("child-{index:03}"), "thread-exact");
+    let mut request = Step::default();
+    parent
+        .list_children(&mut request, None, 0, Vec::new())
+        .unwrap();
+    assert_eq!(request.writes[0]["params"]["limit"], 32);
+    assert!(request.writes[0]["params"].get("cursor").is_none());
+    // Newest first: the first page's children are read and kept live, and
+    // the next page is asked for at once.
+    let first = parent
+        .receive(json!({"id":request.writes[0]["id"],"result":{
+            "data":(0..32).map(child).collect::<Vec<_>>(),"nextCursor":"page-2"}}))
+        .unwrap();
+    assert_eq!(resumes(&first).len(), 32);
+    let next = listing(&first).expect("the next page").clone();
+    assert_eq!(next["params"]["cursor"], "page-2");
+    assert_eq!(next["params"]["ancestorThreadId"], "thread-exact");
+    // Older children, one still running while every live child is still
+    // being read, a child one of them started, a child a live child
+    // started, and one whose parent is on the page after.
+    let mut running = child(33);
+    running["status"] = json!({"type":"active","activeFlags":[]});
+    let second = parent
+        .receive(json!({"id":next["id"],"result":{"data":[
+            child(32), running, thread("nested-033", "child-033"),
+            thread("nested-000", "child-000"), thread("late-nested", "child-050"),
+        ],"nextCursor":"page-3"}}))
+        .unwrap();
+    let third_request = listing(&second).expect("the third page").clone();
+    let third = parent
+        .receive(json!({"id":third_request["id"],"result":{
+            "data":[child(50)],"nextCursor":null}}))
+        .unwrap();
+    let published = [
+        "child-032",
+        "child-033",
+        "nested-033",
+        "nested-000",
+        "child-050",
+        "late-nested",
+    ];
+    let events: Vec<Event> = [second, third]
+        .into_iter()
+        .flat_map(|step| {
+            // Older children are not read, and evict none of the newest.
+            assert!(resumes(&step).is_empty());
+            assert!(
+                step.writes
+                    .iter()
+                    .all(|write| write["method"] != "thread/unsubscribe")
+            );
+            step.events
+        })
+        .collect();
+    for id in published {
+        assert!(events.iter().any(|event| matches!(event,
+            Event::Subagent { id: published, kind, .. } if published == id && kind == id)));
+        assert!(
+            unloaded_notice(&events, id),
+            "{id} says its transcript isn't loaded"
+        );
+        assert!(!parent.children.contains_key(id));
+    }
+    assert_eq!(parent.children.len(), 32);
+    assert!((0..32).all(|index| parent.children.contains_key(&format!("child-{index:03}"))));
+    let mut state = chat::Snapshot::default();
+    crate::chat::runtime::project_events_for_test(&mut state, events);
+    let observed = state
+        .subagents
+        .iter()
+        .find(|agent| agent.id == "child-033")
+        .expect("the earlier running child is listed");
+    assert_eq!(observed.status, ToolStatus::Running);
+    assert!(observed.last_seen_running());
+    assert!(!observed.outlives_turn());
+    assert!(!state.holds_work());
+    assert!(!state.is_working());
+
+    for (read, id) in resumes(&first) {
+        parent
+            .receive(
+                json!({"id":read,"result":{"thread":{"id":id,"status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}}}),
+            )
+            .unwrap();
+    }
+    // Once a settled child can make room, a running one listed past the
+    // newest is read and kept live in its place.
+    let mut request = Step::default();
+    parent
+        .list_children(&mut request, None, 0, Vec::new())
+        .unwrap();
+    let mut running = child(60);
+    running["status"] = json!({"type":"active","activeFlags":[]});
+    let relisted = parent
+        .receive(json!({"id":request.writes[0]["id"],"result":{
+            "data":[running],"nextCursor":null}}))
+        .unwrap();
+    assert_eq!(resumes(&relisted).len(), 1);
+    assert!(parent.children.contains_key("child-060"));
+    assert!(!unloaded_notice(&relisted.events, "child-060"));
+    assert_eq!(parent.children.len(), 32);
+
+    // Live activity loads an older child after all: its transcript replaces
+    // the notice that it isn't loaded.
+    let live = parent
+        .receive(
+            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn",
+            "item":{"type":"subAgentActivity","id":"message","kind":"interacted",
+                "agentThreadId":"child-033","agentPath":"/root/older"}}}),
+        )
+        .unwrap();
+    assert!(parent.children.contains_key("child-033"));
+    assert_eq!(resumes(&live).len(), 1);
+    assert!(live.events.iter().any(|event| matches!(event,
+        Event::SubagentItemsRemoved { id, ids }
+            if id == "child-033" && ids == &["codex-notice:unloaded:child-033"])));
+
+    crate::chat::runtime::project_events_for_test(&mut state, live.events);
+    let promoted = state
+        .subagents
+        .iter()
+        .find(|agent| agent.id == "child-033")
+        .unwrap();
+    assert!(!promoted.last_seen_running());
+
+    // One listing publishes a bounded number of children, however many
+    // pages Codex offers.
+    let mut bounded = adapter();
+    let mut request = Step::default();
+    bounded
+        .list_children(&mut request, None, MAX_LISTED_CHILDREN - 32, Vec::new())
+        .unwrap();
+    let last = bounded
+        .receive(json!({"id":request.writes[0]["id"],"result":{
+            "data":(0..32).map(child).collect::<Vec<_>>(),"nextCursor":"more"}}))
+        .unwrap();
+    assert!(listing(&last).is_none());
+}
+
+#[test]
+fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state() {
+    for (relisted, confirmed, buffered_turn) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let mut parent = adapter();
+        let id = "older-child";
+        parent.listed_unloaded.insert(id.into(), true);
+        let mut listed = Step::default();
+        parent
+            .discover_child_as(
+                id,
+                &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                ChildName::Listed,
+                false,
+                false,
+                &mut listed,
+            )
+            .unwrap();
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(&mut state, listed.events);
+        let mut sparse = Step::default();
+        if relisted {
+            parent
+                .discover_child_as(
+                    id,
+                    &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                    ChildName::Listed,
+                    false,
+                    true,
+                    &mut sparse,
+                )
+                .unwrap();
+        } else {
+            parent
+                .discover_activity_child(
+                    &json!({"agentThreadId":id,"kind":"started"}),
+                    "thread-exact",
+                    ChildName::Recorded,
+                    false,
+                    &mut sparse,
+                )
+                .unwrap();
+        }
+        let request = sparse
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap()["id"]
+            .clone();
+        crate::chat::runtime::project_events_for_test(&mut state, sparse.events);
+        assert!(state.subagents[0].last_seen_running());
+        assert!(!state.holds_work());
+        let notice = unloaded_notice_id(id);
+        let has_notice = |state: &chat::Snapshot| {
+            state.subagents[0]
+                .items
+                .iter()
+                .any(|item| item.id == notice)
+        };
+        assert!(has_notice(&state));
+        assert!(
+            parent
+                .command(Command::StopSubagent { id: id.into() })
+                .is_err()
+        );
+
+        if buffered_turn {
+            let early = parent
+                .receive(json!({"method":"turn/started","params":{"threadId":id,
+                    "turn":{"id":"live","status":"inProgress","items":[]}}}))
+                .unwrap();
+            crate::chat::runtime::project_events_for_test(&mut state, early.events);
+            assert!(state.subagents[0].last_seen_running());
+            assert!(has_notice(&state));
+        }
+        let response = if confirmed {
+            json!({"id":request,"result":{
+                "thread":{"id":id,"status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}}})
+        } else {
+            json!({"id":request,"error":{"code":-1,"message":"read temporarily unavailable"}})
+        };
+        let reply = parent.receive(response).unwrap();
+        crate::chat::runtime::project_events_for_test(&mut state, reply.events);
+        if confirmed {
+            assert_eq!(state.subagents[0].status, ToolStatus::Succeeded);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+        } else if buffered_turn {
+            assert_eq!(state.subagents[0].status, ToolStatus::Running);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+            assert!(state.holds_work());
+        } else {
+            assert!(state.subagents[0].last_seen_running());
+            assert!(has_notice(&state));
+            assert!(
+                parent
+                    .command(Command::StopSubagent { id: id.into() })
+                    .is_err()
+            );
+            let observed = parent
+                .receive(json!({"method":"thread/status/changed","params":{
+                    "threadId":id,"status":{"type":"active","activeFlags":[]}}}))
+                .unwrap();
+            crate::chat::runtime::project_events_for_test(&mut state, observed.events);
+            assert_eq!(state.subagents[0].status, ToolStatus::Running);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+            assert!(state.holds_work());
+        }
+    }
+}
+
+#[test]
+fn paging_a_recorded_collaboration_cannot_replace_a_newer_catalog_observation() {
+    for recorded in ["running", "completed"] {
+        let mut parent = adapter();
+        let mut listed = Step::default();
+        parent.listed_unloaded.insert("older".into(), true);
+        parent
+            .discover_child_as(
+                "older",
+                &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                ChildName::Listed,
+                false,
+                false,
+                &mut listed,
+            )
+            .unwrap();
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(&mut state, listed.events);
+        let mut page = Step::default();
+        parent
+            .page(
+                &json!({"data":[{"id":"prior","status":"completed","items":[{
+                "id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed",
+                "senderThreadId":"thread-exact","receiverThreadIds":["older"],
+                "agentsStates":{"older":{"status":recorded,"agentNickname":"Earlier child"}}
+            }]}],"nextCursor":null}),
+                &mut page,
+                true,
+            )
+            .unwrap();
+        assert_eq!(resumes(&page).len(), 1);
+        crate::chat::runtime::project_events_for_test(&mut state, page.events);
+        assert!(state.subagents[0].last_seen_running());
+        assert!(!state.holds_work());
+    }
+}
+
+#[test]
+fn a_nested_child_never_evicts_its_ancestors_to_make_room() {
+    let mut parent = adapter();
+    let thread = |index: usize, parent: &str| json!({"id":format!("child-{index:03}"),"parentThreadId":parent,"status":{"type":"notLoaded"}});
+    // child-001 is child-000's own subagent; the rest are the parent's.
+    let mut data = vec![thread(0, "thread-exact"), thread(1, "child-000")];
+    data.extend((2..32).map(|index| thread(index, "thread-exact")));
+    let mut request = Step::default();
+    parent
+        .list_children(&mut request, None, 0, Vec::new())
+        .unwrap();
+    let mut reads = resumes(
+        &parent
+            .receive(json!({"id":request.writes[0]["id"],"result":{"data":data,"nextCursor":null}}))
+            .unwrap(),
+    );
+    // Settle every child; child-001's read follows child-000's.
+    while let Some((read, id)) = reads.pop() {
+        let answered = parent
+            .receive(
+                json!({"id":read,"result":{"thread":{"id":id,"status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}}}),
+            )
+            .unwrap();
+        reads.extend(resumes(&answered));
+    }
+    assert_eq!(parent.children.len(), 32);
+    // child-001 starts a subagent of its own. The first settled children,
+    // in the order they are kept, are its ancestors.
+    let spawned = parent
+        .receive(
+            json!({"method":"item/started","params":{"threadId":"child-001","turnId":"turn",
+            "item":{"type":"subAgentActivity","id":"spawn","kind":"started","agentThreadId":"deep",
+                "agentPath":"/root/survey/deep"}}}),
+        )
+        .unwrap();
+    assert!(parent.children.contains_key("deep"));
+    let evicted: Vec<&str> = spawned
+        .writes
+        .iter()
+        .filter(|write| write["method"] == "thread/unsubscribe")
+        .filter_map(|write| write["params"]["threadId"].as_str())
+        .collect();
+    assert_eq!(evicted.len(), 1);
+    assert!(!["child-000", "child-001"].contains(&evicted[0]));
+    assert!(parent.children.contains_key("child-000"));
+    assert!(parent.children.contains_key("child-001"));
+    assert_eq!(resumes(&spawned).len(), 1);
+}
+
+#[test]
+fn a_failed_or_superseded_listing_page_ends_only_that_listing() {
+    let child = |index: usize| json!({"id":format!("child-{index:03}"),"parentThreadId":"thread-exact","status":{"type":"notLoaded"}});
+    let mut parent = adapter();
+    let mut request = Step::default();
+    parent
+        .list_children(&mut request, None, 0, Vec::new())
+        .unwrap();
+    let first = parent
+        .receive(json!({"id":request.writes[0]["id"],"result":{
+            "data":(0..2).map(child).collect::<Vec<_>>(),"nextCursor":"page-2"}}))
+        .unwrap();
+    let next = listing(&first).unwrap().clone();
+    // A failed page ends the listing; what it already published stays.
+    let failed = parent
+        .receive(json!({"id":next["id"],"error":{"code":-32000,"message":"listing unavailable"}}))
+        .unwrap();
+    assert!(listing(&failed).is_none());
+    assert!(
+        failed
+            .events
+            .iter()
+            .all(|event| !matches!(event, Event::Error { .. }))
+    );
+    assert_eq!(parent.children.len(), 2);
+
+    // An attachment restarts the listing: a page of the old one, answered
+    // late, publishes nothing and asks for no more.
+    let mut request = Step::default();
+    parent
+        .list_children(&mut request, None, 0, Vec::new())
+        .unwrap();
+    parent.listing_generation += 1;
+    let stale = parent
+        .receive(json!({"id":request.writes[0]["id"],"result":{
+            "data":[child(9)],"nextCursor":"page-2"}}))
+        .unwrap();
+    assert!(stale.events.is_empty());
+    assert!(stale.writes.is_empty());
+    assert!(!parent.children.contains_key("child-009"));
+}
+
+#[test]
+fn an_activity_hint_never_overrides_how_a_child_stands() {
+    let mut parent = v2_parent();
+    let activity = |kind: &str| {
+        json!({"method":"item/completed","params":{"threadId":V2_PARENT,"turnId":"turn",
+            "item":{"type":"subAgentActivity","id":kind,"kind":kind,"agentThreadId":V2_CHILD,
+                "agentPath":"/root/single_word","model":null}}})
+    };
+    let first = parent.receive(activity("started")).unwrap();
+    assert!(first.events.iter().any(|event| matches!(event,
+        Event::Subagent { id, status: Some(ToolStatus::Running), .. } if id == V2_CHILD)));
+    parent.children.get_mut(V2_CHILD).unwrap().subagent_status = Some(ToolStatus::Failed);
+    for kind in ["completed", "interacted", "started"] {
+        let hinted = parent.receive(activity(kind)).unwrap();
+        assert!(
+            hinted.events.iter().all(|event| !matches!(
+                event,
+                Event::Subagent {
+                    status: Some(_),
+                    ..
+                }
+            )),
+            "{kind} is only a hint"
+        );
+        assert_eq!(
+            parent.children[V2_CHILD].subagent_status,
+            Some(ToolStatus::Failed)
+        );
+    }
+}
+
+#[test]
+fn a_running_turns_history_shows_a_reported_start_as_done() {
+    let recorded: Value = serde_json::from_str(MULTI_AGENT_V2_HISTORY).unwrap();
+    let mut page = recorded["turnsList"].clone();
+    page["data"][0]["status"] = "inProgress".into();
+    let mut parent = v2_parent();
+    let mut step = Step::default();
+    parent.page(&page, &mut step, false).unwrap();
+    let Some(Event::LatestHistory { items, .. }) = step
+        .events
+        .iter()
+        .find(|event| matches!(event, Event::LatestHistory { .. }))
+    else {
+        panic!("the latest history page");
+    };
+    let rows: Vec<&ToolStatus> = items
+        .iter()
+        .filter_map(|item| match &item.content {
+            ItemContent::Tool { name, status, .. } if name == "spawnAgent" => Some(status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, [&ToolStatus::Succeeded]);
+}
+
+#[test]
+fn a_turn_that_both_calls_spawn_agent_and_reports_the_start_shows_one_row() {
+    let mut parent = v2_parent();
+    let call = json!({"method":"item/completed","params":{"threadId":V2_PARENT,"turnId":"turn",
+        "item":{"type":"collabAgentToolCall","id":"call","tool":"spawnAgent","status":"completed",
+            "senderThreadId":V2_PARENT,"receiverThreadIds":[V2_CHILD],"prompt":"Reply ok.",
+            "agentsStates":{V2_CHILD:{"status":"running"}}}}});
+    let activity = json!({"method":"item/completed","params":{"threadId":V2_PARENT,"turnId":"turn",
+        "item":{"type":"subAgentActivity","id":"spawn","kind":"started","agentThreadId":V2_CHILD,
+            "agentPath":"/root/single_word","model":"gpt-6-luna"}}});
+    let called = parent.receive(call).unwrap();
+    assert!(spawn_row_for(&called.events, V2_CHILD).is_some());
+    let reported = parent.receive(activity.clone()).unwrap();
+    assert!(spawn_row_for(&reported.events, V2_CHILD).is_none());
+    // Another turn's report of a start is that turn's own row.
+    let mut later = activity;
+    later["params"]["turnId"] = "later-turn".into();
+    let later = parent.receive(later).unwrap();
+    assert!(spawn_row_for(&later.events, V2_CHILD).is_some());
+    assert_eq!(parent.children.len(), 1);
+}
+
 /// After a restart Codex has loaded none of a conversation's children, and it
 /// resumes a nested child only once its parent is loaded. A grandchild read
 /// sent beside its parent's was refused, and the child it left behind, never
@@ -3446,7 +4364,7 @@ fn listed_descendants_are_read_after_their_parents_and_not_loaded_is_not_running
         let mut adapter = adapter();
         let mut request = Step::default();
         adapter
-            .call(&mut request, "thread/list", json!({}), Pending::ChildList)
+            .call(&mut request, "thread/list", json!({}), child_list())
             .unwrap();
         let listed = adapter
             .receive(json!({"id":request.writes[0]["id"],"result":{"data":[
@@ -3616,7 +4534,7 @@ for line in sys.stdin:
     let mut list = Step::default();
     adapter
         .parser
-        .call(&mut list, "thread/list", json!({}), Pending::ChildList)
+        .call(&mut list, "thread/list", json!({}), child_list())
         .unwrap();
     let mut snapshot = crate::chat::Snapshot::default();
     for frame in adapter.answer(&list.writes) {
@@ -4332,7 +5250,7 @@ fn account_notifications_are_forwarded_as_reports() {
 fn joins_exact_thread_without_settings_or_history_overrides() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("shared.sock");
-    let _server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _server = crate::descriptor::bind(&socket).unwrap();
     let launch = Launch {
         provider: crate::agent::Provider::Codex,
         session_id: Some("thread-exact".into()),
@@ -5390,8 +6308,22 @@ fn codex_events_read_as_what_happened() {
         (done.0.as_str(), done.3),
         ("Wait 1m 30s", ToolStatus::Succeeded)
     );
-    let activity = json!({"id":"a","type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"});
-    assert!(parse_item(&activity, true, "turn").unwrap().is_empty());
+    // Only a subagent's start is a row, the spawn call that started it;
+    // how it goes on is reported on the subagent.
+    for kind in ["interacted", "interrupted", "completed"] {
+        let activity = json!({"id":"a","type":"subAgentActivity","kind":kind,"agentThreadId":"child","agentPath":"/root/review"});
+        assert!(parse_item(&activity, true, "turn").unwrap().is_empty());
+    }
+    let started = json!({"id":"a","type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review","model":"gpt-6-luna","reasoningEffort":"low"});
+    let (name, input, output, status) = only_tool(started, true);
+    assert_eq!(
+        (name.as_str(), input.as_str(), status),
+        ("spawnAgent", "", ToolStatus::Succeeded)
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&output).unwrap(),
+        json!({"child":{"agentPath":"/root/review","model":"gpt-6-luna","reasoningEffort":"low"}})
+    );
     let mut adapter = adapter();
     let diff = adapter
         .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":"@@ -1 +1 @@\n-a\n+b\n"}}))
@@ -5412,6 +6344,25 @@ fn a_tool_result_keeps_structured_content_its_text_does_not_carry() {
     let same = json!({"content":[{"type":"text","text":"{\"issues\":[\"ENG-1\"]}"}],
         "structuredContent":{"issues":["ENG-1"]}});
     assert_eq!(images::readable(&same), "{\"issues\":[\"ENG-1\"]}");
+}
+
+#[test]
+fn a_turn_diff_passes_an_empty_git_directory_in_the_working_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path();
+    let cwd = repository.join("src");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    std::fs::create_dir(repository.join(".git")).unwrap();
+    std::fs::write(repository.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let mut adapter = adapter();
+    adapter.cwd = cwd;
+    adapter
+        .receive(json!({
+            "method": "turn/diff/updated",
+            "params": {"threadId": "thread-exact", "turnId": "turn", "diff": ""}
+        }))
+        .unwrap();
+    assert_eq!(adapter.repo_root, Some(Some(repository.to_path_buf())));
 }
 
 /// A turn's diff is its own change row only for the files none of its

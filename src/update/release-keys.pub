@@ -3,3 +3,4 @@
 # signed; until a key is listed here, this build offers no release update.
 # See docs/releasing.md#signing for how the key is made and kept.
 sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIDKhNA91YlzyJCyLikv3bPApza0mzQJTjBUNVTp3q+CUAAAABHNzaDo= cagents-release
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJKOGaiUM5k1FT00OZLCikBGQyguQ+9K+JmVP7KHZg+8 cagents-release-actions

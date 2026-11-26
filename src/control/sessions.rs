@@ -1,4 +1,5 @@
 use super::fields::{self, Detail, Row as Fields};
+use super::format::listing_output;
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
@@ -50,17 +51,22 @@ impl FieldsArgs {
 pub(super) fn whoami(arguments: FieldsArgs) -> Result<CommandOutput, AppError> {
     let directory = read(Scope::Containing(current_directory()?))?;
     let peers = related(&directory);
-    Ok(CommandOutput {
-        command: "whoami",
-        human: whoami_human(&directory, &peers, &super::format::program(), now_ms()),
-        data: listing_json(
-            json!({ "scope": fields::word(&directory.scope) }),
-            directory.caller.iter().chain(peers.iter().copied()),
-            None,
-            &arguments.fields,
-            now_ms(),
-        ),
-    })
+    let now = now_ms();
+    Ok(listing_output(
+        "whoami",
+        &directory,
+        super::human_output(),
+        |directory| whoami_human(directory, &peers, &super::format::program(), now),
+        |directory| {
+            listing_json(
+                json!({ "scope": fields::word(&directory.scope) }),
+                directory.caller.iter().chain(peers.iter().copied()),
+                None,
+                &arguments.fields,
+                now,
+            )
+        },
+    ))
 }
 
 /// The sessions `whoami` lists beside the caller: its relatives, and peers
@@ -156,23 +162,34 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     };
     let mut client = control_daemon_client()?;
     let directory = read_with(&mut client, scope)?;
-    let unshown = unshown(&mut client, &directory);
-    let mut data = listing_json(
-        json!({ "scope": fields::word(&directory.scope) }),
-        directory.caller.iter().chain(&directory.sessions),
-        None,
-        &arguments.fields.fields,
-        now_ms(),
-    );
-    // Only when no fields were chosen: a selection returns just those.
-    if arguments.fields.fields.is_empty() {
-        mark_unshown(&mut data, &unshown);
-    }
-    Ok(CommandOutput {
-        command: "sessions",
-        human: sessions_human(&directory, &unshown, &super::format::program(), now_ms()),
-        data,
-    })
+    let selected = &arguments.fields.fields;
+    // The human listing and full JSON report chats with no pane. Selected
+    // fields never include that annotation, so they need no workspace model.
+    let unshown = if selected.is_empty() {
+        unshown(&mut client, &directory)
+    } else {
+        BTreeSet::new()
+    };
+    let now = now_ms();
+    Ok(listing_output(
+        "sessions",
+        &directory,
+        super::human_output(),
+        |directory| sessions_human(directory, &unshown, &super::format::program(), now),
+        |directory| {
+            let mut data = listing_json(
+                json!({ "scope": fields::word(&directory.scope) }),
+                directory.caller.iter().chain(&directory.sessions),
+                None,
+                selected,
+                now,
+            );
+            if !unshown.is_empty() {
+                mark_unshown(&mut data, &unshown);
+            }
+            data
+        },
+    ))
 }
 
 /// Marks each listed row no saved pane shows with `"no_pane": true`.
@@ -599,23 +616,27 @@ fn members(channel: Option<ChannelId>, selected: &[String]) -> Result<CommandOut
         Reply::Members(members) => Some(members),
         _ => None,
     })?;
-    let human = members_human(&members, &super::format::program(), now_ms());
-    let Members {
-        channel,
-        caller,
-        sessions,
-    } = &members;
-    Ok(CommandOutput {
-        command: "sessions",
-        data: listing_json(
-            json!({ "channel": channel }),
-            caller.iter().chain(sessions),
-            Some(*channel),
-            selected,
-            now_ms(),
-        ),
-        human,
-    })
+    let now = now_ms();
+    Ok(listing_output(
+        "sessions",
+        &members,
+        super::human_output(),
+        |members| members_human(members, &super::format::program(), now),
+        |members| {
+            let Members {
+                channel,
+                caller,
+                sessions,
+            } = members;
+            listing_json(
+                json!({ "channel": channel }),
+                caller.iter().chain(sessions),
+                Some(*channel),
+                selected,
+                now,
+            )
+        },
+    ))
 }
 
 fn members_human(members: &Members, program: &str, now: u64) -> String {
@@ -1023,7 +1044,7 @@ fn request<T>(
     expected(reply).ok_or_else(|| AppError::new("sessions", "Unexpected reply from the daemon"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 pub(super) mod tests {
     use super::*;
     use crate::agent::ActivityState;

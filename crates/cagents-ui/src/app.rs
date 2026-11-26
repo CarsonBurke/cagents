@@ -22,6 +22,7 @@ mod dispatch_tests;
 mod ingress;
 mod inspector_activity;
 mod inspector_rail;
+mod phone_ui;
 use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
@@ -35,6 +36,8 @@ mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+#[cfg(target_os = "macos")]
+mod macos_window;
 mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
@@ -348,6 +351,8 @@ enum NoticeKey {
     TerminalStart(CardId),
     /// Restoring this card from the window's saved state at startup.
     CardRestore(CardId),
+    /// Closing this pane, which waits for another pane's close to finish.
+    CloseWaiting(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3028,10 +3033,8 @@ fn is_save_press(event: &keyboard::Event) -> bool {
             repeat: false,
             ..
         } if key.eq_ignore_ascii_case("s")
-            && modifiers.control()
-            && !modifiers.alt()
+            && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && !modifiers.shift()
-            && !modifiers.logo()
     )
 }
 
@@ -3048,10 +3051,10 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     else {
         return None;
     };
-    if modifiers.logo() || modifiers.shift() {
+    if modifiers.shift() {
         return None;
     }
-    if modifiers.control() && !modifiers.alt() {
+    if settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
         return match key
             .to_latin(*physical_key)
             .map(|key| key.to_ascii_lowercase())
@@ -3060,6 +3063,9 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
             Some('r') => Some(Message::BrowserReload(card)),
             _ => None,
         };
+    }
+    if modifiers.logo() {
+        return None;
     }
     match key.as_ref() {
         Key::Named(Named::ArrowLeft) if modifiers.alt() && !modifiers.control() => {
@@ -3091,6 +3097,7 @@ fn window_geometry_message(event: &window::Event, window: window::Id) -> Option<
 
 /// Whether a Wayland compositor fills the screen with a window or tiles its
 /// right edge, either of which removes the shell's resize border along it.
+#[cfg(target_os = "linux")]
 fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Message> {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
     use iced::event::{PlatformSpecific, wayland};
@@ -3105,6 +3112,13 @@ fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Messag
         }),
         _ => None,
     }
+}
+
+/// Only Wayland reports window states. Elsewhere, as on X11, each resize
+/// asks the backend whether the window fills the screen.
+#[cfg(target_os = "macos")]
+fn window_edge_message(_event: &iced::Event, _window: window::Id) -> Option<Message> {
+    None
 }
 
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
@@ -3345,6 +3359,12 @@ fn background_poll(message: &Message) -> bool {
         Message::AutomationApproval(
             automation_approval::Action::Tick | automation_approval::Action::Read { .. }
         ) | Message::AccountUi(account_ui::Action::Tick | account_ui::Action::OmpRead(_))
+            // The phone's status is read only by its own control and popover.
+            | Message::Phone(
+                phone_ui::Action::Tick
+                    | phone_ui::Action::Probed(_)
+                    | phone_ui::Action::Progressed(_)
+            )
     )
 }
 
@@ -4969,6 +4989,7 @@ fn grouped_digits(value: usize) -> String {
 #[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
+    Phone(phone_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
         collapsed: bool,
@@ -5156,6 +5177,9 @@ pub enum Message {
         result: Result<SettingsSaved, String>,
     },
     StartupWindowOpened(window::Id),
+    /// The traffic lights' extent in points, or `None` if AppKit drew none.
+    #[cfg(target_os = "macos")]
+    WindowControlsMeasured(Option<sidebar::WindowControls>),
     StartupReported(Result<(), String>),
     VerifyStartupPanes,
     StartupStateInspected(startup_gate::Inspection),
@@ -5730,9 +5754,14 @@ impl PullRequestPane {
     }
 }
 
-/// Whether a pull request card `width` wide hides its side panel.
+/// Whether a pull request card `width` wide hides its side panel: the
+/// person's choice, or else whether a narrow card needs the room for a file's
+/// diff. Until a file is chosen the panel holds what to choose from, the
+/// pull requests or the review's files, and the rest of the card is empty, so
+/// it is never folded away unasked.
 fn review_files_collapsed(pane: &PullRequestPane, width: f32) -> bool {
-    pane.file_panel_collapsed.unwrap_or(width < 640.0)
+    pane.file_panel_collapsed
+        .unwrap_or(width < 640.0 && pane.review.selected().is_some())
 }
 
 /// Static chrome strings for a card kind.
@@ -5951,6 +5980,7 @@ struct HoverFocus {
 pub struct Cagents {
     startup_gate: startup_gate::State,
     device_ui: device_ui::State,
+    phone_ui: phone_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
@@ -6134,6 +6164,10 @@ pub struct Cagents {
     /// Whether the compositor reports the main window's right edge as tiled,
     /// so the shell offers no resize border there.
     right_edge_tiled: bool,
+    /// Where macOS draws the traffic lights over the window's top-left
+    /// corner, in points, once measured. Other systems draw no controls
+    /// there.
+    window_controls_points: Option<sidebar::WindowControls>,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -7275,6 +7309,12 @@ impl Cagents {
         }
     }
 
+    /// Whether the window's outer corners are drawn square: always on macOS,
+    /// where AppKit rounds and clips a titled window itself.
+    pub(super) fn window_corners_sharp(&self) -> bool {
+        cfg!(target_os = "macos") || self.core.window.sharp_corners
+    }
+
     /// The trailing inset that keeps the interface out of the window's resize
     /// border.
     ///
@@ -7283,11 +7323,46 @@ impl Cagents {
     /// reaches a widget. Panes put their scrollbars at their right edge, so the
     /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
     /// fullscreen and right-tiled windows have no border there and stay flush.
+    ///
+    /// macOS has no such border: AppKit resizes the window from its frame.
     fn window_edge_inset(&self) -> f32 {
-        if self.window_filled || self.right_edge_tiled {
+        if cfg!(target_os = "macos") || self.window_filled || self.right_edge_tiled {
             0.0
         } else {
             design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
+        }
+    }
+
+    /// The traffic lights' extent in layout units, which interface scaling
+    /// makes larger than AppKit's points.
+    fn window_controls(&self) -> Option<sidebar::WindowControls> {
+        self.window_controls_points
+            .map(|controls| sidebar::WindowControls {
+                width: controls.width / self.settings.ui_scale,
+                height: controls.height / self.settings.ui_scale,
+                ..controls
+            })
+    }
+
+    /// How far the traffic lights reach into the header holding the window
+    /// controls from its `edge`: past the projects pane, as they do beside
+    /// the compact rail, from the leading edge, and their whole width from
+    /// the trailing edge, where a right-to-left system puts them.
+    pub(super) fn window_controls_reach(&self, edge: sidebar::WindowControlsEdge) -> f32 {
+        let Some(controls) = self
+            .window_controls()
+            .filter(|controls| controls.edge == edge)
+        else {
+            return 0.0;
+        };
+        match edge {
+            sidebar::WindowControlsEdge::Leading => (controls.width
+                - sidebar::effective_width(
+                    self.projects_sidebar_mode(),
+                    self.settings.sidebar_width,
+                ))
+            .max(0.0),
+            sidebar::WindowControlsEdge::Trailing => controls.width,
         }
     }
 
@@ -8100,6 +8175,10 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
             }
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(_)) => workspace_widget::FocusedPane::Browser {
+                inspector: self.pane_has_inspector(card),
+            },
             _ if !self.pane_has_inspector(card) => workspace_widget::FocusedPane::NoInspector,
             _ => workspace_widget::FocusedPane::Other,
         }
@@ -8304,10 +8383,11 @@ impl Cagents {
         let file_panel_toggle = || {
             crate::ui_controls::icon_button(
                 Icon::Sidebar,
-                if collapsed {
-                    "Show review files"
-                } else {
-                    "Hide review files"
+                match (collapsed, review.is_open()) {
+                    (true, true) => "Show review files",
+                    (false, true) => "Hide review files",
+                    (true, false) => "Show pull requests",
+                    (false, false) => "Hide pull requests",
                 },
             )
             .selected(!collapsed)
@@ -8562,9 +8642,10 @@ impl Cagents {
     }
 
     fn open_clicked_link(&mut self, url: Url) -> Task<Message> {
+        // Ctrl+click on Linux, Command+click on macOS.
         let gesture =
             self.keyboard_modifiers
-                .control()
+                .command()
                 .then_some(if self.keyboard_modifiers.shift() {
                     LinkOpenGesture::ControlShiftClick
                 } else {
@@ -9653,7 +9734,12 @@ impl Cagents {
                     Some(CardRuntime::Repository(runtime))
                         if runtime.descriptor.worktree == source.key.canonical_path =>
                     {
-                        runtime.selected_path()
+                        runtime.selected_path().map(|path| {
+                            (
+                                path,
+                                runtime.shows_diff().then(|| runtime.selected_diff_basis()),
+                            )
+                        })
                     }
                     _ => None,
                 });
@@ -10901,10 +10987,8 @@ impl Cagents {
                 modifiers,
                 ..
             } = &event
-            && modifiers.control()
+            && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && modifiers.shift()
-            && !modifiers.alt()
-            && !modifiers.logo()
             && key.eq_ignore_ascii_case("s")
             && let Some(card) = self.workspace.focused()
             && !self.pane_content_inputs_blocked(card)
@@ -11008,6 +11092,12 @@ impl Cagents {
             && let Some(task) = self.resume_key_event(&event)
         {
             return (task, Projection::Full);
+        }
+        if is_escape_press(&event) && self.phone_ui.open && !self.modal_is_open() {
+            return (
+                self.update_phone(phone_ui::Action::Menu(false)),
+                Projection::Full,
+            );
         }
         if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
             return (
@@ -12406,16 +12496,16 @@ impl Cagents {
                 }
             }
             BrowserEvent::Error(_) => {
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {id}: a browser operation failed"
-                )));
+                self.status = Some(TransientNotice::error(
+                    "A browser operation failed".to_owned(),
+                ));
             }
             BrowserEvent::Crashed { reason, .. } => {
                 self.fail_runtime(id, reason.clone());
                 durable_changed = true;
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {id}: the browser stopped unexpectedly"
-                )));
+                self.status = Some(TransientNotice::error(
+                    "The browser stopped unexpectedly".to_owned(),
+                ));
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
             BrowserEvent::ClosedByContent => {
@@ -12741,7 +12831,7 @@ impl Cagents {
                             },
                         )
                         .accessible_name(format!(
-                            "Terminal {}, card {id}",
+                            "Terminal {}",
                             card.map_or_else(
                                 || "Terminal".to_owned(),
                                 |card| card.title.chars().take(80).collect::<String>()
@@ -13468,6 +13558,18 @@ impl Cagents {
     /// page - is [`SidebarFocus::None`], which leaves the panel where it is
     /// rather than tearing it down.
     fn sidebar_focus(&self) -> SidebarFocus {
+        // A worktree channel binds its own checkout, read from the latest
+        // listing rather than from the strip it installed: the worktree may
+        // have been removed or listed again since. Until the listing confirms
+        // it, the panel binds nothing; the main checkout the panes fall back
+        // to is not the channel's to commit.
+        if let Some(focus) = self
+            .durable
+            .active_channel
+            .and_then(|channel| self.channel_checkout_focus(channel))
+        {
+            return focus;
+        }
         if let Some(worktree) = &self.active_workspace {
             return SidebarFocus::Repository {
                 worktree: worktree.clone(),
@@ -15167,11 +15269,10 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => {
-                self.sidebar_model.project(id).and_then(|project| {
-                    sidebar::project_primary_action(project, self.sidebar_state.filter())
-                })
-            }
+            sidebar::SelectionRow::Project(id) => self
+                .sidebar_model
+                .project(id)
+                .and_then(sidebar::project_primary_action),
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -15327,6 +15428,8 @@ impl Cagents {
         // wait for its window anyway: the close is saved, so an answer it
         // does not hear is asked for again, and reported, at the next launch.
         let chats_closed = !self.chat_ui.closing_in_background();
+        #[cfg(target_os = "macos")]
+        macos_window::exit_began();
         self.exit = Some(ApplicationExit {
             closing: close.as_ref().map(|(window, _)| *window),
             servers_reaped: false,
@@ -15528,6 +15631,17 @@ impl Cagents {
             .is_none_or(|card| !card.existence.is_open())
         {
             return Task::none();
+        }
+        // Only a reservation sends this. A commit for one given up meanwhile,
+        // as a stranded one is when a pane waiting behind it is closed again,
+        // has nothing left to commit, and starts nothing: the pane stays open.
+        if !self
+            .workspace
+            .pending_close()
+            .is_some_and(|pending| pending.unmounting == id)
+        {
+            self.abandon_removal(id);
+            return self.next_queued_card_close();
         }
         if self.pending_terminal_spawn(id) {
             return self.begin_card_close(id);
@@ -16414,6 +16528,7 @@ impl Cagents {
         if previous.show_status_bar != self.settings.show_status_bar {
             self.account_ui.set_turned_off(&self.settings);
             self.device_ui.menu_open = false;
+            self.phone_ui.open = false;
             tasks.push(self.accounts_surface_changed());
         } else if self.account_ui.set_turned_off(&self.settings) {
             // A provider turned back on is read again at once, rather than
@@ -16593,8 +16708,23 @@ impl Application for Cagents {
         std::thread::spawn(chat_ui::prune_pasted_images);
         // Before any system theme is applied, so none shows the stock warning.
         cosmic::theme::adjust_system_themes(crate::settings::attention_in_yellow);
+        // Before anything is shaped: no text may select a face swash cannot shape.
+        let unusable_faces = crate::terminal::drop_faces_without_advances();
+        if unusable_faces > 0 {
+            tracing::info!(
+                unusable_faces,
+                "Left out installed fonts that declare no advances"
+            );
+        }
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
+        // AppKit draws these as the traffic lights.
+        #[cfg(target_os = "macos")]
+        {
+            core.window.show_close = false;
+            core.window.show_maximize = false;
+            core.window.show_minimize = false;
+        }
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
         let Bootstrap {
@@ -16785,6 +16915,7 @@ impl Application for Cagents {
             window_filled: false,
             window_state_observed: false,
             right_edge_tiled: false,
+            window_controls_points: None,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -16805,6 +16936,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
+            phone_ui: phone_ui::State::default(),
             account_ui: account_ui::State::installation().into(),
             sign_ins: account_ui::SignIns::default(),
             automation_ui: crate::automation_ui::State::default(),
@@ -17189,6 +17321,7 @@ impl Application for Cagents {
             },
         ));
         subscriptions.extend(operation_subscriptions);
+        subscriptions.push(self.phone_subscription());
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.is_animating() || self.pane_inspectors.is_animating())
         {
@@ -17606,7 +17739,10 @@ impl Application for Cagents {
             self.modal_is_open(),
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
-            !self.core.window.sharp_corners,
+            sidebar::WindowCorner {
+                rounded: !self.window_corners_sharp(),
+                controls: self.window_controls(),
+            },
         )
         .map(Message::Sidebar);
         drop(sidebar_part);
@@ -17800,6 +17936,14 @@ impl Application for Cagents {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
+        // The notice about the shown channel's removed worktree heads the
+        // panes it concerns. Always present, as the bars below are, so its
+        // coming and going does not shift the strip's widget state.
+        let workspace: Element<'_, Message> =
+            widget::column::with_children(vec![self.missing_checkout_banner(), workspace])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         drop(workspace_part);
         let workspace = crate::performance::ui_trace::region("workspace", workspace);
         let chrome_part =
@@ -17830,7 +17974,6 @@ impl Application for Cagents {
             self.daemon_health_banner(),
             self.update_resume_banner(),
             self.pane_follow_banner(),
-            self.missing_checkout_banner(),
             self.automation_approval_banner(),
             self.dictation_banner(),
             bar,
@@ -17924,6 +18067,7 @@ impl Application for Cagents {
         self.dispatching += 1;
         let task = self.dispatch(message);
         self.dispatching -= 1;
+        let task = self.resume_deferred_update_review(task);
         let task = self.finish_update(
             task,
             UpdateEntry {
@@ -18047,6 +18191,10 @@ impl Cagents {
         }
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
+        let closing = match message {
+            Message::CloseCard(card) => Some(card),
+            _ => None,
+        };
         if self.update_prepared && user_message_blocked_during_update(&message) {
             // Nothing else would ever deliver this removal.
             if let Message::CommitClose(card) = message {
@@ -18056,6 +18204,13 @@ impl Cagents {
                 ));
                 return ControlFlow::Break(self.return_kept_panes());
             }
+            // A Close turned away says why, rather than doing nothing.
+            if let Some(card) = closing {
+                let me = self.pane_name(card);
+                self.status = Some(TransientNotice::warning(format!(
+                    "{me} can't close while an update is being prepared. Close it again if the update is cancelled."
+                )));
+            }
             return ControlFlow::Break(Task::none());
         }
         if self.modal_is_open() {
@@ -18064,9 +18219,32 @@ impl Cagents {
             && !matches!(&message, Message::ChromeUi(_))
             && user_workspace_message_blocked_while_modal(&message)
         {
-            return ControlFlow::Break(Task::none());
+            // A menu only dismisses itself under a click elsewhere, but a pane's
+            // Close is aimed at the pane: the menu goes and the close goes on,
+            // as does a rename of the pane being closed. Another rename keeps
+            // what was typed, and says why the pane stays.
+            match closing {
+                Some(card) if !self.chrome_ui.renaming_other_than(card) => {
+                    self.chrome_ui.close();
+                    self.chrome_ui.cancel_rename();
+                }
+                Some(card) => {
+                    let me = self.pane_name(card);
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Finish or cancel the rename first, then close {me}."
+                    )));
+                    return ControlFlow::Break(Task::none());
+                }
+                None => return ControlFlow::Break(Task::none()),
+            }
         }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
+            if let Some(card) = closing {
+                let me = self.pane_name(card);
+                self.status = Some(TransientNotice::warning(format!(
+                    "Close or answer the open dialog first, then close {me}."
+                )));
+            }
             return ControlFlow::Break(Task::none());
         }
         if self.focused_repository_is_saving() && workspace_navigation_blocked_during_save(&message)
@@ -18166,6 +18344,7 @@ impl Cagents {
             Message::TerminalSave(action) => self.update_terminal_save(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
+            Message::Phone(action) => self.update_phone(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
                 self.run_workspace_command(command, keyboard::Modifiers::empty())
@@ -18195,11 +18374,11 @@ impl Cagents {
                                 Err(error) => failures.push((terminal.id, error)),
                             }
                         }
-                        failures.first().map(|(id, error)| {
-                            terminal_handoff_pending_notice(format!(
-                                "{} terminal(s) remain pending; terminal {id}: {error}",
-                                failures.len()
-                            ))
+                        failures.first().map(|(_, error)| {
+                            terminal_handoff_pending_notice(match failures.len() {
+                                1 => error.to_string(),
+                                count => format!("{count} terminals are waiting: {error}"),
+                            })
                         })
                     }
                     Err(error) => Some(match self.unsaved_chat_return() {
@@ -18311,10 +18490,8 @@ impl Cagents {
                 cosmic::task::message(Message::FocusCard(card))
             }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserError { card, message: _ } => {
-                self.status = Some(TransientNotice::error(format!(
-                    "Browser card {card}: a browser operation failed"
-                )));
+            Message::BrowserError { .. } => {
+                self.status = Some(TransientNotice::error("A browser operation failed".to_owned()));
                 Task::none()
             }
             Message::ExternalUrlOpened(result) => {
@@ -18770,7 +18947,22 @@ impl Cagents {
                 // opened yet. Initialize only after iced acknowledges this one.
                 #[cfg(feature = "integrated-browser")]
                 let report = Task::batch([report, self.browser_factory_task()]);
+                #[cfg(target_os = "macos")]
+                let report = Task::batch([
+                    report,
+                    macos_window::adopt(window).map(|controls| {
+                        cosmic::Action::App(Message::WindowControlsMeasured(controls))
+                    }),
+                ]);
                 report
+            }
+            #[cfg(target_os = "macos")]
+            Message::WindowControlsMeasured(controls) => {
+                // A live resize measures on every step; most change nothing.
+                if self.window_controls_points != controls {
+                    self.window_controls_points = controls;
+                }
+                Task::none()
             }
             Message::VerifyStartupPanes => self.verify_startup_gate(),
             Message::StartupStateInspected(state) => self.startup_state_inspected(state),
@@ -19259,7 +19451,8 @@ impl Cagents {
                 if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
                     && (!self.settings.focus_follows_mouse
                         || self.chat_menu_open()
-                        || self.device_ui.menu_open)
+                        || self.device_ui.menu_open
+                        || self.phone_ui.open)
                 {
                     return Task::none();
                 }
@@ -19453,7 +19646,17 @@ impl Cagents {
                 if size.width.is_finite() && size.width > 0.0 {
                     self.window_width = size.width;
                 }
-                self.query_window_filled()
+                // Full screen hides the traffic lights, and AppKit may move
+                // them as the titlebar changes.
+                let filled = self.query_window_filled();
+                #[cfg(target_os = "macos")]
+                let filled = Task::batch([
+                    filled,
+                    macos_window::measure_after_resize(window).map(|controls| {
+                        cosmic::Action::App(Message::WindowControlsMeasured(controls))
+                    }),
+                ]);
+                filled
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -20611,9 +20814,9 @@ fn browser_command(
     if let Some(CardRuntime::Browser(browser)) = cards.get(&card)
         && command(&browser.handle).is_err()
     {
-        *status = Some(TransientNotice::error(format!(
-            "Browser card {card}: a browser operation failed"
-        )));
+        *status = Some(TransientNotice::error(
+            "A browser operation failed".to_owned(),
+        ));
     }
     Task::none()
 }
@@ -20682,16 +20885,8 @@ fn load_repository(
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
-        .map(|worktree| {
-            let status = (!worktree.bare)
-                .then(|| {
-                    service
-                        .status_with_untracked(&worktree.path, false, &cancellation)
-                        .ok()
-                })
-                .flatten();
-            (worktree, status)
-        })
+        // The local Git worker reads status once the watcher is registered.
+        .map(|worktree| (worktree, None))
         .collect::<Vec<_>>();
     let head_repositories = worktrees
         .iter()
@@ -21058,22 +21253,18 @@ fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, S
             if proof.is_complete() {
                 Ok(TerminalStartMode::Attach(proof))
             } else {
-                Err(format!(
-                    "terminal {} has incomplete host continuity proof; explicit relaunch is required",
-                    session.id
-                ))
+                Err("This terminal could not be reattached. Start it again to continue.".into())
             }
         }
         TerminalContinuity::RelaunchAvailable { recipe, .. } => {
             terminal_relaunch_recipe(session, recipe).map(TerminalStartMode::Spawn)
         }
-        TerminalContinuity::Exited { .. } => Err(format!(
-            "terminal {} has exited; explicit relaunch is required",
-            session.id
-        )),
+        TerminalContinuity::Exited { .. } => {
+            Err("This terminal has exited. Start it again to continue.".into())
+        }
         TerminalContinuity::Failed { typed_error, .. } => Err(format!(
-            "terminal {} cannot resume: {}; explicit relaunch is required",
-            session.id, typed_error.message
+            "This terminal cannot resume: {}. Start it again to continue.",
+            typed_error.message
         )),
     }
 }

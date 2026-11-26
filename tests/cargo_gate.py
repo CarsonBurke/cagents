@@ -127,8 +127,13 @@ class IncrementalLinkRecovery(unittest.TestCase):
             from pathlib import Path
             stale = Path(os.environ["FIXTURE_CACHE"]).is_dir()
             print("compiled with", "cached" if stale else "fresh", "state", flush=True)
-            if os.environ.get("FIXTURE_SIGNAL"):
-                os.kill(os.getpid(), int(os.environ["FIXTURE_SIGNAL"]))
+            signal = os.environ.get("FIXTURE_SIGNAL" if stale else "FIXTURE_RETRY_SIGNAL")
+            if signal:
+                os.kill(os.getpid(), int(signal))
+            if os.environ.get("FIXTURE_WARNING"):
+                print(os.environ["FIXTURE_WARNING"], file=sys.stderr)
+            if not stale and os.environ.get("FIXTURE_RETRY_WARNING"):
+                print(os.environ["FIXTURE_RETRY_WARNING"], file=sys.stderr)
             if stale or os.environ.get("FIXTURE_PERSISTENT"):
                 print(os.environ["FIXTURE_DIAGNOSTIC"], file=sys.stderr)
                 sys.exit(1)
@@ -175,11 +180,23 @@ class IncrementalLinkRecovery(unittest.TestCase):
         self.assertTrue(evicted.name.endswith(self.cache.name))
 
     def test_a_second_undefined_symbol_failure_is_returned_without_another_retry(self):
-        result = self.compile(environment={"FIXTURE_PERSISTENT": "1"})
+        warning = json.dumps({"level": "warning", "message": "fixture warning"})
+        result = self.compile(environment={"FIXTURE_PERSISTENT": "1", "FIXTURE_WARNING": warning})
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout.count("compiled with"), 2)
         self.assertEqual(result.stderr.count("retrying fixture"), 1)
         self.assertEqual(result.stderr.count(self.undefined), 1)
+        self.assertEqual(result.stderr.count(warning), 1)
+
+    def test_retry_preserves_a_new_multiline_warning_with_shared_context(self):
+        context = ("\n --> fixture.rs:1:1\n  |\n1 | fixture();\n  | ^^^^^^^^^\n"
+                   "note: fixture declared here\n --> fixture.rs:2:4\n  |\n2 | fn fixture() {}\n  |    ^^^^^^^\n")
+        repeated = "warning: fixture warning" + context
+        new = "warning: retry-only warning" + context
+        result = self.compile(environment={"FIXTURE_WARNING": repeated, "FIXTURE_RETRY_WARNING": new})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count(repeated), 1)
+        self.assertEqual(result.stderr.count(new), 1)
 
     def test_a_human_linker_error_also_retries(self):
         result = self.compile(environment={"FIXTURE_DIAGNOSTIC":
@@ -209,14 +226,16 @@ class IncrementalLinkRecovery(unittest.TestCase):
         self.assertTrue(self.cache.exists())
 
     def test_cargo_can_distinguish_a_signalled_compiler_from_an_exit_code(self):
-        result = subprocess.run(
-            [str(ROOT / "scripts/cargo-incremental-retry.py"), *self.arguments()],
-            env=self.env | {"FIXTURE_SIGNAL": str(signal.SIGTERM)}, cwd=self.source,
-            capture_output=True, text=True, timeout=HANG_GUARD,
-        )
-        self.assertEqual(result.returncode, -signal.SIGTERM)
-        self.assertNotIn("retrying fixture", result.stderr)
-        self.assertTrue(self.cache.exists())
+        for attempt, setting in enumerate(("FIXTURE_SIGNAL", "FIXTURE_RETRY_SIGNAL")):
+            with self.subTest(setting=setting):
+                result = subprocess.run(
+                    [str(ROOT / "scripts/cargo-incremental-retry.py"), *self.arguments()],
+                    env=self.env | {setting: str(signal.SIGTERM)}, cwd=self.source,
+                    capture_output=True, text=True, timeout=HANG_GUARD,
+                )
+                self.assertEqual(result.returncode, -signal.SIGTERM)
+                self.assertEqual(result.stderr.count("retrying fixture"), attempt)
+                self.assertEqual(self.cache.exists(), attempt == 0)
 
     def test_an_explicit_rustc_wrapper_is_preserved(self):
         self.assertIn("wrapper: true", self.compile(environment={"RUSTC_WRAPPER": "/bin/true"}).stdout)
@@ -329,7 +348,8 @@ class InstalledGateSync(unittest.TestCase):
 
     files = ("cargo-gate", "build-host", "cargo-gate-command.py", "cargo-gate-sync.py",
              "cargo-host-test-helper.py", "cargo_artifacts.py",
-             "cargo-gate-rustc-guard", "cargo-incremental-retry.py", "cargo-offload", "memory-capped",
+             "cargo-gate-rustc-guard", "cargo-incremental-retry.py", "cargo-offload", "git_ancestry.py", "memory-capped",
+             "offload_client.py", "native_slots.py",
              "seed-build-dir", "build-disk-guard", "prune-build-dirs", "install-cargo-gate")
 
     def setUp(self):
@@ -607,7 +627,7 @@ class OwnedCommandSupervisor(unittest.TestCase):
     which signals it ignores and waits."""
 
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(prefix="cagents-supervisor-", dir="/var/tmp")
+        directory = tempfile.TemporaryDirectory(prefix="cagents-supervisor-")
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.ignored = self.root / "ignored"
@@ -655,6 +675,81 @@ class OwnedCommandSupervisor(unittest.TestCase):
              "/dev/null", str(self.root / "missing")], capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(failed.returncode, 127)
         self.assertTrue(failed.stderr.startswith("some-wrapper: "), failed.stderr)
+
+    def transport(self, wait):
+        # Model a proxy that has left the transport's session and ignores TERM.
+        ready = self.root / "proxy"
+        proxy = (f"import os, pathlib, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                 f"pathlib.Path({str(ready)!r}).write_text(str(os.getpid())); signal.pause()")
+        command = textwrap.dedent(f"""\
+            import pathlib, subprocess, sys, time
+            child = subprocess.Popen([sys.executable, "-I", "-c", {proxy!r}], start_new_session=True)
+            while not pathlib.Path({str(ready)!r}).exists():
+                time.sleep(0.01)
+            if {wait}:
+                child.wait()
+            sys.exit(23)
+        """)
+        return ready, [sys.executable, "-I", "-c", command]
+
+    def wait_for_proxy(self, ready):
+        deadline = time.monotonic() + HANG_GUARD
+        while not ready.exists() or not ready.stat().st_size:
+            self.assertLess(time.monotonic(), deadline, "the proxy never started")
+            time.sleep(0.02)
+        pidfd = os.pidfd_open(int(ready.read_text()))
+
+        def cleanup():
+            with contextlib.suppress(ProcessLookupError):
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            os.close(pidfd)
+
+        self.addCleanup(cleanup)
+        return pidfd
+
+    def test_transport_deadline_reaps_an_unresponsive_proxy(self):
+        ready, command = self.transport(wait=True)
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"),
+             "--timeout", "2", "/dev/null", *command], stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: process.poll() is None and (process.kill(), process.wait()))
+        proxy = self.wait_for_proxy(ready)
+        _, stderr = process.communicate(timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 124, stderr)
+        self.assertIn("transport deadline expired", stderr)
+        self.assertTrue(select.select([proxy], [], [], 0)[0])
+
+    def test_transport_exit_reaps_a_detached_proxy_and_preserves_status(self):
+        ready, command = self.transport(wait=False)
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(ROOT / "scripts/cargo-gate-command.py"),
+             "--drain-on-exit", "/dev/null", *command])
+        self.addCleanup(lambda: process.poll() is None and (process.kill(), process.wait()))
+        proxy = self.wait_for_proxy(ready)
+        self.assertEqual(process.wait(timeout=HANG_GUARD), 23)
+        self.assertTrue(select.select([proxy], [], [], 0)[0])
+
+    def test_death_of_the_gates_caller_reaps_the_offload_transport(self):
+        ready, command = self.transport(wait=True)
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        for name in ("cargo-gate", "cargo-gate-command.py"):
+            shutil.copy2(ROOT / "scripts" / name, scripts / name)
+        offload = scripts / "cargo-offload"
+        offload.write_text(
+            '#!/bin/sh\nif [ "$1" = --host ]; then printf "fw16\\n"; exit 0; fi\n'
+            'exec "$@"\n')
+        offload.chmod(0o755)
+        # The trailing exit keeps the shell as the gate's invoking process.
+        caller = subprocess.Popen(
+            ["/bin/sh", "-c", '"$@"; exit "$?"', "caller", str(scripts / "cargo-gate"), *command],
+            env=os.environ | {"CAGENTS_BUILD_INSTALLED_GATE": "", "CAGENTS_BUILD_INSTALL_SYNC": "0"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: caller.poll() is None and (caller.kill(), caller.wait()))
+        proxy = self.wait_for_proxy(ready)
+        caller.kill()
+        caller.communicate(timeout=HANG_GUARD)
+        self.assertTrue(select.select([proxy], [], [], 0)[0])
 
 
 class CompilerGuard(unittest.TestCase):
@@ -1082,6 +1177,19 @@ exec sleep {10 * HANG_GUARD}
     def test_under_flock_close_a_gated_command_uses_the_callers_slot(self):
         result = subprocess.run(
             ["flock", "--close", str(self.lock), str(self.gate), "exec", "true"],
+            env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("waiting", result.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes read-only files")
+    def test_a_slot_the_caller_holds_read_only_is_its_slot(self):
+        # As in a sandbox that mounts the lock's directory read-only.
+        self.lock.touch()
+        self.lock.chmod(0o444)
+        self.addCleanup(self.lock.chmod, 0o644)
+        result = subprocess.run(
+            ["sh", "-c", f'exec 7<"{self.lock}"; flock 7; exec "{self.gate}" exec true'],
             env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1517,9 +1625,9 @@ class PreflightCancellation(unittest.TestCase):
             for path in self.root.glob(pattern):
                 path.unlink()
 
-    def start(self, *, environment=None, pass_fds=()):
+    def start(self, *arguments, environment=None, pass_fds=()):
         process = subprocess.Popen(
-            [str(self.root / "cargo-gate"), "test", "--locked", "--no-run"],
+            [str(self.root / "cargo-gate"), *(arguments or ("test", "--locked", "--no-run"))],
             cwd=self.root, env=self.env if environment is None else environment,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True, pass_fds=pass_fds,
@@ -1671,6 +1779,50 @@ class PreflightCancellation(unittest.TestCase):
                 self.assert_preflight_unslotted(self.calls())
                 self.assertTrue(self.slot_is_free())
 
+    def install_offload(self):
+        # The real router, with the helper it reads beside itself.
+        for name in ("cargo-offload", "git_ancestry.py", "offload_client.py", "native_slots.py"):
+            shutil.copy2(ROOT / "scripts" / name, self.root / name)
+
+    def test_read_only_cargo_queries_skip_build_preflight_and_admission(self):
+        self.install_offload()
+        self.configure(guard_exit=2)
+        with self.lock.open("a") as slot:
+            fcntl.flock(slot, fcntl.LOCK_EX)
+            for arguments in (("metadata", "--format-version=1"), ("+stable", "tree", "--locked"),
+                              ("--version",)):
+                with self.subTest(arguments=arguments):
+                    self.clear()
+                    process = self.start("cargo", *arguments)
+                    _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
+                    self.assertEqual(process.returncode, 0, stderr)
+                    calls = [event for event in self.calls() if "arguments" in event]
+                    self.assertEqual([event["arguments"] for event in calls], [list(arguments)])
+                    self.assertTrue(calls[0]["held"], calls)
+                    self.assertFalse(calls[0]["marker"], calls)
+
+    def test_other_local_cargo_commands_keep_build_preflight(self):
+        self.install_offload()
+        self.configure(guard_exit=2)
+        for arguments in (("clean",), ("fmt",), ("build-alias",), ("--offline", "metadata")):
+            with self.subTest(arguments=arguments):
+                self.clear()
+                process = self.start(*arguments)
+                _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
+                self.assertEqual(process.returncode, 2, stderr)
+                self.assertEqual([event["phase"] for event in self.calls()], ["metadata", "guard"])
+
+    def test_local_cargo_queries_use_real_cargo_inside_gate_exec(self):
+        self.install_offload()
+        process = self.start("exec", "sh", "-c", "cargo metadata --format-version=1",
+                             environment=self.env | {"CAGENTS_BUILD_SHARES": "1"})
+        _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 0, stderr)
+        calls = self.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard", "seed", "metadata"])
+        self.assertEqual(calls[-1]["arguments"], ["metadata", "--format-version=1"])
+        self.assertTrue(calls[-1]["held"], calls)
+
 
 class TestsUnderAMemoryLimit(unittest.TestCase):
     """A stand-in limit beside build-host, recording what it is asked to run."""
@@ -1807,6 +1959,9 @@ class SharesByKind(unittest.TestCase):
                 (("test", "--package=cagents-ui"), "2"),
                 (("test", "--package", "cagents"), "1"),
                 (("build", "--package", "cagents", "--features", "cagents/host"), "2"),
+                (("test", "-p", "cagents", "-p", "cagents-host", "--features", "cagents/host"), "2"),
+                (("build", "-pcagents-host", "--bin", "cagentsd"), "2"),
+                (("test", "--package=cagents-host"), "2"),
                 (("test", "--package", "cagents", "--package", "cagents-ui", "--features", "cagents/ui"), "2"),
                 (("build", "--package", "cagents-ui", "--features", "integrated-browser"), "2"),
                 (("run", "--", "--features", "ui"), "1")):
@@ -1914,10 +2069,10 @@ class AdmissionTimeout(unittest.TestCase):
         source = helper.read_text()
         self.assertEqual(source.count("import time\n"), 1)
         source = source.replace("import time\n", pinned)
-        parsed = "        admission_deadline = positive_integer(arguments[1])\n"
+        parsed = "            admission_deadline = positive_integer(value)\n"
         self.assertEqual(source.count(parsed), 1)
         source = source.replace(parsed, parsed +
-            '        os.environ["FIXTURE_ADMISSION_DEADLINE"] = str(admission_deadline)\n')
+            '            os.environ["FIXTURE_ADMISSION_DEADLINE"] = str(admission_deadline)\n')
         helper.write_text(source)
 
     def set_admission_clock(self, nanoseconds):

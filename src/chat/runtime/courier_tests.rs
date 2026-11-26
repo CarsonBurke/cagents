@@ -1,6 +1,8 @@
 //! Real local actor admission with a deterministic adapter barrier. This
 //! exercises command dequeue, event reduction and actual `/bin/cat` pipe I/O;
 //! it does not claim native Codex or Claude protocol qualification.
+// The host crate's tests share these fixtures; no single build uses each.
+#![cfg_attr(not(test), allow(dead_code))]
 use super::*;
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{Value, json};
@@ -76,6 +78,13 @@ impl Adapter for GatedAdapter {
                 }],
                 "unready" => vec![Event::Ready(false)],
                 "waiting" => vec![Event::Waiting(true)],
+                // What the person queued with the provider during a turn, and
+                // the provider taking it.
+                "queued" => vec![Event::QueueChanged(vec![super::super::QueuedMessage::new(
+                    "person-1".into(),
+                    "the person's next message".into(),
+                )])],
+                "dequeued" => vec![Event::QueueChanged(Vec::new())],
                 _ => return Err("unknown fixture state".into()),
             },
             Command::Prompt {
@@ -118,8 +127,8 @@ impl Adapter for GatedAdapter {
 
 /// Reusable by the HOST mailbox fixture. The fixture owns only its own
 /// Compact/idle-command workers; callers must retain their mailbox worker.
-pub(crate) struct RequestRaceFixture {
-    pub(crate) handle: Handle,
+pub struct RequestRaceFixture {
+    pub handle: Handle,
     entered: Receiver<()>,
     release: Sender<()>,
     request: Option<JoinHandle<Result<(), String>>>,
@@ -129,11 +138,15 @@ pub(crate) struct RequestRaceFixture {
 }
 
 impl RequestRaceFixture {
-    pub(crate) fn new() -> Self {
+    #[allow(
+        clippy::new_without_default,
+        reason = "it starts request threads and a directory, which is no default value"
+    )]
+    pub fn new() -> Self {
         Self::with_input_failure(false)
     }
 
-    pub(crate) fn with_input_failure(fail_after_input: bool) -> Self {
+    pub fn with_input_failure(fail_after_input: bool) -> Self {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
@@ -192,7 +205,7 @@ impl RequestRaceFixture {
     /// Return only once Compact is dequeued and blocked inside the adapter.
     /// The Request event is emitted by its Step after release, not by a test
     /// mutating a resident snapshot.
-    pub(crate) fn begin_request(&mut self) {
+    pub fn begin_request(&mut self) {
         assert!(self.request.is_none());
         let handle = self.handle.clone();
         self.request = Some(thread::spawn(move || handle.command(Command::Compact)));
@@ -203,7 +216,7 @@ impl RequestRaceFixture {
 
     /// Under the held Compact gate, the actor cannot consume another command.
     /// This observes the actual queue after the courier caller submitted work.
-    pub(crate) fn wait_for_queued_prompt(&self) {
+    pub fn wait_for_queued_prompt(&self) {
         assert!(self.request.is_some(), "request barrier must be held");
         let deadline = Instant::now() + TIMEOUT;
         while self.handle.local_command_queue_is_empty() {
@@ -212,7 +225,7 @@ impl RequestRaceFixture {
         }
     }
 
-    pub(crate) fn release_request(&mut self) {
+    pub fn release_request(&mut self) {
         self.release.try_send(()).unwrap();
         self.request
             .take()
@@ -224,7 +237,7 @@ impl RequestRaceFixture {
         assert!(!self.handle.is_idle());
     }
 
-    pub(crate) fn clear_request(&self) {
+    pub fn clear_request(&self) {
         self.resolve_request("resolve");
     }
 
@@ -239,11 +252,29 @@ impl RequestRaceFixture {
         assert!(self.handle.requests().is_empty());
     }
 
-    pub(crate) fn prompt_count(&self) -> usize {
+    /// Has the provider hold a message the person queued, or let it go.
+    pub fn set_persons_queue(&self, queued: bool) {
+        self.handle
+            .command(Command::SetModel {
+                model: if queued { "queued" } else { "dequeued" }.into(),
+                reasoning: None,
+            })
+            .unwrap();
+        assert_eq!(
+            self.handle
+                .snapshot(None)
+                .unwrap()
+                .queued_messages
+                .is_empty(),
+            !queued
+        );
+    }
+
+    pub fn prompt_count(&self) -> usize {
         self.observed.prompts.lock().unwrap().len()
     }
 
-    pub(crate) fn prompt_texts(&self) -> Vec<String> {
+    pub fn prompt_texts(&self) -> Vec<String> {
         self.observed.prompts.lock().unwrap().clone()
     }
 
@@ -251,7 +282,7 @@ impl RequestRaceFixture {
         self.observed.echoed.lock().unwrap().len()
     }
 
-    pub(crate) fn close(&mut self) {
+    pub fn close(&mut self) {
         assert!(self.request.is_none(), "release the request barrier first");
         self.handle.close().unwrap();
         for attempt in self.attempts.drain(..) {
@@ -390,6 +421,28 @@ fn courier_prompt_refuses_busy_unready_waiting_and_exited_actors() {
     assert!(fixture.handle.is_completed());
     refused(fixture.handle.try_idle_prompt("courier delivery".into()));
     assert_eq!(fixture.prompt_count(), 0);
+}
+
+#[test]
+fn courier_prompt_waits_behind_a_message_the_person_queued_with_the_provider() {
+    let mut fixture = RequestRaceFixture::new();
+    fixture.set_persons_queue(true);
+    // Idle for the person, who may still send or start what they queued,
+    // but not for the courier.
+    assert!(fixture.handle.is_idle());
+    assert!(!fixture.handle.takes_courier());
+    refused(fixture.handle.try_idle_prompt("courier delivery".into()));
+    assert_eq!(fixture.prompt_count(), 0);
+    assert_eq!(fixture.provider_write_count(), 0);
+    fixture.set_persons_queue(false);
+    assert!(fixture.handle.takes_courier());
+    fixture
+        .handle
+        .try_idle_prompt("courier delivery".into())
+        .unwrap();
+    fixture.wait_for_provider_writes(1);
+    assert_eq!(fixture.prompt_texts(), ["courier delivery"]);
+    fixture.close();
 }
 
 #[test]

@@ -91,6 +91,8 @@ fn projections_of(app: &mut Cagents, message: Message) -> usize {
 
 /// Switching panes by keyboard, the reader's most frequent shortcut,
 /// projects the workspace once per key, and leaves nothing stale.
+// Spelled from the Linux table.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_pane_switching_shortcut_projects_the_workspace_once() {
     let (mut app, first, second) = two_pane_app();
@@ -174,7 +176,7 @@ fn saving_by_shortcut_answers_within_its_own_update() {
     let save = press(
         keyboard::Key::Character("s".into()),
         Code::KeyS,
-        keyboard::Modifiers::CTRL,
+        keyboard::Modifiers::COMMAND,
     );
     assert_eq!(projections_of(&mut app, save), 1);
     // This fixture has no original read root, so the save is refused at

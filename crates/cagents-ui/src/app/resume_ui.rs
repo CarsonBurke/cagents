@@ -2454,10 +2454,8 @@ impl Cagents {
         let state = &self.resume_ui;
         let summary = row.summary.as_deref();
         let mut column = widget::column::with_children(vec![
-            design::heading(&row.title)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(3),
-                ))
+            crate::ui_controls::FadeText::heading(&row.title)
+                .lines(3)
                 .into(),
         ])
         .spacing(space::XS)
@@ -2495,12 +2493,12 @@ impl Cagents {
             );
         }
         let section = |label: &'static str, text: &'a str, lines: usize| {
+            let (text, limit) = scan::shown_excerpt(text);
             widget::column::with_children(vec![
                 design::caption(label).into(),
-                design::body(text)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(lines),
-                    ))
+                crate::ui_controls::fade_text(text)
+                    .lines(lines)
+                    .limit(limit)
                     .into(),
             ])
             .spacing(space::XXS)
@@ -2612,11 +2610,19 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
             .reaches()
             .map(|reach| {
                 let count = counts[reach.index()].to_string();
-                let label = format!("{} {count}", scope.label(reach));
                 // As a scan finds conversations, the counts climb; each
                 // segment keeps room for three digits, so the others don't
                 // shuffle along the bar while it does.
-                let room = format!("{} {}", scope.label(reach), "0".repeat(count.len().max(3)));
+                let room = "0".repeat(count.len().max(3));
+                let counted = |count: String| -> Element<'a, Message> {
+                    widget::row::with_children(vec![
+                        design::body(scope.label(reach)).into(),
+                        crate::ui_controls::count_badge(count, Default::default()),
+                    ])
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center)
+                    .into()
+                };
                 // The sidebar's icons: its worktree glyph for a worktree, a
                 // folder for a project.
                 let icon = match reach {
@@ -2632,8 +2638,8 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
                     ));
                 }
                 contents.push(crate::ui_controls::reserved(
-                    design::body(label),
-                    [design::body(room).into()],
+                    counted(count),
+                    [counted(room)],
                     iced::alignment::Horizontal::Left,
                 ));
                 widget::button::custom(
@@ -2766,17 +2772,15 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 80.0)),
             );
-            // Every box but the labels themselves, which center in the
-            // room their segment keeps.
-            fn boxes(node: &layout::Node, found: &mut Vec<iced::Rectangle>) {
-                if !node.children().is_empty() {
-                    found.push(node.bounds());
-                }
-                node.children().iter().for_each(|child| boxes(child, found));
-            }
-            let mut found = Vec::new();
-            boxes(&node, &mut found);
-            (node.size(), found)
+            // The bar and each segment in it; a segment's label and count
+            // center in the room it keeps, so they may move within it.
+            let segments: Vec<iced::Rectangle> = node
+                .children()
+                .iter()
+                .flat_map(|bar| bar.children().iter().map(layout::Node::bounds))
+                .collect();
+            assert_eq!(segments.len(), 3, "{counts:?}");
+            (node.size(), segments)
         };
         let first = segments([1, 4, 9]);
         for counts in [[12, 40, 98], [120, 400, 999]] {
@@ -3221,8 +3225,9 @@ mod tests {
     #[test]
     fn closed_conversation_resumes_exact_identity_in_its_original_project() {
         let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let entry = saved(directory.path());
+        let entry = saved(root.as_path());
         let original = entry.session.clone();
         let _ = app.resume_saved_conversation(entry);
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
@@ -3233,7 +3238,7 @@ mod tests {
         assert_eq!(session.launch, original.launch);
         assert!(session.proof.is_none());
         assert!(session.terminal.is_none());
-        assert_eq!(app.active_workspace.as_deref(), Some(directory.path()));
+        assert_eq!(app.active_workspace.as_deref(), Some(root.as_path()));
         assert_eq!(card.title, "Review peripheral Rust modules");
         // An already-open conversation focuses its original pane instead of
         // creating another provider writer.

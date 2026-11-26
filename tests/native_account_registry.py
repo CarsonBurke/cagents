@@ -212,6 +212,14 @@ class AccountRegistryFixtureTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             fixture.prepare(self.root)
 
+    def test_empty_git_directory_is_ignored_but_a_checkout_is_refused(self):
+        marker = self.task / ".git"
+        marker.mkdir()
+        self.assertEqual(fixture.fixture_root(self.root), self.root)
+        (marker / "HEAD").touch()
+        with self.assertRaisesRegex(ValueError, "outside Git ancestry"):
+            fixture.fixture_root(self.root)
+
     def test_inherited_authority_refuses_every_operation_before_path_access(self):
         for name in fixture.AUTHORITY:
             for operation in ("prepare", "fault", "restore"):

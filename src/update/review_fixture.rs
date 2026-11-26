@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
-    let Some(bytes) = read_fixture(&root.join("home/.config/fixture-update-review.json"))? else {
+    let Some(bytes) = read_fixture(&path(root))? else {
         return Ok(None);
     };
     let job: UpdateJob = serde_json::from_slice(&bytes)?;
@@ -11,18 +11,24 @@ pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
     // still holds it back: replacing a blocked review with one whose blocker
     // cleared shows the update becoming available. A review that has ended
     // has nothing left to decide.
-    let review = job.phase == UpdatePhase::AwaitingConfirmation
-        && job
-            .active_confirmation()
-            .is_some_and(|confirmation| confirmation.preview.daemon.is_some());
+    let review = matches!(
+        job.phase,
+        UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
+    ) && job
+        .active_confirmation()
+        .is_some_and(|confirmation| confirmation.preview.daemon.is_some());
     let status = (job.phase == UpdatePhase::Installing || job.phase.is_terminal())
         && job.confirmation.is_none();
     if job.id != "fixture-update-review" || !(review || status) {
         return Err(invalid(
-            "update fixture must show terminal service review, installation or completion, and be read-only",
+            "update fixture must show terminal service review, an idle wait, installation or completion, and be read-only",
         ));
     }
     Ok(Some(job))
+}
+
+pub(super) fn path(root: &Path) -> PathBuf {
+    root.join("home/.config/fixture-update-review.json")
 }
 
 /// The release a development build's update check offers while
@@ -37,6 +43,12 @@ pub(super) fn release(root: &Path) -> Result<Option<Release>, UpdateError> {
 
 pub(super) fn offers_release(root: &Path) -> bool {
     root.join(RELEASE).exists()
+}
+
+/// Whether the fixture's release is offered as macOS offers one: through
+/// its installer, while `home/.config/fixture-update-installer` is present.
+pub(super) fn offers_installer(root: &Path) -> bool {
+    root.join("home/.config/fixture-update-installer").exists()
 }
 
 const RELEASE: &str = "home/.config/fixture-update-release.json";
@@ -130,6 +142,23 @@ mod tests {
             read(root.path()).unwrap().unwrap().phase,
             UpdatePhase::Installing
         );
+        // A confirmed update waiting for conversations to become idle, which
+        // the header shows, can no more decide anything than the review.
+        let waiting: UpdateJob =
+            serde_json::from_str(include_str!("../../tests/fixtures/update-waiting.json")).unwrap();
+        publish(&waiting);
+        let loaded = read(root.path()).unwrap().unwrap();
+        assert_eq!(loaded.phase, UpdatePhase::WaitingForIdle);
+        assert_eq!(
+            loaded
+                .active_confirmation()
+                .unwrap()
+                .preview
+                .waiting_for_idle()
+                .len(),
+            3
+        );
+        refuses_decisions(&loaded);
     }
 
     #[test]

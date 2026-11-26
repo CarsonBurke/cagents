@@ -158,7 +158,7 @@ pub(super) fn select(rows: Vec<Value>, fields: &[String]) -> Vec<Value> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use serde_json::json;

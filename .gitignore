@@ -13,3 +13,10 @@ nested.kdl
 observed.json
 shots/
 __pycache__/
+
+# The Android app's Gradle build (mobile/).
+/mobile/.gradle/
+/mobile/.kotlin/
+/mobile/build/
+/mobile/*/build/
+/mobile/local.properties

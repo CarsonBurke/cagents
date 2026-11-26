@@ -1,7 +1,30 @@
 //! Plain tables for interactive CLI output; JSON uses explicit command DTOs.
 use std::path::Path;
 
+use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use super::CommandOutput;
+
+/// Render a successful listing in the requested format.
+pub(super) fn listing_output<T>(
+    command: &'static str,
+    listing: T,
+    human_output: bool,
+    human: impl FnOnce(T) -> String,
+    data: impl FnOnce(T) -> Value,
+) -> CommandOutput {
+    let (human, data) = if human_output {
+        (human(listing), Value::Null)
+    } else {
+        (String::new(), data(listing))
+    };
+    CommandOutput {
+        command,
+        human,
+        data,
+    }
+}
 
 pub(super) fn plain(text: &str) -> String {
     text.chars()
@@ -277,9 +300,28 @@ pub(super) fn relative_time(at_ms: u64, now_ms: u64) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listing_runs_only_the_requested_renderer() {
+        let human = listing_output("fixture.list", "item", true, String::from, |_| {
+            panic!("rendered JSON for a human listing")
+        });
+        assert_eq!(human.human, "item");
+        assert_eq!(human.data, Value::Null);
+
+        let json = listing_output(
+            "fixture.list",
+            "item",
+            false,
+            |_| panic!("rendered a human listing for JSON"),
+            Value::from,
+        );
+        assert!(json.human.is_empty());
+        assert_eq!(json.data, "item");
+    }
 
     #[test]
     fn notes_shorten_the_home_directory_in_the_paths_they_quote() {

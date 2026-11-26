@@ -410,6 +410,11 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
         fs::create_dir_all(fixture.path().join("nested/.git")).unwrap();
+        fs::write(
+            fixture.path().join("nested/.git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
         let source = Arc::new(Root::open(fixture.path()).unwrap());
         let target = target(source.clone(), Path::new("nested/file"), runtime.path());
         assert_eq!(target.relative_path(), Path::new("nested/file"));

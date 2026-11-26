@@ -86,9 +86,14 @@ say() {
     local observed composer
     observed=$("$ne" drive observe 2>/dev/null)
     composer=$(place 'Message' "$observed" tail)
-    # The composer's place in the window when its hint cannot be read.
+    # Where the hint cannot be read, the composer's input sits at a fixed place
+    # in the window, whose size observe reports on its "window" line (an
+    # older driver reported it as "output="). The point left of centre and
+    # above the footer is inside the input, clear of the Stop control.
     [ -n "$composer" ] || composer=$(printf '%s\n' "$observed" |
-        sed -nE 's/.*output=([0-9]+)x([0-9]+).*/\1 \2/p' | awk '{printf "%d,%d", $1 * 0.65, $2 - 67}')
+        sed -nE -e 's/.*output=([0-9]+)x([0-9]+).*/\1 \2/p' \
+            -e "s/^ *window .* ([0-9]+)x([0-9]+)$/\1 \2/p" | head -1 |
+        awk '{printf "%d,%d", $1 * 0.45, $2 - 86}')
     "$ne" drive click "$composer" >/dev/null 2>&1
     "$ne" drive type "$1" >/dev/null 2>&1 || log "typing failed: $1"
     "$ne" drive key Return >/dev/null 2>&1

@@ -2648,6 +2648,137 @@ fn delayed_reconnect_baseline_never_resurrects_a_deleted_scope() {
 }
 
 #[test]
+fn compacted_worktree_view_stays_initialized_through_recreation() {
+    use crate::workspace_model::{
+        delta::ViewRevision,
+        views::{Pane, Scope, View},
+    };
+    let (mut app, project, repository) = app_with_project();
+    let path = PathBuf::from("/repo/removed-worktree");
+    let scope = Scope::Worktree {
+        repository: repository.clone(),
+        path: path.clone(),
+    };
+    // The view removal can arrive before the window refreshes the worktree list.
+    app.sidebar_model.projects[0]
+        .worktrees
+        .push(crate::sidebar::SidebarWorktree::from_durable(
+            crate::model::WorktreeId::new(),
+            path.clone(),
+            None,
+        ));
+    app.known_worktree_roots.insert(path);
+    let channel = ChannelId::new();
+    let card = app.workspace.focused().unwrap();
+    let pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+    let mut local_channel = local(channel, project, "Current work", 0);
+    local_channel.shared = true;
+    local_channel.cards = vec![card];
+    local_channel.focused = Some(card);
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.channels.push(local_channel);
+    durable.active_channel = Some(channel);
+
+    let current_view = View {
+        revision: 3,
+        panes: vec![pane.clone()],
+        ..View::empty(channel)
+    };
+    let mut initial = registry(vec![shared(channel, &repository, "Current work", 0)]);
+    initial.sequence = 4;
+    initial.views = vec![
+        current_view.clone(),
+        View {
+            revision: 4,
+            ..View::empty(scope.clone())
+        },
+    ];
+    let identity = initial.identity;
+    let mut mirror = Mirror::for_model(&initial);
+    assert!(app.install_workspace_model_snapshot(initial));
+    app.shared_views
+        .initialize(current_view.scope.clone(), vec![pane]);
+    app.shared_views.initialize(scope.clone(), vec![]);
+    let published = intercept_publishes(&mut app);
+    let assert_pane_unchanged = |app: &Cagents| {
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.shared_views.closed.is_empty());
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert_eq!(app.durable.channels[0].cards, vec![card]);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![card]);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(app.shared_views.scope_settled(&scope));
+        for edit in drain(&published) {
+            assert!(
+                !matches!(
+                    edit,
+                    ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. }
+                ),
+                "unexpected view publication: {edit:?}"
+            );
+        }
+    };
+
+    let edit = ModelEdit::AgentsChanged;
+    let effects = EditEffects {
+        views: vec![ViewRevision {
+            scope: scope.clone(),
+            before: Some(4),
+            after: None,
+        }],
+        ..Default::default()
+    };
+    let mut removal = mirror.apply(&edit, &effects).changes;
+    removal.sequence = 5;
+    drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+        sequence: 5,
+        edit,
+        changes: EdgeChanges {
+            identity: Some(identity),
+            views: removal,
+            effects,
+        },
+    }));
+    assert_eq!(app.workspace_model.views, vec![current_view.clone()]);
+    assert_eq!(app.shared_views.scope_absences.get(&scope), Some(&5));
+    assert_pane_unchanged(&app);
+
+    let edit = ModelEdit::SeedView {
+        scope: scope.clone(),
+        panes: vec![],
+        closed: vec![],
+    };
+    let recreated = View {
+        revision: 6,
+        ..View::empty(scope.clone())
+    };
+    let effects = EditEffects {
+        views: vec![ViewRevision {
+            scope: scope.clone(),
+            before: None,
+            after: Some(recreated.revision),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        mirror.apply(&edit, &effects).unresolved,
+        vec![scope.clone()]
+    );
+    let views = mirror.install_at(scope.clone(), Some(recreated.clone()), 6);
+    drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+        sequence: 6,
+        edit,
+        changes: EdgeChanges {
+            identity: Some(identity),
+            views,
+            effects,
+        },
+    }));
+    assert_eq!(app.workspace_model.views, vec![current_view, recreated]);
+    assert_pane_unchanged(&app);
+}
+
+#[test]
 fn scoped_reads_ahead_of_the_edge_fence_later_but_older_full_snapshots() {
     use crate::workspace_model::views::{Scope, View};
     let (mut app, _, repository) = app_with_project();
@@ -4223,6 +4354,131 @@ fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
     );
 }
 
+/// #3095: an agent's card, and the pane a window wrote for it, were made
+/// before the provider named the agent's Codex thread. The card learns the
+/// ID once the agent holds it, whether or not the pane does yet; an agent
+/// descriptor that differs in more than the ID changes nothing.
+#[test]
+fn an_existing_agent_card_learns_the_thread_its_agent_names() {
+    use crate::agent_execution::HostedSession;
+    for shown_by_pane in [false, true] {
+        let (mut app, mut agent, mut pane, destination) = unloaded_chat_label_fixture();
+        let Some(HostedSession::Chat(mut unnamed)) = agent.session.clone() else {
+            unreachable!()
+        };
+        unnamed.launch.provider = crate::agent::Provider::Codex;
+        unnamed.launch.recipe.program = "codex".into();
+        unnamed.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        let proof = unnamed.proof.clone().unwrap();
+        assert!(unnamed.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+        agent.spec.provider = crate::agent::Provider::Codex;
+        agent.session = Some(HostedSession::Chat(unnamed.clone()));
+        pane.kind = CardKind::Chat(unnamed.clone());
+        if shown_by_pane {
+            app.workspace_model.views = vec![crate::workspace_model::views::View {
+                scope: crate::agent_execution::Placement::Channel(destination),
+                revision: 9,
+                panes: vec![pane.clone()],
+                retired: vec![],
+            }];
+        }
+        app.workspace_model.agents = vec![agent.clone()];
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        let card = pane.id;
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(unnamed.clone())
+        );
+
+        // Only a different conversation's descriptor: the card keeps its own.
+        let mut other = unnamed.clone();
+        other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        other.owned_codex_listener = None;
+        agent.session = Some(HostedSession::Chat(other));
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(unnamed.clone())
+        );
+
+        let mut named = unnamed.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        named.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        agent.session = Some(HostedSession::Chat(named.clone()));
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named.clone()),
+            "the card takes the agent's thread"
+        );
+        drop(app.reconcile_workspace_model());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named),
+            "a pane without the ID does not take it back"
+        );
+    }
+}
+
+/// #3095: a new card made from a pane that lacks the thread its agent names
+/// takes the agent's ID. A Claude pane without its agent's ID may show a
+/// cleared conversation, so its card keeps the pane's descriptor.
+#[test]
+fn a_new_agent_card_takes_only_the_codex_thread_its_pane_lacks() {
+    use crate::agent_execution::HostedSession;
+    for codex in [true, false] {
+        let (mut app, mut agent, mut pane, destination) = unloaded_chat_label_fixture();
+        let Some(HostedSession::Chat(mut unnamed)) = agent.session.clone() else {
+            unreachable!()
+        };
+        if codex {
+            unnamed.launch.provider = crate::agent::Provider::Codex;
+            unnamed.launch.recipe.program = "codex".into();
+            unnamed.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+            let proof = unnamed.proof.clone().unwrap();
+            assert!(unnamed.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+            agent.spec.provider = crate::agent::Provider::Codex;
+        } else {
+            unnamed.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        }
+        unnamed.launch.session_id = None;
+        let mut named = unnamed.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if codex {
+            named.native_continuity = crate::chat::NativeContinuity::Durable {
+                provider_version: "0.157.1".into(),
+            };
+        }
+        assert!(crate::chat::is_confirmed_identity_update(&unnamed, &named));
+        agent.session = Some(HostedSession::Chat(named.clone()));
+        pane.kind = CardKind::Chat(unnamed.clone());
+        app.workspace_model.views = vec![crate::workspace_model::views::View {
+            scope: crate::agent_execution::Placement::Channel(destination),
+            revision: 9,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        }];
+        app.workspace_model.agents = vec![agent.clone()];
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Chat(if codex { named } else { unnamed }),
+            "codex: {codex}"
+        );
+    }
+}
+
 #[test]
 fn unloaded_spawn_label_reaches_the_sidebar_attention_row_without_a_model_change() {
     use crate::agent_execution::{Placement, agent_label};
@@ -5081,7 +5337,7 @@ fn shared_folder_reopen_loads_new_rows_and_preserves_acknowledged_terminal_membe
                 false,
                 navigation,
                 &shortcuts,
-                false,
+                crate::sidebar::WindowCorner::default(),
             ),
             Size::new(280.0, 900.0),
             cache,
@@ -5147,9 +5403,10 @@ fn shared_folder_reopen_loads_new_rows_and_preserves_acknowledged_terminal_membe
         let mut renderer = super::super::tests::headless_renderer();
         let navigation = crate::sidebar::NavigationCache::default();
         let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().canonicalize().unwrap().join("parent");
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("parent");
         let nested = parent.join("nested");
-        let control = directory.path().join("control");
+        let control = root.join("control");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir(&control).unwrap();
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -5398,6 +5655,7 @@ fn a_fresh_window_adopts_the_shared_folder_kind_without_git_rediscovery() {
     let directory = tempfile::tempdir().unwrap();
     let repository = directory.path().canonicalize().unwrap();
     std::fs::create_dir(repository.join(".git")).unwrap();
+    std::fs::write(repository.join(".git/HEAD"), "invalid ref\n").unwrap();
     let mut app = super::super::tests::context_inspector_test_app(false);
     app.workspace_model = WorkspaceModel {
         projects: vec![ModelProject {

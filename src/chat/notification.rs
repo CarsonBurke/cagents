@@ -210,6 +210,9 @@ impl FrameContext {
                     }
                     self.session_id = Some(id.clone());
                 }
+                Event::ProviderTitleCleared { id } if self.session_id.as_ref() == Some(id) => {
+                    self.conversation.clear();
+                }
                 Event::Error { message, .. } => self.error = bounded(message, RETAINED_BYTES),
                 Event::TurnFinished { outcome, .. } if contexts < CONTEXTS => {
                     pending.push(*outcome);

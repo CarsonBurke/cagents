@@ -1,16 +1,26 @@
-//! Claude's persisted names, refreshed only after a confirmed resume/result.
+//! Claude's persisted names, including titles appended after a turn ends.
 //! Metadata is presentation only, never execution or filesystem ownership proof.
+use super::MetadataWake;
 use crate::chat::{
     Launch,
     claude_metadata::{Lines, Names},
 };
-use std::{fs::File, os::unix::fs::MetadataExt, path::PathBuf};
+use crate::fs_watch::{FileWatch, FileWatches};
+use std::{
+    fs::{File, Metadata},
+    os::{fd::AsFd, unix::fs::MetadataExt},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+const WATCH_RETRY: Duration = Duration::from_secs(10);
 
 pub(super) struct ClaudeTitles {
     config: PathBuf,
     cwd: PathBuf,
     previous: Option<(String, String)>,
     transcript: Option<Transcript>,
+    retry_at: Option<Instant>,
 }
 
 struct Transcript {
@@ -23,6 +33,7 @@ struct Transcript {
     changed: (i64, i64, i64, i64),
     lines: Lines,
     names: Names,
+    watch: Option<FileWatch>,
 }
 
 impl ClaudeTitles {
@@ -52,10 +63,42 @@ impl ClaudeTitles {
             cwd: recipe.working_directory.clone(),
             previous: None,
             transcript: None,
+            retry_at: None,
         })
     }
 
+    pub(super) fn metadata_wake(&self) -> Option<MetadataWake<'_>> {
+        let retry_at = self.retry_at?;
+        let watch = self
+            .transcript
+            .as_ref()
+            .and_then(|saved| saved.watch.as_ref());
+        Some(watch.map_or(MetadataWake::RetryAt(retry_at), |watch| {
+            MetadataWake::Changed(watch.as_fd())
+        }))
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.retry_at = None;
+        self.previous = None;
+        self.transcript = None;
+    }
+
+    pub(super) fn refresh(&mut self, id: &str) -> Option<String> {
+        // Dropping the subscription discards coalesced events and re-arms the
+        // watch on the current inode, including after a rename or replacement.
+        if let Some(saved) = &mut self.transcript {
+            saved.watch = None;
+        }
+        self.update(id)
+    }
+
     pub(super) fn update(&mut self, id: &str) -> Option<String> {
+        self.retry_at = Some(Instant::now() + WATCH_RETRY);
+        let watch = self
+            .transcript
+            .as_mut()
+            .and_then(|saved| saved.watch.take());
         let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
         if !cwd.is_absolute() {
             return None;
@@ -71,6 +114,18 @@ impl ClaudeTitles {
         if !metadata.is_file() {
             return None;
         }
+        let watch = watch
+            .filter(|_| {
+                self.transcript.as_ref().is_some_and(|saved| {
+                    saved.path == path
+                        && saved.device == metadata.dev()
+                        && saved.inode == metadata.ino()
+                })
+            })
+            .or_else(|| watch_transcript(&file, &path, &metadata));
+        // Read the end after installing the watch, so a concurrent append
+        // is covered by this scan or wakes the worker for the next one.
+        let metadata = file.metadata().ok()?;
         let changed = (
             metadata.mtime(),
             metadata.mtime_nsec(),
@@ -97,6 +152,7 @@ impl ClaudeTitles {
                 changed,
                 lines: Lines::default(),
                 names: Names::default(),
+                watch: None,
             });
         }
         let saved = self.transcript.as_mut()?;
@@ -112,6 +168,7 @@ impl ClaudeTitles {
             .ok()?;
         saved.len = metadata.len();
         saved.changed = changed;
+        saved.watch = watch;
         // Do not publish an inferior partial first-pass result on an IO error
         // or interrupted coverage. Subsequent results only read new bytes.
         let title = complete.then(|| saved.names.title()).flatten()?.to_owned();
@@ -125,6 +182,14 @@ impl ClaudeTitles {
         self.previous = Some((id.to_owned(), title.clone()));
         Some(title)
     }
+}
+
+fn watch_transcript(file: &File, path: &Path, metadata: &Metadata) -> Option<FileWatch> {
+    let watch = FileWatches::shared()?.watch(file)?;
+    // If the path was already replaced when we attached the watch, no event
+    // for that replacement is pending. Let the ordinary retry resolve it.
+    let visible = path.symlink_metadata().ok()?;
+    (visible.dev() == metadata.dev() && visible.ino() == metadata.ino()).then_some(watch)
 }
 
 #[cfg(test)]
@@ -194,7 +259,7 @@ mod tests {
 
     #[test]
     fn configured_titles_use_exact_supported_roots_and_refuse_ambiguous_home() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let cwd = directory.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
         let home = cwd.join("home");
@@ -340,7 +405,7 @@ mod tests {
     }
 
     fn live_fixture() -> (tempfile::TempDir, Launch, String, PathBuf) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let cwd = directory.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
         let config = directory.path().join("config");

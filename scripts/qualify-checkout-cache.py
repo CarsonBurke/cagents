@@ -462,7 +462,8 @@ def main():
             'include!("modules.rs");'
         ) == 1, source
     for source in (
-        "build.rs", "src/modules.rs", "crates/cagents-ui/build.rs", "crates/cagents-ui/src/modules.rs",
+        "build.rs", "src/modules.rs", "crates/cagents-host/build.rs", "crates/cagents-host/src/lib.rs",
+        "crates/cagents-ui/build.rs", "crates/cagents-ui/src/modules.rs",
         "crates/cagents-ui-kit/src/lib.rs", "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
         "crates/iced-contracts/src/lib.rs",
         "crates/cosmic-text-contracts/src/lib.rs",

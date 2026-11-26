@@ -125,7 +125,7 @@ if phase == "cargo-run":
     key = "target.'cfg(all())'.runner="
     runners = [json.loads(value[len(key):]) for value in settings if value.startswith(key)]
     package = options[options.index("--package") + 1]
-    manifest = root / "crates" / package if package.startswith("cagents-ui") else root
+    manifest = root / "crates" / package if package in ("cagents-host", "cagents-ui", "cagents-ui-kit") else root
     variant = config.get("artifact", "valid")
     environment = dict(os.environ, CARGO_PKG_NAME=package, CARGO_MANIFEST_DIR=str(manifest))
     environment.update(config.get("cargo_environment", {}))
@@ -203,6 +203,7 @@ class TestLib(unittest.TestCase):
             (self.root / name).mkdir(mode=0o700)
         (self.root / "crates/cagents-ui").mkdir(parents=True)
         (self.root / "crates/cagents-ui-kit").mkdir(parents=True)
+        (self.root / "crates/cagents-host").mkdir(parents=True)
         self.lock = self.root / "slot.lock"
         self.env = {
             "PATH": str(self.root / "bin") + ":/usr/bin:/bin",
@@ -330,19 +331,19 @@ class TestLib(unittest.TestCase):
         self.assert_one_build_then_harness_under_cargo()
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
-        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
-                              ("ui", None), ("ui-kit", None), ("browser", None)):
+        for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-host", None),
+                              ("shared-ui", "test"), ("ui", None), ("ui-kit", None), ("browser", None)):
             with self.subTest(lane=lane):
                 self.clear()
                 extra = [] if profile is None else ["--profile", profile]
                 result = self.invoke(lane, "module::one", "--test-threads", "2", *extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 events = self.events()
-                package = {"ui": "cagents-ui", "ui-kit": "cagents-ui-kit",
+                package = {"host": "cagents-host", "ui": "cagents-ui", "ui-kit": "cagents-ui-kit",
                            "browser": "cagents-ui"}.get(lane, "cagents")
                 options = ["--locked", "--no-default-features", "--manifest-path",
                            str(self.root / "Cargo.toml"), "--package", package, "--lib"]
-                options += {"host": ["--features", "host"],
+                options += {"shared-host": ["--features", "host"],
                             "shared-ui": ["--features", "ui"],
                             "browser": ["--features", "browser-protocol-fixture"]}.get(lane, [])
                 options += ["--config", "target.'cfg(all())'.runner="
@@ -358,7 +359,8 @@ class TestLib(unittest.TestCase):
                 metadata = self.events("metadata")[0]
                 self.assertEqual(metadata["arguments"], ["metadata", "--format-version", "1", "--no-deps"])
                 self.assertEqual(events[:2], [metadata, compiler])
-                manifest = {"ui": self.root / "crates/cagents-ui",
+                manifest = {"host": self.root / "crates/cagents-host",
+                            "ui": self.root / "crates/cagents-ui",
                             "ui-kit": self.root / "crates/cagents-ui-kit",
                             "browser": self.root / "crates/cagents-ui"}.get(lane, self.root)
                 for event in events:
@@ -585,10 +587,12 @@ class TestLib(unittest.TestCase):
         # Built only under cfg(test), an item only tests use looks used; main's
         # build check, of every target, says otherwise.
         lanes = {"cli": ["--locked", "--no-default-features"],
-                 "host": ["--locked", "--no-default-features", "--features", "host"],
+                 "host": ["--locked", "--no-default-features", "--package", "cagents",
+                          "--package", "cagents-host", "--features", "cagents/host"],
                  "shared-ui": ["--locked", "--no-default-features", "--package", "cagents",
                                "--package", "cagents-ui", "--package", "cagents-ui-kit",
                                "--features", "cagents/ui"]}
+        lanes["shared-host"] = lanes["host"]
         lanes["ui"] = lanes["ui-kit"] = lanes["shared-ui"]
         lanes["browser"] = ["--locked", "--no-default-features", "--package", "cagents-ui",
                             "--package", "cagents-ui-kit", "--features",

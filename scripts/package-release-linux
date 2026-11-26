@@ -1,0 +1,50 @@
+#!/bin/bash
+# Invoked from the isolated Ubuntu release entrypoint, in /source.
+set -euo pipefail
+
+# Jammy's dpkg-deb sizes its XZ pool from CPU affinity and can otherwise
+# use the same cores and memory as the Cargo stage it overlaps.
+archive_cpu=$(awk '/^Cpus_allowed_list:/ { split($2, ranges, /[-,]/); print ranges[1]; exit }' /proc/self/status)
+if [[ ! $archive_cpu =~ ^[0-9]+$ ]]; then
+    printf '%s\n' 'package-release-linux: cannot determine the archive worker CPU' >&2
+    exit 1
+fi
+
+staging=$(mktemp -d)
+worker=
+cleanup() {
+    if [[ -n $worker ]]; then
+        # Stop the whole package worker, including any running compressor.
+        # A worker whose setsid has yet to run still has its parent's group.
+        kill -TERM -- "-$worker" 2>/dev/null || kill -TERM "$worker" 2>/dev/null || :
+        wait "$worker" || :
+    fi
+    rm -rf -- "$staging"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+package_variant() {
+    setsid -- taskset -c "$archive_cpu" scripts/package-linux.sh --variant "$1" --package-stage "$staging/$1" &
+    worker=$!
+}
+
+finish_package() {
+    local status=0
+    wait "$worker" || status=$?
+    worker=
+    return "$status"
+}
+
+# Cargo builds stay serial and their executable paths can be overwritten by
+# the next feature set. Each stage fixes the bytes its package worker reads.
+# Overlap one archive worker at a time with the next product's build.
+scripts/package-linux.sh --variant full --stage "$staging/full"
+package_variant full
+scripts/package-linux.sh --variant browserless --stage "$staging/browserless" \
+    --reuse-dictate "$staging/full/cagents-dictate"
+finish_package
+package_variant browserless
+scripts/package-ceditor-linux.sh --stage "$staging/ceditor" --reuse-companions "$staging/browserless"
+finish_package
+scripts/package-ceditor-linux.sh --package-stage "$staging/ceditor"

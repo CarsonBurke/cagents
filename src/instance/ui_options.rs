@@ -81,7 +81,7 @@ pub fn parse<'a>(
     Ok(Some(options))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod restore_policy_tests {
     use super::*;
     #[test]

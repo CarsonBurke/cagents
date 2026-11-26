@@ -18,7 +18,7 @@ impl MockHost {
     fn begin(spawn: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("host.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         let proof = proof("input-admission");
         let session = session();
         let wakes = Arc::new(AtomicUsize::new(0));
@@ -155,7 +155,7 @@ impl MockHost {
     }
     fn no_reconnect(&self) {
         assert!(
-            matches!(self.listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            matches!(crate::descriptor::accept(&self.listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
         );
     }
     fn reconnect(&self) -> UnixStream {

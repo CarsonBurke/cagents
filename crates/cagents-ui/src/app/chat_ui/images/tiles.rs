@@ -131,12 +131,10 @@ impl Runtime {
             if !captioned {
                 return tile;
             }
-            let caption = design::caption(file_name(&item.content).unwrap_or_default().to_owned())
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill);
+            let caption = crate::ui_controls::FadeText::caption(
+                file_name(&item.content).unwrap_or_default().to_owned(),
+            )
+            .width(Length::Fill);
             widget::column::with_children(vec![
                 tile,
                 widget::container(caption)

@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """Retry one workspace compiler invocation after an undefined-symbol link error."""
 
+from collections import Counter
 import contextlib
 import ctypes
 import fcntl
@@ -18,6 +19,7 @@ BUILD_DIR = "CAGENTS_BUILD_OFFLOAD_BUILD_DIR"
 WORKSPACE_DIRS = "CAGENTS_BUILD_OFFLOAD_WORKSPACE_DIRS"
 UNDEFINED = re.compile(rb"\bundefined (?:hidden symbol|symbol|reference to)\b", re.I)
 COLOR = re.compile(rb"\x1b\[[0-9;]*m")
+HUMAN_DIAGNOSTIC = re.compile(rb"^(?:error|warning|note|help)(?:\[[^]]+\])?:")
 
 
 def flag(arguments, name):
@@ -115,6 +117,22 @@ def diagnostic(line):
     return found.get("level") == "error" and str(found.get("message", "")).startswith("linking with ")
 
 
+def diagnostics(stderr):
+    """Rustc separates human diagnostics with blank lines and JSON with newlines."""
+    human = []
+    for line in stderr:
+        plain = COLOR.sub(b"", line)
+        if not human and not HUMAN_DIAGNOSTIC.match(plain):
+            yield line
+            continue
+        human.append(line)
+        if not plain.strip():
+            yield b"".join(human)
+            human.clear()
+    if human:
+        yield b"".join(human)
+
+
 def forward(line):
     sys.stderr.buffer.write(line)
     sys.stderr.buffer.flush()
@@ -127,6 +145,12 @@ def follow_parent(parent):
         os.kill(os.getpid(), signal.SIGTERM)
 
 
+def compiler(arguments):
+    parent = os.getpid()
+    return subprocess.Popen(arguments, stderr=subprocess.PIPE, close_fds=False,
+                            preexec_fn=lambda: follow_parent(parent))
+
+
 def main(arguments):
     target = invocation(arguments)
     if target is None:
@@ -135,19 +159,19 @@ def main(arguments):
     # Normally Cargo reads JSON diagnostics from rustc's stderr. Pass warnings
     # through promptly, holding only a possible failed link and its summary.
     held = []
+    forwarded = Counter()
     undefined = False
     human_link = False
-    parent = os.getpid()
-    with subprocess.Popen(arguments, stderr=subprocess.PIPE, close_fds=False,
-                          preexec_fn=lambda: follow_parent(parent)) as rustc:
-        for line in rustc.stderr:
-            plain = COLOR.sub(b"", line)
+    with compiler(arguments) as rustc:
+        for record in diagnostics(rustc.stderr):
+            plain = COLOR.sub(b"", record)
             human_link = human_link or plain.startswith(b"error: linking with ")
-            undefined = undefined or diagnostic(line) or (human_link and bool(UNDEFINED.search(plain)))
+            undefined = undefined or diagnostic(record) or (human_link and bool(UNDEFINED.search(plain)))
             if human_link or undefined:
-                held.append(line)
+                held.append(record)
             else:
-                forward(line)
+                forward(record)
+                forwarded[record] += 1
         status = rustc.wait()
 
     if status == 1 and undefined:
@@ -160,9 +184,16 @@ def main(arguments):
         if cache is not None:
             print(f"cargo-gate: retrying {target[0]} after an undefined-symbol link error "
                   "with fresh incremental state", file=sys.stderr, flush=True)
-            # Cargo still holds its build admission. Exec the original command
-            # without this wrapper so even an identical failure stops here.
-            os.execvp(arguments[0], arguments)
+            held.clear()
+            # Cargo still holds its build admission. Run the same command once,
+            # preserving new diagnostics as well as the retry's result.
+            with compiler(arguments) as rustc:
+                for record in diagnostics(rustc.stderr):
+                    if forwarded[record]:
+                        forwarded[record] -= 1
+                    else:
+                        forward(record)
+                status = rustc.wait()
 
     for line in held:
         forward(line)

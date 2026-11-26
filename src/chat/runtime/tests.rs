@@ -433,7 +433,11 @@ fn notification_title_matches_resident_session_identity_across_metadata_only_fra
                     session("native-b", Some("Provider B")),
                     session("native-b", None),
                 ],
-                4 => vec![
+                4 => vec![Event::ProviderTitleCleared {
+                    id: "native-b".into(),
+                }],
+                5 => vec![
+                    session("native-b", Some("Provider B again")),
                     Event::Reset {
                         reason: "Explicit new conversation".into(),
                     },
@@ -458,16 +462,16 @@ fn notification_title_matches_resident_session_identity_across_metadata_only_fra
     // frame before the next command, then retires its actual cat child.
     let (receipts, snapshot) = notification_frames_with_snapshot_for_test(
         Box::new(Names),
-        (0..5).map(|index| serde_json::json!(index)).collect(),
+        (0..6).map(|index| serde_json::json!(index)).collect(),
         false,
     );
-    assert_eq!(receipts.len(), 5);
+    assert_eq!(receipts.len(), 6);
     assert_eq!(
         receipts
             .iter()
             .map(|(_, content)| content.conversation.as_str())
             .collect::<Vec<_>>(),
-        ["Provider A", "Provider A", "", "Provider B", ""]
+        ["Provider A", "Provider A", "", "Provider B", "", ""]
     );
     assert_eq!(snapshot.session_id.as_deref(), Some("native-b"));
     assert_eq!(snapshot.title, None);
@@ -664,7 +668,7 @@ fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure
             })
         }
     }
-    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
         followed: false,
@@ -840,6 +844,42 @@ fn usage_keeps_the_compaction_point_each_reading_states() {
     apply_event(&mut state, &mut indices, reading(20_000, None));
     assert_eq!(state.usage.compact_limit, None);
     assert_eq!(state.usage.context_budget(), 1_000_000);
+}
+
+/// A request to send what is queued now is the provider's to report, and
+/// lasts no longer than the provider or the conversation it was made in.
+#[test]
+fn send_now_follows_the_provider_and_ends_with_it() {
+    let mut state = Snapshot::default();
+    let mut indices = BTreeMap::new();
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Delivering)),
+    );
+    assert_eq!(state.send_now, Some(crate::chat::SendNow::Delivering));
+    apply_event(&mut state, &mut indices, Event::SendNow(None));
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Reset {
+            reason: "reset".into(),
+        },
+    );
+    assert_eq!(state.send_now, None);
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SendNow(Some(crate::chat::SendNow::Requested)),
+    );
+    apply_event(&mut state, &mut indices, Event::Exited { code: None });
+    assert_eq!(state.send_now, None);
 }
 
 #[test]
@@ -1370,7 +1410,58 @@ fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
 
 use super::super::Role;
 use super::*;
+
+#[test]
+fn unloaded_catalog_rows_do_not_take_followed_history_slots() {
+    let mut state = Snapshot::default();
+    let mut indices = Default::default();
+    for index in 0..32 {
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: format!("child-{index}"),
+                kind: String::new(),
+                description: String::new(),
+                model: None,
+                status: Some(ToolStatus::Running),
+                waiting: None,
+                detail: None,
+                background: None,
+            },
+        );
+    }
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SubagentItem {
+            id: "child-0".into(),
+            item: text("first", "Followed transcript"),
+        },
+    );
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Subagent {
+            id: "unloaded".into(),
+            kind: String::new(),
+            description: String::new(),
+            model: None,
+            status: Some(ToolStatus::Running),
+            waiting: None,
+            detail: Some(crate::chat::UNLOADED_CHILD_RUNNING.into()),
+            background: None,
+        },
+    );
+    state.subagents[0].status = ToolStatus::Succeeded;
+    trim_subagents(&mut state);
+    assert_eq!(state.subagents.len(), 33);
+    assert_eq!(state.subagents[0].id, "child-0");
+    assert_eq!(state.subagents[0].items.len(), 1);
+    assert!(state.subagents.last().unwrap().last_seen_running());
+}
 use serde_json::{Value, json};
+use std::os::fd::FromRawFd;
 
 #[test]
 fn a_settled_actor_releases_large_json_frame_slack() {
@@ -2877,7 +2968,7 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         (false, true, false, false, true),
         (false, true, true, true, true),
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let original = root.path().join("original");
         let moved = root.path().join("moved");
         std::fs::create_dir(&original).unwrap();
@@ -2951,6 +3042,8 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         std::fs::write(original.join("marker"), "replacement").unwrap();
         let (identity, pin) = handle.pinned_launch_directory().unwrap();
         assert_eq!(identity, expected);
+        // Only Linux reports a path-only handle among a descriptor's flags.
+        #[cfg(target_os = "linux")]
         if !admitted {
             assert_ne!(
                 unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
@@ -3006,7 +3099,7 @@ fn identity_only_context_never_recaptures_a_replacement_directory() {
         environment: BTreeMap::new(),
         unset_environment: Default::default(),
     };
-    assert!(spawn_provider(&spec, &AtomicBool::new(false), None).is_err());
+    assert!(spawn_provider(&spec, &AtomicBool::new(false), None, false).is_err());
 }
 
 struct Echo;
@@ -3893,6 +3986,20 @@ fn native_child_receives_only_the_preserved_source_environment() {
         working_directory: std::env::temp_dir(),
         environment: environment.clone(),
     };
+    // The Command Line Tools Python launcher may set SDK variables before
+    // invoking Python. Measure its output from the same exact clean input.
+    #[cfg(target_os = "macos")]
+    let environment = {
+        let output = std::process::Command::new(&spec.program)
+            .args(["-c", "import json,os; print(json.dumps(dict(os.environ)))"])
+            .current_dir(&spec.working_directory)
+            .env_clear()
+            .envs(&environment)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<BTreeMap<String, String>>(&output.stdout).unwrap()
+    };
     let mut adapter: Box<dyn Adapter> = Box::new(Echo);
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
@@ -4023,7 +4130,7 @@ fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory
         transport: TransportSpec::OwnedUnixWebSocket {
             socket: socket.clone(),
         },
-        program: "/bin/false".into(),
+        program: "/usr/bin/false".into(),
         arguments: Vec::new(),
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
@@ -4410,11 +4517,11 @@ impl Adapter for WebSocketFixture {
 
 #[test]
 fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_close() {
-    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    use std::os::unix::fs::MetadataExt;
     use tungstenite::Message;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = crate::descriptor::bind(&path).unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
@@ -4435,7 +4542,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
     };
     let (pong, pong_received) = crossbeam_channel::bounded(1);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -4530,6 +4637,8 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
             | Update::Ready
             | Update::PromptAvailable
             | Update::RetainedOutcomes
+            | Update::ConversationNameChanged
+            | Update::FailureChanged
             | Update::Execution { .. } => None,
         })
         .collect();
@@ -4548,10 +4657,10 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
 
 #[test]
 fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
-    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+    use std::os::unix::fs::MetadataExt;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    let listener = crate::descriptor::bind(&path).unwrap();
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
@@ -4571,7 +4680,7 @@ fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
     };
     let (release, released) = crossbeam_channel::bounded(1);
     let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -4717,6 +4826,52 @@ fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() 
     assert!(!snapshot.ready);
     assert!(snapshot.error.is_none(), "{snapshot:?}");
     assert!(handle.failure().is_none());
+}
+
+// Claude's answer to initialize prompts the adapter's own request for the
+// context figure. A provider that exits cleanly before reading it lost none
+// of the reader's input, while one that leaves a prompt unread did (#3888).
+#[test]
+fn claude_clean_exit_reports_only_lost_reader_input() {
+    // Closing its stdin before answering fails that request's write with
+    // EPIPE every time, rather than only when the exit wins a race.
+    let (_directory, handle) = claude_initialization_pipe(
+        "import os\nos.close(0)\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
+    );
+    let snapshot = finish_initialization_pipe(&handle);
+    assert!(snapshot.error.is_none(), "{snapshot:?}");
+    assert!(handle.failure().is_none());
+
+    // This one reads the context request, then stops reading and exits
+    // cleanly once the test has sent a prompt it can no longer read.
+    let (directory, handle) = claude_initialization_pipe(
+        "import os, time\n\
+             print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n\
+             assert json.loads(sys.stdin.readline())['request']['subtype'] == 'get_context_usage'\n\
+             os.close(0)\n\
+             open('stopped-reading', 'w').close()\n\
+             while not os.path.exists('prompt-sent'):\n    time.sleep(0.01)\n",
+    );
+    crate::test_timing::eventually("the provider to stop reading", || {
+        directory.path().join("stopped-reading").exists()
+    });
+    handle
+        .command(Command::Prompt {
+            text: "Never read".into(),
+            attachments: Vec::new(),
+            mode: crate::chat::PromptMode::Send,
+        })
+        .unwrap();
+    std::fs::write(directory.path().join("prompt-sent"), b"").unwrap();
+    let snapshot = finish_initialization_pipe(&handle);
+    assert!(
+        snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Provider stdin")),
+        "{snapshot:?}"
+    );
 }
 
 // Closing a busy turn sends Claude an interrupt. When the turn's result was
@@ -5273,6 +5428,40 @@ fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
 }
 
 #[test]
+fn json_line_batches_preserve_order_across_blank_lines_and_the_poll_budget() {
+    let mut output = String::from("\n");
+    let mut expected = String::new();
+    for index in 0..=FRAMES_PER_POLL {
+        if index == FRAMES_PER_POLL {
+            output.push('\n');
+        }
+        let digit = format!("{:x}", index % 16);
+        output.push_str(&format!("{}\n", json!({"text": digit})));
+        expected.push_str(&digit);
+    }
+    output.push('\n');
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/usr/bin/printf".into(),
+        arguments: vec!["%s".into(), output],
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let mut initial = Step::default();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+    let snapshot = until(&handle, |snapshot| snapshot.exited);
+    assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+    assert_eq!(unstamped(&snapshot.items), vec![text("echo", &expected)]);
+    handle.close().unwrap();
+}
+
+#[test]
 fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
     let mut output = String::new();
     for text in ["hello", " world"] {
@@ -5431,7 +5620,7 @@ fn direct_provider_teardown_never_signals_a_reused_process_group() {
         "only the isolated namespace init may reset PID allocation"
     );
     std::fs::write("/proc/sys/kernel/ns_last_pid", b"199").unwrap();
-    let mut original = Process::new("/bin/true");
+    let mut original = Process::new("true");
     // SAFETY: only the async-signal-safe setsid syscall runs after fork.
     unsafe {
         original.pre_exec(|| {
@@ -5805,6 +5994,66 @@ fn direct_provider_non_reaping_observation_preserves_exit_status() {
 }
 
 #[test]
+fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    };
+
+    #[cfg(target_os = "linux")]
+    if crate::daemon::codex_temp::cleanup_fixture::run() {
+        return;
+    }
+
+    let working = tempfile::tempdir().unwrap();
+    let recipe = crate::model::LaunchRecipe {
+        program: "/bin/sh".into(),
+        arguments: vec![
+            "-c".into(),
+            r#"printf '%s\n' "$TMPDIR" "$TMP" "$TEMP"; read -r line"#.into(),
+        ],
+        working_directory: working.path().to_path_buf(),
+        environment: BTreeMap::from([
+            ("TMPDIR".into(), ".".into()),
+            ("TMP".into(), "/original-tmp".into()),
+            ("TEMP".into(), "/original-temp".into()),
+        ]),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let mut child = spawn_provider(&spec, &AtomicBool::new(false), None, true)
+        .unwrap()
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    crate::daemon::codex_temp::cleanup_fixture::include_provider(
+        child.child.id().try_into().unwrap(),
+    );
+    let mut paths = BufReader::new(child.child.stdout.take().unwrap()).split(b'\n');
+    let [first, second, third] =
+        std::array::from_fn(|_| paths.next().expect("expected an environment path").unwrap());
+    assert_eq!(first, second);
+    assert_eq!(first, third);
+    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(first));
+    assert_eq!(
+        temp.parent(),
+        Some(working.path().canonicalize().unwrap().as_path())
+    );
+    assert_eq!(
+        std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    std::fs::create_dir(temp.join(".git")).unwrap();
+    drop(child);
+    #[cfg(target_os = "linux")]
+    assert!(!temp.exists());
+    #[cfg(target_os = "macos")]
+    assert!(
+        temp.is_dir(),
+        "Darwin retains potentially occupied directories"
+    );
+}
+
+#[test]
 fn a_provider_is_never_handed_a_parent_session() {
     use std::io::Read;
     let spec = ProcessSpec {
@@ -5827,7 +6076,7 @@ fn a_provider_is_never_handed_a_parent_session() {
         .into(),
         unset_environment: Default::default(),
     };
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
         .unwrap()
         .unwrap();
     let mut output = String::new();
@@ -5864,7 +6113,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
         environment: Default::default(),
         unset_environment: Default::default(),
     };
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
         .unwrap()
         .unwrap();
     let pid = provider.child.id();
@@ -5891,6 +6140,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
 /// memory kill of the provider itself is named as one when it exits.
 /// The kills are made the way systemd-oomd makes them: it marks the
 /// cgroup, then kills every process in it.
+#[cfg(target_os = "linux")] // cgroups and systemd-oomd are Linux's.
 #[test]
 fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
     use std::io::{BufRead, Read, Write};
@@ -5947,7 +6197,7 @@ fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
         unset_environment: Default::default(),
     };
     let (wake, mut woken) = UnixStream::pair().unwrap();
-    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake))
+    let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake), false)
         .unwrap()
         .unwrap();
     let root = provider.child.id();
@@ -6144,7 +6394,7 @@ fn a_detached_command_outlives_a_closed_or_finished_provider() {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None, false)
             .unwrap()
             .unwrap();
         if !provider
@@ -6229,7 +6479,7 @@ fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after
         messages: None,
         unset_environment: Default::default(),
         transport: TransportSpec::JsonLines,
-        program: "/bin/true".into(),
+        program: "/usr/bin/true".into(),
         arguments: vec![],
         working_directory: std::env::temp_dir(),
         environment: BTreeMap::new(),
@@ -6458,7 +6708,7 @@ fn file_changes_cache_queries_remain_available_after_provider_exit() {
         messages: None,
         unset_environment: Default::default(),
         transport: TransportSpec::JsonLines,
-        program: "/bin/true".into(),
+        program: "/usr/bin/true".into(),
         arguments: vec![],
         working_directory: std::env::temp_dir(),
         environment: BTreeMap::new(),
@@ -6610,4 +6860,72 @@ fn repeated_failed_verifications_keep_only_bounded_latest_detail_and_history() {
     );
     assert_eq!(state.error, None);
     assert_eq!(state.items, retained);
+}
+
+#[test]
+fn a_message_given_to_a_running_turn_keeps_what_the_provider_said_it_is_doing() {
+    struct Turns;
+    impl Adapter for Turns {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            Ok(match command {
+                Command::Compact => Step {
+                    events: vec![Event::Ready(true)],
+                    ..Step::default()
+                },
+                Command::Refresh => Step {
+                    events: vec![Event::Status {
+                        busy: true,
+                        detail: crate::chat::WAITING_ON_BACKGROUND_WORK.into(),
+                    }],
+                    ..Step::default()
+                },
+                _ => Step::default(),
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let mut initial = Step::default();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, Box::new(Turns), initial, store, None, |_| {}).unwrap();
+    let prompt = |mode| Command::Prompt {
+        text: "more".into(),
+        attachments: Vec::new(),
+        mode,
+    };
+    handle.command(Command::Compact).unwrap();
+    handle
+        .command(prompt(super::super::PromptMode::Send))
+        .unwrap();
+    let started = handle.snapshot(None).unwrap();
+    assert!(started.busy);
+    assert_eq!(started.detail, "Waiting for provider turn");
+
+    handle.command(Command::Refresh).unwrap();
+    for mode in [
+        super::super::PromptMode::Queue,
+        super::super::PromptMode::Steer,
+    ] {
+        handle.command(prompt(mode)).unwrap();
+        let running = handle.snapshot(None).unwrap();
+        assert!(running.busy);
+        assert_eq!(running.detail, crate::chat::WAITING_ON_BACKGROUND_WORK);
+    }
+    handle.close().unwrap();
 }

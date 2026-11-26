@@ -41,15 +41,16 @@ fn badge_with_width<'a, Message: 'a>(
     tone: Tone,
     width: Option<f32>,
 ) -> Element<'a, Message> {
-    let text = caption(label)
-        .wrapping(iced::widget::text::Wrapping::None)
-        .class(cosmic::theme::Text::Default);
-    let text = if width.is_some() {
-        text.ellipsize(iced::widget::text::Ellipsize::End(
-            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-        ))
+    // In the pill's own colour; one that is held to its cell fades there.
+    let text: Element<'a, Message> = if width.is_some() {
+        crate::ui_controls::FadeText::caption(label)
+            .class(cosmic::theme::Text::Default)
+            .into()
     } else {
-        text
+        caption(label)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .class(cosmic::theme::Text::Default)
+            .into()
     };
     let pill = widget::container(text)
         .padding(iced::Padding {
@@ -77,6 +78,93 @@ fn badge_with_width<'a, Message: 'a>(
     match width {
         Some(width) => pill.max_width(width).clip(true).into(),
         None => pill.into(),
+    }
+}
+
+/// What a [`count_badge`]'s count says about its section, and so its tone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CountTone {
+    /// How many there are, and nothing more.
+    #[default]
+    Neutral,
+    /// Some of them want looking at, such as warnings.
+    Warning,
+    /// Some of them are failures, such as errors.
+    Danger,
+    /// On an accent-filled control, such as a primary button, whose fill it
+    /// shades rather than adding a hue of its own.
+    OnAccent,
+}
+
+/// The height of a [`count_badge`], about as wide as a one-digit count.
+pub const COUNT_BADGE_HEIGHT: f32 = 16.0;
+
+/// How many items a section, tab or list holds, as a small rounded badge
+/// beside its name.
+///
+/// A bare number after a heading reads as part of the heading, or as stray
+/// text; a filled pill reads at once as a count. Counts beside a name use
+/// this one shape, so a reader learns it once; the projects rail's and
+/// avatars' overlaid counts keep their own ringed pills. Callers say the
+/// count in the accessible name of the control it labels.
+///
+/// Leave the badge out at zero when the body beneath already says it is
+/// empty, as an empty Work board lane does; show "0" when the zero is the
+/// news, as for a search that found nothing.
+pub fn count_badge<'a, Message: 'a>(
+    count: impl Into<Cow<'a, str>> + 'a,
+    tone: CountTone,
+) -> Element<'a, Message> {
+    widget::container(
+        widget::text(count.into())
+            .size(design::TEXT_CAPTION - 0.5)
+            .line_height(iced::widget::text::LineHeight::Absolute(
+                COUNT_BADGE_HEIGHT.into(),
+            ))
+            .font(cosmic::font::semibold())
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .padding([0.0, 5.0])
+    .center_y(Length::Fixed(COUNT_BADGE_HEIGHT))
+    .align_x(Alignment::Center)
+    .width(Length::Shrink)
+    .class(cosmic::theme::Container::custom(move |theme| {
+        count_badge_style(theme, tone)
+    }))
+    .into()
+}
+
+fn count_badge_style(theme: &Theme, tone: CountTone) -> widget::container::Style {
+    let wash = |mut color: iced::Color, strength: f32| {
+        color.a *= strength;
+        color
+    };
+    let on: iced::Color = theme.current_container().on.into();
+    let (fill, ink) = match tone {
+        // A wash of the text colour, so the pill sits on any surface it is
+        // drawn over, hovered and selected rows included, at either polarity.
+        // Its figure is no louder than the muted name beside it.
+        CountTone::Neutral => (wash(on, 0.12), Some(design::muted_color(theme))),
+        // A light wash keeps the tone's ink readable on grey surfaces too.
+        CountTone::Warning => {
+            let color = design::warning_color(theme);
+            (wash(color, 0.12), Some(color))
+        }
+        CountTone::Danger => {
+            let color = design::destructive_color(theme);
+            (wash(color, 0.12), Some(color))
+        }
+        // The control's own label colour carries through.
+        CountTone::OnAccent => (iced::Color::from_rgba(0.0, 0.0, 0.0, 0.2), None),
+    };
+    widget::container::Style {
+        background: Some(iced::Background::Color(fill)),
+        text_color: ink,
+        border: iced::Border {
+            radius: (COUNT_BADGE_HEIGHT / 2.0).into(),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -176,7 +264,7 @@ pub fn comment_card<'a, Message: 'a>(
 ///
 /// Every path this application shows lives under the user's home, so the
 /// absolute prefix is noise that costs the readable tail its space when the
-/// label has to ellipsize.
+/// label has to fade.
 pub fn display_path(path: &Path) -> Cow<'_, str> {
     static HOME: LazyLock<Option<PathBuf>> =
         LazyLock::new(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().to_owned()));

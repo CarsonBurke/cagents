@@ -178,13 +178,59 @@ fn closed(error: &ControlError) -> bool {
     }
 }
 
+/// What a proposal asks to run, as the approval dialog lists it, in words:
+/// no internal revision, enum names or ID beside a name. `account` is the
+/// saved account's label; the account is named by its ID only when no saved
+/// account answers to it.
+fn approval_summary(proposal: &Proposal, account: Option<String>) -> String {
+    let definition = &proposal.definition;
+    let account = account.unwrap_or_else(|| match &definition.agent.account {
+        Some(id) => format!("Saved account unavailable ({id})"),
+        None => "Saved account unavailable".into(),
+    });
+    format!(
+        "{}\nProvider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nView: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nRuns in: {}\nEach run: {}\nSchedule: {} ({})",
+        definition.name,
+        definition.agent.provider.label(),
+        account,
+        definition.agent.target.repository.display(),
+        definition.agent.target.directory.display(),
+        placement_description(proposal),
+        definition
+            .agent
+            .model
+            .as_deref()
+            .unwrap_or("Provider default"),
+        definition
+            .agent
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("Provider default"),
+        definition
+            .agent
+            .permission_mode
+            .as_deref()
+            .unwrap_or("Provider default"),
+        match definition.agent.surface {
+            crate::agent_execution::Surface::Chat => "A chat",
+            crate::agent_execution::Surface::Terminal => "A terminal",
+        },
+        match definition.session_mode {
+            crate::automations::SessionMode::Fresh => "Starts a new conversation",
+            crate::automations::SessionMode::Reuse => "Continues the same conversation",
+        },
+        definition.schedule.pattern.expression().unwrap_or_default(),
+        definition.schedule.timezone,
+    )
+}
+
 fn placement_description(proposal: &Proposal) -> String {
     match &proposal.definition.agent.target.placement {
         Some(crate::agent_execution::Placement::Worktree { path, .. }) => {
             format!("Worktree {}", path.display())
         }
-        Some(crate::agent_execution::Placement::Channel(id)) => format!(
-            "Channel {} ({id})",
+        Some(crate::agent_execution::Placement::Channel(_)) => format!(
+            "Channel {}",
             proposal
                 .channel_title
                 .as_deref()
@@ -661,43 +707,8 @@ impl Cagents {
             .automation_account_choices()
             .into_iter()
             .find(|account| Some(&account.id) == definition.agent.account.as_ref())
-            .map(|account| account.label)
-            .unwrap_or_else(|| "Saved account unavailable".into());
-        let description = format!(
-            "{}\nProvider: {}\nAccount: {} ({})\nProject: {}\nDirectory: {}\nView: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSurface: {:?}\nSession: {:?}\nSchedule: {} ({})\nExecution revision: {}",
-            definition.name,
-            definition.agent.provider.label(),
-            account,
-            definition
-                .agent
-                .account
-                .as_ref()
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
-            definition.agent.target.repository.display(),
-            definition.agent.target.directory.display(),
-            placement_description(proposal),
-            definition
-                .agent
-                .model
-                .as_deref()
-                .unwrap_or("Provider default"),
-            definition
-                .agent
-                .reasoning_effort
-                .as_deref()
-                .unwrap_or("Provider default"),
-            definition
-                .agent
-                .permission_mode
-                .as_deref()
-                .unwrap_or("Provider default"),
-            definition.agent.surface,
-            definition.session_mode,
-            definition.schedule.pattern.expression().unwrap_or_default(),
-            definition.schedule.timezone,
-            proposal.revision
-        );
+            .map(|account| account.label);
+        let description = approval_summary(proposal, account);
         let mut content = widget::column::with_children(vec![design::title("Approve scheduled work?").into(),
             notice_body("A hosted conversation requests recurring work. Approval enables only this saved configuration, including its unattended tools and account."),
             notice_body(description), notice_body(&definition.prompt)]).spacing(space::M);
@@ -825,6 +836,39 @@ mod tests {
             created_ms: 1,
             state: ProposalState::Pending,
         }
+    }
+
+    /// The dialog lists what will run in words, without the proposal's
+    /// revision, enum names, or an ID beside a name the person knows.
+    #[test]
+    fn approval_summary_says_what_runs_without_internal_identifiers() {
+        let mut proposal = proposal();
+        proposal.revision = 4242;
+        let channel = crate::model::ChannelId::new();
+        proposal.definition.agent.target.placement =
+            Some(crate::agent_execution::Placement::Channel(channel));
+        proposal.channel_title = Some("Releases".into());
+        let summary = approval_summary(&proposal, Some("Work account".into()));
+        assert!(summary.contains("Account: Work account\n"), "{summary}");
+        assert!(summary.contains("View: Channel Releases\n"), "{summary}");
+        assert!(summary.contains("Runs in: A chat\n"), "{summary}");
+        assert!(
+            summary.contains("Each run: Starts a new conversation\n"),
+            "{summary}"
+        );
+        for internal in [
+            "4242",
+            "revision",
+            "codex/system",
+            "Fresh",
+            "Surface",
+            &channel.to_string(),
+        ] {
+            assert!(!summary.contains(internal), "{internal}: {summary}");
+        }
+        assert!(
+            approval_summary(&proposal, None).contains("Saved account unavailable (codex/system)")
+        );
     }
 
     /// Pending-request reads reuse one connection, and reach a restarted
@@ -1110,10 +1154,7 @@ mod tests {
         let id = crate::model::ChannelId::new();
         proposal.definition.agent.target.placement = Some(Placement::Channel(id));
         proposal.channel_title = Some("Review queue".into());
-        assert_eq!(
-            placement_description(&proposal),
-            format!("Channel Review queue ({id})")
-        );
+        assert_eq!(placement_description(&proposal), "Channel Review queue");
         proposal.definition.agent.target.placement = Some(Placement::Worktree {
             repository: "/fixture".into(),
             path: "/fixture/feature branch".into(),

@@ -6,7 +6,7 @@
 //! fit the bounds, and published as one `History` event once the load is
 //! answered. A long conversation therefore costs a bounded buffer rather
 //! than one transcript event per chunk.
-use crate::chat::{Event, Item, ItemContent, Phase, Role};
+use crate::chat::{Event, Item, ItemContent, OpeningTitle, Phase, Role};
 use std::collections::{HashMap, VecDeque};
 
 /// The most replayed items kept; older ones are left out, with a note.
@@ -26,6 +26,9 @@ pub(super) struct Replay {
     ordinals: HashMap<String, u64>,
     bytes: usize,
     dropped: bool,
+    /// The opening may have scrolled out of the bounded replay before it
+    /// reaches the store that can derive a title from it.
+    opening_title: Option<OpeningTitle>,
     /// The user's message being replayed and the images it carried, so the
     /// image list cagents appended when sending it can be read back.
     user: Option<(u64, Vec<u64>)>,
@@ -109,8 +112,8 @@ impl Replay {
         }
     }
 
-    /// The history to publish, oldest first.
-    pub fn finish(mut self) -> Vec<Item> {
+    /// The retained history, oldest first, and any title from its omitted start.
+    pub fn finish(mut self) -> (Vec<Item>, Option<OpeningTitle>) {
         self.close_user_unless(false);
         let mut items = Vec::from(self.items);
         if self.dropped {
@@ -129,7 +132,7 @@ impl Replay {
                 },
             );
         }
-        items
+        (items, self.opening_title)
     }
 
     fn get_mut(&mut self, id: &str) -> Option<&mut Item> {
@@ -151,6 +154,7 @@ impl Replay {
             let Some(item) = self.items.pop_front() else {
                 break;
             };
+            OpeningTitle::observe(&mut self.opening_title, &item);
             self.bytes = self.bytes.saturating_sub(size(&item));
             self.ordinals.remove(&item.id);
             self.first += 1;
@@ -223,6 +227,8 @@ impl Replay {
     }
 }
 
+/// Exclude courier prompts from title inference even before Store can verify
+/// their seals. Keep authentication and delivery projection in Store.
 fn prefix(text: &str, limit: usize) -> &str {
     if text.len() <= limit {
         return text;

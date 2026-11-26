@@ -1,8 +1,7 @@
 //! Descendant cleanup for dedicated process owners, never the daemon itself.
-use crate::daemon::holder_registry::Process;
+use crate::{daemon::holder_registry::Process, pinned_process::PinnedProcess};
 use std::{
     io,
-    os::fd::{FromRawFd, OwnedFd},
     process::Child,
     time::{Duration, Instant},
 };
@@ -10,7 +9,7 @@ use std::{
 /// What closing a provider does with the work it leaves behind, such as a
 /// server a command started with `nohup` or `setsid`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum DetachedWork {
+pub enum DetachedWork {
     /// Stop everything the provider started. Forced kills and unattended
     /// executions do, and so does every close that has not decided otherwise.
     #[default]
@@ -20,86 +19,102 @@ pub(crate) enum DetachedWork {
     Spare,
 }
 
-/// Processes pinned by pidfd, so a process that later reuses one's pid is
-/// never signalled in its place.
+/// Establish the process boundary before a dedicated provider helper spawns.
+pub(crate) fn initialize_provider_owner() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::process::become_subreaper()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: getsid(0) queries the calling process and takes no pointers.
+        let session = unsafe { libc::getsid(0) };
+        if session < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if session as u32 != std::process::id() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider helper must lead its own session on macOS",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Processes pinned, so a process that later reuses one's pid is never
+/// signalled in its place.
 #[derive(Default)]
 struct Pinned {
-    fds: Vec<OwnedFd>,
+    processes: Vec<PinnedProcess>,
     pids: Vec<i32>,
 }
 
 impl Pinned {
     /// Pins each of `processes` that is still that exact process, exited or
     /// not; one whose pid now names another process is skipped.
+    #[cfg(target_os = "linux")]
     fn pin(processes: &[Process]) -> io::Result<Self> {
         let mut pinned = Self::default();
         for process in processes {
             if !process.is_current() {
                 continue;
             }
-            // SAFETY: pidfd_open takes scalar arguments and returns a new
-            // owned descriptor or -1 without writing through any pointer.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
-            if fd == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    continue;
-                }
-                return Err(error);
-            }
-            // SAFETY: a successful pidfd_open returned this fresh descriptor.
-            let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            let pin = match PinnedProcess::open_unreaped(process.pid as u32) {
+                Ok(pin) => pin,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             // The pid may have been reused between the check and the open.
             if process.is_current() {
-                pinned.fds.push(fd);
+                pinned.processes.push(pin);
                 pinned.pids.push(process.pid);
             }
         }
         Ok(pinned)
     }
 
-    /// Whether every pinned process has exited, reaped or not.
-    fn exited(&self) -> bool {
-        use std::os::fd::AsRawFd;
-        self.fds.iter().all(|fd| {
-            let mut event = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one live pollfd; a pidfd is readable once its process
-            // has exited.
-            let ready = unsafe { libc::poll(&mut event, 1, 0) };
-            ready == 1
-        })
+    #[cfg(target_os = "macos")]
+    fn pin(processes: &[Process]) -> io::Result<Self> {
+        let mut pinned = Self::default();
+        for process in processes {
+            let pid = u32::try_from(process.pid).map_err(io::Error::other)?;
+            let pin = PinnedProcess::open_started(pid, process.start)?;
+            pinned.processes.push(pin);
+        }
+        Ok(pinned)
     }
 
-    /// Sends `signal` to each pinned process; signal 0 only reports which
-    /// still exist, unreaped zombies included.
+    /// Whether every pinned process has exited, reaped or not.
+    fn exited(&self) -> bool {
+        self.processes
+            .iter()
+            .all(|process| process.exited().unwrap_or(false))
+    }
+
+    /// Sends `signal` to each pinned process, answering whether any took it.
     fn signal(&self, signal: libc::c_int) -> bool {
-        use std::os::fd::AsRawFd;
         let mut any = false;
-        for fd in &self.fds {
-            // SAFETY: the descriptor is live, and a null siginfo with zero
-            // flags is supported.
-            any |= unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd.as_raw_fd(),
-                    signal,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            } == 0;
+        for process in &self.processes {
+            any |= process.signal(signal).unwrap_or(false);
         }
         any
+    }
+
+    /// Whether any pinned process remains, an unreaped zombie included.
+    fn remain(&self) -> bool {
+        self.processes
+            .iter()
+            .any(|process| !process.reaped().unwrap_or(false))
     }
 }
 
 /// Used only in the dedicated, single-threaded subreaper process. It owns every
 /// child of that process; this cleanup must never run inside the daemon.
-pub(crate) struct OwnedChildren {
+pub struct OwnedChildren {
     child: Option<Child>,
+    #[cfg(target_os = "macos")]
+    descendants: Option<std::cell::RefCell<super::descendants::Tracker>>,
     group_signalled: bool,
     detached: DetachedWork,
     /// More of the provider's own processes, such as a server its launcher
@@ -114,14 +129,55 @@ pub(crate) struct OwnedChildren {
 impl OwnedChildren {
     /// The caller must be the sole child reaper in a dedicated subreaper process.
     /// No other thread or signal handler may reap this child or descendants.
-    pub(crate) fn new(child: Child) -> Self {
+    pub fn new(child: Child) -> Self {
         Self {
             child: Some(child),
+            #[cfg(target_os = "macos")]
+            descendants: None,
             group_signalled: false,
             detached: DetachedWork::Stop,
             provider: Pinned::default(),
             server: None,
             server_killed: Default::default(),
+        }
+    }
+
+    /// Start an exact owned root. Darwin registers its fork and exit watch
+    /// before the child can exec into provider code.
+    pub(crate) fn spawn(command: std::process::Command) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut command = command;
+            command.spawn().map(Self::new)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let (child, tracker) = super::descendants::Tracker::spawn(command)?;
+            let mut owner = Self::new(child);
+            owner.descendants = Some(std::cell::RefCell::new(tracker));
+            Ok(owner)
+        }
+    }
+
+    /// Darwin can prove exact cleanup only for a root watched before exec
+    /// that never forked. This is the only Darwin evidence for exit 73.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn cleanup_proved(&mut self) -> bool {
+        self.child.is_none()
+            && !self.provider.remain()
+            && self
+                .descendants
+                .as_mut()
+                .is_some_and(|tracker| tracker.get_mut().prove_empty())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn release_complete(&mut self) -> bool {
+        if self.detached == DetachedWork::Spare {
+            // This request authorized leaving detached work alive.
+            self.child.is_none() && !self.provider.remain()
+        } else {
+            self.cleanup_proved()
         }
     }
 
@@ -148,13 +204,33 @@ impl OwnedChildren {
         if detached == DetachedWork::Spare && self.group_signalled {
             return Ok(());
         }
-        self.provider = Pinned::pin(provider)?;
+        #[cfg(target_os = "linux")]
+        {
+            self.provider = Pinned::pin(provider)?;
+        }
+        #[cfg(target_os = "macos")]
+        if !provider.is_empty() {
+            self.provider = Pinned::pin(provider)?;
+        }
         self.detached = if self.server_killed.get() || self.killed() {
             DetachedWork::Stop
         } else {
             detached
         };
         Ok(())
+    }
+
+    /// Set the extra pinned provider peer independently of the eventual
+    /// release scope. A wrapper may have started it in another process group.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn record_update_server(&mut self, server: &Process) -> io::Result<()> {
+        self.provider = Pinned::pin(std::slice::from_ref(server))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn spare_update_server(&mut self) {
+        self.detached = DetachedWork::Spare;
     }
 
     /// Whether the provider, or one of its `provider` processes this process
@@ -171,6 +247,17 @@ impl OwnedChildren {
 
     pub(crate) fn id(&self) -> i32 {
         self.child.as_ref().expect("owned provider").id() as i32
+    }
+
+    /// A Darwin watch wakes a dedicated holder when a provider forks.
+    pub(crate) fn descendant_events(&self) -> Option<std::os::fd::RawFd> {
+        #[cfg(target_os = "linux")]
+        return None;
+        #[cfg(target_os = "macos")]
+        return self
+            .descendants
+            .as_ref()
+            .map(|tracker| tracker.borrow().fd());
     }
 
     pub(crate) fn exited(&self) -> bool {
@@ -193,6 +280,10 @@ impl OwnedChildren {
     /// Keeping that leader unreaped also reserves its process-group identifier
     /// until `terminate` has sent the group's final signal.
     pub(crate) fn reap_exited_descendants(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(tracker) = &self.descendants {
+            tracker.borrow_mut().observe()?;
+        }
         for pid in direct_children()? {
             if self
                 .child
@@ -227,18 +318,30 @@ impl OwnedChildren {
         Ok(())
     }
 
-    pub(crate) fn terminate(&mut self, timeout: Duration) -> io::Result<bool> {
+    pub fn terminate(&mut self, timeout: Duration) -> io::Result<bool> {
         if !self.group_signalled {
             if self.detached == DetachedWork::Spare {
                 // Let the provider end its own session, as quitting its CLI
                 // would, before anything is forced.
-                self.signal_provider(libc::SIGTERM);
+                self.signal_provider(libc::SIGTERM)?;
                 let grace = Instant::now() + crate::chat::TERMINATE_GRACE.min(timeout);
                 while !(self.exited() && self.provider.exited()) && Instant::now() < grace {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            self.signal_provider(libc::SIGKILL);
+            self.signal_provider(libc::SIGKILL)?;
+            #[cfg(target_os = "macos")]
+            if let Some(child) = &self.child
+                && let Err(error) =
+                    crate::process::identity::finish_unreaped_group(child.id() as i32, timeout)
+            {
+                if self.detached == DetachedWork::Stop
+                    && let Some(tracker) = &mut self.descendants
+                {
+                    let _ = tracker.get_mut().stop_known(timeout);
+                }
+                return Err(error);
+            }
             self.group_signalled = true;
         }
         // The grace above is the provider's own; reaping gets the timeout.
@@ -249,19 +352,46 @@ impl OwnedChildren {
         }
     }
 
-    fn signal_provider(&self, signal: libc::c_int) {
+    fn signal_provider(&self, signal: libc::c_int) -> io::Result<()> {
         if let Some(child) = &self.child {
             // The group leader is still our unreaped child, so this number
             // cannot have been recycled. Never use it again after reaping.
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::kill(-(child.id() as i32), signal);
             }
+            #[cfg(target_os = "macos")]
+            {
+                let pid = child.id() as i32;
+                crate::process::identity::signal_unreaped_group(pid, signal)?;
+                // SAFETY: this helper owns the unreaped child. It may have
+                // left the original group, but its own pid is still reserved.
+                if unsafe { libc::kill(pid, signal) } == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
+                }
+            }
         }
         self.provider.signal(signal);
+        Ok(())
     }
 
     fn stop_children(&mut self, deadline: Instant) -> io::Result<bool> {
         loop {
+            #[cfg(target_os = "macos")]
+            let descendants = self
+                .descendants
+                .as_mut()
+                .map_or(Ok(true), |tracker| tracker.get_mut().stop());
+            #[cfg(target_os = "linux")]
+            let descendants = Ok(true);
+
+            // The unreaped root still reserves its group. Sweep it once more
+            // after the census, while that address still has authority.
+            #[cfg(target_os = "macos")]
+            let final_group_signal = self.signal_provider(libc::SIGKILL);
             for pid in direct_children()? {
                 // No other thread or handler reaps children in this process.
                 // A child that exits stays a zombie until the loop below.
@@ -271,8 +401,14 @@ impl OwnedChildren {
                     return Err(io::Error::last_os_error());
                 }
             }
-            if self.reap()? {
-                return Ok(true);
+            let reaped = self.reap()?;
+            #[cfg(target_os = "macos")]
+            final_group_signal?;
+            if reaped {
+                match descendants {
+                    Ok(false) => {}
+                    outcome => return outcome,
+                }
             }
             if Instant::now() >= deadline {
                 return Ok(false);
@@ -288,7 +424,16 @@ impl OwnedChildren {
         loop {
             // A server its launcher left behind may be adopted here only now.
             self.provider.signal(libc::SIGKILL);
-            if self.reap()? || (self.child.is_none() && !self.provider.signal(0)) {
+            let no_children = self.reap()?;
+            #[cfg(target_os = "linux")]
+            let ended = no_children || (self.child.is_none() && !self.provider.remain());
+            #[cfg(target_os = "macos")]
+            // The confirmed server can be reparented to launchd while it
+            // exits. Our wait cannot prove the server's end on that platform.
+            let ended = self.child.is_none() && !self.provider.remain();
+            #[cfg(target_os = "macos")]
+            let _ = no_children;
+            if ended {
                 return Ok(true);
             }
             if Instant::now() >= deadline {
@@ -342,6 +487,7 @@ fn killed_unreaped(pid: i32) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
     let mut children = std::collections::BTreeSet::new();
     for task in std::fs::read_dir("/proc/self/task")? {
@@ -359,7 +505,15 @@ pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
     Ok(children)
 }
 
-#[cfg(test)]
+#[cfg(target_os = "macos")]
+pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
+    Ok(crate::pinned_process::children_of(std::process::id())?
+        .into_iter()
+        .filter_map(|pid| i32::try_from(pid).ok())
+        .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))] // Adopts work through the Linux subreaper.
 pub(crate) mod tests {
     use super::*;
     use std::{os::unix::process::CommandExt, path::Path, process::Command};
@@ -440,10 +594,12 @@ record "$3" $left; record "$2" $running
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn detached_work(root: &Path) -> Work {
         detached_work_under(root, std::process::id() as i32)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn exists(pid: i32) -> bool {
         Path::new(&format!("/proc/{pid}")).exists()
     }
@@ -456,6 +612,7 @@ record "$3" $left; record "$2" $running
 
     /// Whether `pid` is gone once `reap` has collected what has exited: a
     /// signalled process exits, and is adopted here, only shortly after.
+    #[cfg(target_os = "linux")]
     pub(crate) fn ends(pid: i32, mut reap: impl FnMut()) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while exists(pid) && Instant::now() < deadline {
@@ -465,7 +622,11 @@ record "$3" $left; record "$2" $running
         !exists(pid)
     }
 
+    // These stand in for the native holder as a Linux subreaper, which adopts
+    // what the provider detaches; Darwin has no subreaper to stand in for.
+
     /// A process orphaned to this subreaper once it has been adopted here.
+    #[cfg(target_os = "linux")]
     fn orphan(root: &Path, name: &str) -> i32 {
         let file = root.join(name);
         let status = Command::new("/bin/sh")
@@ -488,10 +649,12 @@ record "$3" $left; record "$2" $running
         pid
     }
 
+    #[cfg(target_os = "linux")]
     fn subreaper() {
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_ordinary_teardown_leaves_what_the_provider_leaves() {
         if crate::retained_fixture::run_isolated() {
@@ -519,6 +682,7 @@ record "$3" $left; record "$2" $running
         assert!(!exists(work.detached) && !exists(work.left));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_server_its_launcher_left_here_ends_with_the_provider() {
         if crate::retained_fixture::run_isolated() {
@@ -544,6 +708,7 @@ record "$3" $left; record "$2" $running
         assert!(children.terminate(Duration::from_secs(10)).unwrap());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_force_stopped_provider_spares_nothing() {
         if crate::retained_fixture::run_isolated() {
@@ -566,6 +731,7 @@ record "$3" $left; record "$2" $running
         assert!(!exists(work.detached) && !exists(work.running) && !exists(work.left));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_killed_server_its_launcher_left_here_spares_nothing() {
         if crate::retained_fixture::run_isolated() {
@@ -602,6 +768,7 @@ record "$3" $left; record "$2" $running
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_teardown_that_did_not_decide_stops_everything() {
         if crate::retained_fixture::run_isolated() {

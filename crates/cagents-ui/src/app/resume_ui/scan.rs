@@ -124,6 +124,9 @@ pub fn scan(
     if scan.settled_negative() {
         return Some(scan);
     }
+    if len >= UNCACHE_BYTES {
+        read_uncached(&file);
+    }
     file.seek(SeekFrom::Start(scan.offset)).ok()?;
     let mut reader = Records::new(provider, path, &mut scan);
     let position = reader.scan.offset;
@@ -296,6 +299,25 @@ fn boundary(file: &mut std::fs::File, scan: &Scan) -> Option<u64> {
     (read == length).then_some(hash)
 }
 
+/// Linux drops a large transcript's pages once it has been read.
+#[cfg(target_os = "linux")]
+fn read_uncached(_file: &std::fs::File) {}
+
+/// Darwin cannot drop a file's cached pages after the fact, so a large
+/// transcript is read without caching it instead. Advisory only. Unlike
+/// Linux, which keeps the pages of a scan that settles as a negative partway
+/// through, this cannot know in advance, so those reads go uncached too.
+#[cfg(target_os = "macos")]
+fn read_uncached(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_NOCACHE takes an integer flag, on a descriptor this function
+    // borrows.
+    unsafe {
+        libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn uncache(file: &std::fs::File) {
     use std::os::fd::AsRawFd;
     // SAFETY: advisory only, on a descriptor this function borrows.
@@ -303,6 +325,10 @@ fn uncache(file: &std::fs::File) {
         libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
     }
 }
+
+/// See [`read_uncached`]: Darwin read it without caching it.
+#[cfg(target_os = "macos")]
+fn uncache(_file: &std::fs::File) {}
 
 /// Reads records into a scan.
 struct Records<'a> {
@@ -853,15 +879,23 @@ pub fn clean_prompt(provider: Provider, text: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
-/// A bounded, single-paragraph-friendly excerpt.
+/// A bounded excerpt: the first [`EXCERPT_CHARS`] characters, and one more
+/// when the text runs on, so the picker can tell a cut excerpt by its length
+/// and fade it out rather than end it on an ellipsis.
 fn excerpt(text: &str) -> String {
-    let text = text.trim();
-    if text.chars().count() <= EXCERPT_CHARS {
-        return text.to_owned();
+    text.trim().chars().take(EXCERPT_CHARS + 1).collect()
+}
+
+/// `excerpt` as the picker shows it, and the most characters it shows.
+///
+/// Catalogs saved before excerpts kept the character past the budget hold a
+/// cut one as the budget less one, ending with an ellipsis. It is shown
+/// without the ellipsis, held to a budget it runs past, so it fades the same.
+pub fn shown_excerpt(excerpt: &str) -> (&str, usize) {
+    match excerpt.strip_suffix('…') {
+        Some(cut) if cut.chars().count() == EXCERPT_CHARS - 1 => (cut, EXCERPT_CHARS - 2),
+        _ => (excerpt, EXCERPT_CHARS),
     }
-    let mut cut: String = text.chars().take(EXCERPT_CHARS - 1).collect();
-    cut.push('…');
-    cut
 }
 
 #[cfg(test)]
@@ -871,6 +905,29 @@ mod tests {
     use std::io::Write;
 
     const ID: &str = "f0e49307-af96-4edd-b23f-60b185fe4fea";
+
+    /// A cut excerpt carries no ellipsis of its own: it runs one character
+    /// past the budget the picker holds it to, so the picker fades it. One
+    /// saved with an ellipsis by an earlier run is shown the same way.
+    #[test]
+    fn a_cut_excerpt_runs_past_its_budget_instead_of_ending_on_an_ellipsis() {
+        let short = excerpt("  Fix the flaky test  ");
+        assert_eq!(shown_excerpt(&short), ("Fix the flaky test", EXCERPT_CHARS));
+        let long = excerpt(&"word ".repeat(EXCERPT_CHARS));
+        assert!(!long.contains('…'));
+        let (shown, limit) = shown_excerpt(&long);
+        assert_eq!(limit, EXCERPT_CHARS);
+        assert!(shown.chars().count() > limit);
+        let legacy = format!("{}…", "a".repeat(EXCERPT_CHARS - 1));
+        let (shown, limit) = shown_excerpt(&legacy);
+        assert_eq!(shown, "a".repeat(EXCERPT_CHARS - 1));
+        assert!(shown.chars().count() > limit);
+        // Text that merely ends with an ellipsis keeps it.
+        assert_eq!(
+            shown_excerpt("Wait for it…"),
+            ("Wait for it…", EXCERPT_CHARS)
+        );
+    }
 
     fn write(path: &Path, records: &[Value]) {
         let mut file = std::fs::File::options()

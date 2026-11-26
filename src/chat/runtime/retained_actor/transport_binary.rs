@@ -23,9 +23,14 @@ impl RemoteActor {
         after: Option<u64>,
         deadline: Instant,
     ) -> Result<PreparedResponse, ReadFailure> {
-        let read = self.read_by("presentation", deadline, |deadline| {
-            self.presentation_until(id, after, deadline)
-        });
+        let read = self
+            .read_by("presentation", deadline, |deadline| {
+                self.presentation_until(id, after, deadline)
+            })
+            .map(|response| match self.0.frames.get() {
+                Some(frames) => frames.recognize_presentation(response),
+                None => response,
+            });
         // A read due after another reader's failure stays due after this one
         // succeeds: that reader still needs it.
         if let Err(failure) = &read
@@ -143,7 +148,7 @@ impl RemoteActor {
                 deadline,
             )?;
             let bytes = deadline_io::receive_bytes_until(&control, deadline)?;
-            verify_peer(&control, &self.0.identity.record)?;
+            verify_replied_peer(&control, &self.0.identity.record)?;
             Ok(bytes)
         })()
         .map_err(|error| interrupted_request("presentation_binary", error))?;

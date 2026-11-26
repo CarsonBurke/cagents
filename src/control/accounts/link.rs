@@ -96,7 +96,7 @@ fn execute_with(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use clap::Parser;

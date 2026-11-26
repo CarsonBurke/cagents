@@ -64,7 +64,7 @@ fn execute_with(client: &mut ControlClient, account: AccountId) -> Result<Comman
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
     use clap::Parser;

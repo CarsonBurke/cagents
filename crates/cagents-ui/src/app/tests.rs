@@ -651,8 +651,8 @@ fn terminal_handoff_completion_retires_only_exact_successes_and_reports_only_fai
     assert!(
         notices
             .iter()
-            .any(|notice| notice.contains("1 terminal(s) remain pending")
-                && notice.contains(&refused.id.to_string()))
+            .any(|notice| notice.contains("receipt refused")
+                && !notice.contains(&refused.id.to_string()))
     );
     assert!(
         notices
@@ -889,8 +889,9 @@ fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
 
 #[test]
 fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
-    // A free right edge keeps `WINDOW_RESIZE_BORDER` of the window from the
-    // content, so the third case sits exactly at the narrow threshold.
+    // The cases below specify window widths with a client resize border.
+    // Adjust the native window width so each platform tests the same content
+    // width, including the exact threshold in the third case.
     // Each pane carries its own inspector, so an open one takes nothing
     // from the window's width.
     for (window, seed, with_project, expected, measured) in [
@@ -902,6 +903,12 @@ fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
         (2000.0, 600.0, true, 0.5, 1360.0),
         (900.0, 1340.0, true, 1.0, 640.0),
     ] {
+        let border = if cfg!(target_os = "macos") {
+            0.0
+        } else {
+            design::WINDOW_RESIZE_BORDER
+        };
+        let window = window - design::WINDOW_RESIZE_BORDER + border;
         let mut app = context_inspector_test_app(false);
         app.settings.default_native_pane_fraction = 0.5;
         if with_project {
@@ -3205,21 +3212,48 @@ fn review_file_panel_control_remains_accessible_across_pane_widths() {
     use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
-    let mut pane = app.pull_request_pane(&crate::model::PullRequestView {
+    let view = crate::model::PullRequestView {
         repository: PathBuf::from("/repo"),
         selected_number: None,
         file_panel_width: None,
         file_panel_collapsed: None,
-    });
+    };
+    let mut pane = app.pull_request_pane(&view);
     let renderer = headless_renderer();
-    for (width, collapsed, label) in [
-        (260.0, None, "Show review files"),
-        (260.0, Some(false), "Hide review files"),
-        (500.0, None, "Show review files"),
-        (900.0, None, "Hide review files"),
+    // Until a file is chosen the panel holds what to choose from, the pull
+    // requests or the review's files, so only a file's diff folds it away on
+    // a narrow card unasked.
+    #[derive(Clone, Copy)]
+    enum Review {
+        Browsing,
+        Opened,
+        FileChosen,
+    }
+    use crate::pull_request_review::discussion_ui::test_support::{ready, ready_unselected};
+    for (width, collapsed, review, label) in [
+        (260.0, None, Review::Browsing, "Hide pull requests"),
+        (260.0, Some(true), Review::Browsing, "Show pull requests"),
+        (500.0, None, Review::Browsing, "Hide pull requests"),
+        (260.0, None, Review::Opened, "Hide review files"),
+        (500.0, None, Review::Opened, "Hide review files"),
+        (500.0, Some(true), Review::Opened, "Show review files"),
+        (260.0, None, Review::FileChosen, "Show review files"),
+        (260.0, Some(false), Review::FileChosen, "Hide review files"),
+        (500.0, None, Review::FileChosen, "Show review files"),
+        (900.0, None, Review::FileChosen, "Hide review files"),
     ] {
         pane.file_panel_collapsed = collapsed;
+        pane.review = match review {
+            Review::Browsing => app.pull_request_pane(&view).review,
+            Review::Opened => ready_unselected(),
+            Review::FileChosen => ready(),
+        };
         drop(app.workspace.resize_viewport(width));
+        assert_eq!(
+            app.pull_request_side_shown(card, &pane),
+            label.starts_with("Hide"),
+            "the panel is drawn exactly when its toggle offers to hide it, at width {width}"
+        );
         let mut element = app.pull_request_card_view(card, &pane);
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -4882,7 +4916,11 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
     }
 
     let width = 1500.0;
-    let border = design::WINDOW_RESIZE_BORDER;
+    let border = if cfg!(target_os = "macos") {
+        0.0
+    } else {
+        design::WINDOW_RESIZE_BORDER
+    };
     for inspector in [false, true] {
         let mut app = context_inspector_test_app(true);
         app.settings.ui_scale = 1.0;
@@ -4956,6 +4994,8 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
     }
 }
 
+// Window states are Wayland events.
+#[cfg(target_os = "linux")]
 #[test]
 fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
@@ -5013,6 +5053,8 @@ fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
     assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
 }
 
+// Window states are Wayland events.
+#[cfg(target_os = "linux")]
 #[test]
 fn resizes_query_the_window_state_only_until_wayland_reports_it() {
     use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
@@ -6123,7 +6165,10 @@ fn the_inspector_shortcut_toggles_the_focused_pane_and_honors_bindings_and_modal
         text: None,
         repeat,
     };
-    let default = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    let default = match settings::ShortcutPlatform::CURRENT {
+        settings::ShortcutPlatform::Linux => keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        settings::ShortcutPlatform::MacOs => keyboard::Modifiers::LOGO | keyboard::Modifiers::ALT,
+    };
     for captured in [false, true] {
         for custom in [false, true] {
             let mut app = context_inspector_test_app(true);
@@ -7424,7 +7469,7 @@ fn workspace_switcher_tab_steers_a_compositor_safe_fallback_hold() {
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Code(physical),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
             text: None,
             repeat: false,
         },
@@ -12253,6 +12298,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         window_filled: false,
         window_state_observed: false,
         right_edge_tiled: false,
+        window_controls_points: None,
         core,
         settings_path: None,
         uncertain_terminal_proofs: HashMap::new(),
@@ -12282,6 +12328,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         source_control_mutations: HashMap::new(),
         operation_recovery: Default::default(),
         device_ui: device_ui::State::default(),
+        phone_ui: phone_ui::State::default(),
         account_ui: account_ui::Accounts::default(),
         sign_ins: account_ui::SignIns::default(),
         automation_ui: crate::automation_ui::State::default(),
@@ -13808,6 +13855,7 @@ fn folder_projects_select_a_directory_scope_and_keep_their_mode_on_refresh() {
     assert_eq!(app.workspace_view(), context_sections::WorkspaceView::Files);
 
     std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/HEAD"), "invalid ref\n").unwrap();
     let refreshed = load_project(
         &root,
         Some(project),
@@ -14883,7 +14931,7 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
             modified_key: keyboard::Key::Character("S".into()),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
             location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
             text: None,
             repeat: false,
         },
@@ -14897,7 +14945,10 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     );
     assert!(!app.palette.is_open());
     app.source_control_mutations.clear();
-    app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
+    app.settings.keyboard_shortcuts.command_palette = settings::parse_chords(&format!(
+        "{}+Shift+S",
+        settings::ModifierNames::CURRENT.primary
+    ));
     drop(app.update(key()));
     assert!(app.palette.is_open());
     assert!(app.source_control_mutations.is_empty(), "nothing is staged");
@@ -16294,4 +16345,92 @@ fn choosing_a_listed_pull_request_in_the_pane_opens_it() {
         "closing the review forgets the pull request"
     );
     let _ = project;
+}
+
+/// A notice's details are held to their lines by the text engine's own
+/// ellipsis, which the vendored patch makes keep ordinary word wrapping up to
+/// the last line. Exercise the engine the UI reexports, so removing or
+/// bypassing that patch fails here.
+#[test]
+fn notice_detail_ellipsis_preserves_ordinary_word_wrap_geometry() {
+    use cosmic::iced::advanced::graphics::text::cosmic_text::{
+        Attrs, AttrsList, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Hinting,
+        ShapeBuffer, ShapeLine, Shaping, Wrap, fontdb,
+    };
+
+    let mut db = fontdb::Database::new();
+    db.load_font_data(
+        include_bytes!("../../../../vendor/libcosmic/res/open-sans/OpenSans-Regular.ttf").to_vec(),
+    );
+    let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+    let text = "Pack my box with five dozen liquor jugs. Sphinx of black quartz, judge my vow. \
+                The five boxing wizards jump quickly.";
+    let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+    let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+    let layout = |ellipsize| {
+        let mut lines = Vec::new();
+        shaped.layout_to_buffer(
+            &mut ShapeBuffer::default(),
+            18.0,
+            Some(110.0),
+            Wrap::WordOrGlyph,
+            ellipsize,
+            None,
+            &mut lines,
+            None,
+            Hinting::Disabled,
+        );
+        lines
+    };
+    let ordinary = layout(Ellipsize::None);
+    let limited = layout(Ellipsize::End(EllipsizeHeightLimit::Lines(
+        NOTICE_DETAIL_LINES,
+    )));
+    assert!(ordinary.len() > NOTICE_DETAIL_LINES);
+    assert_eq!(limited.len(), NOTICE_DETAIL_LINES);
+    let expected = &ordinary[NOTICE_DETAIL_LINES - 1].glyphs[0];
+    let actual = &limited[NOTICE_DETAIL_LINES - 1].glyphs[0];
+    assert_eq!(actual.start, expected.start);
+    assert_eq!(actual.x, expected.x);
+    assert!(!text[actual.start..actual.end].starts_with(' '));
+}
+
+/// The traffic lights' room is measured in AppKit points and laid out in
+/// interface units; the header gives up only what the projects pane beside
+/// them does not already cover, or their whole width at the trailing edge.
+#[test]
+fn the_header_leaves_the_window_controls_only_what_the_projects_pane_does_not() {
+    use crate::sidebar::{WindowControls, WindowControlsEdge};
+    let mut app = context_inspector_test_app(false);
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+
+    let rail = design::NAVIGATION_RAIL_WIDTH;
+    app.settings.ui_scale = 2.0;
+    app.window_controls_points = Some(WindowControls {
+        width: 2.0 * (rail + 20.0),
+        height: 60.0,
+        edge: WindowControlsEdge::Leading,
+    });
+    app.chrome_ui.projects_collapsed = true;
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 20.0);
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Trailing), 0.0);
+    app.chrome_ui.projects_collapsed = false;
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+
+    app.window_controls_points = Some(WindowControls {
+        width: 140.0,
+        height: 60.0,
+        edge: WindowControlsEdge::Trailing,
+    });
+    assert_eq!(app.window_controls_reach(WindowControlsEdge::Leading), 0.0);
+    assert_eq!(
+        app.window_controls_reach(WindowControlsEdge::Trailing),
+        70.0
+    );
+    // The sidebar keeps its leading-edge layout; the trailing lights are
+    // the header's to avoid.
+    assert!(
+        app.window_controls()
+            .is_some_and(|controls| controls.edge == WindowControlsEdge::Trailing)
+    );
 }

@@ -198,7 +198,7 @@ impl Presentation {
     /// Hidden control subscribers discard body changes but must obey the same
     /// revision and retained-metadata fences as a full presentation consumer.
     /// Consuming the update avoids cloning catalogs or transcript payloads.
-    #[cfg(any(feature = "ui", test))]
+    #[cfg(any(feature = "ui", test, feature = "test-support"))]
     pub(crate) fn metadata_for(mut self, previous: &Snapshot) -> Result<Snapshot, &'static str> {
         self.restore_metadata(previous)?;
         if self

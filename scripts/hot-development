@@ -65,9 +65,9 @@ def sandbox(command, *, offline=False):
     return args + ["--"] + command
 
 
-def build_product(name, features, target):
+def build_product(name, selection, target):
     command = ["cargo", "build", "--locked", "--profile", "dev-runtime",
-               "--target", target, "--no-default-features", "--features", features, "--bin", name,
+               "--target", target, "--no-default-features", *selection, "--bin", name,
                "--message-format", "json-render-diagnostics"]
     artifacts = CargoArtifacts()
     with subprocess.Popen(sandbox(command), stdout=subprocess.PIPE, text=True) as child:
@@ -122,8 +122,8 @@ def main():
         fail("Hot development requires a Linux native Rust toolchain")
     # Without `full`, which selects the shipped product's identity and nothing
     # a development build uses, both lanes share one CLI and one daemon build.
-    cli = build_product("cagents", "development", native)
-    daemon = build_product("cagentsd", "development,host", native)
+    cli = build_product("cagents", ["--features", "development"], native)
+    daemon = build_product("cagentsd", ["-p", "cagents-host", "--features", "development"], native)
     ui_features = "hot-reload" if args.browserless else "hot-reload,integrated-browser"
     # Resolve and fetch the selected UI graph before cargo-hot builds offline.
     # cargo-hot builds its specialized executable instead of using an ordinary UI artifact.
