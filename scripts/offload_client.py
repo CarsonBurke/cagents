@@ -67,36 +67,39 @@ def _open_slot(path, use_default):
     return descriptor
 
 
-def _local_budget(cancellation, deadline):
+LOCAL_SYNC_WAIT = "waiting for a local sync slot"
+
+
+def _local_budget(cancellation, deadline, waiting=LOCAL_SYNC_WAIT):
     if cancellation is not None and cancellation.poll(0):
         raise LocalSyncCancelled
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise LocalSyncTimeout("timed out waiting for a local sync slot")
+            raise LocalSyncTimeout(f"timed out while {waiting}")
         return remaining
 
 
-def _wait_for_slot(descriptors, cancel_fd, cancellation, deadline):
+def _wait_for_slot(descriptors, cancel_fd, cancellation, deadline, waiting=LOCAL_SYNC_WAIT):
     # Each helper blocks inside flock. Its descriptor shares the lock with
     # ours, so an exit grants the slot. Watch every slot and take the first
     # one available, including when its previous holder was killed.
-    print("waiting for a local sync slot", file=sys.stderr, flush=True)
+    print(waiting, file=sys.stderr, flush=True)
     waiters = {}
     try:
         poller = select.poll()
         if cancel_fd is not None:
             poller.register(cancel_fd, select.POLLIN)
         for descriptor in descriptors:
-            _local_budget(cancellation, deadline)
+            _local_budget(cancellation, deadline, waiting)
             waiter = Waiter(descriptor)
             waiters[descriptor] = waiter
             if waiter.granted():
                 return descriptor
             poller.register(waiter.pidfd, select.POLLIN)
-        remaining = _local_budget(cancellation, deadline)
+        remaining = _local_budget(cancellation, deadline, waiting)
         poller.poll(None if remaining is None else int(1000 * remaining) + 1)
-        _local_budget(cancellation, deadline)
+        _local_budget(cancellation, deadline, waiting)
         for descriptor, waiter in waiters.items():
             if waiter.granted():
                 return descriptor
@@ -104,6 +107,17 @@ def _wait_for_slot(descriptors, cancel_fd, cancellation, deadline):
     finally:
         for waiter in waiters.values():
             waiter.withdraw()
+
+
+def acquire_held_build(descriptor, *, cancel_fd, deadline):
+    """Acquire the single build lock inside an existing remote hold."""
+    waiting = "waiting for another build in this hold"
+    cancellation = select.poll()
+    cancellation.register(cancel_fd, select.POLLIN)
+    _local_budget(cancellation, deadline, waiting)
+    if not try_lock(descriptor):
+        _wait_for_slot([descriptor], cancel_fd, cancellation, deadline, waiting)
+    _local_budget(cancellation, deadline, waiting)
 
 
 @contextmanager
