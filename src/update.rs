@@ -381,6 +381,7 @@ pub(crate) fn stable_ui_bundle(
     // the new startup connection. Keep direct startup for that fallback.
     if !locate(launcher).is_ok_and(|caller| caller.version_root == layout.version_root)
         || served_version_root(&layout)? != layout.version_root
+        || crate::install_guard::has_staged_owner_marker(&layout.version_root)
     {
         return Ok(None);
     }
@@ -4163,6 +4164,13 @@ mod tests {
         assert_eq!(stable_ui_bundle(&selected, &cli).unwrap(), Some(bundle));
         assert!(stable_ui_bundle(&staged, &cli).unwrap().is_none());
         assert!(stable_ui_bundle(&selected, &staged).unwrap().is_none());
+
+        // A staged owner can exec a different UI. Keep the direct path whose
+        // stdout handshake can follow that existing transition.
+        let owner = prefix.join("versions/1.2.3/.deferred-owner.json");
+        fs::write(&owner, "existing owner marker").unwrap();
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
+        fs::remove_file(owner).unwrap();
 
         fs::remove_file(&launcher).unwrap();
         std::os::unix::fs::symlink(&selected, launcher).unwrap();
