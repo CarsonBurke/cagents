@@ -778,7 +778,11 @@ impl Journal {
 
     /// Keep replay evidence and ownership. Only the request that still
     /// supplies this target's attention may lose its unread state.
-    pub fn acknowledge_waiting(&mut self, target: &Target) -> Result<Option<Uuid>, String> {
+    pub fn acknowledge_waiting(
+        &mut self,
+        target: &Target,
+        matches_source: impl FnOnce(&Event) -> bool,
+    ) -> Result<Option<Uuid>, String> {
         let key = target.storage_key();
         self.0
             .transaction(|connection| {
@@ -794,7 +798,9 @@ impl Journal {
                 };
                 let event = Event::from_journal(&event)
                     .map_err(|_| diesel::result::Error::RollbackTransaction)?;
-                if event.evidence.kind != crate::notifications::Kind::Waiting {
+                if event.evidence.kind != crate::notifications::Kind::Waiting
+                    || !matches_source(&event)
+                {
                     return Ok(None);
                 }
                 let parsed = id
@@ -1296,7 +1302,7 @@ mod tests {
         let first = journal.record(waiting.clone(), false).unwrap().unwrap();
         let target = Target::Session(session);
         assert_eq!(
-            journal.acknowledge_waiting(&target).unwrap(),
+            journal.acknowledge_waiting(&target, |_| true).unwrap(),
             Some(first.id)
         );
         assert!(journal.list().unwrap()[0].acknowledged);
@@ -1306,7 +1312,10 @@ mod tests {
             .record(event(session, "turn:finished"), false)
             .unwrap()
             .unwrap();
-        assert_eq!(journal.acknowledge_waiting(&target).unwrap(), None);
+        assert_eq!(
+            journal.acknowledge_waiting(&target, |_| true).unwrap(),
+            None
+        );
         assert_eq!(journal.list().unwrap(), [finished]);
     }
 

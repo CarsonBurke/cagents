@@ -385,15 +385,34 @@ fn work(
 }
 
 fn candidates(host: &SharedHost) -> Option<Vec<Candidate>> {
+    let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
+    let _control = gate.shared();
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down {
         return None;
     }
+    let proof = state.proof();
+    let waiting = state.notifications.as_ref().map(|notifications| {
+        notifications
+            .terminal_waits(&proof.boot_id)
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+    });
     Some(
         state
             .terminals
             .iter()
             .filter_map(|(&id, record)| {
+                if let (Some(notifications), Some(waiting)) = (&state.notifications, &waiting)
+                    && !state.notification_closed.contains(&id)
+                {
+                    if let Some(exited) = record.handle.exited_waiting_agent() {
+                        // Read from the worker still registered for this exact
+                        // proof. Another foreground provider may already exist.
+                        notifications.clear_terminal_waiting(id, &proof.boot_id, exited);
+                    }
+                    record.handle.watch_waiting_agent(waiting.get(&id).copied());
+                }
                 if record.handle.is_completed() {
                     return None;
                 }
@@ -402,7 +421,7 @@ fn candidates(host: &SharedHost) -> Option<Vec<Candidate>> {
                     id,
                     process,
                     handle: record.handle.clone(),
-                    proof: state.proof().clone(),
+                    proof: proof.clone(),
                 })
             })
             .collect(),
@@ -542,9 +561,11 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
                 Some(AttentionClear::TurnStarted) => {
                     notifications.session_started_turn(candidate.id, predecessors)
                 }
-                Some(AttentionClear::RequestResolved) => {
-                    notifications.clear_session_waiting(candidate.id)
-                }
+                Some(AttentionClear::RequestResolved) => notifications.clear_terminal_waiting(
+                    candidate.id,
+                    &candidate.proof.boot_id,
+                    candidate.process.identity(),
+                ),
                 None => {}
             }
             if let Some(evidence) = observation.attention {
@@ -567,7 +588,15 @@ fn observe(host: &Weak<HostLock>, candidate: &Candidate) -> Outcome {
                         request: None,
                     });
                 }
-                notifications.record(event);
+                if event.evidence.kind == crate::notifications::Kind::Waiting {
+                    notifications.record_terminal_wait(
+                        event,
+                        &candidate.proof.boot_id,
+                        candidate.process.identity(),
+                    );
+                } else {
+                    notifications.record(event);
+                }
             }
         }
     }

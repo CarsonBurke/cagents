@@ -44,7 +44,7 @@ use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use crate::{
     model::{
         LaunchRecipe, TerminalId, TerminalOutputActivity, TerminalSession,
-        agent_recovery::AgentProcess,
+        agent_recovery::{AgentProcess, AgentProcessIdentity},
     },
     pinned_process::PinnedProcess,
     secure_file::open_private_append_file,
@@ -553,6 +553,20 @@ impl InputOrder {
     }
 }
 
+#[derive(Clone, Copy)]
+enum WaitingAgent {
+    Watching(AgentProcessIdentity),
+    Exited(AgentProcessIdentity),
+}
+
+impl WaitingAgent {
+    fn process(self) -> AgentProcessIdentity {
+        match self {
+            Self::Watching(process) | Self::Exited(process) => process,
+        }
+    }
+}
+
 struct PublishedState {
     execution_instance: uuid::Uuid,
     snapshot: ArcSwap<RenderSnapshot>,
@@ -563,6 +577,7 @@ struct PublishedState {
     activity: Mutex<Option<TerminalOutputActivity>>,
     agent_activity: Mutex<Option<crate::agent::Activity>>,
     agent_process: Mutex<Option<AgentProcess>>,
+    waiting_agent: Mutex<Option<WaitingAgent>>,
     agent_observer: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     semantic_events: OnceLock<Weak<Sender<TerminalEvent>>>,
     conversation_title: Mutex<Option<String>>,
@@ -679,6 +694,7 @@ impl PublishedState {
             activity: Mutex::new(None),
             agent_activity: Mutex::new(None),
             agent_process: Mutex::new(None),
+            waiting_agent: Mutex::new(None),
             agent_observer: OnceLock::new(),
             semantic_events: OnceLock::new(),
             conversation_title: Mutex::new(None),
@@ -1652,6 +1668,33 @@ impl TerminalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// Track the current committed terminal request and retain its exit
+    /// proof until the broker publishes the settlement or another request.
+    pub fn watch_waiting_agent(&self, process: Option<AgentProcessIdentity>) {
+        let mut waiting = self
+            .inner
+            .published
+            .waiting_agent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if waiting.map(WaitingAgent::process) != process {
+            *waiting = process.map(WaitingAgent::Watching);
+        }
+    }
+
+    pub fn exited_waiting_agent(&self) -> Option<AgentProcessIdentity> {
+        match *self
+            .inner
+            .published
+            .waiting_agent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            Some(WaitingAgent::Exited(process)) => Some(process),
+            _ => None,
+        }
     }
 
     pub fn set_agent_process_observer(&self, observer: impl Fn() + Send + Sync + 'static) {
@@ -5572,16 +5615,49 @@ impl Worker {
             }));
         }
         self.agent_process = process.clone();
+        let waiting_ended = self.prove_waiting_agent_exit();
         if changed {
             *self
                 .published
                 .agent_process
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = process;
-            if let Some(observer) = self.published.agent_observer.get() {
-                observer();
-            }
         }
+        if (changed || waiting_ended)
+            && let Some(observer) = self.published.agent_observer.get()
+        {
+            observer();
+        }
+    }
+
+    fn prove_waiting_agent_exit(&self) -> bool {
+        let watched = *self
+            .published
+            .waiting_agent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let waiting = match watched {
+            Some(WaitingAgent::Watching(process)) => process,
+            // A full/unavailable broker can retry on the existing PTY
+            // cadence, without another kernel probe or a separate timer.
+            Some(WaitingAgent::Exited(_)) => return true,
+            None => return false,
+        };
+        if self.agent_process.as_ref().map(AgentProcess::identity) == Some(waiting)
+            || !waiting.has_exited()
+        {
+            return false;
+        }
+        let mut watched = self
+            .published
+            .waiting_agent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if matches!(*watched, Some(WaitingAgent::Watching(current)) if current == waiting) {
+            *watched = Some(WaitingAgent::Exited(waiting));
+            return true;
+        }
+        false
     }
 
     /// Timer-driven observation. The descent is only worth its cost while the
