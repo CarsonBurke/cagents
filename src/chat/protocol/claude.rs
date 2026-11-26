@@ -338,8 +338,6 @@ pub(crate) fn attribution_settings(
     explicit: Option<&str>,
     attribution: impl FnOnce() -> Option<Value>,
 ) -> Option<String> {
-    // A file path stays intact. Its contents may include credentials and
-    // Claude loads it on its own.
     let mut settings: serde_json::Map<String, Value> = match explicit {
         Some(value) => serde_json::from_str(value).ok()?,
         None => serde_json::Map::new(),
@@ -349,6 +347,135 @@ pub(crate) fn attribution_settings(
     }
     settings.insert("attribution".into(), attribution()?);
     Some(Value::Object(settings).to_string())
+}
+
+/// The common inline case stays small. Larger settings travel via Claude's
+/// file option so their content cannot exceed an OS argument or environment
+/// entry limit.
+pub(crate) const MAX_INLINE_ATTRIBUTION: usize = 4 * 1024;
+const MAX_SETTINGS_FILE: u64 = 2 * 1024 * 1024;
+
+fn attribution_filename(settings: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(".claude-attribution-{:x}.json", Sha256::digest(settings))
+}
+
+fn write_attribution_file(directory: &Path, settings: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    if settings.len() as u64 > MAX_SETTINGS_FILE {
+        return Err(std::io::Error::other(
+            "Claude settings exceed the file option limit",
+        ));
+    }
+    let path = directory.join(attribution_filename(settings));
+    let argument = path
+        .to_str()
+        .filter(|value| value.len() <= MAX_INLINE_ATTRIBUTION)
+        .ok_or_else(|| {
+            std::io::Error::other("The Claude settings path cannot be passed in argv")
+        })?;
+    if !path.exists() {
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(settings.as_bytes())?;
+        match file.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error),
+        }
+    }
+    if read_attribution_file(directory, argument).as_deref() != Some(settings) {
+        return Err(std::io::Error::other(
+            "Cannot verify the private Claude settings override",
+        ));
+    }
+    Ok(argument.to_owned())
+}
+
+fn read_attribution_file(directory: &Path, argument: &str) -> Option<String> {
+    use std::io::Read;
+    let path = Path::new(argument);
+    if path.parent() != Some(directory)
+        || !path
+            .file_name()?
+            .to_str()?
+            .starts_with(".claude-attribution-")
+    {
+        return None;
+    }
+    let mut value = String::new();
+    crate::secure_file::open_existing_private_file_readonly(path)
+        .ok()?
+        .take(MAX_SETTINGS_FILE + 1)
+        .read_to_string(&mut value)
+        .ok()?;
+    (value.len() as u64 <= MAX_SETTINGS_FILE
+        && path.file_name()?.to_str()? == attribution_filename(&value))
+    .then_some(value)
+}
+
+/// Resolves the explicit settings at the point they would be passed to
+/// Claude. File-valued settings stay in a private file when overlaid.
+pub(crate) fn launch_attribution_argument(
+    cwd: &Path,
+    explicit: Option<&str>,
+    attribution: impl FnOnce() -> Option<Value>,
+) -> Option<String> {
+    launch_attribution_argument_with(cwd, explicit, attribution, |value| {
+        crate::instance::runtime_directory()
+            .and_then(|directory| write_attribution_file(&directory, value))
+    })
+}
+
+fn launch_attribution_argument_with(
+    cwd: &Path,
+    explicit: Option<&str>,
+    attribution: impl FnOnce() -> Option<Value>,
+    stage: impl FnOnce(&str) -> std::io::Result<String>,
+) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let explicit_path = explicit.filter(|value| !value.trim_start().starts_with('{'));
+    let value = if let Some(path) = explicit_path {
+        // Independent homes never need their explicit files read by cagents.
+        let inherited = attribution()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(cwd.join(path))
+            .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut value = String::new();
+        file.take(MAX_SETTINGS_FILE + 1)
+            .read_to_string(&mut value)
+            .ok()?;
+        if value.len() as u64 > MAX_SETTINGS_FILE {
+            return None;
+        }
+        attribution_settings(Some(&value), || Some(inherited))?
+    } else {
+        attribution_settings(explicit, attribution)?
+    };
+    if explicit_path.is_none() && value.len() <= MAX_INLINE_ATTRIBUTION {
+        return Some(value);
+    }
+    match stage(&value) {
+        Ok(argument) => Some(argument),
+        Err(error) => {
+            tracing::warn!(%error, "cannot stage the managed Claude attribution setting");
+            None
+        }
+    }
+}
+
+pub(crate) fn decode_attribution_argument(argument: &str) -> Option<String> {
+    let candidate = argument.strip_prefix("--settings=")?;
+    if candidate.starts_with('{') {
+        return Some(candidate.to_owned());
+    }
+    read_attribution_file(&crate::instance::runtime_directory().ok()?, candidate)
 }
 
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
@@ -470,13 +597,11 @@ fn arguments_with_attribution(
     }
     // Resolve at process launch so fresh, resumed and recovered chats all
     // read the current preference, without saving a flag into their recipe.
-    // Inline settings already live in argv and can share the same overlay.
-    // Leave a file argument intact so its contents stay out of argv.
-    if let Some(value) =
-        attribution_settings(settings_value.map(|index| result[index].as_str()), || {
-            attribution(&launch.recipe, setting_sources)
-        })
-    {
+    if let Some(value) = launch_attribution_argument(
+        &launch.recipe.working_directory,
+        settings_value.map(|index| result[index].as_str()),
+        || attribution(&launch.recipe, setting_sources),
+    ) {
         if let Some(index) = settings_value {
             result[index] = value;
         } else {

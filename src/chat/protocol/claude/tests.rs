@@ -15732,6 +15732,61 @@ fn a_reopened_narration_reads_as_commentary_from_its_signature() {
 }
 
 #[test]
+fn large_managed_attribution_and_explicit_files_stay_in_private_settings_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let stage = |value: &str| write_attribution_file(directory.path(), value);
+    let inherited = json!({"commit": "a".repeat(150 * 1024), "pr": ""});
+    let argument =
+        launch_attribution_argument_with(directory.path(), None, || Some(inherited.clone()), stage)
+            .unwrap();
+    assert!(argument.len() < MAX_INLINE_ATTRIBUTION);
+    let staged = read_attribution_file(directory.path(), &argument).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&staged).unwrap()["attribution"],
+        inherited
+    );
+    assert_eq!(
+        std::fs::metadata(&argument).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        stage(&staged).unwrap(),
+        argument,
+        "identical launches reuse the file"
+    );
+
+    let path = directory.path().join("settings.json");
+    std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+    let argument = launch_attribution_argument_with(
+        directory.path(),
+        Some("settings.json"),
+        || Some(json!(false)),
+        stage,
+    )
+    .unwrap();
+    assert_eq!(
+        read_attribution_file(directory.path(), &argument).as_deref(),
+        Some(r#"{"attribution":false,"theme":"dark"}"#)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"{"theme":"dark"}"#
+    );
+    std::fs::write(path, r#"{"attribution":true}"#).unwrap();
+    assert!(
+        launch_attribution_argument_with(
+            directory.path(),
+            Some("settings.json"),
+            || Some(json!(false)),
+            stage,
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
     let directory = tempfile::tempdir().unwrap();
     let homes = account::home::Homes::at(directory.path().join("accounts"));

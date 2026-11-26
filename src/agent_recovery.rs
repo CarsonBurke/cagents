@@ -12,6 +12,9 @@ use crate::agent::Provider;
 
 const MAX_HINT_BYTES: usize = 16 * 1024;
 const MAX_ARGV_BYTES: usize = 8 * 1024;
+#[cfg(feature = "host")]
+const MAX_OBSERVED_ARGV_BYTES: usize =
+    MAX_ARGV_BYTES + crate::chat::protocol::claude::MAX_INLINE_ATTRIBUTION + 16;
 
 /// Host-only activity evidence, separate from normalized recovery authority.
 #[cfg(feature = "host")]
@@ -279,21 +282,33 @@ pub(crate) fn claude_attribution_overlay_with(
             }
         }
     }
-    let value = crate::chat::protocol::claude::attribution_settings(
-        explicit.map(|(_, _, value)| value),
-        || attribution(&recipe, sources),
-    )?;
     let (position, original) = explicit.map_or((0, Vec::new()), |(position, length, _)| {
         (
             position,
             launch.arguments[position..position + length].to_vec(),
         )
     });
+    if launch_argv_bytes(launch) > MAX_ARGV_BYTES {
+        return None;
+    }
+    let value = crate::chat::protocol::claude::launch_attribution_argument(
+        &recipe.working_directory,
+        explicit.map(|(_, _, value)| value),
+        || attribution(&recipe, sources),
+    )?;
     Some(ClaudeAttributionOverlay {
         position,
         argument: format!("--settings={value}"),
         original,
     })
+}
+
+#[cfg(feature = "host")]
+fn launch_argv_bytes(launch: &LaunchRecipe) -> usize {
+    std::iter::once(&launch.program)
+        .chain(&launch.arguments)
+        .map(|argument| argument.len() + 1)
+        .sum()
 }
 
 #[cfg(feature = "host")]
@@ -321,16 +336,27 @@ fn restore_claude_attribution(launch: &mut LaunchRecipe, environment: &[u8]) {
         [flag, value] if flag == "--settings" => Some(value.as_str()),
         _ => return,
     };
-    let Some(generated) = overlay
-        .argument
-        .strip_prefix("--settings=")
-        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+    let Some(value) = crate::chat::protocol::claude::decode_attribution_argument(&overlay.argument)
+    else {
+        return;
+    };
+    let Some(generated) = serde_json::from_str::<serde_json::Value>(&value)
+        .ok()
         .and_then(|settings| settings.get("attribution").cloned())
     else {
         return;
     };
-    let expected = crate::chat::protocol::claude::attribution_settings(inline, || Some(generated));
-    if expected.is_some_and(|value| overlay.argument == format!("--settings={value}")) {
+    let original_is_file = inline.is_some_and(|original| !original.trim_start().starts_with('{'));
+    // The staged file's name authenticates its exact private contents. The
+    // user's original file can change after launch; keep the original path
+    // for the next launch instead of copying its old contents into a recipe.
+    let valid = if original_is_file {
+        !overlay.argument.starts_with("--settings={")
+    } else {
+        crate::chat::protocol::claude::attribution_settings(inline, || Some(generated)).as_deref()
+            == Some(value.as_str())
+    };
+    if valid {
         // An interpreter, when present, owns argv[1]. The recorded
         // position is relative to the provider's own arguments.
         let index = launch.arguments.len() - arguments.len() + overlay.position;
@@ -503,7 +529,7 @@ impl ProcessView {
         match self {
             #[cfg(any(target_os = "linux", test))]
             Self::Proc(root) => Some(ProcessLaunch {
-                arguments: bounded_read(root.join("cmdline"), MAX_ARGV_BYTES)?,
+                arguments: bounded_read(root.join("cmdline"), MAX_OBSERVED_ARGV_BYTES)?,
                 directory: fs::read_link(root.join("cwd")).ok()?,
                 environment: self.environment(),
             }),
@@ -512,7 +538,7 @@ impl ProcessView {
                 let observed = crate::process::inspect::arguments(pid).ok()?;
                 let arguments = observed.command_line();
                 let environment = process_environment(observed);
-                (arguments.len() <= MAX_ARGV_BYTES).then_some(())?;
+                (arguments.len() <= MAX_OBSERVED_ARGV_BYTES).then_some(())?;
                 Some(ProcessLaunch {
                     arguments,
                     directory: crate::process::inspect::working_directory(pid).ok()?,
@@ -1427,8 +1453,7 @@ fn read_process_launch(
     // Recovery retains its existing fallback. Activity requires the actual
     // allowlisted environment: missing keys must not inherit terminal
     // overrides, and an argv that long is not an agent invocation.
-    let mut exact = (request.agent && arguments.len() <= 128 && environ.is_some())
-        .then(std::collections::BTreeMap::new);
+    let mut exact = (request.agent && environ.is_some()).then(std::collections::BTreeMap::new);
     let mut runtime_environment = !view.is_darwin() || environ.is_some();
     if let Some(bytes) = &environ {
         for entry in bytes.split(|byte| *byte == 0) {
@@ -1475,6 +1500,12 @@ fn read_process_launch(
     };
     if let Some(environ) = &environ {
         restore_claude_attribution(&mut raw, environ);
+    }
+    if launch_argv_bytes(&raw) > MAX_ARGV_BYTES {
+        return None;
+    }
+    if raw.arguments.len() > 128 {
+        exact = None;
     }
     let recognized = Provider::recognize_launch(&raw);
     let native_agent = Provider::from_program(&raw.program).is_some();
@@ -2566,6 +2597,44 @@ mod tests {
                 assert_eq!(observed.exact.unwrap().arguments, expected.arguments);
             }
         }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn recovery_accepts_extra_argv_bytes_only_for_a_matching_attribution_overlay() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut base = launch("claude", &["--model", ""]);
+        base.arguments[1] = "x".repeat(MAX_ARGV_BYTES - launch_argv_bytes(&base));
+        assert_eq!(launch_argv_bytes(&base), MAX_ARGV_BYTES);
+        let overlay =
+            claude_attribution_overlay_with(&base, |_, _| Some(serde_json::json!(false))).unwrap();
+        let mut running = base.clone();
+        running
+            .arguments
+            .insert(overlay.position, overlay.argument.clone());
+        assert!(launch_argv_bytes(&running) > MAX_ARGV_BYTES);
+        process_fixture(fixture.path(), 100, &running, &[]);
+        let root = fixture.path().join("100");
+        let request = ForegroundRequest {
+            hint: Some(&base),
+            agent: true,
+        };
+        assert!(read_process_launch(&ProcessView::Proc(root.clone()), request).is_none());
+        fs::write(
+            root.join("environ"),
+            format!(
+                "{CLAUDE_ATTRIBUTION_OVERLAY}={}\0",
+                serde_json::to_string(&overlay).unwrap()
+            ),
+        )
+        .unwrap();
+        let request = ForegroundRequest {
+            hint: Some(&base),
+            agent: true,
+        };
+        let observed = read_process_launch(&ProcessView::Proc(root), request).unwrap();
+        assert_eq!(observed.inherited.unwrap().arguments, base.arguments);
+        assert_eq!(observed.exact.unwrap().arguments, base.arguments);
     }
 
     #[cfg(feature = "host")]
