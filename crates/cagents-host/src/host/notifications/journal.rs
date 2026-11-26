@@ -92,6 +92,7 @@ impl Journal {
                 UNIQUE(session, evidence));
             CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS review_requests_seen (identity TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS portal_group_withdrawals (id TEXT PRIMARY KEY);
             PRAGMA user_version=3;").map_err(|error| error.to_string())?;
         Ok(Self(connection))
     }
@@ -239,6 +240,59 @@ impl Journal {
                 })
             })
             .collect()
+    }
+
+    pub fn automation_notice_sequence(&mut self, automation: Uuid) -> Result<Option<u64>, String> {
+        let serialized = notices::table
+            .find(format!("automation:{automation}"))
+            .select(notices::event)
+            .first::<String>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?;
+        serialized
+            .map(|serialized| {
+                let event = Event::from_journal(&serialized).map_err(|error| error.to_string())?;
+                match event.target {
+                    Target::Automation { id, sequence } if id == automation => Ok(sequence),
+                    _ => Err("Notification journal contains the wrong automation identity".into()),
+                }
+            })
+            .transpose()
+    }
+
+    pub fn remember_group_withdrawal(&mut self, id: Uuid) -> Result<(), String> {
+        diesel::sql_query("INSERT OR IGNORE INTO portal_group_withdrawals(id) VALUES (?1)")
+            .bind::<diesel::sql_types::Text, _>(id.to_string())
+            .execute(&mut self.0)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn group_withdrawals(&mut self) -> Result<Vec<Uuid>, String> {
+        #[derive(diesel::QueryableByName)]
+        struct Group {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            id: String,
+        }
+        diesel::sql_query("SELECT id FROM portal_group_withdrawals")
+            .load::<Group>(&mut self.0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|group| {
+                group
+                    .id
+                    .parse()
+                    .map_err(|error: uuid::Error| error.to_string())
+            })
+            .collect()
+    }
+
+    pub fn finish_group_withdrawal(&mut self, id: Uuid) -> Result<(), String> {
+        diesel::sql_query("DELETE FROM portal_group_withdrawals WHERE id=?1")
+            .bind::<diesel::sql_types::Text, _>(id.to_string())
+            .execute(&mut self.0)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub fn delivered(&mut self, id: Uuid) -> Result<(), String> {

@@ -14,7 +14,7 @@ use journal::Journal;
 use osascript::{Activation, PortalOwner, connect, remove, send, send_test};
 #[cfg(target_os = "linux")]
 use portal::{Activation, PortalOwner, connect, remove, send, send_test};
-use withdrawals::Withdrawals;
+use withdrawals::{Withdrawal, Withdrawals};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -551,6 +551,14 @@ fn restore(
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
+    match journal.group_withdrawals() {
+        Ok(groups) => {
+            for group in groups {
+                withdrawals.group(group);
+            }
+        }
+        Err(error) => snapshot.diagnostic = Some(error),
+    }
     withdrawals.protect(
         snapshot
             .notices
@@ -646,6 +654,9 @@ fn record_broker_event(
             if registry.automation_attention_resolved(id, sequence)? {
                 return Ok(None);
             }
+            protect_automation_toast(journal, id, &event.target, |previous| {
+                registry.automation_attention_resolved(id, previous)
+            })?;
             record_attention_committed_policy(journal, event, suppressed, None, policy)
         });
         if let Some(receipt) = receipt {
@@ -654,6 +665,22 @@ fn record_broker_event(
         return recorded;
     }
     record_attention_committed_policy(journal, event, suppressed, receipt, policy)
+}
+
+fn protect_automation_toast(
+    journal: &mut Journal,
+    id: Uuid,
+    target: &Target,
+    resolved: impl FnOnce(u64) -> Result<bool, String>,
+) -> Result<(), String> {
+    if let Some(previous) = journal.automation_notice_sequence(id)?
+        && resolved(previous)?
+    {
+        // Commit the stable desktop cleanup before the new event can overwrite
+        // the only journal row containing the old notice's sequence.
+        journal.remember_group_withdrawal(batching::desktop_id(target))?;
+    }
+    Ok(())
 }
 
 fn restore_automation_attention(
@@ -1123,6 +1150,21 @@ async fn run(
             Err(error) => snapshot.diagnostic = Some(error),
         }
         restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, false);
+        let persisted_withdrawals = match journal.group_withdrawals() {
+            Ok(groups) => {
+                for group in &groups {
+                    withdrawals.group(*group);
+                }
+                groups
+            }
+            Err(error) => {
+                snapshot.diagnostic = Some(error);
+                Vec::new()
+            }
+        };
+        pending
+            .actions
+            .retain(|(id, _)| !persisted_withdrawals.contains(id));
         if !policy.message_previews {
             for notice in &mut snapshot.notices {
                 notice.event.content = None;
@@ -1275,7 +1317,15 @@ async fn run(
                 let Some(entry) = withdrawals.pop_first() else {
                     break;
                 };
-                if let Err(error) = remove(backend, entry.id()).await {
+                let result = remove(backend, entry.id()).await.and_then(|()| {
+                    if let Withdrawal::Group(id) = entry
+                        && persisted_withdrawals.contains(&id)
+                    {
+                        journal.finish_group_withdrawal(id)?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
                     withdrawals.requeue(entry);
                     snapshot.diagnostic = Some(error);
                     failed = true;
@@ -1511,6 +1561,60 @@ mod tests {
         assert_eq!(withdrawals.pop_first().unwrap().id(), desktop);
         assert_eq!(withdrawals.pop_first().unwrap().id(), notice.id);
         assert!(withdrawals.is_empty());
+    }
+
+    #[test]
+    fn replacing_a_resolved_automation_notice_keeps_its_toast_withdrawal_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("automation.sqlite3");
+        let id = Uuid::new_v4();
+        let event = |sequence| Event {
+            target: Target::Automation { id, sequence },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{id}:lifecycle:{sequence}"),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+            content: None,
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let previous = journal.record(event(4), false).unwrap().unwrap();
+        journal.delivered(previous.id).unwrap();
+        let newer = event(6);
+        let group = batching::desktop_id(&newer.target);
+        protect_automation_toast(
+            &mut journal,
+            id,
+            &newer.target,
+            |sequence| Ok(sequence <= 5),
+        )
+        .unwrap();
+        let replacement = journal.record(newer, false).unwrap().unwrap();
+        assert!(
+            journal
+                .list()
+                .unwrap()
+                .iter()
+                .all(|notice| notice.id != previous.id)
+        );
+        drop(journal);
+
+        let mut journal = Journal::open(&path).unwrap();
+        let mut snapshot = Snapshot::default();
+        let mut withdrawals = Withdrawals::default();
+        restore(
+            &mut journal,
+            &Preferences::default(),
+            &mut snapshot,
+            &mut withdrawals,
+        );
+        assert_eq!(snapshot.notices, [replacement]);
+        assert_eq!(withdrawals.pop_first().unwrap().id(), group);
+        journal.finish_group_withdrawal(group).unwrap();
+        assert!(journal.group_withdrawals().unwrap().is_empty());
     }
 
     #[test]
