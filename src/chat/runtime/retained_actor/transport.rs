@@ -1661,6 +1661,18 @@ impl RemoteActor {
             {
                 return false;
             }
+            use super::journal::WaitingAttention;
+            // The helper advances the outbox to open a new wait. Resolving
+            // one needs no outbox entry and may get sampled before the change
+            // callback advances the revision. Preserve that resolution when
+            // an older reply for the same helper and outbox arrives last.
+            if state.waiting_attention == Some(WaitingAttention::Resolved)
+                && resident.waiting_attention.is_some()
+                && resident.close.actor_id == state.close.actor_id
+                && resident.outbox_latest == state.outbox_latest
+            {
+                resident.waiting_attention = state.waiting_attention;
+            }
             // A legacy helper copied activity before taking the journal lock.
             // A sample that advanced its outbox may pair stale Working with a
             // newly opened request. A second covered sample must confirm it.

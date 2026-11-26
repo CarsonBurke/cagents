@@ -1901,6 +1901,80 @@ fn resident_naming_and_notification_projections_do_not_need_a_helper_socket() {
     assert!(!actor.0.socket.exists());
 }
 #[test]
+fn a_delayed_waiting_sample_cannot_undo_an_exact_resolution() {
+    use super::super::journal::WaitingAttention;
+    use crate::agent::ActivityState;
+    use crate::chat::runtime::RetainedWaiting;
+
+    let fixture = resident_fixture();
+    let actor = RemoteActor::fixture();
+    *actor.0.state.lock().unwrap() = Arc::new(fixture.server.resident().unwrap());
+
+    let append = |update| {
+        // Stop at the journal publication, before the notification callback
+        // advances the helper's general revision.
+        fixture
+            .server
+            .journal
+            .lock()
+            .unwrap()
+            .append(&update, None)
+            .unwrap();
+        fixture.server.resident().unwrap()
+    };
+    let open = |key: &str| {
+        append(Update::Attention(crate::notifications::Evidence {
+            key: key.into(),
+            kind: crate::notifications::Kind::Waiting,
+        }))
+    };
+    let working = Update::Activity {
+        state: ActivityState::Working,
+        generation: 0,
+    };
+    let initial = fixture.server.resident().unwrap();
+    assert_eq!(initial.waiting_attention, Some(WaitingAttention::Unknown));
+    assert!(actor.publish_resident(append(working.clone())));
+    assert!(actor.publish_resident(initial));
+    assert_eq!(
+        actor.waiting_resolution(None),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    let earlier = open("first request");
+    let sequence = earlier.outbox_latest;
+    assert!(actor.publish_resident(earlier.clone()));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Current)
+    );
+
+    let settled = append(working);
+    assert_eq!(settled.changed, earlier.changed);
+    assert_eq!(settled.generation, earlier.generation);
+    assert_eq!(settled.outbox_latest, sequence);
+    assert!(actor.publish_resident(settled));
+    assert!(actor.publish_resident(earlier));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Resolved)
+    );
+
+    let later = open("next request");
+    let next_sequence = later.outbox_latest;
+    assert!(next_sequence > sequence);
+    assert!(actor.publish_resident(later));
+    assert_eq!(
+        actor.waiting_resolution(Some(sequence)),
+        Some(RetainedWaiting::Superseded)
+    );
+    assert_eq!(
+        actor.waiting_resolution(Some(next_sequence)),
+        Some(RetainedWaiting::Current)
+    );
+}
+
+#[test]
 fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
     use crate::agent::ActivityState;
     use crate::chat::runtime::RetainedWaiting;
@@ -1923,6 +1997,8 @@ fn an_old_helper_can_settle_a_wait_without_publishing_another_outcome() {
     working.waiting = false;
     working.changed += 1;
     assert!(actor.publish_resident(working.clone()));
+    assert!(actor.state().legacy_waiting_settled);
+    assert_eq!(actor.state().waiting_attention, None);
     assert_eq!(
         actor.waiting_resolution(Some(3)),
         Some(RetainedWaiting::Resolved)
