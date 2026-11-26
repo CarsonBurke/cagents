@@ -401,7 +401,7 @@ fi";
     );
     assert!(!control.exists() && !listener.exists());
     let holder = &previous_owner.holder;
-    for suffix in ["closed", "spared"] {
+    for suffix in ["closed", "spared", "update-release"] {
         assert_eq!(
             native
                 .join(format!(
@@ -409,7 +409,7 @@ fi";
                     holder.pid, holder.start
                 ))
                 .exists(),
-            (suffix == "spared") == original_forks
+            suffix == "update-release"
         );
     }
     let store = Store::discover().unwrap();

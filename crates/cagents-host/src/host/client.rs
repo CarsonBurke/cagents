@@ -1703,6 +1703,27 @@ fn process_admitted_request(
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }
+        ClientRequest::ObserveReviewMonitor { update } => {
+            update.validate().map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            let notifications = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notifications
+                .clone()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "Notification delivery is unavailable",
+                        true,
+                    )
+                })?;
+            notifications
+                .observe_review_monitor(update)
+                .map_err(|reason| ProtocolError::new(ProtocolErrorCode::QueueFull, reason, true))?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::ObserveReviewRequests { observed } => {
             observed.validate().map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1719,9 +1740,9 @@ fn process_admitted_request(
                         true,
                     )
                 })?;
-            for event in observed.events() {
-                notifications.record(event);
-            }
+            notifications
+                .observe_review_requests(observed)
+                .map_err(|reason| ProtocolError::new(ProtocolErrorCode::QueueFull, reason, true))?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchNotifications { presence }

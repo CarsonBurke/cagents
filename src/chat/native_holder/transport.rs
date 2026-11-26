@@ -189,6 +189,8 @@ enum Report {
     #[cfg(target_os = "macos")]
     ReleasedSparing,
     #[cfg(target_os = "macos")]
+    ReleasedForUpdate,
+    #[cfg(target_os = "macos")]
     UpdateServerObserved,
     Inspected {
         protocol: u32,
@@ -519,7 +521,7 @@ impl Holder {
     #[cfg(target_os = "macos")]
     pub(in crate::chat) fn close_for_update(&mut self) -> Result<(), String> {
         self.releasing_update = true;
-        if !self.identity.update_release_receipt(true)? {
+        if !self.identity.update_release_receipt()? {
             if self.control_poisoned {
                 self.control.take();
             }
@@ -530,7 +532,7 @@ impl Holder {
             if matches!(&report, Some(Err(_)) | Some(Ok(None))) {
                 self.control.take();
             }
-            if !self.identity.update_release_receipt(true)? {
+            if !self.identity.update_release_receipt()? {
                 return Err(match report {
                     Some(Ok(Some(Report::Failed(error)))) | Some(Err(error)) => error,
                     _ => "Native holder has not recorded its prepared update release".into(),
@@ -1128,7 +1130,9 @@ impl Residence {
         #[cfg(target_os = "linux")]
         let kind = ReceiptKind::Exact;
         #[cfg(target_os = "macos")]
-        let kind = if self.child.cleanup_proved() {
+        let kind = if self.release_scope == Some(ReleaseScope::Update) {
+            ReceiptKind::Update
+        } else if self.child.cleanup_proved() {
             ReceiptKind::Exact
         } else {
             ReceiptKind::Spared
@@ -1229,6 +1233,45 @@ impl Residence {
         Ok(())
     }
 
+    /// Source death can close the control socket after the approved
+    /// checkpoint becomes durable and before the typed release arrives.
+    /// The old holder still owns its process pins and can settle that release.
+    #[cfg(target_os = "macos")]
+    fn recover_committed_release(&mut self) {
+        if self.release_scope.is_some()
+            || self.update_server.is_none()
+            || self.recovery.is_durable()
+            || self.recovery.source.terminal.is_some()
+            || self.recovery.paired_holder.is_some()
+        {
+            return;
+        }
+        use crate::upgrade::handoff::{Phase, Store};
+        let observed = Store::observe_existing()
+            .and_then(|store| store.map_or(Ok(None), |store| store.load()));
+        match observed {
+            Ok(Some(checkpoint))
+                if checkpoint.phase == Phase::Prepared
+                    && checkpoint.preserve_carried
+                    && self.recovery.source.proof.as_ref() == Some(&checkpoint.proof)
+                    && checkpoint.chats.iter().any(|chat| {
+                        chat.source == self.recovery.source
+                            || self.recovery.previous_sources.contains(&chat.source)
+                    }) =>
+            {
+                self.child.spare_update_server();
+                self.release_scope = Some(ReleaseScope::Update);
+            }
+            Err(error) => {
+                // Unreadable evidence grants no update receipt. It also
+                // gives no new authority to kill independently detached work.
+                self.child.spare_update_server();
+                tracing::warn!(%error, "native holder could not read its prepared release evidence");
+            }
+            _ => {}
+        }
+    }
+
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
             if wait_for_control(control.as_raw_fd(), &self.child, &self.child_events).is_err() {
@@ -1300,6 +1343,8 @@ impl Residence {
                             super::cleanup::ReceiptKind::Exact => Report::Released,
                             #[cfg(target_os = "macos")]
                             super::cleanup::ReceiptKind::Spared => Report::ReleasedSparing,
+                            #[cfg(target_os = "macos")]
+                            super::cleanup::ReceiptKind::Update => Report::ReleasedForUpdate,
                         };
                         let _ = send(&control, &report, TIMEOUT);
                         return false;
@@ -1666,6 +1711,8 @@ impl Drop for Residence {
         {
             std::thread::sleep(Duration::from_millis(100));
         }
+        #[cfg(target_os = "macos")]
+        self.recover_committed_release();
         // This helper can lose sight of detached work. Bound its final
         // attempt and preserve the discovery record when proof is unavailable.
         #[cfg(target_os = "macos")]
@@ -3544,10 +3591,23 @@ exec /bin/sleep 60
     #[cfg(target_os = "macos")]
     #[test]
     fn prepared_update_retires_the_peer_and_preserves_detached_work_without_a_reply() {
+        verify_prepared_update_release(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_update_retires_the_peer_after_source_eof_before_release() {
+        verify_prepared_update_release(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_prepared_update_release(source_lost_before_release: bool) {
+        use crate::upgrade::handoff::{Chat, Checkpoint, Store};
         use std::os::unix::process::CommandExt;
 
         const STAGE: &str = "CAGENTS_SCOPED_UPDATE_RELEASE_TEST";
-        const TEST: &str = "chat::native_holder::transport::tests::prepared_update_retires_the_peer_and_preserves_detached_work_without_a_reply";
+        let thread = std::thread::current();
+        let test = thread.name().unwrap();
         let dir_key = "CAGENTS_SCOPED_UPDATE_RELEASE_TEST_DIR";
         match std::env::var(STAGE).as_deref() {
             Ok("provider") => {
@@ -3581,8 +3641,11 @@ exec /bin/sleep 60
             Ok("test") => {}
             _ => {
                 let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+                let home = directory.path().join("home");
+                std::fs::create_dir(&home).unwrap();
                 let output = Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", TEST, "--nocapture"])
+                    .args(["--exact", test, "--nocapture"])
+                    .env("HOME", home)
                     .env(STAGE, "test")
                     .env(dir_key, directory.path())
                     .env("XDG_RUNTIME_DIR", directory.path())
@@ -3616,7 +3679,7 @@ exec /bin/sleep 60
                 .into_os_string()
                 .into_string()
                 .unwrap(),
-            arguments: ["--exact", TEST, "--nocapture"].map(str::to_owned).into(),
+            arguments: ["--exact", test, "--nocapture"].map(str::to_owned).into(),
             working_directory: working.clone(),
             environment: [
                 (STAGE.to_owned(), "provider".to_owned()),
@@ -3663,7 +3726,25 @@ exec /bin/sleep 60
         holder.observe_update_server(&server).unwrap();
         holder.verify_update_release().unwrap();
         let control = holder.control.take().unwrap();
-        send(&control, &Request::ReleasePreparedUpdate, TIMEOUT).unwrap();
+        if source_lost_before_release {
+            let mut launch = source.launch.clone();
+            launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            crate::chat::protocol::align_resume_identity(&mut launch).unwrap();
+            let mut checkpoint = Checkpoint::new(
+                proof.clone(),
+                vec![],
+                vec![],
+                vec![Chat {
+                    source: source.clone(),
+                    launch,
+                    previous_sources: vec![],
+                }],
+            );
+            checkpoint.preserve_carried = true;
+            Store::discover().unwrap().save(&checkpoint).unwrap();
+        } else {
+            send(&control, &Request::ReleasePreparedUpdate, TIMEOUT).unwrap();
+        }
         drop(control);
         let deadline = Instant::now() + Duration::from_secs(5);
         while holder.identity.record.holder.is_current() {
@@ -3677,8 +3758,19 @@ exec /bin/sleep 60
         assert!(server.reaped());
         assert!(holder.identity.record.root.reaped());
         assert!(detached.is_current());
-        assert!(holder.identity.update_release_receipt(true).unwrap());
-        assert!(super::super::closed_source_for_stop(&source, &proof).is_err());
+        assert!(holder.identity.update_release_receipt().unwrap());
+        let native = registry::directory(Kind::Native).unwrap();
+        // Repeat the new receipt namespace beyond the ordinary per-pane scan
+        // limit. Exact Stop still sees none of this scoped update evidence.
+        for start in 1..=129 {
+            std::fs::File::create(native.join(format!("{}-42-{start}.update-release", source.id)))
+                .unwrap();
+        }
+        assert!(
+            super::super::closed_source_for_stop(&source, &proof)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(target_os = "linux")] // The fixture asserts reparenting to the holder as a subreaper.

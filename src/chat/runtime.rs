@@ -278,6 +278,12 @@ pub enum Update {
     /// in resident metadata, from which the host emits its own edge.
     #[serde(skip)]
     FailureChanged,
+    /// The provider has begun a real turn, even if the public activity state
+    /// was already Working or the frame also recorded its completion.
+    #[serde(skip)]
+    TurnStarted {
+        generation: u64,
+    },
 }
 
 pub struct ConversationNaming {
@@ -4077,6 +4083,18 @@ impl Actor {
         // this bounded frame's semantic proof has been published.
         let mut frame_error = None;
         for event in step.events {
+            if matches!(event, Event::TurnStartConfirmed) {
+                if !suppress_current_notification {
+                    self.resident_dirty = true;
+                    let generation = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .turn_generation;
+                    (self.notify)(Update::TurnStarted { generation });
+                }
+                continue;
+            }
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
                     let update = self.execution.start(run, key)?;
@@ -4668,7 +4686,10 @@ fn apply_projected_event(
             state.turn_generation = state.turn_generation.wrapping_add(1);
             state.finished_at = None;
         }
-        Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
+        Event::TurnStartConfirmed
+        | Event::TurnSettled
+        | Event::TurnFinished { .. }
+        | Event::Execution { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));

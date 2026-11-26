@@ -113,6 +113,9 @@ pub(super) struct Journal {
     outcome_ack: u64,
     outcome_latest: u64,
     pub(super) waiting_attention: Option<WaitingAttention>,
+    /// Real turn boundary and the last semantic outcome ordered before it.
+    /// Lives with this exact helper, as do all unresolved publications.
+    attention_turn: Option<(u64, u64)>,
     published_sources: Vec<crate::chat::Session>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
@@ -178,6 +181,7 @@ impl Journal {
             outcome_ack: 0,
             outcome_latest: 0,
             waiting_attention: Some(WaitingAttention::Unknown),
+            attention_turn: None,
             published_sources: Vec::new(),
         })
     }
@@ -290,6 +294,10 @@ impl Journal {
         update: &Update,
         confirmed_session: Option<&str>,
     ) -> Result<(), String> {
+        if let Update::TurnStarted { generation } = update {
+            self.attention_turn = Some((*generation, self.outcome_latest));
+            return Ok(());
+        }
         if matches!(
             update,
             Update::Activity {
@@ -399,6 +407,10 @@ impl Journal {
             self.finished_runs.insert(*run, sequence);
         }
         Ok(())
+    }
+
+    pub fn attention_turn(&self) -> Option<(u64, u64)> {
+        self.attention_turn
     }
     pub fn page(&self, after: u64) -> Result<Vec<OutboxEntry>, String> {
         let ack = self.number("outcome_ack")?;
@@ -858,6 +870,33 @@ mod tests {
         let entry: OutboxEntry = serde_json::from_value(older.clone()).unwrap();
         assert_eq!(entry.confirmed_session, None);
         assert_eq!(serde_json::to_value(&entry).unwrap(), older);
+    }
+
+    #[test]
+    fn a_real_turn_start_marks_the_prior_outbox_without_changing_its_wire_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        journal
+            .append(&Update::TurnStarted { generation: 1 }, None)
+            .unwrap();
+        assert_eq!(journal.attention_turn(), Some((1, 0)));
+        assert!(journal.page(0).unwrap().is_empty());
+        let outcome = |key: &str| {
+            Update::Attention(crate::notifications::Evidence {
+                key: key.into(),
+                kind: crate::notifications::Kind::Succeeded,
+            })
+        };
+        journal.append(&outcome("earlier"), None).unwrap();
+        journal
+            .append(&Update::TurnStarted { generation: 2 }, None)
+            .unwrap();
+        journal.append(&outcome("current"), None).unwrap();
+        assert_eq!(journal.attention_turn(), Some((2, 1)));
+        let page = journal.page(0).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].update, outcome("earlier"));
+        assert_eq!(page[1].update, outcome("current"));
     }
 
     #[test]

@@ -858,7 +858,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
     #[cfg(target_os = "macos")]
-    let cutover_checkpoint = crate::update::cutover_startup_checkpoint();
+    let mut cutover_checkpoint = Some(crate::update::cutover_startup_checkpoint());
     let listener = listener_before_restore(&paths, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
@@ -889,7 +889,17 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             }
             #[cfg(all(test, target_os = "linux"))]
             observe_fixture_startup("restore ordinary", None);
-            update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
+            #[cfg(target_os = "macos")]
+            let ordinary = cutover_checkpoint
+                .as_ref()
+                .and_then(|entry| entry.restoring_digest())
+                .map_or_else(
+                    || update_recovery::restore_ordinary(&host),
+                    |digest| update_recovery::restore_observed_adoption(&host, digest),
+                );
+            #[cfg(not(target_os = "macos"))]
+            let ordinary = update_recovery::restore_ordinary(&host);
+            ordinary.map_err(io::Error::other)?;
             Ok(())
         })();
         // After restore has reattached every holder it could, and before
@@ -1096,15 +1106,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     }
     #[cfg(target_os = "linux")]
     acknowledge_standby(standby.take());
-    #[cfg(target_os = "macos")]
-    let mut settle_startup_update = true;
     loop {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         publish_restored_selection(&host, &mut pending_publication);
         #[cfg(target_os = "macos")]
         if pending_publication.is_none() {
             acknowledge_standby(standby.take());
-            if std::mem::take(&mut settle_startup_update) {
+            if let Some(cutover_checkpoint) = cutover_checkpoint.take() {
                 let serving = host
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())

@@ -58,7 +58,11 @@ impl Cagents {
         let task = self
             .refresh_ui
             .review_requests
-            .update(action, repositories.values().cloned())
+            .update_observing(
+                action,
+                repositories.values().cloned(),
+                crate::notifications::Application::Cagents,
+            )
             .map(Message::ReviewRequests)
             .map(cosmic::Action::App);
         let revised = self.refresh_ui.review_requests.revision() != revision;
@@ -75,7 +79,7 @@ impl Cagents {
         } else {
             iced::Task::perform(
                 crate::notifications::review::report(
-                    crate::notifications::review::ObservedRequests {
+                    crate::notifications::review::StampedRequests {
                         destination: crate::notifications::Destination {
                             application: crate::notifications::Application::Cagents,
                             window: instance::window_slot().into(),
@@ -170,6 +174,7 @@ impl Cagents {
                     error: None,
                     due: crate::github::polling::now() + 60,
                     observation: (uuid::Uuid::new_v4().to_string(), 1),
+                    census: None,
                     observed: vec![crate::github::review_requests::shared::Observation {
                         revision: 1,
                         at: crate::github::polling::now(),

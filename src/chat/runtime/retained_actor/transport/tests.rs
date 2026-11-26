@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn an_outcome_cannot_use_a_resident_marker_from_before_its_publication() {
+    let actor = RemoteActor::fixture();
+    {
+        let mut state = actor.0.state.lock().unwrap();
+        let state = Arc::make_mut(&mut state);
+        state.outbox_latest = 41;
+        state.attention_turn = Some((6, 40));
+    }
+    assert!(actor.attention_turn(Some(42)).is_err());
+    {
+        let mut state = actor.0.state.lock().unwrap();
+        let state = Arc::make_mut(&mut state);
+        state.outbox_latest = 42;
+        state.attention_turn = Some((7, 41));
+    }
+    assert_eq!(actor.attention_turn(Some(42)).unwrap(), Some((7, 41)));
+}
+
+#[test]
+fn a_late_resident_at_the_same_revision_cannot_erase_a_confirmed_turn() {
+    let actor = RemoteActor::fixture();
+    let stale = actor.0.state.lock().unwrap().as_ref().clone();
+    let mut confirmed = stale.clone();
+    confirmed.attention_turn = Some((7, 41));
+    assert!(actor.publish_resident(confirmed));
+    assert!(actor.publish_resident(stale));
+    assert_eq!(actor.attention_turn(None).unwrap(), Some((7, 41)));
+}
+
+#[test]
 fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
     #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {

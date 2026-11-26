@@ -8,7 +8,10 @@ use std::{
 use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
 use uuid::Uuid;
 
-use crate::notifications::{Event, Notice, Target};
+use crate::notifications::{
+    Event, Notice, Target,
+    review::{Census, ScanPoint},
+};
 
 const MAX_SESSIONS: i64 = 2048;
 const KEYS_PER_SESSION: i64 = 32;
@@ -48,9 +51,47 @@ mod schema {
             id -> Text,
         }
     }
+    diesel::table! {
+        review_watches (repository) {
+            repository -> Text,
+            watched -> BigInt,
+        }
+    }
+    diesel::table! {
+        review_notice_points (id) {
+            id -> Text,
+            point -> Text,
+        }
+    }
+    diesel::table! {
+        review_censuses (repository, viewer) {
+            repository -> Text,
+            viewer -> Text,
+            sequence -> BigInt,
+            census -> Text,
+        }
+    }
+    diesel::table! {
+        review_census_stamps (repository, viewer) {
+            repository -> Text,
+            viewer -> Text,
+            stamp -> Text,
+        }
+    }
+    diesel::table! {
+        retained_attention_turns (session) {
+            session -> Text,
+            actor -> Text,
+            generation -> BigInt,
+            outcome_through -> BigInt,
+        }
+    }
     diesel::allow_tables_to_appear_in_same_query!(notices, seen, owners, review_requests_seen);
 }
-use schema::{notices, owners, portal_group_withdrawals, review_requests_seen, seen};
+use schema::{
+    notices, owners, portal_group_withdrawals, retained_attention_turns, review_census_stamps,
+    review_censuses, review_notice_points, review_requests_seen, review_watches, seen,
+};
 
 // PRAGMAs describe the SQLite connection rather than application rows.
 #[derive(diesel::QueryableByName)]
@@ -77,6 +118,14 @@ struct Revision {
     changes: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     data_version: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Admission {
+    pub superseded: bool,
+    pub retained: Option<(Uuid, u64)>,
+    pub resolved_waiting: bool,
+    pub withdraw_previous: bool,
 }
 
 impl Journal {
@@ -117,6 +166,19 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS review_requests_seen (identity TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS portal_group_withdrawals (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS review_watches (repository TEXT PRIMARY KEY, watched INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS review_notice_points (id TEXT PRIMARY KEY, point TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS review_censuses (repository TEXT NOT NULL, viewer TEXT NOT NULL,
+                sequence INTEGER NOT NULL, census TEXT NOT NULL, PRIMARY KEY(repository,viewer));
+            CREATE INDEX IF NOT EXISTS review_census_sequence ON review_censuses(sequence);
+            CREATE TABLE IF NOT EXISTS review_census_stamps (repository TEXT NOT NULL, viewer TEXT NOT NULL,
+                stamp TEXT NOT NULL, PRIMARY KEY(repository,viewer));
+            INSERT OR IGNORE INTO review_census_stamps (repository,viewer,stamp)
+                SELECT repository,viewer,json_extract(census,'$.start') FROM review_censuses
+                WHERE CASE WHEN json_valid(census) THEN json_type(census,'$.start') = 'object' ELSE 0 END;
+            CREATE TABLE IF NOT EXISTS retained_attention_turns (
+                session TEXT PRIMARY KEY, actor TEXT NOT NULL, generation INTEGER NOT NULL,
+                outcome_through INTEGER NOT NULL);
             PRAGMA user_version=3;").map_err(|error| error.to_string())?;
         Ok(Self(connection, None))
     }
@@ -166,24 +228,235 @@ impl Journal {
         Self::open_reader(path)?.list()
     }
 
-    /// Coalesce latest attention without resurrecting dismissed duplicates.
-    pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
-        self.record_with_resolution(event, suppressed, false)
+    pub fn remember_review_watch(&mut self, repository: &str, seconds: i64) -> Result<(), String> {
+        diesel::sql_query(
+            "INSERT INTO review_watches(repository,watched) VALUES (?1,?2)
+             ON CONFLICT(repository) DO UPDATE SET watched=MAX(watched,excluded.watched)",
+        )
+        .bind::<diesel::sql_types::Text, _>(repository)
+        .bind::<diesel::sql_types::BigInt, _>(seconds)
+        .execute(&mut self.0)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
-    pub fn record_with_resolution(
+    pub fn last_review_watch(&mut self, repository: &str) -> Result<Option<i64>, String> {
+        review_watches::table
+            .find(repository)
+            .select(review_watches::watched)
+            .first(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn review_census(
+        &mut self,
+        repository: &str,
+        viewer: &str,
+    ) -> Result<Option<Census>, String> {
+        review_censuses::table
+            .find((repository, viewer))
+            .select(review_censuses::census)
+            .first::<String>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// The small ordering fence survives eviction of the full membership map.
+    pub fn review_census_stamp(
+        &mut self,
+        repository: &str,
+        viewer: &str,
+    ) -> Result<Option<ScanPoint>, String> {
+        review_census_stamps::table
+            .find((repository, viewer))
+            .select(review_census_stamps::stamp)
+            .first::<String>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// Accept the census and retire its exact notices together. Replaying a
+    /// committed census must leave legacy observations accepted after it alone.
+    pub fn commit_review_reconciliation(
+        &mut self,
+        acceptance: Option<(&str, &Census)>,
+        ids: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>, String> {
+        if acceptance.is_none() && ids.is_empty() {
+            return Ok(ids);
+        }
+        let acceptance = acceptance
+            .map(|(repository, census)| {
+                Ok::<_, serde_json::Error>((
+                    repository,
+                    &census.viewer,
+                    serde_json::to_string(&census.start)?,
+                    serde_json::to_string(census)?,
+                ))
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                if let Some((repository, viewer, stamp, value)) = acceptance {
+                    diesel::insert_into(review_census_stamps::table)
+                        .values((
+                            review_census_stamps::repository.eq(repository),
+                            review_census_stamps::viewer.eq(viewer),
+                            review_census_stamps::stamp.eq(&stamp),
+                        ))
+                        .on_conflict((review_census_stamps::repository, review_census_stamps::viewer))
+                        .do_update()
+                        .set(review_census_stamps::stamp.eq(&stamp))
+                        .execute(connection)?;
+                    diesel::sql_query(
+                        "INSERT INTO review_censuses(repository,viewer,sequence,census)
+                         VALUES (?1,?2,(SELECT coalesce(max(sequence),0)+1 FROM review_censuses),?3)
+                         ON CONFLICT(repository,viewer) DO UPDATE
+                         SET sequence=excluded.sequence,census=excluded.census",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(repository)
+                    .bind::<diesel::sql_types::Text, _>(viewer)
+                    .bind::<diesel::sql_types::Text, _>(value)
+                    .execute(connection)?;
+                    diesel::sql_query(
+                        "DELETE FROM review_censuses WHERE sequence IN
+                         (SELECT sequence FROM review_censuses ORDER BY sequence DESC LIMIT -1 OFFSET 256)",
+                    )
+                    .execute(connection)?;
+                }
+                let mut committed = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if acknowledge_notice(connection, id, false)?.is_some() {
+                        committed.push(id);
+                    }
+                }
+                Ok(committed)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn review_points(&mut self) -> Result<std::collections::HashMap<Uuid, ScanPoint>, String> {
+        review_notice_points::table
+            .select((review_notice_points::id, review_notice_points::point))
+            .load::<(String, String)>(&mut self.0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|(id, point)| {
+                Ok((
+                    Uuid::parse_str(&id).map_err(|error| error.to_string())?,
+                    serde_json::from_str(&point).map_err(|error| error.to_string())?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn record_review(
+        &mut self,
+        event: Event,
+        point: &ScanPoint,
+        suppressed: bool,
+    ) -> Result<Option<Notice>, String> {
+        let key = event.target.storage_key();
+        let result =
+            self.record_with_review_point(event, suppressed, Admission::default(), Some(point))?;
+        if result.is_none() {
+            // The same immutable request can receive newer positive evidence
+            // without resetting its existing delivery or acknowledgement.
+            let id = notices::table
+                .find(key)
+                .select(notices::id)
+                .first::<String>(&mut self.0)
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(id) = id {
+                let previous = review_notice_points::table
+                    .find(&id)
+                    .select(review_notice_points::point)
+                    .first::<String>(&mut self.0)
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .map(|stored| serde_json::from_str::<ScanPoint>(&stored))
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                if previous
+                    .as_ref()
+                    .is_none_or(|old| old != point && old.precedes_census(point))
+                {
+                    let value = serde_json::to_string(point).map_err(|error| error.to_string())?;
+                    diesel::insert_into(review_notice_points::table)
+                        .values((
+                            review_notice_points::id.eq(&id),
+                            review_notice_points::point.eq(&value),
+                        ))
+                        .on_conflict(review_notice_points::id)
+                        .do_update()
+                        .set(review_notice_points::point.eq(&value))
+                        .execute(&mut self.0)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Coalesce latest attention without resurrecting dismissed duplicates.
+    pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
+        self.record_admitted(event, suppressed, Admission::default())
+    }
+
+    pub fn record_admitted(
         &mut self,
         event: Event,
         suppressed: bool,
-        resolved: bool,
+        admission: Admission,
+    ) -> Result<Option<Notice>, String> {
+        self.record_with_review_point(event, suppressed, admission, None)
+    }
+
+    fn record_with_review_point(
+        &mut self,
+        event: Event,
+        suppressed: bool,
+        admission: Admission,
+        point: Option<&ScanPoint>,
     ) -> Result<Option<Notice>, String> {
         event.validate()?;
+        let point = point
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let acknowledged = admission.superseded || admission.resolved_waiting;
+        let retained = admission
+            .retained
+            .map(|(actor, sequence)| {
+                i64::try_from(sequence).map(|sequence| (actor.to_string(), sequence))
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
         let session = event.target().storage_key();
         let evidence = serde_json::to_string(&event.evidence).map_err(|error| error.to_string())?;
         let serialized = serde_json::to_string(&event).map_err(|error| error.to_string())?;
         let result = self
             .0
             .transaction::<_, diesel::result::Error, _>(|connection| {
+                if let Some((actor, sequence)) = &retained
+                    && retained_attention_turns::table
+                        .find(&session)
+                        .filter(retained_attention_turns::actor.eq(actor))
+                        .filter(retained_attention_turns::outcome_through.ge(*sequence))
+                        .select(retained_attention_turns::generation)
+                        .first::<i64>(connection)
+                        .optional()?
+                        .is_some()
+                {
+                    return Ok(None);
+                }
                 if let Target::PullRequest(request) = &event.target {
                     // Immutable review identity outlives bounded payloads and
                     // dismissal; every new request node receives its own alert.
@@ -223,6 +496,16 @@ impl Journal {
                     }
                     return Err(diesel::result::Error::RollbackTransaction);
                 };
+                if admission.withdraw_previous
+                    && !acknowledged
+                    && let Some(previous) = notices::table
+                        .find(&session)
+                        .select(notices::id)
+                        .first::<String>(connection)
+                        .optional()?
+                {
+                    remember_notice_withdrawal(connection, &session, &previous)?;
+                }
                 let owner = event
                     .source_session()
                     .map(|id| id.to_string())
@@ -238,8 +521,8 @@ impl Journal {
                 let notice = Notice {
                     id: Uuid::new_v4(),
                     event,
-                    delivered: suppressed || resolved,
-                    acknowledged: resolved,
+                    delivered: suppressed || acknowledged,
+                    acknowledged,
                     window,
                 };
                 let values = (
@@ -251,8 +534,8 @@ impl Journal {
                 );
                 let insert = diesel::insert_into(notices::table)
                     .values((notices::session.eq(&session), values.clone()));
-                let written = if resolved {
-                    // Keep this evidence seen without replacing a later notice.
+                let written = if acknowledged {
+                    // Keep settled evidence without replacing a newer notice.
                     insert.on_conflict_do_nothing().execute(connection)?
                 } else {
                     insert
@@ -261,6 +544,14 @@ impl Journal {
                         .set(values)
                         .execute(connection)?
                 };
+                if let Some(point) = point.filter(|_| written != 0) {
+                    diesel::insert_into(review_notice_points::table)
+                        .values((
+                            review_notice_points::id.eq(notice.id.to_string()),
+                            review_notice_points::point.eq(point),
+                        ))
+                        .execute(connection)?;
+                }
                 let recent_seen = diesel::alias!(seen as recent_seen);
                 diesel::delete(
                     seen::table.filter(seen::session.eq(&session)).filter(
@@ -282,7 +573,7 @@ impl Journal {
                 for (key, id) in evicted {
                     // The portal may already display this notice, including a
                     // previously resolved automation that has not been withdrawn.
-                    if key.starts_with("automation:") {
+                    if admission.withdraw_previous || key.starts_with("automation:") {
                         remember_notice_withdrawal(connection, &key, &id)?;
                     }
                     diesel::delete(notices::table.find(&key)).execute(connection)?;
@@ -292,8 +583,12 @@ impl Journal {
                         .filter(seen::session.ne_all(notices::table.select(notices::session))),
                 )
                 .execute(connection)?;
+                diesel::sql_query(
+                    "DELETE FROM review_notice_points WHERE id NOT IN (SELECT id FROM notices)",
+                )
+                .execute(connection)?;
                 prune_owners(connection)?;
-                Ok((written != 0).then_some(notice))
+                Ok((written != 0 && !admission.superseded).then_some(notice))
             });
         match result {
             Err(diesel::result::Error::RollbackTransaction) => Ok(None),
@@ -421,6 +716,50 @@ impl Journal {
             .map_err(|error| error.to_string())
     }
 
+    pub fn acknowledge_sessions(
+        &mut self,
+        sessions: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<Vec<(String, String)>, String> {
+        self.0
+            .transaction(|db| acknowledge_sessions(db, sessions))
+            .map_err(|error: diesel::result::Error| error.to_string())
+    }
+
+    pub fn acknowledge_retained_turn(
+        &mut self,
+        session: crate::model::TerminalId,
+        actor: Uuid,
+        generation: u64,
+        through: u64,
+        predecessors: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        let generation = i64::try_from(generation).map_err(|error| error.to_string())?;
+        let through = i64::try_from(through).map_err(|error| error.to_string())?;
+        let mut sessions = predecessors.clone();
+        sessions.insert(session);
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|db| {
+                let started = diesel::sql_query(
+                    "INSERT INTO retained_attention_turns(session,actor,generation,outcome_through)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(session) DO UPDATE SET actor=excluded.actor,
+                    generation=excluded.generation,outcome_through=excluded.outcome_through
+                 WHERE retained_attention_turns.actor!=excluded.actor
+                    OR retained_attention_turns.generation<excluded.generation",
+                )
+                .bind::<diesel::sql_types::Text, _>(session.to_string())
+                .bind::<diesel::sql_types::Text, _>(actor.to_string())
+                .bind::<diesel::sql_types::BigInt, _>(generation)
+                .bind::<diesel::sql_types::BigInt, _>(through)
+                .execute(db)?;
+                if started == 0 {
+                    return Ok(None);
+                }
+                acknowledge_sessions(db, &sessions).map(Some)
+            })
+            .map_err(|error| error.to_string())
+    }
+
     pub fn delivered(&mut self, id: Uuid) -> Result<(), String> {
         diesel::update(notices::table.filter(notices::id.eq(id.to_string())))
             .set(notices::delivered.eq(true))
@@ -475,30 +814,8 @@ impl Journal {
         id: Uuid,
         save_withdrawal: bool,
     ) -> Result<Option<String>, String> {
-        let id = id.to_string();
         self.0
-            .transaction(|connection| {
-                let notice = notices::table.filter(notices::id.eq(&id));
-                let row = notice
-                    .select((notices::session, notices::acknowledged))
-                    .first::<(String, bool)>(connection)
-                    .optional()?;
-                let Some((key, acknowledged)) = row else {
-                    return Ok(None);
-                };
-                if !acknowledged {
-                    if save_withdrawal
-                        || key.starts_with("automation:")
-                        || key.starts_with("review:")
-                    {
-                        remember_notice_withdrawal(connection, &key, &id)?;
-                    }
-                    diesel::update(notice)
-                        .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
-                        .execute(connection)?;
-                }
-                Ok(Some(key))
-            })
+            .transaction(|connection| acknowledge_notice(connection, id, save_withdrawal))
             .map_err(|error: diesel::result::Error| error.to_string())
     }
 
@@ -540,9 +857,20 @@ impl Journal {
         let key = target.storage_key();
         self.0
             .transaction::<_, diesel::result::Error, _>(|connection| {
-                diesel::delete(notices::table.find(&key)).execute(connection)?;
+                let notice = notices::table.find(&key);
+                if let Some(id) = notice
+                    .select(notices::id)
+                    .first::<String>(connection)
+                    .optional()?
+                {
+                    remember_notice_withdrawal(connection, &key, &id)?;
+                    diesel::delete(notice).execute(connection)?;
+                }
                 diesel::delete(seen::table.filter(seen::session.eq(&key))).execute(connection)?;
                 diesel::delete(owners::table.find(&key)).execute(connection)?;
+                diesel::sql_query("DELETE FROM retained_attention_turns WHERE session=?1")
+                    .bind::<diesel::sql_types::Text, _>(&key)
+                    .execute(connection)?;
                 Ok(())
             })
             .map_err(|error| error.to_string())
@@ -564,6 +892,31 @@ impl Journal {
     }
 }
 
+fn acknowledge_notice(
+    connection: &mut SqliteConnection,
+    id: Uuid,
+    save_withdrawal: bool,
+) -> QueryResult<Option<String>> {
+    let id = id.to_string();
+    let notice = notices::table.filter(notices::id.eq(&id));
+    let row = notice
+        .select((notices::session, notices::acknowledged))
+        .first::<(String, bool)>(connection)
+        .optional()?;
+    let Some((key, acknowledged)) = row else {
+        return Ok(None);
+    };
+    if !acknowledged {
+        if save_withdrawal || key.starts_with("automation:") || key.starts_with("review:") {
+            remember_notice_withdrawal(connection, &key, &id)?;
+        }
+        diesel::update(notice)
+            .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
+            .execute(connection)?;
+    }
+    Ok(Some(key))
+}
+
 fn remember_notice_withdrawal(
     connection: &mut SqliteConnection,
     key: &str,
@@ -575,6 +928,27 @@ fn remember_notice_withdrawal(
         .bind::<diesel::sql_types::Text, _>(id)
         .execute(connection)
         .map(|_| ())
+}
+
+fn acknowledge_sessions(
+    db: &mut SqliteConnection,
+    sessions: &std::collections::BTreeSet<crate::model::TerminalId>,
+) -> QueryResult<Vec<(String, String)>> {
+    let sessions: Vec<_> = sessions.iter().map(ToString::to_string).collect();
+    let acknowledged = diesel::update(
+        notices::table.filter(
+            notices::session
+                .eq_any(sessions)
+                .and(notices::acknowledged.eq(false)),
+        ),
+    )
+    .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
+    .returning((notices::session, notices::id))
+    .load::<(String, String)>(db)?;
+    for (session, id) in &acknowledged {
+        remember_notice_withdrawal(db, session, id)?;
+    }
+    Ok(acknowledged)
 }
 
 fn remember_owner(
@@ -658,7 +1032,14 @@ impl Reopening {
         self.next_attempt
     }
 
-    /// One final write may still succeed before scheduled background retry.
+    /// Keep later broker writes fenced behind a failed ordered write.
+    pub(super) fn suspend(&mut self, error: String, now: Instant) {
+        self.journal = Err(error);
+        self.next_attempt = now + self.delay;
+        self.delay = (self.delay * 2).min(LAST_REOPEN);
+    }
+
+    /// Finish previously accepted settlement at shutdown, once.
     pub(super) fn journal_for_shutdown(&mut self) -> Result<&mut Journal, &String> {
         if self.journal.is_err()
             && let Some(path) = &self.path
@@ -697,6 +1078,72 @@ impl Reopening {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retained_turn_acknowledgement_does_not_replay_over_its_new_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let predecessor = TerminalId::new();
+        let actor = Uuid::new_v4();
+        // Commit the predecessor's event without any notification publication.
+        let prior = journal
+            .record(event(predecessor, "predecessor"), false)
+            .unwrap()
+            .unwrap();
+        let unrelated = journal
+            .record(event(TerminalId::new(), "unrelated"), false)
+            .unwrap()
+            .unwrap();
+        let old = journal
+            .record(event(session, "prior-turn"), false)
+            .unwrap()
+            .unwrap();
+        let cleared = journal
+            .acknowledge_retained_turn(session, actor, 7, 41, &[predecessor].into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cleared
+                .into_iter()
+                .map(|(_, notice)| notice)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [prior.id.to_string(), old.id.to_string()].into(),
+        );
+        let admission = |sequence| Admission {
+            retained: Some((actor, sequence)),
+            ..Admission::default()
+        };
+        let current = journal
+            .record_admitted(event(session, "current-turn"), false, admission(42))
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(
+            journal
+                .acknowledge_retained_turn(session, actor, 7, 41, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            journal
+                .record_admitted(event(session, "late-prior-turn"), false, admission(41))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            journal
+                .list()
+                .unwrap()
+                .iter()
+                .filter(|notice| !notice.acknowledged)
+                .map(|notice| notice.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [unrelated.id, current.id].into(),
+        );
+    }
     use crate::{
         agent::Provider,
         model::TerminalId,
@@ -951,7 +1398,14 @@ mod tests {
         let mut waiting = event(TerminalId::new(), "turn:waiting:1");
         waiting.evidence.kind = Kind::Waiting;
         let notice = journal
-            .record_with_resolution(waiting.clone(), false, true)
+            .record_admitted(
+                waiting.clone(),
+                false,
+                Admission {
+                    resolved_waiting: true,
+                    ..Admission::default()
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(notice.acknowledged);
@@ -960,6 +1414,43 @@ mod tests {
         let mut journal = Journal::open(&path).unwrap();
         assert_eq!(journal.list().unwrap(), [notice]);
         assert!(journal.record(waiting, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_superseded_wait_does_not_publish_or_overwrite_newer_attention() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let mut waiting = event(session, "turn:waiting:1");
+        waiting.evidence.kind = Kind::Waiting;
+        let admission = Admission {
+            superseded: true,
+            resolved_waiting: true,
+            ..Admission::default()
+        };
+        assert!(
+            journal
+                .record_admitted(waiting.clone(), false, admission)
+                .unwrap()
+                .is_none()
+        );
+        assert!(journal.list().unwrap()[0].acknowledged);
+        let newer = journal
+            .record(event(session, "next-turn:finished"), false)
+            .unwrap()
+            .unwrap();
+        waiting.evidence.key = "turn:waiting:2".into();
+        assert!(
+            journal
+                .record_admitted(waiting.clone(), false, admission)
+                .unwrap()
+                .is_none()
+        );
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.record(waiting, false).unwrap().is_none());
+        assert_eq!(journal.list().unwrap(), [newer]);
     }
 
     fn seed_owners(journal: &mut Journal) {

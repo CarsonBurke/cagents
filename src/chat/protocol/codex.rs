@@ -529,6 +529,7 @@ fn create_inner(
             turn: None,
             held_stop: HeldStop::None,
             notification_turn: None,
+            observed_turn_start: None,
             notification_revision: 0,
             busy: false,
             lifecycle_revision: 0,
@@ -768,6 +769,7 @@ struct Codex {
     /// Exact live notice authority. Scalar status and paged history must not
     /// replace it; they can arrive after a newer turn's start.
     notification_turn: Option<String>,
+    observed_turn_start: Option<String>,
     notification_revision: u64,
     busy: bool,
     lifecycle_revision: u64,
@@ -896,6 +898,14 @@ impl Drop for Codex {
 }
 impl Codex {
     /// The diff state of `turn`, kept for the few turns still running.
+    fn observe_turn_start(&mut self, id: &str, step: &mut Step) {
+        if self.observed_turn_start.as_deref() != Some(id) {
+            self.observed_turn_start = Some(id.to_owned());
+            step.events
+                .extend([Event::TurnStarted, Event::TurnStartConfirmed]);
+        }
+    }
+
     fn turn_diff(&mut self, turn: &str) -> &mut TurnDiff {
         if !self.turn_diffs.contains_key(turn) && self.turn_diffs.len() >= 16 {
             self.turn_diffs.pop_first();
@@ -3396,6 +3406,7 @@ impl Codex {
                     // its RPC reply. An acknowledgement only fills missing state.
                     if owns_lifecycle {
                         self.notification_turn = Some(id.to_owned());
+                        self.observe_turn_start(id, &mut step);
                     }
                     if revision == self.lifecycle_revision {
                         self.turn = Some(id.into());
@@ -3966,7 +3977,7 @@ impl Codex {
                     self.notification_revision = self.notification_revision.wrapping_add(1);
                     self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
-                    step.events.push(Event::TurnStarted);
+                    self.observe_turn_start(turn_id, &mut step);
                     step.events
                         .push(Event::PromptCache(chat::prompt_cache::Evidence::Request));
                 }
