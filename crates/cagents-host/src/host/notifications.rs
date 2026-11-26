@@ -367,15 +367,23 @@ pub(super) fn acknowledge_predecessors(host: &SharedHost, session: TerminalId) {
 
 fn apply_predecessor_reads(
     journal: &mut Journal,
-    reads: &BTreeMap<Uuid, TerminalId>,
+    reads: &mut BTreeMap<Uuid, TerminalId>,
     mut cleared: impl FnMut(Uuid, TerminalId),
 ) -> Result<(), String> {
-    for (&id, &session) in reads {
-        if journal.acknowledge(id)?.is_some() {
-            cleared(id, session);
+    let mut failure = None;
+    reads.retain(|&id, &mut session| match journal.acknowledge(id) {
+        Ok(acknowledged) => {
+            if acknowledged.is_some() {
+                cleared(id, session);
+            }
+            false
         }
-    }
-    Ok(())
+        Err(error) => {
+            failure = Some(error);
+            true
+        }
+    });
+    failure.map_or(Ok(()), Err)
 }
 
 pub(super) struct Broker {
@@ -786,6 +794,7 @@ async fn run(
     let mut store = journal::Reopening::open(journal_path(), Instant::now());
     // Work held while the journal is unavailable, applied before the next batch.
     let mut deferred = Pending::default();
+    let mut predecessor_retry = None;
     let settings = preferences();
     let settings_error = settings.as_ref().err().cloned();
     let mut policy = settings.unwrap_or_else(|_| Preferences {
@@ -826,6 +835,7 @@ async fn run(
         }
         .into_iter()
         .chain(store.retry_at())
+        .chain(predecessor_retry.as_ref().map(|(due, _)| *due))
         .min(),
     )
     .await
@@ -866,6 +876,7 @@ async fn run(
         let journal = match store.journal() {
             Ok(journal) => journal,
             Err(error) => {
+                predecessor_retry = None;
                 let error = error.clone();
                 for (_, receipt) in pending.committed_events.drain(..) {
                     receipt.finish(Err(error.clone()));
@@ -990,13 +1001,28 @@ async fn run(
                 snapshot.diagnostic = Some(error);
             }
         }
-        if let Err(error) =
-            apply_predecessor_reads(journal, &pending.predecessor_reads, |id, session| {
-                delivery.retain(|_, waiting| waiting.id != id);
-                withdraw_target(&mut withdrawals, id, &Target::Session(session));
-            })
-        {
-            snapshot.diagnostic = Some(error);
+        match apply_predecessor_reads(journal, &mut pending.predecessor_reads, |id, session| {
+            delivery.retain(|_, waiting| waiting.id != id);
+            withdraw_target(&mut withdrawals, id, &Target::Session(session));
+        }) {
+            Ok(()) => {
+                if let Some((_, error)) = predecessor_retry.take()
+                    && snapshot.diagnostic.as_ref() == Some(&error)
+                {
+                    snapshot.diagnostic.clone_from(&settings_error);
+                }
+            }
+            Err(error) => {
+                deferred.read_predecessors(pending.predecessor_reads);
+                let now = Instant::now();
+                let due = predecessor_retry
+                    .as_ref()
+                    .map(|(due, _)| *due)
+                    .filter(|due| *due > now)
+                    .unwrap_or(now + RETRY_DELAY);
+                snapshot.diagnostic = Some(error.clone());
+                predecessor_retry = Some((due, error));
+            }
         }
         for id in pending.acknowledged {
             if stopped(&shared) {
@@ -1290,7 +1316,7 @@ mod tests {
             .record(attention_event(unrelated, "outside"), false)
             .unwrap()
             .unwrap();
-        let reads = Journal::open_reader(&path)
+        let mut reads = Journal::open_reader(&path)
             .unwrap()
             .unread_session_ids(&[predecessor, replaced_predecessor].into())
             .unwrap();
@@ -1308,7 +1334,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut retired = Vec::new();
-        apply_predecessor_reads(&mut bridge.journal, &reads, |id, _| retired.push(id)).unwrap();
+        apply_predecessor_reads(&mut bridge.journal, &mut reads, |id, _| retired.push(id)).unwrap();
         assert_eq!(retired, [previous.id]);
         let visible = bridge.list().unwrap();
         assert!(
@@ -1320,6 +1346,31 @@ mod tests {
         );
         assert!(visible.contains(&unrelated));
         assert!(visible.contains(&later));
+    }
+
+    #[test]
+    fn retry_after_a_failed_predecessor_write_keeps_its_original_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let predecessor = TerminalId::new();
+        let previous = journal
+            .record(attention_event(predecessor, "before"), false)
+            .unwrap()
+            .unwrap();
+        let mut reads = [(previous.id, predecessor)].into();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER refuse_ack BEFORE UPDATE OF acknowledged ON notices BEGIN SELECT raise(ABORT, 'temporarily cannot write'); END;").unwrap();
+        assert!(apply_predecessor_reads(&mut journal, &mut reads, |_, _| unreachable!()).is_err());
+        assert_eq!(reads, [(previous.id, predecessor)].into());
+        db.execute_batch("DROP TRIGGER refuse_ack").unwrap();
+        let replacement = journal
+            .record(attention_event(predecessor, "after"), false)
+            .unwrap()
+            .unwrap();
+        apply_predecessor_reads(&mut journal, &mut reads, |_, _| unreachable!()).unwrap();
+        assert!(reads.is_empty());
+        assert_eq!(journal.list().unwrap(), [replacement]);
     }
 
     #[test]
