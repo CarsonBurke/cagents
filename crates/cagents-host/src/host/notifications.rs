@@ -1572,7 +1572,7 @@ mod tests {
             destination: None,
             evidence: crate::notifications::Evidence {
                 key: format!("automation:{id}:lifecycle:6"),
-                kind: Kind::AutomationPaused,
+                kind: crate::notifications::Kind::AutomationPaused,
             },
             content: None,
         };
