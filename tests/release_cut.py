@@ -56,11 +56,16 @@ case $1 in
     pin) [[ ! -e $fixture/pin-fails ]] ;;
     unpin|request) ;;
     wait)
+        if [[ -p $fixture/macos-started ]]; then
+            read -r -t 15 started <> "$fixture/macos-started" || exit 99
+            [[ $started == started ]] || exit 99
+        fi
         if [[ -p $fixture/wait-ready ]]; then
             trap 'touch "$fixture/wait-cancelled"; exit 143' TERM
             printf 'waiting\n' > "$fixture/wait-ready"
             read -r -t 15 unused <>"$fixture/wait-release" || exit 99
         fi
+        [[ ! -e $fixture/linux-package-failed ]] || exit 1
         mv "$fixture/waiting/$2" "$HOME/.local/state/cagents-prebuilt/bundles/$2"
         echo "$2" ;;
 esac
@@ -205,6 +210,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n1)
 echo "package-macos $version epoch=$SOURCE_DATE_EPOCH target=$CARGO_TARGET_DIR git=$([[ -e $root/.git ]] && echo yes || echo no)" \
     >> "$FIXTURE/calls.log"
+if [[ -p $FIXTURE/macos-started ]]; then
+    printf 'started\n' > "$FIXTURE/macos-started"
+fi
 mkdir -p "$2" && cd "$2"
 printf 'macOS archive %s\n' "$version" > "cagents-$version-aarch64-apple-darwin.tar.gz"
 if [[ -f $root/macos-source-marker ]]; then
@@ -397,6 +405,57 @@ class ReleaseCut(unittest.TestCase):
         self.assertTrue(any(f"--require-tests {self.fix}" in line for line in self.log("sentinel.log")))
         self.assertEqual(json.loads((self.root / "bundles/0.2.4/release-metadata.json").read_text())
                          ["source_commit"], self.fix)
+
+    def test_wait_prepares_macos_while_the_tested_tip_packages_on_linux(self):
+        self.bundle(self.feature)
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        tip = self.commit("feat(release): package macOS")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(tip, where=self.root / "waiting")
+        os.mkfifo(self.root / "macos-started")
+
+        result = self.release("cut", "--wait", "--macos-host", "mac", "--key", "fixture-key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Using the prepared macOS release of {tip}.", result.stdout)
+        self.assertTrue(any(f"--require-tests {tip}" in line for line in self.log("sentinel.log")))
+        self.assertEqual(sum(line.startswith("package-macos ") for line in self.log("calls.log")), 1)
+        bundle = self.root / "bundles/0.2.4"
+        metadata = json.loads((bundle / "release-metadata.json").read_text())
+        self.assertEqual(metadata["source_commit"], tip)
+        self.assertIn("cagents-0.2.4-aarch64-apple-darwin.tar.gz", metadata["assets"])
+        self.assertTrue((bundle / "release-metadata.json.sig").is_file())
+        self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), tip)
+
+    def test_wait_does_not_tag_or_sign_if_linux_packaging_fails_after_tests(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        tip = self.commit("feat(release): package macOS")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(tip, where=self.root / "waiting")
+        os.mkfifo(self.root / "macos-started")
+        (self.root / "linux-package-failed").touch()
+
+        result = self.release("cut", "--wait", "--macos-host", "mac", "--key", "fixture-key")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"no bundle of {tip}", result.stderr)
+        self.assertTrue((self.root / f"bundles/.prepared-macos/mac/0.2.4/{tip}/receipt").is_file())
+        self.assertFalse(any(line.startswith("ssh-keygen ") for line in self.log("calls.log")))
+        self.assertEqual(self.git("tag", "--list", "v0.2.4"), "")
+
+    def test_wait_does_not_start_macos_early_for_an_unavailable_verdict(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        tip = self.commit("feat(release): package macOS")
+        self.git("push", "-q", "origin", "main")
+        (self.root / "sentinel-status").write_text("3")
+        os.mkfifo(self.root / "wait-ready")
+        os.mkfifo(self.root / "wait-release")
+
+        result = self.release("cut", "--wait", "--macos-host", "mac")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no verdict (status 3)", result.stderr)
+        self.assertTrue(any(f"--require-tests {tip}" in line for line in self.log("sentinel.log")))
+        self.assertTrue((self.root / "wait-cancelled").exists())
+        self.assertFalse(any(line.startswith("package-macos ") for line in self.log("calls.log")))
+        self.assertEqual(self.git("tag", "--list", "v0.2.4"), "")
 
     def test_wait_stops_when_the_tips_tests_fail(self):
         self.bundle(self.fix, where=self.root / "waiting")

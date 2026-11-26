@@ -445,13 +445,18 @@ add_macos() (
     fi
 )
 
-prepare_macos() (
+prepare_macos() {
     [[ -n $MACOS_HOST ]] || fail 'prepare-macos needs --macos-host MAC'
-    local commit cache bundle stage started=$SECONDS
+    local commit
     repository_git fetch --quiet origin main
     commit=$(repository_git rev-parse --verify --end-of-options "${COMMIT:-origin/main}^{commit}") \
         || fail "unknown commit: $COMMIT"
     repository_git merge-base --is-ancestor "$commit" origin/main || fail "$commit is not on main"
+    prepare_macos_commit "$commit"
+}
+
+prepare_macos_commit() (
+    local commit=$1 cache bundle stage started=$SECONDS
     VERSION=$(version_at "$commit")
     cache=$(macos_cache_dir)
     bundle=$cache/$commit
@@ -496,7 +501,7 @@ on_host() {
 # Prints, as JSON, the build host's prebuilt bundles with each one's test
 # verdict, the build running and the commit main's sentinel compiled last.
 prebuilt() {
-    on_host <<'HOST'
+    on_host "$1" <<'HOST'
 set -euo pipefail
 cd ~/"$1"
 scripts/prebuild-release --repository "$PWD" status --json | /usr/bin/python3 -I -c '
@@ -505,25 +510,32 @@ status = json.load(sys.stdin)
 verdicts = pathlib.Path.home() / ".local/state/cagents-main-sentinel/verdicts"
 def verdict(sha):
     try:
-        return json.loads((verdicts / f"{sha}.json").read_text()).get("passed")
+        result = json.loads((verdicts / f"{sha}.json").read_text())
+        if isinstance(result, dict) and result.get("sha") == sha:
+            return result.get("passed")
     except (OSError, ValueError):
         return None
 # An unreadable bundle.json reads as null; such a bundle is no candidate.
 status["bundles"] = [bundle for bundle in status["bundles"] if bundle]
 for bundle in status["bundles"]:
     bundle["passed"] = verdict(bundle["sha"])
+status["tip_passed"] = verdict(sys.argv[1])
 print(json.dumps(status))
-'
+' "$2"
 HOST
 }
 
 # Builds main's tip on the build host at normal priority and requires its
 # passing verdict, which the sentinel gives while the bundle builds.
-prebuild_tip() {
-    local tip=$1
+start_tip_prebuild() {
+    local tip=$1 relative
+    relative=$(host_repository)
     printf 'Prebuilding %s on %s at normal priority; its tests run beside it if they have not yet.\n' \
         "$tip" "$BUILD_HOST"
-    on_host "$tip" <<'HOST'
+    # Keep the SSH PID so interruption stops our waiter. The requested
+    # fw16 prebuild can still finish and be reused.
+    # shellcheck disable=SC2029
+    ssh "$BUILD_HOST" bash -s -- "$relative" "$tip" <<'HOST' &
 set -euo pipefail
 cd ~/"$1"
 tip=$2
@@ -554,6 +566,7 @@ case $status in
     *) echo "release: the sentinel gave $tip no verdict (status $status); run the release again" >&2; exit 1 ;;
 esac
 HOST
+    TIP_PREBUILD_PID=$!
 }
 
 # The versions tagged on origin, as a JSON array.
@@ -594,7 +607,12 @@ HOST
 }
 
 NOTES_FILE=
+TIP_PREBUILD_PID=
 cut_cleanup() {
+    if [[ -n $TIP_PREBUILD_PID ]]; then
+        kill -TERM "$TIP_PREBUILD_PID" 2>/dev/null || :
+        wait "$TIP_PREBUILD_PID" || :
+    fi
     [[ -z $NOTES_FILE ]] || rm -f -- "$NOTES_FILE"
     unpin_bundle
 }
@@ -602,11 +620,15 @@ cut_cleanup() {
 # Named apart from the cut command, which it would otherwise shadow.
 cut_release() {
     local status released selected sha behind tip answer bundle protocol previous key building
+    local prebuild_status=0 tip_version
     trap cut_cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     repository_git fetch --quiet origin main
     MAIN=$(repository_git rev-parse --verify origin/main)
     tip=$MAIN
-    status=$(prebuilt) || fail "cannot read the prebuilt bundles on $BUILD_HOST"
+    status=$(prebuilt "$tip") || fail "cannot read the prebuilt bundles on $BUILD_HOST"
     released=$(released_versions) || fail 'cannot read the tags on origin'
     if [[ -n $COMMIT ]]; then
         sha=$(repository_git rev-parse --verify "$COMMIT^{commit}") || fail "unknown commit: $COMMIT"
@@ -641,7 +663,19 @@ cut_release() {
             [[ $answer == [yY] ]] || fail 'nothing released'
         fi
         unpin_bundle
-        prebuild_tip "$tip" || fail "no bundle of $tip"
+        start_tip_prebuild "$tip"
+        if [[ -n $MACOS_HOST && $sha != "$tip" ]] && jq -e '.tip_passed == true' <<< "$status" >/dev/null; then
+            tip_version=$(version_at "$tip")
+            if [[ ! -e $BUNDLES/$tip_version/release-metadata.json.sig ]] && \
+                ! jq -e --arg v "$tip_version" 'index($v) != null' <<< "$released" >/dev/null; then
+                # Keep the Mac in the foreground for SSH authentication and
+                # cleanup. Only a recorded passing verdict starts it early.
+                prepare_macos_commit "$tip"
+            fi
+        fi
+        wait "$TIP_PREBUILD_PID" || prebuild_status=$?
+        TIP_PREBUILD_PID=
+        ((prebuild_status == 0)) || fail "no bundle of $tip"
         sha=$tip
         pin_bundle "$sha"
     fi
