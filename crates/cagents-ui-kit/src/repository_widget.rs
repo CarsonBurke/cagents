@@ -1429,7 +1429,7 @@ impl EditorDocument {
             return;
         }
         self.note_document_watch_error(
-            "The file changed on disk. Your unsaved edits are kept, and autosave is paused until you choose."
+            "The file changed on disk while it had unsaved edits, which are kept until you choose."
                 .into(),
         );
         self.disk_version = Some(DiskVersion {
@@ -11257,16 +11257,24 @@ fn disk_notice<'a>(
                 .error
                 .as_deref()
                 .filter(|error| !document.error_from_document_watch && *error != SAVE_CONFLICT);
-            let (heading, detail) = if version.undone {
-                (
+            // Autosave is only worth mentioning to someone who has it on.
+            let (heading, detail) = match (version.undone, runtime.auto_save) {
+                (true, true) => (
                     "Undid a change from disk",
                     "Your text no longer matches the file on disk, and autosave is paused until you choose. Reload takes the file on disk; Keep mine saves this text over it.",
-                )
-            } else {
-                (
+                ),
+                (true, false) => (
+                    "Undid a change from disk",
+                    "Your text no longer matches the file on disk. Reload takes the file on disk; Keep mine lets your next save replace it.",
+                ),
+                (false, true) => (
                     "Changed on disk",
                     "Your unsaved edits are kept, and autosave is paused until you choose. Reload takes the new version; Undo brings your edits back.",
-                )
+                ),
+                (false, false) => (
+                    "Changed on disk",
+                    "Your unsaved edits are kept. Reload takes the new version; Undo brings your edits back.",
+                ),
             };
             (
                 Some(heading),
