@@ -853,6 +853,7 @@ enum ClientCommand {
     },
     Visibility(TerminalVisibility),
     AcknowledgeOutput(u64),
+    AcknowledgeConversation,
     Hibernate,
     Resume {
         visible: bool,
@@ -877,6 +878,7 @@ impl ClientCommand {
             Self::Search { .. } => "search terminal",
             Self::Visibility(_) => "set terminal visibility",
             Self::AcknowledgeOutput(_) => "acknowledge terminal output",
+            Self::AcknowledgeConversation => "acknowledge conversation attention",
             Self::Hibernate => "hibernate terminal",
             Self::Resume { .. } => "resume terminal",
             Self::ShutdownTerminal(_) => "shutdown terminal",
@@ -930,6 +932,10 @@ impl ClientCommand {
             Self::AcknowledgeOutput(epoch) => {
                 ClientRequest::TerminalAcknowledge { terminal_id, epoch }
             }
+            Self::AcknowledgeConversation => ClientRequest::ChatAcknowledge {
+                chat_id: terminal_id,
+                epoch: 1,
+            },
             Self::Hibernate => ClientRequest::Hibernate { terminal_id },
             Self::Resume { visible } => ClientRequest::Resume {
                 terminal_id,
@@ -1218,6 +1224,12 @@ impl HostedTerminalHandle {
         observation.epoch = epoch;
         observation.pending = false;
         Ok(())
+    }
+
+    /// A person has read the attached conversation. Reattaching never
+    /// replays this request with the terminal's output-observation epoch.
+    pub fn acknowledge_conversation_attention(&self) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::AcknowledgeConversation)
     }
 
     pub fn events(&self) -> Receiver<TerminalEvent> {

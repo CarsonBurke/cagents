@@ -2467,13 +2467,9 @@ fn process_admitted_request(
             ))
         }
         ClientRequest::TerminalAcknowledge { terminal_id, epoch } => {
-            let read = host
-                .lock()
+            host.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .acknowledge_output(client_id, terminal_id, epoch)?;
-            if read {
-                super::notifications::acknowledge_predecessors(host, terminal_id);
-            }
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::AcknowledgeRedraw {

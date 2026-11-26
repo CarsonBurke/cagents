@@ -571,6 +571,8 @@ pub enum ClientRequest {
     },
     ChatList,
     /// Acknowledge activity without enabling or reading presentation.
+    /// Explicit read of an attached conversation. Terminal-output observation
+    /// and its replay on reconnect use `TerminalAcknowledge`.
     ChatAcknowledge {
         chat_id: TerminalId,
         epoch: u64,

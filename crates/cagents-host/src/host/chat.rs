@@ -4552,6 +4552,13 @@ fn process_inner(
         } => chat_command(host, client, chat_id, command, Some(delivery)),
         ClientRequest::ChatAcknowledge { chat_id, epoch } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            // An attached terminal can explicitly acknowledge its conversation.
+            // Output rearm during reconnect uses a separate request.
+            if state.attached_terminal_conversation(client, chat_id) {
+                drop(state);
+                super::notifications::acknowledge_predecessors(host, chat_id);
+                return Ok(ServerResponse::Accepted);
+            }
             if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
                 receipt.require_attached(client)?;
                 return Ok(ServerResponse::Accepted);
