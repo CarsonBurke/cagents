@@ -14,7 +14,7 @@ use journal::Journal;
 use osascript::{Activation, PortalOwner, connect, remove, send, send_test};
 #[cfg(target_os = "linux")]
 use portal::{Activation, PortalOwner, connect, remove, send, send_test};
-use withdrawals::{Withdrawal, Withdrawals};
+use withdrawals::Withdrawals;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -540,7 +540,7 @@ fn restore(
     policy: &Preferences,
     snapshot: &mut Snapshot,
     withdrawals: &mut Withdrawals,
-) {
+) -> Result<(), String> {
     if !policy.message_previews {
         match journal.clear_content() {
             Ok(notices) => {
@@ -563,20 +563,7 @@ fn restore(
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
-    withdrawals.protect(
-        snapshot
-            .notices
-            .iter()
-            .map(|notice| batching::desktop_id(&notice.event.target)),
-    );
-    match journal.group_withdrawals() {
-        Ok(groups) => {
-            for group in groups {
-                withdrawals.group(group);
-            }
-        }
-        Err(error) => snapshot.diagnostic = Some(error),
-    }
+    reserve_withdrawals(journal, snapshot, withdrawals).map(|_| ())
 }
 
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
@@ -593,6 +580,24 @@ fn revoke_previews(snapshot: &mut Snapshot, withdrawals: &mut Withdrawals) {
             withdraw_notice(withdrawals, notice);
         }
     }
+}
+
+fn reserve_withdrawals(
+    journal: &mut Journal,
+    snapshot: &Snapshot,
+    withdrawals: &mut Withdrawals,
+) -> Result<BTreeSet<Uuid>, String> {
+    let current: Vec<_> = snapshot
+        .notices
+        .iter()
+        .map(|notice| batching::desktop_id(&notice.event.target))
+        .collect();
+    withdrawals.protect(current.iter().copied());
+    let durable = journal.group_withdrawals_for(&current)?;
+    for id in &durable {
+        withdrawals.group(*id);
+    }
+    Ok(durable)
 }
 
 fn action_notice(snapshot: &Snapshot, id: Uuid) -> Option<&Notice> {
@@ -842,12 +847,19 @@ async fn run(
     let mut withdrawals = Withdrawals::default();
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
+    let mut withdrawal_retry = None;
     let mut snapshot = Snapshot {
         diagnostic: settings_error.clone(),
         ..Default::default()
     };
     match store.journal() {
-        Ok(journal) => restore(journal, &policy, &mut snapshot, &mut withdrawals),
+        Ok(journal) => {
+            if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
+                next_attempt = Instant::now() + RETRY_DELAY;
+                withdrawal_retry = Some((next_attempt, error.clone()));
+                snapshot.diagnostic = Some(error);
+            }
+        }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
     publish(&shared, &host, snapshot.clone());
@@ -866,6 +878,7 @@ async fn run(
         }
         .into_iter()
         .chain(store.retry_at())
+        .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
         .min(),
     )
     .await
@@ -914,7 +927,9 @@ async fn run(
             if snapshot.diagnostic.as_ref() == Some(&recovered) {
                 snapshot.diagnostic.clone_from(&settings_error);
             }
-            restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
+                snapshot.diagnostic = Some(error);
+            }
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -1126,22 +1141,33 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
-        withdrawals.protect(
-            snapshot
-                .notices
-                .iter()
-                .map(|notice| batching::desktop_id(&notice.event.target)),
-        );
-        let persisted_withdrawals = match journal.group_withdrawals() {
+        let persisted_withdrawals = match reserve_withdrawals(journal, &snapshot, &mut withdrawals)
+        {
             Ok(groups) => {
-                for group in &groups {
-                    withdrawals.group(*group);
+                if let Some((_, error)) = withdrawal_retry.take()
+                    && snapshot.diagnostic.as_deref() == Some(error.as_str())
+                {
+                    snapshot.diagnostic = settings_error.clone();
                 }
                 groups
             }
             Err(error) => {
-                snapshot.diagnostic = Some(error);
-                Vec::new()
+                // The same stable desktop group may still have an older
+                // withdrawal in the journal. Wait before publishing or
+                // activating another notice on that group.
+                snapshot.diagnostic = Some(error.clone());
+                if !policy.message_previews {
+                    for notice in &mut snapshot.notices {
+                        notice.event.content = None;
+                    }
+                }
+                publish(&shared, &host, snapshot.clone());
+                answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                proxy = None;
+                next_attempt = Instant::now() + retry_delay;
+                withdrawal_retry = Some((next_attempt, error));
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                continue;
             }
         };
         pending
@@ -1255,10 +1281,8 @@ async fn run(
                     break;
                 };
                 let result = remove(backend, entry.id()).await.and_then(|()| {
-                    if let Withdrawal::Group(id) = entry
-                        && persisted_withdrawals.contains(&id)
-                    {
-                        journal.finish_group_withdrawal(id)?;
+                    if persisted_withdrawals.contains(&entry.id()) {
+                        journal.finish_group_withdrawal(entry.id())?;
                     }
                     Ok(())
                 });
@@ -1991,6 +2015,51 @@ mod tests {
     }
 
     #[test]
+    fn a_current_waiting_group_is_reserved_ahead_of_the_durable_backlog() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let target = Target::Session(TerminalId::new());
+        let notice = journal
+            .record(
+                Event {
+                    target: target.clone(),
+                    source_session: None,
+                    provider: None,
+                    directory: None,
+                    destination: None,
+                    evidence: crate::notifications::Evidence {
+                        key: "current waiting".into(),
+                        kind: Kind::Waiting,
+                    },
+                    content: None,
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        rusqlite::Connection::open(path).unwrap().execute(
+            "WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<?1) INSERT INTO portal_group_withdrawals SELECT printf('00000000-0000-0000-0000-%012x', n) FROM rows",
+            [MAX_PENDING],
+        ).unwrap();
+        let current = batching::desktop_id(&target);
+        journal
+            .remember_notice_withdrawal(&target, Uuid::new_v4())
+            .unwrap();
+        let mut withdrawals = Withdrawals::default();
+        let mut snapshot = Snapshot::default();
+        restore(
+            &mut journal,
+            &Preferences::default(),
+            &mut snapshot,
+            &mut withdrawals,
+        )
+        .unwrap();
+        assert_eq!(snapshot.notices, [notice]);
+        assert!(withdrawals.contains(&current));
+    }
+
+    #[test]
     fn shutdown_reopens_a_recovered_journal_before_the_waiting_retry_deadline() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("attention.sqlite");
@@ -2036,7 +2105,8 @@ mod tests {
             &Preferences::default(),
             &mut snapshot,
             &mut withdrawals,
-        );
+        )
+        .unwrap();
         assert_eq!(snapshot.notices, [newer]);
         let group = batching::desktop_id(&target);
         let mut expected = [group, prior.id];
