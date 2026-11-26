@@ -385,6 +385,10 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
     let store = Store::discover().unwrap();
     let checkpoint = store.load().unwrap().unwrap();
     assert_eq!(checkpoint.phase, Phase::Ready);
+    let ready_bytes = fs::read(&store.path).unwrap();
+    let launch_log = root.join("provider-launches");
+    let original_launches = fs::read_to_string(&launch_log).unwrap();
+    assert_eq!(original_launches.lines().count(), 1);
     let [saved] = checkpoint.chats.as_slice() else {
         panic!("expected one saved native conversation");
     };
@@ -428,7 +432,16 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
         )),
         "{refusal}"
     );
-    assert_eq!(store.load().unwrap().unwrap().phase, Phase::Ready);
+    assert_eq!(
+        fs::read(&store.path).unwrap(),
+        ready_bytes,
+        "the refused restore changed the Ready checkpoint"
+    );
+    assert_eq!(
+        fs::read_to_string(&launch_log).unwrap(),
+        original_launches,
+        "the refused restore launched a replacement provider"
+    );
     assert!(!control.exists() && !listener.exists());
     drop(competing_writer);
     super::super::update_recovery::restore_ordinary(&host).unwrap();
@@ -452,13 +465,7 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
     let restored_owner = owner();
     assert_ne!(restored_owner.holder, previous_owner.holder);
     assert_ne!(restored_owner.root, previous_owner.root);
-    assert_eq!(
-        fs::read_to_string(root.join("provider-launches"))
-            .unwrap()
-            .lines()
-            .count(),
-        2
-    );
+    assert_eq!(fs::read_to_string(&launch_log).unwrap().lines().count(), 2);
     let requests = fs::read_to_string(root.join("provider-requests")).unwrap();
     assert_eq!(
         requests
