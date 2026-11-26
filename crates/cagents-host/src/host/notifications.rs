@@ -636,6 +636,19 @@ fn answer_tests(requesters: &[std::sync::mpsc::Sender<TestOutcome>], outcome: &T
     }
 }
 
+fn commit_waiting_clears(
+    journal: &mut Journal,
+    cleared: &BTreeSet<Target>,
+    mut committed: impl FnMut(&Target, Uuid),
+) -> Result<(), String> {
+    for target in cleared {
+        if let Some(id) = journal.acknowledge_waiting(target)? {
+            committed(target, id);
+        }
+    }
+    Ok(())
+}
+
 async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>) -> bool {
     if let Some(retry) = retry {
         tokio::select! {
@@ -855,6 +868,15 @@ async fn run(
         });
         drop(core);
         if pending.stopped {
+            // Retained shutdown can enqueue its final settlement immediately
+            // before the broker's drop. Finish those durable clears without
+            // calling the portal or accepting any new work.
+            if let Ok(journal) = store.journal()
+                && let Err(error) =
+                    commit_waiting_clears(journal, &pending.cleared_waiting, |_, _| {})
+            {
+                tracing::warn!(%error, "could not record waiting attention settlement at shutdown");
+            }
             break;
         }
         if let Some(owner) = pending.portal_owner.take()
@@ -987,7 +1009,7 @@ async fn run(
             }
             pending.events.extend(inboxes.events);
         }
-        for session in pending.retired {
+        for session in std::mem::take(&mut pending.retired) {
             if stopped(&shared) {
                 return;
             }
@@ -1003,7 +1025,7 @@ async fn run(
                 snapshot.diagnostic = Some(error);
             }
         }
-        for id in pending.acknowledged {
+        for id in std::mem::take(&mut pending.acknowledged) {
             if stopped(&shared) {
                 return;
             }
@@ -1015,21 +1037,24 @@ async fn run(
                 withdraw_notice(&mut withdrawals, notice);
             }
         }
-        for target in &pending.cleared_waiting {
-            if stopped(&shared) {
-                return;
-            }
-            match journal.acknowledge_waiting(target) {
-                Ok(Some(id)) => {
-                    if delivery.get(target).is_some_and(|notice| notice.id == id) {
-                        delivery.remove(target);
-                    }
-                    withdraw_target(&mut withdrawals, id, target);
+        if let Err(error) =
+            commit_waiting_clears(journal, &pending.cleared_waiting, |target, id| {
+                if delivery.get(target).is_some_and(|notice| notice.id == id) {
+                    delivery.remove(target);
                 }
-                Ok(None) => {}
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
+                withdraw_target(&mut withdrawals, id, target);
+            })
+        {
+            snapshot.diagnostic = Some(error.clone());
+            publish(&shared, &host, snapshot.clone());
+            proxy = None;
+            next_attempt = store.retry_failed_write(error, Instant::now());
+            // Reapply these clears before a later request for the same
+            // conversation is allowed to commit. Retained receipts can replay.
+            deferred = pending.deferred();
+            continue;
         }
+        pending.cleared_waiting.clear();
         let events = pending
             .events
             .into_values()
@@ -1869,6 +1894,49 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].event.evidence.key, "new");
         assert!(!retained[0].acknowledged);
+    }
+
+    #[test]
+    fn a_failed_waiting_clear_is_retried_before_a_later_request_commits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let session = TerminalId::new();
+        let target = Target::Session(session);
+        let request = |key: &str| {
+            let mut event = attention_event(session, key);
+            event.evidence.kind = Kind::Waiting;
+            event
+        };
+        let mut store = journal::Reopening::open(Some(path.clone()), Instant::now());
+        let journal = store.journal().unwrap();
+        let old = journal.record(request("old"), false).unwrap().unwrap();
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_ack BEFORE UPDATE ON notices
+             WHEN NEW.acknowledged=1 BEGIN SELECT RAISE(FAIL, 'fixture write failure'); END;",
+        )
+        .unwrap();
+        let mut pending = Pending::default();
+        pending.clear_waiting(target.clone());
+        let failure =
+            commit_waiting_clears(journal, &pending.cleared_waiting, |_, _| {}).unwrap_err();
+        let next = store.retry_failed_write(failure, Instant::now());
+        let mut newer = Pending::default();
+        newer.events.insert(target.clone(), request("new"));
+        let deferred = pending.deferred().followed_by(newer);
+
+        db.execute_batch("DROP TRIGGER fail_ack").unwrap();
+        assert!(store.reopen_if_due(next).is_some());
+        let journal = store.journal().unwrap();
+        let mut cleared = Vec::new();
+        commit_waiting_clears(journal, &deferred.cleared_waiting, |_, id| cleared.push(id))
+            .unwrap();
+        assert_eq!(cleared, [old.id]);
+        let new = journal
+            .record(deferred.events[&target].clone(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.list().unwrap(), [new]);
     }
 
     #[test]

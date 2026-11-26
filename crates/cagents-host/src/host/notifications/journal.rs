@@ -466,6 +466,14 @@ impl Reopening {
         self.journal.as_mut().map_err(|error| &*error)
     }
 
+    /// Preserve work that reached an open journal but failed to write.
+    pub(super) fn retry_failed_write(&mut self, error: String, now: Instant) -> Instant {
+        self.journal = Err(error);
+        self.delay = FIRST_REOPEN;
+        self.next_attempt = now + self.delay;
+        self.next_attempt
+    }
+
     /// When a failed journal is next tried, if it can be.
     pub(super) fn retry_at(&self) -> Option<Instant> {
         (self.journal.is_err() && self.path.is_some()).then_some(self.next_attempt)
