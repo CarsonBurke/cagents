@@ -1599,6 +1599,9 @@ impl Adapter for Omp {
             "agent_start" | "auto_compaction_start" => {
                 if text(&frame, "type") == "agent_start" {
                     step.events.push(Event::TurnStarted);
+                    if !self.agent_turn_active {
+                        step.events.push(Event::TurnStartConfirmed);
+                    }
                     self.turn_outcome = None;
                     self.turn_error = TurnError::default();
                     self.history_error = None;
@@ -2726,6 +2729,8 @@ mod tests {
                     .completion_probe
                     .is_none()
             );
+            let resumed = adapter.receive(json!({"type":"agent_start"})).unwrap();
+            assert!(!resumed.events.contains(&Event::TurnStartConfirmed));
         }
         let (mut adapter, _, message) = captured_legacy_run(true, "stop");
         let end = adapter
@@ -2736,7 +2741,8 @@ mod tests {
             .iter()
             .find(|frame| frame["type"] == "get_state")
             .unwrap();
-        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        let newer = adapter.receive(json!({"type":"agent_start"})).unwrap();
+        assert!(newer.events.contains(&Event::TurnStartConfirmed));
         let stale = adapter
             .receive(
                 json!({"type":"response","id":probe["id"],"command":"get_state","success":true,

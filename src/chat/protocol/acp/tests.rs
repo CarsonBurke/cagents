@@ -154,6 +154,69 @@ fn finished(step: &Step) -> Option<Kind> {
 }
 
 #[test]
+fn prompt_activity_becomes_a_confirmed_turn_only_after_provider_evidence() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let start = |acp: &mut Acp| {
+        let step = acp
+            .command(Command::Prompt {
+                text: "Start work".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert!(step.events.contains(&Event::TurnStarted));
+        assert!(!step.events.contains(&Event::TurnStartConfirmed));
+        only_write(&step).clone()
+    };
+    let prompt = start(&mut acp);
+    let refused = acp
+        .receive(refusal(&prompt, -32000, "No allowance"))
+        .unwrap();
+    assert!(!refused.events.contains(&Event::TurnStartConfirmed));
+    assert_eq!(finished(&refused), Some(Kind::Failed));
+
+    let tool = json!({"sessionUpdate":"tool_call","toolCallId":"parent-work","status":"in_progress","kind":"execute","title":"Run checks"});
+    let prompt = start(&mut acp);
+    let first_tool = acp.receive(update(&session, tool.clone())).unwrap();
+    assert!(first_tool.events.contains(&Event::TurnStartConfirmed));
+    let completed = acp
+        .receive(reply(&prompt, json!({"stopReason":"end_turn"})))
+        .unwrap();
+    assert!(!completed.events.contains(&Event::TurnStartConfirmed));
+
+    let prompt = start(&mut acp);
+    let late_tool = acp.receive(update(&session, tool)).unwrap();
+    assert!(!late_tool.events.contains(&Event::TurnStartConfirmed));
+    let response = json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Work began"}});
+    let other = acp
+        .receive(update("different-session", response.clone()))
+        .unwrap();
+    assert!(!other.events.contains(&Event::TurnStartConfirmed));
+    let first = acp.receive(update(&session, response.clone())).unwrap();
+    assert!(first.events.contains(&Event::TurnStartConfirmed));
+    let next = acp.receive(update(&session, response)).unwrap();
+    assert!(!next.events.contains(&Event::TurnStartConfirmed));
+    let completed = acp
+        .receive(reply(&prompt, json!({"stopReason":"end_turn"})))
+        .unwrap();
+    assert!(!completed.events.contains(&Event::TurnStartConfirmed));
+
+    let prompt = start(&mut acp);
+    let completed = acp
+        .receive(reply(&prompt, json!({"stopReason":"end_turn"})))
+        .unwrap();
+    assert_eq!(
+        completed.events.iter().find(|event| matches!(
+            event,
+            Event::TurnStartConfirmed | Event::TurnFinished { .. }
+        )),
+        Some(&Event::TurnStartConfirmed)
+    );
+    assert_eq!(finished(&completed), Some(Kind::Succeeded));
+}
+
+#[test]
 fn the_handshake_offers_no_files_or_terminal_and_names_cagents() {
     let mut acp = adapter(&[], None);
     let step = acp.initialize().unwrap();

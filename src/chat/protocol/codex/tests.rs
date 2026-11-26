@@ -673,6 +673,42 @@ fn absent_or_failed_predictions_and_observed_child_turns_never_produce_prompts()
 }
 
 #[test]
+fn a_duplicate_provider_start_does_not_reopen_the_same_turn() {
+    let notification = json!({"method":"turn/started","params":{
+        "threadId":"thread-exact",
+        "turn":{"id":"same-turn","status":"inProgress","items":[]},
+    }});
+    for notification_first in [false, true] {
+        let mut current = adapter();
+        let prompted = current
+            .command(Command::Prompt {
+                text: "Begin".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert!(!prompted.events.contains(&Event::TurnStartConfirmed));
+        let start_request = prompted
+            .writes
+            .iter()
+            .find(|request| request["method"] == "turn/start")
+            .unwrap();
+        let reply = json!({"id":start_request["id"],"result":{"turn":{"id":"same-turn","status":"inProgress"}}});
+        let [first, duplicate] = if notification_first {
+            [notification.clone(), reply]
+        } else {
+            [reply, notification.clone()]
+        };
+        let started = current.receive(first).unwrap();
+        assert!(started.events.contains(&Event::TurnStarted));
+        assert!(started.events.contains(&Event::TurnStartConfirmed));
+        let repeated = current.receive(duplicate).unwrap();
+        assert!(!repeated.events.contains(&Event::TurnStarted));
+        assert!(!repeated.events.contains(&Event::TurnStartConfirmed));
+    }
+}
+
+#[test]
 fn next_prompt_prediction_is_correlated_and_legacy_errors_are_quiet() {
     let mut current = adapter();
     let completion = |id: &str| json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":id,"status":"completed","items":[]}}});
@@ -2225,6 +2261,7 @@ fn adapter() -> Codex {
         turn: None,
         held_stop: HeldStop::None,
         notification_turn: None,
+        observed_turn_start: None,
         notification_revision: 0,
         busy: false,
         lifecycle_revision: 0,

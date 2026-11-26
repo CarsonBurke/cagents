@@ -556,6 +556,17 @@ impl Handle {
             Owner::Remote(remote) => remote.state().retained_runs.clone(),
         }
     }
+
+    /// The latest genuine turn start and the outbox sequence preceding it.
+    pub fn retained_attention_turn(
+        &self,
+        sequence: Option<u64>,
+    ) -> Result<Option<(u64, u64)>, String> {
+        match &self.0 {
+            Owner::Remote(remote) => remote.attention_turn(sequence),
+            Owner::Local(_) => Ok(None),
+        }
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub fn attachment_snapshot(&self) -> Snapshot {
         match &self.0 {

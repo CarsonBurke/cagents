@@ -272,6 +272,7 @@ struct Turn {
     /// which ends with the reply to the last.
     requests: Vec<u64>,
     key: String,
+    start_confirmed: bool,
     /// `session/cancel` has been sent; the reply decides how the turn ended.
     cancelling: bool,
     run: Option<crate::model::RunId>,
@@ -669,6 +670,7 @@ impl Acp {
         self.turn = Some(Turn {
             requests: vec![id],
             key: format!("acp-prompt:{}:{id}", self.session_id()),
+            start_confirmed: false,
             cancelling: false,
             run: None,
             on_background: false,
@@ -679,6 +681,12 @@ impl Acp {
             busy: true,
             detail: "Working".into(),
         });
+    }
+
+    fn confirm_turn_start(turn: &mut Turn, events: &mut Vec<Event>) {
+        if !std::mem::replace(&mut turn.start_confirmed, true) {
+            events.push(Event::TurnStartConfirmed);
+        }
     }
 
     /// Sends `blocks` into the running turn, which the agent goes on with;
@@ -839,6 +847,14 @@ impl Acp {
         else {
             return;
         };
+        if outcome.is_ok_and(|result| {
+            matches!(
+                result["stopReason"].as_str(),
+                Some("end_turn" | "max_tokens" | "max_turn_requests")
+            )
+        }) {
+            Self::confirm_turn_start(turn, &mut step.events);
+        }
         turn.requests.retain(|pending| *pending != request);
         // Stopped, the turn is over once any of its prompts says so: an
         // agent owes the others no reply of their own.
@@ -1161,6 +1177,7 @@ impl Acp {
     fn permission(&mut self, rpc: &Value, params: &Value, step: &mut Step) {
         let call = &params["toolCall"];
         let call_id = call["toolCallId"].as_str().unwrap_or_default().to_owned();
+        let known_parent_call = self.calls.contains(&call_id);
         let live = self.turn.is_some() && self.replay.is_none();
         let child = if self.profile.subagents {
             self.subagents.step(call, live)
@@ -1209,6 +1226,14 @@ impl Acp {
             ));
             self.declined(&call_id, ToolStatus::Stopped, &mut step.events);
             return;
+        }
+        if live
+            && !call_id.is_empty()
+            && subagent.is_none()
+            && !known_parent_call
+            && let Some(turn) = &mut self.turn
+        {
+            Self::confirm_turn_start(turn, &mut step.events);
         }
         self.next_permission += 1;
         let id = format!("acp-permission:{}", self.next_permission);
@@ -1345,6 +1370,14 @@ impl Acp {
                     self.at_work(&mut events);
                 }
                 self.chunk(role, kind == "agent_thought_chunk", update, &mut events);
+                if live
+                    && events
+                        .iter()
+                        .any(|event| matches!(event, Event::Item(_) | Event::TextDelta { .. }))
+                    && let Some(turn) = &mut self.turn
+                {
+                    Self::confirm_turn_start(turn, &mut step.events);
+                }
             }
             "tool_call" | "tool_call_update" => {
                 // A subagent's step is its own, not the parent's, though the
@@ -1360,6 +1393,17 @@ impl Acp {
                         self.at_work(&mut events);
                     }
                 } else {
+                    // Only an actual new parent call can establish this
+                    // turn. Earlier calls and child work can continue here.
+                    if live
+                        && update["sessionUpdate"] == "tool_call"
+                        && update["toolCallId"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty() && !self.calls.contains(id))
+                        && let Some(turn) = &mut self.turn
+                    {
+                        Self::confirm_turn_start(turn, &mut step.events);
+                    }
                     if self.profile.subagents {
                         events.extend(self.subagents.invoked(update, live));
                     }
