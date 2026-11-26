@@ -193,12 +193,12 @@ artifacts like the release signing key.
 
 To cut a release with the macOS build, give `cut` or `build` the Mac with
 `--macos-host MAC` (or `CAGENTS_RELEASE_MACOS_HOST`). The release exports the
-commit, copies it to `~/Library/Caches/cagents-release/VERSION` on the Mac and
-runs its `scripts/package-macos` there, which builds, signs and installs it in
-a private home and prefix to check the commands, bundle and login item. It
-brings the three files back into the bundle before the metadata is written and
-signed, then removes the export; the Cargo target stays in
-`~/Library/Caches/cagents-release/target` for the next release. The publisher
+commit to a private staging directory on the Mac and runs that commit's
+`scripts/package-macos`. The packager builds, signs and installs the package in
+a private home and prefix to check the commands, bundle and login item. Cut
+brings the three files into the bundle before writing and signing the metadata.
+The Mac removes the staged source and keeps the shared Cargo target in
+`~/Library/Caches/cagents-release/target` for later builds. The publisher
 then requires all three files, checks `SHA256SUMS-macos` and the archive's
 members, and adds a macOS section to the release notes. GitHub Actions builds
 no macOS release yet.
