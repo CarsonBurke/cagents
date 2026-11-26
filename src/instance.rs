@@ -466,8 +466,7 @@ impl WindowLease {
         // data a daemon in another runtime directory serves. Say so first:
         // that daemon's session, not this window, is what is in the way.
         if !crate::device::is_remote() {
-            match state_claim::daemon_served_elsewhere(&runtime_directory()?.join("cagentsd.lock"))
-            {
+            match state_claim::daemon_served_elsewhere(&daemon_lock_in(&runtime_directory()?)) {
                 Ok(None) => {}
                 Ok(Some(refusal)) => return Err(io::Error::other(refusal)),
                 Err(error) => {
@@ -3412,6 +3411,14 @@ pub fn runtime_subdirectory() -> &'static str {
     namespace()
 }
 
+/// The daemon's runtime lock under the session runtime directory `runtime`.
+/// The daemon takes it and records it in its saved-data claim; a window asking
+/// whether a daemon elsewhere serves this data must name the same file, or it
+/// mistakes this session's daemon for another session's.
+pub fn daemon_lock_in(runtime: &Path) -> PathBuf {
+    runtime.join(runtime_subdirectory()).join("cagentsd.lock")
+}
+
 pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("dev", "cagents", storage_name())
 }
@@ -5634,6 +5641,41 @@ mod startup_update_tests {
         // open instead.
         let (_second, slot) = open(&runtimes[1], true).unwrap();
         assert_eq!(slot, "window-2");
+    }
+
+    #[test]
+    fn a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for runtime in &runtimes {
+            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // The daemon in the first session holds its runtime lock and claims
+        // the saved data under it, as `cagents-host` does at startup.
+        let lock = daemon_lock_in(runtimes[0].path());
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let _held = owned_lock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let _claim = state_claim::claim_daemon_state_in(
+            claims.path(),
+            &lock,
+            Some("session"),
+            state_claim::Claimant::Daemon,
+        )
+        .unwrap();
+        let claim = claims.path().join("daemon.lock");
+
+        // A window in that session names the same lock, so it is served here.
+        assert_eq!(
+            state_claim::served_elsewhere(&claim, &daemon_lock_in(runtimes[0].path())).unwrap(),
+            None
+        );
+        // A window in another session is still told which daemon is in the way.
+        let refusal =
+            state_claim::served_elsewhere(&claim, &daemon_lock_in(runtimes[1].path())).unwrap();
+        assert_eq!(
+            refusal.and_then(|refusal| refusal.pid()),
+            Some(process::id())
+        );
     }
 
     #[test]
