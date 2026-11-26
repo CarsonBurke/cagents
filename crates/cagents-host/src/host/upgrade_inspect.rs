@@ -750,7 +750,7 @@ impl ExecutionEvidence {
         source: &Session,
         owners: &[&crate::daemon::holder_registry::Record],
     ) -> Option<i32> {
-        if source.launch.provider == Provider::Codex {
+        if source.launch.provider == crate::agent::Provider::Codex {
             return match self.codex_execution(source) {
                 CodexExecution::Running { pid: Some(pid), .. } => i32::try_from(pid).ok(),
                 _ => None,
