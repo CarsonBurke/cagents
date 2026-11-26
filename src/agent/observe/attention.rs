@@ -236,6 +236,7 @@ fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
 }
 
 fn claude_root_input(value: &serde_json::Value) -> bool {
+    let origin = value.get("origin").filter(|origin| !origin.is_null());
     if value["message"]["role"] != "user"
         || value["uuid"].as_str().is_none_or(str::is_empty)
         || !value["parent_tool_use_id"].is_null()
@@ -243,9 +244,7 @@ fn claude_root_input(value: &serde_json::Value) -> bool {
         || value["teamName"]
             .as_str()
             .is_some_and(|name| !name.is_empty())
-        || value
-            .get("origin")
-            .is_some_and(|origin| origin["kind"] != "human")
+        || origin.is_some_and(|origin| origin["kind"] != "human")
         || [
             "isMeta",
             "isSidechain",
@@ -262,9 +261,18 @@ fn claude_root_input(value: &serde_json::Value) -> bool {
     let text = |value: &serde_json::Value| {
         value.as_str().is_some_and(|text| {
             let text = text.trim();
-            // Legacy Claude can store wrapped hooks, reminders and local
-            // command output as user text without an explicit origin.
-            !text.is_empty() && !text.starts_with('<')
+            // Legacy Claude can store these synthetic envelopes as user
+            // text. Explicitly human prompts may quote the same markup.
+            const SYNTHETIC: &[&str] = &[
+                "<system-reminder>",
+                "<task-notification>",
+                "<fork-boilerplate>",
+                "<local-command-caveat>",
+                "<local-command-stdout>",
+                "<local-command-stderr>",
+            ];
+            !text.is_empty()
+                && (origin.is_some() || !SYNTHETIC.iter().any(|prefix| text.starts_with(prefix)))
         })
     };
     let content = &value["message"]["content"];

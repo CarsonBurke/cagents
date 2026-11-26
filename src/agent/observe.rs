@@ -142,10 +142,11 @@ struct ClaudeActivity {
     order: ClaudeOrdering,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum ClaudeFence {
     AwaitingInput,
-    InputObserved,
+    InputObservedIdle,
+    InputObservedActive,
 }
 
 #[derive(Default)]
@@ -171,7 +172,7 @@ impl ClaudeOrdering {
         }
         if clear == Some(AttentionClear::TurnStarted) {
             self.fence = Some(if self.idle_input {
-                ClaudeFence::InputObserved
+                ClaudeFence::InputObservedIdle
             } else {
                 ClaudeFence::AwaitingInput
             });
@@ -183,14 +184,26 @@ impl ClaudeOrdering {
             let ordered = if edges.claude_input {
                 edges.claude_ordered_notice
             } else {
-                fence == ClaudeFence::InputObserved
+                match fence {
+                    ClaudeFence::AwaitingInput => false,
+                    // The census can miss an entire turn between Idle and
+                    // Working. A prior Idle input can belong to that missed
+                    // turn, so it cannot authorize a result during new work.
+                    ClaudeFence::InputObservedIdle => state == ActivityState::Idle,
+                    ClaudeFence::InputObservedActive => true,
+                }
             };
             if edges.notice.is_some() && ordered {
                 self.fence = None;
             } else {
                 edges.notice = None;
                 if edges.claude_input {
-                    self.fence = Some(ClaudeFence::InputObserved);
+                    self.fence = Some(match state {
+                        ActivityState::Idle | ActivityState::Unknown => {
+                            ClaudeFence::InputObservedIdle
+                        }
+                        _ => ClaudeFence::InputObservedActive,
+                    });
                 }
             }
         }
@@ -624,6 +637,14 @@ mod tests {
             Some(AttentionClear::TurnStarted)
         );
         assert!(observation.attention.is_none());
+
+        // The prior Idle input could belong to a turn the census missed
+        // altogether. Its result cannot revive a notice mid-work.
+        append(result("missed-turn"));
+        let observation = observe(ActivityState::Working);
+        assert_eq!(observation.clear_attention, None);
+        assert!(observation.attention.is_none());
+
         append(result("later"));
         let observation = observe(ActivityState::Idle);
         assert_eq!(observation.clear_attention, None);
@@ -641,18 +662,51 @@ mod tests {
             "claude:before-unconfirmed-input"
         );
 
-        append(result("before-input"));
         append(input(
-            "human",
-            serde_json::json!("Search for the next issue"),
+            "synthetic",
+            serde_json::json!("<system-reminder>tool context</system-reminder>"),
         ));
-        append(result("after-input"));
+        let mut replay = input("replay", serde_json::json!("<p>Replay</p>"));
+        replay["isReplay"] = serde_json::json!(true);
+        append(replay);
+        append(result("old-with-internal-inputs"));
         let observation = observe(ActivityState::Working);
         assert_eq!(
             observation.clear_attention,
             Some(AttentionClear::TurnStarted)
         );
-        assert_eq!(observation.attention.unwrap().key, "claude:after-input");
+        assert!(observation.attention.is_none());
+
+        let mut explicit = input(
+            "human",
+            serde_json::json!("<system-reminder>Explain this XML</system-reminder>"),
+        );
+        explicit["origin"] = serde_json::json!({"kind": "human"});
+        append(explicit);
+        append(result("explicit-human-result"));
+        let observation = observe(ActivityState::Working);
+        assert_eq!(observation.clear_attention, None);
+        assert_eq!(
+            observation.attention.unwrap().key,
+            "claude:explicit-human-result"
+        );
+
+        assert!(observe(ActivityState::Idle).attention.is_none());
+        append(result("before-input"));
+        append(input(
+            "legacy",
+            serde_json::json!("<html>Summarize this</html>"),
+        ));
+        append(result("legacy-human-result"));
+        let observation = observe(ActivityState::Working);
+        assert_eq!(
+            observation.clear_attention,
+            Some(AttentionClear::TurnStarted)
+        );
+        assert_eq!(
+            observation.attention.unwrap().key,
+            "claude:legacy-human-result"
+        );
     }
 
     #[test]
