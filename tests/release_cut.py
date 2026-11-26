@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import select
 from pathlib import Path
 import shutil
 import signal
@@ -35,6 +36,10 @@ wait "$!"
 SCP = r"""#!/bin/bash
 args=()
 for argument in "$@"; do
+    if [[ $argument == mac-a:*/dist/*.tar.gz && -p $FIXTURE/macos-copy-ready ]]; then
+        printf 'ready\n' > "$FIXTURE/macos-copy-ready"
+        read -r -t 30 unused < "$FIXTURE/macos-copy-resume" || exit 99
+    fi
     case $argument in -q|-r|--) ;; *:*) args+=("$FIXTURE/host/${argument#*:}") ;; *) args+=("$argument") ;; esac
 done
 exec cp -r "${args[@]}"
@@ -202,6 +207,9 @@ echo "package-macos $version epoch=$SOURCE_DATE_EPOCH target=$CARGO_TARGET_DIR g
     >> "$FIXTURE/calls.log"
 mkdir -p "$2" && cd "$2"
 printf 'macOS archive %s\n' "$version" > "cagents-$version-aarch64-apple-darwin.tar.gz"
+if [[ -f $root/macos-source-marker ]]; then
+    cat "$root/macos-source-marker" >> "cagents-$version-aarch64-apple-darwin.tar.gz"
+fi
 printf "#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n" > install-macos.sh
 sha256sum "cagents-$version-aarch64-apple-darwin.tar.gz" install-macos.sh > SHA256SUMS-macos
 [[ ! -e $FIXTURE/macos-damaged ]] || echo damaged >> install-macos.sh
@@ -858,9 +866,10 @@ class ReleaseCut(unittest.TestCase):
         epoch = self.git("show", "-s", "--format=%ct", macos)
         target = self.host / "Library/Caches/cagents-release/target"
         self.assertIn(f"package-macos 0.2.4 epoch={epoch} target={target} git=no", self.log("calls.log"))
-        # Only the Cargo target stays on the Mac.
+        # Only the build lock and the Cargo target stay on the Mac.
+        self.assertTrue((self.host / "Library/Caches/cagents-release/.build.lock").is_file())
         self.assertEqual([path.name for path in (self.host / "Library/Caches/cagents-release").iterdir()
-                          if path.name != "target"], [])
+                          if path.name not in ("target", ".build.lock")], [])
         # Bytes that do not match their checksums are refused, and leave the earlier cut.
         (self.root / "macos-damaged").touch()
         result = self.release("cut", "--commit", macos, "--macos-host", "mac", stdin="y\n")
@@ -869,6 +878,88 @@ class ReleaseCut(unittest.TestCase):
         # Actions builds no macOS release, so it is not silently left out.
         refused = self.release("cut", "--actions", "--macos-host", "mac")
         self.assertIn("builds no macOS release", refused.stderr)
+
+    def test_cut_reuses_only_the_prepared_mac_bundle_for_the_selected_commit(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        prepared = self.commit("feat(release): build the macOS release")
+        later = self.commit("fix(release): change the release source")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(prepared)
+
+        first = self.release("prepare-macos", "--commit", prepared, "--macos-host", "mac")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(f"Prepared the macOS release of {prepared}", first.stdout)
+        self.assertEqual(self.git("tag", "--list", "v0.2.4"), "")
+        self.assertFalse((self.root / "bundles/0.2.4").exists())
+
+        repeat = self.release("prepare-macos", "--commit", prepared, "--macos-host", "mac")
+        self.assertEqual(repeat.returncode, 0, repeat.stderr)
+        self.assertIn("already prepared", repeat.stdout)
+        (self.root / "macos-damaged").touch()
+        cut = self.release("cut", "--commit", prepared, "--macos-host", "mac", stdin="r\n")
+        self.assertEqual(cut.returncode, 0, cut.stderr)
+        self.assertIn(f"Using the prepared macOS release of {prepared}", cut.stdout)
+        self.assertEqual(sum(line.startswith("package-macos ") for line in self.log("calls.log")), 1)
+
+        self.bundle(later)
+        wrong_commit = self.release("cut", "--commit", later, "--macos-host", "mac")
+        self.assertNotEqual(wrong_commit.returncode, 0)
+        self.assertIn("does not match its checksums", wrong_commit.stderr)
+        self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), prepared)
+
+    def test_macos_preparations_on_two_aliases_keep_their_own_remote_assets(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        marker = self.repo / "macos-source-marker"
+        marker.write_text("first commit\n")
+        first_sha = self.commit("feat(release): package the first commit")
+        marker.write_text("second commit\n")
+        second_sha = self.commit("fix(release): package the second commit")
+        self.git("push", "-q", "origin", "main")
+        ready_path = self.root / "macos-copy-ready"
+        resume_path = self.root / "macos-copy-resume"
+        os.mkfifo(ready_path)
+        os.mkfifo(resume_path)
+        release = str(self.repo / "scripts/release")
+        with (os.fdopen(os.open(ready_path, os.O_RDWR), "rb", buffering=0) as ready,
+              os.fdopen(os.open(resume_path, os.O_RDWR), "wb", buffering=0) as resume,
+              subprocess.Popen([release, "prepare-macos", "--commit", first_sha, "--macos-host", "mac-a"],
+                               cwd=self.repo, env=self.env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True) as first):
+            try:
+                self.assertTrue(select.select([ready], [], [], 10)[0], "first Mac package never reached transfer")
+                self.assertEqual(ready.readline(), b"ready\n")
+                second = self.release("prepare-macos", "--commit", second_sha, "--macos-host", "mac-b")
+                self.assertEqual(second.returncode, 0, second.stderr)
+            finally:
+                resume.write(b"resume\n")
+                _, first_error = first.communicate(timeout=HANG_GUARD)
+            self.assertEqual(first.returncode, 0, first_error)
+
+        cache = self.root / "bundles/.prepared-macos"
+        for host, sha, marker in (("mac-a", first_sha, "first commit"), ("mac-b", second_sha, "second commit")):
+            archive = cache / host / "0.2.4" / sha / "cagents-0.2.4-aarch64-apple-darwin.tar.gz"
+            self.assertEqual(archive.read_text(), f"macOS archive 0.2.4\n{marker}\n")
+
+    def test_cut_rebuilds_corrupt_prepared_mac_assets_before_signing(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        commit = self.commit("feat(release): build the macOS release")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(commit)
+        prepared = self.release("prepare-macos", "--macos-host", "mac")
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        cache = self.root / f"bundles/.prepared-macos/mac/0.2.4/{commit}"
+        (cache / "install-macos.sh").write_text("another package's installer")
+        with (cache / "SHA256SUMS-macos").open("w") as checksums:
+            subprocess.run(["sha256sum", "cagents-0.2.4-aarch64-apple-darwin.tar.gz", "install-macos.sh"],
+                           cwd=cache, stdout=checksums, check=True)
+
+        cut = self.release("cut", "--key", str(self.root / "key"), "--macos-host", "mac")
+        self.assertEqual(cut.returncode, 0, cut.stderr)
+        self.assertIn("Building the macOS release", cut.stdout)
+        self.assertEqual(sum(line.startswith("package-macos ") for line in self.log("calls.log")), 2)
+        installer = self.root / "bundles/0.2.4/install-macos.sh"
+        self.assertIn("DEFAULT_REPOSITORY=", installer.read_text())
+        self.assertTrue((installer.parent / "release-metadata.json.sig").exists())
 
     def test_cut_for_actions_tags_the_chosen_commit_and_copies_and_signs_nothing(self):
         self.bundle(self.fix)

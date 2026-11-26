@@ -203,6 +203,15 @@ then requires all three files, checks `SHA256SUMS-macos` and the archive's
 members, and adds a macOS section to the release notes. GitHub Actions builds
 no macOS release yet.
 
+To build and smoke-test macOS while fw16 prepares Linux, run
+`scripts/release prepare-macos --commit SHA --macos-host macbook`. Use the
+same SHA and host for `scripts/release cut --commit SHA --macos-host macbook`.
+The prepared assets are under `$CAGENTS_RELEASE_BUNDLES/.prepared-macos`
+and remain available for later cuts. Cut checks the source commit and asset
+digests before using them. If preparation is missing or damaged, cut builds
+and smoke-tests macOS on the selected host. Cut still requires the passing
+fw16 verdict and Linux bundle for that same commit.
+
 ## Native platform roadmap
 
 [#7](https://github.com/CarsonBurke/cagents/issues/7) tracks Windows and macOS
