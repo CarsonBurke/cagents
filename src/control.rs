@@ -436,6 +436,8 @@ pub enum TopCommand {
         #[arg(long)]
         #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
+        #[arg(long, conflicts_with = "stage_only")]
+        publish_only: bool,
     },
     /// Record that staged files must retain windows on the running daemon's UI.
     #[command(hide = true)]
@@ -4348,8 +4350,13 @@ fn execute_with_model_context(
                 .into(),
             })
         }
-        TopCommand::VerifyInstallGuard { stage_only } => {
-            (if stage_only {
+        TopCommand::VerifyInstallGuard {
+            stage_only,
+            publish_only,
+        } => {
+            (if publish_only {
+                crate::install_guard::verify_publication()
+            } else if stage_only {
                 instance::validate_stage_guard()
             } else {
                 instance::validate_install_guard()

@@ -45,6 +45,7 @@ pub(crate) fn preflight_source_panes(
 
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
+const PUBLICATION_FD_ENV: &str = "CAGENTS_INSTALL_PUBLICATION_FD";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
 
 #[derive(serde::Deserialize)]
@@ -141,6 +142,7 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
         crate::daemon::lease_handoff::DAEMON_LEASE_ENV,
         crate::upgrade::recovery::RECOVERY_FD_ENV,
         RESULT_FD_ENV,
+        PUBLICATION_FD_ENV,
         crate::update::recovery::CENSUS_ENV,
         crate::update::recovery::OUTCOME_ENV,
         OWNER_CLI_ENV,
@@ -203,6 +205,42 @@ pub(crate) enum InstallMode {
     Publish,
 }
 
+/// The command links and LaunchAgent are per account. Serialize their
+/// publishers even when the caller uses a private application runtime. Keep
+/// the lock outside the installed tree and any data that uninstall purges.
+#[cfg(target_os = "macos")]
+pub(crate) fn reserve_darwin_publication() -> io::Result<File> {
+    crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_EX | libc::LOCK_NB)
+        .map(crate::instance::OwnedLock::into_file)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
+    // XDG_RUNTIME_DIR may name the parent of the default runtime. Keep this
+    // inode beside the whole runtime tree so neither spelling can purge it.
+    Ok(crate::instance::darwin_runtime_base()?.with_file_name("cagents.install-publication.lock"))
+}
+
+pub(crate) fn verify_publication() -> io::Result<()> {
+    crate::instance::validate_install_guard()?;
+    #[cfg(target_os = "macos")]
+    {
+        let fd = std::env::var(PUBLICATION_FD_ENV)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|fd| *fd >= 3)
+            .ok_or_else(|| io::Error::other("installer has no inherited publication fence"))?;
+        // SAFETY: the descriptor is checked before borrowing, and no other
+        // code in the verifier can close an inherited descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
+        crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     prefix: &Path,
     installer: &Path,
@@ -228,6 +266,25 @@ pub(crate) fn run(
             ));
         }
         let mut command = installer_command(&script, arguments, &guard, None, None)?;
+        #[cfg(target_os = "macos")]
+        let _publication = {
+            // The publishing shell may outlive this coordinator. It holds
+            // both fences until it has finished mutating the installation.
+            let publication = reserve_darwin_publication()?;
+            let fd = publication.as_raw_fd();
+            command.env(PUBLICATION_FD_ENV, fd.to_string());
+            // SAFETY: the File is retained through execute. The hook only
+            // clears close-on-exec on the child's copy of the description.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            publication
+        };
         let published = execute(&mut command);
         guard.leave_launch_fence_with_successor();
         return published;
@@ -1266,10 +1323,21 @@ mod tests {
                         .err()
                         .expect("launch fence was free");
                     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    #[cfg(target_os = "macos")]
+                    assert_eq!(
+                        reserve_darwin_publication().unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
                 }
                 "available" => {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while let Err(error) = UiUpdateGuard::acquire() {
+                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                        assert!(Instant::now() < deadline, "{error}");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    #[cfg(target_os = "macos")]
+                    while let Err(error) = reserve_darwin_publication() {
                         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
                         assert!(Instant::now() < deadline, "{error}");
                         thread::sleep(Duration::from_millis(10));

@@ -230,7 +230,7 @@ pub(crate) fn runtime_base() -> io::Result<Option<PathBuf>> {
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_runtime_base() -> io::Result<PathBuf> {
+pub(crate) fn darwin_runtime_base() -> io::Result<PathBuf> {
     use std::os::unix::{ffi::OsStringExt, fs::DirBuilderExt};
     static BASE: OnceLock<PathBuf> = OnceLock::new();
     if let Some(base) = BASE.get() {
@@ -2321,22 +2321,22 @@ fn validate_install_fence(require_closed: bool) -> io::Result<()> {
     let inherited = File::from(inherited);
     let runtime = runtime_directory()?;
     let path = runtime.join(format!("{APPLICATION_LOCK_FILE}.update"));
-    let expected = fs::symlink_metadata(&path)?;
-    let actual = inherited.metadata()?;
-    if !actual.is_file()
-        || actual.uid() != current_uid()
-        || actual.mode() & 0o077 != 0
-        || actual.nlink() != 1
-        || !expected.is_file()
-        || actual.dev() != expected.dev()
-        || actual.ino() != expected.ino()
-    {
-        return Err(io::Error::other(
-            "installer inherited a different update fence",
-        ));
-    }
     #[cfg(target_os = "linux")]
     {
+        let expected = fs::symlink_metadata(&path)?;
+        let actual = inherited.metadata()?;
+        if !actual.is_file()
+            || actual.uid() != current_uid()
+            || actual.mode() & 0o077 != 0
+            || actual.nlink() != 1
+            || !expected.is_file()
+            || actual.dev() != expected.dev()
+            || actual.ino() != expected.ino()
+        {
+            return Err(io::Error::other(
+                "installer inherited a different update fence",
+            ));
+        }
         match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
             Ok(_) => return Err(io::Error::other("installer update fence is not held")),
@@ -2347,15 +2347,7 @@ fn validate_install_fence(require_closed: bool) -> io::Result<()> {
         }
     }
     #[cfg(target_os = "macos")]
-    {
-        crate::flock::verify_inherited_exclusive(&inherited)?;
-        let current = fs::symlink_metadata(&path)?;
-        if !current.is_file() || (current.dev(), current.ino()) != (actual.dev(), actual.ino()) {
-            return Err(io::Error::other(
-                "installer update fence changed during validation",
-            ));
-        }
-    }
+    crate::flock::verify_inherited_exclusive_at(&inherited, &path)?;
     if require_closed && !running_window_slots(&runtime)?.is_empty() {
         return Err(io::Error::other(
             "application windows have not finished closing",
