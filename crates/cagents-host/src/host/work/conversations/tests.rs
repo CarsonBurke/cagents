@@ -1578,6 +1578,7 @@ fn an_inspected_claude_chat_finds_its_first_transcript_when_a_turn_starts() {
     let mut files = files::Watches::new(|_| {});
 
     // Opened before its first prompt: Claude has written no transcript.
+    // The inspector has been waiting long enough to back off far.
     work.input_changed(id);
     work.conversation_pass(&host, &mut files);
     let missed = |work: &Handle| {
@@ -1586,9 +1587,26 @@ fn an_inspected_claude_chat_finds_its_first_transcript_when_a_turn_starts() {
         (watched.source == Source::Pending, watched.searches_missed)
     };
     assert_eq!(missed(&work), (true, 1));
+    let waited = |work: &Handle| {
+        let mut state = work.conversations();
+        let watched = state.watched.get_mut(&id).unwrap();
+        watched.input.read = Some(Instant::now() - TICK);
+        watched.searches_missed = 5;
+        watched.search_after = Some(Instant::now() + Duration::from_secs(120));
+    };
+    waited(&work);
 
-    // The prompt makes Claude write it, which no watch reports and the
-    // search's backoff would not look for again soon.
+    // The prompt starts a turn, which is input, before Claude has written
+    // the transcript: the search misses again, but backs off from its start.
+    let observed = signal.observe().unwrap();
+    work.activity_changed(id);
+    assert_ne!(signal.observe(), Some(observed));
+    work.conversation_pass(&host, &mut files);
+    assert_eq!(missed(&work), (true, 1));
+    let soon = work.conversations().watched[&id].search_after.unwrap();
+    assert!(soon <= Instant::now() + search_backoff(1));
+
+    // Claude writes it, which no watch reports; the short backoff ends.
     let key: String = project
         .to_str()
         .unwrap()
@@ -1602,15 +1620,7 @@ fn an_inspected_claude_chat_finds_its_first_transcript_when_a_turn_starts() {
         .watched
         .get_mut(&id)
         .unwrap()
-        .input
-        .read = Some(Instant::now() - TICK);
-    work.conversation_pass(&host, &mut files);
-    assert_eq!(missed(&work), (true, 1));
-
-    // The turn starting is the conversation's input.
-    let observed = signal.observe().unwrap();
-    work.activity_changed(id);
-    assert_ne!(signal.observe(), Some(observed));
+        .search_after = Some(Instant::now());
     work.conversation_pass(&host, &mut files);
     assert_eq!(missed(&work), (false, 0));
 

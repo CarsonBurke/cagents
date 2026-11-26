@@ -95,7 +95,8 @@ pub(super) struct Conversations {
     inputs_changed: Mutex<BTreeSet<TerminalId>>,
     /// Inspected conversations whose transcript was looked for and not
     /// found. Their provider writes it once a turn starts, which no file
-    /// watch sees, so their activity is input. Taken with no other lock.
+    /// watch sees, so their activity is input. Nothing is locked while
+    /// this is held.
     unlocated: Mutex<BTreeSet<TerminalId>>,
     watching: AtomicBool,
     projection: AtomicU64,
@@ -883,8 +884,12 @@ impl Handle {
                     }
                     if dirty.contains(id) {
                         watched.input.changed(now);
-                        // What changed may be what a missed search lacked.
+                        // What changed may be what a missed search lacked,
+                        // and may still be on its way: Claude writes the
+                        // transcript after taking the turn's prompt. Look
+                        // now, and soon after.
                         watched.search_after = None;
+                        watched.searches_missed = 0;
                     }
                     let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
                     (due(watched.input.due)
@@ -939,6 +944,15 @@ impl Handle {
                     watched.searches_missed = watched.searches_missed.saturating_add(1);
                     watched.search_after =
                         Some(Instant::now() + search_backoff(watched.searches_missed));
+                    // So activity during the rest of this pass is not lost.
+                    if !watched.watchers.is_empty() {
+                        self.0
+                            .conversations
+                            .unlocated
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(*conversation);
+                    }
                 }
                 if let Location::Found(id, source) = located {
                     watched.searches_missed = 0;
@@ -1010,18 +1024,19 @@ impl Handle {
                 watched.apply(scanned, facts.get(conversation).and_then(Option::as_deref));
             }
         }
-        *self
-            .0
-            .conversations
-            .unlocated
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = self
+        let unlocated = self
             .conversations()
             .watched
             .iter()
             .filter(|(_, watched)| !watched.watchers.is_empty() && watched.searches_missed > 0)
             .map(|(conversation, _)| *conversation)
             .collect();
+        *self
+            .0
+            .conversations
+            .unlocated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = unlocated;
         let deadline = self.conversation_deadline(&followed);
         if conversations.is_empty() {
             return NextPass {
