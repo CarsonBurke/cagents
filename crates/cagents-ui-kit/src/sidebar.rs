@@ -31,10 +31,10 @@ use crate::{
     model::{CardId, ChannelId, ProjectId, ProjectKind, ProjectState, WorktreeId},
     repository::{
         BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
-        ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
-        PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo, RepositorySnapshot,
-        StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName, WorktreeRecord,
-        build_file_tree, build_file_tree_with_directories,
+        ConflictKind, DiffBasis, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid,
+        PathSelection, PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo,
+        RepositorySnapshot, StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName,
+        WorktreeRecord, build_file_tree, build_file_tree_with_directories,
     },
     splitter::{Edge as SplitterEdge, Splitter},
     ui_controls::Icon,
@@ -3060,11 +3060,9 @@ enum SidebarSelection {
 
 /// What the source-control panel currently highlights.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PanelSelection {
-    File(RepoPath),
-    Change { path: RepoPath, area: ChangeArea },
-    Branch(RepoPath),
-    Commit { oid: Oid, path: RepoPath },
+struct PanelSelection {
+    path: RepoPath,
+    basis: Option<DiffBasis>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4515,24 +4513,26 @@ impl SidebarState {
         self.follow_projected_card();
     }
 
-    /// Synchronize when editor focus changes outside the file navigator.
-    pub fn select_file(&mut self, key: &ActiveWorktreeKey, path: Option<&Path>) {
+    /// Follow the focused repository pane's file and comparison.
+    pub fn select_file(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        selected: Option<(&Path, Option<&DiffBasis>)>,
+    ) {
         if self.active_worktree.as_ref() != Some(key) {
             return;
         }
         let current = self
             .panel_selection
             .as_ref()
-            .map(|selection| match selection {
-                PanelSelection::File(path)
-                | PanelSelection::Branch(path)
-                | PanelSelection::Change { path, .. }
-                | PanelSelection::Commit { path, .. } => path.as_path(),
+            .map(|selection| (selection.path.as_path(), selection.basis.as_ref()));
+        if current != selected {
+            self.panel_selection = selected.and_then(|(path, basis)| {
+                Some(PanelSelection {
+                    path: RepoPath::parse(path).ok()?,
+                    basis: basis.cloned(),
+                })
             });
-        if current != path {
-            self.panel_selection = path
-                .and_then(|path| RepoPath::parse(path).ok())
-                .map(PanelSelection::File);
         }
     }
 
@@ -4902,24 +4902,6 @@ impl SidebarState {
                     collapsed.insert(path.clone());
                 }
             }
-            SidebarAction::OpenFile { path, .. } => {
-                self.panel_selection = Some(PanelSelection::File(path.clone()));
-            }
-            SidebarAction::OpenChange { path, area, .. } => {
-                self.panel_selection = Some(PanelSelection::Change {
-                    path: path.clone(),
-                    area: *area,
-                });
-            }
-            SidebarAction::OpenBranchFile { path, .. } => {
-                self.panel_selection = Some(PanelSelection::Branch(path.clone()));
-            }
-            SidebarAction::OpenCommitFile { oid, path, .. } => {
-                self.panel_selection = Some(PanelSelection::Commit {
-                    oid: oid.clone(),
-                    path: path.clone(),
-                });
-            }
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.revise_commit_draft();
                 self.commit_draft.message.clone_from(message);
@@ -5013,6 +4995,10 @@ impl SidebarState {
             | SidebarAction::RetryWorktreeDeletion { .. }
             | SidebarAction::RetryChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
+            | SidebarAction::OpenFile { .. }
+            | SidebarAction::OpenChange { .. }
+            | SidebarAction::OpenBranchFile { .. }
+            | SidebarAction::OpenCommitFile { .. }
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
             | SidebarAction::NewWorktree { .. }
@@ -10950,7 +10936,7 @@ fn files_section<'a>(
         .opacity(if row.ignored { 0.5 } else { 1.0 });
         let selected = matches!(
             state.panel_selection.as_ref(),
-            Some(PanelSelection::File(path)) if *path == row.path
+            Some(PanelSelection { path, basis: None }) if *path == row.path
         );
         let identity = panel_row(
             &*chrome.accessible_name,
@@ -11476,29 +11462,44 @@ fn branch_changes_section<'a>(
             ChangeKind::Deleted => BadgeTone::Danger,
             _ => BadgeTone::Neutral,
         };
-        rows.push(crate::sticky_tree::Row { depth: file.depth, directory: false, element: panel_row(
-            &*row.label, if flat { 0 } else { file.depth },
-            widget::row::with_children(vec![
-                crate::file_icon::icon(row.entry.path.as_path()).into(),
-                crate::ui_controls::fade_text(if !flat && row.entry.old_path.is_none() {
-                    row.entry.path.file_name()
-                } else { Cow::Borrowed(&*row.label) })
+        rows.push(crate::sticky_tree::Row {
+            depth: file.depth,
+            directory: false,
+            element: panel_row(
+                &*row.label,
+                if flat { 0 } else { file.depth },
+                widget::row::with_children(vec![
+                    crate::file_icon::icon(row.entry.path.as_path()).into(),
+                    crate::ui_controls::fade_text(if !flat && row.entry.old_path.is_none() {
+                        row.entry.path.file_name()
+                    } else {
+                        Cow::Borrowed(&*row.label)
+                    })
                     .edge(crate::ui_controls::FadeEdge::Start)
-                    .width(Length::Fill).into(),
-                semantic_caption(&*row.status, tone),
-                design::caption(&*row.counts).into(),
-            ]).spacing(space::XS).align_y(Alignment::Center),
-            Some(SidebarAction::OpenBranchFile {
-                key: source.key.clone(),
-                path: row.entry.path.clone(),
-                old_path: row.entry.old_path.clone(),
-                base_ref: branch.base_ref.clone(),
-                head: branch.head.clone(),
-                merge_base: branch.merge_base.clone(),
-            }),
-            matches!(&state.panel_selection, Some(PanelSelection::Branch(path)) if path == &row.entry.path),
-            modal_open,
-        ) });
+                    .width(Length::Fill)
+                    .into(),
+                    semantic_caption(&*row.status, tone),
+                    design::caption(&*row.counts).into(),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+                Some(SidebarAction::OpenBranchFile {
+                    key: source.key.clone(),
+                    path: row.entry.path.clone(),
+                    old_path: row.entry.old_path.clone(),
+                    base_ref: branch.base_ref.clone(),
+                    head: branch.head.clone(),
+                    merge_base: branch.merge_base.clone(),
+                }),
+                matches!(&state.panel_selection,
+                    Some(PanelSelection {
+                        path, basis: Some(DiffBasis::MergeBaseToHead { base_ref, head, merge_base })
+                    }) if path == &row.entry.path && base_ref == &branch.base_ref
+                        && head == &branch.head && merge_base == &branch.merge_base
+                ),
+                modal_open,
+            ),
+        });
     }
     column = column.push(crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT));
     column
@@ -11586,8 +11587,12 @@ fn change_row_view<'a>(
     let chrome = &row.chrome;
     let selected = matches!(
         state.panel_selection.as_ref(),
-        Some(PanelSelection::Change { path, area: selected })
-            if *path == row.entry.path && *selected == area
+        Some(PanelSelection { path, basis: Some(basis) })
+            if *path == row.entry.path && match basis {
+                DiffBasis::HeadToIndex => area == ChangeArea::Staged,
+                DiffBasis::IndexToWorktree => area != ChangeArea::Staged,
+                _ => false,
+            }
     );
     let tone = if row.entry.conflict.is_some() {
         BadgeTone::Danger
@@ -12432,7 +12437,7 @@ fn commit_changes_section<'a>(
                         oid: commit.oid.clone(),
                         path: entry.path.clone(),
                     }),
-                    matches!(&state.panel_selection, Some(PanelSelection::Commit { oid, path }) if oid == &commit.oid && path == &entry.path),
+                    matches!(&state.panel_selection, Some(PanelSelection { path, basis: Some(DiffBasis::CommitToParent { oid, .. }) }) if oid == &commit.oid && path == &entry.path),
                     modal_open,
                 ));
             }
