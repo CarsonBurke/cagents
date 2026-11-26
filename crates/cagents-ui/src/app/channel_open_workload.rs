@@ -341,10 +341,17 @@ fn timed_frame(
 
 /// The user-space instructions this thread retires, from a Linux hardware
 /// counter. Unlike wall time, the count does not depend on what else the host
-/// is running.
+/// is running. Elsewhere there is no counter and the workload says so.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct RetiredInstructions(std::fs::File);
 
 impl RetiredInstructions {
+    #[cfg(not(target_os = "linux"))]
+    fn open() -> Option<Self> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
     fn open() -> Option<Self> {
         // `perf_event_attr` in its first, 64-byte layout: the type
         // (PERF_TYPE_HARDWARE, 0) and size share the first word, the config

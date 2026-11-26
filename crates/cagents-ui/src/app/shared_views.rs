@@ -4313,8 +4313,6 @@ impl Cagents {
             self.retain_local_pane(id);
         }
         current.extend(retained_upgrades);
-        // Once for the view, so restoring its terminals reads the index.
-        self.index_cards();
         for shared in &view.panes {
             if self.shared_views.quarantined.contains(&shared.id) {
                 continue;
