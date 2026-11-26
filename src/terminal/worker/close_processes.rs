@@ -192,6 +192,18 @@ impl FrozenFamily {
                 {
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                if process.session != root.process.session
+                    && !family.targets.iter().any(|parent| {
+                        parent.identity.pid == process.parent
+                            && matches!(parent.pidfd.reaped(), Ok(false))
+                    })
+                {
+                    // A deferred census row may name a descendant sampled
+                    // after a numeric parent PID was reused. An unreaped
+                    // stopped parent keeps its original PID across the read.
+                    return Err("Terminal job ancestry changed during close inspection".into());
+                }
                 let pidfd = match open_target(&process) {
                     Ok(pidfd) => pidfd,
                     Err(error)

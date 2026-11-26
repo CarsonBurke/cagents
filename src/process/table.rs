@@ -120,7 +120,11 @@ pub(crate) fn settled_rows<T>(
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(timed_out(pid));
         }
-        match read(pid) {
+        let result = read(pid);
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(timed_out(pid));
+        }
+        match result {
             Ok(record) => {
                 found.extend(record);
                 Ok(false)
