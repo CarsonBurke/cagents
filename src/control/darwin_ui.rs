@@ -3,11 +3,12 @@
 use super::{Command, Duration, Instant, Path, Stdio, io, read_ui_launch_handshake};
 use crate::{
     descriptor_frame::{FrameByteOrder, receive_json_with_fds_until},
-    instance::ui_startup::{CONNECT_TIMEOUT, HANDSHAKE_LIMIT, Identity, SOCKET_ENV},
+    instance::ui_startup::{ADMITTED, CONNECT_TIMEOUT, HANDSHAKE_LIMIT, Identity, SOCKET_ENV},
     pinned_process::{PinnedProcess, peer_credentials},
 };
 use std::{
     fs,
+    io::Write,
     os::{
         fd::AsFd,
         unix::{
@@ -72,6 +73,7 @@ pub(super) fn launch(
         (expected.dev(), expected.ino()),
         deadline,
     )?;
+    response.write_all(&[ADMITTED])?;
     read_ui_launch_handshake(&mut response, timeout)
 }
 

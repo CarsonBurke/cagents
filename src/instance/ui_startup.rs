@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const SOCKET_ENV: &str = "CAGENTS_UI_STARTUP_SOCKET";
 pub(crate) const HANDSHAKE_LIMIT: usize = 128;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const ADMITTED: u8 = 1;
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct Identity {
@@ -23,18 +24,20 @@ static REPLY: std::sync::Mutex<Option<UnixStream>> = std::sync::Mutex::new(None)
 #[cfg(feature = "ui")]
 pub fn connect_ui_launcher() -> io::Result<()> {
     use crate::descriptor_frame::{FrameByteOrder, send_json_with_fds_until};
+    use std::{io::Read, os::fd::AsFd};
     let Some(path) =
         std::env::var_os(SOCKET_ENV).filter(|_| super::ui_launch_handshake_requested())
     else {
         return Ok(());
     };
-    let stream = UnixStream::connect(path)?;
+    let mut stream = UnixStream::connect(path)?;
     if crate::pinned_process::peer_uid(&stream)? != crate::daemon::current_uid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "The UI launcher belongs to another account",
         ));
     }
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
     send_json_with_fds_until(
         &stream,
         &Identity {
@@ -42,12 +45,25 @@ pub fn connect_ui_launcher() -> io::Result<()> {
             address: crate::process::own_code_address(),
         },
         &[],
-        Instant::now() + CONNECT_TIMEOUT,
+        deadline,
         HANDSHAKE_LIMIT,
         0,
         FrameByteOrder::LittleEndian,
     )
     .map_err(io::Error::other)?;
+    if !crate::descriptor::wait_for_activity(stream.as_fd(), libc::POLLIN, Some(deadline))? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "The UI launcher did not admit this window",
+        ));
+    }
+    let mut admitted = [0];
+    stream.read_exact(&mut admitted)?;
+    if admitted != [ADMITTED] {
+        return Err(io::Error::other(
+            "The UI launcher did not admit this window",
+        ));
+    }
     *REPLY.lock().unwrap_or_else(|error| error.into_inner()) = Some(stream);
     Ok(())
 }
