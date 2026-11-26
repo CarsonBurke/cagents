@@ -1558,10 +1558,11 @@ pub(super) fn execute_with_context(
             // hint, after them all, so a wait prints one however many.
             let single = statuses.len() == 1;
             let now = super::sessions::now_ms();
+            let mut named = Vec::new();
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
-                    with_standing(
+                    with_standing_once(
                         status_lines(
                             agent,
                             run,
@@ -1572,6 +1573,7 @@ pub(super) fn execute_with_context(
                         ),
                         member_of(&members, agent.id),
                         now,
+                        &mut named,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1896,7 +1898,8 @@ fn submitted(
             data["messages"] = json!(messages);
         }
     }
-    // A run that settled says what stops its provider now, and the account.
+    // A run that settled says what stops its provider now, and the account
+    // when it needs attention.
     let members = session.members(&[accepted.agent.id]);
     let member = member_of(&members, accepted.agent.id);
     let now = super::sessions::now_ms();
@@ -1931,9 +1934,24 @@ fn woke(after: Option<&Value>, before: &Value) -> bool {
 }
 
 /// A status with what stops the agent's provider, the account it runs on
-/// and whether its prompt cache has likely expired, as of `now`, after its
-/// first line, which readers of the output parse.
+/// when that account could change what the caller does next, and whether
+/// its prompt cache has likely expired, as of `now`, after its first line,
+/// which readers of the output parse. Status and wait run in loops, so an
+/// account with ordinary allowance left goes unsaid; `--json` and `ls`
+/// still name it.
 fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
+    with_standing_once(lines, member, now, &mut Vec::new())
+}
+
+/// [`with_standing`] for one of several runs printed together, naming each
+/// account at most once among them: `named` holds the accounts already
+/// named.
+fn with_standing_once(
+    lines: String,
+    member: Option<&Member>,
+    now: u64,
+    named: &mut Vec<crate::account::AccountId>,
+) -> String {
     let Some(member) = member else {
         return lines;
     };
@@ -1944,7 +1962,13 @@ fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
             super::sessions::limit_phrase(limit, now)
         ));
     }
-    if let Some(account) = &member.account {
+    if let Some(account) = member
+        .account
+        .as_ref()
+        .filter(|account| member.limit.is_some() || account_needs_attention(account))
+        .filter(|account| !named.contains(&account.id))
+    {
+        named.push(account.id.clone());
         standing.push_str(&format!(
             "\nAccount {}",
             super::sessions::account_phrase(account, now)
@@ -1959,6 +1983,28 @@ fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
     match lines.split_once('\n') {
         Some((head, rest)) => format!("{head}{standing}\n{rest}"),
         None => format!("{lines}{standing}"),
+    }
+}
+
+/// Whether an account's standing is worth a line in a run's status: its
+/// allowance is past the warning mark, used up, or needs a new sign-in.
+/// Once one of the reading's windows has reset, its Warning or Limited
+/// counts only while a window that has not reset is still past the warning
+/// mark: the old status no longer says anything about the allowance. A
+/// reading that is merely old is still believed.
+fn account_needs_attention(account: &crate::agent_execution::directory::SessionAccount) -> bool {
+    use crate::account::UsageStatus;
+    let still_spent = || {
+        !account.remaining.iter().any(|window| window.reset_elapsed)
+            || account.remaining.iter().any(|window| {
+                !window.reset_elapsed
+                    && window.remaining_fraction < 1.0 - crate::account::WARNING_FRACTION
+            })
+    };
+    match account.status {
+        Some(UsageStatus::NeedsLogin) => true,
+        Some(UsageStatus::Warning | UsageStatus::Limited) => still_spent(),
+        _ => account.ordinary_usage_allowed == Some(false) && still_spent(),
     }
 }
 
@@ -4385,6 +4431,96 @@ mod tests {
         assert_eq!(data["limit"]["reset"], "3pm");
         assert_eq!(data["account"]["id"], "claude/system");
         assert!(data.get("cache").is_none(), "no estimate");
+
+        // Without a limit, the account is named only when its standing
+        // could change what the caller does; JSON names it either way.
+        let mut unlimited = found.unwrap().clone();
+        unlimited.limit = None;
+        for (usage, shown) in [
+            (None, false),
+            (Some(crate::account::UsageStatus::Ok), false),
+            (Some(crate::account::UsageStatus::Unavailable), false),
+            (Some(crate::account::UsageStatus::Warning), true),
+            (Some(crate::account::UsageStatus::Limited), true),
+            (Some(crate::account::UsageStatus::NeedsLogin), true),
+        ] {
+            unlimited.account.as_mut().unwrap().status = usage;
+            let human = with_standing(status.into(), Some(&unlimited), 0);
+            assert_eq!(
+                human.contains("\nAccount claude/system"),
+                shown,
+                "{usage:?}: {human}"
+            );
+            let mut data = json!({});
+            standing_json(&mut data, Some(&unlimited), 0);
+            assert_eq!(data["account"]["id"], "claude/system", "{usage:?}");
+        }
+        let account = unlimited.account.as_mut().unwrap();
+        account.status = Some(crate::account::UsageStatus::Ok);
+        account.ordinary_usage_allowed = Some(false);
+        assert!(with_standing(status.into(), Some(&unlimited), 0).contains("\nAccount "));
+
+        // A stale Limited reading counts while a window it saw spent has not
+        // reset, and not once every such window has.
+        let spent = |reset_elapsed| crate::account::info::RemainingWindow {
+            window: crate::account::UsageWindow {
+                key: "weekly".into(),
+                kind: crate::account::WindowKind::Weekly,
+                label: "Weekly".into(),
+                used: 1.0,
+                resets_at: None,
+                span_secs: None,
+                binding: false,
+            },
+            remaining_fraction: 0.0,
+            reset_elapsed,
+        };
+        let account = unlimited.account.as_mut().unwrap();
+        account.ordinary_usage_allowed = None;
+        account.status = Some(crate::account::UsageStatus::Limited);
+        account.stale = true;
+        account.remaining = vec![spent(false)];
+        assert!(account_needs_attention(account), "not reset yet");
+        account.remaining = vec![spent(true)];
+        assert!(!account_needs_attention(account), "reset since the reading");
+        account.remaining = vec![spent(true), spent(false)];
+        assert!(
+            account_needs_attention(account),
+            "another window still spent"
+        );
+        let mut unspent = spent(false);
+        unspent.remaining_fraction = 0.9;
+        account.remaining = vec![spent(true), unspent];
+        assert!(
+            !account_needs_attention(account),
+            "the other window has room"
+        );
+        // A reading that is only old, with no window reset, is believed:
+        // a provider's own Limited or Warning, or its refusal of ordinary
+        // use, needs no spent window behind it.
+        account.remaining = Vec::new();
+        assert!(account_needs_attention(account), "provider-limited, old");
+        account.status = Some(crate::account::UsageStatus::Warning);
+        assert!(account_needs_attention(account), "provider warning, old");
+        let mut healthy = spent(false);
+        healthy.remaining_fraction = 0.9;
+        account.remaining = vec![healthy];
+        account.status = Some(crate::account::UsageStatus::Ok);
+        account.ordinary_usage_allowed = Some(false);
+        assert!(
+            account_needs_attention(account),
+            "refused ordinary use, old"
+        );
+        account.ordinary_usage_allowed = None;
+        account.status = Some(crate::account::UsageStatus::Limited);
+        account.stale = false;
+
+        // Several runs on one account name it once among them.
+        let mut named = Vec::new();
+        let first = with_standing_once(status.into(), Some(&unlimited), 0, &mut named);
+        let second = with_standing_once(status.into(), Some(&unlimited), 0, &mut named);
+        assert!(first.contains("\nAccount claude/system"), "{first}");
+        assert_eq!(second, status);
 
         // A cache that likely expired gets a line among the standing, and
         // the same `now` decides the text and the JSON.
