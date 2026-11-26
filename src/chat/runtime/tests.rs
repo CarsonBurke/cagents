@@ -5944,14 +5944,22 @@ fn direct_provider_non_reaping_observation_preserves_exit_status() {
 
 #[test]
 fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
-    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    };
+
+    #[cfg(target_os = "linux")]
+    if crate::daemon::codex_temp::cleanup_fixture::run() {
+        return;
+    }
 
     let working = tempfile::tempdir().unwrap();
     let recipe = crate::model::LaunchRecipe {
         program: "/bin/sh".into(),
         arguments: vec![
             "-c".into(),
-            r#"printf '%s\n' "$TMPDIR" "$TMP" "$TEMP""#.into(),
+            r#"printf '%s\n' "$TMPDIR" "$TMP" "$TEMP"; read -r line"#.into(),
         ],
         working_directory: working.path().to_path_buf(),
         environment: BTreeMap::from([
@@ -5965,15 +5973,16 @@ fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
     let mut child = spawn_provider(&spec, &AtomicBool::new(false), None, true)
         .unwrap()
         .unwrap();
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut child.child.stdout.take().unwrap(), &mut bytes).unwrap();
-    let paths: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
-    let [first, second, third, []] = paths.as_slice() else {
-        panic!("expected three environment paths");
-    };
+    #[cfg(target_os = "linux")]
+    crate::daemon::codex_temp::cleanup_fixture::include_provider(
+        child.child.id().try_into().unwrap(),
+    );
+    let mut paths = BufReader::new(child.child.stdout.take().unwrap()).split(b'\n');
+    let [first, second, third] =
+        std::array::from_fn(|_| paths.next().expect("expected an environment path").unwrap());
     assert_eq!(first, second);
     assert_eq!(first, third);
-    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(first.to_vec()));
+    let temp = std::path::PathBuf::from(std::ffi::OsString::from_vec(first));
     assert_eq!(
         temp.parent(),
         Some(working.path().canonicalize().unwrap().as_path())

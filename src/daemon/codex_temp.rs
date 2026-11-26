@@ -234,7 +234,12 @@ fn sweep_base(base: &Path, namespace: u64, proc: &Path) -> io::Result<()> {
 }
 
 fn reclaim(path: PathBuf) -> io::Result<()> {
-    for path in unused(Path::new(PROC), &HashSet::from([path]))? {
+    let proc = Path::new(PROC);
+    #[cfg(all(test, target_os = "linux", feature = "host"))]
+    let fixture = cleanup_fixture::proc_root();
+    #[cfg(all(test, target_os = "linux", feature = "host"))]
+    let proc = fixture.as_deref().unwrap_or(proc);
+    for path in unused(proc, &HashSet::from([path]))? {
         remove(path)?;
     }
     Ok(())
@@ -437,6 +442,49 @@ fn process_may_share_uid(process: &Path) -> io::Result<bool> {
             line.split_whitespace()
                 .any(|value| value.parse() == Ok(uid))
         }))
+}
+
+#[cfg(all(test, target_os = "linux", feature = "host"))]
+pub(crate) mod cleanup_fixture {
+    use std::{
+        os::unix::fs::symlink,
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    const PROC_ROOT: &str = "CAGENTS_TEST_CODEX_TEMP_PROC";
+
+    pub(super) fn proc_root() -> Option<PathBuf> {
+        std::env::var_os(PROC_ROOT).map(PathBuf::from)
+    }
+
+    /// Run the caller with a procfs census containing only its own provider.
+    /// The terminal holder reexecs this test binary and inherits the root.
+    /// An unreadable or unstable production census can retain an unused path.
+    pub(crate) fn run() -> bool {
+        if proc_root().is_some() {
+            return false;
+        }
+        let proc = tempfile::tempdir().unwrap();
+        let thread = std::thread::current();
+        let test = thread.name().expect("named libtest fixture");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(PROC_ROOT, proc.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "Codex cleanup fixture failed: {status}");
+        true
+    }
+
+    pub(crate) fn include_provider(pid: i32) {
+        let pid = pid.to_string();
+        symlink(
+            Path::new(super::PROC).join(&pid),
+            proc_root().unwrap().join(&pid),
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
