@@ -1777,8 +1777,12 @@ impl UiUpdateGuard {
         self.closed.clear();
     }
 
+    pub(crate) fn running_window_slots(&self) -> io::Result<Vec<String>> {
+        running_window_slots(&self.runtime)
+    }
+
     pub fn has_running_windows(&self) -> io::Result<bool> {
-        running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
+        self.running_window_slots().map(|slots| !slots.is_empty())
     }
     /// Pass the held launch fence to an installer that would otherwise try to
     /// acquire it again. The child validates both this exact lock description

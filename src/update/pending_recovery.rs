@@ -99,39 +99,32 @@ pub(crate) fn run(
             // Another update or a completed job owns the current window state.
             return Ok(report(&settled.outcome));
         };
-        let outcome = if !archived {
-            let selection = staged_selection(&layout)?;
-            #[cfg(target_os = "macos")]
-            let publication = crate::install_guard::reserve_darwin_publication()?;
-            #[cfg(target_os = "linux")]
-            let switch = selection
+        if cfg!(target_os = "linux") && !archived {
+            let switch = staged_selection(&layout)?
                 .as_ref()
                 .map(|selection| selection.prepare(&layout))
                 .transpose()?
                 .flatten();
-            #[cfg(target_os = "macos")]
-            let switch = prepare_recovery_selection(&layout, selection.as_ref())?;
             installed::complete_selection(switch, &layout)?;
-            guard.set_fallback_executable(ui.clone());
-            // Only a still-canonical recovery may replace already open windows.
             let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
             let windows = recovery_window_slots(&pending.windows, &current_windows);
             guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
             drop(retirement);
-            #[cfg(target_os = "macos")]
-            drop(publication);
             guard.relaunch_windows(&windows, &ui)?;
-            verify(&pending, &daemon, None).and_then(|_| {
-                recovery::retire_current_service(source::BusyPatience::for_one_run())?;
-                verify(&pending, &daemon, None)
-            })
         } else {
-            // Archived records cannot publish a version or replace a live window.
+            // The verified Darwin successor already published its selection.
+            // Both retries keep existing windows and open only recorded slots.
             installed::selected_candidate(&layout.prefix, &layout.version_root)?;
             drop(retirement);
             guard.relaunch_missing_windows(&settled.windows, &ui)?;
+        }
+        let outcome = verify(&pending, &daemon, None).and_then(|(serving, outcome)| {
+            if archived {
+                return Ok((serving, outcome));
+            }
+            recovery::retire_current_service(source::BusyPatience::for_one_run())?;
             verify(&pending, &daemon, None)
-        };
+        });
         return match outcome {
             Ok((_, outcome)) => {
                 let message = report(&outcome);
@@ -177,10 +170,19 @@ pub(crate) fn run(
     let id = uuid::Uuid::new_v4().to_string();
     let log_path = state.join(format!("{id}.log"));
     let log = private_create(&log_path)?;
-    let saved_windows = pending.windows.clone();
+    // Persist each slot before any request asks its window to close.
+    let saved_windows = recovery_window_slots(&pending.windows, &guard.running_window_slots()?);
     let mut receipt = pending
         .authorize_manual(
-            checkpoint, yes, &state, &id, &daemon, &worker, &guard, &handoff,
+            checkpoint,
+            yes,
+            &state,
+            &id,
+            &daemon,
+            &worker,
+            &guard,
+            &handoff,
+            &saved_windows,
         )
         .map_err(invalid)?;
     let mut job = UpdateJob {
@@ -239,9 +241,18 @@ pub(crate) fn run(
             Some(command)
         };
         #[cfg(target_os = "macos")]
-        guard.set_fallback_executable(served_version_root(&layout)?.join("bin/cagents-ui"));
+        let previous = served_version_root(&layout)?;
+        #[cfg(target_os = "macos")]
+        guard.set_fallback_executable(previous.join("bin/cagents-ui"));
         let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
-        let windows = recovery_window_slots(&saved_windows, &current_windows);
+        if current_windows
+            .iter()
+            .any(|slot| !saved_windows.contains(slot))
+        {
+            return Err(invalid(
+                "A window appeared outside the saved recovery scope",
+            ));
+        }
         if direct_start.is_some() {
             select_target(&layout)?;
         }
@@ -260,13 +271,20 @@ pub(crate) fn run(
                 } else {
                     started
                 };
-            if ready.is_err() && standby.may_own_runtime() {
+            let ready = ready
+                .and_then(|()| installed::selected_candidate(&layout.prefix, &layout.version_root));
+            if ready.is_err() {
+                let owns_runtime = standby.may_own_runtime();
                 #[cfg(target_os = "macos")]
-                guard.defer_reopening_to_recovery();
-                guard.leave_launch_fence_with_successor();
+                if owns_runtime || installed::selected_candidate(&layout.prefix, &previous).is_err()
+                {
+                    guard.defer_reopening_to_recovery();
+                }
+                if owns_runtime {
+                    guard.leave_launch_fence_with_successor();
+                }
             }
             ready?;
-            installed::selected_candidate(&layout.prefix, &layout.version_root)?;
             #[cfg(target_os = "macos")]
             guard.set_fallback_executable(ui.clone());
             Some(standby.pid())
@@ -285,7 +303,7 @@ pub(crate) fn run(
         let (serving, _) = verify(&pending, &daemon, pid)?;
         receipt.verify_successor(&serving).map_err(invalid)?;
         receipt.release_daemon_reservation();
-        Ok::<_, UpdateError>(windows)
+        Ok::<_, UpdateError>(saved_windows)
     })();
     // Close the coordinator's reservation without unlocking the serving daemon.
     drop(handoff);
@@ -441,29 +459,6 @@ fn verify(
         return Err(invalid("The serving recovery executable changed"));
     }
     Ok((client.proof().clone(), receipt))
-}
-
-/// A retained, explicitly authorized release can have no local staging
-/// marker. Prepare the exchange against this installation's complete selected
-/// tree. The caller holds the launch fence and publishes after verifying custody.
-#[cfg(target_os = "macos")]
-fn prepare_recovery_selection(
-    layout: &InstallLayout,
-    selection: Option<&installed::Selection>,
-) -> Result<Option<crate::install_guard::CurrentExchange>, UpdateError> {
-    if let Some(selection) = selection {
-        return selection.prepare(layout);
-    }
-    let expected = fs::read_link(layout.prefix.join("current"))?;
-    if served_version_root(layout)? == layout.version_root {
-        return Ok(None);
-    }
-    let selected = Path::new("versions").join(&layout.version);
-    Ok(Some(crate::install_guard::CurrentExchange::prepare(
-        &layout.prefix,
-        &selected,
-        &expected,
-    )?))
 }
 
 fn report(receipt: &recovery::Receipt) -> String {

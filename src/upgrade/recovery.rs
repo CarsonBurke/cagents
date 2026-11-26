@@ -1065,12 +1065,7 @@ impl PendingRecovery {
                                 .any(|known| known.id == paired.id && !same_terminal(known, paired))
                     })
             })
-            || self.windows.len() > 1024
-            || self
-                .windows
-                .iter()
-                .any(|slot| crate::instance::validate_window_slot(slot).is_err())
-            || self.windows.iter().collect::<BTreeSet<_>>().len() != self.windows.len()
+            || !valid_recovery_windows(&self.windows)
         {
             return Err(
                 "Retained recovery census has duplicate, foreign or unbounded original owners"
@@ -1251,9 +1246,15 @@ impl PendingRecovery {
         worker: &File,
         guard: &UiUpdateGuard,
         handoff: &LeaseHandoff,
+        windows: &[String],
     ) -> Result<Receipt, String> {
         if !yes || selected_hash != self.checkpoint_hash {
             return Err("Recovery requires --yes and the exact retained checkpoint SHA256; nothing was started".into());
+        }
+        if !valid_recovery_windows(windows)
+            || self.windows.iter().any(|slot| !windows.contains(slot))
+        {
+            return Err("Recovery requires the original saved window slots".into());
         }
         if !self.original_census_complete {
             return Err("Recovery needs the complete original census. Repeat this exact command with --census PATH naming the retained pre-update installer census; the checkpoint was preserved".into());
@@ -1339,7 +1340,7 @@ impl PendingRecovery {
             target: target.clone(),
             target_hash: target_hash.clone(),
             census_hash: digest(&serde_json::to_vec(&self.census).map_err(|e| e.to_string())?),
-            windows: self.windows.clone(),
+            windows: windows.to_vec(),
         };
         let request = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
         let mut file = OpenOptions::new()
@@ -1359,6 +1360,7 @@ impl PendingRecovery {
             read_checkpoint(&self.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         self.validate(&bytes)?;
         let mut authority = self.authority();
+        authority.windows = windows.to_vec();
         authority.job = job.into();
         authority.request_identity = digest(&request);
         authority.job_request_hash = digest(&request);
@@ -2577,6 +2579,14 @@ pub struct RecoveryRecord {
     #[cfg(feature = "host")]
     #[serde(skip)]
     authority: Option<Continuity>,
+}
+
+fn valid_recovery_windows(windows: &[String]) -> bool {
+    windows.len() <= 1024
+        && windows
+            .iter()
+            .all(|slot| crate::instance::validate_window_slot(slot).is_ok())
+        && windows.iter().collect::<BTreeSet<_>>().len() == windows.len()
 }
 
 fn recovery_name(hash: &str) -> String {
