@@ -645,6 +645,29 @@ fn route_notification_action(
     )
 }
 
+fn discard_resolved_delivery(
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    delivery: &mut BTreeMap<Target, Notice>,
+    notice: &Notice,
+) -> Result<(), String> {
+    // The registry already proved this toast obsolete. Leaving it ready in
+    // the delivery queue makes the broker retry a failed SQLite write without
+    // waiting for the reconciliation deadline.
+    delivery.remove(&notice.event.target());
+    journal.acknowledge(notice.id)?;
+    if let Some(current) = snapshot
+        .notices
+        .iter_mut()
+        .find(|current| current.id == notice.id)
+    {
+        current.acknowledged = true;
+    }
+    withdraw_notice(withdrawals, notice);
+    Ok(())
+}
+
 fn delivery_batch(
     delivery: &BTreeMap<Target, Notice>,
     schedule: &batching::Schedule,
@@ -1405,19 +1428,15 @@ async fn run(
                         });
                     match resolved {
                         Ok(true) => {
-                            match journal.acknowledge(notice.id) {
-                                Ok(_) => {
-                                    delivery.remove(&notice.event.target());
-                                    if let Some(current) = snapshot
-                                        .notices
-                                        .iter_mut()
-                                        .find(|current| current.id == notice.id)
-                                    {
-                                        current.acknowledged = true;
-                                    }
-                                    withdraw_notice(&mut withdrawals, &notice);
-                                }
-                                Err(error) => snapshot.diagnostic = Some(error),
+                            let result = discard_resolved_delivery(
+                                journal,
+                                &mut snapshot,
+                                &mut withdrawals,
+                                &mut delivery,
+                                &notice,
+                            );
+                            if result.is_err() {
+                                automation_retry.update(result, &mut snapshot, Instant::now());
                             }
                             continue;
                         }
@@ -1727,18 +1746,23 @@ mod tests {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch("CREATE TRIGGER refuse_ack BEFORE UPDATE OF acknowledged ON notices BEGIN SELECT raise(ABORT, 'temporarily cannot write'); END;").unwrap();
         let mut snapshot = Snapshot {
-            notices: vec![notice],
+            notices: vec![notice.clone()],
             ..Default::default()
         };
         let mut withdrawals = Withdrawals::default();
         let mut retry = AutomationRetry::default();
         let now = Instant::now();
-        let result = reconcile_automation_attention(
+        let mut delivery = [(notice.event.target(), notice.clone())].into();
+        let result = discard_resolved_delivery(
             &mut journal,
             &mut snapshot,
             &mut withdrawals,
-            true,
-            |_, _| Ok(true),
+            &mut delivery,
+            &notice,
+        );
+        assert!(
+            delivery.is_empty(),
+            "no obsolete due delivery may drive immediate retries"
         );
         assert!(result.is_err());
         retry.update(result, &mut snapshot, now);
