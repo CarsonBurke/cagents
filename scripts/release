@@ -528,17 +528,26 @@ HOST
 # Builds main's tip on the build host at normal priority and requires its
 # passing verdict, which the sentinel gives while the bundle builds.
 start_tip_prebuild() {
-    local tip=$1 relative
+    local tip=$1 relative output mode=wait
     relative=$(host_repository)
+    if [[ -n $CUT_LINUX_ARCHIVE ]]; then
+        mode=stream
+        exec {output}>"$CUT_LINUX_ARCHIVE"
+    else
+        exec {output}>&1
+    fi
     printf 'Prebuilding %s on %s at normal priority; its tests run beside it if they have not yet.\n' \
         "$tip" "$BUILD_HOST"
     # Keep the SSH PID so interruption stops our waiter. The requested
     # fw16 prebuild can still finish and be reused.
     # shellcheck disable=SC2029
-    ssh "$BUILD_HOST" bash -s -- "$relative" "$tip" <<'HOST' &
+    ssh "$BUILD_HOST" bash -s -- "$relative" "$tip" "$mode" >&"$output" <<'HOST' &
 set -euo pipefail
 cd ~/"$1"
 tip=$2
+if [[ $3 == stream ]]; then
+    exec 3>&1 1>&2
+fi
 scripts/prebuild-release --repository "$PWD" request "$tip" >/dev/null
 scripts/main-build-sentinel --repository "$PWD" --require-tests "$tip" > /dev/null 2>&1 </dev/null &
 tests=$!
@@ -565,8 +574,22 @@ case $status in
     1) echo "release: $tip fails its tests; see ~/.local/state/cagents-main-sentinel/logs on the build host" >&2; exit 1 ;;
     *) echo "release: the sentinel gave $tip no verdict (status $status); run the release again" >&2; exit 1 ;;
 esac
+if [[ $3 == stream ]]; then
+    # Keep the bytes even if the bundle is evicted while macOS prepares.
+    # Hold the eviction lock only while linking the immutable asset files.
+    store=$HOME/.local/state/cagents-prebuilt
+    snapshot=$(mktemp -d "$store/.cut.XXXXXXXXXX")
+    trap 'rm -rf -- "$snapshot"' EXIT
+    trap 'exit 1' HUP INT TERM
+    (
+        flock 9
+        cp -al -- "$store/bundles/$tip/dist" "$snapshot/dist"
+    ) 9>>"$store/pins.lock"
+    tar -C "$snapshot/dist" -cf - . >&3
+fi
 HOST
     TIP_PREBUILD_PID=$!
+    exec {output}>&-
 }
 
 # The versions tagged on origin, as a JSON array.
@@ -608,11 +631,15 @@ HOST
 
 NOTES_FILE=
 TIP_PREBUILD_PID=
+CUT_LINUX_ARCHIVE=
 cut_cleanup() {
     if [[ -n $TIP_PREBUILD_PID ]]; then
-        kill -TERM "$TIP_PREBUILD_PID" 2>/dev/null || :
+        # This is the only background job cut starts. Use the job table so a
+        # finished waiter's numeric PID cannot target an unrelated process.
+        kill -TERM %+ 2>/dev/null || :
         wait "$TIP_PREBUILD_PID" || :
     fi
+    [[ -z $CUT_LINUX_ARCHIVE ]] || rm -f -- "$CUT_LINUX_ARCHIVE"
     [[ -z $NOTES_FILE ]] || rm -f -- "$NOTES_FILE"
     unpin_bundle
 }
@@ -663,21 +690,22 @@ cut_release() {
             [[ $answer == [yY] ]] || fail 'nothing released'
         fi
         unpin_bundle
-        start_tip_prebuild "$tip"
         if [[ -n $MACOS_HOST && $sha != "$tip" ]] && jq -e '.tip_passed == true' <<< "$status" >/dev/null; then
             tip_version=$(version_at "$tip")
             if [[ ! -e $BUNDLES/$tip_version/release-metadata.json.sig ]] && \
                 ! jq -e --arg v "$tip_version" 'index($v) != null' <<< "$released" >/dev/null; then
-                # Keep the Mac in the foreground for SSH authentication and
-                # cleanup. Only a recorded passing verdict starts it early.
-                prepare_macos_commit "$tip"
+                mkdir -p -- "$BUNDLES"
+                CUT_LINUX_ARCHIVE=$(mktemp "$BUNDLES/.linux-cut.XXXXXXXXXX")
             fi
         fi
+        start_tip_prebuild "$tip"
+        # Keep the Mac in the foreground for SSH authentication and cleanup.
+        [[ -z $CUT_LINUX_ARCHIVE ]] || prepare_macos_commit "$tip"
         wait "$TIP_PREBUILD_PID" || prebuild_status=$?
         TIP_PREBUILD_PID=
         ((prebuild_status == 0)) || fail "no bundle of $tip"
         sha=$tip
-        pin_bundle "$sha"
+        [[ -n $CUT_LINUX_ARCHIVE ]] || pin_bundle "$sha"
     fi
     VERSION=$(version_at "$sha")
     TAG=v$VERSION
@@ -730,8 +758,15 @@ cut_release() {
     fi
     mkdir -p -- "$BUNDLES"
     rm -rf -- "$bundle.partial"
-    printf 'Copying the bundle of %s (%s) from %s.\n' "$sha" "$VERSION" "$BUILD_HOST"
-    scp -q -r -- "$BUILD_HOST:.local/state/cagents-prebuilt/bundles/$sha/dist" "$bundle.partial"
+    if [[ -n $CUT_LINUX_ARCHIVE ]]; then
+        mkdir -- "$bundle.partial"
+        tar -xf "$CUT_LINUX_ARCHIVE" -C "$bundle.partial"
+        rm -f -- "$CUT_LINUX_ARCHIVE"
+        CUT_LINUX_ARCHIVE=
+    else
+        printf 'Copying the bundle of %s (%s) from %s.\n' "$sha" "$VERSION" "$BUILD_HOST"
+        scp -q -r -- "$BUILD_HOST:.local/state/cagents-prebuilt/bundles/$sha/dist" "$bundle.partial"
+    fi
     # Every file matches the size and digest the prebuild recorded for this
     # commit and version: what is signed is what was built and smoke-tested.
     "$ROOT_DIR/scripts/release-metadata" check --dir "$bundle.partial" --version "$VERSION" \

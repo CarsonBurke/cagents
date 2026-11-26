@@ -30,7 +30,14 @@ echo "$host $*" >> "$FIXTURE/ssh.log"
 # The remote side outlives the client, which an interrupt ends at once.
 HOME=$FIXTURE/host bash -c "$*" <&0 &
 trap 'exit 255' INT TERM
-wait "$!"
+status=0
+wait "$!" || status=$?
+if [[ $status == 0 && ${@: -1} == stream && -p $FIXTURE/linux-streamed ]]; then
+    # Evict the published copy while the Mac still holds its preparation.
+    rm -rf -- "$FIXTURE/host/.local/state/cagents-prebuilt/bundles/${@: -2:1}"
+    printf 'streamed\n' > "$FIXTURE/linux-streamed"
+fi
+exit "$status"
 """
 
 SCP = r"""#!/bin/bash
@@ -212,6 +219,10 @@ echo "package-macos $version epoch=$SOURCE_DATE_EPOCH target=$CARGO_TARGET_DIR g
     >> "$FIXTURE/calls.log"
 if [[ -p $FIXTURE/macos-started ]]; then
     printf 'started\n' > "$FIXTURE/macos-started"
+fi
+if [[ -p $FIXTURE/linux-streamed ]]; then
+    read -r -t 15 streamed <> "$FIXTURE/linux-streamed"
+    [[ $streamed == streamed ]]
 fi
 mkdir -p "$2" && cd "$2"
 printf 'macOS archive %s\n' "$version" > "cagents-$version-aarch64-apple-darwin.tar.gz"
@@ -413,6 +424,7 @@ class ReleaseCut(unittest.TestCase):
         self.git("push", "-q", "origin", "main")
         self.bundle(tip, where=self.root / "waiting")
         os.mkfifo(self.root / "macos-started")
+        os.mkfifo(self.root / "linux-streamed")
 
         result = self.release("cut", "--wait", "--macos-host", "mac", "--key", "fixture-key")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -425,6 +437,9 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("cagents-0.2.4-aarch64-apple-darwin.tar.gz", metadata["assets"])
         self.assertTrue((bundle / "release-metadata.json.sig").is_file())
         self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), tip)
+        self.assertFalse((self.host / f".local/state/cagents-prebuilt/bundles/{tip}").exists())
+        self.assertEqual(list((self.host / ".local/state/cagents-prebuilt").glob(".cut.*")), [])
+        self.assertEqual(list((self.root / "bundles").glob(".linux-cut.*")), [])
 
     def test_wait_does_not_tag_or_sign_if_linux_packaging_fails_after_tests(self):
         self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
