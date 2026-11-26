@@ -28,13 +28,15 @@ pub(super) enum ReceiptKind {
     Exact,
     #[cfg(target_os = "macos")]
     Spared,
+    #[cfg(target_os = "macos")]
+    Update,
 }
 
 #[cfg(target_os = "macos")]
 pub(super) const SCOPED_SPARE: &str = "native-scope-spare-1";
 
 #[cfg(target_os = "macos")]
-pub(super) const UPDATE_RELEASE: &str = "native-update-release-1";
+pub(super) const UPDATE_RELEASE: &str = "native-update-release-2";
 
 #[cfg(target_os = "macos")]
 pub(super) fn supports_scoped_spare(record: &Record) -> bool {
@@ -71,6 +73,8 @@ fn path(terminal: TerminalId, holder: &Process, kind: ReceiptKind) -> Result<Pat
         ReceiptKind::Exact => "closed",
         #[cfg(target_os = "macos")]
         ReceiptKind::Spared => "spared",
+        #[cfg(target_os = "macos")]
+        ReceiptKind::Update => "update-release",
     };
     Ok(registry::directory(Kind::Native)?.join(format!(
         "{}-{}-{}.{extension}",
@@ -228,24 +232,21 @@ impl Detached {
                     .is_some_and(|role| role.matches(&receipt.record, &self.proof)))
     }
 
+    /// An update attests only its own scoped release. Ordinary Stop and
+    /// Floor Resume have independent whole-tree evidence and scan budgets.
     #[cfg(target_os = "macos")]
-    pub(super) fn update_release_receipt(&self, retain: bool) -> Result<bool, String> {
+    pub(super) fn update_release_receipt(&self) -> Result<bool, String> {
         let digest = source_digest(&self.source)?;
-        self.receipt_matching(retain, DetachedWork::Spare, |receipt| {
-            receipt.sources.contains(&digest)
-        })
+        consume(
+            self.record.terminal,
+            &self.record.holder,
+            ReceiptKind::Update,
+            true,
+            |receipt| self.matches_receipt(receipt) && receipt.sources.contains(&digest),
+        )
     }
 
     pub(super) fn receipt(&self, retain: bool, detached: DetachedWork) -> Result<bool, String> {
-        self.receipt_matching(retain, detached, |_| true)
-    }
-
-    fn receipt_matching(
-        &self,
-        retain: bool,
-        detached: DetachedWork,
-        matches_source: impl Fn(&Receipt) -> bool,
-    ) -> Result<bool, String> {
         #[cfg(target_os = "macos")]
         if detached == DetachedWork::Stop && !supports_scoped_spare(&self.record) {
             // A legacy Darwin close receipt did not encode its cleanup scope.
@@ -256,7 +257,7 @@ impl Detached {
             &self.record.holder,
             ReceiptKind::Exact,
             retain,
-            |receipt| self.matches_receipt(receipt) && matches_source(receipt),
+            |receipt| self.matches_receipt(receipt),
         )?;
         #[cfg(target_os = "linux")]
         let _ = detached;
@@ -267,7 +268,7 @@ impl Detached {
                 &self.record.holder,
                 ReceiptKind::Spared,
                 retain,
-                |receipt| self.matches_receipt(receipt) && matches_source(receipt),
+                |receipt| self.matches_receipt(receipt),
             );
         }
         Ok(exact)

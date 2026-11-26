@@ -189,6 +189,8 @@ enum Report {
     #[cfg(target_os = "macos")]
     ReleasedSparing,
     #[cfg(target_os = "macos")]
+    ReleasedForUpdate,
+    #[cfg(target_os = "macos")]
     UpdateServerObserved,
     Inspected {
         protocol: u32,
@@ -519,7 +521,7 @@ impl Holder {
     #[cfg(target_os = "macos")]
     pub(in crate::chat) fn close_for_update(&mut self) -> Result<(), String> {
         self.releasing_update = true;
-        if !self.identity.update_release_receipt(true)? {
+        if !self.identity.update_release_receipt()? {
             if self.control_poisoned {
                 self.control.take();
             }
@@ -530,7 +532,7 @@ impl Holder {
             if matches!(&report, Some(Err(_)) | Some(Ok(None))) {
                 self.control.take();
             }
-            if !self.identity.update_release_receipt(true)? {
+            if !self.identity.update_release_receipt()? {
                 return Err(match report {
                     Some(Ok(Some(Report::Failed(error)))) | Some(Err(error)) => error,
                     _ => "Native holder has not recorded its prepared update release".into(),
@@ -1128,7 +1130,9 @@ impl Residence {
         #[cfg(target_os = "linux")]
         let kind = ReceiptKind::Exact;
         #[cfg(target_os = "macos")]
-        let kind = if self.child.cleanup_proved() {
+        let kind = if self.release_scope == Some(ReleaseScope::Update) {
+            ReceiptKind::Update
+        } else if self.child.cleanup_proved() {
             ReceiptKind::Exact
         } else {
             ReceiptKind::Spared
@@ -1300,6 +1304,8 @@ impl Residence {
                             super::cleanup::ReceiptKind::Exact => Report::Released,
                             #[cfg(target_os = "macos")]
                             super::cleanup::ReceiptKind::Spared => Report::ReleasedSparing,
+                            #[cfg(target_os = "macos")]
+                            super::cleanup::ReceiptKind::Update => Report::ReleasedForUpdate,
                         };
                         let _ = send(&control, &report, TIMEOUT);
                         return false;
@@ -3677,8 +3683,19 @@ exec /bin/sleep 60
         assert!(server.reaped());
         assert!(holder.identity.record.root.reaped());
         assert!(detached.is_current());
-        assert!(holder.identity.update_release_receipt(true).unwrap());
-        assert!(super::super::closed_source_for_stop(&source, &proof).is_err());
+        assert!(holder.identity.update_release_receipt().unwrap());
+        let native = registry::directory(Kind::Native).unwrap();
+        // Repeat the new receipt namespace beyond the ordinary per-pane scan
+        // limit. Exact Stop still sees none of this scoped update evidence.
+        for start in 1..=129 {
+            std::fs::File::create(native.join(format!("{}-42-{start}.update-release", source.id)))
+                .unwrap();
+        }
+        assert!(
+            super::super::closed_source_for_stop(&source, &proof)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(target_os = "linux")] // The fixture asserts reparenting to the holder as a subreaper.
