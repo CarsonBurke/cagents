@@ -857,6 +857,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
+    #[cfg(target_os = "macos")]
+    let cutover_checkpoint = crate::update::cutover_startup_checkpoint();
     let listener = listener_before_restore(&paths, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
@@ -1109,7 +1111,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                     .proof()
                     .clone();
                 let host = Arc::clone(&host);
-                crate::update::settle_as_successor(serving, move || {
+                crate::update::settle_as_successor(serving, cutover_checkpoint, move || {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
                     let mut chats = chat::chat_list_inventory(&state);
                     chats.retain(|session| {

@@ -12,8 +12,6 @@ struct Intent {
     job: String,
     request_digest: String,
     checkpoint_digest: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inventory_digest: Option<String>,
     target: PathBuf,
     target_image: (u64, u64),
     window_image: (u64, u64),
@@ -37,6 +35,21 @@ pub(crate) struct Original<'a> {
     pub(crate) inventory: &'a crate::upgrade::recovery::Census,
 }
 
+#[cfg(feature = "host")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StartupCheckpoint {
+    Absent,
+    Unsettled,
+}
+
+#[cfg(feature = "host")]
+pub fn startup_checkpoint() -> StartupCheckpoint {
+    match recovery::checkpoint_status() {
+        Ok(None) => StartupCheckpoint::Absent,
+        _ => StartupCheckpoint::Unsettled,
+    }
+}
+
 /// A single snapshot of actual running owners under the serving host's lock.
 #[cfg(feature = "host")]
 pub struct LiveInventory {
@@ -57,21 +70,40 @@ struct OriginalInventory {
 }
 
 #[cfg(feature = "host")]
-const INVENTORY_LIMIT: u64 = crate::upgrade::recovery::STANDBY_RECEIPT_LIMIT as u64;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Witness {
+    version: u16,
+    intent_digest: String,
+    inventory_digest: String,
+    inventory: OriginalInventory,
+}
 
 #[cfg(feature = "host")]
+const INVENTORY_LIMIT: u64 = crate::upgrade::recovery::STANDBY_RECEIPT_LIMIT as u64;
+
 fn inventory_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.cutover-inventory.json"))
 }
 
 #[cfg(feature = "host")]
-fn persist(state: &Path, target: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
+fn persist(state: &Path, target: &Path, bytes: &[u8], exclusive: bool) -> Result<(), UpdateError> {
     let temporary = state.join(format!(".cutover-{}", uuid::Uuid::new_v4()));
     let saved = (|| {
         let mut file = private_create(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, target)?;
+        if exclusive {
+            let root = crate::fs_safety::Root::open(state)?;
+            crate::fs_safety::rename_new_within(
+                &root,
+                temporary.file_name().expect("cutover temporary name"),
+                target.file_name().expect("cutover file name"),
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        } else {
+            fs::rename(&temporary, target)?;
+        }
         File::open(state)?.sync_all()?;
         Ok(())
     })();
@@ -79,6 +111,14 @@ fn persist(state: &Path, target: &Path, bytes: &[u8]) -> Result<(), UpdateError>
         let _ = fs::remove_file(temporary);
     }
     saved
+}
+
+fn has_witness(state: &Path, job: &str) -> Result<bool, UpdateError> {
+    match fs::symlink_metadata(inventory_path(state, job)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn path(state: &Path, job: &str) -> PathBuf {
@@ -117,10 +157,6 @@ impl Intent {
         if uuid::Uuid::parse_str(&self.job).is_err()
             || !hash(&self.request_digest)
             || !hash(&self.checkpoint_digest)
-            || self
-                .inventory_digest
-                .as_deref()
-                .is_some_and(|digest| !hash(digest))
             || !self.target.is_absolute()
             || !self.source.is_complete()
             || !self.successor.is_complete()
@@ -175,8 +211,13 @@ impl Intent {
         &self,
         layout: &InstallLayout,
         serving: &HostSessionProof,
-    ) -> Result<(), UpdateError> {
-        if !self.names_selected(layout)? {
+    ) -> Result<source::Client, UpdateError> {
+        if !self.names_selected(layout)?
+            || crate::process::mapped_region_identity(
+                std::process::id(),
+                crate::process::own_code_address(),
+            )? != self.target_image
+        {
             return Err(invalid("The restored build is no longer selected"));
         }
         let mut client =
@@ -191,7 +232,7 @@ impl Intent {
                 "The selected service no longer owns the restored work",
             ));
         }
-        Ok(())
+        Ok(client)
     }
 
     fn original_alive(&self) -> Result<bool, UpdateError> {
@@ -219,15 +260,15 @@ impl Intent {
         serving: &HostSessionProof,
         mut inventory: LiveInventory,
     ) -> Result<(), UpdateError> {
-        let digest = self
-            .inventory_digest
-            .as_deref()
-            .ok_or_else(|| invalid("The installed cutover does not carry an original inventory"))?;
         let bytes = read_private(&inventory_path(state, &self.job), INVENTORY_LIMIT)?;
-        if format!("{:x}", Sha256::digest(&bytes)) != digest {
+        let witness: Witness = serde_json::from_slice(&bytes)?;
+        if witness.version != 1
+            || witness.intent_digest != self.digest()?
+            || witness.inventory_digest != hashed_json(&witness.inventory)?
+        {
             return Err(invalid("The original cutover inventory changed"));
         }
-        let saved: OriginalInventory = serde_json::from_slice(&bytes)?;
+        let saved = witness.inventory;
         let store = crate::upgrade::handoff::Store::discover().map_err(invalid)?;
         let mut lineage = store.recovered_chats().map_err(invalid)?;
         let mut terminals = inventory.terminals;
@@ -264,8 +305,23 @@ impl Intent {
 
     #[cfg(feature = "host")]
     fn persist(&self, state: &Path) -> Result<(), UpdateError> {
-        persist(state, &path(state, &self.job), &serde_json::to_vec(self)?)
+        persist(
+            state,
+            &path(state, &self.job),
+            &serde_json::to_vec(self)?,
+            false,
+        )
     }
+
+    #[cfg(feature = "host")]
+    fn digest(&self) -> Result<String, UpdateError> {
+        hashed_json(self)
+    }
+}
+
+#[cfg(feature = "host")]
+fn hashed_json(value: &impl Serialize) -> Result<String, UpdateError> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
 /// Written with the transferred worker lease and launch fence held, after
@@ -296,20 +352,10 @@ pub(crate) fn record(
         crate::process::own_code_address(),
     )?;
     let ui = fs::symlink_metadata(layout.version_root.join("bin/cagents-ui"))?;
-    let inventory = serde_json::to_vec(&OriginalInventory {
-        terminals: original.inventory.terminals.clone(),
-        chats: original.inventory.chats.clone(),
-    })?;
-    if inventory.len() as u64 > INVENTORY_LIMIT {
-        return Err(invalid(
-            "The original cutover inventory exceeds the evidence limit",
-        ));
-    }
     let intent = Intent {
         job: job.into(),
         request_digest: request_digest.into(),
         checkpoint_digest: checkpoint_digest.into(),
-        inventory_digest: Some(format!("{:x}", Sha256::digest(&inventory))),
         target: target.into(),
         target_image,
         window_image: (ui.dev(), ui.ino()),
@@ -321,7 +367,29 @@ pub(crate) fn record(
     };
     intent.validate()?;
     intent.verify_request(&state)?;
-    persist(&state, &inventory_path(&state, job), &inventory)?;
+    let inventory = OriginalInventory {
+        terminals: original.inventory.terminals.clone(),
+        chats: original.inventory.chats.clone(),
+    };
+    let witness = serde_json::to_vec(&Witness {
+        version: 1,
+        intent_digest: intent.digest()?,
+        inventory_digest: hashed_json(&inventory)?,
+        inventory,
+    })?;
+    if witness.len() as u64 > INVENTORY_LIMIT {
+        return Err(invalid(
+            "The original cutover inventory exceeds the evidence limit",
+        ));
+    }
+    let witness_path = inventory_path(&state, job);
+    if has_witness(&state, job)? {
+        if read_private(&witness_path, INVENTORY_LIMIT)? != witness {
+            return Err(invalid("An exact cutover inventory is already recorded"));
+        }
+    } else {
+        persist(&state, &witness_path, &witness, true)?;
+    }
     intent.persist(&state)
 }
 
@@ -348,7 +416,7 @@ pub(super) fn pending_selected(
     }
     // Keep a recoverable job reserved until another exact selected daemon
     // can finish it, even if the first successor no longer exists.
-    if intent.inventory_digest.is_some() {
+    if has_witness(state, &job.id)? {
         return Ok(true);
     }
     intent.original_alive()
@@ -360,6 +428,7 @@ pub(super) fn finish(
     state: &Path,
     successor: &HostSessionProof,
     mut job: UpdateJob,
+    entry_checkpoint: StartupCheckpoint,
     observe_live: impl FnOnce() -> LiveInventory,
 ) -> Result<Option<String>, UpdateError> {
     if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
@@ -377,13 +446,7 @@ pub(super) fn finish(
         return Ok(None);
     }
     let reentered = &intent.successor != successor;
-    if reentered
-        && (intent.inventory_digest.is_none()
-            || !intent.original_exited()?
-            || recovery::checkpoint_status()?.is_some())
-    {
-        // A Restoring checkpoint is adoption-only. Window completion cannot
-        // authorize re-running an interrupted restoration.
+    if reentered && (!has_witness(state, &job.id)? || !intent.original_exited()?) {
         return Ok(None);
     }
     if !reentered && intent.process.pid != std::process::id() as i32 {
@@ -391,9 +454,24 @@ pub(super) fn finish(
     }
     let finished = (|| {
         intent.verify_request(state)?;
-        intent.verify_serving(layout, successor)?;
+        let mut client = intent.verify_serving(layout, successor)?;
         if reentered {
+            // A no-replay completion is available only if the checkpoint
+            // was already retired before this daemon began restoring.
+            if entry_checkpoint != StartupCheckpoint::Absent
+                || recovery::checkpoint_status()?.is_some()
+            {
+                return Err(invalid(
+                    "Saved work had not finished reopening before the daemon restarted",
+                ));
+            }
+            let generation = client.inventory_generation()?;
             intent.verify_resumed_inventory(state, successor, observe_live())?;
+            if client.inventory_generation()? != generation {
+                return Err(invalid(
+                    "The running work changed during update verification",
+                ));
+            }
         }
         finish_windows(&intent, layout, successor)
     })();
@@ -440,7 +518,7 @@ fn finish_windows(
             verified?;
         }
     }
-    intent.verify_serving(layout, serving)
+    intent.verify_serving(layout, serving).map(|_| ())
 }
 
 #[cfg(test)]
@@ -457,7 +535,6 @@ mod tests {
             job: uuid::Uuid::new_v4().to_string(),
             request_digest: "a".repeat(64),
             checkpoint_digest: "b".repeat(64),
-            inventory_digest: None,
             target: "/private/install/versions/0.2.4/bin/cagentsd".into(),
             target_image: (42, 12),
             window_image: (42, 14),
@@ -541,8 +618,7 @@ mod tests {
         intent.process.start += 1;
         save(&intent);
         assert!(!pending_selected(&layout, &state, &job).unwrap());
-        intent.inventory_digest = Some("c".repeat(64));
-        save(&intent);
+        private_create(&inventory_path(&state, &job.id)).unwrap();
         assert!(pending_selected(&layout, &state, &job).unwrap());
     }
 }

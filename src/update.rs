@@ -9,7 +9,10 @@ mod confirmation;
 mod cutover;
 #[cfg(all(target_os = "macos", feature = "host"))]
 #[doc(hidden)]
-pub use cutover::LiveInventory as CutoverLiveInventory;
+pub use cutover::{
+    LiveInventory as CutoverLiveInventory, StartupCheckpoint as CutoverStartupCheckpoint,
+    startup_checkpoint as cutover_startup_checkpoint,
+};
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) use cutover::{Original as ReadyCutoverOriginal, record as record_ready_cutover};
 mod feed;
@@ -2110,6 +2113,7 @@ fn settle_under_worker_lease(
 #[cfg(feature = "host")]
 pub fn settle_as_successor(
     serving: crate::model::HostSessionProof,
+    #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
     #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory + Send + 'static,
 ) {
     let Ok(executable) = crate::process::current_executable() else {
@@ -2129,6 +2133,8 @@ pub fn settle_as_successor(
                 &layout,
                 &state,
                 &serving,
+                #[cfg(target_os = "macos")]
+                entry_checkpoint,
                 #[cfg(target_os = "macos")]
                 observe_live,
             ) {
@@ -2152,6 +2158,7 @@ fn settle_after_worker(
     layout: &InstallLayout,
     state: &Path,
     serving: &crate::model::HostSessionProof,
+    #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
     #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory,
 ) -> Result<Option<String>, UpdateError> {
     // The kernel wakes this thread when the original worker releases the
@@ -2165,7 +2172,14 @@ fn settle_after_worker(
         Err(error) => return Err(error),
     };
     #[cfg(target_os = "macos")]
-    if let Some(completed) = cutover::finish(layout, state, serving, job.clone(), observe_live)? {
+    if let Some(completed) = cutover::finish(
+        layout,
+        state,
+        serving,
+        job.clone(),
+        entry_checkpoint,
+        observe_live,
+    )? {
         return Ok(Some(completed));
     }
     if job.phase != UpdatePhase::Failed
