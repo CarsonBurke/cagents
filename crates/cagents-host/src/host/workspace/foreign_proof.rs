@@ -57,7 +57,11 @@ pub(super) fn refuse_foreign_proof(
     edit: &ModelEdit,
 ) -> Result<(), ProtocolError> {
     let ModelEdit::ChangeView {
-        change: change @ (Change::Update { pane, .. } | Change::UpdateTerminalSource { pane, .. }),
+        scope,
+        expected_revision,
+        change:
+            change @ (Change::Update { before, pane }
+            | Change::UpdateTerminalSource { before, pane, .. }),
         ..
     } = edit
     else {
@@ -78,6 +82,14 @@ pub(super) fn refuse_foreign_proof(
     let Some(mut view) = registry.pane_view(pane.id).map_err(unavailable)? else {
         return Ok(());
     };
+    // A write against another view, an older revision or a changed source is
+    // the store's to refuse as a conflict the window rebases and retries.
+    if view.scope != *scope
+        || view.revision != *expected_revision
+        || view.source_update_conflicts(before, pane)
+    {
+        return Ok(());
+    }
     let proof = |view: &crate::workspace_model::views::View| {
         view.panes
             .iter()
@@ -241,5 +253,38 @@ mod tests {
         update(&foreign, renamed).unwrap();
         assert_eq!(saved().title, "renamed");
         assert_eq!(saved().kind, stored.kind);
+
+        // A stale write is the store's conflict, which the window rebases.
+        let stale = edit_delta(
+            &host,
+            1,
+            ModelEdit::ChangeView {
+                scope: Scope::Channel(channel),
+                expected_revision: 0,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update {
+                    before: saved(),
+                    pane: foreign.clone(),
+                },
+            },
+        )
+        .expect_err("a stale write is refused");
+        assert_eq!(stale.code, ProtocolErrorCode::ViewConflict);
+        assert!(stale.retryable);
+
+        // A write carrying this daemon's own proof goes through.
+        let current = saved();
+        let restarted = Pane {
+            kind: CardKind::Chat(crate::chat::Session {
+                launch: crate::chat::Launch {
+                    session_id: Some("restarted".into()),
+                    ..chat.launch.clone()
+                },
+                ..chat.clone()
+            }),
+            ..current.clone()
+        };
+        update(&current, restarted.clone()).unwrap();
+        assert_eq!(saved().kind, restarted.kind);
     }
 }

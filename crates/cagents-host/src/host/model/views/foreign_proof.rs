@@ -45,6 +45,15 @@ impl Registry {
         if !restamps_foreign_proof(current, live, serving) {
             return Ok(false);
         }
+        // An open agent on this chat that names another process keeps its
+        // pane as the agent knows it, rather than fenced from it.
+        let actor = crate::agent_execution::HostedSession::Chat(live.clone());
+        if super::super::execution::agent_for_session_in(&tx, live.id)?
+            .and_then(|agent| agent.session)
+            .is_some_and(|session| !session.same_process(&actor))
+        {
+            return Ok(false);
+        }
         let adopted = crate::workspace_model::views::Pane {
             kind: CardKind::Chat(live.clone()),
             ..pane.clone()
@@ -91,6 +100,7 @@ pub(super) fn restamps_foreign_proof(
     };
     issued == serving
         && serving.is_complete()
+        && live.has_valid_native_continuity()
         && foreign.is_complete()
         && foreign.boot_id == serving.boot_id
         && foreign.host_session_id != serving.host_session_id
@@ -252,6 +262,33 @@ mod tests {
         assert!(
             !registry.adopt_foreign_chat_pane(&live, &serving).unwrap(),
             "a pane already showing the chat is left alone"
+        );
+    }
+
+    #[test]
+    fn a_pane_whose_agent_names_another_process_stays_as_the_agent_knows_it() {
+        let (live, stamped) = chat();
+        let serving = live.proof.clone().unwrap();
+        let (mut registry, _directory, channel, pane) = registry_with(&stamped);
+        let mut agent = crate::agent_execution::Agent::fixture_placed_in(channel);
+        agent.session = Some(HostedSession::Chat(stamped.clone()));
+        registry
+            .db
+            .execute(
+                "INSERT INTO agents(id, origin, record, session_id, closed) \
+                 VALUES (?1, '\"User\"', ?2, ?3, 0)",
+                rusqlite::params![
+                    agent.id.to_string(),
+                    serde_json::to_string(&agent).unwrap(),
+                    live.id.to_string()
+                ],
+            )
+            .unwrap();
+
+        assert!(!registry.adopt_foreign_chat_pane(&live, &serving).unwrap());
+        assert_eq!(
+            shown(&registry, channel, pane).kind,
+            CardKind::Chat(stamped)
         );
     }
 
