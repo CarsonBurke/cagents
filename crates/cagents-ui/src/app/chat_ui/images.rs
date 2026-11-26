@@ -1369,6 +1369,11 @@ impl Gallery {
         (self.selected + 1, self.entries.len())
     }
     pub(in crate::app) fn next(&mut self, host: ViewerHost, forward: bool) -> Task<Message> {
+        // A lone picture has nowhere to go; moving "to" it again would drop
+        // its pixels and the reader's zoom only to read it back.
+        if self.entries.len() < 2 {
+            return Task::none();
+        }
         // Only the shown picture is held whole, unless it is all there is.
         let entry = &mut self.entries[self.selected];
         if entry.source.is_some() {
@@ -2632,6 +2637,11 @@ mod tests {
         drop(gallery.next(ViewerHost::Dialog, true));
         assert_eq!(gallery.selected, 0);
         assert_eq!(gallery.url().unwrap().as_str(), "file:///fixture/a.png");
+        // A lone picture has nowhere to go: its zoom and pixels stay.
+        gallery.entries.truncate(1);
+        drop(gallery.next(ViewerHost::Dialog, true));
+        assert_eq!((gallery.selected, gallery.reset), (0, 2));
+        assert!(gallery.entries[0].full.is_some());
         gallery.remote = true;
         assert!(
             gallery.url().is_none(),
