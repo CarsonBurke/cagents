@@ -258,12 +258,16 @@ if [ "$UNINSTALL" -eq 1 ]; then
         rm -rf "$HOME/Library/Application Support/dev.cagents.cagents" \
             "$HOME/Library/Caches/dev.cagents.cagents" \
             "$HOME/Library/Preferences/dev.cagents.cagents"
+        runtime=$(/usr/bin/getconf DARWIN_USER_DIR 2>/dev/null || :)
         case ${XDG_RUNTIME_DIR:-} in
-            /*) rm -rf "${XDG_RUNTIME_DIR%/}/cagents" ;;
-            *)
-                runtime=$(getconf DARWIN_USER_DIR 2>/dev/null || :)
-                [ -z "$runtime" ] || rm -rf "${runtime%/}/cagents/cagents"
+            /*)
+                # With this alias, cagents/ also holds the default runtime
+                # and its admission leases. Leave their subtree intact.
+                if [ -n "$runtime" ] && [ ! "$XDG_RUNTIME_DIR" -ef "$runtime" ]; then
+                    rm -rf "${XDG_RUNTIME_DIR%/}/cagents"
+                fi
                 ;;
+            *) [ -z "$runtime" ] || rm -rf "${runtime%/}/cagents/cagents" ;;
         esac
     fi
     rm -rf "$PREFIX/versions" "$PREFIX/current"

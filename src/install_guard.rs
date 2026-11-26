@@ -216,7 +216,9 @@ pub(crate) fn reserve_darwin_publication() -> io::Result<File> {
 
 #[cfg(target_os = "macos")]
 fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
-    Ok(crate::instance::darwin_runtime_base()?.join("install-publication.lock"))
+    // XDG_RUNTIME_DIR may name the parent of the default runtime. Keep this
+    // inode beside the whole runtime tree so neither spelling can purge it.
+    Ok(crate::instance::darwin_runtime_base()?.with_file_name("cagents.install-publication.lock"))
 }
 
 pub(crate) fn verify_publication() -> io::Result<()> {

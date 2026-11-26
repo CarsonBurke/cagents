@@ -236,6 +236,8 @@ grep -q '"running": *true' "$ROOT/status.json" || fail 'repair did not start the
 cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started after publication'
 
 # Purge only isolated data, while retaining the runtime lock files.
+account_fence="$(/usr/bin/getconf DARWIN_USER_DIR)/cagents.install-publication.lock"
+account_inode=$(stat -f %i "$account_fence")
 mkdir -p "$ROOT/home/Library/Application Support/dev.cagents.cagents" "$ROOT/runtime/cagents"
 touch "$ROOT/runtime/cagents/smoke-data"
 pause_publication removal --purge
@@ -247,6 +249,7 @@ finish_publication
 [ ! -e "$ROOT/home/Library/Application Support/dev.cagents.cagents" ] && [ ! -e "$ROOT/runtime/cagents" ] \
     || fail 'purge left private app data behind'
 [ -f "$ROOT/runtime/cagents-ui.lock.update" ] || fail 'purge removed the application launch fence'
+[ "$(stat -f %i "$account_fence")" = "$account_inode" ] || fail 'purge replaced the account publication fence'
 [ ! -e "$PREFIX" ] || fail 'uninstall left the prefix behind'
 [ ! -L "$ROOT/home/.local/bin/cagents" ] && [ ! -L "$ROOT/home/Applications/Cagents.app" ] && [ ! -e "$AGENT" ] \
     || fail 'uninstall left a link or the login item behind'
