@@ -1461,16 +1461,14 @@ fn observe_darwin_codex_process(
     if result
         .as_ref()
         .is_err_and(|error| error.raw_os_error() == Some(libc::EIO))
+        && deadline.is_none_or(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) > STARTING_RETRY
+        })
     {
         // XNU can fail to copy the argument stack while a process changes.
         // Only another observation can establish unrelatedness or exit.
-        let pause = deadline.map_or(STARTING_RETRY, |deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(STARTING_RETRY)
-        });
-        if !pause.is_zero() {
-            std::thread::sleep(pause);
+        std::thread::sleep(STARTING_RETRY);
+        if deadline.is_none_or(|deadline| Instant::now() < deadline) {
             return observe();
         }
     }
@@ -2357,6 +2355,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
         assert_eq!(calls, 2);
+
+        calls = 0;
+        let error = observe_darwin_codex_process(Some(Instant::now()), || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, 1);
     }
 
     #[cfg(target_os = "macos")]
