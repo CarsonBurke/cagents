@@ -135,6 +135,9 @@ pub fn conversation_state(snapshot: &chat::Snapshot) -> api::ConversationState {
         subagents: snapshot
             .subagents
             .iter()
+            // The phone aggregates live subagents. Unloaded catalog rows
+            // carry a desktop history observation rather than live work.
+            .filter(|agent| !agent.last_seen_running())
             .map(|agent| api::Subagent {
                 id: agent.id.clone(),
                 kind: agent.kind.clone(),

@@ -1410,6 +1410,56 @@ fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
 
 use super::super::Role;
 use super::*;
+
+#[test]
+fn unloaded_catalog_rows_do_not_take_followed_history_slots() {
+    let mut state = Snapshot::default();
+    let mut indices = Default::default();
+    for index in 0..32 {
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: format!("child-{index}"),
+                kind: String::new(),
+                description: String::new(),
+                model: None,
+                status: Some(ToolStatus::Running),
+                waiting: None,
+                detail: None,
+                background: None,
+            },
+        );
+    }
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::SubagentItem {
+            id: "child-0".into(),
+            item: text("first", "Followed transcript"),
+        },
+    );
+    apply_event(
+        &mut state,
+        &mut indices,
+        Event::Subagent {
+            id: "unloaded".into(),
+            kind: String::new(),
+            description: String::new(),
+            model: None,
+            status: Some(ToolStatus::Running),
+            waiting: None,
+            detail: Some(crate::chat::UNLOADED_CHILD_RUNNING.into()),
+            background: None,
+        },
+    );
+    state.subagents[0].status = ToolStatus::Succeeded;
+    trim_subagents(&mut state);
+    assert_eq!(state.subagents.len(), 33);
+    assert_eq!(state.subagents[0].id, "child-0");
+    assert_eq!(state.subagents[0].items.len(), 1);
+    assert!(state.subagents.last().unwrap().last_seen_running());
+}
 use serde_json::{Value, json};
 use std::os::fd::FromRawFd;
 

@@ -5091,17 +5091,31 @@ fn stop_running_steps(items: &mut [Arc<Item>]) {
 /// available for status and selective Stop.
 fn trim_subagents(state: &mut Snapshot) {
     const RICH_HISTORY: usize = 32;
-    while state.subagents.len() > RICH_HISTORY {
+    // The provider bounds its unloaded listing separately. A catalog row
+    // does not buy history by evicting a followed child's transcript.
+    let mut followed = state
+        .subagents
+        .iter()
+        .filter(|agent| !agent.last_seen_running())
+        .count();
+    while followed > RICH_HISTORY {
         let Some(finished) = state
             .subagents
             .iter()
-            .position(|agent| !agent.status.is_live())
+            .position(|agent| !agent.last_seen_running() && !agent.is_live())
         else {
             break;
         };
         state.subagents.remove(finished);
+        followed -= 1;
     }
-    for agent in state.subagents.iter_mut().rev().skip(RICH_HISTORY) {
+    for agent in state
+        .subagents
+        .iter_mut()
+        .rev()
+        .filter(|agent| !agent.last_seen_running())
+        .skip(RICH_HISTORY)
+    {
         agent.items.clear();
     }
 }
