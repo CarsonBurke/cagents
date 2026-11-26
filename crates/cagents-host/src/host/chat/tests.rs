@@ -619,7 +619,7 @@ fn only_detaching_the_last_visible_chat_subscriber_wakes_the_actor() {
     };
     let chat_id = identity.record.terminal;
     let mut state = HostState::new(proof.clone());
-    for client in 1..=4 {
+    for client in 1..=5 {
         state.register_client(client);
     }
     state.chats.insert(
@@ -643,11 +643,12 @@ fn only_detaching_the_last_visible_chat_subscriber_wakes_the_actor() {
             },
             handle: handle.clone(),
             source_process: None,
-            subscribers: BTreeMap::from([(1, true), (2, true), (3, false)]),
+            subscribers: BTreeMap::from([(1, true), (2, true), (3, false), (5, false)]),
             observations: BTreeMap::from([
                 (1, Observation::default()),
                 (2, Observation::default()),
                 (3, Observation::default()),
+                (5, Observation::default()),
             ]),
             completion_observed: false,
             returning_terminal: false,
@@ -662,10 +663,20 @@ fn only_detaching_the_last_visible_chat_subscriber_wakes_the_actor() {
     process(&host, 1, ClientRequest::ChatDetach { chat_id }).unwrap();
     assert_eq!(handle.take_pending_visibility_fixture(), None);
     let mut state = host.lock().unwrap();
+    // The last visible subscriber hides the chat while a hidden one stays.
     drop(state.unregister_client(2));
     assert_eq!(handle.take_pending_visibility_fixture(), Some(false));
-    assert!(state.chats[&chat_id].subscribers.is_empty());
-    assert!(state.chats[&chat_id].observations.is_empty());
+    assert_eq!(
+        state.chats[&chat_id].subscribers,
+        BTreeMap::from([(5, false)])
+    );
+    assert_eq!(
+        state.chats[&chat_id]
+            .observations
+            .keys()
+            .collect::<Vec<_>>(),
+        [&5]
+    );
 }
 
 #[test]
