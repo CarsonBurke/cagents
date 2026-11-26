@@ -11187,6 +11187,22 @@ fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
         step.writes[0]["response"]["response"],
         json!({"action":"accept","content":{"query":"search","limit":5}})
     );
+    // An empty multi-select is a selection of nothing, not a blank field.
+    adapter.receive(json!({"type":"control_request","request_id":"e4","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string","enum":["a","b"]}}},"required":["tags"]}}})).unwrap();
+    let step = adapter
+        .answer(
+            "e4".into(),
+            "accept".into(),
+            vec![Answer {
+                field: "tags".into(),
+                values: vec![],
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"tags":[]}})
+    );
 }
 
 #[test]
