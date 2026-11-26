@@ -1,23 +1,24 @@
 //! A read-only phone view of a terminal agent's current screen.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 
 use cagents_mobile_api as api;
-use crossbeam_channel::{Receiver, Sender, after, bounded, never, select_biased};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, after, bounded, never, select_biased};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     agent::Provider,
+    control::ControlClient,
     model::{HostSessionProof, TerminalId},
     terminal::{HostedTerminalHandle, RenderSnapshot, TerminalEvent},
 };
 
-use super::{Outbox, PendingScreen, translate};
+use super::{Outbox, PendingScreen, WatchSocket, translate};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_ROWS: usize = 128;
@@ -28,6 +29,7 @@ pub(super) struct Watch {
     pub session: TerminalId,
     // Dropping the sender wakes the watch even when the terminal is quiet.
     _stop: Sender<()>,
+    lookup: WatchSocket,
     publisher: Publisher,
 }
 
@@ -35,12 +37,13 @@ impl Watch {
     pub fn start(
         id: u64,
         session: TerminalId,
-        provider: Provider,
         socket: PathBuf,
         proof: HostSessionProof,
         outbox: Outbox,
     ) -> std::io::Result<Self> {
         let (stop, stopped) = bounded(0);
+        let lookup = WatchSocket::default();
+        let worker_lookup = lookup.clone();
         let publisher = Publisher {
             session,
             state: Arc::new(Mutex::new(Some(State::Opening(id)))),
@@ -51,13 +54,20 @@ impl Watch {
         thread::Builder::new()
             .name("mobile-terminal".into())
             .spawn(move || {
-                if let Some(ending) = follow(&worker, stopped, provider, socket, proof) {
+                let provider = find_provider(&socket, &proof, session, &worker_lookup);
+                worker_lookup.stop();
+                let ending = match provider {
+                    Ok(provider) => follow(&worker, stopped, provider, socket, proof),
+                    Err(error) => Some(error),
+                };
+                if let Some(ending) = ending {
                     worker.finish(ending);
                 }
             })?;
         Ok(Self {
             session,
             _stop: stop,
+            lookup,
             publisher,
         })
     }
@@ -67,7 +77,9 @@ impl Drop for Watch {
     fn drop(&mut self) {
         // Fence any publisher that is still processing a wake, and answer an
         // open that was superseded before its first frame.
-        if let Some(State::Opening(id)) = self.publisher.state.lock().unwrap().take() {
+        let previous = self.publisher.state.lock().unwrap().take();
+        self.lookup.stop();
+        if let Some(State::Opening(id)) = previous {
             self.publisher.outbox.error(
                 Some(id),
                 api::Error {
@@ -140,6 +152,31 @@ fn exited(exit_code: u32, signal: Option<&str>) -> api::Error {
     }
 }
 
+fn find_provider(
+    socket: &Path,
+    proof: &HostSessionProof,
+    session: TerminalId,
+    lookup: &WatchSocket,
+) -> Result<Provider, api::Error> {
+    let failed = |error| unavailable(format!("Could not list terminal agents: {error}"));
+    let mut control =
+        ControlClient::connect_observing_socket(socket, |stream| lookup.register(stream))
+            .map_err(failed)?;
+    if control.proof() != proof {
+        return Err(unavailable("The computer's cagents daemon was replaced."));
+    }
+    control
+        .mobile_sessions()
+        .map_err(failed)?
+        .iter()
+        .find(|member| member.session.id == session)
+        .and_then(translate::terminal_provider)
+        .ok_or_else(|| api::Error {
+            code: api::ErrorCode::NotWatchable,
+            message: "Only a listed, running terminal agent can be followed.".into(),
+        })
+}
+
 fn follow(
     publisher: &Publisher,
     stopped: Receiver<()>,
@@ -147,6 +184,9 @@ fn follow(
     socket: PathBuf,
     proof: HostSessionProof,
 ) -> Option<api::Error> {
+    if matches!(stopped.try_recv(), Err(TryRecvError::Disconnected)) {
+        return None;
+    }
     let (wake, updates) = bounded(1);
     let handle =
         match HostedTerminalHandle::observe_at(socket, publisher.session, proof, move |_| {

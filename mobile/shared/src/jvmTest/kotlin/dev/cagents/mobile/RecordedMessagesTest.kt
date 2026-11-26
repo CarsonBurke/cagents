@@ -139,7 +139,7 @@ class RecordedMessagesTest {
 
         val ending = event<Event.TerminalWatchEnded>("event terminal_ended").ending
         assertEquals(terminal.id, ending.session)
-        assertEquals("The terminal exited with status 0.", ending.message)
+        assertEquals("The terminal is no longer running this agent.", ending.message)
     }
 
     @Test

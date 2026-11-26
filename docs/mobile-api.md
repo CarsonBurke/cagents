@@ -360,9 +360,10 @@ daemon observes that the agent has left the terminal. The viewport can include
 shell text during that transition.
 
 `terminal_ended` means the terminal can no longer be followed. Show its
-`message` alongside the last received screen. The API offers no
-terminal input, resizing or scrollback operations. Conversation commands
-still apply only to watched native chats.
+`message` alongside the last received screen. If the provider leaves the
+terminal, the watch can end before the daemon observes an exit status.
+The API offers no terminal input, resizing or scrollback operations.
+Conversation commands still apply only to watched native chats.
 
 ## Compatibility
 

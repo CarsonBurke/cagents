@@ -678,25 +678,11 @@ impl Bridge {
     }
 
     fn watch_terminal(&mut self, id: u64, session: TerminalId) -> Result<(), Failure> {
-        let provider = self
-            .control
-            .mobile_sessions()
-            .map_err(daemon_lost)?
-            .iter()
-            .find(|member| member.session.id == session)
-            .and_then(translate::terminal_provider)
-            .ok_or_else(|| {
-                Failure::Refused(api::Error {
-                    code: api::ErrorCode::NotWatchable,
-                    message: "Only a listed, running terminal agent can be followed.".into(),
-                })
-            })?;
         drop(self.terminal.take());
         self.terminal = Some(
             terminal::Watch::start(
                 id,
                 session,
-                provider,
                 self.socket.clone(),
                 self.control.proof().clone(),
                 self.outbox.clone(),

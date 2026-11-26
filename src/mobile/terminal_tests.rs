@@ -1,8 +1,12 @@
-use std::{io, os::unix::net::UnixStream};
+use std::{
+    io,
+    os::unix::net::{UnixListener, UnixStream},
+};
 
 use super::*;
 use crate::{
     agent::ActivityState,
+    agent_execution::{Lineage, Operation, Reply, directory},
     mobile::{Lines, Outgoing, write_lines},
     model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     terminal::{
@@ -146,19 +150,124 @@ impl FakeDaemon {
     }
 }
 
+fn proof() -> HostSessionProof {
+    HostSessionProof {
+        host_session_id: HostSessionId::new("session"),
+        boot_id: BootId::new("boot"),
+        host_incarnation: HostIncarnation::new("incarnation"),
+    }
+}
+
+fn accept_directory_lookup(listener: &UnixListener, proof: &HostSessionProof) -> (FakeDaemon, u64) {
+    let (stream, _) = crate::descriptor::accept(listener).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    let mut daemon = FakeDaemon {
+        stream,
+        proof: proof.clone(),
+    };
+    let connect = daemon.receive();
+    assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+    daemon.reply(
+        connect.request_id,
+        ServerResponse::Connected {
+            proof: proof.clone(),
+            resumed: Vec::new(),
+        },
+    );
+    let read = daemon.receive();
+    assert!(matches!(
+        read.request,
+        ClientRequest::Agent {
+            operation: Operation::Context {
+                scope: directory::Scope::All,
+                standing: false
+            },
+            ..
+        }
+    ));
+    (daemon, read.request_id)
+}
+
+fn listed_terminal(session: TerminalId) -> ServerResponse {
+    ServerResponse::Agent(Reply::Context(directory::Context {
+        sessions: directory::Sessions {
+            caller: None,
+            scope: directory::Scope::All,
+            sessions: vec![directory::Member {
+                session: directory::Entry {
+                    id: session,
+                    surface: directory::Surface::Terminal,
+                    provider: Some(Provider::Claude),
+                    title: None,
+                    channel: None,
+                    view_scope: None,
+                    channel_repository: None,
+                    lineage_channel: None,
+                    state: ActivityState::Working,
+                    directory: None,
+                    worktree: None,
+                    project: None,
+                    project_name: None,
+                    delegation: None,
+                    relation: directory::Relation::Peer,
+                    lineage: Lineage(session),
+                },
+                exited: false,
+                failure: None,
+                active_at: None,
+                limit: None,
+                account: None,
+                cache: None,
+            }],
+        },
+        lineage_channel: None,
+    }))
+}
+
 #[test]
-fn watches_a_terminal_with_daemon_push_and_releases_it_on_exit() {
+fn unwatch_cancels_a_stalled_terminal_directory_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = crate::descriptor::bind(&socket).unwrap();
+    let proof = proof();
+    let (outbox, lines) = Outbox::new();
+    let watch = Watch::start(1, TerminalId::new(), socket, proof.clone(), outbox).unwrap();
+    let (mut lookup, _) = accept_directory_lookup(&listener, &proof);
+    lookup
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+
+    // Do not answer the directory request. Unwatch shuts its socket down.
+    drop(watch);
+    assert!(
+        read_frame::<ClientEnvelope>(&mut lookup.stream)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        next_line(&lines),
+        api::ServerLine::Error { id: Some(1), error } if error.code == api::ErrorCode::Unavailable
+    ));
+    assert!(lines.outgoing.try_recv().is_err());
+}
+
+#[test]
+fn watches_a_terminal_with_daemon_push_until_the_provider_leaves() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("daemon.sock");
     let listener = crate::descriptor::bind(&socket).unwrap();
     let session = TerminalId::new();
-    let proof = HostSessionProof {
-        host_session_id: HostSessionId::new("session"),
-        boot_id: BootId::new("boot"),
-        host_incarnation: HostIncarnation::new("incarnation"),
-    };
+    let proof = proof();
     let (outbox, lines) = Outbox::new();
-    let _watch = Watch::start(1, session, Provider::Claude, socket, proof.clone(), outbox).unwrap();
+    let _watch = Watch::start(1, session, socket, proof.clone(), outbox).unwrap();
+    let (mut lookup, request) = accept_directory_lookup(&listener, &proof);
+    lookup.reply(request, listed_terminal(session));
+    assert!(
+        read_frame::<ClientEnvelope>(&mut lookup.stream)
+            .unwrap()
+            .is_none()
+    );
     let (stream, _) = crate::descriptor::accept(&listener).unwrap();
     stream.set_read_timeout(Some(WAIT)).unwrap();
     let mut daemon = FakeDaemon { stream, proof };
@@ -290,16 +399,15 @@ fn watches_a_terminal_with_daemon_push_and_releases_it_on_exit() {
         ServerMessage::Event {
             terminal_id: session,
             sequence: 4,
-            event: WireTerminalEvent::Exited {
-                exit_code: 0,
-                signal: None,
-                intentional: false,
-            },
+            // Ordinary PTY exit clears provider activity before the exit event.
+            event: WireTerminalEvent::AgentActivityChanged { activity: None },
         },
     );
     assert!(matches!(
         next_line(&lines),
-        api::ServerLine::Event(api::Event::TerminalEnded(ending)) if ending.session == session.to_string()
+        api::ServerLine::Event(api::Event::TerminalEnded(ending))
+            if ending.session == session.to_string()
+                && ending.message == "The terminal is no longer running this agent."
     ));
     // Even while the phone keeps its final text, the daemon attachment is gone.
     assert!(

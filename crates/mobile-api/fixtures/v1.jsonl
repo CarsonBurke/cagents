@@ -31,8 +31,8 @@
 {"direction":"server","message":{"id":21,"page":{"kind":"diff","patches":[{"item":"edit","offset":0,"text":"-old\n+new\n"}]},"type":"ok"},"name":"ok diff page"}
 {"direction":"server","message":{"id":22,"page":{"base64":"aW1hZ2U=","kind":"image"},"type":"ok"},"name":"ok image page"}
 {"direction":"server","message":{"api":1,"conversation_details":true,"host":"desktop","server_version":"0.1.3","type":"welcome"},"name":"welcome conversation details"}
-{"name":"terminal.watch","direction":"client","message":{"id":12,"op":"terminal.watch","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"type":"request"}}
-{"name":"terminal.unwatch","direction":"client","message":{"id":13,"op":"terminal.unwatch","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"type":"request"}}
+{"name":"terminal.watch","direction":"client","message":{"id":24,"op":"terminal.watch","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"type":"request"}}
+{"name":"terminal.unwatch","direction":"client","message":{"id":25,"op":"terminal.unwatch","params":{"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"type":"request"}}
 {"name":"event terminal session","direction":"server","message":{"data":{"sessions":[{"activity":"working","exited":false,"id":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10","lineage":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10","provider":"claude","provider_label":"Claude Code","surface":"terminal","terminal_watchable":true,"watchable":false}]},"event":"sessions","type":"event"}}
 {"name":"event terminal_screen","direction":"server","message":{"data":{"activity":"working","columns":80,"last_output_at":1700000000000,"lines":["Running tests","  3 passed"],"rows":2,"session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"event":"terminal_screen","type":"event"}}
-{"name":"event terminal_ended","direction":"server","message":{"data":{"message":"The terminal exited with status 0.","session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"event":"terminal_ended","type":"event"}}
+{"name":"event terminal_ended","direction":"server","message":{"data":{"message":"The terminal is no longer running this agent.","session":"8d4f2a8e-3c55-4b8e-9d2a-1f0c6b7e5a10"},"event":"terminal_ended","type":"event"}}

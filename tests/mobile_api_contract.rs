@@ -179,11 +179,11 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
         ),
         (
             "terminal.watch",
-            request(12, Call::WatchTerminal { session: session() }),
+            request(24, Call::WatchTerminal { session: session() }),
         ),
         (
             "terminal.unwatch",
-            request(13, Call::UnwatchTerminal { session: session() }),
+            request(25, Call::UnwatchTerminal { session: session() }),
         ),
         (
             "conversation.load_earlier",
@@ -593,7 +593,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             "event terminal_ended",
             event(Event::TerminalEnded(TerminalEnded {
                 session: session(),
-                message: "The terminal exited with status 0.".into(),
+                message: "The terminal is no longer running this agent.".into(),
             })),
         ),
         (
