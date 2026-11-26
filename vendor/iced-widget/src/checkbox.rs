@@ -574,6 +574,10 @@ where
             None => {}
         }
         node.set_selected(self.is_checked);
+        // Drawn as disabled without `on_toggle`, so announced as disabled too.
+        if self.on_toggle.is_none() {
+            node.set_disabled();
+        }
         // TODO hover
         // if is_hovered {
         //     node.set_hovered();

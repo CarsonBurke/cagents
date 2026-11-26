@@ -2395,6 +2395,11 @@ const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
 /// Room for the widest zoom step the viewer's label can hold, so the controls
 /// either side of it do not move when the step changes.
 const ZOOM_LABEL_WIDTH: f32 = 48.0;
+/// Why the find bar's Selection option is unavailable: Find captures the
+/// selection it opens with, and it opened with none.
+const FIND_SELECTION_UNAVAILABLE: &str = "Select text before opening Find to search only within it";
+/// Why Replace's Preserve case option is unavailable while Regex is on.
+const PRESERVE_CASE_UNAVAILABLE: &str = "Preserve case applies only to plain-text search";
 /// How many committed comparisons one open file keeps.
 ///
 /// Viewed working bases stay cached until a save or mutation invalidates them.
@@ -10288,7 +10293,6 @@ fn find_strip<'a>(
         runtime.find_options.case_sensitive,
         runtime.find_options.regex,
         runtime.find_options.whole_word,
-        true,
         move |option, enabled| RepositoryAction::FindOptionsChanged {
             card,
             option,
@@ -10297,16 +10301,21 @@ fn find_strip<'a>(
     )];
     let selection_enabled =
         runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
-    let mut selection =
+    let selection =
         crate::ui_controls::field::checkbox(runtime.find_selection.is_some()).label("Selection");
-    if selection_enabled {
-        selection = selection
-            .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
-    }
-    options.push(crate::interaction::tooltip(
-        selection,
-        "Search the selection captured when enabled",
-    ));
+    options.push(if selection_enabled {
+        crate::interaction::tooltip(
+            selection
+                .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled }),
+            "Search the selection captured when enabled",
+        )
+    } else {
+        // Find captures the selection it opens with.
+        crate::interaction::disabled_tooltip(
+            selection.description(FIND_SELECTION_UNAVAILABLE),
+            FIND_SELECTION_UNAVAILABLE,
+        )
+    });
     strips.push(
         widget::row::with_children(options)
             .spacing(space::S)
@@ -10343,18 +10352,22 @@ fn find_strip<'a>(
                     move || RepositoryAction::CloseFind { card },
                 ),
                 {
-                    let mut preserve =
+                    let preserve =
                         crate::ui_controls::field::checkbox(runtime.replace_preserve_case)
                             .label("Preserve case");
-                    if !runtime.find_options.regex {
-                        preserve = preserve.on_toggle(move |enabled| {
-                            RepositoryAction::PreserveCaseChanged { card, enabled }
-                        });
+                    if runtime.find_options.regex {
+                        crate::interaction::disabled_tooltip(
+                            preserve.description(PRESERVE_CASE_UNAVAILABLE),
+                            PRESERVE_CASE_UNAVAILABLE,
+                        )
+                    } else {
+                        crate::interaction::tooltip(
+                            preserve.on_toggle(move |enabled| {
+                                RepositoryAction::PreserveCaseChanged { card, enabled }
+                            }),
+                            "Keep each matched word's upper, lower or title case",
+                        )
                     }
-                    crate::interaction::tooltip(
-                        preserve,
-                        "Keep each matched word's upper, lower or title case (plain text)",
-                    )
                 },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
