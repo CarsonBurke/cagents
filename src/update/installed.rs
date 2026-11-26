@@ -165,15 +165,40 @@ pub(super) fn digest(root: &Path, binaries: &[&str]) -> Result<String, UpdateErr
         .collect())
 }
 
+pub(super) enum Candidate<'a> {
+    Local(&'a Path),
+    #[cfg(target_os = "macos")]
+    Release(&'a super::release_stage::VerifiedCandidate),
+}
+
+impl Candidate<'_> {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Local(root) => root,
+            #[cfg(target_os = "macos")]
+            Self::Release(release) => &release.root,
+        }
+    }
+
+    fn digest(&self) -> Result<String, UpdateError> {
+        match self {
+            Self::Local(root) => digest(root, &BINARIES),
+            #[cfg(target_os = "macos")]
+            Self::Release(release) => release.digest(),
+        }
+    }
+}
+
 pub(super) fn perform(
     installation: &Installation,
     state: &Path,
     job: &mut UpdateJob,
-    root: &Path,
+    candidate: Candidate<'_>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
     terminal: bool,
 ) -> Result<Completion, UpdateError> {
+    let root = candidate.root();
     let layout = locate(&crate::process::current_executable()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
@@ -191,7 +216,7 @@ pub(super) fn perform(
         "Verifying the installed application set",
     )?;
     let before = stamp(root)?;
-    let identity = digest(root, &BINARIES)?;
+    let identity = candidate.digest()?;
     let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged = candidate::Staged::from_installed(
         root.join("bin/cagents"),
@@ -260,7 +285,7 @@ pub(super) fn perform(
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
         if !confirmed.preserves_consent(&context.apply(latest))
-            || digest(root, &BINARIES).map_err(io::Error::other)? != staged.identity.digest
+            || candidate.digest().map_err(io::Error::other)? != staged.identity.digest
         {
             return Err(invalid(
                 "The installed build or session ownership changed during pane inspection; existing windows were kept open",

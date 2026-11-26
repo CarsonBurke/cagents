@@ -2475,10 +2475,13 @@ fn perform_update(
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
 ) -> Result<Completion, UpdateError> {
-    let request: UpdateRequest = serde_json::from_slice(&read_private(
+    let request_bytes = read_private(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
-    )?)?;
+    )?;
+    let request: UpdateRequest = serde_json::from_slice(&request_bytes)?;
+    #[cfg(target_os = "macos")]
+    let request_digest: [u8; 32] = Sha256::digest(&request_bytes).into();
     let terminal = matches!(request, UpdateRequest::ReleaseFromTerminal(_));
     #[cfg(target_os = "macos")]
     if job.phase == UpdatePhase::Verifying {
@@ -2489,12 +2492,12 @@ fn perform_update(
                 "Only a verified release can transfer its update worker",
             ));
         };
-        let root = release_stage::resume(installation, state, job, release)?;
+        let candidate = release_stage::resume(installation, state, job, release, &request_digest)?;
         return installed::perform(
             installation,
             state,
             job,
-            &root,
+            installed::Candidate::Release(&candidate),
             handoff,
             survivors,
             terminal,
@@ -2506,10 +2509,26 @@ fn perform_update(
             release
         }
         UpdateRequest::Installed { root } => {
-            return installed::perform(installation, state, job, &root, handoff, survivors, false);
+            return installed::perform(
+                installation,
+                state,
+                job,
+                installed::Candidate::Local(&root),
+                handoff,
+                survivors,
+                false,
+            );
         }
         UpdateRequest::InstalledFromTerminal { root } => {
-            return installed::perform(installation, state, job, &root, handoff, survivors, true);
+            return installed::perform(
+                installation,
+                state,
+                job,
+                installed::Candidate::Local(&root),
+                handoff,
+                survivors,
+                true,
+            );
         }
     };
     let cancellation = CancellationToken::for_job(state, &job.id)?;
@@ -2539,7 +2558,8 @@ fn perform_update(
             installation,
             state,
             job,
-            release,
+            &release,
+            request_digest,
             &assets,
             &cancellation,
         );

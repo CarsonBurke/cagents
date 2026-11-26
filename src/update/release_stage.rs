@@ -1,15 +1,30 @@
 //! Stage a verified Darwin release and transfer the same job to its matched CLI.
 use super::*;
 
-const PROGRAMS: &[&str] = &["cagents", "cagentsd", "cagents-ui", "cagents-dictate"];
+const PROGRAMS: &[&str] = &["cagents", "cagents-ui", "cagentsd", "cagents-dictate"];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stage {
     job: String,
-    release: Release,
+    request: [u8; 32],
     previous: PathBuf,
     binaries: String,
+}
+
+pub(super) struct VerifiedCandidate {
+    pub root: PathBuf,
+    binaries: String,
+}
+
+impl VerifiedCandidate {
+    pub fn digest(&self) -> Result<String, UpdateError> {
+        let digest = programs_digest(&self.root)?;
+        if digest != self.binaries {
+            return Err(invalid("The verified release files changed"));
+        }
+        Ok(digest)
+    }
 }
 
 fn path(state: &Path, job: &str) -> PathBuf {
@@ -21,11 +36,12 @@ pub(super) fn resume(
     state: &Path,
     job: &UpdateJob,
     requested: &Release,
-) -> Result<PathBuf, UpdateError> {
+    request: &[u8; 32],
+) -> Result<VerifiedCandidate, UpdateError> {
     let stage: Stage =
         serde_json::from_slice(&read_private(&path(state, &job.id), SMALL_ASSET_LIMIT)?)?;
     if stage.job != job.id
-        || stage.release != *requested
+        || stage.request != *request
         || job.version != requested.version
         || installation.version != requested.version
         || fs::read_link(installation.prefix.join("current"))? != stage.previous
@@ -42,20 +58,23 @@ pub(super) fn resume(
             std::process::id(),
             resume as *const () as usize as u64,
         )? != (named.dev(), named.ino())
-        || installed::digest(&layout.version_root, PROGRAMS)? != stage.binaries
     {
         return Err(invalid(
             "The staged release changed before its update worker could start",
         ));
     }
-    Ok(layout.version_root)
+    Ok(VerifiedCandidate {
+        root: layout.version_root,
+        binaries: stage.binaries,
+    })
 }
 
 pub(super) fn extract_and_exec(
     installation: &Installation,
     state: &Path,
     job: &UpdateJob,
-    release: Release,
+    release: &Release,
+    request: [u8; 32],
     assets: &feed::VerifiedAssets,
     cancellation: &CancellationToken,
 ) -> Result<Completion, UpdateError> {
@@ -78,22 +97,25 @@ pub(super) fn extract_and_exec(
     extract(
         &installation.prefix,
         stage_dir.path(),
-        &release,
+        release,
         assets,
         cancellation,
     )?;
     let archive_name = format!("cagents-{}", release.version);
     let source = stage_dir.path().join(&archive_name);
-    let digest = installed::digest(&source, PROGRAMS)?;
+    let digest = programs_digest(&source)?;
     for binary in PROGRAMS {
         File::open(source.join("bin").join(binary))?.sync_all()?;
     }
     File::open(source.join("bin"))?.sync_all()?;
+    // Close-on-exec serializes account publication until the kernel has
+    // opened the verified candidate image and replaced this worker process.
+    let _publication = crate::install_guard::reserve_darwin_publication()?;
     let root = promote(
         installation,
         stage_dir.path(),
         &archive_name,
-        &release,
+        release,
         &previous,
         &digest,
     )?;
@@ -101,7 +123,7 @@ pub(super) fn extract_and_exec(
         state,
         &Stage {
             job: job.id.clone(),
-            release,
+            request,
             previous,
             binaries: digest,
         },
@@ -115,7 +137,36 @@ pub(super) fn extract_and_exec(
     // run_worker owns the validated lock at this reserved descriptor. exec
     // replaces the process and preserves the one shared lock description.
     candidate::inherit(&mut command, WORKER_LOCK_FD);
-    Err(command.exec().into())
+    let error = command.exec();
+    // The pre-exec hook may have cleared this bit before a failed exec.
+    unsafe { libc::fcntl(WORKER_LOCK_FD, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Err(error.into())
+}
+
+fn owned_directory(path: &Path) -> Result<(), UpdateError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(invalid("The release directory is not privately owned"));
+    }
+    Ok(())
+}
+
+fn programs_digest(root: &Path) -> Result<String, UpdateError> {
+    let bin = root.join("bin");
+    owned_directory(root)?;
+    owned_directory(&bin)?;
+    for name in PROGRAMS {
+        let metadata = fs::symlink_metadata(bin.join(name))?;
+        if !metadata.is_file() || metadata.mode() & 0o100 == 0 {
+            return Err(invalid(
+                "The verified release needs a complete executable set",
+            ));
+        }
+    }
+    installed::digest(root, PROGRAMS)
 }
 
 fn extract(
@@ -158,13 +209,13 @@ fn promote(
     previous: &Path,
     digest: &str,
 ) -> Result<PathBuf, UpdateError> {
-    let _publication = crate::install_guard::reserve_darwin_publication()?;
     if fs::read_link(installation.prefix.join("current"))? != previous {
         return Err(invalid(
             "The selected installation changed before the release could be staged",
         ));
     }
     let versions = installation.prefix.join("versions");
+    owned_directory(&versions)?;
     let root = versions.join(&release.version);
     let source = stage.join(archive_name);
     let marker = format!("{}\n", installation.version);
@@ -185,7 +236,7 @@ fn promote(
         Err(error) if error.is_already_exists() => {
             // A prior attempt or rollback may already have installed these
             // exact binaries. Keep them and refresh only the staging marker.
-            if root.canonicalize()? != root || installed::digest(&root, PROGRAMS)? != digest {
+            if root.canonicalize()? != root || programs_digest(&root)? != digest {
                 return Err(invalid(
                     "These release files already exist as a different installation",
                 ));
@@ -217,6 +268,7 @@ fn save(state: &Path, stage: &Stage) -> Result<(), UpdateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn sealed(bytes: &[u8]) -> File {
         let mut file = anonymous_file().unwrap();
@@ -284,5 +336,24 @@ printf 'staged\n' > "$6/cagents-0.2.4/receipt"
             fs::read(stage.path().join("cagents-0.2.4/receipt")).unwrap(),
             b"staged\n"
         );
+    }
+
+    #[test]
+    fn matching_bytes_do_not_qualify_a_non_executable_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        for name in PROGRAMS {
+            let program = bin.join(name);
+            fs::write(&program, name).unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let candidate = VerifiedCandidate {
+            root: directory.path().to_owned(),
+            binaries: programs_digest(directory.path()).unwrap(),
+        };
+        assert_eq!(candidate.digest().unwrap(), candidate.binaries);
+        fs::set_permissions(bin.join("cagents-ui"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(candidate.digest().is_err());
     }
 }
