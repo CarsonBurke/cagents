@@ -658,14 +658,45 @@ mod flow_tests {
                 );
                 continue;
             }
-            let ServerResponse::ChatResumePrepared { session: successor } = super::super::process(
-                &host,
-                1,
-                ClientRequest::ChatPrepareResume {
-                    source: original.clone(),
-                },
-            )
-            .unwrap() else {
+            let prepare = |host: &SharedHost| {
+                super::super::process(
+                    host,
+                    1,
+                    ClientRequest::ChatPrepareResume {
+                        source: original.clone(),
+                    },
+                )
+            };
+            let prepared = prepare(&host);
+            #[cfg(target_os = "macos")]
+            let prepared = if original.launch.provider == Provider::Codex {
+                // This stopped ledger has no exact Codex retirement receipt.
+                // It remains readable, but on this boot it grants no writer.
+                let failure = prepared.unwrap_err();
+                assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+                assert!(
+                    failure.message.starts_with("The earlier Codex provider's")
+                        && failure.message.contains("nothing was started"),
+                    "{failure:?}"
+                );
+                {
+                    let state = host.lock().unwrap();
+                    assert!(state.chat_spawning.is_empty());
+                    assert!(state.chats[&original.id].handle.is_read_only_history());
+                }
+                // After a reboot the old provider cannot survive. Exercise
+                // the same ledger's positive resume with a successor host.
+                let mut restarted = HostState::new(proof("rebooted", "next-boot"));
+                restarted.register_client(1);
+                restarted.install_model(
+                    crate::host::model::Registry::at(&root.join("rebooted.sqlite3")).unwrap(),
+                );
+                prepare(&Arc::new(HostLock::new(restarted)))
+            } else {
+                prepared
+            };
+            let ServerResponse::ChatResumePrepared { session: successor } = prepared.unwrap()
+            else {
                 panic!("no resume preparation")
             };
             assert_ne!(successor.id, original.id);
