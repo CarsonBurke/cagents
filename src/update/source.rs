@@ -884,6 +884,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         205,
         "intermediate #3959 protocol; superseded by 206 without a qualified installed update source",
     ),
+    (
+        206,
+        "#4227 protocol; main encoded the queue-hold capability at an unrecorded position and no installed update source was qualified",
+    ),
 ];
 
 #[cfg(any(test, feature = "test-support"))]

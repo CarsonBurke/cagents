@@ -3500,11 +3500,6 @@ pub struct Capabilities {
     pub queue_remove: bool,
     #[serde(default)]
     pub queue_start: bool,
-    /// Whether what is queued when a turn is stopped or refused waits for
-    /// the reader, who can send it with [`Command::SendQueuedNow`] or start
-    /// one message of it, rather than starting the next turn by itself.
-    #[serde(default)]
-    pub queue_holds: bool,
     #[serde(default)]
     pub interrupt_modes: Vec<String>,
     #[serde(default)]
@@ -3518,27 +3513,36 @@ pub struct Capabilities {
     pub interrupt_stops_background: bool,
     /// Whether [`Command::SendQueuedNow`] is carried: the provider can hand
     /// what is queued to a turn blocked on long work without stopping the
-    /// work. Last, so that a client or source from before it reads the rest.
+    /// work.
     #[serde(
         default,
         skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
     )]
     pub send_queued_now: bool,
+    /// Whether what is queued when a turn is stopped or refused waits for
+    /// the reader, who can send it with [`Command::SendQueuedNow`] or start
+    /// one message of it, rather than starting the next turn by itself.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_queue_holds"
+    )]
+    pub queue_holds: bool,
 }
 
-/// As derived, except that a client from before [`SendNow`] is sent the
-/// fields it decodes: see [`Capabilities::send_queued_now`].
+/// Omit capabilities appended after the recipient's protocol version.
 impl Serialize for Capabilities {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         Self::serialize(self, serializer)
     }
 }
 
-/// As derived, except that one from a source before [`SendNow`] cannot send
-/// what is queued early.
+/// Default capabilities the source's protocol cannot report.
 impl<'de> Deserialize<'de> for Capabilities {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 2));
+        }
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::QUEUE_HOLDS) {
             return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
         }
         Self::deserialize(deserializer)
