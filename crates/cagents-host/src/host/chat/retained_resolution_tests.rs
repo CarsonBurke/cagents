@@ -474,48 +474,40 @@ fn ordinary_shutdown_settles_a_wait_with_an_already_acknowledged_helper_outbox()
         return;
     }
     let Some(root) = isolated() else { return };
-    let mut fixture = Fixture::with_provider(
-        root,
-        Some((
-            "        for index in range(40):",
-            r#"        send({'type':'control_request','request_id':'shutdown-question','request':{'subtype':'can_use_tool','tool_name':'AskUserQuestion','tool_use_id':'shutdown-use','input':{'questions':[{'question':'Continue this fixture?','header':'Continue','multiSelect':False,'options':[{'label':'Yes','description':'Continue'},{'label':'No','description':'Stop'}]}]}}})
-        continue
-        for index in range(40):"#,
-        )),
-    );
+    let mut fixture = Fixture::new(root);
     let handle = fixture.handle();
-    handle
-        .command(chat::Command::Prompt {
-            text: "Wait for a response".into(),
-            attachments: Vec::new(),
-            mode: chat::PromptMode::Send,
-        })
+    // A published waiting notice can outlast its helper's acknowledged
+    // outbox. Seed that durable half of the boundary while leaving the real
+    // retained owner responsive to an ordinary close.
+    let notifications = fixture.broker.as_ref().unwrap().handle();
+    let receipt = notifications
+        .record_committed(crate::notifications::Event::session(
+            fixture.original.id,
+            Provider::Claude,
+            fixture.root.join("project"),
+            crate::notifications::Evidence {
+                key: "previously published waiting request".into(),
+                kind: crate::notifications::Kind::Waiting,
+            },
+        ))
         .unwrap();
-    let waiting = || {
-        fixture
-            .broker
-            .as_ref()
-            .unwrap()
-            .handle()
-            .snapshot()
-            .notices
-            .into_iter()
-            .find(|notice| {
-                notice.event.source_session() == Some(fixture.original.id)
-                    && notice.event.evidence.kind == crate::notifications::Kind::Waiting
-                    && !notice.acknowledged
-            })
+    receipt
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    let unread_wait = || {
+        notifications.snapshot().notices.into_iter().find(|notice| {
+            notice.event.source_session() == Some(fixture.original.id)
+                && notice.event.evidence.kind == crate::notifications::Kind::Waiting
+                && !notice.acknowledged
+        })
     };
     wait(
-        || {
-            waiting().is_some()
-                && handle
-                    .uncommitted_outcomes()
-                    .is_ok_and(|entries| entries.is_empty())
-        },
-        "the exact waiting notice did not commit and leave the helper outbox",
+        || unread_wait().is_some(),
+        "the waiting notice did not publish",
     );
-    let notice = waiting().unwrap();
+    let notice = unread_wait().unwrap();
+    assert!(handle.uncommitted_outcomes().unwrap().is_empty());
     fixture.host.lock().unwrap().graceful_shutdown();
     super::super::finish_chat_shutdown(&fixture.host).unwrap();
     drop(fixture.broker.take());
