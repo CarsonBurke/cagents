@@ -92,6 +92,9 @@ pub(crate) struct TerminalRecord {
     /// Actual OSC/display title, separate from provider conversation metadata.
     display_title: Option<String>,
     working_directory: Option<(u64, PathBuf)>,
+    /// The provider last reported running here, which decides whether the
+    /// courier can alert this terminal. Its working state does not matter.
+    agent_provider: Option<crate::agent::Provider>,
 }
 
 impl TerminalRecord {
@@ -2083,6 +2086,7 @@ impl HostState {
                 conversation_title: None,
                 display_title: None,
                 working_directory: None,
+                agent_provider: None,
             },
         );
         // This is the live terminal even if saving its pane fails later.
@@ -6469,6 +6473,13 @@ fn record_event_from(
         if let WireTerminalEvent::WorkingDirectoryChanged { path } = &wire_event {
             record.working_directory = Some((sequence, path.clone()));
         }
+        let provider_changed = match &wire_event {
+            WireTerminalEvent::AgentActivityChanged { activity } => {
+                let provider = activity.as_ref().map(|activity| activity.provider);
+                std::mem::replace(&mut record.agent_provider, provider) != provider
+            }
+            _ => false,
+        };
         if let WireTerminalEvent::Exited {
             exit_code, signal, ..
         } = &wire_event
@@ -6521,10 +6532,8 @@ fn record_event_from(
         }
         // The exact worker's provider can now receive inbox attention, or
         // its departure can leave a single live member of a lineage.
-        if matches!(
-            wire_event,
-            WireTerminalEvent::AgentActivityChanged { .. } | WireTerminalEvent::Completed { .. }
-        ) && let Some(courier) = &state.mailbox
+        if (provider_changed || matches!(wire_event, WireTerminalEvent::Completed { .. }))
+            && let Some(courier) = &state.mailbox
         {
             courier.wake();
         }

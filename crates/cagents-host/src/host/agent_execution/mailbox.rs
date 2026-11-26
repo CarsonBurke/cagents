@@ -1013,8 +1013,15 @@ impl Handle {
                 self.0.scanned.notify_all();
             }
             if let Err(error) = self.0.wait.until(deadline) {
-                tracing::error!(%error, "cannot wait for message delivery");
-                return;
+                // Rescan on a short interval rather than leave mail stranded.
+                // Edges, including the one that stops the courier, still end
+                // the wait at once.
+                tracing::error!(%error, "cannot wait for a delivery deadline");
+                let remaining = Duration::from_millis(deadline.saturating_sub(super::now()));
+                if let Err(error) = self.0.wait.edge_within(remaining.min(RETRY)) {
+                    tracing::error!(%error, "cannot wait for message delivery");
+                    return;
+                }
             }
         }
     }

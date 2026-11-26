@@ -14,6 +14,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 struct Observed {
     prompts: Mutex<Vec<String>>,
     echoed: Mutex<Vec<String>>,
+    /// How many times the actor told the daemon the courier may try again.
+    prompt_available: std::sync::atomic::AtomicUsize,
 }
 
 struct GatedAdapter {
@@ -183,7 +185,22 @@ impl RequestRaceFixture {
         // Follow real preflight. Its cfg(test) Store owns a unique private
         // temporary cache; ProcessSpec does not override that cache's root.
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+        let available = observed.clone();
+        let handle = Handle::start(
+            spec,
+            Box::new(adapter),
+            initial,
+            store,
+            None,
+            move |update| {
+                if matches!(update, Update::PromptAvailable) {
+                    available
+                        .prompt_available
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap();
         let fixture = Self {
             handle,
             entered,
@@ -268,6 +285,12 @@ impl RequestRaceFixture {
                 .is_empty(),
             !queued
         );
+    }
+
+    pub fn prompt_available_count(&self) -> usize {
+        self.observed
+            .prompt_available
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn prompt_count(&self) -> usize {
@@ -434,8 +457,12 @@ fn courier_prompt_waits_behind_a_message_the_person_queued_with_the_provider() {
     refused(fixture.handle.try_idle_prompt("courier delivery".into()));
     assert_eq!(fixture.prompt_count(), 0);
     assert_eq!(fixture.provider_write_count(), 0);
+    let announced = fixture.prompt_available_count();
     fixture.set_persons_queue(false);
     assert!(fixture.handle.takes_courier());
+    // The conversation stayed idle throughout, so only this announcement
+    // tells the courier that the mail it left can go now.
+    assert_eq!(fixture.prompt_available_count(), announced + 1);
     fixture
         .handle
         .try_idle_prompt("courier delivery".into())

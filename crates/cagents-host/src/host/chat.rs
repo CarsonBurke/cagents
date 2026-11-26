@@ -603,9 +603,12 @@ fn changed_for_instance(
         state.tally_updates.notify_one();
     }
     // A conversation that starts or settles may take the messages left for
-    // it, and may have hit a usage limit or left one behind.
-    if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
-        && let Some(courier) = &state.mailbox
+    // it, and may have hit a usage limit or left one behind. A failure, such
+    // as a usage limit, can arrive in a later frame than the settling.
+    if matches!(
+        &update,
+        Update::PromptAvailable | Update::Activity { .. } | Update::FailureChanged
+    ) && let Some(courier) = &state.mailbox
     {
         courier.wake();
     }

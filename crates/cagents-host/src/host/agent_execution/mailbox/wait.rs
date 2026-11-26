@@ -14,6 +14,7 @@ mod linux {
     use std::{
         io,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        time::Duration,
     };
 
     /// An eventfd for edges and a realtime timerfd for the deadline, which
@@ -125,6 +126,30 @@ mod linux {
                 }
             }
         }
+
+        /// Blocks until an edge or `timeout` elapses on the monotonic clock,
+        /// without the deadline timer, for when [`Wait::until`] failed.
+        pub(in super::super) fn edge_within(&self, timeout: Duration) -> io::Result<()> {
+            let mut descriptor = libc::pollfd {
+                fd: self.edge.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+            // SAFETY: poll borrows the live eventfd and writes only into
+            // `descriptor`.
+            match unsafe { libc::poll(&mut descriptor, 1, timeout) } {
+                0 => Ok(()),
+                ready if ready > 0 && descriptor.revents & libc::POLLIN != 0 => Ok(()),
+                ready if ready > 0 => Err(io::Error::other(
+                    "courier edge descriptor became unavailable",
+                )),
+                _ => match io::Error::last_os_error() {
+                    error if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+                    error => Err(error),
+                },
+            }
+        }
     }
 
     fn owned(fd: libc::c_int) -> io::Result<OwnedFd> {
@@ -185,6 +210,19 @@ mod portable {
                     .wait_timeout(edge, Duration::from_millis(remaining).min(RECHECK))
                     .unwrap_or_else(|p| p.into_inner())
                     .0;
+            }
+            Ok(())
+        }
+
+        /// Blocks until an edge or `timeout` elapses.
+        pub(in super::super) fn edge_within(&self, timeout: Duration) -> io::Result<()> {
+            let edge = self.edge.lock().unwrap_or_else(|p| p.into_inner());
+            if !*edge {
+                drop(
+                    self.changed
+                        .wait_timeout(edge, timeout)
+                        .unwrap_or_else(|p| p.into_inner()),
+                );
             }
             Ok(())
         }
