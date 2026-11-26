@@ -163,6 +163,14 @@ impl Cagents {
             Action::Choose { card, key } => self.show_work(card, key, true),
             Action::ShowChanges { card, key } => {
                 let show = self.show_work(card, key, false);
+                if self.active_folder_scope() {
+                    // The panel still shows the plain folder it was bound to,
+                    // which has no source control; the end of this update
+                    // binds it to the chosen worktree and reads that.
+                    self.context_sections.workspace_view =
+                        context_sections::WorkspaceView::SourceControl;
+                    return Task::batch([show, self.save_settings_task(false)]);
+                }
                 let changes = self.handle_context_section(context_sections::Action::Show(
                     context_sections::WorkspaceView::SourceControl,
                 ));
@@ -170,6 +178,7 @@ impl Cagents {
             }
             Action::Copy(text) => {
                 chat_ui::invalidate_copy_intent();
+                self.status = Some(TransientNotice::success(format!("Copied {text}")));
                 iced::clipboard::write(text)
             }
             Action::OpenFolder(path) => {
