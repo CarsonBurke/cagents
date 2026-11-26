@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
+use std::{collections::HashMap, os::unix::ffi::OsStrExt};
 use std::{
     collections::HashSet,
     ffi::OsStr,
@@ -236,7 +236,7 @@ fn sweep_base(base: &Path, namespace: u64, proc: &Path) -> io::Result<()> {
 fn reclaim(path: PathBuf) -> io::Result<()> {
     let proc = Path::new(PROC);
     #[cfg(all(test, target_os = "linux", feature = "host"))]
-    let fixture = cleanup_fixture::proc_root();
+    let fixture = cleanup_fixture::census_root()?;
     #[cfg(all(test, target_os = "linux", feature = "host"))]
     let proc = fixture.as_deref().unwrap_or(proc);
     for path in unused(proc, &HashSet::from([path]))? {
@@ -250,37 +250,91 @@ fn remove(path: PathBuf) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_ids(proc: &Path) -> io::Result<HashSet<i32>> {
-    fs::read_dir(proc)?
-        .map(|entry| {
-            Ok(entry?
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse().ok()))
-        })
-        .filter_map(Result::transpose)
-        .collect()
+#[derive(Default)]
+struct ProcessCensus {
+    identities: HashMap<(i32, u64), bool>,
+    vanished_during_read: bool,
 }
 
-/// Only collect directories absent from a stable process census. A process
-/// may fork, leave its provider's group, and exit during the scan. If the
-/// process set changes, scan again or leave the candidates for a later sweep.
+#[cfg(target_os = "linux")]
+fn process_census(proc: &Path) -> io::Result<ProcessCensus> {
+    let mut census = ProcessCensus::default();
+    for entry in fs::read_dir(proc)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        let Some(stat) = proc_entry(fs::read(entry.path().join("stat")))? else {
+            census.vanished_during_read = true;
+            continue;
+        };
+        let (start, live) = process_identity_and_liveness(&stat)
+            .ok_or_else(|| io::Error::other("invalid process stat record"))?;
+        census.identities.insert((pid, start), live);
+    }
+    Ok(census)
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity_and_liveness(stat: &[u8]) -> Option<(u64, bool)> {
+    let mut fields = crate::model::agent_recovery::process_stat_fields(stat)?;
+    let state = fields.next()?;
+    // Skip from field 3 (state) to 20 (num_threads), then to 22 (starttime).
+    let threads: u32 = fields.nth(16)?.parse().ok()?;
+    let start = fields.nth(1)?.parse().ok()?;
+    // A zombie leader can still have live siblings using the directory.
+    Some((start, state != "Z" || threads != 1))
+}
+
+/// Reaping a group that had already exited cannot transfer a reference.
+/// A newly observed group could have passed a reference to an inspected
+/// process before becoming a zombie, so it still invalidates the scan.
+#[cfg(target_os = "linux")]
+fn census_is_stable(before: &ProcessCensus, after: &ProcessCensus) -> bool {
+    // A PID that disappeared between readdir and stat may also have been new.
+    !after.vanished_during_read
+        && after
+            .identities
+            .iter()
+            .all(|(identity, live)| before.identities.get(identity) == Some(live))
+        && before
+            .identities
+            .iter()
+            .filter(|&(_, live)| *live)
+            .all(|(identity, _)| after.identities.contains_key(identity))
+}
+
 #[cfg(target_os = "linux")]
 fn unused(proc: &Path, candidates: &HashSet<PathBuf>) -> io::Result<HashSet<PathBuf>> {
+    unused_with_census(proc, candidates, || process_census(proc))
+}
+
+#[cfg(target_os = "linux")]
+fn unused_with_census(
+    proc: &Path,
+    candidates: &HashSet<PathBuf>,
+    mut census: impl FnMut() -> io::Result<ProcessCensus>,
+) -> io::Result<HashSet<PathBuf>> {
     if candidates.is_empty() {
         return Ok(HashSet::new());
     }
+    let mut unused = candidates.clone();
+    let mut processes = census()?;
     for _ in 0..3 {
-        let processes = process_ids(proc)?;
-        let mut unused = candidates.clone();
-        for pid in &processes {
+        for (&(pid, _), _) in processes.identities.iter().filter(|&(_, live)| *live) {
             let process = proc.join(pid.to_string());
             match inspect_process(&process, &mut unused) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    if process_may_share_uid(&process)? {
-                        // Even older processes can open or receive a file
-                        // descriptor after the directory was created.
+                    if unreadable_process_may_hold_references(&process)? {
+                        tracing::debug!(
+                            pid,
+                            "Deferring Codex temporary cleanup for unreadable process"
+                        );
                         return Ok(HashSet::new());
                     }
                 }
@@ -290,10 +344,13 @@ fn unused(proc: &Path, candidates: &HashSet<PathBuf>) -> io::Result<HashSet<Path
                 return Ok(unused);
             }
         }
-        if processes == process_ids(proc)? {
+        let after = census()?;
+        if census_is_stable(&processes, &after) {
             return Ok(unused);
         }
+        processes = after;
     }
+    tracing::debug!("Deferring Codex temporary cleanup after changes among possible users");
     Ok(HashSet::new())
 }
 
@@ -425,37 +482,74 @@ fn inspect_process(process: &Path, unused: &mut HashSet<PathBuf>) -> io::Result<
 }
 
 #[cfg(target_os = "linux")]
-fn process_may_share_uid(process: &Path) -> io::Result<bool> {
-    // A non-dumpable process can have a root-owned proc directory even
-    // when it runs as us, so inspect its credentials instead.
-    let Some(status) = proc_entry(fs::read_to_string(process.join("status")))? else {
+fn status_value<'a>(status: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    status
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(key))
+        .map(<[u8]>::trim_ascii)
+}
+
+#[cfg(target_os = "linux")]
+fn is_exited(status: &[u8]) -> bool {
+    // The kernel releases a zombie's resources before its parent reaps it.
+    // A zombie leader can still have live siblings using the directory.
+    status_value(status, b"State:").is_some_and(|state| state.starts_with(b"Z "))
+        && status_value(status, b"Threads:") == Some(b"1")
+}
+
+#[cfg(target_os = "linux")]
+fn may_share_uid(status: &[u8]) -> bool {
+    // A non-dumpable process can have a root-owned proc directory even when
+    // it runs as us. Compare credentials instead of proc directory ownership.
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    status_value(status, b"Uid:")
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .is_none_or(|line| {
+            line.split_ascii_whitespace()
+                .any(|value| value.parse() == Ok(uid))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn unreadable_process_may_hold_references(process: &Path) -> io::Result<bool> {
+    let Some(status) = proc_entry(fs::read(process.join("status")))? else {
         // An unreadable resource can race with process exit, but a missing
         // status alone does not establish that its process is gone.
         return process.try_exists();
     };
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    Ok(status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .is_none_or(|line| {
-            line.split_whitespace()
-                .any(|value| value.parse() == Ok(uid))
-        }))
+    Ok(!is_exited(&status) && may_share_uid(&status))
 }
 
 #[cfg(all(test, target_os = "linux", feature = "host"))]
 pub(crate) mod cleanup_fixture {
     use std::{
+        fs, io,
         os::unix::fs::symlink,
         path::{Path, PathBuf},
         process::Command,
     };
 
-    const PROC_ROOT: &str = "CAGENTS_TEST_CODEX_TEMP_PROC";
+    pub(crate) const PROC_ROOT: &str = "CAGENTS_TEST_CODEX_TEMP_PROC";
 
-    pub(super) fn proc_root() -> Option<PathBuf> {
+    fn proc_root() -> Option<PathBuf> {
         std::env::var_os(PROC_ROOT).map(PathBuf::from)
+    }
+
+    pub(super) fn census_root() -> io::Result<Option<PathBuf>> {
+        let Some(proc) = proc_root() else {
+            return Ok(None);
+        };
+        // The synthetic census is a directory of links to real PID entries.
+        // Remove links whose PID entry disappeared before the scan starts.
+        for entry in fs::read_dir(&proc)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_symlink() && !path.try_exists()? {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(Some(proc))
     }
 
     /// Run the caller with a procfs census containing only its own provider.
@@ -493,6 +587,144 @@ mod tests {
     use std::process::Command;
     #[cfg(target_os = "linux")]
     use std::{os::unix::fs::symlink, process::Stdio};
+
+    #[cfg(target_os = "linux")]
+    fn fake_process(proc: &Path, pid: i32) -> PathBuf {
+        let process = proc.join(pid.to_string());
+        fs::create_dir_all(&process).unwrap();
+        write_process_stat(&process, "S", 1, 1);
+        process
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_process_stat(process: &Path, state: &str, threads: u32, start: u64) {
+        let skipped = "0 ".repeat(16);
+        let mut stat = b"1 (fixture) \xff) ".to_vec();
+        stat.extend_from_slice(format!("{state} {skipped}{threads} 0 {start}\n").as_bytes());
+        fs::write(process.join("stat"), stat).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unreaped_zombies_do_not_defer_cleanup_as_their_pids_disappear() {
+        let fixture = tempfile::tempdir().unwrap();
+        let proc = fixture.path().join("proc");
+        fs::create_dir(&proc).unwrap();
+        fake_process(&proc, 1);
+        for pid in 2..=7 {
+            let zombie = fake_process(&proc, pid);
+            write_process_stat(&zombie, "Z", 1, 1);
+        }
+        let candidate = fixture.path().join("unused");
+        let candidates = HashSet::from([candidate]);
+        let mut pid = 1;
+        let unused = unused_with_census(&proc, &candidates, || {
+            if pid > 1 {
+                fs::remove_dir_all(proc.join(pid.to_string()))?;
+            }
+            pid += 1;
+            process_census(&proc)
+        })
+        .unwrap();
+
+        assert_eq!(unused, candidates);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_new_process_can_inherit_a_reference_after_the_first_census() {
+        let fixture = tempfile::tempdir().unwrap();
+        let proc = fixture.path();
+        let parent = fake_process(proc, 1);
+        let candidate = PathBuf::from("/base/inherited");
+        let mut first = true;
+        let candidates = HashSet::from([candidate.clone()]);
+        let unused = unused_with_census(proc, &candidates, || {
+            if !std::mem::replace(&mut first, false) {
+                fs::remove_dir_all(&parent)?;
+                let child = fake_process(proc, 2);
+                fs::create_dir(child.join("fd"))?;
+                symlink(candidate.join("file"), child.join("fd/3"))?;
+            }
+            process_census(proc)
+        })
+        .unwrap();
+
+        assert!(unused.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_surviving_peer_can_receive_a_reference_from_a_departing_process() {
+        let fixture = tempfile::tempdir().unwrap();
+        let proc = fixture.path();
+        let donor = fake_process(proc, 1);
+        let recipient = fake_process(proc, 2);
+        let candidate = PathBuf::from("/base/received");
+        let candidates = HashSet::from([candidate.clone()]);
+        let mut first = true;
+        let unused = unused_with_census(proc, &candidates, || {
+            if !std::mem::replace(&mut first, false) {
+                fs::remove_dir_all(&donor)?;
+                fs::create_dir(recipient.join("fd"))?;
+                symlink(candidate.join("file"), recipient.join("fd/3"))?;
+            }
+            process_census(proc)
+        })
+        .unwrap();
+
+        assert!(unused.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_new_zombie_can_have_transferred_a_reference_during_the_scan() {
+        let fixture = tempfile::tempdir().unwrap();
+        let proc = fixture.path();
+        let recipient = fake_process(proc, 1);
+        let candidate = PathBuf::from("/base/received");
+        let candidates = HashSet::from([candidate.clone()]);
+        let mut reads = 0;
+        let unused = unused_with_census(proc, &candidates, || {
+            reads += 1;
+            if reads == 2 {
+                let donor = fake_process(proc, 2);
+                write_process_stat(&donor, "Z", 1, 1);
+                fs::create_dir(recipient.join("fd"))?;
+                symlink(candidate.join("file"), recipient.join("fd/3"))?;
+            }
+            process_census(proc)
+        })
+        .unwrap();
+
+        assert!(unused.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_pid_reaped_before_stat_can_have_transferred_a_reference() {
+        let fixture = tempfile::tempdir().unwrap();
+        let proc = fixture.path();
+        let recipient = fake_process(proc, 1);
+        let candidate = PathBuf::from("/base/received");
+        let candidates = HashSet::from([candidate.clone()]);
+        let mut reads = 0;
+        let unused = unused_with_census(proc, &candidates, || {
+            reads += 1;
+            if reads == 2 {
+                fs::create_dir(proc.join("2"))?;
+                fs::create_dir(recipient.join("fd"))?;
+                symlink(candidate.join("file"), recipient.join("fd/3"))?;
+            } else if reads == 3 {
+                fs::remove_dir(proc.join("2"))?;
+            }
+            process_census(proc)
+        })
+        .unwrap();
+
+        assert!(unused.is_empty());
+        assert_eq!(reads, 2);
+    }
 
     #[test]
     fn relative_tmpdir_uses_launch_cwd_and_managed_paths_do_not_nest() {
@@ -548,7 +780,7 @@ mod tests {
     fn open_fds_and_mappings_keep_directories_without_environment_or_cwd_references() {
         let fixture = tempfile::tempdir().unwrap();
         let proc = fixture.path();
-        fs::create_dir_all(proc.join("1/fd")).unwrap();
+        fs::create_dir(fake_process(proc, 1).join("fd")).unwrap();
         let open = PathBuf::from("/base/open");
         let mapped = PathBuf::from("/base/mapped with space\nand newline");
         let unrelated = PathBuf::from("/base/mapped with space");
@@ -568,7 +800,9 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let proc = fixture.path();
         let candidate = PathBuf::from("/base/in-use");
-        fs::create_dir_all(proc.join("1/task/2")).unwrap();
+        let leader = fake_process(proc, 1);
+        write_process_stat(&leader, "Z", 2, 1);
+        fs::create_dir_all(leader.join("task/2")).unwrap();
         symlink(candidate.join("working"), proc.join("1/task/2/cwd")).unwrap();
         assert!(
             unused(proc, &HashSet::from([candidate]))
@@ -582,8 +816,7 @@ mod tests {
     fn an_unreadable_same_user_process_keeps_the_directory() {
         let fixture = tempfile::tempdir().unwrap();
         let proc = fixture.path();
-        let process = proc.join("1");
-        fs::create_dir(&process).unwrap();
+        let process = fake_process(proc, 1);
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
         fs::write(
@@ -610,6 +843,28 @@ mod tests {
                 );
             }
             Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_unreadable_zombie_can_only_keep_references_through_live_threads() {
+        let fixture = tempfile::tempdir().unwrap();
+        let process = fixture.path();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        for (threads, can_hold_references) in [(1, false), (2, true)] {
+            fs::write(
+                process.join("status"),
+                format!(
+                    "State:\tZ (zombie)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nThreads:\t{threads}\n"
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                unreadable_process_may_hold_references(process).unwrap(),
+                can_hold_references
+            );
         }
     }
 
@@ -665,11 +920,8 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        symlink(
-            format!("/proc/{}", child.id()),
-            proc.join(child.id().to_string()),
-        )
-        .unwrap();
+        let child_entry = proc.join(child.id().to_string());
+        symlink(format!("/proc/{}", child.id()), &child_entry).unwrap();
 
         sweep_base(&root, namespace, &proc).unwrap();
         assert!(active.path().is_dir());
@@ -677,6 +929,8 @@ mod tests {
         assert!(unrelated.is_dir());
 
         assert!(child.wait().unwrap().success());
+        // The fixture's link persists after the kernel removes the PID entry.
+        fs::remove_file(child_entry).unwrap();
         sweep_base(&root, namespace, &proc).unwrap();
         assert!(!orphan.exists());
         assert!(active.path().is_dir());

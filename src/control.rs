@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsFd, AsRawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -43,6 +43,8 @@ mod completions;
 pub use automations::AutomationCommand;
 #[cfg(all(test, feature = "host"))]
 mod daemon_stop_tests;
+#[cfg(target_os = "macos")]
+mod darwin_ui;
 mod sessions;
 #[cfg(test)]
 mod startup_route;
@@ -436,6 +438,9 @@ pub enum TopCommand {
         #[arg(long)]
         #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
+        /// Check the launch fence for offline publication.
+        #[arg(long, conflicts_with = "stage_only")]
+        publish_only: bool,
     },
     /// Record that staged files must retain windows on the running daemon's UI.
     #[command(hide = true)]
@@ -1009,6 +1014,8 @@ pub struct ControlClient {
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<ModelEdge>,
     observed_notifications: VecDeque<crate::notifications::Update>,
+    mobile_watch: Option<crate::terminal::ipc::MobileWatch>,
+    mobile_changed: bool,
     /// The newest Work board pushed while a correlated response was pending.
     /// Each carries the whole board, so only the newest matters.
     observed_work: Option<(u64, Box<crate::work::Board>)>,
@@ -1130,6 +1137,14 @@ pub struct ResidentTerminals {
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
+        Self::connect_observing_socket(socket_path, |_| Ok(()))
+    }
+
+    /// Make the socket available for cancellation before the handshake.
+    pub(crate) fn connect_observing_socket(
+        socket_path: &Path,
+        connected: impl FnOnce(&UnixStream) -> io::Result<()>,
+    ) -> Result<Self, ControlError> {
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
         let deadline = Instant::now() + Self::handshake_timeout();
@@ -1139,6 +1154,7 @@ impl ControlClient {
                 io_timeout().min(deadline.saturating_duration_since(Instant::now())),
             )
             .map_err(ControlError::Connect)?;
+            connected(&stream).map_err(ControlError::Configure)?;
             Self::from_stream_inner(
                 stream,
                 deadline,
@@ -1271,6 +1287,8 @@ impl ControlClient {
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
+            mobile_watch: None,
+            mobile_changed: false,
             observed_work: None,
             observed_conversation: None,
             attached_chats: BTreeSet::new(),
@@ -1290,19 +1308,30 @@ impl ControlClient {
     /// Panics if anything was asked on it: a reply or notification it read
     /// would be lost to the new owner.
     pub fn into_handshaken_stream(self) -> (UnixStream, HostSessionProof) {
+        assert_eq!(
+            self.next_request_id, 2,
+            "the connection has already sent a request"
+        );
+        let (stream, proof, _) = self.into_unsubscribed_stream();
+        (stream, proof)
+    }
+
+    /// Hand over a current-protocol connection after ordinary round trips.
+    /// The new owner keeps the request sequence, and must subscribe itself.
+    pub(crate) fn into_unsubscribed_stream(self) -> (UnixStream, HostSessionProof, u64) {
         assert!(
             self.protocol == PROTOCOL_VERSION
-                && self.next_request_id == 2
                 && self.observed.is_empty()
                 && self.observed_model.is_empty()
                 && self.observed_notifications.is_empty()
+                && self.mobile_watch.is_none()
                 && self.observed_work.is_none()
                 && self.observed_conversation.is_none()
                 && self.attached_chats.is_empty()
                 && self.terminal_streams.is_empty(),
-            "only a connection that has asked nothing since its handshake can be handed over"
+            "only an unsubscribed current-protocol connection can be handed over"
         );
-        (self.stream, self.proof)
+        (self.stream, self.proof, self.next_request_id)
     }
 
     /// Whether nothing has arrived on this connection since its last reply,
@@ -1553,6 +1582,61 @@ impl ControlClient {
         match self.request_strict(ClientRequest::ApplyWorkspaceEdit { edit })? {
             ServerResponse::WorkspaceEdit(receipt) => Ok(receipt),
             response => Err(unexpected_response("a workspace edit receipt", &response)),
+        }
+    }
+
+    pub(crate) fn watch_mobile(
+        &mut self,
+        topic: crate::terminal::ipc::MobileWatch,
+    ) -> Result<(), ControlError> {
+        self.mobile_watch = Some(topic);
+        self.accepted(ClientRequest::WatchMobile { topic })
+    }
+
+    /// Await the next invalidation. A read can be interrupted by a newer
+    /// invalidation; keep that edge for the next pass.
+    pub(crate) fn next_mobile_change(&mut self) -> Result<(), ControlError> {
+        if std::mem::take(&mut self.mobile_changed) {
+            return Ok(());
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        let envelope = self.read_envelope()?;
+        self.validate_pinned_envelope(&envelope)?;
+        match envelope.message {
+            ServerMessage::MobileChanged { topic }
+                if envelope.request_id.is_none() && Some(topic) == self.mobile_watch =>
+            {
+                Ok(())
+            }
+            ServerMessage::HostShuttingDown => Err(ControlError::ConnectionClosed),
+            message => Err(ControlError::UnexpectedMessage {
+                expected: "a mobile watch update",
+                actual: message_name(&message),
+            }),
+        }
+    }
+
+    pub(crate) fn mobile_sessions(
+        &mut self,
+    ) -> Result<Vec<crate::agent_execution::directory::Member>, ControlError> {
+        self.stream
+            .set_read_timeout(Some(io_timeout()))
+            .map_err(ControlError::Configure)?;
+        let reply = self.agent(
+            Authority::default(),
+            crate::agent_execution::Operation::Context {
+                scope: crate::agent_execution::directory::Scope::All,
+                standing: false,
+            },
+        )?;
+        match reply {
+            crate::agent_execution::Reply::Context(context) => Ok(context.sessions.sessions),
+            _ => Err(ControlError::UnexpectedResponse {
+                expected: "mobile sessions",
+                actual: "agent reply",
+            }),
         }
     }
 
@@ -3039,6 +3123,9 @@ impl ControlClient {
     fn absorb(&mut self, message: ServerMessage) -> Option<ServerMessage> {
         match message {
             ServerMessage::TerminalWorker { .. } => {}
+            ServerMessage::MobileChanged { topic } if Some(topic) == self.mobile_watch => {
+                self.mobile_changed = true;
+            }
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited {
                 sequence,
@@ -3379,6 +3466,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
+        | ServerMessage::MobileChanged { .. }
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
         | ServerMessage::ConversationPullRequests { .. }
@@ -3411,6 +3499,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
         ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
+        ServerMessage::MobileChanged { .. } => "mobile_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
@@ -4348,8 +4437,13 @@ fn execute_with_model_context(
                 .into(),
             })
         }
-        TopCommand::VerifyInstallGuard { stage_only } => {
-            (if stage_only {
+        TopCommand::VerifyInstallGuard {
+            stage_only,
+            publish_only,
+        } => {
+            (if publish_only {
+                crate::install_guard::verify_publication()
+            } else if stage_only {
                 instance::validate_stage_guard()
             } else {
                 instance::validate_install_guard()
@@ -4512,7 +4606,17 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<Option<Strin
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
-        .env(UI_LAUNCH_PANE_NOTES_ENV, "1")
+        .env(UI_LAUNCH_PANE_NOTES_ENV, "1");
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = crate::update::stable_ui_bundle(
+        Path::new(command.get_program()),
+        &crate::process::current_executable()?,
+    )
+    .map_err(io::Error::other)?
+    {
+        return darwin_ui::launch(command, &bundle, timeout);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -4552,7 +4656,15 @@ fn finish_ui_launch(
                             Ok(0) => break,
                             Ok(_) => {}
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(100))
+                                if crate::descriptor::wait_for_activity(
+                                    stdout.as_fd(),
+                                    libc::POLLIN,
+                                    None,
+                                )
+                                .is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                             Err(_) => break,
@@ -4588,17 +4700,10 @@ fn handshake_reports_already_running(error: &io::Error) -> bool {
 }
 
 fn read_ui_launch_handshake(
-    stdout: &mut ChildStdout,
+    response_stream: &mut (impl Read + AsFd),
     timeout: Duration,
 ) -> io::Result<Option<String>> {
-    let descriptor = stdout.as_raw_fd();
-    // SAFETY: fcntl receives a live descriptor and integer flags only.
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-    if flags == -1
-        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
+    crate::descriptor::set_nonblocking(response_stream.as_fd())?;
 
     let started = Instant::now();
     let mut deadline = started + timeout;
@@ -4606,7 +4711,7 @@ fn read_ui_launch_handshake(
     let mut response = Vec::new();
     let mut buffer = [0_u8; 256];
     loop {
-        match stdout.read(&mut buffer) {
+        match response_stream.read(&mut buffer) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -4645,7 +4750,11 @@ fn read_ui_launch_handshake(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
+                if !crate::descriptor::wait_for_activity(
+                    response_stream.as_fd(),
+                    libc::POLLIN,
+                    Some(deadline),
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         if recovery_announced {
@@ -4659,7 +4768,6 @@ fn read_ui_launch_handshake(
                         },
                     ));
                 }
-                thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -11915,6 +12023,19 @@ mod tests {
         assert_eq!(
             spawn_ui_process(&mut command).unwrap().as_deref(),
             Some("One pane could not reconnect. Another is still reconnecting.")
+        );
+    }
+
+    #[test]
+    fn ui_launch_handshake_keeps_buffered_readiness_after_socket_close() {
+        let (mut parent, mut window) = UnixStream::pair().unwrap();
+        window
+            .write_all(b"recovering: 1\nready-with-pane-notes: Exact pane kept.\n")
+            .unwrap();
+        drop(window);
+        assert_eq!(
+            read_ui_launch_handshake(&mut parent, Duration::from_secs(5)).unwrap(),
+            Some("Exact pane kept.".into())
         );
     }
 

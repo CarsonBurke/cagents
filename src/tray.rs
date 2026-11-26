@@ -41,7 +41,7 @@ mod service {
     };
 
     use ksni::{TrayMethods, menu::StandardItem};
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{Notify, mpsc, oneshot};
 
     use super::AgentTally;
     use crate::{
@@ -56,8 +56,6 @@ mod service {
     const RESULT_TTL: Duration = Duration::from_secs(6);
     /// A failure stays long enough to be found on a later look at the menu.
     const FAILURE_TTL: Duration = Duration::from_secs(60);
-    /// How often the agent counts are read from the daemon.
-    const TALLY_INTERVAL: Duration = Duration::from_secs(3);
 
     /// What a finished tray action reports.
     type ActionResult = Result<String, String>;
@@ -437,9 +435,12 @@ mod service {
         }
     }
 
-    /// Starts the tray; `tally` reads the daemon's agent counts, or `None`
-    /// once the daemon is gone.
-    pub fn start(tally: impl Fn() -> Option<AgentTally> + Send + Sync + 'static) -> TrayGuard {
+    /// Starts the tray. The host signals inventory and activity changes via
+    /// `tally_updates`; `tally` reads the latest counts, or `None` after host exit.
+    pub fn start(
+        tally_updates: Arc<Notify>,
+        tally: impl Fn() -> Option<AgentTally> + Send + Sync + 'static,
+    ) -> TrayGuard {
         let tally = Arc::new(tally);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let worker = thread::Builder::new()
@@ -458,7 +459,8 @@ mod service {
                 runtime.block_on(async move {
                     let (updates, mut results) = mpsc::unbounded_channel();
                     let mut tray = DaemonTray::new(updates);
-                    tray.tally = tally().unwrap_or_default();
+                    let initial_tally = tally().unwrap_or_default();
+                    tray.tally = initial_tally;
                     let handle = match tray.assume_sni_available(true).spawn().await {
                         Ok(handle) => handle,
                         Err(error) => {
@@ -485,22 +487,20 @@ mod service {
                     });
                     let tally_handle = Arc::clone(&handle);
                     let counter = tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(TALLY_INTERVAL);
-                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        let mut last = None;
+                        let mut last = initial_tally;
                         loop {
-                            interval.tick().await;
+                            tally_updates.notified().await;
                             // Off the tray's own thread: the daemon's lock can
                             // be held across slow work.
                             let read = Arc::clone(&tally);
-                            let Ok(current) = tokio::task::spawn_blocking(move || read()).await
+                            let Ok(Some(current)) =
+                                tokio::task::spawn_blocking(move || read()).await
                             else {
                                 continue;
                             };
                             // Only a change is worth a menu update on the bus.
-                            if current.is_some() && current != last {
+                            if current != last {
                                 last = current;
-                                let current = current.unwrap_or_default();
                                 tally_handle.update(move |tray| tray.tally = current).await;
                             }
                         }
@@ -683,6 +683,9 @@ pub struct TrayGuard;
 
 /// macOS shows no status item; see the module documentation.
 #[cfg(target_os = "macos")]
-pub fn start(_tally: impl Fn() -> Option<AgentTally> + Send + Sync + 'static) -> TrayGuard {
+pub fn start(
+    _tally_updates: std::sync::Arc<tokio::sync::Notify>,
+    _tally: impl Fn() -> Option<AgentTally> + Send + Sync + 'static,
+) -> TrayGuard {
     TrayGuard
 }

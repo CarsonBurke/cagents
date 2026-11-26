@@ -599,6 +599,9 @@ fn changed_for_instance(
         return;
     }
     let proof = state.proof().clone();
+    if matches!(update, Update::Activity { .. }) {
+        state.tally_updates.notify_one();
+    }
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind.
     if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
@@ -641,6 +644,12 @@ fn changed_for_instance(
         }
         return;
     }
+    if matches!(
+        update,
+        Update::Activity { .. } | Update::ConversationNameChanged | Update::FailureChanged
+    ) {
+        state.mobile_sessions_changed();
+    }
     if matches!(update, Update::ConversationNameChanged) {
         if let Some(titles) = &state.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
@@ -655,10 +664,9 @@ fn changed_for_instance(
     // Check the exact current producer under HostState; a failed/retained owner
     // must not masquerade as released work. Remote proxies publish Resident
     // metadata before this callback, so this reads no helper or transcript.
-    let wake_completed = instance.is_some()
-        && matches!(update, Update::Observed { .. })
-        && record.handle.is_completed()
-        && !record.handle.owns_work();
+    let completed = matches!(update, Update::Observed { .. }) && record.handle.is_completed();
+    let released = completed && !record.handle.owns_work();
+    let mobile_ended = released && !record.returning_terminal;
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
             &Update::Activity { state, generation } => ServerMessage::ChatActivity {
@@ -726,8 +734,15 @@ fn changed_for_instance(
     {
         record.handle.observe_next_update();
     }
+    // The completion flag is published after the final Activity event.
+    // An overview read triggered only by Activity can still see the old row.
+    if mobile_ended {
+        state.mobile_chat_ended(id);
+    } else if completed {
+        state.mobile_sessions_changed();
+    }
     drop(state);
-    if wake_completed {
+    if instance.is_some() && released {
         crate::daemon::wake();
     }
 }
@@ -2535,6 +2550,15 @@ fn start_publishing(
             source_execution.as_ref()
         },
     )?;
+    #[cfg(target_os = "macos")]
+    if source.is_none()
+        && restart_launch.is_none()
+        && !saved_history_only
+        && session.launch.session_id.is_none()
+        && let Some(login_path) = crate::account::probe::shell_search_path()
+    {
+        add_login_search_directories(&mut process_launch.recipe, &login_path);
+    }
     // A begun thread's bare remote joins the account's shared daemon, which
     // owns the thread while it runs. With nothing serving that daemon, the
     // thread is reopened from its history on a listener of its own instead of
@@ -2802,7 +2826,7 @@ fn start_publishing(
         };
         session.proof = Some(state.proof().clone());
         capacity::Reservation::install(&mut admission, host, &mut state, &session)?;
-        state.inventory_generation += 1;
+        state.inventory_changed();
         source_handle
     };
     let result = (|| {
@@ -3166,7 +3190,7 @@ fn start_publishing(
         if let Some(context) = &execution {
             context.installed();
         }
-        state.inventory_generation += 1;
+        state.inventory_changed();
         drop(state);
         drop(retired);
         if remote {
@@ -3517,7 +3541,7 @@ fn codex_terminal_view(
         record.source_process = paired_terminal.observe_agent_process();
         record.returning_terminal = false;
         owners = paired_close::Owners::capture(&state, &state.chats[&chat_id])?;
-        state.inventory_generation += 1;
+        state.inventory_changed();
         Ok(ServerResponse::ChatTerminal {
             chat_id,
             session: descriptor.session.clone(),
@@ -4700,7 +4724,7 @@ fn process_inner(
                     .expect("validated exact attachment");
                 record.returning_terminal = true;
                 record.completion_observed = false;
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 state.recovery_independence.extend(chat_id, terminal_id);
                 // The terminal resumes this chat's conversation under its
                 // claim, which refuses any other's (see
@@ -4793,8 +4817,7 @@ fn process_inner(
                 }
                 let old_pair = owners.remove_pair(&mut state, &closing)?;
                 let mut record = state
-                    .chats
-                    .remove(&chat_id)
+                    .remove_chat(chat_id)
                     .expect("validated exact attachment");
                 state.chat_handoffs.insert(
                     chat_id,
@@ -4806,7 +4829,7 @@ fn process_inner(
                         Instant::now() + ACKNOWLEDGEMENT_GRACE,
                     ),
                 );
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 Ok((record, old_pair))
             })();
             match publication {
@@ -4872,7 +4895,7 @@ fn process_inner(
                 .find_map(|(&id, receipt)| (receipt.terminal.id == terminal_id).then_some(id));
             if let Some(source_id) = source_id {
                 state.chat_handoffs.remove(&source_id);
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             Ok(ServerResponse::Accepted)
         }
@@ -5182,8 +5205,8 @@ pub(super) fn close_captured(
                 "The paired terminal changed while its previous worker was closing.",
             ));
         }
-        state.inventory_generation += 1;
-        let record = state.chats.remove(&chat_id);
+        state.inventory_changed();
+        let record = state.remove_chat(chat_id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(chat_id);
         }
@@ -5394,6 +5417,31 @@ fn prepare_native_process_launch(
         .environment
         .retain(|name, _| !removed.contains(name));
     Ok(process_launch)
+}
+
+/// A fresh provider keeps its caller's tool order. Supply directories absent
+/// from its PATH so a launcher can find dependencies installed for the user.
+#[cfg(any(target_os = "macos", test))]
+fn add_login_search_directories(
+    recipe: &mut crate::model::LaunchRecipe,
+    login_path: &std::ffi::OsStr,
+) {
+    if recipe.unset_environment.contains("PATH") {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let directories = recipe
+        .environment
+        .get("PATH")
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(std::env::split_paths(login_path).filter(|directory| directory.is_absolute()))
+        .filter(|directory| seen.insert(directory.clone()));
+    if let Ok(path) = std::env::join_paths(directories)
+        && let Ok(path) = path.into_string()
+    {
+        recipe.environment.insert("PATH".into(), path);
+    }
 }
 
 /// The environment `restore_upgrade` will start `launch` with in the next
@@ -5747,9 +5795,9 @@ pub(super) fn stop_failed_upgrade_restore(
     let record = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_current(&state)?;
-        let record = state.chats.remove(&id);
+        let record = state.remove_chat(id);
         if record.is_some() {
-            state.inventory_generation += 1;
+            state.inventory_changed();
             if let Some(notifications) = &state.notifications {
                 notifications.retire(id);
             }
@@ -5848,10 +5896,9 @@ pub(super) fn close_terminal_actor(
         // and the caller's exact-worker attention fence. A successful native
         // handoff removes the old pair when it publishes its replacement.
         let record = state
-            .chats
-            .remove(&terminal_id)
+            .remove_chat(terminal_id)
             .expect("validated exact attachment");
-        state.inventory_generation += 1;
+        state.inventory_changed();
         record
     };
     drop(removed);

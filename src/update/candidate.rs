@@ -3,7 +3,16 @@ use super::*;
 
 pub(super) struct Staged {
     pub identity: impact::Candidate,
-    executable: File,
+    executable: Executable,
+}
+
+enum Executable {
+    Sealed(File),
+    #[cfg(target_os = "macos")]
+    Installed {
+        path: PathBuf,
+        original: fs::Metadata,
+    },
 }
 
 impl Staged {
@@ -75,39 +84,80 @@ impl Staged {
         if unsafe { libc::fchmod(executable.as_raw_fd(), 0o700) } == -1 {
             return Err(io::Error::last_os_error().into());
         }
-        let mut staged = Self {
-            identity: impact::Candidate {
+        Self::probe_protocol(
+            Executable::Sealed(executable),
+            version,
+            digest,
+            cancellation,
+        )
+    }
+
+    pub(super) fn from_installed(
+        executable: PathBuf,
+        version: String,
+        digest: String,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, UpdateError> {
+        if !executable.is_absolute() {
+            return Err(invalid("the staged candidate CLI path is not absolute"));
+        }
+        // Darwin cannot exec a descriptor path. Use the exact owned, staged
+        // CLI there without consulting the public selector or PATH.
+        #[cfg(target_os = "macos")]
+        {
+            let original = fs::symlink_metadata(&executable)?;
+            Self::probe_protocol(
+                Executable::Installed {
+                    path: executable,
+                    original,
+                },
                 version,
-                protocol: 0,
                 digest,
-            },
-            executable,
-        };
-        let mut command = staged.command();
-        command.args(["--json", "daemon", "protocol-version"]);
-        let mut output = bounded_command(
-            &mut command,
+                cancellation,
+            )
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let source = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(executable)?;
+            let mut sealed = anonymous_file()?;
+            io::copy(&mut source.take(512 * 1024 * 1024 + 1), &mut sealed)?;
+            if sealed.metadata()?.len() > 512 * 1024 * 1024 {
+                return Err(invalid("installed CLI exceeds update size limit"));
+            }
+            Self::from_file(seal_file(sealed)?, version, digest, cancellation)
+        }
+    }
+
+    fn probe_protocol(
+        executable: Executable,
+        version: String,
+        digest: String,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, UpdateError> {
+        let envelope = executable.probe(
+            &["--json", "daemon", "protocol-version"],
             "candidate protocol probe",
-            SMALL_ASSET_LIMIT,
-            Duration::from_secs(10),
             cancellation,
         )?;
-        let envelope: serde_json::Value = serde_json::from_reader(&mut output)?;
-        staged.identity.protocol = envelope
+        let protocol = envelope
             .get("data")
             .and_then(|data| data.get("protocol_version"))
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| u16::try_from(value).ok())
             .filter(|value| *value > 0)
             .ok_or_else(|| invalid("candidate did not report a valid daemon protocol"))?;
-        Ok(staged)
-    }
-
-    pub fn command(&self) -> Command {
-        let fd = self.executable.as_raw_fd();
-        let mut command = Command::new(format!("/proc/self/fd/{fd}"));
-        inherit(&mut command, fd);
-        command
+        Ok(Self {
+            identity: impact::Candidate {
+                version,
+                protocol,
+                digest,
+            },
+            executable,
+        })
     }
 
     pub fn verify_compatible_handshake(
@@ -118,16 +168,11 @@ impl Staged {
     }
 
     pub fn daemon_running(&self, cancellation: &CancellationToken) -> Result<bool, UpdateError> {
-        let mut command = self.command();
-        command.args(["--json", "daemon", "status"]);
-        let mut output = bounded_command(
-            &mut command,
+        let envelope = self.executable.probe(
+            &["--json", "daemon", "status"],
             "candidate daemon handshake",
-            SMALL_ASSET_LIMIT,
-            Duration::from_secs(10),
             cancellation,
         )?;
-        let envelope: serde_json::Value = serde_json::from_reader(&mut output)?;
         let data = envelope
             .get("data")
             .ok_or_else(|| invalid("candidate did not return a valid daemon status"))?;
@@ -149,6 +194,44 @@ impl Staged {
     }
 }
 
+impl Executable {
+    fn probe(
+        &self,
+        arguments: &[&str],
+        operation: &'static str,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, UpdateError> {
+        match self {
+            Self::Sealed(executable) => {
+                let fd = executable.as_raw_fd();
+                let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+                inherit(&mut command, fd);
+                command.args(arguments);
+                let output = bounded_command(
+                    &mut command,
+                    operation,
+                    SMALL_ASSET_LIMIT,
+                    Duration::from_secs(10),
+                    cancellation,
+                )?;
+                Ok(serde_json::from_reader(output)?)
+            }
+            #[cfg(target_os = "macos")]
+            Self::Installed { path, original } => {
+                let mut command = Command::new(path);
+                command.args(arguments);
+                companion_read(
+                    command,
+                    "The staged candidate CLI",
+                    operation,
+                    cancellation,
+                    Some(original),
+                )
+            }
+        }
+    }
+}
+
 pub(super) fn inherit(command: &mut Command, fd: i32) {
     // SAFETY: the caller keeps the File alive through spawn; only an
     // async-signal-safe descriptor operation executes in the child.
@@ -165,6 +248,51 @@ pub(super) fn inherit(command: &mut Command, fd: i32) {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn installed_candidate_probes_its_owned_physical_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cli = directory.path().join("cagents");
+        fs::write(
+            &cli,
+            r#"#!/bin/sh
+case "$*" in
+    '--json daemon protocol-version') printf '%s\n' '{"data":{"protocol_version":123}}' ;;
+    '--json daemon status') printf '%s\n' '{"data":{"running":false}}' ;;
+    *) exit 42 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let cancellation = CancellationToken::new();
+        let staged = Staged::from_installed(
+            cli.clone(),
+            "9.8.7".into(),
+            "bound digest".into(),
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(staged.identity.protocol, 123);
+        assert_eq!(staged.identity.digest, "bound digest");
+        assert!(!staged.daemon_running(&cancellation).unwrap());
+        cancellation.cancel();
+        assert!(matches!(
+            staged.daemon_running(&cancellation),
+            Err(UpdateError::Cancelled)
+        ));
+
+        let other = directory.path().join("other");
+        fs::rename(&cli, &other).unwrap();
+        fs::copy(&other, &cli).unwrap();
+        assert!(staged.daemon_running(&CancellationToken::new()).is_err());
+        fs::remove_file(&cli).unwrap();
+        std::os::unix::fs::symlink("other", cli).unwrap();
+        assert!(staged.daemon_running(&CancellationToken::new()).is_err());
+    }
 
     #[test]
     #[cfg_attr(

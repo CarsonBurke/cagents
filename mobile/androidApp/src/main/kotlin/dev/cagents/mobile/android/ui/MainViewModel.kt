@@ -11,7 +11,9 @@ import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.ConnectionLost
 import dev.cagents.mobile.client.RemoteState
 import dev.cagents.mobile.client.RequestFailed
+import dev.cagents.mobile.protocol.Call
 import dev.cagents.mobile.protocol.ErrorCode
+import dev.cagents.mobile.protocol.ImageAttachment
 import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.SendMode
 import kotlinx.coroutines.Dispatchers
@@ -172,11 +174,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun openConversation(session: String) = controller.open(session)
     fun closeConversation(session: String) = controller.close(session)
+    suspend fun refreshConversationForRead(session: String) = controller.refreshConversationForRead(session)
+    suspend fun readConversation(session: String, checkpoint: String) =
+        controller.readConversation(session, checkpoint)
     fun rewatch(session: String) = controller.rewatch(session)
 
     /** Sends a message; [done] says whether the computer took it. */
-    fun send(session: String, text: String, mode: SendMode, done: (Boolean) -> Unit) =
-        act(onSuccess = { done(true) }, onFailure = { done(false) }) { controller.send(session, text, mode) }
+    fun send(session: String, text: String, mode: SendMode, image: ImageAttachment?, done: (Boolean) -> Unit) =
+        act(onSuccess = { done(true) }, onFailure = { done(false) }) { controller.send(session, text, mode, image) }
+
+    suspend fun readDetail(request: Call.ReadDetail) = controller.readDetail(request)
+
 
     fun interrupt(session: String) = act { controller.interrupt(session) }
 

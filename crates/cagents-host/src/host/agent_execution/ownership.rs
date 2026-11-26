@@ -205,7 +205,7 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
                 state
                     .historical_chat_retirements
                     .insert(source.id, source.clone());
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             (handle, previous_boot)
         };
@@ -219,7 +219,7 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
                     }
                     if state.chat_spawning.get(&self.1.id) == Some(self.1) {
                         state.chat_spawning.remove(&self.1.id);
-                        state.inventory_generation += 1;
+                        state.inventory_changed();
                     }
                 }
             }

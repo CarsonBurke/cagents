@@ -185,6 +185,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadTerminalRemovalBasis { .. }
             | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
+            | ClientRequest::WatchMobile { .. }
             | ClientRequest::ProviderStatus
     )
 }
@@ -743,7 +744,7 @@ impl Drop for ExplicitCloseGuard {
                 && entry.failure.is_none()
             {
                 entry.failure = Some("Explicit close was interrupted before cleanup could be confirmed; retry the retained result".into());
-                state.inventory_generation += 1;
+                state.inventory_changed();
                 true
             } else {
                 false
@@ -899,7 +900,7 @@ fn reserve_terminal_close(
             previous: None,
         };
         let previous = state.terminal_retirements.insert(terminal, entry);
-        state.inventory_generation += 1;
+        state.inventory_changed();
         (reservation, previous)
     };
     reservation.previous = previous;
@@ -987,7 +988,7 @@ fn finish_terminal_close(
             && entry.handle.same_worker(&close.handle)
         {
             entry.failure = Some(message.clone());
-            state.inventory_generation += 1;
+            state.inventory_changed();
         }
         return Err(error(message));
     }
@@ -1038,7 +1039,7 @@ fn finish_terminal_close(
                 && entry.handle.same_worker(&close.handle)
             {
                 entry.failure = Some(message.clone());
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             return Err(error(message));
         }
@@ -1677,6 +1678,17 @@ fn process_admitted_request(
             authority,
             operation,
         } => {
+            if matches!(
+                &operation,
+                crate::agent_execution::Operation::Context {
+                    scope: crate::agent_execution::directory::Scope::All,
+                    standing: false,
+                }
+            ) {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .mobile_snapshot_started(client_id, crate::terminal_ipc::MobileWatch::Sessions);
+            }
             let reply = super::agent_execution::process_request(host, authority, operation)
                 .map_err(|error| match error {
                     crate::agent_execution::AcceptanceError::Invalid(message) => {
@@ -1792,10 +1804,21 @@ fn process_admitted_request(
             }
         }
         ClientRequest::ReadNotifications => {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let (published, service_available) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.mobile_snapshot_started(
+                    client_id,
+                    crate::terminal_ipc::MobileWatch::Notifications,
+                );
+                (state.notification_snapshot(), state.notifications.is_some())
+            };
             Ok((
                 ServerResponse::Notifications {
-                    snapshot: state.notification_snapshot(),
+                    snapshot: if service_available {
+                        super::notifications::committed_snapshot(published)
+                    } else {
+                        published
+                    },
                 },
                 Vec::new(),
                 false,
@@ -2026,6 +2049,12 @@ fn process_admitted_request(
                 Vec::new(),
                 false,
             ))
+        }
+        ClientRequest::WatchMobile { topic } => {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .watch_mobile(client_id, topic)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchTerminals => {
             host.lock()
@@ -2662,7 +2691,7 @@ fn process_admitted_request(
                         .get(&terminal_id)
                         .is_some_and(|entry| entry.ticket == close.ticket)
                     {
-                        state.inventory_generation += 1;
+                        state.inventory_changed();
                         let removed = state.terminal_retirements.remove(&terminal_id);
                         if let Some(previous) = close.previous.take() {
                             state.terminal_retirements.insert(terminal_id, previous);

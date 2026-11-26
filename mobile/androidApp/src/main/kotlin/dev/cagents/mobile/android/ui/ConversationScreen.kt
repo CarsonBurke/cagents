@@ -1,5 +1,8 @@
 package dev.cagents.mobile.android.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.fadeIn
@@ -27,7 +30,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.ChecklistRtl
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Stop
@@ -66,17 +71,22 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.cagents.mobile.client.Conversation
 import dev.cagents.mobile.client.ConnectionState
 import dev.cagents.mobile.client.RemoteState
 import dev.cagents.mobile.protocol.ConversationState
+import dev.cagents.mobile.protocol.ImageAttachment
 import dev.cagents.mobile.protocol.PlanStatus
 import dev.cagents.mobile.protocol.SendMode
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -100,13 +110,32 @@ fun ConversationScreen(
 ) {
     // Watched for as long as this screen is on the back stack: across
     // configuration changes, not just while composed.
-    viewModel(key = "watch/$session") { ConversationWatch(vm, session) }
+    val watch = viewModel(key = "watch/$session") { ConversationWatch(vm, session) }
     // Only what this screen shows, so the session list and other
     // conversations changing don't recompose it.
     val view by remember(session) {
         vm.remote.map { ConversationView.of(it, session) }.distinctUntilChanged()
     }.collectAsStateWithLifecycle(remember(session) { ConversationView.of(vm.remote.value, session) })
     val conversation = view.conversation
+    val lifecycleState by LocalLifecycleOwner.current.lifecycle.currentStateFlow.collectAsStateWithLifecycle()
+    val visible = lifecycleState == Lifecycle.State.RESUMED
+    val checkpoint = conversation?.readCheckpoint
+    val previouslyDisplayed = remember(session, visible) {
+        vm.remote.value.conversations[session]?.readCheckpoint
+    }
+    // A back-stack watch can stay open while Settings covers this route.
+    // Get a fresh checkpoint from the same watch before reporting a read.
+    LaunchedEffect(session, visible, previouslyDisplayed) {
+        if (visible && previouslyDisplayed != null) vm.refreshConversationForRead(session)
+    }
+    LaunchedEffect(session, visible, checkpoint) {
+        if (visible && checkpoint != null && checkpoint != previouslyDisplayed &&
+            view.connection == ConnectionState.Connected
+        ) {
+            vm.readConversation(session, checkpoint)
+        }
+    }
+
     val state = conversation?.state ?: ConversationState()
     val title = state.title ?: view.listedTitle ?: "Conversation"
     // Whether the transcript keeps to the newest item as items arrive. Only
@@ -157,7 +186,7 @@ fun ConversationScreen(
         bottomBar = {
             Column(Modifier.imePadding().navigationBarsPadding()) {
                 if (conversation != null) {
-                    BottomPanel(vm, session, conversation, view.connection == ConnectionState.Connected) { follow = true }
+                    BottomPanel(vm, session, conversation, view.connection == ConnectionState.Connected, view.details, watch) { follow = true }
                 }
             }
         },
@@ -166,7 +195,9 @@ fun ConversationScreen(
             when {
                 conversation == null || (!conversation.loaded && conversation.ended == null) ->
                     Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
-                else -> Transcript(vm, session, conversation, follow) { follow = it }
+                else -> Transcript(
+                    vm, session, conversation, view.details && conversation.ended == null && !state.exited, follow,
+                ) { follow = it }
             }
         }
     }
@@ -181,17 +212,24 @@ private data class ConversationView(
     val listedTitle: String?,
     val providerLabel: String?,
     val connection: ConnectionState,
+    val details: Boolean,
 ) {
     companion object {
         fun of(remote: RemoteState, session: String): ConversationView {
             val listed = remote.sessions?.firstOrNull { it.id == session }
-            return ConversationView(remote.conversations[session], listed?.let(::sessionTitle), listed?.providerLabel, remote.connection)
+            return ConversationView(
+                remote.conversations[session], listed?.let(::sessionTitle), listed?.providerLabel,
+                remote.connection, remote.welcome?.conversationDetails == true,
+            )
         }
     }
 }
 
 /** Follows one conversation from when its screen opens until it leaves the back stack. */
 private class ConversationWatch(private val vm: MainViewModel, private val session: String) : ViewModel() {
+    var image by mutableStateOf<ImageAttachment?>(null)
+    var sending by mutableStateOf(false)
+
     init {
         vm.openConversation(session)
     }
@@ -204,6 +242,7 @@ private fun Transcript(
     vm: MainViewModel,
     session: String,
     conversation: Conversation,
+    details: Boolean,
     follow: Boolean,
     onFollow: (Boolean) -> Unit,
 ) {
@@ -211,6 +250,11 @@ private fun Transcript(
     // item grows upwards from the composer.
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    var detail by remember(session) { mutableStateOf<TranscriptDetail?>(null) }
+    detail?.takeIf { details }?.let { selected ->
+        key(selected) { TranscriptDetailDialog(vm, session, selected) { detail = null } }
+    }
+    LaunchedEffect(details) { if (!details) detail = null }
     val reversed = remember(conversation.items) { conversation.items.asReversed() }
     val atEnd by remember {
         derivedStateOf { listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= END_SLOP_PX }
@@ -250,7 +294,7 @@ private fun Transcript(
             modifier = Modifier.fillMaxSize(),
         ) {
             items(reversed, key = { it.id }, contentType = { it.body::class }) { item ->
-                TranscriptItem(item)
+                TranscriptItem(item, if (details) ({ detail = it }) else null)
             }
             val state = conversation.state
             if (state.hasEarlier || state.loadingEarlier) {
@@ -343,6 +387,8 @@ private fun BottomPanel(
     session: String,
     conversation: Conversation,
     connected: Boolean,
+    details: Boolean,
+    watch: ConversationWatch,
     onSent: () -> Unit,
 ) {
     val state = conversation.state
@@ -396,7 +442,7 @@ private fun BottomPanel(
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
                 )
             } else {
-                Composer(vm, session, state, connected, onSent)
+                Composer(vm, session, state, connected, details, watch, onSent)
             }
         }
     }
@@ -427,11 +473,35 @@ private fun Composer(
     session: String,
     state: ConversationState,
     connected: Boolean,
+    details: Boolean,
+    watch: ConversationWatch,
     onSent: () -> Unit,
 ) {
     var text by rememberSaveable(session) { mutableStateOf("") }
     var mode by rememberSaveable(session) { mutableStateOf(SendMode.Steer) }
-    var sending by remember { mutableStateOf(false) }
+    var preparing by remember { mutableStateOf(false) }
+    var imageError by remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) {
+            preparing = true
+            imageError = null
+            scope.launch {
+                try {
+                    watch.image = prepareImage(context, uri)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    imageError = "Couldn’t prepare this image. Try a smaller photo."
+                } finally {
+                    preparing = false
+                }
+            }
+        }
+    }
+    val image = watch.image
+    val sending = watch.sending
     // Stop takes Send's place once the text clears; a second tap meant for
     // Send mustn't interrupt the turn it just steered.
     var stopArmed by remember { mutableStateOf(true) }
@@ -443,10 +513,25 @@ private fun Composer(
         stopArmed = true
     }
     val busy = state.busy
-    val canSend = connected && text.isNotBlank() && !sending && (state.ready || busy)
+    val hasDraft = text.isNotBlank() || image != null
+    val canAttach = details && state.canAttachImage
+    val canSend = connected && hasDraft && !sending && !preparing && (state.ready || busy)
+        && (image == null || canAttach)
 
     Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-        AnimatedVisibility(visible = busy && text.isNotBlank()) {
+        image?.let {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    it.name, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                IconButton(onClick = { watch.image = null }, enabled = !sending && !preparing) {
+                    Icon(Icons.Outlined.Close, "Remove image")
+                }
+            }
+        }
+        imageError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        AnimatedVisibility(visible = busy && hasDraft) {
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
                 listOf(SendMode.Steer to "Steer now", SendMode.Queue to "After this turn").forEachIndexed { index, (value, label) ->
                     SegmentedButton(
@@ -458,6 +543,16 @@ private fun Composer(
             }
         }
         Row(verticalAlignment = Alignment.Bottom) {
+            if (canAttach) {
+                if (preparing) {
+                    CircularProgressIndicator(Modifier.padding(12.dp).size(20.dp), strokeWidth = 2.dp)
+                } else {
+                    IconButton(
+                        onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                        enabled = connected && !sending,
+                    ) { Icon(Icons.Outlined.AttachFile, if (image == null) "Attach image" else "Replace image") }
+                }
+            }
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it },
@@ -476,7 +571,7 @@ private fun Composer(
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(8.dp))
-            if (busy && text.isBlank()) {
+            if (busy && !hasDraft) {
                 FilledTonalIconButton(
                     onClick = { vm.interrupt(session) },
                     enabled = connected && stopArmed,
@@ -489,15 +584,16 @@ private fun Composer(
             } else {
                 FilledIconButton(
                     onClick = {
-                        sending = true
+                        watch.sending = true
                         stopArmed = false
                         lastSend++
                         val sent = text
-                        vm.send(session, sent.trim(), if (busy) mode else SendMode.Send) { delivered ->
-                            sending = false
+                        vm.send(session, sent.trim(), if (busy) mode else SendMode.Send, image) { delivered ->
+                            watch.sending = false
                             if (delivered) {
                                 onSent()
                                 if (text == sent) text = ""
+                                if (watch.image === image) watch.image = null
                                 // Count the delay from when the text cleared and Stop appeared.
                                 lastSend++
                             }

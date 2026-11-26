@@ -2041,13 +2041,30 @@ pub fn codex_agent_task(path: &str) -> Option<String> {
     Some(first.to_uppercase().chain(letters).take(120).collect())
 }
 
+/// A thread-listing observation for a child whose transcript and later
+/// status changes aren't subscribed. It travels in the existing detail field.
+pub const UNLOADED_CHILD_RUNNING: &str = "Last seen running · transcript not loaded";
+
 impl Subagent {
+    pub fn last_seen_running(&self) -> bool {
+        self.status == ToolStatus::Running && self.detail == UNLOADED_CHILD_RUNNING
+    }
+
+    /// Live work that this connection can still observe and act on.
+    pub fn is_live(&self) -> bool {
+        self.status.is_live() && !self.last_seen_running()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status == ToolStatus::Running && !self.last_seen_running()
+    }
+
     /// Delegated work, running or waiting on its own background work, that
     /// cancelling the parent's turn would also stop, where the provider's
     /// interrupt does not spare it. Claude Code's interrupt kills a waiting
     /// agent and its own background work as it does a running one.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
-        self.status.is_live() && self.background && capabilities.interrupt_stops_background
+        self.is_live() && self.background && capabilities.interrupt_stops_background
     }
 }
 
@@ -2111,6 +2128,7 @@ impl Snapshot {
         let mut activity = SubagentActivity::default();
         for agent in &self.subagents {
             match agent.status {
+                ToolStatus::Running if agent.last_seen_running() => {}
                 ToolStatus::Running if agent.waiting => activity.waiting += 1,
                 ToolStatus::Running => activity.working += 1,
                 ToolStatus::Waiting => activity.on_background_work += 1,
@@ -2160,15 +2178,11 @@ impl Snapshot {
     /// its turn, a question to the user, or a subagent working or waiting on
     /// its own background work.
     pub fn holds_work(&self) -> bool {
-        self.turn_accepted() || self.subagents.iter().any(|agent| agent.status.is_live())
+        self.turn_accepted() || self.subagents.iter().any(Subagent::is_live)
     }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
-        self.busy
-            || self
-                .subagents
-                .iter()
-                .any(|agent| agent.status == ToolStatus::Running)
+        self.busy || self.subagents.iter().any(Subagent::is_running)
     }
     pub fn activity(&self) -> ActivityState {
         if self.exited {
@@ -2188,7 +2202,7 @@ impl Snapshot {
             || self
                 .subagents
                 .iter()
-                .any(|agent| agent.waiting && agent.status == ToolStatus::Running)
+                .any(|agent| agent.waiting && agent.is_running())
         {
             ActivityState::Waiting
         } else if self.is_working() {
@@ -2676,7 +2690,7 @@ impl Subagent {
     /// Whether it holds its conversation apart from the turn: it runs in the
     /// background, or waits on background work of its own.
     pub fn outlives_turn(&self) -> bool {
-        self.status == ToolStatus::Waiting || self.background && self.status.is_live()
+        self.status == ToolStatus::Waiting || self.background && self.is_live()
     }
 }
 
@@ -5156,68 +5170,19 @@ fn claude_configured_default_mode_in(
         .ok_or(())
     }
 
-    let environment = |name: &str| {
-        (!recipe.unset_environment.contains(name))
-            .then(|| {
-                recipe
-                    .environment
-                    .get(name)
-                    .cloned()
-                    .or_else(|| std::env::var(name).ok())
-            })
-            .flatten()
-            .filter(|value| !value.is_empty())
-    };
-    if environment("CLAUDE_CODE_PERMISSION_MODE").is_some() {
-        // This explicit choice outranks settings; do not pin a CLI default
-        // during fresh creation or when converting an older launch.
+    if claude_launch_variable(recipe, "CLAUDE_CODE_PERMISSION_MODE").is_some() {
+        // An explicit environment choice outranks settings.
         return None;
     }
-    let resolve = |path: std::path::PathBuf| {
-        if path.is_absolute() {
-            path
-        } else {
-            recipe.working_directory.join(path)
-        }
-    };
-    let user_home = environment("HOME")
-        .map(std::path::PathBuf::from)
-        .map(resolve);
-    let root = environment("CLAUDE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .map(resolve)
-        .or_else(|| user_home.as_ref().map(|home| home.join(".claude")))?;
-    let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
-    for directory in recipe.working_directory.ancestors() {
-        if user_home.as_deref() == Some(directory) {
-            if recipe.working_directory == directory
-                && setting(&directory.join(".claude/settings.local.json"))
-                    .ok()
-                    .flatten()
-                    .is_some()
-            {
-                // HOME itself can be a project cwd. Its local setting then
-                // belongs to that session, but never to descendant projects.
-                return None;
-            }
-            break;
-        }
-        if ["settings.local.json", "settings.json"]
-            .into_iter()
-            .any(|name| {
-                let path = directory.join(".claude").join(name);
-                if account_settings.is_some()
-                    && std::fs::canonicalize(&path).ok() == account_settings
-                {
-                    return false;
-                }
-                setting(&path).ok().flatten().is_some()
-            })
-        {
-            // A project-specific choice belongs to Claude's own settings
-            // handling, not to a command-line override from another account.
-            return None;
-        }
+    let (user_home, root) = claude_launch_homes(recipe)?;
+    if claude_project_setting(
+        recipe,
+        user_home.as_deref(),
+        &root,
+        &["settings.local.json", "settings.json"],
+        |path| setting(path).ok().flatten().is_some(),
+    ) {
+        return None;
     }
 
     // A managed home isolates a login, not the user's permission preference.
@@ -5246,4 +5211,182 @@ fn claude_configured_default_mode_in(
     setting(&root.join("settings.json"))
         .ok()?
         .filter(|mode| mode != "default")
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_launch_variable(recipe: &LaunchRecipe, name: &str) -> Option<String> {
+    (!recipe.unset_environment.contains(name))
+        .then(|| {
+            recipe
+                .environment
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        })
+        .flatten()
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_launch_homes(
+    recipe: &LaunchRecipe,
+) -> Option<(Option<std::path::PathBuf>, std::path::PathBuf)> {
+    let resolve = |path: std::path::PathBuf| {
+        if path.is_absolute() {
+            path
+        } else {
+            recipe.working_directory.join(path)
+        }
+    };
+    let user_home = claude_launch_variable(recipe, "HOME")
+        .map(std::path::PathBuf::from)
+        .map(resolve);
+    let root = claude_launch_variable(recipe, "CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .map(resolve)
+        .or_else(|| user_home.as_ref().map(|home| home.join(".claude")))?;
+    Some((user_home, root))
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn claude_project_setting(
+    recipe: &LaunchRecipe,
+    user_home: Option<&std::path::Path>,
+    root: &std::path::Path,
+    files: &[&str],
+    has_setting: impl Fn(&std::path::Path) -> bool,
+) -> bool {
+    let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
+    for directory in recipe.working_directory.ancestors() {
+        if user_home == Some(directory) {
+            if recipe.working_directory == directory
+                && files.contains(&"settings.local.json")
+                && has_setting(&directory.join(".claude/settings.local.json"))
+            {
+                // HOME itself can be a project cwd. Its local setting then
+                // belongs to that session, but never to descendant projects.
+                return true;
+            }
+            break;
+        }
+        if files.iter().any(|name| {
+            let path = directory.join(".claude").join(name);
+            if account_settings.is_some() && std::fs::canonicalize(&path).ok() == account_settings {
+                return false;
+            }
+            has_setting(&path)
+        }) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(feature = "host")]
+fn managed_claude_attribution(
+    recipe: &LaunchRecipe,
+    homes: &crate::account::home::Homes,
+    system_home: &std::path::Path,
+    sources: &str,
+) -> Option<serde_json::Value> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn attribution(path: &std::path::Path) -> Option<serde_json::Value> {
+        const MAX_SETTINGS: u64 = 1024 * 1024;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let bytes = crate::fs_safety::read_bounded(&mut file, MAX_SETTINGS).ok()?;
+        if bytes.len() as u64 > MAX_SETTINGS {
+            return None;
+        }
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        settings
+            .get("attribution")
+            .filter(|value| {
+                value.as_bool() == Some(false)
+                    || value.as_object().is_some_and(|fields| {
+                        fields
+                            .get("commit")
+                            .is_none_or(serde_json::Value::is_string)
+                            && fields.get("pr").is_none_or(serde_json::Value::is_string)
+                            && fields
+                                .get("sessionUrl")
+                                .is_none_or(serde_json::Value::is_boolean)
+                    })
+            })
+            .cloned()
+    }
+
+    let enabled = |name| sources.split(',').any(|source| source.trim() == name);
+    if !enabled("user") {
+        return None;
+    }
+    let (user_home, root) = claude_launch_homes(recipe)?;
+    if !homes
+        .managed_identity(&root)
+        .is_some_and(|(provider, _)| provider == Provider::Claude)
+    {
+        return None;
+    }
+    let cwd = &recipe.working_directory;
+    let shared = cwd.join(".claude/settings.json");
+    if enabled("project")
+        && attribution(&shared).is_some()
+        && shared.canonicalize().ok() != root.join("settings.json").canonicalize().ok()
+    {
+        return None;
+    }
+    if enabled("local") {
+        // Current Claude reads personal settings from the primary checkout
+        // and continues to read a legacy local file from the starting cwd.
+        let from_cwd = attribution(&cwd.join(".claude/settings.local.json")).is_some();
+        let from_checkout = || {
+            let primary = claude_local_checkout(cwd)?;
+            if &primary == cwd || user_home.as_ref() == Some(&primary) {
+                return None;
+            }
+            let uid = unsafe { libc::geteuid() };
+            for path in [
+                primary.clone(),
+                primary.join(".git"),
+                primary.join(".claude"),
+            ] {
+                match std::fs::metadata(path) {
+                    Ok(metadata) if metadata.uid() == uid => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return None,
+                }
+            }
+            attribution(&primary.join(".claude/settings.local.json"))
+        };
+        if from_cwd || from_checkout().is_some() {
+            return None;
+        }
+    }
+    attribution(&system_home.join("settings.json"))
+}
+
+/// Find the checkout whose personal settings apply to this Claude session.
+#[cfg(feature = "host")]
+fn claude_local_checkout(directory: &std::path::Path) -> Option<std::path::PathBuf> {
+    let (checkout, git) = directory.ancestors().find_map(|checkout| {
+        crate::project_location::git_directories(checkout).map(|git| (checkout, git))
+    })?;
+    if git.private == git.common {
+        return Some(checkout.to_path_buf());
+    }
+    if git.common.file_name().is_some_and(|name| name == ".git") {
+        return git.common.parent().map(std::path::Path::to_path_buf);
+    }
+    crate::repository::RepositoryService::system("git")
+        .managed_primary_checkout(directory, &crate::repository::CancellationToken::new())
+        .ok()
+        .flatten()
 }

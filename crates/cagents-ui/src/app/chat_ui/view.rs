@@ -1957,6 +1957,9 @@ fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str,
 /// How `agent` stands, given what it waits on if it waits on work of its
 /// own that its transcript names; see [`Runtime::native_child_status`].
 fn agent_caption<'a>(agent: &chat::Subagent, work: Option<&'a str>) -> &'a str {
+    if agent.last_seen_running() {
+        return chat::UNLOADED_CHILD_RUNNING;
+    }
     match agent.status {
         chat::ToolStatus::Running if agent.waiting => "Waiting",
         chat::ToolStatus::Waiting => work.unwrap_or("Waiting on background work"),
@@ -1977,6 +1980,9 @@ pub(super) fn agent_mark(
     work: Option<&str>,
 ) -> (Option<disclosure::Mark>, Option<String>) {
     use disclosure::Mark;
+    if agent.last_seen_running() {
+        return (None, Some(chat::UNLOADED_CHILD_RUNNING.into()));
+    }
     let mark = match agent.status {
         chat::ToolStatus::Running if agent.waiting => Mark::Attention,
         chat::ToolStatus::Running => Mark::Working,
@@ -1997,9 +2003,12 @@ pub(super) fn agent_mark(
 /// How long `agent` has worked: from its first step to its last, or to now
 /// while it has yet to end. `None` where its transcript carries no times.
 pub(super) fn agent_elapsed_ms(agent: &chat::Subagent, now: Option<u64>) -> Option<u64> {
+    if agent.last_seen_running() {
+        return None;
+    }
     let first = agent.items.first()?;
     let start = first.started_at.or(first.at)?;
-    let end = if agent.status.is_live() {
+    let end = if agent.is_live() {
         now?
     } else {
         agent
@@ -2195,7 +2204,7 @@ impl Runtime {
     /// own state, said on its row, not a question for the person.
     pub(super) fn child_error<'a>(&self, agent: &'a chat::Subagent) -> Option<&'a str> {
         let detail = agent.detail.trim();
-        (agent.status == chat::ToolStatus::Running
+        (agent.is_running()
             && !detail.is_empty()
             && agent.items.last().is_some_and(|item| {
                 chat::failure::provider_error_text(self.session.launch.provider, item).is_some()
@@ -2237,7 +2246,7 @@ impl Runtime {
         // for copying; the tab says what it means. A finished child's detail
         // is its own report, whose prose may merely mention such words.
         let detail = agent.detail.trim();
-        if !detail.is_empty() {
+        if !detail.is_empty() && !agent.last_seen_running() {
             identity.push_str(" · ");
             let failure = (agent.waiting
                 || agent.status == chat::ToolStatus::Failed
@@ -2520,7 +2529,7 @@ impl Runtime {
                     self.native_child_status(agent).to_owned(),
                 ));
             }
-            return (agent.status == chat::ToolStatus::Running).then(|| {
+            return (agent.is_running()).then(|| {
                 if agent.waiting {
                     (Icon::AgentWaiting, "Waiting".to_owned())
                 } else if let Some(error) = self.child_error(agent) {
@@ -2578,13 +2587,10 @@ impl Runtime {
     /// card states its own runs in words, so the closing line spins for it.
     fn work_shown(&self, selected: Option<&chat::Subagent>) -> bool {
         match selected {
-            Some(agent) => agent.items.last().is_some_and(|item| {
-                Self::row_live(
-                    &self.child_cache,
-                    item,
-                    agent.status == chat::ToolStatus::Running,
-                )
-            }),
+            Some(agent) => agent
+                .items
+                .last()
+                .is_some_and(|item| Self::row_live(&self.child_cache, item, agent.is_running())),
             None => {
                 let snapshot = &self.snapshot;
                 snapshot.busy
@@ -2958,11 +2964,11 @@ impl Runtime {
             && snapshot
                 .subagents
                 .iter()
-                .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running)
+                .any(|agent| agent.waiting && agent.is_running())
             && !snapshot
                 .subagents
                 .iter()
-                .any(|agent| !agent.waiting && agent.status == chat::ToolStatus::Running)
+                .any(|agent| !agent.waiting && agent.is_running())
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
         } else if snapshot.busy && snapshot.detail == chat::WAITING_ON_BACKGROUND_WORK {
@@ -3026,9 +3032,7 @@ impl Runtime {
             scope: self.selected_subagent.clone(),
             presentation: self.presentation_revision,
             turns: self.turns.stamp(),
-            busy: selected.map_or(self.snapshot.busy, |agent| {
-                agent.status == chat::ToolStatus::Running
-            }),
+            busy: selected.map_or(self.snapshot.busy, |agent| agent.is_running()),
             expanded: match &self.selected_subagent {
                 Some(child) => self.child_expanded.get(child).map(Revised::stamp),
                 None => Some(self.expanded.stamp()),
@@ -3347,11 +3351,7 @@ impl Runtime {
                 .hash(&mut revision);
         }
         if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
-            let finished = reasoning_finished(
-                &agent.items,
-                agent.status == chat::ToolStatus::Running,
-                index,
-            );
+            let finished = reasoning_finished(&agent.items, agent.is_running(), index);
             (
                 finished,
                 reasoning_elapsed(&agent.items, index, finished, None),
@@ -3488,7 +3488,7 @@ impl Runtime {
             // One waiting on its own background work is still going, and
             // stopping it is how that work ends. The same square as the
             // composer's own Stop, which cancels the conversation's turn.
-            if agent.status.is_live() && snapshot.capabilities.stop_subagent {
+            if agent.is_live() && snapshot.capabilities.stop_subagent {
                 identity.push(
                     crate::ui_controls::icon_button(
                         Icon::Stop,
@@ -6618,7 +6618,13 @@ impl Runtime {
         hasher: &mut crate::fingerprint::Hasher,
     ) {
         use std::hash::Hash;
-        (agent.status, agent.waiting, self.agent_work.get(&agent.id)).hash(hasher);
+        (
+            agent.status,
+            agent.waiting,
+            agent.last_seen_running(),
+            self.agent_work.get(&agent.id),
+        )
+            .hash(hasher);
         // Its time counts up while it works, at the second it is shown to.
         agent_elapsed_ms(agent, now)
             .map(|millis| millis / 1_000)
@@ -8111,13 +8117,7 @@ impl Runtime {
                             .finished_at
                             .filter(|_| !self.snapshot.has_later),
                     ),
-                    |agent| {
-                        (
-                            agent.items.as_slice(),
-                            agent.status == chat::ToolStatus::Running,
-                            None,
-                        )
-                    },
+                    |agent| (agent.items.as_slice(), agent.is_running(), None),
                 );
             debug_assert!(
                 items.get(index).is_none_or(|at| at.id == item.id),
@@ -8216,7 +8216,7 @@ fn child_placeholder(agent: &chat::Subagent) -> Option<&'static str> {
         .iter()
         .any(|item| !reasoning::contentless(&item.content));
     let failure = agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty();
-    (!shown && !failure).then_some(if agent.status == chat::ToolStatus::Running {
+    (!shown && !failure).then_some(if agent.is_running() {
         "Waiting for subagent activity…"
     } else {
         "No recent subagent activity is available here."

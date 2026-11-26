@@ -186,7 +186,17 @@ pub(in crate::host) fn restore_presentations(
 fn prune_history(recovering: Option<&HostSessionProof>) {
     let result = (|| -> Result<(), String> {
         let registry = Registry::open()?;
-        let mut referenced = open_agent_sessions(&registry.db)?;
+        let referenced = registry.saved_session_inventory()?;
+        crate::upgrade::floor::prune_unreferenced(&referenced, recovering)
+    })();
+    if let Err(error) = result {
+        tracing::warn!(%error, "Stopped update history was kept until its panes can be inspected");
+    }
+}
+
+impl Registry {
+    pub(in crate::host) fn saved_session_inventory(&self) -> Result<BTreeSet<TerminalId>, String> {
+        let mut referenced = open_agent_sessions(&self.db)?;
         let mut remember = |kind: &crate::model::CardKind| match kind {
             crate::model::CardKind::Chat(session) => {
                 referenced.insert(session.id);
@@ -199,7 +209,7 @@ fn prune_history(recovering: Option<&HostSessionProof>) {
             }
             _ => (),
         };
-        for view in super::views::occupied(&registry.db)? {
+        for view in super::views::occupied(&self.db)? {
             for pane in &view.panes {
                 remember(&pane.kind);
             }
@@ -208,8 +218,10 @@ fn prune_history(recovering: Option<&HostSessionProof>) {
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         );
         for path in crate::instance::window_database_paths().map_err(|error| error.to_string())? {
-            if !path.exists() {
-                continue;
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
             }
             for pane in
                 crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget)
@@ -218,10 +230,28 @@ fn prune_history(recovering: Option<&HostSessionProof>) {
                 remember(&pane.kind);
             }
         }
-        crate::upgrade::floor::prune_unreferenced(&referenced, recovering)
-    })();
-    if let Err(error) = result {
-        tracing::warn!(%error, "Stopped update history was kept until its panes can be inspected");
+        Ok(referenced)
+    }
+
+    pub(in crate::host) fn saved_session_inventory_sequence(&self) -> Result<u64, String> {
+        self.db
+            .query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn has_closed_session_for_attention(
+        &self,
+        id: TerminalId,
+    ) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE closed=1 AND session_id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
     }
 }
 

@@ -3,6 +3,14 @@
 # macOS. See docs/releasing.md#macos for the layout.
 set -eu
 
+# The coordinator opens an ordinary script file and gives it the publication
+# fence. Spool a private copy so the same file is available to curl | sh.
+installer_dir=$(mktemp -d "${TMPDIR:-/tmp}/cagents-installer.XXXXXX")
+trap 'rm -rf "$installer_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+cat > "$installer_dir/install.sh" <<'CAGENTS_INSTALLER'
+set -eu
+
 PROGRAM=cagents-install
 DEFAULT_REPOSITORY='<OWNER>/<REPO>'
 TARGET=aarch64-apple-darwin
@@ -23,7 +31,7 @@ Install the cagents Apple Silicon macOS release for the current user.
   ~/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist
                                                   starts the daemon at login
 
-A daemon of another version must be stopped first; the installer says how.
+Quit cagents and stop its daemon before replacing or removing an installation.
 
 Options:
   --version VERSION  Install a release version (default: the latest release)
@@ -54,19 +62,27 @@ PREFIX=
 START=1
 UNINSTALL=0
 PURGE=0
+PUBLISH_TREE=
+PUBLISHER=
+PUBLISH_REMOVAL=0
+EXTRACT_DIR=
 while [ "$#" -gt 0 ]; do
     case $1 in
-        --version|--prefix)
+        --version|--prefix|--publish-tree|--publisher|--extract-update)
             [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$1 requires a value"
             case $1 in
                 --version) VERSION=${2#v} ;;
                 --prefix) PREFIX=$2 ;;
+                --publish-tree) PUBLISH_TREE=$2 ;;
+                --publisher) PUBLISHER=$2 ;;
+                --extract-update) EXTRACT_DIR=$2 ;;
             esac
             shift 2
             ;;
         --no-start) START=0; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         --purge) UNINSTALL=1; PURGE=1; shift ;;
+        --publish-removal) PUBLISH_REMOVAL=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown option: $1 (see --help)" ;;
     esac
@@ -83,9 +99,26 @@ case $HOME in
     /*) ;;
     *) fail 'HOME must be an absolute path' ;;
 esac
-for command in awk cmp codesign curl diff ditto find launchctl ln mkdir mktemp mv osascript plutil rm shasum tar; do
+for command in awk cmp codesign curl diff ditto find launchctl ln mkdir mktemp mv osascript plutil rm shasum stat tar; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+
+if [ -n "$EXTRACT_DIR" ]; then
+    [ "$UNINSTALL" -eq 0 ] && [ "$PUBLISH_REMOVAL" -eq 0 ] \
+        && [ -z "$PUBLISH_TREE" ] && [ -z "$PUBLISHER" ] \
+        || fail 'an update extraction cannot publish or remove an installation'
+    [ -n "$PREFIX" ] && [ -n "$VERSION" ] || fail 'update extraction needs --prefix and --version'
+    case ${CAGENTS_ARCHIVE:-} in
+        /*) ;;
+        *) fail 'update extraction needs an absolute CAGENTS_ARCHIVE file path' ;;
+    esac
+    case ${CAGENTS_CHECKSUMS:-} in
+        /*) ;;
+        *) fail 'update extraction needs an absolute CAGENTS_CHECKSUMS file path' ;;
+    esac
+    [ -f "$CAGENTS_ARCHIVE" ] && [ -f "$CAGENTS_CHECKSUMS" ] \
+        || fail 'update extraction needs the local archive and checksum files'
+fi
 
 PREFIX=${PREFIX:-"$HOME/Library/Application Support/cagents-install"}
 case $PREFIX in
@@ -93,6 +126,8 @@ case $PREFIX in
     *) fail '--prefix must be an absolute path' ;;
 esac
 PREFIX=${PREFIX%/}
+MARKER=$PREFIX/.cagents-install-root
+PENDING_MARKER=$MARKER.pending
 APP=$PREFIX/Cagents.app
 APP_LINK=$HOME/Applications/Cagents.app
 BIN_LINK=$HOME/.local/bin/cagents
@@ -119,8 +154,35 @@ register_app() {
 
 # The installation this script made, or nothing at PREFIX at all.
 owned_prefix() {
-    [ -f "$PREFIX/.cagents-install-root" ] && [ ! -L "$PREFIX/.cagents-install-root" ] \
-        && [ "$(cat "$PREFIX/.cagents-install-root")" = "$MARKER_TEXT" ]
+    [ -f "$MARKER" ] && [ ! -L "$MARKER" ] && [ "$(cat "$MARKER")" = "$MARKER_TEXT" ]
+}
+
+# The update worker owns this directory for the lifetime of the extraction.
+# Work inside it so publishing the validated tree needs only a local rename.
+verify_extract_dir() {
+    uid=$(id -u)
+    [ "$PREFIX" = "$(CDPATH= cd -P "$PREFIX" && pwd -P)" ] && owned_prefix \
+        && [ "$(stat -f %u "$PREFIX")" = "$uid" ] \
+        || fail 'update extraction needs an owned, physical installation prefix'
+    prefix_mode=$(stat -f %Lp "$PREFIX") || fail 'cannot inspect the installation permissions'
+    [ "$((0$prefix_mode & 022))" -eq 0 ] || fail 'the installation directory is writable by others'
+    [ "${EXTRACT_DIR%/*}" = "$PREFIX/.update" ] \
+        && [ "$EXTRACT_DIR" = "$(CDPATH= cd -P "$EXTRACT_DIR" && pwd -P)" ] \
+        || fail 'update extraction needs a physical directory directly under .update'
+    [ "$(stat -f '%u:%Lp' "$PREFIX/.update")" = "$uid:700" ] \
+        && [ "$(stat -f '%u:%Lp' "$EXTRACT_DIR")" = "$uid:700" ] \
+        || fail 'the update extraction directories must be private'
+    entries=$(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -print) \
+        || fail 'cannot inspect the update extraction directory'
+    [ -z "$entries" ] || fail 'the update extraction directory must be empty'
+}
+
+verify_program_versions() {
+    for program in cagents cagentsd cagents-ui cagents-dictate; do
+        reported=$("$1/bin/$program" --version) || fail "cagents $VERSION could not run $program on this Mac"
+        [ "$reported" = "$program $VERSION" ] \
+            || fail "the release holds $reported, expected $program $VERSION"
+    done
 }
 
 # Removes LINK when it is a symbolic link to TARGET, and only then.
@@ -157,6 +219,16 @@ installed_daemon() {
     fi
 }
 
+require_publication_fence() {
+    "$1" --no-start verify-install-guard --publish-only >/dev/null \
+        || fail 'the installer could not verify publication ownership; no installation files were changed'
+}
+
+can_coordinate_publication() {
+    "$1" coordinate-install --help 2>/dev/null | grep -q -- '--publish-only' \
+        && "$1" verify-install-guard --help 2>/dev/null | grep -q -- '--publish-only'
+}
+
 # Recognize this installation's stable login item and its older versioned form.
 owned_agent() {
     [ -f "$AGENT_PLIST" ] || return 1
@@ -171,25 +243,6 @@ owned_agent() {
             ;;
         *) return 1 ;;
     esac
-}
-
-# A second installer working on PREFIX at once would interleave its steps.
-LOCK=
-acquire_lock() {
-    LOCK=$PREFIX/.lock
-    if ! mkdir "$LOCK" 2>/dev/null; then
-        holder=$(cat "$LOCK/pid" 2>/dev/null || :)
-        if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-            LOCK=
-            fail "another cagents installer (process $holder) is changing $PREFIX; wait for it to finish"
-        fi
-        rm -rf "$LOCK"
-        mkdir "$LOCK" 2>/dev/null || { LOCK=; fail "cannot lock $PREFIX"; }
-    fi
-    printf '%s\n' "$$" > "$LOCK/pid"
-}
-release_lock() {
-    [ -z "$LOCK" ] || rm -rf "$LOCK"
 }
 
 stop_instructions() {
@@ -209,96 +262,243 @@ unload_agent() {
 }
 
 if [ "$UNINSTALL" -eq 1 ]; then
-    if [ -e "$PREFIX" ]; then
+    [ -z "$PUBLISH_TREE" ] && [ -z "$PUBLISHER" ] || fail 'invalid removal request'
+    if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
+        [ -d "$PREFIX" ] && [ ! -L "$PREFIX" ] || fail "$PREFIX is not an installation directory; nothing was removed"
         owned_prefix || fail "$PREFIX was not made by this installer; nothing was removed"
-        acquire_lock
-        trap release_lock EXIT
-        trap 'exit 1' HUP INT TERM
-        if [ -x "$PREFIX/current/bin/cagents" ]; then
-            daemon=$(running_daemon "$PREFIX/current/bin/cagents") \
-                || fail 'cannot tell whether the cagents daemon is running; nothing was removed'
-            if [ -n "$daemon" ]; then
-                printf '%s: the cagents daemon (%s) is running; nothing was removed.\n' "$PROGRAM" "$daemon" >&2
-                stop_instructions >&2
-                exit 1
-            fi
-        elif [ "$PURGE" -eq 1 ]; then
-            fail "$PREFIX has no installed cagents to check for a running daemon; nothing was removed"
+        current_cli=$PREFIX/current/bin/cagents
+        [ -x "$current_cli" ] || fail "$PREFIX has no installed cagents to coordinate removal; repair the installation first"
+        if [ "$PUBLISH_REMOVAL" -eq 0 ]; then
+            can_coordinate_publication "$current_cli" \
+                || fail 'this version needs its own release installer for removal'
+            set -- --prefix "$PREFIX" --uninstall --publish-removal
+            [ "$PURGE" -eq 0 ] || set -- "$@" --purge
+            exec "$current_cli" --no-start coordinate-install --prefix "$PREFIX" --installer "$0" --publish-only -- "$@"
+        fi
+        require_publication_fence "$current_cli"
+        daemon=$(running_daemon "$current_cli") \
+            || fail 'cannot tell whether the cagents daemon is running; nothing was removed'
+        if [ -n "$daemon" ]; then
+            printf '%s: the cagents daemon (%s) is running; nothing was removed.\n' "$PROGRAM" "$daemon" >&2
+            stop_instructions >&2
+            exit 1
         fi
     elif [ "$PURGE" -eq 1 ]; then
         fail "no cagents is installed at $PREFIX to check for a running daemon; stop it with \`cagents daemon stop\`, then remove ~/Library/Application Support/dev.cagents.cagents yourself"
+    else
+        printf 'No cagents installation at %s.\n' "$PREFIX"
+        exit 0
     fi
+    # Once removal starts, finish it under the inherited fence. Interrupting
+    # after the selected CLI is removed would strand a partially removed install.
+    trap '' HUP INT TERM PIPE
     if owned_agent; then
         unload_agent
         rm -f "$AGENT_PLIST"
     fi
     remove_owned_link "$BIN_LINK" "$PREFIX/current/bin/cagents"
     remove_owned_link "$APP_LINK" "$APP"
-    if [ -e "$PREFIX" ]; then
-        [ ! -d "$APP" ] || register_app -u "$APP"
-        rm -rf "$PREFIX/versions" "$PREFIX/current" "$APP" "$PREFIX/.update" "$PREFIX"/.stage.* "$PREFIX"/.current.* \
-            "$PREFIX/.previous"
-        rm -f "$PREFIX/.cagents-install-root"
-        release_lock
-        LOCK=
-        rmdir "$PREFIX" 2>/dev/null || note "kept $PREFIX, which holds files this installer did not make"
-    fi
+    [ ! -d "$APP" ] || register_app -u "$APP"
+    rm -rf "$APP" "$PREFIX/.update" "$PREFIX"/.stage.* "$PREFIX"/.current.* "$PREFIX/.previous"
     if [ "$PURGE" -eq 1 ]; then
         # ProjectDirs("dev", "cagents", "cagents") on macOS.
         rm -rf "$HOME/Library/Application Support/dev.cagents.cagents" \
             "$HOME/Library/Caches/dev.cagents.cagents" \
             "$HOME/Library/Preferences/dev.cagents.cagents"
-        runtime=$(getconf DARWIN_USER_DIR 2>/dev/null || :)
-        [ -z "$runtime" ] || rm -rf "${runtime%/}/cagents/cagents"
+        runtime=$(/usr/bin/getconf DARWIN_USER_DIR 2>/dev/null || :)
+        case ${XDG_RUNTIME_DIR:-} in
+            /*)
+                # With this alias, cagents/ also holds the default runtime
+                # and its admission leases. Leave their subtree intact.
+                if [ -n "$runtime" ] && [ ! "$XDG_RUNTIME_DIR" -ef "$runtime" ]; then
+                    rm -rf "${XDG_RUNTIME_DIR%/}/cagents"
+                fi
+                ;;
+            *) [ -z "$runtime" ] || rm -rf "${runtime%/}/cagents/cagents" ;;
+        esac
+    fi
+    rm -rf "$PREFIX/versions" "$PREFIX/current"
+    rm -f "$MARKER"
+    rmdir "$PREFIX" 2>/dev/null || note "kept $PREFIX, which holds files this installer did not make"
+    if [ "$PURGE" -eq 1 ]; then
         printf 'Removed cagents and its data.\n'
     else
-        printf 'Removed cagents; your data in ~/Library/Application Support/dev.cagents.cagents was kept.\n'
+        printf 'Removed cagents and kept your data in ~/Library/Application Support/dev.cagents.cagents.\n'
     fi
     exit 0
 fi
+[ "$PUBLISH_REMOVAL" -eq 0 ] || fail 'invalid publication request'
 
-REPOSITORY=${CAGENTS_REPOSITORY:-$DEFAULT_REPOSITORY}
-case $REPOSITORY in
-    '<OWNER>/<REPO>'|'') fail 'set CAGENTS_REPOSITORY to the GitHub OWNER/REPO for this project' ;;
-    */*/*|*[!A-Za-z0-9._/-]*) fail "invalid repository: $REPOSITORY" ;;
-esac
-CURL_OPTIONS='--disable --proto =https --tlsv1.2 --fail --location --silent --show-error'
-LOCAL_ARCHIVE=${CAGENTS_ARCHIVE:-}
-LOCAL_CHECKSUMS=${CAGENTS_CHECKSUMS:-}
-if [ -n "$LOCAL_ARCHIVE" ] && [ -z "$VERSION" ]; then
-    name=${LOCAL_ARCHIVE##*/}
-    case $name in
-        cagents-*-"$TARGET".tar.gz) VERSION=${name#cagents-}; VERSION=${VERSION%-"$TARGET".tar.gz} ;;
-        *) fail 'cannot infer the version from CAGENTS_ARCHIVE; pass --version' ;;
+if [ -z "$PUBLISH_TREE" ]; then
+    if [ -n "$EXTRACT_DIR" ]; then
+        verify_extract_dir
+        STAGE=$(mktemp -d "$EXTRACT_DIR/.unpacking.XXXXXX")
+    else
+        STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cagents-download.XXXXXX")
+    fi
+    trap 'rm -rf "$STAGE"' EXIT
+    trap 'exit 1' HUP INT TERM
+
+    if [ -z "$EXTRACT_DIR" ]; then
+        REPOSITORY=${CAGENTS_REPOSITORY:-$DEFAULT_REPOSITORY}
+        case $REPOSITORY in
+            '<OWNER>/<REPO>'|'') fail 'set CAGENTS_REPOSITORY to the GitHub OWNER/REPO for this project' ;;
+            */*/*|*[!A-Za-z0-9._/-]*) fail "invalid repository: $REPOSITORY" ;;
+        esac
+    fi
+    CURL_OPTIONS='--disable --proto =https --tlsv1.2 --fail --location --silent --show-error'
+    LOCAL_ARCHIVE=${CAGENTS_ARCHIVE:-}
+    LOCAL_CHECKSUMS=${CAGENTS_CHECKSUMS:-}
+    if [ -n "$LOCAL_ARCHIVE" ] && [ -z "$VERSION" ]; then
+        name=${LOCAL_ARCHIVE##*/}
+        case $name in
+            cagents-*-"$TARGET".tar.gz) VERSION=${name#cagents-}; VERSION=${VERSION%-"$TARGET".tar.gz} ;;
+            *) fail 'cannot infer the version from CAGENTS_ARCHIVE; pass --version' ;;
+        esac
+    fi
+    if [ -z "$VERSION" ]; then
+        latest_url=$(curl $CURL_OPTIONS -o /dev/null -w '%{url_effective}' "https://github.com/$REPOSITORY/releases/latest") \
+            || fail 'could not resolve the latest release'
+        case $latest_url in
+            https://github.com/"$REPOSITORY"/releases/tag/v*) VERSION=${latest_url##*/v} ;;
+            *) fail 'the latest release did not redirect to a v* tag' ;;
+        esac
+    fi
+    case $VERSION in
+        ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "invalid version: $VERSION" ;;
     esac
-fi
-if [ -z "$VERSION" ]; then
-    latest_url=$(curl $CURL_OPTIONS -o /dev/null -w '%{url_effective}' "https://github.com/$REPOSITORY/releases/latest") \
-        || fail 'could not resolve the latest release'
-    case $latest_url in
-        https://github.com/"$REPOSITORY"/releases/tag/v*) VERSION=${latest_url##*/v} ;;
-        *) fail 'the latest release did not redirect to a v* tag' ;;
+    TOP_LEVEL=cagents-$VERSION
+    ARCHIVE_NAME=cagents-$VERSION-$TARGET.tar.gz
+
+    download() {
+        curl $CURL_OPTIONS -o "$STAGE/$1" "https://github.com/$REPOSITORY/releases/download/v$VERSION/$1" \
+            || fail "could not download $1 for cagents $VERSION"
+    }
+    if [ -n "$LOCAL_ARCHIVE" ]; then cp "$LOCAL_ARCHIVE" "$STAGE/$ARCHIVE_NAME"; else download "$ARCHIVE_NAME"; fi
+    if [ -n "$LOCAL_CHECKSUMS" ]; then cp "$LOCAL_CHECKSUMS" "$STAGE/SHA256SUMS-macos"; else download SHA256SUMS-macos; fi
+    expected=$(awk -v target="$ARCHIVE_NAME" '
+        NF == 0 { next }
+        NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-fA-F]+$/ { bad = 1; next }
+        $2 == target { matches++; hash = tolower($1) }
+        END { if (bad || matches != 1) exit 1; print hash }
+    ' "$STAGE/SHA256SUMS-macos") || fail 'SHA256SUMS-macos is malformed or lacks exactly one archive checksum'
+    actual=$(shasum -a 256 "$STAGE/$ARCHIVE_NAME" | awk '{ print tolower($1) }')
+    [ "$actual" = "$expected" ] || fail "$ARCHIVE_NAME does not match its checksum"
+
+    # Accept exactly the release's members, so the archive cannot place files
+    # anywhere else or smuggle links into the version tree.
+    tar -tzf "$STAGE/$ARCHIVE_NAME" > "$STAGE/members" || fail "cannot read $ARCHIVE_NAME"
+    for member in \
+        '' bin/ bin/cagents bin/cagents-dictate bin/cagents-ui bin/cagentsd \
+        Cagents.app/ Cagents.app/Contents/ Cagents.app/Contents/Info.plist \
+        Cagents.app/Contents/MacOS/ Cagents.app/Contents/MacOS/Cagents Cagents.app/Contents/PkgInfo \
+        Cagents.app/Contents/Resources/ Cagents.app/Contents/Resources/Cagents.icns \
+        Cagents.app/Contents/_CodeSignature/ Cagents.app/Contents/_CodeSignature/CodeResources \
+        share/ share/doc/ share/doc/cagents/ share/doc/cagents/LICENSE share/doc/cagents/THIRD-PARTY-NOTICES
+    do
+        printf '%s\n' "$TOP_LEVEL/$member"
+    done > "$STAGE/expected"
+    sed 's|/$||' "$STAGE/expected" | LC_ALL=C sort > "$STAGE/expected-paths"
+    sed 's|/$||' "$STAGE/members" | LC_ALL=C sort | cmp -s - "$STAGE/expected-paths" \
+        || fail "$ARCHIVE_NAME has missing or unexpected members"
+    mkdir "$STAGE/tree"
+    tar -xzf "$STAGE/$ARCHIVE_NAME" -C "$STAGE/tree" --no-same-owner || fail "cannot unpack $ARCHIVE_NAME"
+    NEW=$STAGE/tree/$TOP_LEVEL
+    while IFS= read -r member; do
+        path=$STAGE/tree/${member%/}
+        [ ! -L "$path" ] || fail "$ARCHIVE_NAME holds a symbolic link at $member"
+        case $member in
+            */) [ -d "$path" ] || fail "$ARCHIVE_NAME needs a directory at $member" ;;
+            *) [ -f "$path" ] && [ "$(stat -f %l "$path")" = 1 ] \
+                || fail "$ARCHIVE_NAME needs a regular, unlinked file at $member" ;;
+        esac
+    done < "$STAGE/expected"
+    # A download through a browser carries quarantine, which Gatekeeper would
+    # turn into a refusal for an ad hoc signed app the person chose to install.
+    xattr -dr com.apple.quarantine "$NEW" 2>/dev/null || :
+    for path in "$NEW/bin/cagents" "$NEW/bin/cagentsd" "$NEW/bin/cagents-ui" "$NEW/bin/cagents-dictate" "$NEW/Cagents.app"; do
+        codesign --verify --strict "$path" 2>/dev/null || fail "${path#"$NEW/"} is not intact; download the release again"
+    done
+    verify_program_versions "$NEW"
+
+    if [ -n "$EXTRACT_DIR" ]; then
+        mv "$NEW" "$EXTRACT_DIR/$TOP_LEVEL" || fail 'cannot keep the verified update tree'
+        exit 0
+    fi
+
+    NEW=$(cd "$NEW" && pwd -P) || fail 'cannot locate the verified release tree'
+    publisher=$NEW/bin/cagents
+    if ! can_coordinate_publication "$publisher"; then
+        # An older archive can roll back a newer installation. Its own
+        # installer is required when there is no installed coordinator.
+        publisher=$PREFIX/current/bin/cagents
+        owned_prefix && [ -x "$publisher" ] && can_coordinate_publication "$publisher" \
+            || fail 'use the release installer published with this archive'
+    fi
+    set -- --prefix "$PREFIX" --version "$VERSION" --publish-tree "$NEW" --publisher "$publisher"
+    "$publisher" --no-start coordinate-install --prefix "$PREFIX" \
+        --installer "$0" --publish-only -- "$@"
+
+    # Start the selected version through normal daemon admission after the
+    # coordinator and publisher have released both fences. The plist is for
+    # the next login.
+    DAEMON_STARTED=0
+    if [ "$START" -eq 1 ]; then
+        if selected_bin=$(CDPATH= cd -P "$PREFIX/current/bin" && pwd -P) \
+            && "$selected_bin/cagents" daemon start >/dev/null; then
+            DAEMON_STARTED=1
+        else
+            note 'could not start the daemon; it will start when you open cagents'
+        fi
+    fi
+
+    if [ "$DAEMON_STARTED" -eq 1 ]; then
+        printf 'Installed cagents %s; the daemon is running and will start at login.\n' "$VERSION"
+    else
+        printf 'Installed cagents %s; the daemon will start at login or when you open cagents.\n' "$VERSION"
+    fi
+    printf 'Open cagents from Applications, or run: cagents ui\n'
+    case :$PATH: in
+        *:"$HOME/.local/bin":*) ;;
+        *) printf 'Add %s to PATH to use the cagents command.\n' "$HOME/.local/bin" ;;
     esac
+    exit 0
 fi
+
+# Only the guarded publication shell reaches the installation.
 case $VERSION in
     ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "invalid version: $VERSION" ;;
 esac
-TOP_LEVEL=cagents-$VERSION
-ARCHIVE_NAME=cagents-$VERSION-$TARGET.tar.gz
+case $PUBLISH_TREE in
+    /*) ;;
+    *) fail 'publication needs an absolute release tree path' ;;
+esac
+case $PUBLISHER in
+    "$PUBLISH_TREE/bin/cagents"|"$PREFIX/current/bin/cagents") ;;
+    *) fail 'publication needs a staged or installed coordinator' ;;
+esac
+require_publication_fence "$PUBLISHER"
 
 if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
     [ -d "$PREFIX" ] && [ ! -L "$PREFIX" ] || fail "$PREFIX is not a directory"
     if ! owned_prefix; then
-        [ -z "$(ls -A "$PREFIX")" ] || fail "$PREFIX holds files this installer did not make; choose another --prefix"
+        entries=$(ls -A "$PREFIX") || fail "cannot inspect $PREFIX"
+        case $entries in
+            '') ;;
+            "${PENDING_MARKER##*/}")
+                # An interrupted first install can leave this one file.
+                [ -f "$PENDING_MARKER" ] && [ ! -L "$PENDING_MARKER" ] \
+                    && [ "$(stat -f %u "$PENDING_MARKER")" = "$(id -u)" ] \
+                    || fail "$PENDING_MARKER is not an installation marker"
+                ;;
+            *) fail "$PREFIX holds files this installer did not make; choose another --prefix" ;;
+        esac
     fi
 fi
-mkdir -p "$PREFIX/versions"
-chmod 0755 "$PREFIX"
+mkdir -p "$PREFIX"
 [ "$(stat -f %u "$PREFIX")" = "$(id -u)" ] || fail "$PREFIX is not owned by you"
-owned_prefix || printf '%s\n' "$MARKER_TEXT" > "$PREFIX/.cagents-install-root"
-acquire_lock
 
-STAGE=$(mktemp -d "$PREFIX/.stage.XXXXXX")
+STAGE=
 # The login item is staged beside the one it replaces (see AGENT_STAGE).
 AGENT_STAGE=
 # Until the install starts changing what is published, there is nothing to
@@ -313,76 +513,45 @@ cleanup() {
     trap '' HUP INT TERM PIPE
     roll_back
     rm -f "$PREFIX/.current.$$"
-    [ "$STAGE_KEPT" -eq 1 ] || rm -rf "$STAGE"
+    [ -z "$STAGE" ] || [ "$STAGE_KEPT" -eq 1 ] || rm -rf "$STAGE"
     if [ -n "$AGENT_STAGE" ]; then
         rm -f "$AGENT_STAGE/new"
         [ "$STAGE_KEPT" -eq 1 ] && exists "$AGENT_STAGE/prior" || rm -rf "$AGENT_STAGE"
     fi
-    release_lock
 }
 exists() { [ -e "$1" ] || [ -L "$1" ]; }
 trap cleanup EXIT
 trap 'trap "" HUP INT TERM; exit 1' HUP INT TERM
 
-download() {
-    curl $CURL_OPTIONS -o "$STAGE/$1" "https://github.com/$REPOSITORY/releases/download/v$VERSION/$1" \
-        || fail "could not download $1 for cagents $VERSION"
-}
-if [ -n "$LOCAL_ARCHIVE" ]; then cp "$LOCAL_ARCHIVE" "$STAGE/$ARCHIVE_NAME"; else download "$ARCHIVE_NAME"; fi
-if [ -n "$LOCAL_CHECKSUMS" ]; then cp "$LOCAL_CHECKSUMS" "$STAGE/SHA256SUMS-macos"; else download SHA256SUMS-macos; fi
-expected=$(awk -v target="$ARCHIVE_NAME" '
-    NF == 0 { next }
-    NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-fA-F]+$/ { bad = 1; next }
-    $2 == target { matches++; hash = tolower($1) }
-    END { if (bad || matches != 1) exit 1; print hash }
-' "$STAGE/SHA256SUMS-macos") || fail 'SHA256SUMS-macos is malformed or lacks exactly one archive checksum'
-actual=$(shasum -a 256 "$STAGE/$ARCHIVE_NAME" | awk '{ print tolower($1) }')
-[ "$actual" = "$expected" ] || fail "$ARCHIVE_NAME does not match its checksum"
-
-# Accept exactly the release's members, so the archive cannot place files
-# anywhere else or smuggle links into the version tree.
-tar -tzf "$STAGE/$ARCHIVE_NAME" > "$STAGE/members" || fail "cannot read $ARCHIVE_NAME"
-LC_ALL=C sort -o "$STAGE/members" "$STAGE/members"
-for member in \
-    '' bin/ bin/cagents bin/cagents-dictate bin/cagents-ui bin/cagentsd \
-    Cagents.app/ Cagents.app/Contents/ Cagents.app/Contents/Info.plist \
-    Cagents.app/Contents/MacOS/ Cagents.app/Contents/MacOS/Cagents Cagents.app/Contents/PkgInfo \
-    Cagents.app/Contents/Resources/ Cagents.app/Contents/Resources/Cagents.icns \
-    Cagents.app/Contents/_CodeSignature/ Cagents.app/Contents/_CodeSignature/CodeResources \
-    share/ share/doc/ share/doc/cagents/ share/doc/cagents/LICENSE share/doc/cagents/THIRD-PARTY-NOTICES
-do
-    printf '%s\n' "$TOP_LEVEL/$member"
-done | sed 's|/$||' | LC_ALL=C sort > "$STAGE/expected"
-sed 's|/$||' "$STAGE/members" | LC_ALL=C sort | cmp -s - "$STAGE/expected" \
-    || fail "$ARCHIVE_NAME has missing or unexpected members"
-mkdir "$STAGE/tree"
-tar -xzf "$STAGE/$ARCHIVE_NAME" -C "$STAGE/tree" --no-same-owner || fail "cannot unpack $ARCHIVE_NAME"
-NEW=$STAGE/tree/$TOP_LEVEL
-find "$NEW" -type l | grep -q . && fail "$ARCHIVE_NAME holds symbolic links"
-# A download through a browser carries quarantine, which Gatekeeper would
-# turn into a refusal for an ad hoc signed app the person chose to install.
-xattr -dr com.apple.quarantine "$NEW" 2>/dev/null || :
-for path in "$NEW/bin/cagents" "$NEW/bin/cagentsd" "$NEW/bin/cagents-ui" "$NEW/bin/cagents-dictate" "$NEW/Cagents.app"; do
-    codesign --verify --strict "$path" 2>/dev/null || fail "${path#"$NEW/"} is not intact; download the release again"
-done
-reported=$("$NEW/bin/cagents" --version) || fail 'the downloaded cagents does not run on this Mac'
-[ "$reported" = "cagents $VERSION" ] || fail "the archive holds $reported, not cagents $VERSION"
-
-# Only one daemon serves a user, and macOS cannot hand its sessions to
-# another version yet: install over a running daemon only of this version.
+# Check the selected installation and daemon while new launches are fenced.
 CURRENT_VERSION=
 if [ -L "$PREFIX/current" ]; then
     CURRENT_VERSION=$(readlink "$PREFIX/current")
     CURRENT_VERSION=${CURRENT_VERSION#versions/}
 fi
-daemon=$(installed_daemon "$NEW/bin/cagents") \
+daemon=$(installed_daemon "$PUBLISH_TREE/bin/cagents") \
     || fail 'cannot tell whether the cagents daemon is running; the installation was not changed'
-if [ -n "$daemon" ] && [ "$daemon" != "$VERSION" ]; then
+if [ -n "$daemon" ]; then
     printf '%s: the cagents daemon (%s) is running; the installation was not changed.\n' "$PROGRAM" "$daemon" >&2
     stop_instructions >&2
     exit 1
 fi
 
+# Commit ownership before staging under a fresh prefix, so an interrupted copy
+# cannot leave a directory that the next installer refuses to use.
+if ! owned_prefix; then
+    rm -f "$PENDING_MARKER"
+    (set -C; printf '%s\n' "$MARKER_TEXT" > "$PENDING_MARKER")
+    mv -f "$PENDING_MARKER" "$MARKER"
+fi
+STAGE=$(mktemp -d "$PREFIX/.stage.XXXXXX")
+NEW=$STAGE/candidate
+# Rollback and publication use a child-owned stage on the prefix's volume.
+# The original download can disappear once this copy is complete.
+ditto "$PUBLISH_TREE" "$NEW" || fail 'could not stage the verified release on the installation volume'
+
+mkdir -p "$PREFIX/versions"
+chmod 0755 "$PREFIX"
 TARGET_DIR=$PREFIX/versions/$VERSION
 mkdir -p "$HOME/Applications" "$HOME/.local/bin" "$HOME/Library/LaunchAgents" \
     || fail 'cannot create the folders the installation links from; the installation was not changed'
@@ -548,10 +717,7 @@ else
     mv "$NEW" "$TARGET_DIR" || fail 'cannot move the release into place'
 fi
 # Ready means every program answers from where it will run.
-for program in cagents cagentsd cagents-ui cagents-dictate; do
-    [ "$("$TARGET_DIR/bin/$program" --version 2>/dev/null)" = "$program $VERSION" ] \
-        || fail "the installed $program does not run"
-done
+verify_program_versions "$TARGET_DIR"
 
 { rm -f "$PREFIX/.current.$$" && ln -s "versions/$VERSION" "$PREFIX/.current.$$" \
     && mv -fh "$PREFIX/.current.$$" "$PREFIX/current"; } || fail 'cannot select the new version'
@@ -576,37 +742,6 @@ mv -f "$AGENT_NEW" "$AGENT_PLIST" || fail 'cannot install the login item'
 # The commit.
 mv -f "$STAGE/previous" "$PREFIX/.previous" || fail 'cannot record the version kept for rollback'
 [ "$APP_CHANGED" -eq 0 ] || register_app -f "$APP"
-
-DAEMON_STARTED=0
-if [ "$START" -eq 1 ]; then
-    # A job loaded from an earlier install would keep its old definition.
-    unload_agent
-    # launchd runs a job in the account's own environment, so the login item
-    # of a private HOME would start a daemon serving the account's data, and
-    # its label is the account's. Such an installation starts its daemon
-    # here, in this environment, and leaves the login item unloaded.
-    attempt=20
-    if ! own_home; then
-        if "$TARGET_DIR/bin/cagents" daemon start >/dev/null 2>&1; then
-            attempt=0
-        else
-            note 'could not start the daemon; it will start when you open cagents'
-        fi
-    elif launchctl bootstrap "$DOMAIN" "$AGENT_PLIST" 2>/dev/null; then
-        attempt=0
-    else
-        note 'could not load the login item now; the daemon will start at your next login'
-    fi
-    # RunAtLoad starts the daemon now; wait briefly to report it.
-    while [ "$attempt" -lt 20 ]; do
-        if [ -n "$(running_daemon "$TARGET_DIR/bin/cagents" 2>/dev/null)" ]; then
-            DAEMON_STARTED=1
-            break
-        fi
-        attempt=$((attempt + 1))
-        sleep 1
-    done
-fi
 
 # Keep the served version and the one it replaced, for rollback; remove
 # older trees no running process uses. Without a reliable answer from lsof,
@@ -633,14 +768,9 @@ if [ "$in_use" != unknown ]; then
         rm -rf "$tree"
     done
 fi
+# Retire this installation's previous login job during publication, so a
+# concurrent removal cannot be followed by loading a stale job.
+unload_agent
+CAGENTS_INSTALLER
 
-if [ "$DAEMON_STARTED" -eq 1 ]; then
-    printf 'Installed cagents %s; the daemon is running and will start at login.\n' "$VERSION"
-else
-    printf 'Installed cagents %s; the daemon will start at login or when you open cagents.\n' "$VERSION"
-fi
-printf 'Open cagents from Applications, or run: cagents ui\n'
-case :$PATH: in
-    *:"$HOME/.local/bin":*) ;;
-    *) printf 'Add %s to PATH to use the cagents command.\n' "$HOME/.local/bin" ;;
-esac
+/bin/sh "$installer_dir/install.sh" "$@"

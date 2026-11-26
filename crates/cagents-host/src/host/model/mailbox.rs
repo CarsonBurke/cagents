@@ -941,7 +941,7 @@ mod tests {
         drop(registry);
         assert_eq!(
             super::super::schema::downgrade(&path, 30).unwrap(),
-            Some(31)
+            Some(super::super::SCHEMA_VERSION)
         );
 
         let registry = Registry::at(&path).unwrap();

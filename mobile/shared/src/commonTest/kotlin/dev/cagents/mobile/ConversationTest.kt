@@ -21,6 +21,17 @@ class ConversationTest {
         Conversation(s).apply(ConversationUpdate(s, reset = true, items = items.toList())).conversation
 
     @Test
+    fun aReadCheckpointChangesOnlyWhenTheConversationResets() {
+        val held = Conversation(s).apply(ConversationUpdate(s, reset = true, readCheckpoint = "first")).conversation
+        val updated = held.apply(ConversationUpdate(s, items = listOf(text("a", "Working")))).conversation
+        val reattached = updated.apply(ConversationUpdate(s, reset = true, readCheckpoint = "second")).conversation
+        assertEquals("first", held.readCheckpoint)
+        assertEquals(held.readCheckpoint, updated.readCheckpoint)
+        assertEquals("second", reattached.readCheckpoint)
+        assertEquals(null, reattached.apply(ConversationUpdate(s, reset = true)).conversation.readCheckpoint)
+    }
+
+    @Test
     fun appendsStreamIntoTheirItemAndLeaveTheRestAlone() {
         val held = loaded(text("a", "Earlier"), text("b", "On it"))
         val next = held.apply(ConversationUpdate(s, appends = listOf(TextAppend("b", 5, ", done.", at = 9)))).conversation

@@ -1,6 +1,10 @@
 package dev.cagents.mobile.client
 
 import dev.cagents.mobile.protocol.Call
+import dev.cagents.mobile.protocol.DetailPage
+import dev.cagents.mobile.protocol.ErrorCode
+import dev.cagents.mobile.protocol.ImageAttachment
+import dev.cagents.mobile.protocol.RemoteError
 import dev.cagents.mobile.protocol.Event
 import dev.cagents.mobile.protocol.FieldAnswer
 import dev.cagents.mobile.protocol.Notice
@@ -9,24 +13,30 @@ import dev.cagents.mobile.protocol.Session
 import dev.cagents.mobile.protocol.Welcome
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
@@ -40,7 +50,12 @@ import kotlin.time.TimeSource
 sealed interface ConnectionState {
     /** Not connecting: not started, or stopped while the app is in the background. */
     data object Offline : ConnectionState
-    data object Connecting : ConnectionState
+    /**
+     * An attempt is under way. [lastFailure] is why the one before it failed,
+     * kept in view while this one runs, so the person learns what is wrong
+     * rather than watching an attempt that may take half a minute.
+     */
+    data class Connecting(val lastFailure: String? = null) : ConnectionState
     data object Connected : ConnectionState
 
     /** The last attempt failed; another follows after a backoff. */
@@ -69,10 +84,17 @@ data class ControllerConfig(
     val pingTimeout: Duration = 15.seconds,
     val backoffStart: Duration = 1.seconds,
     val backoffMax: Duration = 30.seconds,
-    /** How long the connection outlives the app going to the background. */
+    /** How long we keep an existing connection if the network stays available in the background. */
     val backgroundGrace: Duration = 30.seconds,
     /** A connection that lasted this long starts the backoff over when it drops. */
     val stableAfter: Duration = 10.seconds,
+    /**
+     * How long reaching the computer and starting the bridge may take,
+     * whatever it waits on, such as a name lookup that never answers.
+     */
+    val connectTimeout: Duration = 30.seconds,
+    /** How long the bridge, once started, has to answer `hello`. */
+    val handshakeTimeout: Duration = 20.seconds,
 )
 
 /**
@@ -108,9 +130,11 @@ class RemoteController(
      * conversations watched: a watching phone counts as someone following
      * them on the computer.
      */
-    @kotlin.concurrent.Volatile
-    private var foreground = true
+    private val foreground = MutableStateFlow(true)
     private val wake = Channel<Unit>(Channel.CONFLATED)
+
+    /** Wakes the current socket's keepalive when the person returns. Guarded by [locked]. */
+    private var resumeChecks: Channel<Unit>? = null
 
     @kotlin.concurrent.Volatile
     private var current: BridgeSession? = null
@@ -190,16 +214,16 @@ class RemoteController(
      * given up halfway would leave the old connection running unseen.
      */
     private suspend fun disconnect(onlyIf: () -> Boolean = { true }) = withContext(NonCancellable) {
-        val job = locked {
+        val (job, bridge) = locked {
             if (!onlyIf()) return@withContext
-            loop.also { loop = null }
+            (loop to current).also { loop = null }
         }
         // Cancelled before the close, so the loop doesn't take the closed
         // connection for a dropped one and connect again meanwhile, by then
         // perhaps to another computer.
         job?.cancel()
         // Closing an SSH channel can block on the network; keep it off the caller's thread.
-        withContext(Dispatchers.Default) { current?.close() }
+        withContext(Dispatchers.Default) { bridge?.close() }
         job?.join()
         // Unless a connection was started meanwhile, such as on returning to the app.
         locked { if (loop == null) _state.update { it.copy(connection = ConnectionState.Offline) } }
@@ -221,7 +245,7 @@ class RemoteController(
         }
         // Hidden at once, while the old connection closes, so nothing of it
         // can be opened meanwhile.
-        if (computerChanged) _state.value = RemoteState(connection = ConnectionState.Connecting)
+        if (computerChanged) _state.value = RemoteState(connection = ConnectionState.Connecting())
         stopping.withLock {
             disconnect()
             locked {
@@ -244,14 +268,17 @@ class RemoteController(
 
     /**
      * Follows the app going to the background and back. In the background
-     * the open conversations are unwatched at once, since nobody is looking
-     * at them, or once their requests are answered. The connection stays
-     * for [ControllerConfig.backgroundGrace], so a quick switch away doesn't
-     * drop it, and then closes. Coming back watches them again and, if
-     * [connect], connects.
+     * overview watches stop at once, and open conversations stop once their
+     * requests are answered. An existing connection can stay open for
+     * [ControllerConfig.backgroundGrace]. Coming back resumes the watches
+     * and, if [connect], starts or wakes the connection loop.
      */
     fun setForeground(foreground: Boolean, connect: Boolean = true) {
-        this.foreground = foreground
+        locked {
+            val returned = foreground && !this.foreground.value
+            this.foreground.value = foreground
+            if (returned) resumeChecks?.trySend(Unit)
+        }
         if (foreground) {
             if (connect) start()
         } else {
@@ -260,8 +287,10 @@ class RemoteController(
                 backgroundStop = scope.launch {
                     delay(config.backgroundGrace)
                     val self = coroutineContext.job
-                    // Unless the app came back meanwhile, which replaces or clears it.
-                    stopping.withLock { disconnect(onlyIf = { backgroundStop === self }) }
+                    // A newer lifecycle event may have already superseded this timer.
+                    stopping.withLock {
+                        disconnect(onlyIf = { backgroundStop === self && !this@RemoteController.foreground.value })
+                    }
                 }
             }
         }
@@ -302,11 +331,44 @@ class RemoteController(
         syncs?.trySend(Sync(session, kind))
     }
 
-    suspend fun send(session: String, text: String, mode: SendMode) = call(Call.Send(session, text, mode))
+    suspend fun send(session: String, text: String, mode: SendMode, image: ImageAttachment? = null) =
+        call(if (image == null) Call.Send(session, text, mode) else Call.SendImage(session, text, mode, image))
+
+    suspend fun readDetail(request: Call.ReadDetail): DetailPage {
+        // Reads can end with their watch when the app goes to the background.
+        val bridge = current ?: throw ConnectionLost("Not connected to the computer.")
+        val page = bridge.call(request)
+        if (page == null || page.kind != request.kind || (page.next != null && page.next == request.cursor)) {
+            throw RequestFailed(RemoteError(ErrorCode.Internal, "The computer sent an unexpected transcript page."))
+        }
+        return page
+    }
+
     suspend fun interrupt(session: String) = call(Call.Interrupt(session))
     suspend fun loadEarlier(session: String) = call(Call.LoadEarlier(session))
     suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) =
         call(Call.Answer(session, request, action, answers))
+
+    /** Refresh the read checkpoint without replacing the existing watch. */
+    suspend fun refreshConversationForRead(session: String) {
+        if (session in _state.value.conversations) {
+            callForVisibleConversation(Call.RefreshReadCheckpoint(session))
+        }
+    }
+
+    suspend fun readConversation(session: String, checkpoint: String) =
+        callForVisibleConversation(Call.ReadConversation(session, checkpoint))
+
+    private suspend fun callForVisibleConversation(request: Call.OnSession) {
+        if (!foreground.value) return
+        try {
+            call(request)
+        } catch (_: RequestFailed) {
+            // Older bridges and a watch that was just closed can refuse this.
+        } catch (_: ConnectionLost) {
+            // A newly visible reset on the next connection can acknowledge it.
+        }
+    }
 
     suspend fun acknowledge(notice: String) {
         call(Call.AcknowledgeNotification(notice))
@@ -315,7 +377,11 @@ class RemoteController(
 
     private suspend fun call(call: Call) {
         val bridge = current ?: throw ConnectionLost("Not connected to the computer.")
-        val session = (call as? Call.OnSession)?.session ?: return bridge.call(call)
+        if (call !is Call.OnSession) {
+            bridge.call(call)
+            return
+        }
+        val session = call.session
         locked { inFlight[session] = (inFlight[session] ?: 0) + 1 }
         try {
             bridge.call(call)
@@ -325,7 +391,7 @@ class RemoteController(
                 if (left == 0) inFlight -= session else inFlight[session] = left
                 left == 0
             }
-            if (last && !foreground) sync(session, SyncKind.Settle)
+            if (last && !foreground.value) sync(session, SyncKind.Settle)
         }
     }
 
@@ -333,8 +399,15 @@ class RemoteController(
 
     private suspend fun connectLoop() {
         var attempt = 0
+        var lastFailure: String? = null
         while (true) {
-            _state.update { it.copy(connection = ConnectionState.Connecting) }
+            if (!foreground.value) {
+                _state.update { it.copy(connection = ConnectionState.Offline) }
+                foreground.first { it }
+                attempt = 0
+                lastFailure = null
+            }
+            _state.update { it.copy(connection = ConnectionState.Connecting(lastFailure)) }
             var connectedAt: TimeMark? = null
             val failure: ConnectFailure = try {
                 ConnectFailure.Network(connectOnce { connectedAt = timeSource.markNow() })
@@ -350,8 +423,14 @@ class RemoteController(
                 _state.update { it.copy(connection = ConnectionState.NeedsAction(failure)) }
                 wake.receive()
                 attempt = 0
+                lastFailure = null
                 continue
             }
+            // If the OS takes the network away, retry when the app is visible again.
+            if (!foreground.value) continue
+
+            val reason = sentence(failure.message)
+            lastFailure = reason
 
             // Only a connection that held starts over; one that drops straight
             // after connecting, again and again, keeps backing off.
@@ -359,7 +438,7 @@ class RemoteController(
             attempt++
             val backoff = backoff(attempt)
             _state.update {
-                it.copy(connection = ConnectionState.Retrying(failure.message.orEmpty(), attempt, backoff))
+                it.copy(connection = ConnectionState.Retrying(reason, attempt, backoff))
             }
             withTimeoutOrNull(backoff) { wake.receive() }
         }
@@ -367,15 +446,29 @@ class RemoteController(
 
     /** Connects, serves the connection until it ends and returns why it ended. */
     private suspend fun connectOnce(onConnected: () -> Unit): String {
-        val channel = transport.open()
+        // Kept as it opens: a timeout landing just as open() returns would otherwise drop it unclosed.
+        var opened: LineChannel? = null
+        val channel = withTimeoutOrNull(config.connectTimeout) { transport.open().also { opened = it } }
+            ?: run {
+                opened?.close()
+                throw ConnectFailure.Network(
+                    "The computer didn't answer within ${config.connectTimeout.inWholeSeconds} seconds. " +
+                        "Is it awake, and is this phone on its network or on Tailscale?",
+                )
+            }
         val bridge = BridgeSession(channel, config.clientName, config.clientVersion)
         var queue: Channel<Sync>? = null
         try {
-            val welcome = bridge.handshake()
+            val welcome = withTimeoutOrNull(config.handshakeTimeout) { bridge.handshake() }
+                ?: throw ConnectFailure.Network(
+                    "The computer accepted this phone, but cagents there didn't answer within ${config.handshakeTimeout.inWholeSeconds} seconds. " +
+                        "Check that cagents is running there, and the command in Settings.",
+                )
             onConnected()
             // Drain a wake that arrived while connecting, so it doesn't skip a later backoff.
             wake.tryReceive()
             val syncQueue = Channel<Sync>(Channel.UNLIMITED).also { queue = it }
+            val resumes = Channel<Unit>(Channel.CONFLATED)
             return coroutineScope {
                 val reader = async { bridge.run { event -> handle(event) } }
                 locked {
@@ -383,47 +476,75 @@ class RemoteController(
                     recoveries.clear()
                     syncs = syncQueue
                     current = bridge
+                    resumeChecks = resumes
                 }
                 _state.update { it.copy(connection = ConnectionState.Connected, welcome = welcome) }
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    watchOverview(bridge, Call.WatchSessions, Call.UnwatchSessions)
+                }
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    watchOverview(bridge, Call.WatchNotifications, Call.UnwatchNotifications)
+                }
                 launch {
-                    subscribe(bridge)
                     // Opened before this connection, or while it was being made.
                     _state.value.conversations.keys.forEach { syncQueue.trySend(Sync(it, SyncKind.Watch)) }
                     reconcile(bridge, syncQueue)
                 }
-                launch { keepalive(bridge) }
-                val reason = reader.await()
-                coroutineContext.cancelChildren()
-                reason
+                launch { keepalive(bridge, resumes) }
+                try {
+                    reader.await()
+                } finally {
+                    // A cancelled writer can still be blocked in SSH until the socket closes.
+                    bridge.close()
+                    coroutineContext.cancelChildren()
+                }
             }
         } finally {
             // Unless a newer connection has taken their place.
             locked {
                 if (syncs === queue) syncs = null
-                if (current === bridge) current = null
+                if (current === bridge) {
+                    current = null
+                    resumeChecks = null
+                }
             }
             bridge.close()
         }
     }
 
-    private suspend fun subscribe(bridge: BridgeSession) {
-        runCatching { bridge.call(Call.WatchSessions) }
-        runCatching { bridge.call(Call.WatchNotifications) }
+    private suspend fun watchOverview(bridge: BridgeSession, watch: Call, unwatch: Call) {
+        var requested = false
+        try {
+            foreground.collectLatest { looking ->
+                if (looking == requested) return@collectLatest
+                // A new foreground state supersedes a reply still in flight.
+                // Unwatch is sent even if the original watch has not answered.
+                requested = looking
+                try {
+                    bridge.call(if (looking) watch else unwatch)
+                } catch (_: RequestFailed) {
+                    // The other subscription and conversation watches can continue.
+                }
+            }
+        } catch (_: ConnectionLost) {
+            // The next connection starts with fresh subscriptions.
+        }
     }
 
     /**
-     * Works through [queue], one request at a time, watching the conversations
-     * the app holds and unwatching the ones it let go, until the connection ends.
+     * Reconciles the requested watch for each conversation. A new decision
+     * for one conversation can supersede a reply that is still pending.
      */
-    private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) {
+    private suspend fun reconcile(bridge: BridgeSession, queue: Channel<Sync>) = coroutineScope {
         val watched = HashSet<String>()
+        val replies = HashMap<String, Job>()
         // Asked for again in the background, to be watched on return.
         val deferred = HashSet<String>()
         for ((session, kind) in queue) {
             // A recovery given up on, or closed, since it was queued.
             if (kind == SyncKind.Resync && locked { session !in resyncing }) continue
             val held = _state.value.conversations[session]
-            val looking = foreground || locked { session in inFlight }
+            val looking = foreground.value || locked { session in inFlight }
             val force = when {
                 held == null -> {
                     deferred -= session
@@ -439,49 +560,79 @@ class RemoteController(
             // let go unless asked for again; in the background, every one is
             // once its requests are answered.
             val wanted = held != null && looking && (force || held.ended == null)
-            try {
-                if (wanted && (force || session !in watched)) {
-                    try {
-                        bridge.call(Call.WatchConversation(session))
-                        watched += session
-                    } catch (e: RequestFailed) {
-                        // Whatever the reason, including `unavailable`, no updates follow.
-                        // An earlier watch may still stand on the server, so it stays
-                        // in `watched` to be unwatched; that is harmless if it doesn't.
+            val call = when {
+                wanted && (force || session !in watched) -> {
+                    watched += session
+                    Call.WatchConversation(session)
+                }
+                !wanted && watched.remove(session) -> Call.UnwatchConversation(session)
+                else -> continue
+            }
+            replies.entries.removeAll { it.value.isCompleted }
+            replies.remove(session)?.cancelAndJoin()
+            replies[session] = launch(start = CoroutineStart.UNDISPATCHED) {
+                try {
+                    bridge.call(call)
+                } catch (e: RequestFailed) {
+                    ensureActive()
+                    if (call is Call.WatchConversation) {
+                        // An earlier watch may still stand if a replacement
+                        // failed. Leave it eligible for an explicit unwatch.
                         locked { resyncing -= session }
                         markEnded(session, e.message ?: "This conversation can't be followed.")
                     }
-                } else if (!wanted && session in watched) {
-                    watched -= session
-                    runCatching { bridge.call(Call.UnwatchConversation(session)) }
-                        .onFailure { if (it is ConnectionLost) throw it }
+                } catch (_: ConnectionLost) {
+                    // Every held conversation is watched again after reconnect.
                 }
-            } catch (e: ConnectionLost) {
-                // Every held conversation is watched again after the reconnect.
-                return
             }
         }
     }
 
-    private suspend fun keepalive(bridge: BridgeSession) {
+    private suspend fun keepalive(bridge: BridgeSession, resumes: ReceiveChannel<Unit>) {
         while (true) {
-            delay(config.pingInterval)
-            val answered = try {
-                withTimeout(config.pingTimeout) { bridge.call(Call.Ping) }
+            val checkingOnReturn = if (foreground.value) {
+                withTimeoutOrNull(config.pingInterval) { resumes.receive() } != null
+            } else {
+                resumes.receive()
                 true
-            } catch (e: RequestFailed) {
-                true
-            } catch (e: CancellationException) {
-                // withTimeout's own cancellation is a missed ping; an outer one ends the loop.
-                if (e is kotlinx.coroutines.TimeoutCancellationException) false else throw e
-            } catch (e: ConnectionLost) {
-                return
             }
-            if (!answered) {
-                bridge.close()
-                return
+            if (foreground.value && !ping(bridge, resumes, checkingOnReturn)) return
+        }
+    }
+
+    private suspend fun ping(
+        bridge: BridgeSession,
+        resumes: ReceiveChannel<Unit>,
+        checkingOnReturn: Boolean,
+    ): Boolean = coroutineScope {
+        // Time the reply independently so we can close the channel even if writing the ping stalls.
+        val reply = async {
+            try {
+                bridge.call(Call.Ping)
+                true
+            } catch (_: RequestFailed) {
+                true // Even a negative reply proves the connection works.
+            } catch (_: ConnectionLost) {
+                false
             }
         }
+        val resumeTimeout = minOf(config.pingTimeout, 5.seconds)
+        val answered = if (checkingOnReturn) {
+            withTimeoutOrNull(resumeTimeout) { reply.await() }
+        } else {
+            withTimeoutOrNull(config.pingTimeout) {
+                select<Boolean> {
+                    reply.onAwait { it }
+                    // A ping already in flight doubles as the resume probe.
+                    resumes.onReceive { withTimeoutOrNull(resumeTimeout) { reply.await() } ?: false }
+                }
+            }
+        }
+        if (answered != true) {
+            bridge.close()
+            reply.cancel()
+        }
+        answered == true
     }
 
     private fun markEnded(session: String, message: String) {
@@ -528,6 +679,7 @@ class RemoteController(
                 }
             }
             is Event.ConversationEnded -> markEnded(event.session, event.message)
+            is Event.TerminalScreenUpdated, is Event.TerminalWatchEnded,
             is Event.Closing, is Event.Unknown -> Unit
         }
     }
@@ -555,6 +707,12 @@ class RemoteController(
     }
 
     private companion object {
+        /** [message] as a sentence to show, with a stand-in when there is none. */
+        fun sentence(message: String?): String {
+            val text = message?.trim().orEmpty().ifEmpty { return "The connection failed." }
+            return if (text.last() in ".?!…") text else "$text."
+        }
+
         const val MAX_RECOVERIES = 3
         const val UNREADABLE = "This app can't read part of this conversation. Update the app."
     }

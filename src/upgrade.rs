@@ -2016,9 +2016,29 @@ pub mod handoff {
 
         #[cfg(any(feature = "host", test))]
         pub fn load(&self) -> Result<Option<Checkpoint>, String> {
+            self.load_for_restore(None)
+        }
+
+        /// Restore the same bytes that were acknowledged, when an update
+        /// supplied that identity. Decode from the read used for verification.
+        #[cfg(any(feature = "host", test))]
+        pub fn load_for_restore(
+            &self,
+            expected_digest: Option<&str>,
+        ) -> Result<Option<Checkpoint>, String> {
             let Some(bytes) = self.read_bytes()? else {
+                if expected_digest.is_some() {
+                    return Err(
+                        "The acknowledged Ready checkpoint disappeared before restoration".into(),
+                    );
+                }
                 return Ok(None);
             };
+            if expected_digest
+                .is_some_and(|expected| format!("{:x}", Sha256::digest(&bytes)) != expected)
+            {
+                return Err("The acknowledged Ready checkpoint changed before restoration".into());
+            }
             decode_checkpoint(&bytes).map(Some)
         }
 
@@ -4393,6 +4413,41 @@ mod tests {
         assert!(store.load().unwrap().unwrap().require_ready().is_err());
         // A second load cannot convert an uncertain partial restore into replay.
         assert!(store.load().unwrap().unwrap().require_ready().is_err());
+    }
+
+    #[test]
+    fn ready_restore_uses_only_the_acknowledged_checkpoint_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        checkpoint.phase = Phase::Ready;
+        store.save(&checkpoint).unwrap();
+        let captured = store.checkpoint_status().unwrap().unwrap();
+        let restored = store
+            .load_for_restore(Some(&captured.digest))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.proof, checkpoint.proof);
+        assert_eq!(restored.phase, Phase::Ready);
+
+        // A different valid Ready checkpoint from the same daemon still has
+        // no authority under the acknowledged capture.
+        checkpoint.terminals.clear();
+        store.save(&checkpoint).unwrap();
+        let changed = fs::read(&store.path).unwrap();
+        assert_eq!(
+            store.load_for_restore(Some(&captured.digest)).unwrap_err(),
+            "The acknowledged Ready checkpoint changed before restoration"
+        );
+        assert_eq!(fs::read(&store.path).unwrap(), changed);
+        assert!(store.load().unwrap().unwrap().terminals.is_empty());
+
+        fs::remove_file(&store.path).unwrap();
+        assert_eq!(
+            store.load_for_restore(Some(&captured.digest)).unwrap_err(),
+            "The acknowledged Ready checkpoint disappeared before restoration"
+        );
+        assert!(store.load().unwrap().is_none());
     }
 
     #[test]

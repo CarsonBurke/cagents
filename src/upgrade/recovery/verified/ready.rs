@@ -61,6 +61,13 @@ pub struct ReadyCapture {
 }
 
 #[cfg(feature = "host")]
+impl ReadyCapture {
+    pub fn checkpoint_digest(&self) -> &str {
+        &self.checkpoint_hash
+    }
+}
+
+#[cfg(feature = "host")]
 pub fn capture() -> Result<Option<ReadyCapture>, String> {
     let Some(store) = super::super::super::handoff::Store::existing()? else {
         return Ok(None);
@@ -70,12 +77,6 @@ pub fn capture() -> Result<Option<ReadyCapture>, String> {
     };
     if status.phase != super::super::super::handoff::Phase::Ready {
         return Ok(None);
-    }
-    let bytes = read_checkpoint(&store.path)?
-        .ok_or("The Ready checkpoint disappeared before restoration")?;
-    super::super::super::handoff::validate_checkpoint_bytes(&bytes)?;
-    if digest(&bytes) != status.digest {
-        return Err("The Ready checkpoint changed before restoration".into());
     }
     let Some(bytes) = read_checkpoint(&bound_capture_path(&store.path, &status.digest))? else {
         return Ok(None);

@@ -71,7 +71,7 @@ mod views;
 mod workspace_snapshot_tests;
 mod worktree_repair;
 
-const SCHEMA_VERSION: u32 = 31;
+const SCHEMA_VERSION: u32 = 32;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -226,10 +226,7 @@ impl Registry {
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
-        let view = views::store::owner(&self.db, pane)?
-            .map(|scope| views::store::read_stored(&self.db, &scope))
-            .transpose()?
-            .flatten();
+        let view = self.pane_view_in_snapshot(pane)?;
         snapshot.commit().map_err(|error| error.to_string())?;
         Ok(view)
     }
@@ -251,6 +248,28 @@ impl Registry {
         channel_row(&self.db, id)
     }
 
+    fn pane_view_in_snapshot(
+        &self,
+        pane: crate::model::CardId,
+    ) -> Result<Option<crate::workspace_model::views::View>, String> {
+        views::store::owner(&self.db, pane)?
+            .map(|scope| views::store::read_stored(&self.db, &scope))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn identity(&self) -> Result<Uuid, String> {
+        let identity: String = self
+            .db
+            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        identity
+            .parse()
+            .map_err(|error: uuid::Error| error.to_string())
+    }
+
     /// Metadata-only queries pin the same coherent WAL snapshot as full reads.
     pub(crate) fn metadata(
         &self,
@@ -261,15 +280,7 @@ impl Registry {
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
-        let identity: String = self
-            .db
-            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| error.to_string())?;
-        let identity = identity
-            .parse()
-            .map_err(|error: uuid::Error| error.to_string())?;
+        let identity = self.identity()?;
         let reply = match query {
             Query::Identity => Reply::Identity(identity),
             Query::Projects => Reply::Projects {
@@ -413,7 +424,7 @@ impl Registry {
         {
             Self::pending_terminal_save_fixture_error()?;
         }
-        self.apply_delta_guarded(edit, |_, _| Ok(()))
+        self.apply_delta_guarded(edit, None, |_, _| Ok(()))
     }
 
     /// Acquire SQL writer admission before retaining resident serialization.
@@ -421,10 +432,12 @@ impl Registry {
     pub(crate) fn apply_delta_guarded<G>(
         &mut self,
         edit: &ModelEdit,
+        serving: Option<&crate::model::HostSessionProof>,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
     ) -> Result<DeltaApplied, String> {
         self.commit_delta(
             edit,
+            serving,
             |seen, sql| guard(seen, sql).map(|guard| (guard, false)),
             true,
         )
@@ -441,7 +454,7 @@ impl Registry {
     where
         E: From<String>,
     {
-        self.commit_delta(edit, |_, sql| guard(sql), true)
+        self.commit_delta(edit, None, |_, sql| guard(sql), true)
     }
 
     #[cfg(test)]
@@ -459,6 +472,7 @@ impl Registry {
     fn commit_delta<G, E>(
         &mut self,
         edit: &ModelEdit,
+        serving: Option<&crate::model::HostSessionProof>,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<(G, bool), E>,
         check_schema: bool,
     ) -> Result<DeltaApplied, E>
@@ -482,7 +496,7 @@ impl Registry {
         let mut recorder = views::Recorder::default();
         let mut removed_channels = Vec::new();
         let changed = match edit {
-            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder)?,
+            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder, serving)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service"
@@ -1216,6 +1230,10 @@ fn migrate_through(
     if version < 31 && target >= 31 {
         execution::migrate_courier_runs(tx)?;
         schema::migration_checkpoint(31)?;
+    }
+    if version < 32 && target >= 32 {
+        automation_notifications::migrate_attention_resolution(tx)?;
+        schema::migration_checkpoint(32)?;
     }
     Ok(())
 }

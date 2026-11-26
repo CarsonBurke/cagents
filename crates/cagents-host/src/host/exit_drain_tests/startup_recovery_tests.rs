@@ -2,7 +2,7 @@
 //! created in a separate, naturally exiting fixture process, so its adopter
 //! has no local reaper credit that could mask the final startup-progress wake.
 use super::*;
-use crate::daemon::holder_registry::Record;
+use crate::{agent_execution::HostedSession, daemon::holder_registry::Record};
 use serde::{Deserialize, Serialize};
 
 const ORIGIN: &str = "CAGENTS_STARTUP_EXIT_ORIGIN_COUNT";
@@ -18,6 +18,24 @@ fn registry_path() -> PathBuf {
         .unwrap()
         .data_dir()
         .join("workspace-model.sqlite3")
+}
+
+fn replace_authority_source(
+    connection: &rusqlite::Connection,
+    terminal: TerminalId,
+    expected: &str,
+    replacement: &str,
+) {
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE agent_authorities SET source=?3 WHERE session_id=?1 AND source=?2",
+                rusqlite::params![terminal.to_string(), expected, replacement],
+            )
+            .unwrap(),
+        1,
+        "the exact saved authority must still exist"
+    );
 }
 
 struct AuthoritySchemaFault {
@@ -433,15 +451,39 @@ fn startup_recovery_and_exit_pending_keep_exact_close_available_until_foreign_ow
     }
     let (originals, mut pins) = foreign_originals(&root, NAME, 1);
     let original = &originals[0];
-    // Real SQLite layout damage makes the actual successor's model admission
-    // unavailable; orphan adoption has already installed its exact live owner
-    // before execution-authority restoration refuses. No fake error seam.
-    let fault = AuthoritySchemaFault::inject();
+    // Ordinary startup can adopt terminals with the shared model unavailable.
+    // Admit the real model and make authority restoration fail after adoption
+    // by storing an issuing capability from a different holder lineage.
+    let connection = rusqlite::Connection::open(registry_path()).unwrap();
+    let saved: String = connection
+        .query_row(
+            "SELECT source FROM agent_authorities WHERE session_id=?1",
+            [original.session.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut unrelated: HostedSession = serde_json::from_str(&saved).unwrap();
+    let HostedSession::Terminal(TerminalSession {
+        continuity: TerminalContinuity::Live {
+            host_incarnation, ..
+        },
+        ..
+    }) = &mut unrelated
+    else {
+        panic!("the original terminal must have live issuing authority");
+    };
+    *host_incarnation = HostIncarnation::new("unrelated-authority");
+    let unrelated = serde_json::to_string(&unrelated).unwrap();
+    replace_authority_source(&connection, original.session.id, &saved, &unrelated);
     let paths = RuntimePaths::discover().unwrap();
     let (host, completed, running) = run_host();
     let handle = same_original(&host, original);
     assert!(host.lock().unwrap().startup_blocks_shutdown());
-    assert!(host.lock().unwrap().startup_recovery().is_some());
+    let detail = host.lock().unwrap().startup_recovery().unwrap().to_owned();
+    assert!(
+        detail.contains("The issuing capability belongs to another session lineage"),
+        "{detail}"
+    );
     let drain = begin_ordinary_exit(&host).expect("ordinary, not committed successor transfer");
     daemon::wake();
     wait_for(|| host.lock().unwrap().ordinary_exit_cleanup_pending());
@@ -457,6 +499,8 @@ fn startup_recovery_and_exit_pending_keep_exact_close_available_until_foreign_ow
     let mut rpc = Rpc::connect(&paths.socket);
     inspect_and_refuse_mutation(&mut rpc, original, &root);
     stale_close_is_refused(&paths, original);
+    replace_authority_source(&connection, original.session.id, &unrelated, &saved);
+    let fault = AuthoritySchemaFault::inject();
     unknown_pin_close_retains_original(&mut rpc, &host, original, &handle);
     fault.restore(&host);
     assert!(

@@ -16,6 +16,7 @@ data class Welcome(
     val api: Int,
     @SerialName("server_version") val serverVersion: String,
     val host: String? = null,
+    @SerialName("conversation_details") val conversationDetails: Boolean = false,
 )
 
 @Serializable
@@ -63,6 +64,24 @@ data class Session(
     @SerialName("active_at") val activeAt: Long? = null,
     val agent: Agent? = null,
     val watchable: Boolean = false,
+    @SerialName("terminal_watchable") val terminalWatchable: Boolean = false,
+)
+
+@Serializable
+data class TerminalScreen(
+    val session: String,
+    val activity: Activity = Activity.Unknown,
+    @SerialName("last_output_at") val lastOutputAt: Long? = null,
+    val columns: Int,
+    val rows: Int,
+    val lines: List<String> = emptyList(),
+    val clipped: Boolean = false,
+)
+
+@Serializable
+data class TerminalEnded(
+    val session: String,
+    val message: String,
 )
 
 @Serializable(with = Surface.Serializer::class)
@@ -129,6 +148,7 @@ data class ConversationUpdate(
     val order: List<String>? = null,
     val items: List<Item> = emptyList(),
     val appends: List<TextAppend> = emptyList(),
+    @SerialName("read_checkpoint") val readCheckpoint: String? = null,
 )
 
 @Serializable
@@ -146,6 +166,7 @@ data class ConversationState(
     val activity: Activity = Activity.Unknown,
     val busy: Boolean = false,
     val ready: Boolean = false,
+    @SerialName("can_attach_image") val canAttachImage: Boolean = false,
     val exited: Boolean = false,
     val error: String? = null,
     @SerialName("read_only") val readOnly: String? = null,
@@ -219,6 +240,33 @@ data class RequestField(
 @Serializable
 data class Choice(val id: String, val label: String = "", val description: String = "")
 
+const val MAX_UPLOAD_IMAGE_BYTES = 512 * 1024
+const val MAX_DOWNLOAD_IMAGE_BYTES = 8 * 1024 * 1024
+
+@Serializable(with = DetailKind.Serializer::class)
+enum class DetailKind(override val wire: String) : WireEnum {
+    Output("output"),
+    Diff("diff"),
+    Image("image"),
+    Unknown("");
+
+    object Serializer : WireEnumSerializer<DetailKind>("DetailKind", entries, Unknown)
+}
+
+@Serializable
+data class DetailPage(
+    val kind: DetailKind,
+    val next: String? = null,
+    val text: String = "",
+    val patches: List<DiffPart> = emptyList(),
+    val base64: String = "",
+)
+
+@Serializable
+data class DiffPart(val item: String, val offset: Long, val text: String)
+
+data class ImageAttachment(val name: String, val pngBase64: String)
+
 // ---------------------------------------------------------------------------
 // Transcript items
 // ---------------------------------------------------------------------------
@@ -283,11 +331,12 @@ sealed interface ItemBody {
         val input: String = "",
         val output: String = "",
         val clipped: Boolean = false,
+        @SerialName("output_clipped") val outputClipped: Boolean = false,
         val status: ToolStatus = ToolStatus.Unknown,
     ) : ItemBody
 
     @Serializable
-    data class Image(val description: String = "") : ItemBody
+    data class Image(val description: String = "", val available: Boolean = false) : ItemBody
 
     @Serializable
     data class Delivery(

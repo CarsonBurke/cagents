@@ -14,7 +14,49 @@ use std::{
         fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::net::{SocketAddr, UnixListener, UnixStream},
     },
+    time::Instant,
 };
+
+/// Wait for descriptor activity without changing the file description. Report
+/// hangup or pending errors as activity so the caller can read the actual result.
+pub(crate) fn wait_for_activity(
+    descriptor: BorrowedFd<'_>,
+    events: libc::c_short,
+    deadline: Option<Instant>,
+) -> io::Result<bool> {
+    loop {
+        let timeout = if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let milliseconds = (deadline - now).as_nanos().div_ceil(1_000_000);
+            milliseconds.min(libc::c_int::MAX as u128) as libc::c_int
+        } else {
+            -1
+        };
+        let mut watched = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: the descriptor is borrowed, and poll sees one live pollfd.
+        let ready = unsafe { libc::poll(&mut watched, 1, timeout) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if watched.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if watched.revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
+            return Ok(true);
+        }
+    }
+}
 
 /// `openat` relative to `directory`, with creation races settled as Linux
 /// settles them.

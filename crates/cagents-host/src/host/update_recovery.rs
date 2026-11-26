@@ -5,7 +5,7 @@ use super::{
 };
 use crate::upgrade::{
     handoff::{Carried, Store},
-    recovery,
+    recovery::{self, verified::ready},
 };
 use std::collections::BTreeSet;
 
@@ -33,15 +33,33 @@ pub(super) fn restore_settled_from(
 /// Ordinary startup restores only current, authenticated holders and the
 /// current Ready checkpoint. Archived update evidence cannot recreate panes.
 pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
+    restore_ordinary_with(host, std::path::Path::new("/proc"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn restore_ordinary_with_process_fixture(
+    host: &SharedHost,
+    processes: &std::path::Path,
+) -> Result<(), String> {
+    restore_ordinary_with(host, processes)
+}
+
+fn restore_ordinary_with(host: &SharedHost, processes: &std::path::Path) -> Result<(), String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: previous boot history", None);
     chat::retained_actor::reconcile_previous_boot_history(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: capture Ready", None);
-    let ready_capture = crate::upgrade::recovery::verified::ready::capture()?;
+    let ready_capture = ready::capture()?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
-    let unattached = state::restore_upgrade(host)?;
+    let mut restored = state::restore_upgrade_with_digest(
+        host,
+        processes,
+        ready_capture
+            .as_ref()
+            .map(ready::ReadyCapture::checkpoint_digest),
+    )?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;
@@ -54,7 +72,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore native holders", None);
-    chat::restore_orphaned_native(host, &unattached)?;
+    chat::restore_orphaned_native(host, &restored.unattached)?;
     if let Some(detail) = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -92,13 +110,8 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     let executable = crate::process::current_executable().map_err(|error| error.to_string())?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
-    crate::upgrade::recovery::verified::ready::publish(
-        ready_capture,
-        &proof,
-        &executable,
-        &terminals,
-        &chats,
-    )?;
+    ready::publish(ready_capture, &proof, &executable, &terminals, &chats)?;
+    restored.finish(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: optional archived proof", None);
     publish_archived_proof(host);
@@ -260,11 +273,11 @@ fn restore_recovered(
     Ok(true)
 }
 
-/// Returns true only for the one startup carrying a validated recovery receipt.
+/// Returns the settled record only for the startup carrying a validated receipt.
 /// Ordinary startup keeps Prepared's existing refusal and replay guarantees.
-pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
+pub(super) fn restore(host: &SharedHost) -> Result<Option<recovery::RecoveryRecord>, String> {
     let Some(mut record) = recovery::take_for_host()? else {
-        return Ok(false);
+        return Ok(None);
     };
     let store = Store::discover()?;
     let checkpoint = store
@@ -420,11 +433,10 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     record.adopted_terminal_descriptors = host.lock().unwrap_or_else(|p| p.into_inner()).list(0);
     // The superseding record preserves Prepared byte-for-byte. It records this
     // one adoption's result; it never grants a later plain start new authority.
-    record.finish(&successor)?;
-    Ok(true)
+    record.finish(&successor).map(Some)
 }
 
-fn live_chat_descriptors(state: &state::HostState) -> Vec<crate::chat::Session> {
+pub(super) fn live_chat_descriptors(state: &state::HostState) -> Vec<crate::chat::Session> {
     state
         .chats
         .values()

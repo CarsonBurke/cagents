@@ -2234,6 +2234,7 @@ fn adapter() -> Codex {
         subagent_status: None,
         subagent_waiting: false,
         subagent_detail: String::new(),
+        unloaded_notice_pending: false,
         ready: true,
         attached: true,
         direct_input: true,
@@ -2258,7 +2259,7 @@ fn adapter() -> Codex {
         waiting_child_resumes: BTreeMap::new(),
         listing_generation: 0,
         parent_child: None,
-        listed_unloaded: std::collections::BTreeSet::new(),
+        listed_unloaded: BTreeMap::new(),
         spawn_calls: std::collections::BTreeSet::new(),
         turn_diffs: BTreeMap::new(),
         repo_root: None,
@@ -3952,23 +3953,18 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
     }
     assert_eq!(parent.children.len(), 32);
     assert!((0..32).all(|index| parent.children.contains_key(&format!("child-{index:03}"))));
-    // Nothing reports how a child that isn't subscribed goes on, so the
-    // conversation doesn't show a running one running for good.
     let mut state = chat::Snapshot::default();
     crate::chat::runtime::project_events_for_test(&mut state, events);
-    let shown = |id: &str| {
-        state
-            .subagents
-            .iter()
-            .find(|subagent| subagent.id == id)
-            .map(|subagent| subagent.status)
-    };
-    assert_eq!(shown("child-033"), Some(ToolStatus::Stopped));
-    assert!(
-        published
-            .iter()
-            .all(|id| shown(id).is_some_and(|status| status != ToolStatus::Running))
-    );
+    let observed = state
+        .subagents
+        .iter()
+        .find(|agent| agent.id == "child-033")
+        .expect("the earlier running child is listed");
+    assert_eq!(observed.status, ToolStatus::Running);
+    assert!(observed.last_seen_running());
+    assert!(!observed.outlives_turn());
+    assert!(!state.holds_work());
+    assert!(!state.is_working());
 
     for (read, id) in resumes(&first) {
         parent
@@ -4010,6 +4006,14 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
         Event::SubagentItemsRemoved { id, ids }
             if id == "child-033" && ids == &["codex-notice:unloaded:child-033"])));
 
+    crate::chat::runtime::project_events_for_test(&mut state, live.events);
+    let promoted = state
+        .subagents
+        .iter()
+        .find(|agent| agent.id == "child-033")
+        .unwrap();
+    assert!(!promoted.last_seen_running());
+
     // One listing publishes a bounded number of children, however many
     // pages Codex offers.
     let mut bounded = adapter();
@@ -4022,6 +4026,162 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
             "data":(0..32).map(child).collect::<Vec<_>>(),"nextCursor":"more"}}))
         .unwrap();
     assert!(listing(&last).is_none());
+}
+
+#[test]
+fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state() {
+    for (relisted, confirmed, buffered_turn) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let mut parent = adapter();
+        let id = "older-child";
+        parent.listed_unloaded.insert(id.into(), true);
+        let mut listed = Step::default();
+        parent
+            .discover_child_as(
+                id,
+                &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                ChildName::Listed,
+                false,
+                false,
+                &mut listed,
+            )
+            .unwrap();
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(&mut state, listed.events);
+        let mut sparse = Step::default();
+        if relisted {
+            parent
+                .discover_child_as(
+                    id,
+                    &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                    ChildName::Listed,
+                    false,
+                    true,
+                    &mut sparse,
+                )
+                .unwrap();
+        } else {
+            parent
+                .discover_activity_child(
+                    &json!({"agentThreadId":id,"kind":"started"}),
+                    "thread-exact",
+                    ChildName::Recorded,
+                    false,
+                    &mut sparse,
+                )
+                .unwrap();
+        }
+        let request = sparse
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap()["id"]
+            .clone();
+        crate::chat::runtime::project_events_for_test(&mut state, sparse.events);
+        assert!(state.subagents[0].last_seen_running());
+        assert!(!state.holds_work());
+        let notice = unloaded_notice_id(id);
+        let has_notice = |state: &chat::Snapshot| {
+            state.subagents[0]
+                .items
+                .iter()
+                .any(|item| item.id == notice)
+        };
+        assert!(has_notice(&state));
+        assert!(
+            parent
+                .command(Command::StopSubagent { id: id.into() })
+                .is_err()
+        );
+
+        if buffered_turn {
+            let early = parent
+                .receive(json!({"method":"turn/started","params":{"threadId":id,
+                    "turn":{"id":"live","status":"inProgress","items":[]}}}))
+                .unwrap();
+            crate::chat::runtime::project_events_for_test(&mut state, early.events);
+            assert!(state.subagents[0].last_seen_running());
+            assert!(has_notice(&state));
+        }
+        let response = if confirmed {
+            json!({"id":request,"result":{
+                "thread":{"id":id,"status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}}})
+        } else {
+            json!({"id":request,"error":{"code":-1,"message":"read temporarily unavailable"}})
+        };
+        let reply = parent.receive(response).unwrap();
+        crate::chat::runtime::project_events_for_test(&mut state, reply.events);
+        if confirmed {
+            assert_eq!(state.subagents[0].status, ToolStatus::Succeeded);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+        } else if buffered_turn {
+            assert_eq!(state.subagents[0].status, ToolStatus::Running);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+            assert!(state.holds_work());
+        } else {
+            assert!(state.subagents[0].last_seen_running());
+            assert!(has_notice(&state));
+            assert!(
+                parent
+                    .command(Command::StopSubagent { id: id.into() })
+                    .is_err()
+            );
+            let observed = parent
+                .receive(json!({"method":"thread/status/changed","params":{
+                    "threadId":id,"status":{"type":"active","activeFlags":[]}}}))
+                .unwrap();
+            crate::chat::runtime::project_events_for_test(&mut state, observed.events);
+            assert_eq!(state.subagents[0].status, ToolStatus::Running);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+            assert!(state.holds_work());
+        }
+    }
+}
+
+#[test]
+fn paging_a_recorded_collaboration_cannot_replace_a_newer_catalog_observation() {
+    for recorded in ["running", "completed"] {
+        let mut parent = adapter();
+        let mut listed = Step::default();
+        parent.listed_unloaded.insert("older".into(), true);
+        parent
+            .discover_child_as(
+                "older",
+                &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                ChildName::Listed,
+                false,
+                false,
+                &mut listed,
+            )
+            .unwrap();
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(&mut state, listed.events);
+        let mut page = Step::default();
+        parent
+            .page(
+                &json!({"data":[{"id":"prior","status":"completed","items":[{
+                "id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed",
+                "senderThreadId":"thread-exact","receiverThreadIds":["older"],
+                "agentsStates":{"older":{"status":recorded,"agentNickname":"Earlier child"}}
+            }]}],"nextCursor":null}),
+                &mut page,
+                true,
+            )
+            .unwrap();
+        assert_eq!(resumes(&page).len(), 1);
+        crate::chat::runtime::project_events_for_test(&mut state, page.events);
+        assert!(state.subagents[0].last_seen_running());
+        assert!(!state.holds_work());
+    }
 }
 
 #[test]

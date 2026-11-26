@@ -45,6 +45,7 @@ pub(crate) fn preflight_source_panes(
 
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
+pub(crate) const PUBLICATION_FD_ENV: &str = "CAGENTS_INSTALL_PUBLICATION_FD";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
 
 #[derive(serde::Deserialize)]
@@ -141,6 +142,7 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
         crate::daemon::lease_handoff::DAEMON_LEASE_ENV,
         crate::upgrade::recovery::RECOVERY_FD_ENV,
         RESULT_FD_ENV,
+        PUBLICATION_FD_ENV,
         crate::update::recovery::CENSUS_ENV,
         crate::update::recovery::OUTCOME_ENV,
         OWNER_CLI_ENV,
@@ -150,6 +152,8 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
     ] {
         command.env_remove(name);
     }
+    #[cfg(target_os = "macos")]
+    command.env_remove(crate::instance::ui_startup::SOCKET_ENV);
 }
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -203,6 +207,112 @@ pub(crate) enum InstallMode {
     Publish,
 }
 
+/// The command links and LaunchAgent are per account. Serialize their
+/// publishers even when the caller uses a private application runtime. Keep
+/// the lock outside the installed tree and any data that uninstall purges.
+#[cfg(target_os = "macos")]
+pub(crate) fn reserve_darwin_publication() -> io::Result<File> {
+    crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_EX | libc::LOCK_NB)
+        .map(crate::instance::OwnedLock::into_file)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
+    // XDG_RUNTIME_DIR may name the parent of the default runtime. Keep this
+    // inode beside the whole runtime tree so neither spelling can purge it.
+    Ok(crate::instance::darwin_runtime_base()?.with_file_name("cagents.install-publication.lock"))
+}
+
+/// Serialize ordinary access to production state with offline publication.
+/// Installed processes also prove they are running the selected executable.
+/// The caller retains admission until it acquires its own state claim.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+pub fn admit_darwin_state_access() -> io::Result<Option<crate::instance::OwnedLock>> {
+    let executable = crate::process::current_executable()?;
+    let installed = installed_version_root(&executable).is_some()
+        || std::env::current_exe().is_ok_and(|path| installed_version_root(&path).is_some());
+    if !installed && crate::instance::IS_DEVELOPMENT {
+        return Ok(None);
+    }
+    let lock =
+        crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_SH | libc::LOCK_NB)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    io::Error::new(error.kind(), crate::instance::UpdateInProgress)
+                } else {
+                    error
+                }
+            })?;
+    if !installed {
+        return Ok(Some(lock));
+    }
+    let layout = crate::update::locate(&executable).map_err(io::Error::other)?;
+    let selected = std::fs::canonicalize(layout.prefix.join("current"))?;
+    let named = std::fs::metadata(&executable)?;
+    let mapped = crate::process::mapped_region_identity(
+        std::process::id(),
+        admit_darwin_state_access as *const () as usize as u64,
+    )?;
+    if selected != layout.version_root || (named.dev(), named.ino()) != mapped {
+        return Err(io::Error::other(
+            "The installed build changed before startup. Open cagents again to start the selected build.",
+        ));
+    }
+    Ok(Some(lock))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inherit_darwin_publication(
+    command: &mut Command,
+    publication: &File,
+) -> io::Result<()> {
+    let inherited = publication.try_clone()?;
+    command.env(PUBLICATION_FD_ENV, inherited.as_raw_fd().to_string());
+    // SAFETY: the closure holds the cloned File. The hook clears
+    // close-on-exec only on the child's copy of the descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(inherited.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inherited_darwin_publication() -> io::Result<Option<(File, i32)>> {
+    let Some(value) = std::env::var_os(PUBLICATION_FD_ENV) else {
+        return Ok(None);
+    };
+    let fd = value
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|fd| *fd >= 3)
+        .ok_or_else(|| io::Error::other("invalid inherited publication fence descriptor"))?;
+    // SAFETY: check the inherited descriptor before borrowing. The verifier
+    // owns no other handle that could close its original descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
+    crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
+    Ok(Some((file, fd)))
+}
+
+pub(crate) fn verify_publication() -> io::Result<()> {
+    crate::instance::validate_install_guard()?;
+    #[cfg(target_os = "macos")]
+    {
+        let _publication = inherited_darwin_publication()?
+            .ok_or_else(|| io::Error::other("installer has no inherited publication fence"))?;
+        crate::instance::state_claim::require_idle_for_installation()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     prefix: &Path,
     installer: &Path,
@@ -228,6 +338,14 @@ pub(crate) fn run(
             ));
         }
         let mut command = installer_command(&script, arguments, &guard, None, None)?;
+        #[cfg(target_os = "macos")]
+        let _publication = {
+            // The publishing shell may outlive this coordinator. It holds
+            // both fences until it has finished mutating the installation.
+            let publication = reserve_darwin_publication()?;
+            inherit_darwin_publication(&mut command, &publication)?;
+            publication
+        };
         let published = execute(&mut command);
         guard.leave_launch_fence_with_successor();
         return published;
@@ -775,7 +893,13 @@ pub(crate) fn staged_owner_bin(
     let Some(owner) = read_staged_owner(version_root)? else {
         return Ok(None);
     };
-    let layout = crate::update::locate(executable).map_err(io::Error::other)?;
+    let layout = match crate::update::locate(executable) {
+        Ok(layout) => layout,
+        // A deferred owner can only belong to an installer-managed tree.
+        // Standalone CLI operations on other installs use their normal route.
+        Err(crate::update::UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(io::Error::other(error)),
+    };
     if owner.daemon_compatible && owner.candidate_protocol != crate::terminal_ipc::PROTOCOL_VERSION
     {
         return Err(io::Error::other(
@@ -830,7 +954,6 @@ pub(crate) fn staged_owner_bin(
         return Ok(None);
     };
     let expected = layout.prefix.join("versions").join(version).join("bin");
-    crate::update::locate(&expected.join("cagents")).map_err(io::Error::other)?;
     for window in &windows {
         if window.executable != expected.join("cagents-ui") {
             return Err(io::Error::other(
@@ -838,8 +961,8 @@ pub(crate) fn staged_owner_bin(
             ));
         }
     }
-    if let Some(executable) = running {
-        let bin = running_owner_bin(&layout.prefix, &executable)?;
+    if let Some(executable) = &running {
+        let bin = running_owner_bin(&layout.prefix, executable)?;
         if bin == layout.version_root.join("bin") && windows.is_empty() {
             return Ok(None);
         }
@@ -848,14 +971,14 @@ pub(crate) fn staged_owner_bin(
                 "daemon does not match the deferred runtime owner",
             ));
         }
-        return Ok((bin != layout.version_root.join("bin")).then_some(bin));
     }
-    if windows.is_empty() {
+    if windows.is_empty() && running.is_none() {
         return Ok(None);
     }
+    crate::update::locate(&expected.join("cagents")).map_err(staged_layout_error)?;
     // Starting through the old public CLI uses its own protocol and recovery
-    // contract. Never ask the incompatible candidate to restore an old host.
-    if !recover {
+    // contract.
+    if running.is_some() || !recover {
         return Ok(Some(expected));
     }
     restore_window_daemon(&expected, &launch)?;
@@ -870,6 +993,15 @@ pub(crate) fn staged_owner_bin(
         ));
     }
     Ok(Some(expected))
+}
+
+fn staged_layout_error(error: crate::update::UpdateError) -> io::Error {
+    match error {
+        crate::update::UpdateError::UnsupportedInstallation => {
+            io::Error::other("the deferred runtime owner does not have a complete installation")
+        }
+        error => io::Error::other(error),
+    }
 }
 
 fn installed_version_root(executable: &Path) -> Option<&Path> {
@@ -935,6 +1067,11 @@ pub(crate) fn staged_agent_owner_cli(executable: &Path) -> io::Result<Option<std
 
 /// The ownership marker a staging transaction recorded in `version_root`, if
 /// any. It is only private routing evidence; it never conveys authority.
+#[cfg(target_os = "macos")]
+pub(crate) fn has_staged_owner_marker(version_root: &Path) -> bool {
+    !matches!(read_staged_owner(version_root), Ok(None))
+}
+
 fn read_staged_owner(version_root: &Path) -> io::Result<Option<StagedOwner>> {
     use std::os::unix::fs::OpenOptionsExt;
     let marker = version_root.join(STAGED_OWNER);
@@ -996,7 +1133,7 @@ fn window_owner_bin(
                 "live window identity is not an authenticated UI",
             ));
         }
-        let layout = crate::update::locate(&window.executable).map_err(io::Error::other)?;
+        let layout = crate::update::locate(&window.executable).map_err(staged_layout_error)?;
         let bin = layout.version_root.join("bin");
         if layout.prefix != prefix || owner.as_ref().is_some_and(|owner| owner != &bin) {
             return Err(io::Error::other(
@@ -1252,10 +1389,21 @@ mod tests {
                         .err()
                         .expect("launch fence was free");
                     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    #[cfg(target_os = "macos")]
+                    assert_eq!(
+                        reserve_darwin_publication().unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
                 }
                 "available" => {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while let Err(error) = UiUpdateGuard::acquire() {
+                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                        assert!(Instant::now() < deadline, "{error}");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    #[cfg(target_os = "macos")]
+                    while let Err(error) = reserve_darwin_publication() {
                         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
                         assert!(Instant::now() < deadline, "{error}");
                         thread::sleep(Duration::from_millis(10));
@@ -1544,6 +1692,36 @@ IFS= read -r released <&3
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, ["current"], "no temporary link may remain");
+    }
+
+    #[test]
+    fn a_local_cli_without_a_managed_install_has_no_staged_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let version = root.path().join("versions/0.2.4+local.fixture");
+        let bin = version.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for file in ["cagents", "cagentsd", "cagents-ui"] {
+            std::fs::write(bin.join(file), b"fixture").unwrap();
+        }
+        let marker = version.join(STAGED_OWNER);
+        std::fs::write(
+            &marker,
+            r#"{"version":1,"owner_version":"0.2.3","daemon_compatible":false,"candidate_protocol":203}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for recover in [false, true] {
+            assert_eq!(
+                staged_owner_bin(&bin.join("cagents"), recover).unwrap(),
+                None
+            );
+        }
+        assert!(matches!(
+            crate::update::locate(&bin.join("cagents")),
+            Err(crate::update::UpdateError::UnsupportedInstallation)
+        ));
     }
 
     #[cfg(target_os = "linux")]

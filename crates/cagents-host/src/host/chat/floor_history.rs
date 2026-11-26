@@ -163,7 +163,7 @@ fn install(
             },
         );
         state.chat_added(id);
-        state.inventory_generation += 1;
+        state.inventory_changed();
     }
     Ok(())
 }

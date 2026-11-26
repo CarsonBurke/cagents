@@ -29,6 +29,10 @@ use std::{
 };
 
 mod daemon_admission;
+#[cfg(target_os = "macos")]
+pub(crate) mod ui_startup;
+#[cfg(all(target_os = "macos", feature = "ui"))]
+pub use ui_startup::connect_ui_launcher;
 pub mod state_claim;
 #[doc(hidden)]
 pub mod ui_options;
@@ -230,7 +234,7 @@ pub(crate) fn runtime_base() -> io::Result<Option<PathBuf>> {
 }
 
 #[cfg(target_os = "macos")]
-fn darwin_runtime_base() -> io::Result<PathBuf> {
+pub(crate) fn darwin_runtime_base() -> io::Result<PathBuf> {
     use std::os::unix::{ffi::OsStringExt, fs::DirBuilderExt};
     static BASE: OnceLock<PathBuf> = OnceLock::new();
     if let Some(base) = BASE.get() {
@@ -462,12 +466,17 @@ impl WindowLease {
         requested: Option<&str>,
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let publication = crate::install_guard::admit_darwin_state_access()?;
+        #[cfg(target_os = "macos")]
+        let require_state = publication.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let require_state = false;
         // A window here would need a daemon here, which would refuse to serve
         // data a daemon in another runtime directory serves. Say so first:
         // that daemon's session, not this window, is what is in the way.
         if !crate::device::is_remote() {
-            match state_claim::daemon_served_elsewhere(&runtime_directory()?.join("cagentsd.lock"))
-            {
+            match state_claim::daemon_served_elsewhere(&daemon_lock_in(&runtime_directory()?)) {
                 Ok(None) => {}
                 Ok(Some(refusal)) => return Err(io::Error::other(refusal)),
                 Err(error) => {
@@ -475,12 +484,18 @@ impl WindowLease {
                 }
             }
         }
-        let claims = state_claim::claims_directory()
-            .inspect_err(|error| tracing::warn!(%error, "window claims are unavailable"))
-            .ok();
+        let claims = match state_claim::claims_directory() {
+            Ok(claims) => Some(claims),
+            Err(error) if require_state => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "window claims are unavailable");
+                None
+            }
+        };
         let (lease, slot) = Self::acquire_waiting_in(
             &runtime_directory()?,
             claims.as_deref(),
+            require_state,
             new_window,
             requested,
             daemon_admission::admission_wait_timeout(),
@@ -510,6 +525,7 @@ impl WindowLease {
         Self::acquire_waiting_in(
             runtime,
             None,
+            false,
             new_window,
             requested,
             Duration::ZERO,
@@ -522,6 +538,7 @@ impl WindowLease {
     fn acquire_waiting_in(
         runtime: &Path,
         claims: Option<&Path>,
+        require_state: bool,
         new_window: bool,
         requested: Option<&str>,
         admission_timeout: Duration,
@@ -570,6 +587,7 @@ impl WindowLease {
                                 }
                                 return Err(error);
                             }
+                            Err(error) if require_state => return Err(error),
                             // A claim that can't be taken for another reason,
                             // such as a read-only data directory, leaves the
                             // window as it was before claims.
@@ -680,9 +698,10 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
                 "saved conversation inventory exceeds the recovery limit",
             ));
         }
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}")?;
-        stdout.flush()?;
+        write_ui_launch_line(
+            &format!("{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}"),
+            false,
+        )?;
     }
     Ok(())
 }
@@ -725,11 +744,20 @@ fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()
             Ok(_) => UI_LAUNCH_READY.to_owned(),
             Err(error) => format!("{UI_LAUNCH_ERROR_PREFIX}{error}").replace('\n', " "),
         };
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{message}")?;
-        stdout.flush()?;
+        write_ui_launch_line(&message, true)?;
     }
     Ok(())
+}
+
+fn write_ui_launch_line(message: &str, final_response: bool) -> io::Result<()> {
+    #[cfg(all(target_os = "macos", feature = "ui"))]
+    if let Some(result) = ui_startup::write_reply(message, final_response) {
+        return result;
+    }
+    let _ = final_response;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{message}")?;
+    stdout.flush()
 }
 
 pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};
@@ -1756,8 +1784,19 @@ impl UiUpdateGuard {
         }
     }
 
+    /// An already committed close is recorded in the retained checkpoint.
+    /// Leave those windows there when no launch can yet reach the successor.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn defer_reopening_to_recovery(&mut self) {
+        self.closed.clear();
+    }
+
+    pub(crate) fn running_window_slots(&self) -> io::Result<Vec<String>> {
+        running_window_slots(&self.runtime)
+    }
+
     pub fn has_running_windows(&self) -> io::Result<bool> {
-        running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
+        self.running_window_slots().map(|slots| !slots.is_empty())
     }
     /// Pass the held launch fence to an installer that would otherwise try to
     /// acquire it again. The child validates both this exact lock description
@@ -2205,6 +2244,20 @@ impl UiUpdateGuard {
             .map(|_| ())
     }
 
+    pub(crate) fn relaunch_missing_windows(
+        self,
+        slots: &[String],
+        executable: &Path,
+    ) -> io::Result<()> {
+        let running = running_window_slots(&self.runtime)?;
+        let missing: Vec<_> = slots
+            .iter()
+            .filter(|slot| !running.contains(slot))
+            .cloned()
+            .collect();
+        self.relaunch_windows(&missing, executable)
+    }
+
     fn relaunch_windows_with_notes(
         mut self,
         slots: &[String],
@@ -2322,22 +2375,22 @@ fn validate_install_fence(require_closed: bool) -> io::Result<()> {
     let inherited = File::from(inherited);
     let runtime = runtime_directory()?;
     let path = runtime.join(format!("{APPLICATION_LOCK_FILE}.update"));
-    let expected = fs::symlink_metadata(&path)?;
-    let actual = inherited.metadata()?;
-    if !actual.is_file()
-        || actual.uid() != current_uid()
-        || actual.mode() & 0o077 != 0
-        || actual.nlink() != 1
-        || !expected.is_file()
-        || actual.dev() != expected.dev()
-        || actual.ino() != expected.ino()
-    {
-        return Err(io::Error::other(
-            "installer inherited a different update fence",
-        ));
-    }
     #[cfg(target_os = "linux")]
     {
+        let expected = fs::symlink_metadata(&path)?;
+        let actual = inherited.metadata()?;
+        if !actual.is_file()
+            || actual.uid() != current_uid()
+            || actual.mode() & 0o077 != 0
+            || actual.nlink() != 1
+            || !expected.is_file()
+            || actual.dev() != expected.dev()
+            || actual.ino() != expected.ino()
+        {
+            return Err(io::Error::other(
+                "installer inherited a different update fence",
+            ));
+        }
         match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
             Ok(_) => return Err(io::Error::other("installer update fence is not held")),
@@ -2348,15 +2401,7 @@ fn validate_install_fence(require_closed: bool) -> io::Result<()> {
         }
     }
     #[cfg(target_os = "macos")]
-    {
-        crate::flock::verify_inherited_exclusive(&inherited)?;
-        let current = fs::symlink_metadata(&path)?;
-        if !current.is_file() || (current.dev(), current.ino()) != (actual.dev(), actual.ino()) {
-            return Err(io::Error::other(
-                "installer update fence changed during validation",
-            ));
-        }
-    }
+    crate::flock::verify_inherited_exclusive_at(&inherited, &path)?;
     if require_closed && !running_window_slots(&runtime)?.is_empty() {
         return Err(io::Error::other(
             "application windows have not finished closing",
@@ -3410,6 +3455,14 @@ pub fn storage_name() -> &'static str {
 /// daemon socket and its lock.
 pub fn runtime_subdirectory() -> &'static str {
     namespace()
+}
+
+/// The daemon's runtime lock under the session runtime directory `runtime`.
+/// The daemon takes it and records it in its saved-data claim; a window asking
+/// whether a daemon elsewhere serves this data must name the same file, or it
+/// mistakes this session's daemon for another session's.
+pub fn daemon_lock_in(runtime: &Path) -> PathBuf {
+    runtime.join(runtime_subdirectory()).join("cagentsd.lock")
 }
 
 pub fn project_dirs() -> Option<ProjectDirs> {
@@ -5617,6 +5670,7 @@ mod startup_update_tests {
             WindowLease::acquire_waiting_in(
                 runtime.path(),
                 Some(claims.path()),
+                false,
                 new_window,
                 None,
                 Duration::ZERO,
@@ -5637,6 +5691,64 @@ mod startup_update_tests {
     }
 
     #[test]
+    fn a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        const DAEMON_RUNTIME: &str = "CAGENTS_TEST_WINDOW_DAEMON_RUNTIME";
+        if let Some(daemon_runtime) = env::var_os(DAEMON_RUNTIME).map(PathBuf::from) {
+            let lock = daemon_lock_in(&daemon_runtime);
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let _held = owned_lock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+            let _claim = state_claim::claim_daemon_state(&lock, "test-session").unwrap();
+
+            let lease = WindowLease::acquire(false, None);
+            if runtime_directory().unwrap().canonicalize().unwrap() == daemon_runtime {
+                lease.unwrap_or_else(|error| panic!("window refused its own daemon: {error}"));
+            } else {
+                let error = lease.err().expect("window accepted a foreign daemon");
+                assert_eq!(
+                    state_claim::state_in_use(&error).and_then(|refusal| refusal.pid()),
+                    Some(process::id()),
+                    "{error}"
+                );
+            }
+            return;
+        }
+
+        // Each child gets its own environment and window slot.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let daemon_runtime = root.join("daemon");
+        let foreign_runtime = root.join("foreign");
+        for directory in [&home, &daemon_runtime, &foreign_runtime] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+        }
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        for runtime in [alias.join("daemon"), foreign_runtime] {
+            let output = process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::startup_update_tests::a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere",
+                ])
+                .env(DAEMON_RUNTIME, &daemon_runtime)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "window launch with runtime {} failed: {}{}",
+                runtime.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    #[test]
     fn a_window_launched_during_daemon_admission_waits_and_then_takes_its_lease() {
         let runtime = tempfile::tempdir().unwrap();
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -5646,6 +5758,7 @@ mod startup_update_tests {
         let (lease, slot) = WindowLease::acquire_waiting_in(
             runtime.path(),
             None,
+            false,
             false,
             None,
             Duration::from_secs(30),
@@ -5667,6 +5780,7 @@ mod startup_update_tests {
         let error = WindowLease::acquire_waiting_in(
             runtime.path(),
             None,
+            false,
             false,
             None,
             Duration::from_millis(60),

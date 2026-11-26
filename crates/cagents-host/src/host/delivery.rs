@@ -147,6 +147,7 @@ enum SlotKey {
     ChatActivity(TerminalId),
     Bell(TerminalId),
     WorkBoard,
+    Mobile(crate::terminal_ipc::MobileWatch),
 }
 
 fn coalescible(message: &ServerMessage) -> Option<SlotKey> {
@@ -160,6 +161,7 @@ fn coalescible(message: &ServerMessage) -> Option<SlotKey> {
             ..
         } => Some(SlotKey::Bell(*terminal_id)),
         ServerMessage::WorkBoard { .. } => Some(SlotKey::WorkBoard),
+        ServerMessage::MobileChanged { topic } => Some(SlotKey::Mobile(*topic)),
         _ => None,
     }
 }
@@ -422,13 +424,10 @@ impl DeliveryQueue {
                         return Ok(());
                     }
                 }
-                ServerMessage::ChatChanged { .. } => {
-                    if matches!(
-                        state.messages[index].message,
-                        ServerMessage::ChatChanged { .. }
-                    ) {
-                        return Ok(());
-                    }
+                ServerMessage::ChatChanged { .. } | ServerMessage::MobileChanged { .. }
+                    if state.messages[index].message == message.message =>
+                {
+                    return Ok(());
                 }
                 ServerMessage::ChatActivity { generation, .. } => {
                     let generation = *generation;

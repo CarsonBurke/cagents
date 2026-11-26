@@ -4,6 +4,7 @@
 //! where the daemon has no app bundle to post from, through `osascript`.
 mod batching;
 mod journal;
+pub(super) mod orphaned;
 #[cfg(target_os = "macos")]
 mod osascript;
 #[cfg(target_os = "linux")]
@@ -231,6 +232,10 @@ impl Handle {
         let _ = self.0.wake.try_send(());
     }
 
+    pub(super) fn reconcile_automation_attention(&self) {
+        self.change(|_| {});
+    }
+
     pub fn record(&self, event: Event) {
         if event.validate().is_err() {
             return;
@@ -346,6 +351,22 @@ impl Handle {
         receiver
     }
 
+    pub(in crate::host) fn unread_automation_notices(&self) -> Vec<(Uuid, Uuid, u64)> {
+        self.0
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notices
+            .iter()
+            .filter_map(|notice| match notice.event.target {
+                Target::Automation { id, sequence } if !notice.acknowledged => {
+                    Some((notice.id, id, sequence))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.0
             .snapshot
@@ -436,18 +457,54 @@ fn supervise(
     }
 }
 
+/// Explicit notification reads see the current journal, even while the
+/// broker awaits desktop delivery. Text remains subject to the broker's
+/// published privacy projection.
+pub(super) fn committed_snapshot(mut published: Snapshot) -> Snapshot {
+    let Some(dirs) = crate::instance::project_dirs() else {
+        return published;
+    };
+    match Journal::committed_notices(&dirs.data_dir().join("agent-attention.sqlite3")) {
+        Ok(notices) => combine_committed_notices(&mut published, notices),
+        Err(error) => {
+            tracing::debug!(%error, "could not read the committed attention journal");
+        }
+    }
+    published
+}
+
+fn combine_committed_notices(published: &mut Snapshot, mut notices: Vec<Notice>) {
+    let previews = published
+        .notices
+        .drain(..)
+        .filter_map(|notice| notice.event.content.map(|preview| (notice.id, preview)))
+        .collect::<std::collections::HashMap<_, _>>();
+    for notice in &mut notices {
+        if notice.event.content.is_some() {
+            notice.event.content = previews.get(&notice.id).cloned();
+        }
+    }
+    published.notices = notices;
+}
+
 fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
     if let Some(shared) = shared.upgrade() {
         let mut current = shared.snapshot.lock().unwrap_or_else(|p| p.into_inner());
         if *current == snapshot {
             return;
         }
+        let automation_waiting = snapshot.notices.iter().any(|notice| {
+            !notice.acknowledged && matches!(notice.event.target, Target::Automation { .. })
+        });
         *current = snapshot;
         drop(current);
         if let Some(host) = host.upgrade() {
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .notifications_changed();
+            if automation_waiting {
+                super::automations::wake(&host);
+            }
         }
     }
 }
@@ -601,10 +658,79 @@ fn reserve_withdrawals(
 }
 
 fn action_notice(snapshot: &Snapshot, id: Uuid) -> Option<&Notice> {
-    snapshot
+    snapshot.notices.iter().find(|notice| {
+        if matches!(notice.event.target, Target::Automation { .. }) {
+            !notice.acknowledged && notice.id == id
+        } else {
+            notice.id == id || batching::desktop_id(&notice.event.target) == id
+        }
+    })
+}
+
+fn action_if_current<T>(
+    notice: &Notice,
+    resolved: impl FnOnce(Uuid, u64) -> Result<bool, String>,
+    route: impl FnOnce() -> T,
+) -> Result<Option<T>, String> {
+    if let Target::Automation { id, sequence } = notice.event.target
+        && resolved(id, sequence)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(route()))
+}
+
+fn route_notification_action(
+    host: &SharedHost,
+    notice: &Notice,
+) -> Result<Option<crate::notifications::Destination>, String> {
+    let route = || {
+        host.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .activate_notification_destination(
+                notice.event.target(),
+                notice.event.source_session(),
+                notice.window.as_deref(),
+                notice.event.destination.as_ref(),
+            )
+    };
+    if !matches!(notice.event.target, Target::Automation { .. }) {
+        return Ok(Some(route()));
+    }
+    let registry = super::agent_execution::registry(host)?;
+    // Serialize exact action authorization and its nonblocking routing with
+    // resume, edit, and removal. Launching or raising a window comes later.
+    let registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action_if_current(
+        notice,
+        |id, seq| registry.automation_attention_resolved(id, seq),
+        route,
+    )
+}
+
+fn discard_resolved_delivery(
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    delivery: &mut BTreeMap<Target, Notice>,
+    notice: &Notice,
+) -> Result<(), String> {
+    // The registry already proved this toast obsolete. Leaving it ready in
+    // the delivery queue makes the broker retry a failed SQLite write without
+    // waiting for the reconciliation deadline.
+    delivery.remove(&notice.event.target());
+    journal.acknowledge(notice.id)?;
+    if let Some(current) = snapshot
         .notices
-        .iter()
-        .find(|notice| notice.id == id || batching::desktop_id(&notice.event.target) == id)
+        .iter_mut()
+        .find(|current| current.id == notice.id)
+    {
+        current.acknowledged = true;
+    }
+    withdraw_notice(withdrawals, notice);
+    Ok(())
 }
 
 fn delivery_batch(
@@ -700,6 +826,153 @@ fn record_attention_committed_policy(
     result
 }
 
+fn record_broker_event(
+    journal: &mut Journal,
+    event: Event,
+    suppressed: bool,
+    receipt: Option<CommitReceipt>,
+    policy: &Preferences,
+    registry: impl FnOnce() -> Result<super::agent_execution::SharedRegistry, String>,
+) -> Result<Option<Notice>, String> {
+    let resolved = receipt.as_ref().is_some_and(|receipt| receipt.resolved);
+    if let Target::Automation { id, sequence } = event.target {
+        // Management uses this registry guard. The journal edge must be
+        // admitted before that transaction resolves it, or skipped afterward.
+        let recorded = registry().and_then(|registry| {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            if registry.automation_attention_resolved(id, sequence)? {
+                return Ok(None);
+            }
+            protect_automation_toast(journal, id, &event.target, |previous| {
+                registry.automation_attention_resolved(id, previous)
+            })?;
+            record_attention_committed_policy(journal, event, suppressed, None, policy, false)
+        });
+        if let Some(receipt) = receipt {
+            receipt.finish(recorded.as_ref().map(|_| ()).map_err(Clone::clone));
+        }
+        return recorded;
+    }
+    record_attention_committed_policy(journal, event, suppressed, receipt, policy, resolved)
+}
+
+fn protect_automation_toast(
+    journal: &mut Journal,
+    id: Uuid,
+    target: &Target,
+    resolved: impl FnOnce(u64) -> Result<bool, String>,
+) -> Result<(), String> {
+    if let Some((previous, sequence)) = journal.automation_notice(id)?
+        && resolved(sequence)?
+    {
+        // Commit the stable desktop cleanup before the new event can overwrite
+        // the only journal row containing the old notice's sequence.
+        journal.remember_notice_withdrawal(target, previous)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct AutomationRetry(Option<(Instant, String)>);
+
+impl AutomationRetry {
+    fn deadline(&self) -> Option<Instant> {
+        self.0.as_ref().map(|(due, _)| *due)
+    }
+
+    fn update(&mut self, result: Result<(), String>, snapshot: &mut Snapshot, now: Instant) {
+        match result {
+            Ok(()) => {
+                if let Some((_, error)) = self.0.take()
+                    && snapshot.diagnostic.as_deref() == Some(error.as_str())
+                {
+                    snapshot.diagnostic = None;
+                }
+            }
+            Err(error) => {
+                let due = self
+                    .deadline()
+                    .filter(|due| *due > now)
+                    .unwrap_or(now + RETRY_DELAY);
+                snapshot.diagnostic = Some(error.clone());
+                self.0 = Some((due, error));
+            }
+        }
+    }
+}
+
+fn restore_automation_attention(
+    journal: &mut Journal,
+    host: &Weak<HostLock>,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    reopening: bool,
+    retry: &mut AutomationRetry,
+) {
+    let result = check_automation_attention(journal, host, snapshot, withdrawals, reopening);
+    retry.update(result, snapshot, Instant::now());
+}
+
+fn check_automation_attention(
+    journal: &mut Journal,
+    host: &Weak<HostLock>,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    reopening: bool,
+) -> Result<(), String> {
+    if !snapshot.notices.iter().any(|notice| {
+        matches!(notice.event.target, Target::Automation { .. })
+            && (reopening || !notice.acknowledged)
+    }) {
+        return Ok(());
+    }
+    let Some(host) = host.upgrade() else {
+        return Ok(());
+    };
+    let registry = super::agent_execution::registry(&host)?;
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    reconcile_automation_attention(journal, snapshot, withdrawals, reopening, |id, sequence| {
+        registry.automation_attention_resolved(id, sequence)
+    })
+}
+
+fn reconcile_automation_attention(
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    reopening: bool,
+    resolved: impl Fn(uuid::Uuid, u64) -> Result<bool, String>,
+) -> Result<(), String> {
+    let mut failure = None;
+    for notice in &mut snapshot.notices {
+        let Target::Automation { id, sequence } = notice.event.target else {
+            continue;
+        };
+        if notice.acknowledged && !reopening {
+            continue;
+        }
+        match resolved(id, sequence) {
+            Ok(true) => {
+                if !notice.acknowledged {
+                    match journal.acknowledge(notice.id) {
+                        Ok(_) => notice.acknowledged = true,
+                        Err(error) => {
+                            failure = Some(error);
+                            continue;
+                        }
+                    }
+                }
+                // A daemon can exit between acknowledging and removing the
+                // toast. Retry the idempotent withdrawal when reopening.
+                withdraw_notice(withdrawals, notice);
+            }
+            Ok(false) => {}
+            Err(error) => failure = Some(error),
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 fn record_attention_committed(
     journal: &mut Journal,
     event: Event,
@@ -764,6 +1037,39 @@ impl JournalTestBridge {
         policy: &Preferences,
         suppressed: bool,
     ) -> Result<Option<Notice>, String> {
+        self.commit_next_with(|journal, event, receipt| {
+            let resolved = receipt.resolved;
+            record_attention_committed_policy(
+                journal,
+                event,
+                suppressed,
+                Some(receipt),
+                policy,
+                resolved,
+            )
+        })
+    }
+
+    pub(in crate::host) fn commit_next_automation(
+        &mut self,
+        registry: &super::agent_execution::SharedRegistry,
+    ) -> Result<Option<Notice>, String> {
+        self.commit_next_with(|journal, event, receipt| {
+            record_broker_event(
+                journal,
+                event,
+                false,
+                Some(receipt),
+                &Preferences::default(),
+                || Ok(registry.clone()),
+            )
+        })
+    }
+
+    fn commit_next_with(
+        &mut self,
+        commit: impl FnOnce(&mut Journal, Event, CommitReceipt) -> Result<Option<Notice>, String>,
+    ) -> Result<Option<Notice>, String> {
         let next = self
             .handle
             .0
@@ -775,14 +1081,7 @@ impl JournalTestBridge {
         let Some((event, receipt)) = next else {
             return Ok(None);
         };
-        record_attention_committed_policy(
-            &mut self.journal,
-            event,
-            suppressed,
-            Some(receipt),
-            policy,
-            false,
-        )
+        commit(&mut self.journal, event, receipt)
     }
 
     pub(in crate::host) fn pending_events(&self) -> Vec<Event> {
@@ -848,6 +1147,7 @@ async fn run(
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
     let mut withdrawal_retry = None;
+    let mut automation_retry = AutomationRetry::default();
     let mut snapshot = Snapshot {
         diagnostic: settings_error.clone(),
         ..Default::default()
@@ -859,6 +1159,14 @@ async fn run(
                 withdrawal_retry = Some((next_attempt, error.clone()));
                 snapshot.diagnostic = Some(error);
             }
+            restore_automation_attention(
+                journal,
+                &host,
+                &mut snapshot,
+                &mut withdrawals,
+                true,
+                &mut automation_retry,
+            );
         }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
@@ -879,6 +1187,7 @@ async fn run(
         .into_iter()
         .chain(store.retry_at())
         .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
+        .chain(automation_retry.deadline())
         .min(),
     )
     .await
@@ -930,6 +1239,14 @@ async fn run(
             if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
                 snapshot.diagnostic = Some(error);
             }
+            restore_automation_attention(
+                journal,
+                &host,
+                &mut snapshot,
+                &mut withdrawals,
+                true,
+                &mut automation_retry,
+            );
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -1110,9 +1427,10 @@ async fn run(
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
             let resolved = receipt.as_ref().is_some_and(|receipt| receipt.resolved);
-            match record_attention_committed_policy(
-                journal, event, suppressed, receipt, &policy, resolved,
-            ) {
+            match record_broker_event(journal, event, suppressed, receipt, &policy, || {
+                let host = host.upgrade().ok_or("The daemon has stopped")?;
+                super::agent_execution::registry(&host)
+            }) {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot.notices.iter().find(|old| {
@@ -1141,6 +1459,14 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
+        restore_automation_attention(
+            journal,
+            &host,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            &mut automation_retry,
+        );
         let persisted_withdrawals = match reserve_withdrawals(journal, &snapshot, &mut withdrawals)
         {
             Ok(groups) => {
@@ -1194,7 +1520,7 @@ async fn run(
             .iter()
             .map(|notice| notice.id)
             .collect::<BTreeSet<_>>();
-        delivery.retain(|_, notice| retained.contains(&notice.id));
+        delivery.retain(|_, notice| !notice.acknowledged && retained.contains(&notice.id));
         // A delayed completion stops being a desktop alert once the user has
         // returned to that pane or disabled its category.
         delivery.retain(|_, notice| {
@@ -1254,6 +1580,41 @@ async fn run(
                 if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
                     return;
                 }
+                // Portal connection and test delivery can each await. An
+                // automation may have been resolved after this batch started.
+                if let Target::Automation { id, sequence } = notice.event.target {
+                    let resolved = host
+                        .upgrade()
+                        .ok_or_else(|| "The daemon has stopped".to_owned())
+                        .and_then(|host| super::agent_execution::registry(&host))
+                        .and_then(|registry| {
+                            registry
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .automation_attention_resolved(id, sequence)
+                        });
+                    match resolved {
+                        Ok(true) => {
+                            let result = discard_resolved_delivery(
+                                journal,
+                                &mut snapshot,
+                                &mut withdrawals,
+                                &mut delivery,
+                                &notice,
+                            );
+                            if result.is_err() {
+                                automation_retry.update(result, &mut snapshot, Instant::now());
+                            }
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            snapshot.diagnostic = Some(error);
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
                 match send(backend, &notice, activation.receives_actions()).await {
                     Ok(()) => {
                         delivery.remove(&notice.event.target());
@@ -1280,12 +1641,9 @@ async fn run(
                 let Some(entry) = withdrawals.pop_first() else {
                     break;
                 };
-                let result = remove(backend, entry.id()).await.and_then(|()| {
-                    if persisted_withdrawals.contains(&entry.id()) {
-                        journal.finish_group_withdrawal(entry.id())?;
-                    }
-                    Ok(())
-                });
+                let result = remove(backend, entry.id())
+                    .await
+                    .and_then(|()| journal.finish_group_withdrawal(entry.id()));
                 if let Err(error) = result {
                     withdrawals.requeue(entry);
                     snapshot.diagnostic = Some(error);
@@ -1310,6 +1668,20 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
+        restore_automation_attention(
+            journal,
+            &host,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            &mut automation_retry,
+        );
+        if !withdrawals.is_empty()
+            && proxy.is_some()
+            && let Some(shared) = shared.upgrade()
+        {
+            let _ = shared.wake.try_send(());
+        }
         if !policy.message_previews {
             for notice in &mut snapshot.notices {
                 notice.event.content = None;
@@ -1319,15 +1691,14 @@ async fn run(
             if let Some(notice) = action_notice(&snapshot, action)
                 && let Some(host) = host.upgrade()
             {
-                let window = host
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .activate_notification_destination(
-                        notice.event.target(),
-                        notice.event.source_session(),
-                        notice.window.as_deref(),
-                        notice.event.destination.as_ref(),
-                    );
+                let window = match route_notification_action(&host, notice) {
+                    Ok(Some(window)) => window,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        snapshot.diagnostic = Some(error);
+                        continue;
+                    }
+                };
                 // Activation and the matched executable handshake can wait;
                 // they never run under the daemon's session lock.
                 match crate::instance::activate_destination(&window, token.as_deref()) {
@@ -1374,6 +1745,29 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         )
+    }
+
+    #[test]
+    fn an_explicit_attention_read_sees_committed_notice_ids_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let mut published = Snapshot::default();
+        let old = journal
+            .record(attention_event(session, "old"), false)
+            .unwrap()
+            .unwrap();
+        published.notices.push(old.clone());
+        let current = journal
+            .record(attention_event(session, "new"), false)
+            .unwrap()
+            .unwrap();
+
+        combine_committed_notices(&mut published, Journal::committed_notices(&path).unwrap());
+
+        assert_eq!(published.notices, [current]);
+        assert!(published.notices.iter().all(|notice| notice.id != old.id));
     }
 
     #[test]
@@ -1449,6 +1843,237 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn an_automation_toast_is_withdrawn_again_after_acknowledgement_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("automation.sqlite3");
+        let automation = Uuid::new_v4();
+        let target = Target::Automation {
+            id: automation,
+            sequence: 4,
+        };
+        let resolved = |id, sequence| Ok(id == automation && sequence <= 4);
+        let event = Event {
+            target: target.clone(),
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{automation}:lifecycle:4"),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+            content: None,
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let notice = journal.record(event, false).unwrap().unwrap();
+        journal.delivered(notice.id).unwrap();
+        let mut snapshot = Snapshot {
+            notices: journal.list().unwrap(),
+            ..Snapshot::default()
+        };
+        let mut withdrawals = Withdrawals::default();
+        reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            resolved,
+        )
+        .unwrap();
+        let desktop = batching::desktop_id(&target);
+        assert!(withdrawals.contains(&desktop));
+
+        // Lose the process-local queue after SQLite committed the acknowledgement.
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        snapshot.notices = journal.list().unwrap();
+        assert!(snapshot.notices[0].acknowledged);
+        let mut withdrawals = Withdrawals::default();
+        reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            resolved,
+        )
+        .unwrap();
+        assert!(withdrawals.is_empty());
+        reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            true,
+            resolved,
+        )
+        .unwrap();
+        assert_eq!(withdrawals.pop_first().unwrap().id(), desktop);
+        assert_eq!(withdrawals.pop_first().unwrap().id(), notice.id);
+        assert!(withdrawals.is_empty());
+    }
+
+    #[test]
+    fn failed_automation_acknowledgement_retries_even_with_no_portal_work() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let id = Uuid::new_v4();
+        let event = Event {
+            target: Target::Automation { id, sequence: 1 },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{id}:lifecycle:1"),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+            content: None,
+        };
+        let notice = journal.record(event, false).unwrap().unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER refuse_ack BEFORE UPDATE OF acknowledged ON notices BEGIN SELECT raise(ABORT, 'temporarily cannot write'); END;").unwrap();
+        let mut snapshot = Snapshot {
+            notices: vec![notice.clone()],
+            ..Default::default()
+        };
+        let mut withdrawals = Withdrawals::default();
+        let mut retry = AutomationRetry::default();
+        let now = Instant::now();
+        let mut delivery = [(notice.event.target(), notice.clone())].into();
+        let result = discard_resolved_delivery(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            &mut delivery,
+            &notice,
+        );
+        assert!(
+            delivery.is_empty(),
+            "no obsolete due delivery may drive immediate retries"
+        );
+        assert!(result.is_err());
+        retry.update(result, &mut snapshot, now);
+        assert_eq!(retry.deadline(), Some(now + RETRY_DELAY));
+        assert!(!snapshot.notices[0].acknowledged);
+        assert!(withdrawals.is_empty());
+
+        db.execute_batch("DROP TRIGGER refuse_ack").unwrap();
+        let result = reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            |_, _| Ok(true),
+        );
+        retry.update(result, &mut snapshot, now + RETRY_DELAY);
+        assert_eq!(retry.deadline(), None);
+        assert!(snapshot.notices[0].acknowledged);
+        assert!(snapshot.diagnostic.is_none());
+        assert!(!withdrawals.is_empty());
+    }
+
+    #[test]
+    fn a_returning_automation_reserves_its_withdrawal_even_with_a_full_old_backlog() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite3")).unwrap();
+        let id = Uuid::new_v4();
+        let target = Target::Automation { id, sequence: 6 };
+        let event = Event {
+            target: target.clone(),
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{id}:lifecycle:6"),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+            content: None,
+        };
+        let current = journal.record(event, false).unwrap().unwrap();
+        journal
+            .remember_notice_withdrawal(&target, Uuid::new_v4())
+            .unwrap();
+        let old = (0..MAX_PENDING).map(|index| Uuid::from_u128(index as u128));
+        let mut withdrawals = Withdrawals::default();
+        withdrawals.protect(old.clone());
+        for id in old {
+            withdrawals.group(id);
+        }
+        let mut snapshot = Snapshot::default();
+        restore(
+            &mut journal,
+            &Preferences::default(),
+            &mut snapshot,
+            &mut withdrawals,
+        )
+        .unwrap();
+        assert_eq!(snapshot.notices, [current]);
+        assert!(withdrawals.contains(&batching::desktop_id(&target)));
+    }
+
+    #[test]
+    fn replacing_a_resolved_automation_notice_keeps_its_toast_withdrawal_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("automation.sqlite3");
+        let id = Uuid::new_v4();
+        let event = |sequence| Event {
+            target: Target::Automation { id, sequence },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{id}:lifecycle:{sequence}"),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+            content: None,
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let previous = journal.record(event(4), false).unwrap().unwrap();
+        journal.delivered(previous.id).unwrap();
+        let newer = event(6);
+        let group = batching::desktop_id(&newer.target);
+        protect_automation_toast(
+            &mut journal,
+            id,
+            &newer.target,
+            |sequence| Ok(sequence <= 5),
+        )
+        .unwrap();
+        let replacement = journal.record(newer, false).unwrap().unwrap();
+        assert!(
+            journal
+                .list()
+                .unwrap()
+                .iter()
+                .all(|notice| notice.id != previous.id)
+        );
+        drop(journal);
+
+        let mut journal = Journal::open(&path).unwrap();
+        let mut snapshot = Snapshot::default();
+        let mut withdrawals = Withdrawals::default();
+        restore(
+            &mut journal,
+            &Preferences::default(),
+            &mut snapshot,
+            &mut withdrawals,
+        )
+        .unwrap();
+        assert_eq!(snapshot.notices, [replacement]);
+        assert!(action_notice(&snapshot, group).is_none());
+        assert!(action_notice(&snapshot, previous.id).is_none());
+        let mut removed = BTreeSet::new();
+        while let Some(entry) = withdrawals.pop_first() {
+            removed.insert(entry.id());
+            journal.finish_group_withdrawal(entry.id()).unwrap();
+        }
+        assert_eq!(removed, [group, previous.id].into());
+        assert!(journal.group_withdrawals().unwrap().is_empty());
     }
 
     #[test]
@@ -2347,6 +2972,54 @@ mod tests {
     }
 
     #[test]
+    fn automation_click_checks_the_exact_witness_even_if_projection_is_stale() {
+        let id = Uuid::new_v4();
+        let sequence = 18;
+        let notice = Notice {
+            id: Uuid::new_v4(),
+            event: Event {
+                target: Target::Automation { id, sequence },
+                source_session: None,
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: crate::notifications::Evidence {
+                    key: format!("automation:{id}:lifecycle:{sequence}"),
+                    kind: crate::notifications::Kind::AutomationBlocked,
+                },
+                content: None,
+            },
+            acknowledged: false,
+            delivered: true,
+            window: None,
+        };
+        let snapshot = Snapshot {
+            notices: vec![notice.clone()],
+            ..Snapshot::default()
+        };
+        let still_visible = action_notice(&snapshot, notice.id).unwrap();
+        for state in [
+            Ok(true),
+            Err("automation registry unavailable".into()),
+            Ok(false),
+        ] {
+            let mut routed = false;
+            let actual = action_if_current(
+                still_visible,
+                |current, witness| {
+                    assert_eq!((current, witness), (id, sequence));
+                    state.clone()
+                },
+                || {
+                    routed = true;
+                },
+            );
+            assert_eq!(routed, state == Ok(false));
+            assert_eq!(actual, state.map(|resolved| (!resolved).then_some(())));
+        }
+    }
+
+    #[test]
     fn no_run_commit_privacy_and_exact_group_activation_survive_reopen() {
         use crate::notifications::{Content, Evidence, Kind};
         for previews in [false, true] {
@@ -2426,12 +3099,9 @@ mod tests {
             let serialized = serde_json::to_string(&snapshot).unwrap();
             assert_eq!(serialized.contains("PRIVATE_AUTOMATION_TITLE"), previews);
             assert_eq!(serialized.contains("PRIVATE_AUTOMATION_REASON"), previews);
-            assert_eq!(
-                action_notice(&snapshot, batching::desktop_id(&old.event.target))
-                    .unwrap()
-                    .event
-                    .target,
-                current.event.target
+            assert!(
+                action_notice(&snapshot, batching::desktop_id(&old.event.target)).is_none(),
+                "a group-only click cannot select an automation lifecycle receipt"
             );
             assert!(
                 action_notice(&snapshot, old.id).is_none(),

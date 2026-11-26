@@ -196,7 +196,7 @@ fn adopt(transaction: &Transaction<'_>, scope: &Scope, home: &Home) -> Result<Ad
             operation: uuid::Uuid::new_v4(),
             change,
         };
-        views::apply_recorded(transaction, &edit, &mut recorder)?;
+        views::apply_recorded(transaction, &edit, &mut recorder, None)?;
         moved += 1;
     }
     let left: Vec<crate::model::CardId> = views::read(transaction, scope)?

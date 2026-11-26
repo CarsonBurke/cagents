@@ -220,6 +220,43 @@ fn pending_recovery_rejects_reduced_index_with_missing_host_options_without_muta
 }
 
 #[test]
+fn recovery_retries_carry_slots_closed_before_the_previous_claim() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let authority = preparation(root.path()).authority;
+    let request = ManualRequest {
+        version: 1,
+        job: uuid::Uuid::new_v4().to_string(),
+        checkpoint: "a".repeat(64),
+        source: authority.source,
+        target: PathBuf::from("/candidate/bin/cagentsd"),
+        target_hash: "b".repeat(64),
+        census_hash: digest(&serde_json::to_vec(&authority.census).unwrap()),
+        windows: vec!["primary".into()],
+    };
+    let mut earlier: ManualRequest =
+        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    earlier.job = uuid::Uuid::new_v4().to_string();
+    earlier.windows.push("closed-before-claim".into());
+    let old_path = root.path().join(format!("{}.request", earlier.job));
+    let old_bytes = serde_json::to_vec(&earlier).unwrap();
+    save(&old_path, &old_bytes);
+
+    earlier.job = uuid::Uuid::new_v4().to_string();
+    earlier.target_hash = "c".repeat(64);
+    earlier.windows = vec!["other-build".into()];
+    save(
+        &root.path().join(format!("{}.request", earlier.job)),
+        &serde_json::to_vec(&earlier).unwrap(),
+    );
+
+    assert_eq!(
+        request.carried_windows(root.path()).unwrap(),
+        BTreeSet::from(["closed-before-claim".into()])
+    );
+    assert_eq!(fs::read(old_path).unwrap(), old_bytes);
+}
+
+#[test]
 fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
     let root = crate::test_fixture::tempdir().unwrap();
     let mut authority = preparation(root.path()).authority;
@@ -387,13 +424,30 @@ fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
 }
 
 #[test]
+fn checkpoint_discovery_requires_a_known_string_phase() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    let path = &preparation.authority.checkpoint_path;
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&checkpoint(&preparation, "Prepared")).unwrap();
+    for phase in [
+        serde_json::json!({ "Ready": null }),
+        serde_json::json!("Future"),
+    ] {
+        checkpoint["phase"] = phase;
+        save(path, &serde_json::to_vec(&checkpoint).unwrap());
+        assert!(PendingRecovery::inspect_at(path).is_err());
+    }
+}
+
+#[test]
 fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let bytes = checkpoint(&preparation, "Prepared");
     assert_eq!(
         validate_checkpoint(&preparation.authority, &bytes).unwrap(),
-        "Prepared"
+        Phase::Prepared
     );
     let mut foreign: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     foreign["proof"]["host_incarnation"] = "unrelated-daemon".into();
@@ -449,7 +503,7 @@ fn a_reviewed_conversation_whose_provider_ended_need_not_be_checkpointed() {
     // window restarts the saved conversation.
     assert_eq!(
         check(&mut preparation, chat(PROVIDER_ENDED)).unwrap(),
-        "Prepared"
+        Phase::Prepared
     );
     // Any other reviewed conversation must still be in the checkpoint.
     assert_eq!(
@@ -868,7 +922,7 @@ fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issue
                 &serde_json::to_vec(&checkpoint).unwrap()
             )
             .unwrap(),
-            "Ready"
+            Phase::Ready
         );
         checkpoint["chats"][0]["launch"]["session_id"] = uuid::Uuid::new_v4().to_string().into();
         assert!(
@@ -2760,6 +2814,43 @@ fn complete_files(files: &SettledFiles) {
             &[],
         )
         .unwrap();
+}
+
+#[test]
+fn explicit_retry_reads_only_the_exact_completed_archive() {
+    let files = settled_files();
+    let hash = &files.record.checkpoint_hash;
+    let capture = CapturedCensus {
+        producer: Some(CaptureProducer::Acknowledged {
+            job: files.record.job.clone(),
+            request_hash: files.record.job_request_hash.clone(),
+        }),
+        source: files.record.source.clone(),
+        checkpoint_hash: Some(hash.clone()),
+        census: files.record.census.clone(),
+        windows: files.record.windows.clone(),
+    };
+    persist_bound_capture(&files.checkpoint, &capture).unwrap();
+    let inspect =
+        |hash: &str| PendingRecovery::inspect_archived_at(&files.checkpoint, hash, &files.target);
+    assert!(inspect(hash).unwrap().is_none());
+
+    complete_files(&files);
+    let pending = inspect(hash).unwrap().unwrap();
+    assert!(pending.original_census_complete);
+    assert_eq!(pending.census, capture.census);
+    assert_eq!(pending.windows, capture.windows);
+    assert!(inspect(&"0".repeat(64)).unwrap().is_none());
+
+    let archived = pending.checkpoint_path;
+    let hidden = archived.with_extension("hidden");
+    fs::rename(&archived, &hidden).unwrap();
+    assert!(inspect(hash).is_err());
+    fs::rename(&hidden, &archived).unwrap();
+    save(&files.checkpoint, br#"{"phase":"Ready"}"#);
+    assert!(inspect(hash).unwrap().is_none());
+    assert_eq!(fs::read(&archived).unwrap(), files.checkpoint_bytes);
+    assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
 }
 
 #[test]

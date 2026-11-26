@@ -7,6 +7,7 @@ pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     path::PathBuf,
@@ -27,10 +28,10 @@ use crate::{
     },
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
-        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
-        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight, StartupState,
-        TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
-        WireTerminalEvent,
+        MobileWatch, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+        ServerMessage, ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+        StartupState, TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions,
+        TerminalVisibility, WireTerminalEvent,
     },
     workspace_model::ModelEdit,
 };
@@ -234,6 +235,17 @@ impl Subscriptions {
             .is_some_and(|terminals| terminals.contains_key(&terminal_id))
     }
 
+    fn drives_presentation(&self, client_id: ClientId, terminal_id: TerminalId) -> bool {
+        self.by_client
+            .get(&client_id)
+            .and_then(|terminals| terminals.get(&terminal_id))
+            == Some(&TerminalVisibility::Visible)
+            && self
+                .viewports
+                .get(&(client_id, terminal_id))
+                .is_some_and(|view| view.focused || view.size.is_some())
+    }
+
     fn clients(&self, terminal_id: TerminalId) -> Vec<ClientId> {
         self.by_terminal
             .get(&terminal_id)
@@ -279,6 +291,13 @@ struct PendingPublication {
     reservation: Option<super::workspace::PendingTerminal>,
 }
 
+struct MobileSubscription {
+    topic: MobileWatch,
+    /// At most one edge outstanding until this watcher begins another read.
+    /// HostState serializes access to the credit with both reads and writes.
+    pending: Cell<bool>,
+}
+
 pub(crate) struct HostState {
     recover_holders: bool,
     /// Shared, never mutated: a redraw broadcast hands the same proof to every
@@ -302,7 +321,7 @@ pub(crate) struct HostState {
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) publishing_startup: bool,
     publication_pending: BTreeMap<TerminalId, PendingPublication>,
     /// Missing original owners after an acknowledged incomplete update. Their
@@ -389,6 +408,7 @@ pub(crate) struct HostState {
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
+    mobile_watchers: BTreeMap<ClientId, MobileSubscription>,
     notification_activation:
         BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
     subscriptions: Subscriptions,
@@ -404,6 +424,7 @@ pub(crate) struct HostState {
     /// Its terminal may be the final startup owner blocking ordinary exit.
     checked_close_replies: BTreeSet<ClientId>,
     pub(super) inventory_generation: u64,
+    pub(super) tally_updates: Arc<tokio::sync::Notify>,
     published_terminal_workers: removal::PublishedWorkers,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) native_chat_capacity: usize,
@@ -528,7 +549,7 @@ impl HostState {
             spawning_terminals: BTreeMap::new(),
             handoff_terminals: BTreeMap::new(),
             startup_custody: BTreeSet::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             publishing_startup: false,
             publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
@@ -563,6 +584,7 @@ impl HostState {
             notifications: None,
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
+            mobile_watchers: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
             shutting_down: false,
@@ -571,6 +593,7 @@ impl HostState {
             ordinary_exit_registration_closed: false,
             checked_close_replies: BTreeSet::new(),
             inventory_generation: 0,
+            tally_updates: Arc::new(tokio::sync::Notify::new()),
             published_terminal_workers: Default::default(),
             shutdown_capabilities: VecDeque::new(),
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
@@ -640,6 +663,7 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        self.mobile_watchers.remove(&client_id);
         self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
@@ -718,6 +742,12 @@ impl HostState {
             })
     }
 
+    pub(super) fn inventory_changed(&mut self) {
+        self.inventory_generation += 1;
+        self.tally_updates.notify_one();
+        self.mobile_sessions_changed();
+    }
+
     pub(super) fn notification_snapshot(&self) -> crate::notifications::Snapshot {
         self.notifications.as_ref().map_or_else(
             || crate::notifications::Snapshot {
@@ -794,7 +824,74 @@ impl HostState {
         }
     }
 
+    pub(super) fn watch_mobile(
+        &mut self,
+        client: ClientId,
+        topic: MobileWatch,
+    ) -> Result<(), ProtocolError> {
+        if let MobileWatch::Conversation(chat) = topic
+            && self.chats.get(&chat).is_none_or(|record| {
+                !record.subscribers.contains_key(&client)
+                    || (record.handle.is_completed()
+                        && !record.handle.owns_work()
+                        && !record.returning_terminal)
+            })
+        {
+            return Err(not_found(chat));
+        }
+        self.mobile_watchers.insert(
+            client,
+            MobileSubscription {
+                topic,
+                pending: Cell::new(false),
+            },
+        );
+        Ok(())
+    }
+
+    /// Rearm before taking the snapshot. A change racing that read is either
+    /// visible in its result or advances the next snapshot.
+    pub(super) fn mobile_snapshot_started(&self, client: ClientId, topic: MobileWatch) {
+        if let Some(watch) = self.mobile_watchers.get(&client)
+            && watch.topic == topic
+        {
+            watch.pending.set(false);
+        }
+    }
+
+    fn mobile_changed(&self, topic: MobileWatch) {
+        for (&client, watch) in &self.mobile_watchers {
+            if watch.topic == topic
+                && !watch.pending.replace(true)
+                && let Some(delivery) = self.clients.get(&client)
+            {
+                let _ = delivery.push(Outbound::broadcast(
+                    &self.proof,
+                    ServerMessage::MobileChanged { topic },
+                ));
+            }
+        }
+    }
+
+    pub(super) fn mobile_sessions_changed(&self) {
+        self.mobile_changed(MobileWatch::Sessions);
+    }
+
+    pub(super) fn mobile_chat_ended(&mut self, id: TerminalId) {
+        self.mobile_sessions_changed();
+        let topic = MobileWatch::Conversation(id);
+        self.mobile_changed(topic);
+        self.mobile_watchers.retain(|_, watch| watch.topic != topic);
+    }
+
+    pub(super) fn remove_chat(&mut self, id: TerminalId) -> Option<super::chat::Record> {
+        let record = self.chats.remove(&id)?;
+        self.mobile_chat_ended(id);
+        Some(record)
+    }
+
     pub(super) fn notifications_changed(&self) {
+        self.mobile_changed(MobileWatch::Notifications);
         for client in self.notification_watchers.keys() {
             if let Some(delivery) = self.clients.get(client) {
                 let _ = delivery.push(ServerEnvelope {
@@ -1076,6 +1173,7 @@ impl HostState {
         edit: &ModelEdit,
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
+        self.mobile_sessions_changed();
         let edit = edit.committed();
         for client_id in &self.model_watchers {
             if *client_id == origin {
@@ -1136,6 +1234,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.mobile_watchers.remove(&client_id);
         self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
@@ -1166,24 +1265,33 @@ impl HostState {
             .map(|terminals| {
                 terminals
                     .keys()
-                    .map(|terminal_id| (*terminal_id, self.subscriptions.visibility(*terminal_id)))
+                    .map(|&terminal_id| {
+                        (
+                            terminal_id,
+                            self.subscriptions.visibility(terminal_id),
+                            self.subscriptions
+                                .drives_presentation(client_id, terminal_id),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let handles = terminals
             .iter()
-            .filter_map(|(terminal_id, _)| {
+            .filter_map(|(terminal_id, _, _)| {
                 self.terminals
                     .get(terminal_id)
                     .map(|record| record.handle.clone())
             })
             .collect::<Vec<_>>();
-        for (terminal_id, _) in &terminals {
+        for (terminal_id, _, _) in &terminals {
             self.retain_presentation_watermark(client_id, *terminal_id);
         }
         self.subscriptions.disconnect(client_id);
-        for (terminal_id, old_visibility) in terminals {
-            self.refresh_presentation_owner(terminal_id);
+        for (terminal_id, old_visibility, drove_presentation) in terminals {
+            if drove_presentation {
+                self.refresh_presentation_owner(terminal_id);
+            }
             let new_visibility = self.subscriptions.visibility(terminal_id);
             if old_visibility != new_visibility
                 && let Some(record) = self.terminals.get(&terminal_id)
@@ -1240,6 +1348,9 @@ impl HostState {
             return Ok(());
         }
         self.retain_presentation_watermark(client_id, terminal_id);
+        let drove_presentation = self
+            .subscriptions
+            .drives_presentation(client_id, terminal_id);
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
         let new_visibility = self.subscriptions.visibility(terminal_id);
@@ -1248,7 +1359,9 @@ impl HostState {
                 .handle
                 .set_host_visibility(new_visibility);
         }
-        self.refresh_presentation_owner(terminal_id);
+        if drove_presentation {
+            self.refresh_presentation_owner(terminal_id);
+        }
         self.disarm_output_if_observed(terminal_id);
         Ok(())
     }
@@ -1276,6 +1389,9 @@ impl HostState {
                 false,
             ));
         };
+        let drove_presentation = self
+            .subscriptions
+            .drives_presentation(client_id, terminal_id);
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions
             .set_visibility(client_id, terminal_id, requested);
@@ -1283,7 +1399,13 @@ impl HostState {
         if old_visibility != new_visibility {
             record.handle.set_host_visibility(new_visibility);
         }
-        self.refresh_presentation_owner(terminal_id);
+        if drove_presentation
+            || self
+                .subscriptions
+                .drives_presentation(client_id, terminal_id)
+        {
+            self.refresh_presentation_owner(terminal_id);
+        }
         if requested == TerminalVisibility::Visible {
             let generation = self.presentation_revision(client_id, terminal_id);
             if let Some(delivery) = self.clients.get(&client_id) {
@@ -1588,7 +1710,7 @@ impl HostState {
         for client in clients {
             self.subscriptions.detach(client, terminal_id);
         }
-        self.inventory_generation += 1;
+        self.inventory_changed();
         Some(record)
     }
 
@@ -1738,7 +1860,7 @@ impl HostState {
         if let Some(spawned) = spawned {
             self.spawning_terminals.insert(terminal_id, spawned.clone());
         }
-        self.inventory_generation += 1;
+        self.inventory_changed();
         Ok(())
     }
 
@@ -1790,7 +1912,7 @@ impl HostState {
         self.spawning_transcripts.remove(&terminal_id);
         self.spawning_terminals.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
-            self.inventory_generation += 1;
+            self.inventory_changed();
         }
     }
 
@@ -1924,7 +2046,7 @@ impl HostState {
         }
         session.resume_hint =
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
-        self.inventory_generation += 1;
+        self.inventory_changed();
         self.notification_closed.remove(&terminal_id);
         self.terminals.insert(
             terminal_id,
@@ -2200,13 +2322,14 @@ impl HostState {
 
     fn inventory_count(&mut self) -> u64 {
         let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
+        let mut completed = 0;
         for record in self.chats.values_mut() {
             if !record.completion_observed
                 && !record.handle.owns_work()
                 && !record.returning_terminal
             {
                 record.completion_observed = true;
-                self.inventory_generation += 1;
+                completed += 1;
             }
             if !record.completion_observed {
                 count += 1;
@@ -2215,11 +2338,15 @@ impl HostState {
         for record in self.terminals.values_mut() {
             if !record.completion_observed && record.handle.is_completed() {
                 record.completion_observed = true;
-                self.inventory_generation += 1;
+                completed += 1;
             }
             if !record.completion_observed {
                 count += 1;
             }
+        }
+        if completed != 0 {
+            self.inventory_generation += completed;
+            self.tally_updates.notify_one();
         }
         count
     }
@@ -2479,6 +2606,23 @@ impl HostState {
         })
     }
 
+    pub(super) fn may_restore_session_notice(&self, id: TerminalId) -> bool {
+        self.terminals.contains_key(&id)
+            || self.chats.contains_key(&id)
+            || self.spawning.contains(&id)
+            || self.chat_spawning.contains_key(&id)
+            || self.handoff_terminals.contains_key(&id)
+            || self.chat_handoffs.contains_key(&id)
+            || self.native_closing.contains_key(&id)
+            || self.native_actor_startups.contains_key(&id)
+            || self.startup_custody_contains(id)
+            || self
+                .upgrade_chats
+                .values()
+                .flatten()
+                .any(|source| source.source.id == id)
+    }
+
     pub(super) fn startup_custody_contains(&self, id: TerminalId) -> bool {
         self.startup_custody.contains(&id)
     }
@@ -2499,7 +2643,7 @@ impl HostState {
     /// never cleared, so waiting on the remaining custody cannot finish startup.
     pub(super) fn startup_state(&self) -> StartupState {
         let state = self.startup_state_before_publication();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.publishing_startup && state == StartupState::Ready {
             return StartupState::Restoring { awaiting: 0 };
         }
@@ -2544,7 +2688,7 @@ impl HostState {
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
         if self.startup_recovery.is_none() {
             self.startup_recovery = Some(message);
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if self.publishing_startup {
                 crate::daemon::wake();
             }
@@ -2596,7 +2740,7 @@ impl HostState {
     }
 
     pub(super) fn startup_blocks_shutdown(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.publishing_startup {
             return true;
         }
@@ -3487,16 +3631,30 @@ fn apply_size(
 }
 
 /// Runs while HostLease is held, before accepting clients on the public listener.
-/// Returns the native conversations this restore left unattached: a retained
-/// one's reattachment was just refused, so startup must not retry it at once,
-/// and a relaunched one's failed restart was stopped for its pane to reopen.
-pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
-    restore_upgrade_from(
+/// Acknowledged updates defer checkpoint retirement until Ready proof is durable.
+pub(super) fn restore_upgrade_with_digest(
+    host: &SharedHost,
+    processes: &std::path::Path,
+    expected_digest: Option<&str>,
+) -> Result<RestoredUpgrade, String> {
+    let store = crate::upgrade::handoff::Store::discover()?;
+    let checkpoint = store.load_for_restore(expected_digest)?;
+    let mut restored = restore_upgrade_checkpoint(
         host,
-        crate::upgrade::handoff::Store::discover()?,
-        std::path::Path::new("/proc"),
+        store,
+        checkpoint,
+        processes,
         holder_directory().ok().as_deref(),
-    )
+    )?;
+    if expected_digest.is_none() {
+        restored.finish(host)?;
+    }
+    Ok(restored)
+}
+
+#[cfg(test)]
+pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
+    Ok(restore_upgrade_with_digest(host, std::path::Path::new("/proc"), None)?.unattached)
 }
 
 /// Lifecycle fixtures inspect real kernel data for their owned process roster
@@ -3506,12 +3664,7 @@ pub(in crate::host) fn restore_upgrade_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,
 ) -> Result<Vec<TerminalId>, String> {
-    restore_upgrade_from(
-        host,
-        crate::upgrade::handoff::Store::discover()?,
-        processes,
-        holder_directory().ok().as_deref(),
-    )
+    Ok(restore_upgrade_with_digest(host, processes, None)?.unattached)
 }
 
 /// An acknowledged incomplete update authorizes attaching its original holder
@@ -3855,23 +4008,73 @@ fn restart_or_stop(
     Ok(())
 }
 
-/// Replays a checkpoint, abandoning the replay as soon as termination is
-/// requested.
-///
-/// The accept loop is the only other place that observes
-/// `daemon::termination_requested`, and it is not reached until this returns, so
-/// without these checks the daemon kept launching checkpointed processes after
-/// `cagents daemon stop-for-rebuild` had asked it to stop, and a
-/// logout `SIGKILL` mid-restore left the checkpoint in `Phase::Restoring`, which
-/// is never automatically replayed for native sessions. Aborting through
-/// `close_failed_restore` positively closes whatever was already started and
-/// leaves the checkpoint in a replayable `Ready` phase.
+#[cfg(test)]
 fn restore_upgrade_from(
     host: &SharedHost,
     store: crate::upgrade::handoff::Store,
     proc_root: &std::path::Path,
     holders: Option<&std::path::Path>,
 ) -> Result<Vec<TerminalId>, String> {
+    let checkpoint = store.load()?;
+    let mut restored = restore_upgrade_checkpoint(host, store, checkpoint, proc_root, holders)?;
+    restored.finish(host)?;
+    Ok(restored.unattached)
+}
+
+#[derive(Default)]
+pub(super) struct RestoredUpgrade {
+    /// Startup must avoid immediately retrying these native conversations.
+    pub(super) unattached: Vec<TerminalId>,
+    finalization: Option<RestoreFinalization>,
+}
+
+struct RestoreFinalization {
+    store: Arc<crate::upgrade::handoff::Store>,
+    interrupted_setups: bool,
+}
+
+impl RestoredUpgrade {
+    pub(super) fn finish(&mut self, host: &SharedHost) -> Result<(), String> {
+        let Some(finalization) = self.finalization.take() else {
+            return Ok(());
+        };
+        let store = &finalization.store;
+        let result = if finalization.interrupted_setups {
+            store.archive_interrupted_setup().map(|evidence| {
+                tracing::warn!(evidence = %evidence.display(),
+                    "Interrupted worktree setup requires explicit review; its checkpoint was preserved and other sessions were restored");
+            })
+        } else {
+            store.remove()
+        };
+        if let Err(error) = result {
+            let message = format!(
+                "Upgrade restore finalization failed while retaining its original owners: {error}"
+            );
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain_startup_recovery(message.clone());
+            return Err(message);
+        }
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retained_startup_checkpoint
+            .take();
+        Ok(())
+    }
+}
+
+/// Stop starting checkpointed processes as soon as termination is requested.
+/// On graceful abort `close_failed_restore` closes replacements already started
+/// and returns the checkpoint to Ready. Hard interruption leaves Restoring
+/// evidence, which never authorizes automatic replay of native sessions.
+fn restore_upgrade_checkpoint(
+    host: &SharedHost,
+    store: crate::upgrade::handoff::Store,
+    checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
+    proc_root: &std::path::Path,
+    holders: Option<&std::path::Path>,
+) -> Result<RestoredUpgrade, String> {
     use crate::upgrade::{
         ensure_no_surviving_process,
         handoff::{Phase, UnattachedChat},
@@ -3889,11 +4092,10 @@ fn restore_upgrade_from(
             .unwrap_or_else(|p| p.into_inner())
             .upgrade_evidence = Some(store.clone());
     };
-    let Some(mut checkpoint) = store.load()? else {
+    let Some(mut checkpoint) = checkpoint else {
         publish();
-        return Ok(Vec::new());
+        return Ok(RestoredUpgrade::default());
     };
-    checkpoint.validate()?;
     if checkpoint
         .chats
         .iter()
@@ -3957,7 +4159,7 @@ fn restore_upgrade_from(
             checkpoint = %store.path.display(),
             "skipped upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
         );
-        return Ok(Vec::new());
+        return Ok(RestoredUpgrade::default());
     }
     // Restoration records its progress on disk, but retained-owner admission
     // must still use the exact Ready payload accepted at this boundary.
@@ -4211,7 +4413,7 @@ fn restore_upgrade_from(
                 %error,
                 "abandoned upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
             );
-            return Ok(Vec::new());
+            return Ok(RestoredUpgrade::default());
         }
         return Err(format!(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
@@ -4226,27 +4428,6 @@ fn restore_upgrade_from(
             restore_relaunched_execution_authority(host, chat.source.id);
         }
     }
-    let finalized = if interrupted_setups {
-        store.archive_interrupted_setup().map(|evidence| {
-            tracing::warn!(evidence = %evidence.display(),
-                "Interrupted worktree setup requires explicit review; its checkpoint was preserved and other sessions were restored");
-        })
-    } else {
-        store.remove()
-    };
-    if let Err(error) = finalized {
-        let message = format!(
-            "Upgrade restore finalization failed while retaining its original owners: {error}"
-        );
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.upgrade_evidence = Some(store.clone());
-        state.retain_startup_recovery(message.clone());
-        return Err(message);
-    }
-    host.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_startup_checkpoint
-        .take();
     publish();
     if !unattached.is_empty() {
         tracing::warn!(
@@ -4255,7 +4436,13 @@ fn restore_upgrade_from(
             "the daemon upgrade finished, but native conversations it could not restore need attention"
         );
     }
-    Ok(unattached.iter().map(|chat| chat.summary.id).collect())
+    Ok(RestoredUpgrade {
+        unattached: unattached.iter().map(|chat| chat.summary.id).collect(),
+        finalization: Some(RestoreFinalization {
+            store,
+            interrupted_setups,
+        }),
+    })
 }
 
 /// Forgets unattached conversations whose native holder no longer exists,
@@ -6256,6 +6443,16 @@ fn record_event_from(
         while record.events.len() > EVENT_REPLAY_CAPACITY {
             record.events.pop_front();
         }
+        if matches!(
+            wire_event,
+            WireTerminalEvent::ConversationTitleChanged { .. }
+                | WireTerminalEvent::WorkingDirectoryChanged { .. }
+                | WireTerminalEvent::AgentActivityChanged { .. }
+                | WireTerminalEvent::Completed { .. }
+                | WireTerminalEvent::Exited { .. }
+        ) {
+            state.mobile_sessions_changed();
+        }
         let deliveries = client_ids
             .into_iter()
             .filter(|client_id| recipient.is_none_or(|owner| owner == *client_id))
@@ -6267,6 +6464,12 @@ fn record_event_from(
         let wake_exit = state.ordinary_exit_cleanup_pending
             && worker.is_some()
             && matches!(wire_event, WireTerminalEvent::Completed { .. });
+        if matches!(
+            wire_event,
+            WireTerminalEvent::AgentActivityChanged { .. } | WireTerminalEvent::Exited { .. }
+        ) {
+            state.tally_updates.notify_one();
+        }
         (proof, sequence, deliveries, wake_exit)
     };
     if wake_exit {

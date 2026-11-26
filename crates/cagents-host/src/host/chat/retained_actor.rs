@@ -1098,7 +1098,7 @@ pub(super) fn forget_startup(
         .is_some_and(|pending| &pending.source == source && Arc::ptr_eq(&pending.context, context))
     {
         state.native_actor_startups.remove(&source.id);
-        state.inventory_generation += 1;
+        state.inventory_changed();
         crate::daemon::wake();
     }
 }
@@ -2518,7 +2518,7 @@ fn restore_actor_inner(
     state.chat_added(id);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);
-    state.inventory_generation += 1;
+    state.inventory_changed();
     drop(state);
     drop(retired);
     if visible {
@@ -2673,7 +2673,7 @@ fn close_with_target(
             let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
             if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
                 state.chat_spawning.remove(&self.source.id);
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
         }
     }
@@ -2699,7 +2699,7 @@ fn close_with_target(
         }
         if closing.is_none() {
             state.chat_spawning.insert(requested.id, requested.clone());
-            state.inventory_generation += 1;
+            state.inventory_changed();
         }
         state.proof().clone()
     };
@@ -3024,7 +3024,7 @@ fn remove_closed_resident(
         if let Some((terminal, _)) = paired {
             state.retire_terminal(terminal.id);
         }
-        let removed = state.chats.remove(&source.id);
+        let removed = state.remove_chat(source.id);
         // Ordinary Close may finish a previously failed initialization too.
         // Clear only the startup captured by this fully retired attachment;
         // a replacement owner or an unproved teardown retains its reservation.
@@ -3048,7 +3048,7 @@ fn remove_closed_resident(
                 Ending::Stopped => notifications.clear_session_waiting(source.id),
             }
         }
-        state.inventory_generation += 1;
+        state.inventory_changed();
         removed
     };
     drop(removed);
@@ -3265,7 +3265,7 @@ fn close_verified_unattached(
                 Ending::Stopped => notifications.clear_session_waiting(requested.id),
             }
         }
-        state.inventory_generation += 1;
+        state.inventory_changed();
     }
     super::super::state::retire_unattached_upgrade_chat(host, requested.id);
     Ok(())

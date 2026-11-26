@@ -1,5 +1,7 @@
 package dev.cagents.mobile.android.ssh
 
+import android.system.ErrnoException
+import android.system.OsConstants
 import com.hierynomus.sshj.key.KeyAlgorithms
 import com.hierynomus.sshj.userauth.certificate.Certificate
 import dev.cagents.mobile.android.data.ConnectionSettings
@@ -36,6 +38,7 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.security.PrivateKey
 import java.security.PublicKey
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.time.Duration.Companion.milliseconds
@@ -221,10 +224,10 @@ private suspend fun connect(target: SshTarget, host: String): SSHClient {
         throw e
     } catch (e: TransportException) {
         client.disconnectQuietly()
-        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e)
+        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, host.takeIf { isRefusal(e) })
     } catch (e: Exception) {
         client.disconnectQuietly()
-        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e)
+        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, host.takeIf { isRefusal(e) })
     }
     return client
 }
@@ -254,6 +257,25 @@ internal fun describeConnectFailure(e: Throwable, host: String, port: Int): Stri
     val known = generateSequence(e) { it.cause }.firstOrNull {
         it is UnknownHostException || it is ConnectException || it is NoRouteToHostException || it is SocketTimeoutException
     }
+    return when {
+        isRefusal(e) ->
+            "$host refused the connection on port $port. Is its SSH server running on that port? " +
+                "Check the port in Settings, or pair again."
+        else -> describeKnown(known, e, host, address)
+    }
+}
+
+/**
+ * Whether the computer answered and turned the connection down, as it does
+ * when nothing listens on the port, rather than not answering at all.
+ */
+internal fun isRefusal(e: Throwable): Boolean = generateSequence(e) { it.cause }.any { cause ->
+    (cause is ErrnoException && cause.errno == OsConstants.ECONNREFUSED) ||
+        // The JVM says so only in words.
+        (cause is ConnectException && cause.message.orEmpty().let { "ECONNREFUSED" in it || "Connection refused" in it })
+}
+
+private fun describeKnown(known: Throwable?, e: Throwable, host: String, address: String): String {
     return when (known) {
         is UnknownHostException -> "Couldn't find $host. Check the address."
         is ConnectException, is NoRouteToHostException ->
@@ -332,6 +354,7 @@ private class SshLineChannel(
     private val reader = BufferedReader(InputStreamReader(command.inputStream, Charsets.UTF_8))
     private val output: OutputStream = command.outputStream
     private val writeLock = Mutex()
+    private val closed = AtomicBoolean()
     private val stderr = StringBuilder()
     private val stderrReader = thread(name = "cagents-bridge-stderr", isDaemon = true) {
         runCatching {
@@ -373,10 +396,12 @@ private class SshLineChannel(
     }
 
     /**
-     * Drops the whole connection without waiting for the computer: closing the
-     * session channel first would wait for its reply, which a dead network never sends.
+     * Close the socket first to release a reader or writer blocked on a dead
+     * network. SSHJ's graceful disconnect sends a packet on the same socket.
      */
     override fun close() {
-        runCatching { client.disconnect() }
+        if (!closed.compareAndSet(false, true)) return
+        runCatching { client.socket?.close() }
+        client.disconnectQuietly()
     }
 }

@@ -148,26 +148,28 @@ cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
 
 The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
 the release's members, refuses links in the tree, and checks every signature in
-a staging directory before it moves the release into place. It prepares the
-bundle there too, and the login item in a hidden folder beside the one it
-replaces, so that publishing it is a rename on the same volume whatever the
-prefix. It checks that each program runs from its version tree, and only then
-moves `current`, the bundle, the links and the login item. Renaming the record
-of the version kept for rollback into place commits the install; a failure or
-interrupt before that puts each change back, judging what to undo from what
-each step left on disk, so the previous installation stays as it was. It holds
-a lock on the prefix while it works. It installs over a running daemon only of the
-same version, asking the installed CLI, which speaks that daemon's protocol:
-the daemon cannot yet hand its sessions to another version on macOS, so it
-says how to stop it instead, and it refuses when it cannot tell. `--uninstall`
-removes the installation, its links, and the login item when that runs this
-installation; `--purge` also removes saved app data, and needs the installed
-CLI to check for a running daemon first. Only an installation in the account's
-own home registers `Cagents.app` with Launch Services or loads and unloads its
-login item, so a test install under a private `HOME`, as the package's smoke
-test makes, leaves the account's own alone. launchd would run that login item
-in the account's environment, serving the account's data, so such an install
-starts its daemon directly instead.
+a private staging directory. Quit all cagents windows and stop the daemon
+before replacing or removing an installation. The installer holds the
+application launch fence while it checks for a running daemon and changes the
+installation. A per-user publication lock also excludes a second installer
+even when it uses another runtime directory. The installer starts the selected
+daemon after releasing both locks, unless `--no-start` is set.
+
+The release tree and bundle are staged on the prefix's volume. The login item
+is staged beside the one it replaces, so it can be published by rename even when
+the prefix is on another volume. The installer checks that each program runs
+from its version tree before it switches `current`, the bundle, the links and
+the login item. Renaming the record of the previous version commits the
+installation. Before that commit, error handling and soft signals roll back
+the publication.
+
+`--uninstall` uses the installed CLI to acquire the fence, then removes the
+installation, its links and its login item. `--purge` also removes saved app
+data. Use an older release's own installer if its CLI predates this command.
+Only installations under the account's own home register `Cagents.app` with
+Launch Services. The installer unloads its previous login job during
+publication. The new job runs at the next login. The package smoke test
+installs under a private `HOME` and starts its isolated daemon directly.
 
 Every executable and the bundle are signed ad hoc (`codesign --sign -`), which
 Apple Silicon requires to run anything. Files that `curl`, `tar` or
@@ -193,15 +195,26 @@ artifacts like the release signing key.
 
 To cut a release with the macOS build, give `cut` or `build` the Mac with
 `--macos-host MAC` (or `CAGENTS_RELEASE_MACOS_HOST`). The release exports the
-commit, copies it to `~/Library/Caches/cagents-release/VERSION` on the Mac and
-runs its `scripts/package-macos` there, which builds, signs and installs it in
-a private home and prefix to check the commands, bundle and login item. It
-brings the three files back into the bundle before the metadata is written and
-signed, then removes the export; the Cargo target stays in
-`~/Library/Caches/cagents-release/target` for the next release. The publisher
+commit to a private staging directory on the Mac and runs that commit's
+`scripts/package-macos`. The packager builds, signs and installs the package in
+a private home and prefix to check the commands, bundle and login item. Cut
+brings the three files into the bundle before writing and signing the metadata.
+The Mac removes the staged source and keeps the shared Cargo target in
+`~/Library/Caches/cagents-release/target` for later builds. The publisher
 then requires all three files, checks `SHA256SUMS-macos` and the archive's
 members, and adds a macOS section to the release notes. GitHub Actions builds
 no macOS release yet.
+
+To build and smoke-test macOS while fw16 prepares Linux, run
+`scripts/release prepare-macos --commit SHA --macos-host macbook`. Use the
+same SHA and host for `scripts/release cut --commit SHA --macos-host macbook`.
+The prepared assets are under `$CAGENTS_RELEASE_BUNDLES/.prepared-macos`
+and remain available for later cuts. Cut checks the source commit and asset
+digests before using them. If preparation is missing or damaged, cut builds
+and smoke-tests macOS on the selected host. Cut still requires the passing
+fw16 verdict and Linux bundle for that same commit. When cut waits for main's
+tip and the exact tip already has a passing test verdict, it prepares macOS
+while waiting for the Linux bundle.
 
 ## Native platform roadmap
 

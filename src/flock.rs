@@ -3,6 +3,33 @@
 use std::os::unix::fs::MetadataExt;
 use std::{collections::BTreeSet, fs, io, path::Path};
 
+/// Prove an inherited exclusive lock still protects the expected private path.
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_inherited_exclusive_at(file: &fs::File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let actual = file.metadata()?;
+    let same_path = || -> io::Result<bool> {
+        let named = fs::symlink_metadata(path)?;
+        Ok(named.is_file() && (named.dev(), named.ino()) == (actual.dev(), actual.ino()))
+    };
+    if !actual.is_file()
+        || actual.uid() != crate::daemon::current_uid()
+        || actual.mode() & 0o077 != 0
+        || actual.nlink() != 1
+        || !same_path()?
+    {
+        return Err(io::Error::other("inherited a different installation fence"));
+    }
+    verify_inherited_exclusive(file)?;
+    if !same_path()? {
+        return Err(io::Error::other(
+            "installation fence changed during validation",
+        ));
+    }
+    Ok(())
+}
+
 /// Verify an exclusive flock on a description passed by a trusted updater.
 /// The caller must retain custody throughout transfer and never explicitly
 /// unlock. Darwin cannot atomically inspect a flock's owning description:

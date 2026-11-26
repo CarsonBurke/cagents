@@ -649,18 +649,39 @@ pub async fn refresh_search_path() -> Option<OsString> {
 /// The `PATH` `shell` sets up when started interactively, as a terminal
 /// starts it, or `None` if it does not say within `timeout`.
 ///
-/// Interactive, and not a login shell, because that is how a terminal starts
-/// it: the startup files that put a CLI on the `PATH` - `.bashrc`, `.zshrc`,
-/// a Node version manager's hook - are the interactive ones, which a login
-/// shell run without a terminal would skip.
+/// Interactive startup includes the files that add provider executables.
+/// On macOS, Terminal starts an interactive login shell by default. Its
+/// login startup also adds system directories that a provider's launcher
+/// may need, such as the Homebrew directory containing Node for Codex.
 ///
 /// It runs with no terminal and its output discarded but for the `PATH` it
 /// prints, in its own process group, which goes with it. Nothing it starts
 /// can ask the reader for anything: no terminal, no input, no display, no
 /// askpass.
 async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
+    // Some shells (including tcsh) do not accept a combined login and
+    // command invocation. Fall back within the original probe budget.
+    let modes: &[&str] = if cfg!(target_os = "macos") {
+        &["-il", "-i"]
+    } else {
+        &["-i"]
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    for &mode in modes {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Some(path) = shell_path_in_mode(shell, mode, remaining).await {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn shell_path_in_mode(shell: &Path, mode: &str, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
-    command.args(["-i", "-c", SHELL_PATH_COMMAND]);
+    command.args([mode, "-c", SHELL_PATH_COMMAND]);
     scrub(&mut command, SHELL_SCRUBBED_ENVIRONMENT);
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
@@ -3057,11 +3078,16 @@ exec /bin/cat >/dev/null
         make_executable(&cli);
         let shell = directory.path().join("shell");
         let asked = directory.path().join("asked");
+        let expected_flags = if cfg!(target_os = "macos") {
+            "-il -c"
+        } else {
+            "-i -c"
+        };
         std::fs::write(
             &shell,
             format!(
                 "#!/bin/sh\n\
-                 [ \"$1 $2\" = '-i -c' ] || exit 9\n\
+                 [ \"$1 $2\" = '{expected_flags}' ] || exit 9\n\
                  [ -z \"${{DISPLAY-}}${{WAYLAND_DISPLAY-}}${{SSH_ASKPASS-}}\" ] || exit 8\n\
                  printf '%s' \"$3\" > '{}'\n\
                  printf 'Welcome back\\0__cagents_path__'\n\
@@ -3088,6 +3114,26 @@ exec /bin/cat >/dev/null
         assert!(
             started.elapsed() < timeout + EXIT_GRACE,
             "a shell out of time is not given a grace to exit"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_shell_that_rejects_login_command_mode_still_supplies_a_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let shell = directory.path().join("shell");
+        std::fs::write(
+            &shell,
+            r#"#!/bin/sh
+[ "$1 $2" = '-i -c' ] || exit 9
+PATH=/fixture/bin eval "$3"
+"#,
+        )
+        .unwrap();
+        make_executable(&shell);
+        assert_eq!(
+            shell_path(&shell, Duration::from_secs(5)).await,
+            Some("/fixture/bin".into())
         );
     }
 

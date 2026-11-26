@@ -272,6 +272,10 @@ pub enum Update {
         model: Option<super::ActiveModel>,
     },
     ConversationNameChanged,
+    /// Local edge for directory readers. Retained helpers carry the failure
+    /// in resident metadata, from which the host emits its own edge.
+    #[serde(skip)]
+    FailureChanged,
 }
 
 pub struct ConversationNaming {
@@ -553,7 +557,7 @@ impl LocalHandle {
     /// when it published each update. A frame's confirmation is installed
     /// before the outcomes it settles are published.
     pub(super) fn start_retained(
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
@@ -569,6 +573,7 @@ impl LocalHandle {
             &spec.working_directory,
             |name| spec.environment.get(name).map(std::ffi::OsString::from),
         )?;
+        super::protocol::claude::apply_spawn_attribution(&mut spec, store.directory());
         let confirmed_session = Arc::new(Mutex::new(None));
         let followed = confirmed_session.clone();
         Self::start_with_scope(
@@ -793,6 +798,7 @@ impl LocalHandle {
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
                     waiting_fingerprint: None,
+                    published_error: None,
                     last_present: Instant::now(),
                     first_frame: false,
                     stdout_noise: spec.stdout_noise,
@@ -1817,7 +1823,7 @@ impl LocalHandle {
         state
             .subagents
             .iter()
-            .filter(|agent| agent.background && agent.status.is_live())
+            .filter(|agent| agent.background && agent.is_live())
             .map(|agent| agent.id.clone())
             .collect()
     }
@@ -2665,6 +2671,7 @@ struct Actor {
     execution: execution::Tracker,
     attention_baselined: bool,
     waiting_fingerprint: Option<String>,
+    published_error: Option<String>,
     last_present: Instant,
     first_frame: bool,
     stdout_noise: Option<fn(&[u8]) -> bool>,
@@ -4315,12 +4322,19 @@ impl Actor {
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
         }
+        let error_changed = self.published_error != state.error;
+        if error_changed {
+            self.published_error.clone_from(&state.error);
+        }
         self.retained = counter.0;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
         drop(state);
         if name_changed {
             (self.notify)(Update::ConversationNameChanged);
+        }
+        if error_changed {
+            (self.notify)(Update::FailureChanged);
         }
     }
     fn publish_activity(&mut self) {
@@ -5069,7 +5083,7 @@ fn apply_projected_event(
 fn stop_snapshot_steps(state: &mut Snapshot) {
     stop_running_steps(&mut state.items);
     for agent in &mut state.subagents {
-        if agent.status == ToolStatus::Running {
+        if agent.is_running() {
             agent.status = ToolStatus::Stopped;
             agent.waiting = false;
         }
@@ -5098,17 +5112,31 @@ fn stop_running_steps(items: &mut [Arc<Item>]) {
 /// available for status and selective Stop.
 fn trim_subagents(state: &mut Snapshot) {
     const RICH_HISTORY: usize = 32;
-    while state.subagents.len() > RICH_HISTORY {
+    // The provider bounds its unloaded listing separately. A catalog row
+    // does not buy history by evicting a followed child's transcript.
+    let mut followed = state
+        .subagents
+        .iter()
+        .filter(|agent| !agent.last_seen_running())
+        .count();
+    while followed > RICH_HISTORY {
         let Some(finished) = state
             .subagents
             .iter()
-            .position(|agent| !agent.status.is_live())
+            .position(|agent| !agent.last_seen_running() && !agent.is_live())
         else {
             break;
         };
         state.subagents.remove(finished);
+        followed -= 1;
     }
-    for agent in state.subagents.iter_mut().rev().skip(RICH_HISTORY) {
+    for agent in state
+        .subagents
+        .iter_mut()
+        .rev()
+        .filter(|agent| !agent.last_seen_running())
+        .skip(RICH_HISTORY)
+    {
         agent.items.clear();
     }
 }
