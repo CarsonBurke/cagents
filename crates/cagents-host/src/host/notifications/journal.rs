@@ -103,9 +103,9 @@ impl Journal {
         Ok(Self(connection))
     }
 
-    /// Read only committed entries. The broker remains the sole writer
-    /// and can still be working on desktop delivery for these entries.
-    pub(super) fn committed_notices(path: &Path) -> Result<Vec<Notice>, String> {
+    /// The broker remains the sole writer. A reader can observe committed
+    /// identities while that broker works on presentation and desktop delivery.
+    pub(super) fn open_reader(path: &Path) -> Result<Self, String> {
         drop(
             crate::secure_file::open_existing_private_file_readonly(path)
                 .map_err(|error| error.to_string())?,
@@ -119,7 +119,33 @@ impl Journal {
         connection
             .batch_execute("PRAGMA query_only=ON; PRAGMA busy_timeout=100;")
             .map_err(|error| error.to_string())?;
-        Self(connection).list()
+        Ok(Self(connection))
+    }
+
+    pub(super) fn unread_session_ids(
+        &mut self,
+        sessions: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<std::collections::BTreeMap<Uuid, crate::model::TerminalId>, String> {
+        notices::table
+            .filter(notices::acknowledged.eq(false))
+            .select((notices::session, notices::id))
+            .limit(MAX_SESSIONS)
+            .load::<(String, String)>(&mut self.0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter_map(|(key, id)| {
+                let session = key
+                    .parse()
+                    .ok()
+                    .filter(|session| sessions.contains(session))?;
+                Some(Uuid::parse_str(&id).map(|id| (id, session)))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn committed_notices(path: &Path) -> Result<Vec<Notice>, String> {
+        Self::open_reader(path)?.list()
     }
 
     /// Coalesce latest attention without resurrecting dismissed duplicates.
@@ -376,6 +402,21 @@ impl Journal {
     }
 
     pub fn acknowledge(&mut self, id: Uuid) -> Result<Option<String>, String> {
+        self.acknowledge_notice(id, false)
+    }
+
+    pub(super) fn acknowledge_with_withdrawal(
+        &mut self,
+        id: Uuid,
+    ) -> Result<Option<String>, String> {
+        self.acknowledge_notice(id, true)
+    }
+
+    fn acknowledge_notice(
+        &mut self,
+        id: Uuid,
+        save_withdrawal: bool,
+    ) -> Result<Option<String>, String> {
         let id = id.to_string();
         self.0
             .transaction(|connection| {
@@ -388,7 +429,7 @@ impl Journal {
                     return Ok(None);
                 };
                 if !acknowledged {
-                    if key.starts_with("automation:") {
+                    if save_withdrawal || key.starts_with("automation:") {
                         remember_notice_withdrawal(connection, &key, &id)?;
                     }
                     diesel::update(notice)
@@ -512,6 +553,16 @@ impl Reopening {
 
     pub(super) fn journal(&mut self) -> Result<&mut Journal, &String> {
         self.journal.as_mut().map_err(|error| &*error)
+    }
+
+    /// Attempt one last open for reads already accepted before shutdown.
+    pub(super) fn journal_for_shutdown(&mut self) -> Result<&mut Journal, &String> {
+        if self.journal.is_err()
+            && let Some(path) = &self.path
+        {
+            self.journal = Journal::open(path);
+        }
+        self.journal()
     }
 
     /// When a failed journal is next tried, if it can be.

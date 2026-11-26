@@ -4530,15 +4530,25 @@ fn process_inner(
         } => chat_command(host, client, chat_id, command, Some(delivery)),
         ClientRequest::ChatAcknowledge { chat_id, epoch } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            // An attached terminal can explicitly acknowledge its conversation.
+            // Output rearm during reconnect uses a separate request.
+            if state.attached_terminal_conversation(client, chat_id) {
+                drop(state);
+                super::notifications::acknowledge_predecessors(host, chat_id);
+                return Ok(ServerResponse::Accepted);
+            }
             if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
                 receipt.require_attached(client)?;
                 return Ok(ServerResponse::Accepted);
             }
             let record = attached_mut(&mut state, client, chat_id)?;
             let observation = record.observations.entry(client).or_default();
-            if epoch > observation.epoch {
-                observation.acknowledge(epoch, record.handle.observe_next_update());
+            if epoch <= observation.epoch {
+                return Ok(ServerResponse::Accepted);
             }
+            observation.acknowledge(epoch, record.handle.observe_next_update());
+            drop(state);
+            super::notifications::acknowledge_predecessors(host, chat_id);
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatVisibility { chat_id, visible } => {

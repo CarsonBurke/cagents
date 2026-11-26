@@ -1483,6 +1483,10 @@ impl HostState {
         Ok(())
     }
 
+    pub(super) fn attached_terminal_conversation(&self, client: ClientId, id: TerminalId) -> bool {
+        self.attached_terminal(client, id).is_ok()
+    }
+
     pub(crate) fn list(&self, client_id: ClientId) -> Vec<TerminalDescriptor> {
         self.terminals
             .keys()

@@ -853,6 +853,7 @@ enum ClientCommand {
     },
     Visibility(TerminalVisibility),
     AcknowledgeOutput(u64),
+    AcknowledgeConversation(Instant),
     Hibernate,
     Resume {
         visible: bool,
@@ -877,11 +878,16 @@ impl ClientCommand {
             Self::Search { .. } => "search terminal",
             Self::Visibility(_) => "set terminal visibility",
             Self::AcknowledgeOutput(_) => "acknowledge terminal output",
+            Self::AcknowledgeConversation(_) => "acknowledge conversation attention",
             Self::Hibernate => "hibernate terminal",
             Self::Resume { .. } => "resume terminal",
             Self::ShutdownTerminal(_) => "shutdown terminal",
             Self::Stop => "detach terminal",
         }
+    }
+
+    fn belongs_to_connection(&self, connected_at: Instant) -> bool {
+        !matches!(self, Self::AcknowledgeConversation(read_at) if *read_at < connected_at)
     }
 
     fn into_request(self, terminal_id: TerminalId) -> ClientRequest {
@@ -930,6 +936,10 @@ impl ClientCommand {
             Self::AcknowledgeOutput(epoch) => {
                 ClientRequest::TerminalAcknowledge { terminal_id, epoch }
             }
+            Self::AcknowledgeConversation(_) => ClientRequest::ChatAcknowledge {
+                chat_id: terminal_id,
+                epoch: 1,
+            },
             Self::Hibernate => ClientRequest::Hibernate { terminal_id },
             Self::Resume { visible } => ClientRequest::Resume {
                 terminal_id,
@@ -1236,6 +1246,16 @@ impl HostedTerminalHandle {
         Ok(())
     }
 
+    /// A person has read the attached conversation. Reattaching never
+    /// replays this request with the terminal's output-observation epoch.
+    pub fn acknowledge_conversation_attention(&self) -> Result<(), TerminalSendError> {
+        let read_at = Instant::now();
+        if !matches!(self.current_attachment(), Ok(Some(_))) {
+            return Err(TerminalSendError::Closed);
+        }
+        self.try_command(ClientCommand::AcknowledgeConversation(read_at))
+    }
+
     pub fn events(&self) -> Receiver<TerminalEvent> {
         self.inner.published.begin_event_drain();
         self.inner.events.clone()
@@ -1451,6 +1471,7 @@ enum PendingRequest {
     Spawn,
     Snapshot,
     Acknowledge,
+    ConversationRead,
     Command(&'static str),
     // QueueFull for these commands proves no PTY input was admitted. Keep the
     // type of the original request, rather than classifying an operation label.
@@ -2202,6 +2223,7 @@ fn serve_connection(
     } = context;
     let terminal_id = *terminal_id;
     published.clear_current_attachment();
+    let connected_at = Instant::now();
     // Retire currentness on every EOF, retry, stop, or unwind before the next
     // connection can authenticate. The remembered proof remains unchanged.
     let _attachment = CurrentAttachment(published);
@@ -2635,19 +2657,14 @@ fn serve_connection(
             {
                 return ConnectionEnd::Retry;
             }
-            let epoch = published
-                .output_observation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .epoch;
-            if epoch != 0
+            if let Some(request) = restored_output_observation(published, terminal_id)
                 && send_request(
                     connection.writer(),
                     &proof,
                     &mut next_request_id,
                     &mut pending,
                     PendingRequest::Command("restore terminal output observation"),
-                    ClientRequest::TerminalAcknowledge { terminal_id, epoch },
+                    request,
                 )
                 .is_err()
             {
@@ -2694,12 +2711,16 @@ fn serve_connection(
                 connection.close();
                 return ConnectionEnd::Stop;
             }
+            if !command.belongs_to_connection(connected_at) {
+                continue;
+            }
             let operation = command.operation();
             let pending_kind = match &command {
                 ClientCommand::Input(_)
                 | ClientCommand::Paste(..)
                 | ClientCommand::Key(_)
                 | ClientCommand::Mouse(_) => PendingRequest::Input(operation),
+                ClientCommand::AcknowledgeConversation(_) => PendingRequest::ConversationRead,
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -2961,7 +2982,8 @@ fn serve_connection(
                             snapshot_pending = true;
                         }
                     }
-                    (PendingRequest::Acknowledge, ServerResponse::Accepted)
+                    (PendingRequest::ConversationRead, ServerResponse::Accepted)
+                    | (PendingRequest::Acknowledge, ServerResponse::Accepted)
                     | (PendingRequest::Command(_), ServerResponse::Accepted)
                     | (PendingRequest::Input(_), ServerResponse::Accepted) => {}
                     (PendingRequest::Hibernate, ServerResponse::Accepted) => {}
@@ -3026,6 +3048,15 @@ fn serve_connection(
                     };
                 };
                 let request = pending.remove(&request_id);
+                // An older compatible daemon only recognizes this request on
+                // native chat. Refusal of the optional attention operation
+                // does not indicate a broken PTY attachment.
+                if matches!(request, Some(PendingRequest::ConversationRead))
+                    && error.code != ProtocolErrorCode::ProofMismatch
+                {
+                    tracing::debug!(%terminal_id, message = %error.message, "terminal conversation read was refused");
+                    continue;
+                }
                 if let Some(PendingRequest::Input(operation)) = &request {
                     let refusal = match (error.code, error.retryable, error.message.as_str()) {
                         (ProtocolErrorCode::QueueFull, true, _) => {
@@ -3070,6 +3101,7 @@ fn serve_connection(
                         "fetch hosted terminal snapshot"
                     }
                     Some(PendingRequest::Acknowledge) => "acknowledge hosted terminal redraw",
+                    Some(PendingRequest::ConversationRead) => "acknowledge conversation attention",
                     Some(PendingRequest::Hibernate) => "hibernate terminal",
                     Some(PendingRequest::Shutdown(_)) => "shutdown terminal",
                     Some(PendingRequest::Command(operation) | PendingRequest::Input(operation)) => {
@@ -3392,6 +3424,18 @@ impl RetainedPresentationFixture {
     }
 }
 
+fn restored_output_observation(
+    published: &HostedPublishedState,
+    terminal_id: TerminalId,
+) -> Option<ClientRequest> {
+    let epoch = published
+        .output_observation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .epoch;
+    (epoch != 0).then_some(ClientRequest::TerminalAcknowledge { terminal_id, epoch })
+}
+
 #[cfg(test)]
 mod tests {
     mod explicit_authority_tests;
@@ -3427,6 +3471,34 @@ mod tests {
                 assert_eq!(published.frame().generation, generation);
                 assert!(!published.needs_snapshot(generation, false));
             }
+        }
+
+        #[test]
+        fn a_hidden_reconnect_only_rearms_output_until_an_explicit_conversation_read() {
+            let published = HostedPublishedState::new(None, true, Arc::new(|_| {}));
+            published.set_visibility(TerminalVisibility::Hidden);
+            published.output_observation.lock().unwrap().epoch = 8;
+            let id = TerminalId::new();
+            assert_eq!(
+                restored_output_observation(&published, id),
+                Some(ClientRequest::TerminalAcknowledge {
+                    terminal_id: id,
+                    epoch: 8
+                }),
+            );
+            let connected_at = Instant::now();
+            let previous =
+                ClientCommand::AcknowledgeConversation(connected_at - Duration::from_millis(1));
+            let current = ClientCommand::AcknowledgeConversation(connected_at);
+            assert!(!previous.belongs_to_connection(connected_at));
+            assert!(current.belongs_to_connection(connected_at));
+            assert_eq!(
+                current.into_request(id),
+                ClientRequest::ChatAcknowledge {
+                    chat_id: id,
+                    epoch: 1
+                },
+            );
         }
 
         #[test]
@@ -4755,6 +4827,127 @@ mod tests {
                 TerminalEvent::ResumeHintChanged(_)
             ));
         }
+    }
+
+    #[test]
+    fn an_older_daemon_can_refuse_terminal_attention_without_failing_the_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = crate::descriptor::bind(&socket).unwrap();
+        let session = session();
+        let terminal_id = session.id;
+        let pinned = proof("legacy-read");
+        let handle =
+            HostedTerminalHandle::connect_at(socket, terminal_id, Some(pinned.clone()), |_| {})
+                .unwrap();
+        let mut stream = accept_connection(&listener);
+        let send = |stream: &mut UnixStream, request_id, message| {
+            write_frame(
+                stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: pinned.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+        };
+        let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        send(
+            &mut stream,
+            Some(connect.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: pinned.clone(),
+                    resumed: Vec::new(),
+                },
+            },
+        );
+        let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(
+            matches!(attach.request, ClientRequest::Attach { terminal_id: id, .. } if id == terminal_id)
+        );
+        send(
+            &mut stream,
+            Some(attach.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Attached {
+                    terminal: TerminalDescriptor {
+                        session,
+                        generation: 0,
+                        event_sequence: 0,
+                        activity: None,
+                        agent_activity: None,
+                        upgrade_sources: Vec::new(),
+                        upgrade_relaunches: Vec::new(),
+                        title: None,
+                        oldest_event_sequence: 1,
+                        attached: true,
+                        transcript: None,
+                        screen_lost_after_crash: false,
+                    },
+                },
+            },
+        );
+        handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            handle
+                .events()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            TerminalEvent::ResumeHintChanged(_)
+        ));
+        handle.acknowledge_conversation_attention().unwrap();
+        let read = loop {
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            match request.request {
+                ClientRequest::ChatAcknowledge { chat_id, .. } if chat_id == terminal_id => {
+                    break request;
+                }
+                ClientRequest::SetVisibility { .. } => send(
+                    &mut stream,
+                    Some(request.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                ),
+                unexpected => panic!("unexpected request before read: {unexpected:?}"),
+            }
+        };
+        send(
+            &mut stream,
+            Some(read.request_id),
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Exact native chat is not hosted; explicit recovery is required",
+                false,
+            )),
+        );
+        send(
+            &mut stream,
+            None,
+            ServerMessage::Event {
+                terminal_id,
+                sequence: 1,
+                event: crate::terminal_ipc::WireTerminalEvent::TitleChanged {
+                    title: "still attached".into(),
+                },
+            },
+        );
+        assert_eq!(
+            handle
+                .events()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            TerminalEvent::TitleChanged("still attached".into())
+        );
+        assert_eq!(handle.current_attachment().unwrap(), Some(pinned));
+        handle.input(b"x".to_vec()).unwrap();
+        let input: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(
+            matches!(input.request, ClientRequest::Input { terminal_id: id, bytes } if id == terminal_id && bytes == b"x")
+        );
     }
 
     #[test]
