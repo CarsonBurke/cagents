@@ -53,7 +53,7 @@ fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
     assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn local_startup_reports_ready_only_after_public_selection() {
     let host = Arc::new(HostLock::new(test_host()));
@@ -69,6 +69,17 @@ fn local_startup_reports_ready_only_after_public_selection() {
     );
     assert_eq!(state.startup_recovery(), None);
     assert!(state.startup_blocks_shutdown());
+    drop(state);
+    assert_eq!(
+        crate::host::recovery_admission::admit(
+            &host,
+            &crate::terminal_ipc::ClientRequest::ChatCapacitySet { limit: 1 },
+        )
+        .unwrap_err()
+        .code,
+        crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable
+    );
+    let mut state = host.lock().unwrap();
     state.publishing_startup = false;
     assert_eq!(state.startup_state(), StartupState::Ready);
     assert!(!state.startup_blocks_shutdown());
