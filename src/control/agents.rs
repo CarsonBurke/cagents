@@ -9,6 +9,7 @@ use crate::{
         directory::{Member, Scope, UsageLimit},
     },
     model::{AgentId, RunId},
+    workspace_model::primary_checkout,
 };
 use imara_diff::{Algorithm, Diff, InternedInput};
 
@@ -329,17 +330,6 @@ impl ShowArgs {
     }
 }
 
-/// The directory a project named without a path works in: the checkout
-/// around a Git repository's metadata, and a folder project itself.
-fn checkout(project: &Path) -> PathBuf {
-    match project.parent() {
-        Some(parent) if project.file_name() == Some(std::ffi::OsStr::new(".git")) => {
-            parent.to_owned()
-        }
-        _ => project.to_owned(),
-    }
-}
-
 pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
     match state {
         crate::agent_execution::State::Accepted => "Queued",
@@ -421,7 +411,7 @@ fn list_human(summaries: &[Summary], projects: &[ModelProject], program: &str) -
     let handles = Handles::among(summaries, &[]);
     let project_of = |summary: &Summary| {
         let repository = &summary.agent.spec.target.repository;
-        let root = checkout(repository);
+        let root = primary_checkout(repository).to_owned();
         let name = projects
             .iter()
             .find(|project| project.repository == *repository)
@@ -1348,7 +1338,7 @@ pub(super) fn execute_with_context(
                                 let directory = if project.is_absolute() {
                                     project
                                 } else {
-                                    checkout(&named)
+                                    primary_checkout(&named).to_owned()
                                 };
                                 (named, directory)
                             }
@@ -4806,8 +4796,11 @@ mod tests {
             here.is_absolute() && here.ends_with("src"),
             "an existing word is a path"
         );
-        assert_eq!(checkout(Path::new("/repo/.git")), Path::new("/repo"));
-        assert_eq!(checkout(Path::new("/notes")), Path::new("/notes"));
+        assert_eq!(
+            primary_checkout(Path::new("/repo/.git")),
+            Path::new("/repo")
+        );
+        assert_eq!(primary_checkout(Path::new("/notes")), Path::new("/notes"));
     }
 
     #[test]
