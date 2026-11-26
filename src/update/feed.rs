@@ -356,7 +356,20 @@ impl Feed {
         let http_status = (status.code() == Some(22))
             .then(|| read_http_status(read_status))
             .flatten();
-        if (self.local && status.code() == Some(37)) || http_status == Some(404) {
+        if self.local && status.code() == Some(37) {
+            let absent = url::Url::parse(&format!("{}/{path}", self.base))
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .is_some_and(|file| {
+                    fs::metadata(file).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                });
+            return Err(if absent {
+                UpdateError::ReleaseAssetMissing(path.to_owned())
+            } else {
+                invalid(format!("The local release asset {path} could not be read."))
+            });
+        }
+        if !self.local && http_status == Some(404) {
             return Err(UpdateError::ReleaseAssetMissing(path.to_owned()));
         }
         let host = url::Url::parse(&self.base)
@@ -918,6 +931,40 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "cagents 0.2.5 is no longer published. Check for updates again."
+        );
+    }
+
+    #[test]
+    fn a_file_that_curl_cannot_open_does_not_trigger_metadata_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let local = file_feed(
+            root.path(),
+            &ed25519_dalek::SigningKey::from_bytes(&[23; 32]),
+        );
+        let latest = root.path().join("latest/download");
+        fs::create_dir_all(&latest).unwrap();
+        fs::write(latest.join(METADATA), b"exists").unwrap();
+        let result = Feed::fetch_metadata_with("latest/download", |path| {
+            assert!(
+                path.ends_with(METADATA),
+                "the older generation must not be fetched"
+            );
+            // curl reports exit 37 when it cannot read a file, regardless
+            // of whether it exists. Exercise the status without chmod or UID.
+            local.fetch_command(
+                Command::new("sh").args(["-c", "exit 37"]),
+                path,
+                "checking for a new release",
+                METADATA_LIMIT,
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not be read")
         );
     }
 
