@@ -1674,17 +1674,7 @@ const RESTART_TEST: &str = "host::state::native_upgrade_tests::upgrade_restore_s
 fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     match std::env::var(MODE).as_deref() {
         Ok("provider") => return provider(),
-        Ok("restart") => {
-            #[cfg(target_os = "linux")]
-            {
-                assert_eq!(std::process::id(), 1);
-                assert_eq!(
-                    fs::read_link("/proc/1/ns/pid").unwrap(),
-                    fs::read_link("/proc/self/ns/pid").unwrap(),
-                    "restart fixture needs procfs mounted for its PID namespace"
-                );
-            }
-        }
+        Ok("restart") => {}
         _ => return run_isolated(RESTART_TEST, "restart"),
     }
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
@@ -1701,6 +1691,12 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         proof.clone(),
     )));
     let native_directory = registry::directory(Kind::Native).unwrap();
+    #[cfg(target_os = "linux")]
+    let processes = {
+        let processes = root.join("processes");
+        fs::create_dir(&processes).unwrap();
+        processes
+    };
     // Every holder and server this isolated fixture started, by exact
     // identity, so a failed assertion leaves none running.
     #[derive(Default)]
@@ -1716,6 +1712,16 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     let mut track = |id: TerminalId| {
         let socket = registry::socket(&native_directory, id);
         let record = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
+        #[cfg(target_os = "linux")]
+        for process in [&record.holder, &record.root] {
+            // The recovery census reads real kernel state for every provider
+            // and holder this test starts, without unrelated login sessions.
+            let entry = processes.join(process.pid.to_string());
+            if let Err(error) = std::os::unix::fs::symlink(format!("/proc/{}", process.pid), entry)
+            {
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+        }
         cleanup
             .0
             .extend([record.holder.clone(), record.root.clone()]);
@@ -1820,6 +1826,10 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
             .ok()
             .and_then(|pid| registry::Process::read(pid.trim().parse().ok()?).ok())
     };
+    #[cfg(target_os = "linux")]
+    super::super::update_recovery::restore_ordinary_with_process_fixture(&updated, &processes)
+        .unwrap();
+    #[cfg(not(target_os = "linux"))]
     super::super::update_recovery::restore_ordinary(&updated).unwrap();
     let unattached = store().unattached().unwrap();
     // Only the two stopped restarts are left unattached, so startup's orphan
@@ -1830,6 +1840,7 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
             .map(|entry| entry.id)
             .collect::<std::collections::BTreeSet<_>>(),
         [ids[stalled], ids[refused]].into_iter().collect(),
+        "{unattached:?}"
     );
 
     // The update finished: no checkpoint and no daemon-wide recovery hold,
@@ -2162,36 +2173,12 @@ fn run_isolated(test: &str, mode: &str) {
     ] {
         fs::create_dir_all(root.join(path)).unwrap();
     }
-    let executable = std::env::current_exe().unwrap();
-    let mut command = if cfg!(target_os = "linux") && mode == "restart" {
-        // Keep unrelated processes outside the real recovery census. The
-        // provider and holder processes still use kernel identities in procfs.
-        let mut command = Command::new("/usr/bin/unshare");
-        command
-            .args([
-                "--user",
-                "--map-root-user",
-                "--pid",
-                "--fork",
-                "--mount-proc",
-            ])
-            .arg(&executable);
-        for (name, _) in std::env::vars_os() {
-            if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
-                command.env_remove(name);
-            }
-        }
-        command
-    } else {
-        let mut command = Command::new(&executable);
-        command.env_clear();
-        command
-    };
-    let output = command
+    let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
+        .env_clear()
         .env(MODE, mode)
         .env("CAGENTS_UPGRADE_ROOT", root)
-        .env("CAGENTS_UPGRADE_EXE", &executable)
+        .env("CAGENTS_UPGRADE_EXE", std::env::current_exe().unwrap())
         .env("HOME", root.join("home"))
         .env("CODEX_HOME", root.join("home/.codex"))
         .env("XDG_RUNTIME_DIR", root.join("run"))
