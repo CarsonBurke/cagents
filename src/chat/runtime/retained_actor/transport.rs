@@ -233,6 +233,8 @@ pub struct Resident {
     pub retained_runs: Vec<crate::model::RunId>,
     pub outbox_ack: u64,
     pub outbox_latest: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_waiting: Option<u64>,
     changed: u64,
 }
 impl Resident {
@@ -579,6 +581,7 @@ impl RemoteActor {
             retained_runs: Vec::new(),
             outbox_ack: 0,
             outbox_latest: 0,
+            latest_waiting: None,
             changed: 1,
         };
         Self(Arc::new(Remote {
@@ -727,18 +730,54 @@ impl RemoteActor {
         actor
     }
 
-    pub fn waiting_resolved(&self, through: Option<u64>) -> Option<bool> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_waiting_fixture() -> Self {
+        let actor = Self::fixture();
+        {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.activity = crate::agent::ActivityState::Waiting;
+            state.waiting = true;
+            state.idle = false;
+            state.outbox_latest = 4;
+            state.latest_waiting = Some(3);
+        }
+        actor
+    }
+
+    pub fn waiting_resolution(
+        &self,
+        through: Option<u64>,
+    ) -> Option<crate::chat::runtime::RetainedWaiting> {
+        use crate::chat::runtime::RetainedWaiting;
+
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         if through.is_some_and(|sequence| sequence > state.outbox_latest) {
             return None;
         }
         if state.completed {
-            return Some(!state.owns_work);
+            return Some(if state.owns_work {
+                RetainedWaiting::Current
+            } else {
+                RetainedWaiting::Resolved
+            });
         }
-        Some(matches!(
+        if matches!(
             state.activity,
             crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle
-        ))
+        ) {
+            return Some(RetainedWaiting::Resolved);
+        }
+        Some(
+            if through
+                .zip(state.latest_waiting)
+                .is_some_and(|(sequence, current)| sequence < current)
+            {
+                RetainedWaiting::Superseded
+            } else {
+                RetainedWaiting::Current
+            },
+        )
     }
     pub fn close_proved(
         identity: &ActorIdentity,
@@ -3230,6 +3269,7 @@ impl Server {
             retained_runs: journal.retained_runs()?,
             outbox_ack: journal.acknowledged()?,
             outbox_latest: journal.latest()?,
+            latest_waiting: journal.latest_waiting,
             changed,
         })
     }

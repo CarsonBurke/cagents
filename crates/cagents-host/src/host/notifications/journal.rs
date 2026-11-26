@@ -179,12 +179,18 @@ impl Journal {
                     notices::acknowledged.eq(notice.acknowledged),
                     notices::ordinal.eq(ordinal),
                 );
-                diesel::insert_into(notices::table)
-                    .values((notices::session.eq(&session), values.clone()))
-                    .on_conflict(notices::session)
-                    .do_update()
-                    .set(values)
-                    .execute(connection)?;
+                let insert = diesel::insert_into(notices::table)
+                    .values((notices::session.eq(&session), values.clone()));
+                let written = if resolved {
+                    // Keep this evidence seen without replacing a later notice.
+                    insert.on_conflict_do_nothing().execute(connection)?
+                } else {
+                    insert
+                        .on_conflict(notices::session)
+                        .do_update()
+                        .set(values)
+                        .execute(connection)?
+                };
                 let recent_seen = diesel::alias!(seen as recent_seen);
                 diesel::delete(
                     seen::table.filter(seen::session.eq(&session)).filter(
@@ -216,7 +222,7 @@ impl Journal {
                 )
                 .execute(connection)?;
                 prune_owners(connection)?;
-                Ok(Some(notice))
+                Ok((written != 0).then_some(notice))
             });
         match result {
             Err(diesel::result::Error::RollbackTransaction) => Ok(None),

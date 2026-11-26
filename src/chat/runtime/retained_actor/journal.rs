@@ -105,6 +105,7 @@ pub(super) struct Journal {
     unknown_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
+    pub latest_waiting: Option<u64>,
     published_sources: Vec<crate::chat::Session>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
@@ -169,6 +170,7 @@ impl Journal {
             unknown_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
+            latest_waiting: None,
             published_sources: Vec::new(),
         })
     }
@@ -366,6 +368,13 @@ impl Journal {
         }
         tx.commit().map_err(|error| error.to_string())?;
         self.outcome_latest = sequence;
+        if matches!(
+            update,
+            Update::Attention(evidence) | Update::AttentionContext { evidence, .. }
+                if evidence.kind == crate::notifications::Kind::Waiting
+        ) {
+            self.latest_waiting = Some(sequence);
+        }
         if let Update::Execution {
             run,
             update: crate::agent_execution::Update::Finished { .. },

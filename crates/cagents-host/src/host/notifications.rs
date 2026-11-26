@@ -48,11 +48,21 @@ pub(in crate::host) type CommitAcknowledgement = std::sync::mpsc::Receiver<Resul
 
 /// An in-flight commit is unacknowledged until the FULL journal transaction
 /// returns. Early shutdown or unwinding must explicitly fail the waiter.
-struct CommitReceipt(Option<std::sync::mpsc::Sender<Result<(), String>>>);
+struct CommitReceipt {
+    reply: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    resolved: bool,
+}
 
 impl CommitReceipt {
+    fn new(reply: std::sync::mpsc::Sender<Result<(), String>>) -> Self {
+        Self {
+            reply: Some(reply),
+            resolved: false,
+        }
+    }
+
     fn finish(mut self, result: Result<(), String>) {
-        if let Some(reply) = self.0.take() {
+        if let Some(reply) = self.reply.take() {
             let _ = reply.send(result);
         }
     }
@@ -60,7 +70,7 @@ impl CommitReceipt {
 
 impl Drop for CommitReceipt {
     fn drop(&mut self) {
-        if let Some(reply) = self.0.take() {
+        if let Some(reply) = self.reply.take() {
             let _ = reply.send(Err(
                 "Notification journal did not commit; outcome remains unacknowledged".into(),
             ));
@@ -104,17 +114,6 @@ impl Pending {
         for target in newer.cleared_waiting.iter().cloned() {
             self.clear_waiting(target);
         }
-        for event in newer
-            .events
-            .values()
-            .chain(newer.committed_events.iter().map(|(event, _)| event))
-        {
-            if event.evidence.kind == Kind::Waiting
-                && !newer.cleared_waiting.contains(&event.target)
-            {
-                self.cleared_waiting.remove(&event.target);
-            }
-        }
         for (target, event) in newer.events {
             if self.events.len() < MAX_PENDING || self.events.contains_key(&target) {
                 self.events.insert(target, event);
@@ -150,6 +149,11 @@ impl Pending {
             .is_some_and(|event| event.evidence.kind == Kind::Waiting)
         {
             self.events.remove(&target);
+        }
+        for (event, receipt) in &mut self.committed_events {
+            if event.target == target && event.evidence.kind == Kind::Waiting {
+                receipt.resolved = true;
+            }
         }
         if self.cleared_waiting.len() < MAX_PENDING {
             self.cleared_waiting.insert(target);
@@ -236,9 +240,6 @@ impl Handle {
             // worker may reuse this session while retirement is still queued;
             // apply that retirement first, then its new event in the broker.
             if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
-                if event.evidence.kind == Kind::Waiting {
-                    pending.cleared_waiting.remove(&event.target);
-                }
                 pending.events.insert(event.target(), event);
             }
         });
@@ -259,12 +260,9 @@ impl Handle {
         if pending.committed_events.len() >= MAX_PENDING {
             return Err("Notification commit queue is full; outcome remains unacknowledged".into());
         }
-        if event.evidence.kind == Kind::Waiting {
-            pending.cleared_waiting.remove(&event.target);
-        }
         pending
             .committed_events
-            .push_back((event, CommitReceipt(Some(receipt))));
+            .push_back((event, CommitReceipt::new(receipt)));
         drop(pending);
         let _ = self.0.wake.try_send(());
         Ok(result)
@@ -566,6 +564,11 @@ fn restore(
     match journal.list() {
         Ok(notices) => snapshot.notices = notices,
         Err(error) => snapshot.diagnostic = Some(error),
+    }
+    for notice in &snapshot.notices {
+        if notice.acknowledged {
+            withdraw_notice(withdrawals, notice);
+        }
     }
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
@@ -1040,8 +1043,7 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
-            let resolved = event.evidence.kind == Kind::Waiting
-                && pending.cleared_waiting.contains(&event.target);
+            let resolved = receipt.as_ref().is_some_and(|receipt| receipt.resolved);
             match record_attention_committed_policy(
                 journal, event, suppressed, receipt, &policy, resolved,
             ) {
@@ -1497,7 +1499,7 @@ mod tests {
                 });
                 let original = event.clone();
                 let (receipt, result) = std::sync::mpsc::channel();
-                let receipt = (path != "ordinary").then_some(CommitReceipt(Some(receipt)));
+                let receipt = (path != "ordinary").then_some(CommitReceipt::new(receipt));
                 let notice = record_attention_committed_policy(
                     &mut journal,
                     event,
@@ -1800,8 +1802,42 @@ mod tests {
         assert!(combined.cleared_waiting.contains(&target));
 
         let combined = combined.followed_by(pending(request("new")));
-        assert!(!combined.cleared_waiting.contains(&target));
+        assert!(combined.cleared_waiting.contains(&target));
         assert_eq!(combined.events.get(&target), Some(&request("new")));
+
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let older = handle.record_committed(request("old")).unwrap();
+        handle.clear_session_waiting(session);
+        let newer = handle.record_committed(request("new")).unwrap();
+        let mut pending = take_pending(&shared);
+        let old = pending.committed_events.pop_front().unwrap();
+        let new = pending.committed_events.pop_front().unwrap();
+        assert!(old.1.resolved);
+        assert!(!new.1.resolved);
+
+        // The resolved older event can commit after the newer request is
+        // available, without replacing it or being advertised as unread.
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        for (event, receipt) in [new, old] {
+            let resolved = receipt.resolved;
+            record_attention_committed_policy(
+                &mut journal,
+                event,
+                false,
+                Some(receipt),
+                &Preferences::default(),
+                resolved,
+            )
+            .unwrap();
+        }
+        assert_eq!(older.recv().unwrap(), Ok(()));
+        assert_eq!(newer.recv().unwrap(), Ok(()));
+        let retained = journal.list().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].event.evidence.key, "new");
+        assert!(!retained[0].acknowledged);
     }
 
     #[test]

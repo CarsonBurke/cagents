@@ -2,7 +2,9 @@
 //! callbacks only wake it; neither callback return nor enqueueing acknowledges
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
-use crate::chat::runtime::{OutboxEntry, RetirementInspection, VerifiedRetirement};
+use crate::chat::runtime::{
+    OutboxEntry, RetainedWaiting, RetirementInspection, VerifiedRetirement,
+};
 use crate::daemon::owned_children::DetachedWork;
 use crate::host::model::NativeActorEvent;
 use std::{
@@ -924,28 +926,30 @@ fn reconcile_waiting(
     through: Option<u64>,
 ) -> Result<bool, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    waiting_resolution(&state, target, through)
+    waiting_resolution(&state, target, through).map(|state| state == RetainedWaiting::Resolved)
 }
 
 fn waiting_resolution(
     state: &super::HostState,
     target: &SemanticTarget,
     through: Option<u64>,
-) -> Result<bool, String> {
+) -> Result<RetainedWaiting, String> {
     if state.chats.get(&target.source.id).is_none_or(|record| {
         record.execution_instance != target.identity.instance
             || !record.handle.same_attachment(&target.handle)
     }) {
         return Err("Retained actor ownership changed before notification admission".into());
     }
-    let resolved = target
+    let resolution = target
         .handle
-        .retained_waiting_resolved(through)
+        .retained_waiting_resolution(through)
         .ok_or("The latest retained outcome is awaiting its actor publication")?;
-    if resolved && let Some(notifications) = &state.notifications {
+    if resolution == RetainedWaiting::Resolved
+        && let Some(notifications) = &state.notifications
+    {
         notifications.clear_session_waiting(target.source.id);
     }
-    Ok(resolved)
+    Ok(resolution)
 }
 
 fn queue_attention(
@@ -956,7 +960,7 @@ fn queue_attention(
 ) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if event.evidence.kind == crate::notifications::Kind::Waiting {
-        if waiting_resolution(&state, target, Some(sequence))? {
+        if waiting_resolution(&state, target, Some(sequence))? != RetainedWaiting::Current {
             return Ok(None);
         }
     } else if state.chats.get(&target.source.id).is_none_or(|record| {
@@ -1513,10 +1517,12 @@ mod startup_retryability_tests {
 
     #[test]
     fn a_retained_wait_needs_current_publication_and_a_proven_end_clears_its_notice() {
-        for proved in [false, true] {
+        for (proved, newer_waiting) in [(false, false), (true, false), (false, true)] {
             let root = crate::fixture_tempdir().unwrap();
             let (host, mut source, _) = pending(root.path());
-            let handle = if proved {
+            let handle = if newer_waiting {
+                Handle::fixture_waiting_remote()
+            } else if proved {
                 Handle::fixture_ended_remote()
             } else {
                 Handle::fixture_failed_remote()
@@ -1562,16 +1568,38 @@ mod startup_retryability_tests {
                     kind: crate::notifications::Kind::Waiting,
                 },
             );
-            assert!(queue_attention(&host, &target, waiting.clone(), 2).is_err());
+            assert!(queue_attention(&host, &target, waiting.clone(), 5).is_err());
             assert!(!journal.waiting_clear_pending(source.id));
             assert_eq!(reconcile_waiting(&host, &target, None).unwrap(), proved);
             assert_eq!(journal.waiting_clear_pending(source.id), proved);
-            if proved {
+            if proved || newer_waiting {
                 assert!(
                     queue_attention(&host, &target, waiting, 1)
                         .unwrap()
                         .is_none()
                 );
+            }
+            if newer_waiting {
+                assert!(
+                    !journal.waiting_clear_pending(source.id),
+                    "an older request cannot clear the newer one"
+                );
+                let mut current = crate::notifications::Event::session(
+                    source.id,
+                    source.launch.provider,
+                    source.launch.recipe.working_directory.clone(),
+                    crate::notifications::Evidence {
+                        key: "waiting-current".into(),
+                        kind: crate::notifications::Kind::Waiting,
+                    },
+                );
+                assert!(
+                    queue_attention(&host, &target, current.clone(), 3)
+                        .unwrap()
+                        .is_some()
+                );
+                current.evidence.key = "a-still-unpublished-request".into();
+                assert!(queue_attention(&host, &target, current, 5).is_err());
             }
         }
     }
