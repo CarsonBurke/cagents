@@ -1785,31 +1785,52 @@ fn read_verified_record(
         target_hash,
         serving,
     )?;
-    let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
-    let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
-    if terminals.len() != live_terminals.len()
-        || chats.len() != live_chats.len()
-        || terminals != record.adopted_terminals.iter().copied().collect()
-        || chats != record.adopted_chats.iter().copied().collect()
-        || record.adopted_chat_descriptors.len() != live_chats.len()
-        || record.adopted_terminal_descriptors.len() != live_terminals.len()
-        || live_terminals.iter().any(|item| {
-            !record
-                .adopted_terminal_descriptors
-                .iter()
-                .any(|issued| same_adopted_terminal(issued, item, serving))
-                || !verified_terminal(census, item, serving, target)
-        })
-        || live_chats.iter().any(|item| {
-            !record.adopted_chat_descriptors.contains(item)
-                || !verified_chat(census, item, serving, live_terminals, target)
-        })
-    {
-        return Err(
-            "The serving recovery inventory differs from its verified original owners".into(),
-        );
-    }
+    record.verify_live_inventory(serving, live_terminals, live_chats)?;
     Ok(record)
+}
+
+impl RecoveryRecord {
+    /// A startup publisher uses the same lineage checks as an external
+    /// installer, against the live owner's inventory before opening admission.
+    pub fn verify_live_inventory(
+        &self,
+        serving: &HostSessionProof,
+        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        live_chats: &[Session],
+    ) -> Result<(), String> {
+        if !self.settled || self.successor.as_ref() != Some(serving) || !serving.is_complete() {
+            return Err("The replacement has not settled this recovery".into());
+        }
+        let target = self
+            .target
+            .as_deref()
+            .ok_or("Recovery is missing its exact target")?;
+        let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
+        let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
+        if terminals.len() != live_terminals.len()
+            || chats.len() != live_chats.len()
+            || terminals != self.adopted_terminals.iter().copied().collect()
+            || chats != self.adopted_chats.iter().copied().collect()
+            || self.adopted_chat_descriptors.len() != live_chats.len()
+            || self.adopted_terminal_descriptors.len() != live_terminals.len()
+            || live_terminals.iter().any(|item| {
+                !self
+                    .adopted_terminal_descriptors
+                    .iter()
+                    .any(|issued| same_adopted_terminal(issued, item, serving))
+                    || !verified_terminal(&self.census, item, serving, target)
+            })
+            || live_chats.iter().any(|item| {
+                !self.adopted_chat_descriptors.contains(item)
+                    || !verified_chat(&self.census, item, serving, live_terminals, target)
+            })
+        {
+            return Err(
+                "The serving recovery inventory differs from its verified original owners".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn same_adopted_terminal(
@@ -4385,7 +4406,7 @@ impl RecoveryRecord {
             format!("This recovery receipt could not be claimed. Existing recovery evidence was preserved: {error}")
         })
     }
-    pub fn finish(mut self, successor: &HostSessionProof) -> Result<(), String> {
+    pub fn finish(mut self, successor: &HostSessionProof) -> Result<Self, String> {
         self.validate_continuity()?;
         self.validate_census()?;
         self.adopted_terminal_descriptors = std::mem::take(&mut self.adopted_terminal_descriptors)
@@ -4397,7 +4418,7 @@ impl RecoveryRecord {
         self.settled = true;
         self.save()?;
         drop(self.authority.take());
-        Ok(())
+        Ok(self)
     }
 }
 

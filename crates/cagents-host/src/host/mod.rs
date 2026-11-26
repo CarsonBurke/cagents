@@ -241,13 +241,15 @@ pub struct DaemonAdmission {
     standby: Option<daemon::standby::Activated>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct StartupPublication {
     publication: crate::update::LocalPublication,
     _admission: DaemonAdmission,
+    #[cfg(target_os = "macos")]
+    recovered: Option<crate::upgrade::recovery::RecoveryRecord>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPublication>) {
     if pending.is_none() {
         return;
@@ -259,15 +261,48 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
         return;
     }
     let publication = pending.take().unwrap();
-    // A retained startup owns the only listener that can inspect its original
-    // work. Give the public launcher that listener's protocol while leaving
-    // its Retained status and verification outcome intact.
-    if let Err(error) = publication.publication.publish() {
+    // Linux keeps its established matched inspection route for retained work.
+    #[cfg(target_os = "linux")]
+    let result = publication
+        .publication
+        .publish()
+        .map_err(|error| error.to_string());
+    #[cfg(target_os = "macos")]
+    let result = if readiness == StartupState::Ready {
+        publication
+            .recovered
+            .ok_or_else(|| "The replacement did not settle Prepared recovery".to_string())
+            .and_then(|record| {
+                record.verify_live_inventory(
+                    state.proof(),
+                    &state.list(0),
+                    &update_recovery::live_chat_descriptors(&state),
+                )
+            })
+            .and_then(|()| {
+                publication
+                    .publication
+                    .publish()
+                    .map_err(|error| error.to_string())
+            })
+    } else {
+        Err("The replacement retained the original owners for inspection".into())
+    };
+    if let Err(error) = result {
         let detail = format!("Could not select the restored application: {error}");
         state.retain_startup_recovery(detail.clone());
         tracing::error!(%detail, "restored startup owners were kept");
     }
     state.publishing_startup = false;
+}
+
+fn acknowledge_standby(standby: Option<daemon::standby::Activated>) {
+    if let Some(standby) = standby
+        && let Err(error) = standby.started()
+    {
+        // The host owns the restored state even after the coordinator exits.
+        tracing::warn!(%error, "replacement daemon startup acknowledgement was not delivered");
+    }
 }
 
 impl DaemonAdmission {
@@ -659,10 +694,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
-    #[cfg(target_os = "linux")]
     let mut standby = admission.standby.take();
-    #[cfg(target_os = "macos")]
-    let standby = admission.standby.take();
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -795,12 +827,18 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("activity monitor started", None);
     let mut recovered_prepared = false;
+    #[cfg(target_os = "macos")]
+    let mut prepared_outcome = None;
     let listener = listener_before_restore(&paths, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
         let restored = (|| -> io::Result<()> {
-            if update_recovery::restore(&host).map_err(io::Error::other)? {
+            if let Some(_record) = update_recovery::restore(&host).map_err(io::Error::other)? {
                 recovered_prepared = true;
+                #[cfg(target_os = "macos")]
+                {
+                    prepared_outcome = Some(_record);
+                }
                 return Ok(());
             }
             #[cfg(all(test, target_os = "linux"))]
@@ -853,7 +891,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     })?;
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("restore complete; release admission", None);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut pending_publication = if let Some(publication) = standby
         .as_mut()
         .and_then(daemon::standby::Activated::take_local_publication)
@@ -864,14 +902,16 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         Some(StartupPublication {
             publication,
             _admission: admission,
+            #[cfg(target_os = "macos")]
+            recovered: prepared_outcome,
         })
     } else {
         drop(admission);
         None
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     publish_restored_selection(&host, &mut pending_publication);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     drop(admission);
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("admission released", None);
@@ -1013,16 +1053,15 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             tracing::warn!(%error, "recovery completion proof could not be scheduled; serving owners were kept");
         }
     }
-    if let Some(standby) = standby
-        && let Err(error) = standby.started()
-    {
-        // The host already owns the restored state. A missing acknowledgement
-        // is never a reason to tear down its sessions.
-        tracing::warn!(%error, "replacement daemon startup acknowledgement was not delivered");
-    }
+    #[cfg(target_os = "linux")]
+    acknowledge_standby(standby.take());
     loop {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         publish_restored_selection(&host, &mut pending_publication);
+        #[cfg(target_os = "macos")]
+        if pending_publication.is_none() {
+            acknowledge_standby(standby.take());
+        }
         reap_finished(&mut clients);
         if daemon::termination_requested() {
             host.lock()

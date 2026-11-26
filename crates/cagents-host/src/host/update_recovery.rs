@@ -277,11 +277,11 @@ fn restore_recovered(
     Ok(true)
 }
 
-/// Returns true only for the one startup carrying a validated recovery receipt.
+/// Returns the settled record only for the startup carrying a validated receipt.
 /// Ordinary startup keeps Prepared's existing refusal and replay guarantees.
-pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
+pub(super) fn restore(host: &SharedHost) -> Result<Option<recovery::RecoveryRecord>, String> {
     let Some(mut record) = recovery::take_for_host()? else {
-        return Ok(false);
+        return Ok(None);
     };
     let store = Store::discover()?;
     let checkpoint = store
@@ -437,11 +437,10 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     record.adopted_terminal_descriptors = host.lock().unwrap_or_else(|p| p.into_inner()).list(0);
     // The superseding record preserves Prepared byte-for-byte. It records this
     // one adoption's result; it never grants a later plain start new authority.
-    record.finish(&successor)?;
-    Ok(true)
+    record.finish(&successor).map(Some)
 }
 
-fn live_chat_descriptors(state: &state::HostState) -> Vec<crate::chat::Session> {
+pub(super) fn live_chat_descriptors(state: &state::HostState) -> Vec<crate::chat::Session> {
     state
         .chats
         .values()

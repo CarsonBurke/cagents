@@ -81,7 +81,7 @@ pub(super) fn complete_selection(
 }
 
 #[derive(PartialEq, Eq)]
-struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
+pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
 
 #[cfg(target_os = "linux")]
 impl Stamp {
@@ -95,7 +95,7 @@ impl Stamp {
     }
 }
 
-fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
+pub(super) fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     let mut entries = Vec::new();
     for binary in BINARIES {
         let metadata = fs::symlink_metadata(root.join("bin").join(binary))?;

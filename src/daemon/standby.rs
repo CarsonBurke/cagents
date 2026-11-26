@@ -440,7 +440,7 @@ impl Drop for Parked {
 #[cfg(feature = "host")]
 pub struct Activated {
     channel: UnixStream,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     publication: Option<crate::update::LocalPublication>,
     #[cfg(target_os = "macos")]
     _legacy_fence: crate::instance::OwnedLock,
@@ -463,7 +463,7 @@ impl Activated {
             .and_then(|()| send(stream, &reason, &[]));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn take_local_publication(&mut self) -> Option<crate::update::LocalPublication> {
         self.publication.take()
     }
@@ -499,22 +499,21 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     crate::instance::validate_stage_guard()?;
     #[cfg(target_os = "macos")]
     let legacy_fence = crate::instance::reserve_standby_legacy_fence()?;
-    // SAFETY: this is the single-threaded standby entry. The sender's copy
-    // remains held until publication, even after the successor sends Started.
+    // The account fence stays alive through publication and acknowledgement.
     #[cfg(target_os = "macos")]
-    let publication = unsafe { take_darwin_publication()? };
-    #[cfg(target_os = "linux")]
+    let account_fence = unsafe { take_darwin_publication()? };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let publication = std::env::var_os(LOCAL_PREVIOUS_CURRENT)
         .map(|expected| {
+            #[cfg(target_os = "macos")]
+            if account_fence.is_none() {
+                return Err(io::Error::other(
+                    "selection requires the inherited publication fence",
+                ));
+            }
             crate::update::LocalPublication::prepare(Path::new(&expected)).map_err(io::Error::other)
         })
         .transpose()?;
-    #[cfg(target_os = "macos")]
-    if std::env::var_os(LOCAL_PREVIOUS_CURRENT).is_some() {
-        return Err(io::Error::other(
-            "the Darwin coordinator owns installation publication",
-        ));
-    }
     // SAFETY: activation runs before the daemon starts any threads.
     unsafe { std::env::remove_var(LOCAL_PREVIOUS_CURRENT) };
     let stdin = io::stdin();
@@ -572,7 +571,14 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     #[cfg(target_os = "linux")]
     install_descriptors(descriptors, &request.slots())?;
     #[cfg(target_os = "macos")]
-    install_darwin_activation(&control, &request, descriptors)?;
+    {
+        if publication.is_some() && !matches!(request, Activation::Checkpoint) {
+            return Err(io::Error::other(
+                "installation publication requires exact Prepared recovery authority",
+            ));
+        }
+        install_darwin_activation(&control, &request, descriptors)?;
+    }
     // SAFETY: the inherited authority readers run immediately afterward in
     // this same thread, consuming their normal authenticated descriptors.
     unsafe {
@@ -586,12 +592,12 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     }
     Ok(Activated {
         channel: control,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         publication,
         #[cfg(target_os = "macos")]
         _legacy_fence: legacy_fence,
         #[cfg(target_os = "macos")]
-        _publication: publication,
+        _publication: account_fence,
     })
 }
 
