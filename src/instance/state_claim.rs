@@ -454,6 +454,9 @@ fn create_claim(path: &Path, ours: &Record) -> io::Result<OwnedLock> {
         .parent()
         .ok_or_else(|| io::Error::other("claim has no directory"))?;
     let mut candidate = tempfile::NamedTempFile::new_in(directory)?;
+    candidate
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
     write(candidate.as_file_mut(), ours)?;
     let lock = owned_file_lock(
         candidate.as_file().try_clone()?,
@@ -1106,6 +1109,41 @@ mod tests {
         ] {
             assert!(failure.to_string().contains("unreadable"), "{failure}");
         }
+    }
+
+    #[test]
+    fn first_claim_remains_readable_under_restrictive_umask() {
+        const FIXTURE: &str = "CAGENTS_TEST_CLAIM_UMASK";
+        if env::var_os(FIXTURE).is_none() {
+            let status = process::Command::new(env::current_exe().unwrap())
+                .args(["--exact", "instance::state_claim::tests::first_claim_remains_readable_under_restrictive_umask", "--test-threads=1"])
+                .env(FIXTURE, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new();
+        let _owner = runtime.hold();
+        let claim = root.path().join(DAEMON_CLAIM);
+        let claim_record = record(&runtime.lock, None).unwrap();
+        // SAFETY: only the isolated subprocess test changes its umask.
+        let original = unsafe { libc::umask(0o777) };
+        let first = acquire(
+            &claim,
+            claim_record.clone(),
+            Claimant::Daemon,
+            Duration::ZERO,
+        );
+        unsafe { libc::umask(original) };
+        drop(first.unwrap());
+        assert_eq!(
+            fs::metadata(&claim).unwrap().mode() & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        assert_eq!(read_path(&claim).unwrap(), Some(claim_record.clone()));
+        acquire(&claim, claim_record, Claimant::Daemon, Duration::ZERO).unwrap();
     }
 
     #[test]
