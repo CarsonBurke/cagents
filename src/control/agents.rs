@@ -1998,13 +1998,14 @@ fn with_standing_once(
 
 /// Whether an account's standing is worth a line in a run's status: its
 /// allowance is past the warning mark, used up, or needs a new sign-in.
-/// A stale reading's Warning or Limited counts only while one of its
-/// windows that has not reset since is still past the warning mark: after a
-/// reset, the old status no longer says anything about the allowance.
+/// Once one of the reading's windows has reset, its Warning or Limited
+/// counts only while a window that has not reset is still past the warning
+/// mark: the old status no longer says anything about the allowance. A
+/// reading that is merely old is still believed.
 fn account_needs_attention(account: &crate::agent_execution::directory::SessionAccount) -> bool {
     use crate::account::UsageStatus;
     let still_spent = || {
-        !account.stale
+        !account.remaining.iter().any(|window| window.reset_elapsed)
             || account.remaining.iter().any(|window| {
                 !window.reset_elapsed
                     && window.remaining_fraction < 1.0 - crate::account::WARNING_FRACTION
@@ -4492,11 +4493,25 @@ mod tests {
         assert!(account_needs_attention(account), "not reset yet");
         account.remaining = vec![spent(true)];
         assert!(!account_needs_attention(account), "reset since the reading");
-        account.stale = false;
+        // A reading that is only old, with no window reset, is believed:
+        // a provider's own Limited or Warning, or its refusal of ordinary
+        // use, needs no spent window behind it.
+        account.remaining = Vec::new();
+        assert!(account_needs_attention(account), "provider-limited, old");
+        account.status = Some(crate::account::UsageStatus::Warning);
+        assert!(account_needs_attention(account), "provider warning, old");
+        let mut healthy = spent(false);
+        healthy.remaining_fraction = 0.9;
+        account.remaining = vec![healthy];
+        account.status = Some(crate::account::UsageStatus::Ok);
+        account.ordinary_usage_allowed = Some(false);
         assert!(
             account_needs_attention(account),
-            "a fresh reading is trusted"
+            "refused ordinary use, old"
         );
+        account.ordinary_usage_allowed = None;
+        account.status = Some(crate::account::UsageStatus::Limited);
+        account.stale = false;
 
         // Several runs on one account name it once among them.
         let mut named = Vec::new();
