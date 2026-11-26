@@ -787,7 +787,7 @@ mod tests {
                 focused: None,
                 checkout: None,
             }];
-            app.note_channel_named(id);
+            app.note_channel_named(id, title.into());
             drop(app.update_chrome(Action::RenameChannel(id)));
             // No conversation here names the channel, so the copy says what
             // clearing does without promising a name.
@@ -2738,9 +2738,12 @@ impl Cagents {
                             channel.title_source = crate::model::ChannelTitleSource::Manual;
                         }
                         self.publish_model_edit(
-                            crate::workspace_model::ModelEdit::RetitleChannel { id, title },
+                            crate::workspace_model::ModelEdit::RetitleChannel {
+                                id,
+                                title: title.clone(),
+                            },
                         );
-                        self.note_channel_named(id);
+                        self.note_channel_named(id, title);
                         self.refresh_sidebar_channels();
                         self.persist();
                         return restore;
