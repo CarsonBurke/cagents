@@ -17,12 +17,15 @@ use std::{
     time::Instant,
 };
 
+mod foreign_proof;
 mod pane_move;
 #[cfg(test)]
 mod pending_tests;
 #[cfg(test)]
 mod tests;
 pub(super) mod titles;
+
+pub(super) use foreign_proof::adopt_foreign_panes;
 
 #[cfg(test)]
 thread_local! {
@@ -166,6 +169,9 @@ fn edit_then<T>(
     // A replayed operation returns its original result without re-checking later pane ownership.
     if !replay && super::chat::pane_start::requires_edit_check(&edit) {
         super::chat::pane_start::validate_edit(host, &registry, &edit)?;
+    }
+    if !replay {
+        foreign_proof::refuse_foreign_proof(host, &registry, &edit)?;
     }
     let applied = if matches!(&edit, ModelEdit::SuggestConversationTitle { .. }) {
         apply_title(host, &mut registry, &edit)?

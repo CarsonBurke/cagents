@@ -763,6 +763,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         // saves them instead.
         if restored.is_ok() {
             save_abandoned_identities(&host);
+            // A second daemon over the same data may have stamped panes of
+            // chats this one serves with its own proof (#4118).
+            workspace::adopt_foreign_panes(&host);
         }
         // An open agent's own ID is the daemon's record whatever restore
         // reached, so its pane learns it before any client reads the pane.
