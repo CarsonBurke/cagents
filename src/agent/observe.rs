@@ -106,7 +106,7 @@ pub struct Observer {
     accounts: Mutex<BTreeMap<Key, Arc<Mutex<Entry>>>>,
     rollouts: rollout::Rollouts,
     attention: Mutex<attention::Tails>,
-    claude_activity: Mutex<BTreeMap<(i32, u64), (ActivityState, Instant)>>,
+    claude_activity: Mutex<BTreeMap<(i32, u64), ClaudeActivity>>,
 }
 
 #[derive(Default)]
@@ -133,6 +133,76 @@ fn observed_claude_progress(
             Some(AttentionClear::RequestResolved)
         }
         _ => None,
+    }
+}
+
+struct ClaudeActivity {
+    state: ActivityState,
+    seen: Instant,
+    order: ClaudeOrdering,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaudeFence {
+    AwaitingInput,
+    InputObserved,
+}
+
+#[derive(Default)]
+struct ClaudeOrdering {
+    transcript: Option<(u64, u64)>,
+    idle_input: bool,
+    fence: Option<ClaudeFence>,
+}
+
+impl ClaudeOrdering {
+    fn notice(
+        &mut self,
+        state: ActivityState,
+        clear: Option<AttentionClear>,
+        mut edges: attention::Edges,
+    ) -> Option<crate::notifications::Evidence> {
+        if let Some(transcript) = edges.claude_transcript
+            && (self.transcript != Some(transcript) || edges.claude_baseline)
+        {
+            self.transcript = Some(transcript);
+            self.idle_input = false;
+            self.fence = self.fence.map(|_| ClaudeFence::AwaitingInput);
+        }
+        if clear == Some(AttentionClear::TurnStarted) {
+            self.fence = Some(if self.idle_input {
+                ClaudeFence::InputObserved
+            } else {
+                ClaudeFence::AwaitingInput
+            });
+        }
+        if let Some(fence) = self.fence {
+            // An older completion may arrive on any poll after the census
+            // reported a new start. Even returning to Idle doesn't establish
+            // which turn emitted it. Require order in this exact transcript.
+            let ordered = if edges.claude_input {
+                edges.claude_ordered_notice
+            } else {
+                fence == ClaudeFence::InputObserved
+            };
+            if edges.notice.is_some() && ordered {
+                self.fence = None;
+            } else {
+                edges.notice = None;
+                if edges.claude_input {
+                    self.fence = Some(ClaudeFence::InputObserved);
+                }
+            }
+        }
+        if state != ActivityState::Idle || edges.notice.is_some() {
+            self.idle_input = false;
+        }
+        if state == ActivityState::Idle && edges.claude_input {
+            // A root input can reach disk before the census shows Working.
+            // Retain it as ordering evidence without treating it as a start.
+            self.idle_input = !edges.claude_ordered_notice;
+        }
+        edges.notice
     }
 }
 
@@ -277,12 +347,9 @@ impl Observer {
             }
             Inventory::Codex(_) => attention::Edges::default(),
         };
-        let previous = (|| {
+        let (previous, clear_attention, attention) = if provider == Provider::Claude {
             // Claude's PID-scoped inventory explicitly distinguishes waiting.
             // A first census is a baseline, including when already waiting.
-            if provider != Provider::Claude {
-                return None;
-            }
             let mut activity = self
                 .claude_activity
                 .lock()
@@ -291,29 +358,30 @@ impl Observer {
             if !activity.contains_key(&key) && activity.len() >= 2048 {
                 let stale = activity
                     .iter()
-                    .min_by_key(|(_, (_, seen))| *seen)
+                    .min_by_key(|(_, record)| record.seen)
                     .map(|(key, _)| *key);
                 if let Some(stale) = stale {
                     activity.remove(&stale);
                 }
             }
-            activity
-                .insert(key, (state, Instant::now()))
-                .map(|(previous, _)| previous)
-        })();
+            let previous = activity.get(&key).map(|record| record.state);
+            let record = activity.entry(key).or_insert_with(|| ClaudeActivity {
+                state,
+                seen: Instant::now(),
+                order: ClaudeOrdering::default(),
+            });
+            record.state = state;
+            record.seen = Instant::now();
+            let clear = observed_claude_progress(previous, state);
+            (previous, clear, record.order.notice(state, clear, edges))
+        } else {
+            (None, None, edges.notice)
+        };
         let waiting = (state.waits_on_user() && previous.is_some_and(|previous| previous != state))
             .then(|| crate::notifications::Evidence {
                 key: format!("waiting:{}", uuid::Uuid::new_v4()),
                 kind: crate::notifications::Kind::Waiting,
             });
-        let clear_attention = observed_claude_progress(previous, state);
-        // A live census and a transcript tail are independent observations.
-        // A completion read alongside a new start may be the previous turn's
-        // late write. Keep it only when a root input ordered it after the
-        // earlier work. Codex's explicit rollout boundaries are handled above.
-        let attention = edges.notice.filter(|_| {
-            clear_attention != Some(AttentionClear::TurnStarted) || edges.claude_ordered_notice
-        });
         Ok(Observation {
             activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
             title,
@@ -479,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_terminal_orders_same_sample_success_after_real_root_input() {
+    fn claude_terminal_fences_late_outcomes_across_polls() {
         use std::io::Write;
 
         let directory = tempfile::tempdir().unwrap();
@@ -529,16 +597,33 @@ mod tests {
         };
 
         assert!(observe(ActivityState::Idle).attention.is_none());
-        append(input("tool", serde_json::json!([{"type": "tool_result"}])));
-        append(result("previous"));
         let observation = observe(ActivityState::Working);
         assert_eq!(
             observation.clear_attention,
             Some(AttentionClear::TurnStarted)
         );
         assert!(observation.attention.is_none());
-        assert!(observe(ActivityState::Working).attention.is_none());
 
+        append(input("tool", serde_json::json!([{"type": "tool_result"}])));
+        append(result("previous"));
+        let observation = observe(ActivityState::Working);
+        assert_eq!(observation.clear_attention, None);
+        assert!(observation.attention.is_none());
+        append(result("previous-at-idle"));
+        let observation = observe(ActivityState::Idle);
+        assert_eq!(observation.clear_attention, None);
+        assert!(observation.attention.is_none());
+
+        append(input("new-turn", serde_json::json!("Read the next issue")));
+        let observation = observe(ActivityState::Idle);
+        assert_eq!(observation.clear_attention, None);
+        assert!(observation.attention.is_none());
+        let observation = observe(ActivityState::Working);
+        assert_eq!(
+            observation.clear_attention,
+            Some(AttentionClear::TurnStarted)
+        );
+        assert!(observation.attention.is_none());
         append(result("later"));
         let observation = observe(ActivityState::Idle);
         assert_eq!(observation.clear_attention, None);
@@ -568,6 +653,42 @@ mod tests {
             Some(AttentionClear::TurnStarted)
         );
         assert_eq!(observation.attention.unwrap().key, "claude:after-input");
+    }
+
+    #[test]
+    fn claude_terminal_does_not_transfer_input_proof_to_another_transcript() {
+        let mut ordering = ClaudeOrdering::default();
+        let old_transcript = Some((1, 1));
+        let new_transcript = Some((1, 2));
+        let setup = attention::Edges {
+            claude_transcript: old_transcript,
+            claude_input: true,
+            ..attention::Edges::default()
+        };
+        assert!(
+            ordering
+                .notice(
+                    ActivityState::Working,
+                    Some(AttentionClear::TurnStarted),
+                    setup,
+                )
+                .is_none()
+        );
+        for claude_transcript in [new_transcript, old_transcript] {
+            let unproven = attention::Edges {
+                claude_transcript,
+                notice: Some(crate::notifications::Evidence {
+                    key: "unproven".into(),
+                    kind: crate::notifications::Kind::Succeeded,
+                }),
+                ..attention::Edges::default()
+            };
+            assert!(
+                ordering
+                    .notice(ActivityState::Idle, None, unproven)
+                    .is_none()
+            );
+        }
     }
 
     fn poison_fresh_census(entry: &Mutex<Entry>) {

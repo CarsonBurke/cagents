@@ -23,6 +23,9 @@ pub(super) enum Format {
 #[derive(Default)]
 pub(super) struct Edges {
     pub started: bool,
+    pub claude_transcript: Option<(u64, u64)>,
+    pub claude_baseline: bool,
+    pub claude_input: bool,
     /// Whether this read's completion follows its latest root Claude input.
     /// The live census still decides whether a turn started.
     pub claude_ordered_notice: bool,
@@ -73,6 +76,10 @@ impl Tails {
                 return Ok(Edges::default());
             }
         }
+        let mut edges = Edges {
+            claude_transcript: matches!(format, Format::Claude).then_some((key.2, key.3)),
+            ..Edges::default()
+        };
         if self.0.get(&key).is_none_or(|cursor| cursor.offset > size) {
             // A partial historical line must also be skipped to its newline.
             let mut last = [b'\n'];
@@ -93,7 +100,8 @@ impl Tails {
                     eligible,
                 },
             );
-            return Ok(Edges::default());
+            edges.claude_baseline = edges.claude_transcript.is_some();
+            return Ok(edges);
         }
         let cursor = self.0.get_mut(&key).expect("cursor was initialized");
         cursor.seen = Instant::now();
@@ -106,8 +114,6 @@ impl Tails {
         }
         let end = size.min(cursor.offset.saturating_add(MAX_READ));
         let mut buffer = [0; 64 * 1024];
-        let mut edges = Edges::default();
-        let mut claude_input = false;
         while cursor.offset < end {
             let length = (end - cursor.offset).min(buffer.len() as u64) as usize;
             file.read_exact_at(&mut buffer[..length], cursor.offset)?;
@@ -137,11 +143,11 @@ impl Tails {
                                 edges.notice = None;
                             }
                             Some(Boundary::ClaudeInput) => {
-                                claude_input = true;
+                                edges.claude_input = true;
                                 edges.claude_ordered_notice = false;
                             }
                             Some(Boundary::Outcome(kind, identity)) => {
-                                edges.claude_ordered_notice = claude_input;
+                                edges.claude_ordered_notice = edges.claude_input;
                                 edges.notice = Some(Evidence {
                                     key: identity.unwrap_or_else(|| {
                                         format!("log:{}:{}:{}", key.2, key.3, cursor.offset)
