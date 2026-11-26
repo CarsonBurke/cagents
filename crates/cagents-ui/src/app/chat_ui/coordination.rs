@@ -1153,11 +1153,10 @@ struct Row {
     /// What follows the name and tells it apart, the number two agents of
     /// one name go by or a session's ID, which the row keeps whole.
     tag: String,
-    /// The start of what was said, or the started agent's type.
+    /// The start of what was said.
     preview: String,
-    /// The preview is one term, the agent's type, which the row shows whole
-    /// or leaves out: the agent's name and how it stands come first.
-    term: bool,
+    /// A single started agent's type, where its name is not already it.
+    agent_type: Option<AgentType>,
     /// The whole of it, for the tooltip.
     full: String,
     state: RowStatus,
@@ -1171,6 +1170,35 @@ struct Row {
     several: bool,
     /// The menu's name for copying what the step said.
     copy: &'static str,
+}
+
+/// The type of agent a row started. Drawn, it follows the name as
+/// `name · Type`, whole or not at all: the agent's name and how it stands
+/// come first. The tooltip and the accessible name give it either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentType {
+    name: String,
+    /// Whether the row draws it: a type someone chose does, and the
+    /// provider's default, which tells the reader nothing, does not.
+    shown: bool,
+}
+
+impl AgentType {
+    /// The type Claude Code starts an agent as when the call names none
+    /// that someone chose.
+    const CLAUDE_DEFAULT: &'static str = "general-purpose";
+
+    fn of(provider: Provider, name: &str) -> Self {
+        Self {
+            shown: !(provider == Provider::Claude && name == Self::CLAUDE_DEFAULT),
+            name: name.to_owned(),
+        }
+    }
+
+    /// What the row draws of it.
+    fn drawn(&self) -> Option<String> {
+        self.shown.then(|| format!("· {}", self.name))
+    }
 }
 
 /// What a row that opens no agent does when pressed, said where the
@@ -1225,6 +1253,10 @@ impl Row {
                 pressing.to_owned()
             },
             self.preview.clone(),
+            self.agent_type
+                .as_ref()
+                .map(|kind| kind.name.clone())
+                .unwrap_or_default(),
         ]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
@@ -1417,6 +1449,7 @@ enum Tone {
 /// whole after it, and the preview. The name takes its room before the
 /// preview has any, and a preview that is one term, an agent's type, is left
 /// out whole rather than cut, so the name fades only once nothing follows it.
+/// `term` is that type as drawn, in place of the preview.
 /// What must not be cut for the state's sake, the second element, is the
 /// verb, as much of the name as [`LABEL_CHARS`] allows and the tag, measured
 /// and never drawn: past that, a long name fades rather than hide the state.
@@ -1425,7 +1458,7 @@ fn row_words(
     name: String,
     tag: String,
     preview: String,
-    term: bool,
+    term: Option<String>,
 ) -> (Element<'static, Message>, Element<'static, Message>) {
     let measured = Runtime::short_description(&name, LABEL_CHARS);
     let title = crate::ui_controls::FadeText::transcript(name).font(design::transcript_name_font());
@@ -1436,7 +1469,8 @@ fn row_words(
     } else {
         crate::ui_controls::trailing(title, tagged(tag.clone()), 0.0)
     };
-    let preview = crate::ui_controls::FadeText::transcript(preview)
+    let whole = term.is_some();
+    let preview = crate::ui_controls::FadeText::transcript(term.unwrap_or(preview))
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .width(Length::Fill);
     let words = widget::row::with_children(vec![
@@ -1445,7 +1479,7 @@ fn row_words(
             .wrapping(iced::widget::text::Wrapping::None)
             .into(),
         title,
-        if term { preview.whole() } else { preview }.into(),
+        if whole { preview.whole() } else { preview }.into(),
     ])
     .spacing(step::GAP_S)
     .align_y(Alignment::Center)
@@ -1698,7 +1732,7 @@ impl Runtime {
             shown,
             tag,
             preview,
-            term: false,
+            agent_type: None,
             full: full.join("\n\n").trim().to_owned(),
             state,
             elapsed: None,
@@ -1759,16 +1793,17 @@ impl Runtime {
                 |title| format!("in channel “{title}”"),
             )
         });
-        let mut term = false;
+        let mut agent_type = None;
         let mut preview = if let Some((_, task)) = &cli_label {
             task.clone().unwrap_or_default()
         } else {
             match spawn.agents.as_slice() {
-                [agent] if agent.kind.trim() != label => {
-                    term = true;
-                    agent.kind.trim().to_owned()
+                [agent] => {
+                    let kind = agent.kind.trim();
+                    agent_type = (!kind.is_empty() && kind != label)
+                        .then(|| AgentType::of(self.session.launch.provider, kind));
+                    String::new()
                 }
-                [_] => String::new(),
                 agents => agents
                     .iter()
                     .map(|agent| {
@@ -1794,7 +1829,6 @@ impl Runtime {
                         .as_deref()
                         == Some(title)
                 });
-            term = false;
             preview = if preview.is_empty() || duplicate_task {
                 destination.clone()
             } else {
@@ -1896,7 +1930,7 @@ impl Runtime {
             shown,
             tag,
             preview,
-            term,
+            agent_type,
             full: full.join("\n\n"),
             state,
             // A started agent's time, not its launch's, or none at all.
@@ -1925,7 +1959,7 @@ impl Runtime {
             row.shown.clone(),
             row.tag.clone(),
             row.preview.clone(),
-            row.term,
+            row.agent_type.as_ref().and_then(AgentType::drawn),
         );
         let elapsed = row
             .elapsed
@@ -2039,7 +2073,7 @@ impl Runtime {
             run.count.clone(),
             String::new(),
             run.preview.clone(),
-            false,
+            None,
         );
         // The messages' time together, as a strip of steps counts its own.
         let elapsed = self
@@ -2369,6 +2403,58 @@ impl Runtime {
 mod identity_tests {
     use super::*;
 
+    /// A type someone chose follows the agent's name after the row's
+    /// separator, so it does not read as part of the name; the default type
+    /// is left off, and a type that is the agent's only name is not repeated.
+    #[test]
+    fn an_agent_row_sets_a_chosen_type_apart_from_its_name() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let row = |runtime: &mut Runtime, input: serde_json::Value, status: ToolStatus| {
+            let step = claude_step("Agent", input, "");
+            let Kind::Spawn(spawn) = step.reading.kind.clone() else {
+                panic!("an Agent call starts an agent");
+            };
+            std::sync::Arc::make_mut(&mut runtime.snapshot)
+                .subagents
+                .clear();
+            runtime.spawn_row(&step, &spawn, status, "")
+        };
+        let chosen = row(
+            &mut runtime,
+            serde_json::json!({"description": "Find callers", "prompt": "Find them.", "subagent_type": "Explore"}),
+            ToolStatus::Running,
+        );
+        assert_eq!(
+            (chosen.verb, chosen.shown.as_str()),
+            ("Started", "Find callers")
+        );
+        assert_eq!(chosen.preview, "");
+        let kind = chosen.agent_type.as_ref().unwrap();
+        assert_eq!(kind.drawn().as_deref(), Some("· Explore"));
+        assert!(chosen.described().1.ends_with(" · Explore"));
+
+        for status in [ToolStatus::Running, ToolStatus::Failed] {
+            let default = row(
+                &mut runtime,
+                serde_json::json!({"description": "Review the change", "prompt": "Review it.", "subagent_type": "general-purpose"}),
+                status,
+            );
+            assert_eq!(default.preview, "");
+            assert_eq!(default.agent_type.as_ref().unwrap().drawn(), None);
+            let (tip, name) = default.described();
+            assert!(tip.contains("general-purpose"), "{tip}");
+            assert!(name.contains("general-purpose"), "{name}");
+        }
+
+        let unnamed = row(
+            &mut runtime,
+            serde_json::json!({"prompt": "", "subagent_type": "Explore"}),
+            ToolStatus::Running,
+        );
+        assert_eq!(unnamed.label, "Explore");
+        assert_eq!(unnamed.agent_type, None);
+    }
+
     #[test]
     fn cli_spawn_preview_names_the_destination_without_repeating_the_task() {
         let (runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
@@ -2486,9 +2572,9 @@ mod identity_tests {
     }
 
     /// A background agent's row says what it waits on in the words its tab
-    /// uses, and shows its type whole or not at all.
+    /// uses, and leaves off the type it was started as by default.
     #[test]
-    fn a_waiting_agents_row_names_what_it_waits_on_and_its_type_is_a_whole_term() {
+    fn a_waiting_agents_row_names_what_it_waits_on_and_leaves_off_the_default_type() {
         let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
         let reading = claude_step(
             "Agent",
@@ -2526,8 +2612,15 @@ mod identity_tests {
             |runtime: &Runtime| runtime.spawn_row(&reading, &spawn, ToolStatus::Succeeded, "");
         let started = row(&runtime);
         assert_eq!(started.shown, "Review restart safety");
-        assert_eq!(started.preview, "general-purpose");
-        assert!(started.term, "the type is drawn whole or left out");
+        // Claude Code's default type says nothing on the row, but the
+        // tooltip and the accessible name still give it.
+        assert_eq!(started.preview, "");
+        let kind = started.agent_type.as_ref().expect("the agent has a type");
+        assert_eq!(kind.name, "general-purpose");
+        assert_eq!(kind.drawn(), None);
+        let (tip, name) = started.described();
+        assert!(tip.contains("general-purpose"), "{tip}");
+        assert!(name.ends_with(" · general-purpose"), "{name}");
         assert_eq!(started.state.text, "Waiting on scripts/restart-check");
         let agent = &runtime.snapshot.subagents[0];
         assert_eq!(
@@ -2883,8 +2976,8 @@ mod identity_tests {
                 "Started",
                 "Review restart safety".into(),
                 tag.into(),
-                "general-purpose".into(),
-                true,
+                String::new(),
+                Some("· Explore".into()),
             );
             lay(words, width)
         };
@@ -2923,7 +3016,7 @@ mod identity_tests {
             "Review restart safety".into(),
             " 2".into(),
             "general-purpose ".repeat(40),
-            false,
+            None,
         );
         let kept = lay(kept, 4000.0).size().width;
         assert_eq!(kept, verb + gap + whole[0] + whole[1]);
@@ -2931,7 +3024,7 @@ mod identity_tests {
         // that it fades, and the state keeps its place beside it.
         let long = "Confirm every supported upgrade path still migrates from the oldest release";
         let kept = |name: &str| {
-            let (_, kept) = row_words("Started", name.into(), String::new(), String::new(), true);
+            let (_, kept) = row_words("Started", name.into(), String::new(), String::new(), None);
             lay(kept, 4000.0).size().width
         };
         assert_eq!(
@@ -3130,7 +3223,7 @@ mod identity_tests {
             shown: shown.to_owned(),
             tag: String::new(),
             preview: "The repo is now at /srv".to_owned(),
-            term: false,
+            agent_type: None,
             full: "The repo is now at /srv/repos/t3code.".to_owned(),
             state,
             elapsed: None,
