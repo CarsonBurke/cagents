@@ -518,16 +518,6 @@ impl Shared {
     }
 }
 
-fn stopped(shared: &Weak<Shared>) -> bool {
-    shared.upgrade().is_none_or(|shared| {
-        shared
-            .pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .stopped
-    })
-}
-
 fn queue_withdrawal(queue: &mut Withdrawals, id: Uuid) {
     queue.legacy(id);
 }
@@ -647,6 +637,30 @@ fn commit_waiting_clears(
         }
     }
     Ok(())
+}
+
+fn settle_waiting_at_shutdown(
+    shared: &Weak<Shared>,
+    journal: &mut Journal,
+    local: &BTreeSet<Target>,
+) -> bool {
+    let queued = shared.upgrade().map_or_else(
+        || Some(BTreeSet::new()),
+        |shared| {
+            let mut pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending
+                .stopped
+                .then(|| std::mem::take(&mut pending.cleared_waiting))
+        },
+    );
+    let Some(queued) = queued else {
+        return false;
+    };
+    let cleared = local.union(&queued).cloned().collect();
+    if let Err(error) = commit_waiting_clears(journal, &cleared, |_, _| {}) {
+        tracing::warn!(%error, "could not record waiting attention settlement at shutdown");
+    }
+    true
 }
 
 async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>) -> bool {
@@ -871,11 +885,8 @@ async fn run(
             // Retained shutdown can enqueue its final settlement immediately
             // before the broker's drop. Finish those durable clears without
             // calling the portal or accepting any new work.
-            if let Ok(journal) = store.journal()
-                && let Err(error) =
-                    commit_waiting_clears(journal, &pending.cleared_waiting, |_, _| {})
-            {
-                tracing::warn!(%error, "could not record waiting attention settlement at shutdown");
+            if let Ok(journal) = store.journal() {
+                settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting);
             }
             break;
         }
@@ -929,9 +940,27 @@ async fn run(
                 continue;
             }
         };
+        if let Err(error) =
+            commit_waiting_clears(journal, &pending.cleared_waiting, |target, id| {
+                if delivery.get(target).is_some_and(|notice| notice.id == id) {
+                    delivery.remove(target);
+                }
+                withdraw_target(&mut withdrawals, id, target);
+            })
+        {
+            snapshot.diagnostic = Some(error.clone());
+            publish(&shared, &host, snapshot.clone());
+            proxy = None;
+            next_attempt = store.retry_failed_write(error, Instant::now());
+            // Reapply these clears before a later request for the same
+            // conversation is allowed to commit. Retained receipts can replay.
+            deferred = pending.deferred();
+            continue;
+        }
+        pending.cleared_waiting.clear();
         if let Some(current) = current_presence {
             for (client, update) in &current {
-                if stopped(&shared) {
+                if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
                     return;
                 }
                 if presence.is_empty() {
@@ -1009,8 +1038,8 @@ async fn run(
             }
             pending.events.extend(inboxes.events);
         }
-        for session in std::mem::take(&mut pending.retired) {
-            if stopped(&shared) {
+        for session in pending.retired {
+            if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
                 return;
             }
             delivery.remove(&session);
@@ -1025,8 +1054,8 @@ async fn run(
                 snapshot.diagnostic = Some(error);
             }
         }
-        for id in std::mem::take(&mut pending.acknowledged) {
-            if stopped(&shared) {
+        for id in pending.acknowledged {
+            if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
                 return;
             }
             delivery.retain(|_, notice| notice.id != id);
@@ -1037,24 +1066,6 @@ async fn run(
                 withdraw_notice(&mut withdrawals, notice);
             }
         }
-        if let Err(error) =
-            commit_waiting_clears(journal, &pending.cleared_waiting, |target, id| {
-                if delivery.get(target).is_some_and(|notice| notice.id == id) {
-                    delivery.remove(target);
-                }
-                withdraw_target(&mut withdrawals, id, target);
-            })
-        {
-            snapshot.diagnostic = Some(error.clone());
-            publish(&shared, &host, snapshot.clone());
-            proxy = None;
-            next_attempt = store.retry_failed_write(error, Instant::now());
-            // Reapply these clears before a later request for the same
-            // conversation is allowed to commit. Retained receipts can replay.
-            deferred = pending.deferred();
-            continue;
-        }
-        pending.cleared_waiting.clear();
         let events = pending
             .events
             .into_values()
@@ -1066,7 +1077,7 @@ async fn run(
                     .map(|(event, receipt)| (event, Some(receipt))),
             );
         for (event, receipt) in events {
-            if stopped(&shared) {
+            if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
                 return;
             }
             let focused = presence.values().any(|window| {
@@ -1207,7 +1218,7 @@ async fn run(
                 delivery_batch(&delivery, &delivery_schedule, &withdrawals, Instant::now())
             };
             for notice in batch {
-                if stopped(&shared) {
+                if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
                     return;
                 }
                 match send(backend, &notice, activation.receives_actions()).await {
@@ -1227,7 +1238,7 @@ async fn run(
             // Cleanup is bounded like delivery. A desktop that stops answering
             // cannot hold daemon shutdown behind thousands of remove calls.
             for _ in 0..8 {
-                if stopped(&shared) {
+                if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
                     return;
                 }
                 if failed {
@@ -1894,6 +1905,39 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].event.evidence.key, "new");
         assert!(!retained[0].acknowledged);
+    }
+
+    #[test]
+    fn shutdown_commits_waiting_clears_even_after_taking_the_broker_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite")).unwrap();
+        let (first, second) = (TerminalId::new(), TerminalId::new());
+        for session in [first, second] {
+            let mut event = attention_event(session, "question");
+            event.evidence.kind = Kind::Waiting;
+            journal.record(event, false).unwrap().unwrap();
+        }
+        let (wake, _receiver) = mpsc::channel(1);
+        let shared = Arc::new(Shared {
+            pending: Mutex::default(),
+            presence: Mutex::default(),
+            snapshot: Mutex::default(),
+            wake,
+        });
+        let handle = Handle(shared.clone());
+        handle.clear_session_waiting(first);
+        let batch = take_pending(&shared);
+        handle.clear_session_waiting(second);
+        handle.change(|pending| pending.stopped = true);
+
+        assert!(settle_waiting_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &batch.cleared_waiting,
+        ));
+        let notices = journal.list().unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|notice| notice.acknowledged));
     }
 
     #[test]

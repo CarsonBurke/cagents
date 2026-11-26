@@ -250,6 +250,16 @@ impl Resident {
             && matches!(self.activity, ActivityState::Idle | ActivityState::Working)
     }
 
+    fn waiting_state_cursor(&self) -> u64 {
+        // A conditional request is otherwise suppressed by an old helper
+        // whose settled state has not changed since the first observation.
+        if self.legacy_activity_is_settled() && !self.legacy_waiting_settled {
+            self.changed ^ (1u64 << 63)
+        } else {
+            self.changed
+        }
+    }
+
     fn has_retirable_inputs(&self) -> bool {
         self.terminal_input_count
             .unwrap_or(self.acknowledged_input_count)
@@ -944,8 +954,9 @@ impl RemoteActor {
         if self.0.stop.load(Ordering::Acquire) && !closed {
             return Err("This retained actor attachment is unavailable; authenticate a new attachment before refreshing".into());
         }
+        let after = self.state().waiting_state_cursor();
         if let Some(mut resident) =
-            self.call_until::<Option<Resident>>("state", json!([self.state().changed]), deadline)?
+            self.call_until::<Option<Resident>>("state", json!([after]), deadline)?
         {
             if self.0.stop.load(Ordering::Acquire) {
                 if !closed || !resident.close.completed {
@@ -958,7 +969,11 @@ impl RemoteActor {
                 resident.ready = false;
                 resident.idle = false;
                 resident.busy = false;
-                let (changed, generation) = (resident.changed, resident.generation);
+                let (changed, generation, outbox) = (
+                    resident.changed,
+                    resident.generation,
+                    resident.outbox_latest,
+                );
                 let active_model_clock = (resident.close.actor_id, resident.active_model_revision);
                 if !self.publish_resident_inner(resident, true) {
                     // Another refresh, such as the outcome broker's while a
@@ -968,6 +983,7 @@ impl RemoteActor {
                     if !(current.completed
                         && (current.changed > changed
                             || current.generation > generation
+                            || current.outbox_latest > outbox
                             || (current.close.actor_id == active_model_clock.0
                                 && current.active_model_revision > active_model_clock.1)))
                     {
@@ -1625,6 +1641,7 @@ impl RemoteActor {
                     && resident.close.completed))
                 || resident.changed < state.changed
                 || resident.generation < state.generation
+                || resident.outbox_latest < state.outbox_latest
                 // A model update can precede its change callback while both
                 // general clocks still match an older in-flight sample.
                 || (resident.close.actor_id == state.close.actor_id
