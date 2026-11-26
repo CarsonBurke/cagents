@@ -281,6 +281,15 @@ fn finish_watch(removed: bool) {
 
 #[test]
 fn refreshing_a_read_checkpoint_keeps_pending_commands_on_the_same_watch() {
+    refresh_read_checkpoint(false);
+}
+
+#[test]
+fn a_retryable_read_keeps_the_checkpoint_for_the_next_retained_presentation() {
+    refresh_read_checkpoint(true);
+}
+
+fn refresh_read_checkpoint(transient_read: bool) {
     use crate::notifications::{Event, Evidence, Kind, Notice, Snapshot};
 
     let (bridge, daemon) = UnixStream::pair().unwrap();
@@ -357,18 +366,47 @@ fn refreshing_a_read_checkpoint_keeps_pending_commands_on_the_same_watch() {
             snapshot: None,
         },
     );
+    let expected_read = ClientRequest::ChatRead {
+        chat_id,
+        after_generation: None,
+    };
     let presentation = daemon.receive();
-    assert_eq!(
-        presentation.request,
-        ClientRequest::ChatRead {
-            chat_id,
-            after_generation: None
-        },
-    );
+    assert_eq!(presentation.request, expected_read);
     assert!(
         lines.outgoing.try_recv().is_err(),
         "a journal receipt alone is not a presentation"
     );
+    let (presentation, pending_command, command_id) = if transient_read {
+        daemon.reply(
+            &presentation,
+            ServerMessage::Error(ProtocolError {
+                code: ProtocolErrorCode::TerminalUnavailable,
+                message: "Retained provider presentation is temporarily unavailable.".into(),
+                retryable: true,
+            }),
+        );
+        daemon.respond(&interrupt, ServerResponse::Accepted);
+        assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 2, page: None });
+
+        // Commands can still use the watch while the actor waits to publish
+        // its scheduled reread, and no extra presentation request races them.
+        assert!(watch.send(Command::Chat {
+            id: 6,
+            command: chat::Command::Interrupt,
+        }));
+        let pending_command = daemon.receive();
+        assert!(matches!(
+            pending_command.request,
+            ClientRequest::ChatCommand { .. }
+        ));
+        daemon.notify(ServerMessage::ChatChanged { chat_id });
+        let presentation = daemon.receive();
+        assert_eq!(presentation.request, expected_read);
+        assert!(lines.outgoing.try_recv().is_err());
+        (presentation, pending_command, 6)
+    } else {
+        (presentation, interrupt, 2)
+    };
     daemon.respond(
         &presentation,
         ServerResponse::ChatSnapshot {
@@ -416,8 +454,14 @@ fn refreshing_a_read_checkpoint_keeps_pending_commands_on_the_same_watch() {
     daemon.respond(&dismiss, ServerResponse::Accepted);
     assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 5, page: None });
 
-    daemon.respond(&interrupt, ServerResponse::Accepted);
-    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 2, page: None });
+    daemon.respond(&pending_command, ServerResponse::Accepted);
+    assert_eq!(
+        next_line(&lines),
+        api::ServerLine::Ok {
+            id: command_id,
+            page: None
+        }
+    );
 }
 
 #[test]

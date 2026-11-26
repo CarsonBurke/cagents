@@ -434,9 +434,8 @@ impl Connection {
         loop {
             // A phone that is behind gets the conversation as it stands once
             // it catches up, rather than every publication on the way.
-            let needs_read = followed.changed || self.read_checkpoint_ready.is_some();
-            let held_back = needs_read && !followed.reading && self.outbox.congested();
-            if needs_read && !followed.reading && !held_back {
+            let held_back = followed.changed && !followed.reading && self.outbox.congested();
+            if followed.changed && !followed.reading && !held_back {
                 let after_generation = (self.read_checkpoint_ready.is_none()
                     && followed.snapshot.generation != 0)
                     .then_some(followed.snapshot.generation);
@@ -753,9 +752,25 @@ impl Connection {
                         self.outbox.ok(refresh.id);
                         return false;
                     }
-                    followed.read_checkpoint_request = None;
                     true
                 });
+                if !followed.ending
+                    && matches!(
+                        &envelope.message,
+                        ServerMessage::Error(error)
+                            if error.retryable && error.code != ProtocolErrorCode::TerminalNotFound
+                    )
+                    && let Some(refresh) = refresh.take()
+                {
+                    // A retained actor schedules its own reread signal after
+                    // a transient failure. Keep the exact capture for that
+                    // next full read without retrying on our own timer.
+                    self.read_checkpoint_ready = Some(refresh);
+                    return Ok(());
+                }
+                if refresh.is_some() {
+                    followed.read_checkpoint_request = None;
+                }
                 if let Some(presentation) = &refresh
                     && !matches!(
                         &envelope.message,
@@ -844,6 +859,7 @@ impl Connection {
                             notification_request: request_id,
                             notice: unread_session_notice(snapshot, self.chat_id),
                         });
+                        followed.changed = true;
                     }
                     ServerMessage::Error(error) => {
                         followed.read_checkpoint_request = None;
