@@ -41,6 +41,7 @@ pub(crate) fn run(
     // Arm Drop before any fallible close: reopening a saved recovery pane is
     // an attachment, never permission to resume or start its provider.
     guard.set_recovery_restore_only();
+    #[cfg(target_os = "linux")]
     guard.set_fallback_executable(ui.clone());
     let store = crate::upgrade::handoff::Store::existing()
         .map_err(invalid)?
@@ -100,28 +101,36 @@ pub(crate) fn run(
         };
         let outcome = if !archived {
             let selection = staged_selection(&layout)?;
+            #[cfg(target_os = "macos")]
+            let publication = crate::install_guard::reserve_darwin_publication()?;
+            #[cfg(target_os = "linux")]
             let switch = selection
                 .as_ref()
                 .map(|selection| selection.prepare(&layout))
                 .transpose()?
                 .flatten();
+            #[cfg(target_os = "macos")]
+            let switch = prepare_recovery_selection(&layout, selection.as_ref())?;
             installed::complete_selection(switch, &layout)?;
+            guard.set_fallback_executable(ui.clone());
             // Only a still-canonical recovery may replace already open windows.
             let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
             let windows = recovery_window_slots(&pending.windows, &current_windows);
             guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
             drop(retirement);
+            #[cfg(target_os = "macos")]
+            drop(publication);
             guard.relaunch_windows(&windows, &ui)?;
-            verify(&pending, &daemon).and_then(|_| {
+            verify(&pending, &daemon, None).and_then(|_| {
                 recovery::retire_current_service(source::BusyPatience::for_one_run())?;
-                verify(&pending, &daemon)
+                verify(&pending, &daemon, None)
             })
         } else {
             // Archived records cannot publish a version or replace a live window.
             installed::selected_candidate(&layout.prefix, &layout.version_root)?;
             drop(retirement);
             guard.relaunch_missing_windows(&settled.windows, &ui)?;
-            verify(&pending, &daemon)
+            verify(&pending, &daemon, None)
         };
         return match outcome {
             Ok((_, outcome)) => {
@@ -137,10 +146,18 @@ pub(crate) fn run(
     }
     drop(retirement);
     let before = candidate_stamp(&layout.version_root)?;
+    #[cfg(target_os = "linux")]
     let selection = staged_selection(&layout)?;
+    #[cfg(target_os = "linux")]
     let previous_link = selection
         .as_ref()
         .and_then(installed::Selection::previous_link);
+    #[cfg(target_os = "macos")]
+    let previous_link = (served_version_root(&layout)? != layout.version_root)
+        .then(|| fs::read_link(layout.prefix.join("current")))
+        .transpose()?;
+    #[cfg(target_os = "macos")]
+    let previous_link = previous_link.as_deref();
     let paths = crate::daemon::RuntimePaths::discover().map_err(|e| invalid(e.to_string()))?;
     let handoff = LeaseHandoff::try_acquire(&paths).map_err(|e| invalid(e.to_string()))?
         .ok_or_else(|| invalid("A daemon is serving or starting. It was kept running; inspect `cagents --no-start daemon status` before repeating recovery"))?;
@@ -186,26 +203,24 @@ pub(crate) fn run(
                 "The selected candidate changed before recovery; nothing was started",
             ));
         }
-        #[cfg(target_os = "linux")]
-        let mut standby = previous_link
-            .map(|expected| {
+        // The exact Prepared successor owns Darwin publication. A selected
+        // Darwin candidate still needs standby to authenticate the receipt.
+        let parks_successor = cfg!(target_os = "macos") || previous_link.is_some();
+        let mut standby = parks_successor
+            .then(|| {
                 let binary = fs::symlink_metadata(&daemon)?;
                 crate::daemon::standby::Parked::launch(
                     &daemon,
                     (binary.dev(), binary.ino()),
                     &guard,
-                    Some(expected),
+                    previous_link,
                 )
             })
             .transpose()?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
-        #[cfg(target_os = "linux")]
-        let parked = standby.is_some();
-        #[cfg(not(target_os = "linux"))]
-        let parked = false;
         // Prepare the authority transport before touching windows or publishing
-        // the direct-start target. Darwin rejects inherited receipts here.
-        let direct_start = if parked {
+        // the direct-start target.
+        let direct_start = if standby.is_some() {
             None
         } else {
             let mut command = Command::new(&cli);
@@ -223,28 +238,37 @@ pub(crate) fn run(
             receipt.inherit(&mut command)?;
             Some(command)
         };
+        #[cfg(target_os = "macos")]
+        guard.set_fallback_executable(served_version_root(&layout)?.join("bin/cagents-ui"));
         let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
         let windows = recovery_window_slots(&saved_windows, &current_windows);
-        if previous_link.is_none() {
+        if direct_start.is_some() {
             select_target(&layout)?;
         }
         guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
-        #[cfg(target_os = "linux")]
-        if let Some(standby) = standby.as_mut() {
+        let pid = if let Some(standby) = standby.as_mut() {
             let started = standby
                 .activate(&daemon, Some(&handoff), Some(&receipt), timeout, || {
                     let _ = installed::report_overdue_startup(&state, &mut job);
                 })
-                .map_err(UpdateError::from)
-                .and_then(|()| {
+                .map_err(UpdateError::from);
+            // Authority may have arrived even when its acknowledgement did
+            // not. Only the exact child can settle that uncertain transfer.
+            let ready =
+                if started.is_ok() || (cfg!(target_os = "macos") && standby.may_own_runtime()) {
                     installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout)
-                });
-            if started.is_err() && standby.may_own_runtime() {
+                } else {
+                    started
+                };
+            if ready.is_err() && standby.may_own_runtime() {
                 guard.leave_launch_fence_with_successor();
             }
-            started?;
+            ready?;
             installed::selected_candidate(&layout.prefix, &layout.version_root)?;
-        }
+            Some(standby.pid())
+        } else {
+            None
+        };
         if let Some(mut command) = direct_start {
             crate::install_guard::wait_daemon_start(&mut command, timeout)
             .map_err(|failure| invalid(format!("Target recovery startup failed: {}. Its checkpoint and claim were preserved; inspect {} before another recovery attempt", failure.error, job.log_path.display())))?;
@@ -254,8 +278,10 @@ pub(crate) fn run(
         let pending = PendingRecovery::inspect()
             .map_err(invalid)?
             .ok_or_else(|| invalid("The Prepared evidence disappeared after recovery"))?;
-        let (serving, _) = verify(&pending, &daemon)?;
+        let (serving, _) = verify(&pending, &daemon, pid)?;
         receipt.verify_successor(&serving).map_err(invalid)?;
+        #[cfg(target_os = "macos")]
+        guard.set_fallback_executable(ui.clone());
         receipt.release_daemon_reservation();
         Ok::<_, UpdateError>(windows)
     })();
@@ -268,9 +294,9 @@ pub(crate) fn run(
         let pending = PendingRecovery::inspect()
             .map_err(invalid)?
             .ok_or_else(|| invalid("The recovery checkpoint disappeared while reopening panes"))?;
-        verify(&pending, &daemon)?;
+        verify(&pending, &daemon, None)?;
         recovery::retire_current_service(source::BusyPatience::for_one_run())?;
-        verify(&pending, &daemon)
+        verify(&pending, &daemon, None)
     });
     match result {
         Ok((_, outcome)) => {
@@ -348,7 +374,7 @@ fn verify_settled(
     daemon: &Path,
     checkpoint: &Path,
 ) -> Result<Settled, UpdateError> {
-    let (_, outcome) = verify(pending, daemon)?;
+    let (_, outcome) = verify(pending, daemon, None)?;
     let settled = pending_retirement(checkpoint, daemon)
         .map_err(invalid)?
         .ok_or_else(|| invalid("The installed recovery has no settled Prepared record"))?;
@@ -366,13 +392,15 @@ fn verify_settled(
 fn verify(
     pending: &PendingRecovery,
     daemon: &Path,
+    pid: Option<u32>,
 ) -> Result<(HostSessionProof, recovery::Receipt), UpdateError> {
     let busy = source::BusyPatience::for_one_run();
     let socket = crate::terminal_ipc::daemon_socket_path()?;
     let mut client = source::Client::connect(&socket)
         .map_err(|e| invalid(e.to_string()))?
         .with_busy_patience(busy);
-    if client.serving_executable()? != daemon
+    if pid.is_some_and(|pid| client.peer_pid() != pid)
+        || client.serving_executable()? != daemon
         || client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION
         || client.startup_state()? != crate::terminal_ipc::StartupState::Ready
     {
@@ -411,6 +439,29 @@ fn verify(
         return Err(invalid("The serving recovery executable changed"));
     }
     Ok((client.proof().clone(), receipt))
+}
+
+/// A retained, explicitly authorized release can have no local staging
+/// marker. Prepare the exchange against this installation's complete selected
+/// tree. The caller holds the launch fence and publishes after verifying custody.
+#[cfg(target_os = "macos")]
+fn prepare_recovery_selection(
+    layout: &InstallLayout,
+    selection: Option<&installed::Selection>,
+) -> Result<Option<crate::install_guard::CurrentExchange>, UpdateError> {
+    if let Some(selection) = selection {
+        return selection.prepare(layout);
+    }
+    let expected = fs::read_link(layout.prefix.join("current"))?;
+    if served_version_root(layout)? == layout.version_root {
+        return Ok(None);
+    }
+    let selected = Path::new("versions").join(&layout.version);
+    Ok(Some(crate::install_guard::CurrentExchange::prepare(
+        &layout.prefix,
+        &selected,
+        &expected,
+    )?))
 }
 
 fn report(receipt: &recovery::Receipt) -> String {
