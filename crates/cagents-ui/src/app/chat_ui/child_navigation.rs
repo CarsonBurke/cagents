@@ -566,10 +566,6 @@ impl Runtime {
     /// the child's ID is the provider's address for it, not a name.
     pub(super) fn child_choice_name(&self, child: &chat::Subagent, label: &str) -> String {
         let status = self.native_child_status(child);
-        if child.last_seen_running() {
-            return status.to_owned();
-        }
-
         match Self::native_child_task(child).filter(|_| !Self::named_by_task(child)) {
             Some(task) => format!(
                 "{label} · {status} · Task: {}",
@@ -750,6 +746,9 @@ impl Runtime {
         report: Option<&chat::Item>,
     ) -> String {
         let status = self.native_child_status(child);
+        if child.last_seen_running() {
+            return status.to_owned();
+        }
         let detail = child.detail.trim();
         let reported = || {
             report
@@ -1072,6 +1071,20 @@ mod tests {
         assert_eq!(direct_tabs(&children, Some(&child.id), None), [&child]);
         assert_eq!(
             super::super::view::AgentWork::default().caption(&child),
+            chat::UNLOADED_CHILD_RUNNING
+        );
+
+        let (runtime, _) = super::super::view::prepared_runtime_for_test(&[]);
+        let mut other = child.clone();
+        other.id = "earlier-2".into();
+        let first = runtime.child_choice_name(&child, "Reviewer 1");
+        let second = runtime.child_choice_name(&other, "Reviewer 2");
+        assert!(first.starts_with("Reviewer 1 · "));
+        assert!(second.starts_with("Reviewer 2 · "));
+        assert!(first.contains(chat::UNLOADED_CHILD_RUNNING));
+        assert!(second.contains(chat::UNLOADED_CHILD_RUNNING));
+        assert_eq!(
+            runtime.child_activity(&child, None),
             chat::UNLOADED_CHILD_RUNNING
         );
     }
