@@ -33,7 +33,7 @@ pub(super) fn restore_settled_from(
 /// Ordinary startup restores only current, authenticated holders and the
 /// current Ready checkpoint. Archived update evidence cannot recreate panes.
 pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
-    restore_ordinary_with(host, std::path::Path::new("/proc"))
+    restore_ordinary_with(host, std::path::Path::new("/proc"), None).map(|_| ())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -41,25 +41,41 @@ pub(super) fn restore_ordinary_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,
 ) -> Result<(), String> {
-    restore_ordinary_with(host, processes)
+    restore_ordinary_with(host, processes, None).map(|_| ())
 }
 
-fn restore_ordinary_with(host: &SharedHost, processes: &std::path::Path) -> Result<(), String> {
+#[cfg(target_os = "macos")]
+pub(super) fn restore_installed_ready(
+    host: &SharedHost,
+    admission: &recovery::ReadyAdmission,
+) -> Result<state::RestoredUpgrade, String> {
+    restore_ordinary_with(
+        host,
+        std::path::Path::new("/proc"),
+        Some(admission.checkpoint_digest()),
+    )
+}
+
+fn restore_ordinary_with(
+    host: &SharedHost,
+    processes: &std::path::Path,
+    expected_ready: Option<&str>,
+) -> Result<state::RestoredUpgrade, String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: previous boot history", None);
     chat::retained_actor::reconcile_previous_boot_history(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: capture Ready", None);
     let ready_capture = ready::capture()?;
+    let captured_digest = ready_capture
+        .as_ref()
+        .map(ready::ReadyCapture::checkpoint_digest);
+    if expected_ready.is_some() && captured_digest != expected_ready {
+        return Err("Installed startup lost its acknowledged Ready capture".into());
+    }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
-    let mut restored = state::restore_upgrade_with_digest(
-        host,
-        processes,
-        ready_capture
-            .as_ref()
-            .map(ready::ReadyCapture::checkpoint_digest),
-    )?;
+    let mut restored = state::restore_upgrade_with_digest(host, processes, captured_digest)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;
@@ -111,13 +127,15 @@ fn restore_ordinary_with(host: &SharedHost, processes: &std::path::Path) -> Resu
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
     ready::publish(ready_capture, &proof, &executable, &terminals, &chats)?;
-    restored.finish(host)?;
+    if expected_ready.is_none() {
+        restored.finish(host)?;
+    }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: optional archived proof", None);
     publish_archived_proof(host);
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: complete", None);
-    Ok(())
+    Ok(restored)
 }
 
 /// Settle what agents were left doing by an earlier daemon. A committed

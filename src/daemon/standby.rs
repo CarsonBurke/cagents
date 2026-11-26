@@ -49,6 +49,8 @@ enum Activation {
     Fresh,
     Lease,
     Checkpoint,
+    #[cfg(target_os = "macos")]
+    ReadyCheckpoint,
 }
 
 #[cfg(any(feature = "host", test))]
@@ -72,7 +74,7 @@ impl Activation {
         match self {
             Self::Fresh => 0,
             Self::Lease => 1,
-            Self::Checkpoint => DESCRIPTOR_LIMIT,
+            Self::Checkpoint | Self::ReadyCheckpoint => DESCRIPTOR_LIMIT,
         }
     }
 }
@@ -358,7 +360,7 @@ impl Parked {
             .map(LeaseHandoff::descriptor)
             .collect::<Vec<_>>();
         #[cfg(target_os = "macos")]
-        let prepared = receipt
+        let authority = receipt
             .map(|receipt| receipt.standby_proof(executable))
             .transpose()?;
         let request = if let Some(receipt) = receipt {
@@ -375,10 +377,15 @@ impl Parked {
             }
             #[cfg(target_os = "macos")]
             {
-                let _ = receipt;
-                let (_, files) = prepared.as_ref().expect("validated Prepared authority");
+                let (_, files) = authority.as_ref().expect("validated checkpoint authority");
                 descriptors.extend(files.iter().map(|file| file.as_fd()));
+                if receipt.is_ready() {
+                    Activation::ReadyCheckpoint
+                } else {
+                    Activation::Checkpoint
+                }
             }
+            #[cfg(target_os = "linux")]
             Activation::Checkpoint
         } else if lease.is_some() {
             Activation::Lease
@@ -391,7 +398,7 @@ impl Parked {
         self.channel.write_all(&[0])?;
         send(&self.channel, &request, &descriptors)?;
         #[cfg(target_os = "macos")]
-        if let Some((authority, _)) = prepared {
+        if let Some((authority, _)) = authority {
             send_json_with_fds_until(
                 &self.channel,
                 authority,
@@ -446,6 +453,8 @@ pub struct Activated {
     _legacy_fence: crate::instance::OwnedLock,
     #[cfg(target_os = "macos")]
     _publication: Option<File>,
+    #[cfg(target_os = "macos")]
+    ready_admission: Option<crate::upgrade::recovery::ReadyAdmission>,
 }
 
 #[cfg(feature = "host")]
@@ -466,6 +475,11 @@ impl Activated {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn take_local_publication(&mut self) -> Option<crate::update::LocalPublication> {
         self.publication.take()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn take_ready_admission(&mut self) -> Option<crate::upgrade::recovery::ReadyAdmission> {
+        self.ready_admission.take()
     }
 }
 
@@ -571,20 +585,33 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     #[cfg(target_os = "linux")]
     install_descriptors(descriptors, &request.slots())?;
     #[cfg(target_os = "macos")]
-    {
-        if publication.is_some() && !matches!(request, Activation::Checkpoint) {
+    let ready_admission = {
+        if publication.is_some()
+            && !matches!(
+                request,
+                Activation::Checkpoint | Activation::ReadyCheckpoint
+            )
+        {
             return Err(io::Error::other(
-                "installation publication requires exact Prepared recovery authority",
+                "installation publication requires exact checkpoint authority",
             ));
         }
-        install_darwin_activation(&control, &request, descriptors)?;
-    }
+        if request == Activation::ReadyCheckpoint && publication.is_none() {
+            return Err(io::Error::other(
+                "Ready activation requires an installed selection",
+            ));
+        }
+        install_darwin_activation(&control, request, descriptors)?
+    };
     // SAFETY: the inherited authority readers run immediately afterward in
     // this same thread, consuming their normal authenticated descriptors.
     unsafe {
+        #[cfg(target_os = "linux")]
         if !matches!(request, Activation::Fresh) {
             std::env::set_var(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
         }
+        #[cfg(target_os = "macos")]
+        std::env::set_var(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
         #[cfg(target_os = "linux")]
         if matches!(request, Activation::Checkpoint) {
             std::env::set_var(RECOVERY_FD_ENV, RECEIPT_DESCRIPTORS[0].to_string());
@@ -598,22 +625,27 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         _legacy_fence: legacy_fence,
         #[cfg(target_os = "macos")]
         _publication: account_fence,
+        #[cfg(target_os = "macos")]
+        ready_admission,
     })
 }
 
 #[cfg(all(feature = "host", target_os = "macos"))]
 fn install_darwin_activation(
     control: &UnixStream,
-    request: &Activation,
+    request: Activation,
     descriptors: Vec<OwnedFd>,
-) -> io::Result<()> {
-    use crate::upgrade::recovery::{Authority, accept_standby_authority};
+) -> io::Result<Option<crate::upgrade::recovery::ReadyAdmission>> {
+    use crate::upgrade::recovery::{Authority, accept_ready_authority, accept_standby_authority};
 
     let mut descriptors = descriptors.into_iter();
     let lease = descriptors
         .next()
         .ok_or_else(|| io::Error::other("Darwin standby requires a runtime lease transfer"))?;
-    if *request == Activation::Checkpoint {
+    let ready = if matches!(
+        request,
+        Activation::Checkpoint | Activation::ReadyCheckpoint
+    ) {
         let (authority, _): (Authority, _) = receive_json_with_fds_until(
             control,
             Instant::now() + TRANSFER_TIMEOUT,
@@ -626,10 +658,19 @@ fn install_darwin_activation(
             .map(File::from)
             .collect::<Vec<_>>()
             .try_into()
-            .map_err(|_| io::Error::other("Prepared transfer has incomplete custody"))?;
-        accept_standby_authority(authority, files, File::from(lease.try_clone()?))?;
-    }
-    install_descriptors(vec![lease], &[DAEMON_LEASE_FD])
+            .map_err(|_| io::Error::other("Checkpoint transfer has incomplete custody"))?;
+        let daemon = File::from(lease.try_clone()?);
+        if request == Activation::ReadyCheckpoint {
+            Some(accept_ready_authority(authority, files, daemon)?)
+        } else {
+            accept_standby_authority(authority, files, daemon)?;
+            None
+        }
+    } else {
+        None
+    };
+    install_descriptors(vec![lease], &[DAEMON_LEASE_FD])?;
+    Ok(ready)
 }
 
 #[cfg(any(feature = "host", test))]

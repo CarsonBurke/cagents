@@ -770,6 +770,8 @@ pub(crate) struct CapturedPreparation(Preparation);
 pub(crate) struct Receipt {
     #[cfg(target_os = "linux")]
     receipt: File,
+    #[cfg(target_os = "macos")]
+    phase: Phase,
     worker: File,
     fence: File,
     legacy: File,
@@ -1435,6 +1437,8 @@ impl PendingRecovery {
         Ok(Receipt {
             #[cfg(target_os = "linux")]
             receipt: sealed_receipt(&authority).map_err(|e| e.to_string())?,
+            #[cfg(target_os = "macos")]
+            phase: Phase::Prepared,
             worker,
             fence,
             legacy,
@@ -1587,7 +1591,7 @@ impl CapturedPreparation {
         target_daemon: &Path,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        let result = self.make_receipt(target_daemon, None, handoff);
+        let result = self.make_receipt(target_daemon, None, handoff, false);
         if let Err(error) = &result {
             eprintln!(
                 "The acknowledged preparation could not authorize successor recovery: {error}"
@@ -1604,7 +1608,7 @@ impl CapturedPreparation {
         verified_daemon_sha256: &str,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        let result = self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff);
+        let result = self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff, false);
         if let Err(error) = &result {
             eprintln!(
                 "The acknowledged preparation could not authorize successor recovery: {error}"
@@ -1613,11 +1617,24 @@ impl CapturedPreparation {
         result
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn standby_receipt(
+        self,
+        target_daemon: &Path,
+        handoff: &LeaseHandoff,
+    ) -> Result<Receipt, String> {
+        self.make_receipt(target_daemon, None, handoff, true)?
+            .ok_or_else(|| {
+                "The acknowledged checkpoint did not authorize standby activation".to_owned()
+            })
+    }
+
     fn make_receipt(
         self,
         target_daemon: &Path,
         verified_digest: Option<&str>,
         handoff: &LeaseHandoff,
+        transfer_ready: bool,
     ) -> Result<Option<Receipt>, String> {
         let mut preparation = self.0;
         preparation.validate_continuity()?;
@@ -1630,7 +1647,9 @@ impl CapturedPreparation {
             // original scope for the exact final bytes consumed by normal
             // restoration, including panes ended before that checkpoint.
             preparation.bind_acknowledged_checkpoint(&bytes)?;
-            return Ok(None);
+            if !transfer_ready {
+                return Ok(None);
+            }
         }
         if digest(&bytes) != preparation.authority.checkpoint_hash {
             return Err("The Prepared checkpoint changed after this update acknowledged it; automatic recovery was refused".into());
@@ -1663,6 +1682,8 @@ impl CapturedPreparation {
         Ok(Some(Receipt {
             #[cfg(target_os = "linux")]
             receipt: sealed_receipt(&preparation.authority).map_err(|e| e.to_string())?,
+            #[cfg(target_os = "macos")]
+            phase,
             worker: preparation.worker,
             fence: preparation.fence,
             legacy: preparation.legacy,
@@ -1673,6 +1694,10 @@ impl CapturedPreparation {
 }
 
 impl Receipt {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn is_ready(&self) -> bool {
+        self.phase == Phase::Ready
+    }
     pub(crate) fn saved_windows(&self) -> &[String] {
         &self.authority.windows
     }
@@ -4211,7 +4236,7 @@ impl Inherited {
             return Err("Update recovery receipt exceeds its byte limit".into());
         }
         let authority = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        self.validate_received(&authority)?;
+        self.validate_received(&authority, Phase::Prepared)?;
         Ok(authority)
     }
 
@@ -4223,11 +4248,11 @@ impl Inherited {
             .ok_or("Prepared authority was already consumed")?;
         // The private transfer checked the request and exact mapped target
         // before admission. The checkpoint must still name the same bytes.
-        validate_received_checkpoint(&authority)?;
+        validate_received_checkpoint(&authority, Phase::Prepared)?;
         Ok(authority)
     }
 
-    fn validate_received(&self, authority: &Authority) -> Result<(), String> {
+    fn validate_received(&self, authority: &Authority, phase: Phase) -> Result<(), String> {
         validate_host_context(authority)?;
         if authority.version != 1
             || fs::canonicalize(&authority.target).map_err(|e| e.to_string())?
@@ -4278,7 +4303,7 @@ impl Inherited {
         if !same_authority_path(&authority.daemon_path, &paths.lock) {
             return Err("Recovery inherited a different daemon namespace".into());
         }
-        validate_received_checkpoint(authority)?;
+        validate_received_checkpoint(authority, phase)?;
         #[cfg(target_os = "macos")]
         validate_acknowledged_capture(authority)?;
         Ok(())
@@ -4328,7 +4353,7 @@ pub(crate) fn accept_standby_authority(
         daemon,
     };
     received
-        .validate_received(&authority)
+        .validate_received(&authority, Phase::Prepared)
         .map_err(io::Error::other)?;
     received.authority = Some(authority);
     INHERITED
@@ -4336,17 +4361,85 @@ pub(crate) fn accept_standby_authority(
         .map_err(|_| io::Error::other("Prepared receipt was already initialized"))
 }
 
+/// The acknowledged Ready checkpoint and the exact worker, launch, legacy,
+/// and runtime descriptions that protect its one installed cutover. This
+/// authority never enters the global Prepared adoption slot.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub struct ReadyAdmission {
+    authority: Authority,
+    custody: Inherited,
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+impl ReadyAdmission {
+    pub fn checkpoint_digest(&self) -> &str {
+        &self.authority.checkpoint_hash
+    }
+
+    pub fn verify_live_inventory(
+        &self,
+        serving: &HostSessionProof,
+        terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        chats: &[Session],
+    ) -> Result<(), String> {
+        for (file, path) in [
+            (&self.custody.worker, &self.authority.worker_path),
+            (&self.custody.fence, &self.authority.fence_path),
+            (&self.custody.daemon, &self.authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|error| error.to_string())?;
+        }
+        validate_lock_mode(&self.custody.legacy, &self.authority.legacy_path, "READ")
+            .map_err(|error| error.to_string())?;
+        let store = super::handoff::Store::discover()?;
+        let lineage = store.recovered_chats()?;
+        crate::update::recovery::verify_ready_inventory(
+            &self.authority.job,
+            &self.authority.source,
+            &self.authority.census,
+            serving,
+            terminals,
+            chats,
+            &lineage,
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn accept_ready_authority(
+    authority: Authority,
+    [worker, fence, legacy]: [File; STANDBY_RECEIPT_DESCRIPTORS],
+    daemon: File,
+) -> io::Result<ReadyAdmission> {
+    if !matches!(authority.origin, Origin::AcknowledgedPrepare) || std::env::var_os(ENV).is_some() {
+        return Err(io::Error::other(
+            "Ready activation requires this update's original acknowledgement",
+        ));
+    }
+    let custody = Inherited {
+        authority: None,
+        worker,
+        fence,
+        legacy,
+        daemon,
+    };
+    custody
+        .validate_received(&authority, Phase::Ready)
+        .map_err(io::Error::other)?;
+    Ok(ReadyAdmission { authority, custody })
+}
+
 #[cfg(feature = "host")]
-fn validate_received_checkpoint(authority: &Authority) -> Result<(), String> {
+fn validate_received_checkpoint(authority: &Authority, phase: Phase) -> Result<(), String> {
     let checkpoint =
         read_checkpoint(&authority.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
     super::handoff::validate_checkpoint_bytes(&checkpoint)?;
-    if validate_checkpoint(authority, &checkpoint)? != Phase::Prepared
+    if validate_checkpoint(authority, &checkpoint)? != phase
         || digest(&checkpoint) != authority.checkpoint_hash
     {
-        return Err(
-            "Recovery receipt does not identify these exact Prepared checkpoint bytes".into(),
-        );
+        return Err(format!(
+            "Recovery receipt does not identify these exact {phase:?} checkpoint bytes"
+        ));
     }
     if super::handoff::Store::discover()?.path != authority.checkpoint_path {
         return Err("Recovery checkpoint belongs to another application".into());
