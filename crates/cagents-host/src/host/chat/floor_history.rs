@@ -667,7 +667,12 @@ mod flow_tests {
                     },
                 )
             };
-            let prepared = prepare(&host);
+            let prepared = {
+                #[cfg(target_os = "macos")]
+                let _native = (original.launch.provider == Provider::Codex)
+                    .then(|| ProcessRootGuard::install(Path::new("/proc")));
+                prepare(&host)
+            };
             #[cfg(target_os = "macos")]
             let prepared = if original.launch.provider == Provider::Codex {
                 // This stopped ledger has no exact Codex retirement receipt.
