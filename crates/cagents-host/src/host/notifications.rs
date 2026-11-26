@@ -368,8 +368,12 @@ pub(super) fn acknowledge_predecessors(host: &SharedHost, session: TerminalId) {
 fn apply_predecessor_reads(
     journal: &mut Journal,
     reads: &mut BTreeMap<Uuid, TerminalId>,
+    delivery: &mut BTreeMap<Target, Notice>,
     mut cleared: impl FnMut(Uuid, TerminalId),
 ) -> Result<(), String> {
+    // The person already read these exact notices. A failed disk write
+    // must not allow a waiting desktop delivery to announce them again.
+    delivery.retain(|_, notice| !reads.contains_key(&notice.id));
     let mut failure = None;
     reads.retain(|&id, &mut session| match journal.acknowledge(id) {
         Ok(acknowledged) => {
@@ -1001,10 +1005,14 @@ async fn run(
                 snapshot.diagnostic = Some(error);
             }
         }
-        match apply_predecessor_reads(journal, &mut pending.predecessor_reads, |id, session| {
-            delivery.retain(|_, waiting| waiting.id != id);
-            withdraw_target(&mut withdrawals, id, &Target::Session(session));
-        }) {
+        match apply_predecessor_reads(
+            journal,
+            &mut pending.predecessor_reads,
+            &mut delivery,
+            |id, session| {
+                withdraw_target(&mut withdrawals, id, &Target::Session(session));
+            },
+        ) {
             Ok(()) => {
                 if let Some((_, error)) = predecessor_retry.take()
                     && snapshot.diagnostic.as_ref() == Some(&error)
@@ -1334,7 +1342,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut retired = Vec::new();
-        apply_predecessor_reads(&mut bridge.journal, &mut reads, |id, _| retired.push(id)).unwrap();
+        apply_predecessor_reads(
+            &mut bridge.journal,
+            &mut reads,
+            &mut BTreeMap::new(),
+            |id, _| retired.push(id),
+        )
+        .unwrap();
         assert_eq!(retired, [previous.id]);
         let visible = bridge.list().unwrap();
         assert!(
@@ -1359,18 +1373,45 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut reads = [(previous.id, predecessor)].into();
+        let unrelated = journal
+            .record(attention_event(TerminalId::new(), "unrelated"), false)
+            .unwrap()
+            .unwrap();
+        let mut delivery = [
+            (previous.event.target(), previous.clone()),
+            (unrelated.event.target(), unrelated.clone()),
+        ]
+        .into();
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch("CREATE TRIGGER refuse_ack BEFORE UPDATE OF acknowledged ON notices BEGIN SELECT raise(ABORT, 'temporarily cannot write'); END;").unwrap();
-        assert!(apply_predecessor_reads(&mut journal, &mut reads, |_, _| unreachable!()).is_err());
+        assert!(
+            apply_predecessor_reads(
+                &mut journal,
+                &mut reads,
+                &mut delivery,
+                |_, _| unreachable!()
+            )
+            .is_err()
+        );
         assert_eq!(reads, [(previous.id, predecessor)].into());
+        assert_eq!(
+            delivery,
+            [(unrelated.event.target(), unrelated.clone())].into()
+        );
         db.execute_batch("DROP TRIGGER refuse_ack").unwrap();
         let replacement = journal
             .record(attention_event(predecessor, "after"), false)
             .unwrap()
             .unwrap();
-        apply_predecessor_reads(&mut journal, &mut reads, |_, _| unreachable!()).unwrap();
+        apply_predecessor_reads(
+            &mut journal,
+            &mut reads,
+            &mut delivery,
+            |_, _| unreachable!(),
+        )
+        .unwrap();
         assert!(reads.is_empty());
-        assert_eq!(journal.list().unwrap(), [replacement]);
+        assert_eq!(journal.list().unwrap(), [replacement, unrelated]);
     }
 
     #[test]
