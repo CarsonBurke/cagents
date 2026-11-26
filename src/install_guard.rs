@@ -737,7 +737,13 @@ pub(crate) fn staged_owner_bin(
     let Some(owner) = read_staged_owner(version_root)? else {
         return Ok(None);
     };
-    let layout = crate::update::locate(executable).map_err(io::Error::other)?;
+    let layout = match crate::update::locate(executable) {
+        Ok(layout) => layout,
+        // A deferred owner can only belong to an installer-managed tree.
+        // Standalone CLI operations on other installs use their normal route.
+        Err(crate::update::UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(io::Error::other(error)),
+    };
     if owner.daemon_compatible && owner.candidate_protocol != crate::terminal_ipc::PROTOCOL_VERSION
     {
         return Err(io::Error::other(
@@ -792,7 +798,6 @@ pub(crate) fn staged_owner_bin(
         return Ok(None);
     };
     let expected = layout.prefix.join("versions").join(version).join("bin");
-    crate::update::locate(&expected.join("cagents")).map_err(io::Error::other)?;
     for window in &windows {
         if window.executable != expected.join("cagents-ui") {
             return Err(io::Error::other(
@@ -800,8 +805,8 @@ pub(crate) fn staged_owner_bin(
             ));
         }
     }
-    if let Some(executable) = running {
-        let bin = running_owner_bin(&layout.prefix, &executable)?;
+    if let Some(executable) = &running {
+        let bin = running_owner_bin(&layout.prefix, executable)?;
         if bin == layout.version_root.join("bin") && windows.is_empty() {
             return Ok(None);
         }
@@ -810,14 +815,14 @@ pub(crate) fn staged_owner_bin(
                 "daemon does not match the deferred runtime owner",
             ));
         }
-        return Ok((bin != layout.version_root.join("bin")).then_some(bin));
     }
-    if windows.is_empty() {
+    if windows.is_empty() && running.is_none() {
         return Ok(None);
     }
+    crate::update::locate(&expected.join("cagents")).map_err(staged_layout_error)?;
     // Starting through the old public CLI uses its own protocol and recovery
-    // contract. Never ask the incompatible candidate to restore an old host.
-    if !recover {
+    // contract.
+    if running.is_some() || !recover {
         return Ok(Some(expected));
     }
     restore_window_daemon(&expected, &launch)?;
@@ -832,6 +837,15 @@ pub(crate) fn staged_owner_bin(
         ));
     }
     Ok(Some(expected))
+}
+
+fn staged_layout_error(error: crate::update::UpdateError) -> io::Error {
+    match error {
+        crate::update::UpdateError::UnsupportedInstallation => {
+            io::Error::other("the deferred runtime owner does not have a complete installation")
+        }
+        error => io::Error::other(error),
+    }
 }
 
 fn installed_version_root(executable: &Path) -> Option<&Path> {
@@ -958,7 +972,7 @@ fn window_owner_bin(
                 "live window identity is not an authenticated UI",
             ));
         }
-        let layout = crate::update::locate(&window.executable).map_err(io::Error::other)?;
+        let layout = crate::update::locate(&window.executable).map_err(staged_layout_error)?;
         let bin = layout.version_root.join("bin");
         if layout.prefix != prefix || owner.as_ref().is_some_and(|owner| owner != &bin) {
             return Err(io::Error::other(
@@ -1416,6 +1430,36 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, ["current"], "no temporary link may remain");
+    }
+
+    #[test]
+    fn a_local_cli_without_a_managed_install_has_no_staged_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let version = root.path().join("versions/0.2.4+local.fixture");
+        let bin = version.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for file in ["cagents", "cagentsd", "cagents-ui"] {
+            std::fs::write(bin.join(file), b"fixture").unwrap();
+        }
+        let marker = version.join(STAGED_OWNER);
+        std::fs::write(
+            &marker,
+            r#"{"version":1,"owner_version":"0.2.3","daemon_compatible":false,"candidate_protocol":203}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for recover in [false, true] {
+            assert_eq!(
+                staged_owner_bin(&bin.join("cagents"), recover).unwrap(),
+                None
+            );
+        }
+        assert!(matches!(
+            crate::update::locate(&bin.join("cagents")),
+            Err(crate::update::UpdateError::UnsupportedInstallation)
+        ));
     }
 
     #[cfg(target_os = "linux")]
