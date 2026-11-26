@@ -14,6 +14,42 @@ fn test_host() -> HostState {
 }
 
 #[test]
+fn restore_keeps_the_checkpoint_until_ready_publication_is_finalized() {
+    use crate::upgrade::handoff::{Checkpoint, Phase, Store};
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(HostLock::new(test_host_with_incarnation("successor")));
+    let source = test_host_with_incarnation("source").proof().clone();
+    let mut checkpoint = Checkpoint::new(source, Vec::new(), Vec::new(), Vec::new());
+    checkpoint.phase = Phase::Ready;
+    let store = Store::open(directory.path()).unwrap();
+    let path = store.path.clone();
+    store.save(&checkpoint).unwrap();
+    let restore = |store| {
+        restore_upgrade_checkpoint(
+            &host,
+            store,
+            Some(checkpoint.clone()),
+            directory.path(),
+            None,
+        )
+        .unwrap()
+    };
+    let interrupted = restore(store);
+    let evidence = std::fs::read(&path).unwrap();
+    drop(interrupted);
+    assert_eq!(std::fs::read(&path).unwrap(), evidence);
+    let store = Store::open(directory.path()).unwrap();
+    assert_eq!(store.load().unwrap().unwrap().phase, Phase::Restoring);
+
+    // Simulate a fresh startup from another acknowledged Ready checkpoint.
+    store.save(&checkpoint).unwrap();
+    let mut restored = restore(store);
+    restored.finish(&host).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
 fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
     use crate::terminal_ipc::{ClientRequest, ServerResponse};
     let host = Arc::new(HostLock::new(test_host()));

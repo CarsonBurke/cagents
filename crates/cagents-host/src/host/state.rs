@@ -3631,28 +3631,30 @@ fn apply_size(
 }
 
 /// Runs while HostLease is held, before accepting clients on the public listener.
-/// Returns the native conversations this restore left unattached: a retained
-/// one's reattachment was just refused, so startup must not retry it at once,
-/// and a relaunched one's failed restart was stopped for its pane to reopen.
+/// Acknowledged updates defer checkpoint retirement until Ready proof is durable.
 pub(super) fn restore_upgrade_with_digest(
     host: &SharedHost,
     processes: &std::path::Path,
     expected_digest: Option<&str>,
-) -> Result<Vec<TerminalId>, String> {
+) -> Result<RestoredUpgrade, String> {
     let store = crate::upgrade::handoff::Store::discover()?;
     let checkpoint = store.load_for_restore(expected_digest)?;
-    restore_upgrade_checkpoint(
+    let mut restored = restore_upgrade_checkpoint(
         host,
         store,
         checkpoint,
         processes,
         holder_directory().ok().as_deref(),
-    )
+    )?;
+    if expected_digest.is_none() {
+        restored.finish(host)?;
+    }
+    Ok(restored)
 }
 
 #[cfg(test)]
 pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
-    restore_upgrade_with_digest(host, std::path::Path::new("/proc"), None)
+    Ok(restore_upgrade_with_digest(host, std::path::Path::new("/proc"), None)?.unattached)
 }
 
 /// Lifecycle fixtures inspect real kernel data for their owned process roster
@@ -3662,7 +3664,7 @@ pub(in crate::host) fn restore_upgrade_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,
 ) -> Result<Vec<TerminalId>, String> {
-    restore_upgrade_with_digest(host, processes, None)
+    Ok(restore_upgrade_with_digest(host, processes, None)?.unattached)
 }
 
 /// An acknowledged incomplete update authorizes attaching its original holder
@@ -4014,7 +4016,48 @@ fn restore_upgrade_from(
     holders: Option<&std::path::Path>,
 ) -> Result<Vec<TerminalId>, String> {
     let checkpoint = store.load()?;
-    restore_upgrade_checkpoint(host, store, checkpoint, proc_root, holders)
+    let mut restored = restore_upgrade_checkpoint(host, store, checkpoint, proc_root, holders)?;
+    restored.finish(host)?;
+    Ok(restored.unattached)
+}
+
+#[derive(Default)]
+pub(super) struct RestoredUpgrade {
+    /// Startup must avoid immediately retrying these native conversations.
+    pub(super) unattached: Vec<TerminalId>,
+    finalization: Option<RestoreFinalization>,
+}
+
+struct RestoreFinalization {
+    store: Arc<crate::upgrade::handoff::Store>,
+    interrupted_setups: bool,
+}
+
+impl RestoredUpgrade {
+    pub(super) fn finish(&mut self, host: &SharedHost) -> Result<(), String> {
+        let Some(finalization) = self.finalization.take() else {
+            return Ok(());
+        };
+        let store = &finalization.store;
+        let result = if finalization.interrupted_setups {
+            store.archive_interrupted_setup().map(|evidence| {
+                tracing::warn!(evidence = %evidence.display(),
+                    "Interrupted worktree setup requires explicit review; its checkpoint was preserved and other sessions were restored");
+            })
+        } else {
+            store.remove()
+        };
+        if let Err(error) = result {
+            let message = format!(
+                "Upgrade restore finalization failed while retaining its original owners: {error}"
+            );
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain_startup_recovery(message.clone());
+            return Err(message);
+        }
+        Ok(())
+    }
 }
 
 /// Stop starting checkpointed processes as soon as termination is requested.
@@ -4027,7 +4070,7 @@ fn restore_upgrade_checkpoint(
     checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
     proc_root: &std::path::Path,
     holders: Option<&std::path::Path>,
-) -> Result<Vec<TerminalId>, String> {
+) -> Result<RestoredUpgrade, String> {
     use crate::upgrade::{
         ensure_no_surviving_process,
         handoff::{Phase, UnattachedChat},
@@ -4047,7 +4090,7 @@ fn restore_upgrade_checkpoint(
     };
     let Some(mut checkpoint) = checkpoint else {
         publish();
-        return Ok(Vec::new());
+        return Ok(RestoredUpgrade::default());
     };
     if checkpoint
         .chats
@@ -4112,7 +4155,7 @@ fn restore_upgrade_checkpoint(
             checkpoint = %store.path.display(),
             "skipped upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
         );
-        return Ok(Vec::new());
+        return Ok(RestoredUpgrade::default());
     }
     // Restoration records its progress on disk, but retained-owner admission
     // must still use the exact Ready payload accepted at this boundary.
@@ -4366,7 +4409,7 @@ fn restore_upgrade_checkpoint(
                 %error,
                 "abandoned upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
             );
-            return Ok(Vec::new());
+            return Ok(RestoredUpgrade::default());
         }
         return Err(format!(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
@@ -4381,23 +4424,6 @@ fn restore_upgrade_checkpoint(
             restore_relaunched_execution_authority(host, chat.source.id);
         }
     }
-    let finalized = if interrupted_setups {
-        store.archive_interrupted_setup().map(|evidence| {
-            tracing::warn!(evidence = %evidence.display(),
-                "Interrupted worktree setup requires explicit review; its checkpoint was preserved and other sessions were restored");
-        })
-    } else {
-        store.remove()
-    };
-    if let Err(error) = finalized {
-        let message = format!(
-            "Upgrade restore finalization failed while retaining its original owners: {error}"
-        );
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.upgrade_evidence = Some(store.clone());
-        state.retain_startup_recovery(message.clone());
-        return Err(message);
-    }
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .retained_startup_checkpoint
@@ -4410,7 +4436,13 @@ fn restore_upgrade_checkpoint(
             "the daemon upgrade finished, but native conversations it could not restore need attention"
         );
     }
-    Ok(unattached.iter().map(|chat| chat.summary.id).collect())
+    Ok(RestoredUpgrade {
+        unattached: unattached.iter().map(|chat| chat.summary.id).collect(),
+        finalization: Some(RestoreFinalization {
+            store,
+            interrupted_setups,
+        }),
+    })
 }
 
 /// Forgets unattached conversations whose native holder no longer exists,

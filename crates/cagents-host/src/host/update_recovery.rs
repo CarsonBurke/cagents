@@ -53,7 +53,7 @@ fn restore_ordinary_with(host: &SharedHost, processes: &std::path::Path) -> Resu
     let ready_capture = ready::capture()?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
-    let unattached = state::restore_upgrade_with_digest(
+    let mut restored = state::restore_upgrade_with_digest(
         host,
         processes,
         ready_capture
@@ -72,7 +72,7 @@ fn restore_ordinary_with(host: &SharedHost, processes: &std::path::Path) -> Resu
     }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore native holders", None);
-    chat::restore_orphaned_native(host, &unattached)?;
+    chat::restore_orphaned_native(host, &restored.unattached)?;
     if let Some(detail) = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -111,6 +111,7 @@ fn restore_ordinary_with(host: &SharedHost, processes: &std::path::Path) -> Resu
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
     ready::publish(ready_capture, &proof, &executable, &terminals, &chats)?;
+    restored.finish(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: optional archived proof", None);
     publish_archived_proof(host);
