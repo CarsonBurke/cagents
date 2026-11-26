@@ -289,10 +289,7 @@ mod tests {
             manifest(model).replace(model.revision, "000000000000"),
         )
         .unwrap();
-        assert!(matches!(
-            status(root.path(), model),
-            Status::Partial { .. }
-        ));
+        assert!(matches!(status(root.path(), model), Status::Partial { .. }));
         fs::write(directory.join(MANIFEST), manifest(model)).unwrap();
 
         // A file of the wrong size is not an install.
@@ -300,10 +297,7 @@ mod tests {
             .unwrap()
             .set_len(1)
             .unwrap();
-        assert!(matches!(
-            status(root.path(), model),
-            Status::Partial { .. }
-        ));
+        assert!(matches!(status(root.path(), model), Status::Partial { .. }));
     }
 
     #[test]
