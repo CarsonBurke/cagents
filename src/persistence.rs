@@ -10236,6 +10236,7 @@ mod tests {
                     account_scope: None,
                     confirmed_session: session.launch.session_id.clone(),
                     fingerprint: Some(fingerprint),
+                    direct_queue_ids: None,
                 })),
                 closed_at_unix_ms: now_unix_ms(),
                 ..Default::default()

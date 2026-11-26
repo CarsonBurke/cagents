@@ -486,6 +486,10 @@ pub struct ConfirmedQueueSource {
     /// Identity of the full receipt, even after removing already returned entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<[u8; 32]>,
+    /// The completed direct archive's original IDs, including entries that
+    /// had already returned before the rest of the queue was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_queue_ids: Option<Vec<String>>,
 }
 
 impl ConfirmedQueueSource {

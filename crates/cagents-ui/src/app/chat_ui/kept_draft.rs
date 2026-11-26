@@ -191,6 +191,7 @@ impl Cagents {
                 account_scope: queue.account_scope,
                 confirmed_session: queue.confirmed_session.clone(),
                 fingerprint: key.map(|key| key.1),
+                direct_queue_ids: None,
             })
         });
         let now = unix_millis();

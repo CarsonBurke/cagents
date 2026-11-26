@@ -131,6 +131,9 @@ pub(super) struct Reopening {
     /// The conversation as saved, which the pane holds meanwhile.
     entry: SavedConversation,
     stage: ReopenStage,
+    /// A direct History reopen keeps its existing unprepared successor
+    /// policy and reads the old owner's archived input first.
+    direct_history: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -419,7 +422,7 @@ pub enum Action {
         CardId,
         u64,
         Result<Option<Box<chat::Session>>, String>,
-        Option<Arc<chat::ExitedQueue>>,
+        Option<ReopeningQueue>,
     ),
     QueuedDraftChecked(u64, Box<SavedConversation>, Option<ExitedQueueKey>),
     QueueRecipientScope(
@@ -429,6 +432,70 @@ pub enum Action {
         Option<[u8; 32]>,
         Vec<(CardId, ExitedQueueKey)>,
     ),
+}
+
+/// A completed direct archive is released separately from helper retirement.
+#[derive(Debug, Clone)]
+pub enum ReopeningQueue {
+    Retained(Arc<chat::ExitedQueue>),
+    Direct(Arc<chat::ExitedQueue>),
+}
+
+impl ReopeningQueue {
+    fn receipt(&self) -> &chat::ExitedQueue {
+        match self {
+            Self::Retained(queue) | Self::Direct(queue) => queue,
+        }
+    }
+
+    fn direct_ids(&self, source: TerminalId) -> Option<Vec<String>> {
+        let Self::Direct(queue) = self else {
+            return None;
+        };
+        chat_ui::completed_queue_key(source, &queue.messages)?;
+        Some(
+            queue
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect(),
+        )
+    }
+}
+
+struct DirectQueueRelease {
+    origin: CardId,
+    source: chat::Session,
+    key: ExitedQueueKey,
+    ids: Vec<String>,
+}
+
+impl DirectQueueRelease {
+    fn from_escrow(origin: CardId, proof: &ConfirmedQueueSource) -> Option<Self> {
+        let key = proof.receipt_key()?;
+        let ids = proof.direct_queue_ids.as_ref()?;
+        if proof.source.native_continuity.retains_provider()
+            || ids.is_empty()
+            || chat::exited_queue_fingerprint(ids.iter().map(String::as_str)) != key.1
+        {
+            return None;
+        }
+        Some(Self {
+            origin,
+            source: proof.source.clone(),
+            key,
+            ids: ids.clone(),
+        })
+    }
+
+    fn release(self) {
+        if let Ok(socket) = crate::terminal::ipc::daemon_socket_path()
+            && let Ok(mut client) = crate::control::ControlClient::connect(&socket)
+            && let Err(error) = client.commit_exited_chat_queue(self.source, self.ids)
+        {
+            tracing::debug!(%error, "Could not release the saved history chat queue");
+        }
+    }
 }
 
 /// What indexing has found so far, in the order it is found.
@@ -1321,11 +1388,10 @@ impl Cagents {
                 self.resume_saved_conversation_checked(*entry)
             }
             Action::Prepared(card, attempt, result, queue) => {
-                self.reopening_prepared(card, attempt, result, queue.as_deref())
+                self.reopening_prepared(card, attempt, result, queue.as_ref())
             }
             Action::QueueRecipientScope(card, attempt, recipient, account, returned) => {
-                self.apply_queue_recipient_scope(card, attempt, &recipient, account, returned);
-                Task::none()
+                self.apply_queue_recipient_scope(card, attempt, &recipient, account, returned)
             }
         }
     }
@@ -1728,6 +1794,39 @@ impl Cagents {
             .map(|card| card.id)
     }
 
+    fn direct_queue_release(&self, origin: CardId) -> Option<DirectQueueRelease> {
+        let proof = self
+            .durable
+            .kept_chat_drafts
+            .get(&origin)?
+            .confirmed_waiting
+            .as_ref()?;
+        DirectQueueRelease::from_escrow(origin, proof)
+    }
+
+    fn release_saved_direct_queue(
+        &self,
+        recipient: CardId,
+        release: Option<DirectQueueRelease>,
+    ) -> Task<Message> {
+        let Some(release) = release.filter(|release| {
+            self.durable
+                .returned_chat_queues
+                .get(&release.origin)
+                .and_then(|queues| queues.get(&release.key))
+                .is_some_and(|destination| destination.is_none() || *destination == Some(recipient))
+        }) else {
+            return Task::none();
+        };
+        self.release_completed_queue_after_save(
+            recipient,
+            release.origin,
+            release.source,
+            release.key,
+            release.ids,
+        )
+    }
+
     fn recoverable_queued_draft(&self, entry: &SavedConversation) -> Option<&ConfirmedQueueSource> {
         let draft = self.durable.kept_chat_drafts.get(&entry.card)?;
         let proof = draft.confirmed_waiting.as_ref()?;
@@ -1753,11 +1852,18 @@ impl Cagents {
             self.resume_ui.queued_draft_check = Some(attempt);
             self.resume_ui.loading = true;
             let origin = entry.card;
+            let release = self.direct_queue_release(origin);
             return cosmic::task::future(async move {
-                let returned =
-                    tokio::task::spawn_blocking(move || store.has_returned_chat_queue(origin, key))
-                        .await
-                        .is_ok_and(|result| matches!(result, Ok(true)));
+                let returned = tokio::task::spawn_blocking(move || {
+                    let returned = matches!(store.has_returned_chat_queue(origin, key), Ok(true));
+                    if returned && let Some(release) = release.filter(|release| release.key == key)
+                    {
+                        release.release();
+                    }
+                    returned
+                })
+                .await
+                .unwrap_or_default();
                 Message::ResumeConversation(Action::QueuedDraftChecked(
                     attempt,
                     Box::new(entry),
@@ -1829,8 +1935,14 @@ impl Cagents {
             self.resume_error(&missing_directory(session));
             return Task::none();
         }
-        if session.native_continuity.retains_provider() || unstarted_successor(session) {
-            return self.reopen_before_preparation(entry);
+        let prepare = session.native_continuity.retains_provider() || unstarted_successor(session);
+        let direct_history = !prepare
+            && self.session.is_some()
+            && session.proof.is_some()
+            && session.terminal.is_none()
+            && !session.launch.needs_read_only_history();
+        if prepare || direct_history {
+            return self.reopen_before_preparation(entry, direct_history);
         }
         let session = unprepared_resume(entry.session.clone());
         self.place_resumed_conversation(entry, session, None).1
@@ -1935,31 +2047,49 @@ impl Cagents {
         recipient: &chat::Session,
         account: Option<[u8; 32]>,
         returned: Vec<(CardId, ExitedQueueKey)>,
-    ) {
+    ) -> Task<Message> {
         if self.resume_ui.queue_queries.get(&card) != Some(&attempt) {
-            return;
+            return Task::none();
         }
         self.resume_ui.queue_queries.remove(&card);
         for (origin, key) in returned {
             self.acknowledge_returned_chat_queue(origin, key);
         }
         self.materialize_replica_snapshot();
+        let releases = self
+            .durable
+            .kept_chat_drafts
+            .keys()
+            .filter_map(|origin| self.direct_queue_release(*origin))
+            .collect::<Vec<_>>();
         if let Some(account) = account
             && self.restore_attested_reopened_queues(card, recipient, account)
         {
             self.persist();
         }
+        Task::batch(
+            releases
+                .into_iter()
+                .map(|release| self.release_saved_direct_queue(card, Some(release))),
+        )
     }
 
     /// Puts the pane of a conversation the service must prepare in place at
     /// once, then asks the service to prepare it. Preparation either keeps
     /// a live actor or allocates its exact successor, and the pane holds the
     /// saved conversation, starting nothing, until it answers.
-    fn reopen_before_preparation(&mut self, entry: SavedConversation) -> Task<Message> {
+    fn reopen_before_preparation(
+        &mut self,
+        entry: SavedConversation,
+        direct_history: bool,
+    ) -> Task<Message> {
         self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
         let attempt = self.resume_ui.attempts;
         let session = entry.session.clone();
         let (card, placed) = self.place_resumed_conversation(entry, session, Some(attempt));
+        if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
+            reopening.direct_history = direct_history;
+        }
         Task::batch([placed, self.prepare_reopening(card)])
     }
 
@@ -1970,6 +2100,7 @@ impl Cagents {
             return Task::none();
         };
         let attempt = reopening.attempt;
+        let direct_history = reopening.direct_history;
         let origin = reopening.entry.card;
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let source = reopening.entry.session.clone();
@@ -1998,7 +2129,10 @@ impl Cagents {
                 } else {
                     None
                 };
-                let (queued, prepared) = match client.prepare_chat_resume_with_queue(source) {
+                let (queued, prepared) = if direct_history {
+                    (None, Ok(Some(Box::new(unprepared_resume(source.clone())))))
+                } else {
+                    match client.prepare_chat_resume_with_queue(source.clone()) {
                     Ok((queued, prepared)) => (
                         queued,
                         prepared.map(|session| Some(Box::new(session))).map_err(|error| {
@@ -2011,10 +2145,12 @@ impl Cagents {
                         }),
                     ),
                     Err(error) => (None, Err(error.to_string())),
+                    }
                 };
-                let queued = queued.or(completed);
+                let queued = queued.map(|queue| ReopeningQueue::Retained(Arc::new(queue)))
+                    .or_else(|| completed.map(|queue| ReopeningQueue::Direct(Arc::new(queue))));
                 let returned = queued.as_ref()
-                    .and_then(|queue| chat_ui::completed_queue_key(source_id, &queue.messages))
+                    .and_then(|queue| chat_ui::completed_queue_key(source_id, &queue.receipt().messages))
                     .is_some_and(|key| {
                         store.is_some_and(|store| match store.has_returned_chat_queue(origin, key) {
                             Ok(returned) => returned,
@@ -2024,8 +2160,16 @@ impl Cagents {
                             }
                         })
                     });
-                let queued = queued.filter(|_| !returned);
-                Ok((queued.map(Arc::new), prepared))
+                if returned {
+                    if let Some(ids) = queued.as_ref().and_then(|queue| queue.direct_ids(source_id))
+                        && let Err(error) = client.commit_exited_chat_queue(source, ids)
+                    {
+                        tracing::debug!(%error, "Could not release the saved history chat queue");
+                    }
+                    Ok((None, prepared))
+                } else {
+                    Ok((queued, prepared))
+                }
             })
             .await
             .unwrap_or_else(|error| Err(error.to_string()));
@@ -2127,7 +2271,7 @@ impl Cagents {
         card: CardId,
         attempt: u64,
         result: Result<Option<Box<chat::Session>>, String>,
-        queue: Option<&chat::ExitedQueue>,
+        queue: Option<&ReopeningQueue>,
     ) -> Task<Message> {
         self.materialize_replica_snapshot();
         let Some(reopening) = self.resume_ui.reopening.get(&card).filter(|reopening| {
@@ -2163,7 +2307,16 @@ impl Cagents {
             Err(error) => Err(error),
         };
         let waiting = queue.is_some_and(|queue| {
-            let waiting = self.keep_reopened_queue(saved_card, &source, queue);
+            let waiting = self.keep_reopened_queue(saved_card, &source, queue.receipt());
+            if waiting
+                && let Some(ids) = queue.direct_ids(source.id)
+                && let Some(proof) = Arc::make_mut(&mut self.durable)
+                    .kept_chat_drafts
+                    .get_mut(&saved_card)
+                    .and_then(|draft| draft.confirmed_waiting.as_mut())
+            {
+                proof.direct_queue_ids = Some(ids);
+            }
             self.persist();
             waiting
         });
@@ -2230,6 +2383,7 @@ impl Cagents {
         let Some(reopening) = self.resume_ui.reopening.remove(&card) else {
             return Task::none();
         };
+        let release = self.direct_queue_release(reopening.entry.card);
         if let Some(state) = self.card_state_mut(card) {
             state.kind = CardKind::Chat(session.clone());
         }
@@ -2246,7 +2400,10 @@ impl Cagents {
             self.restore_reopened_queue_to_unstarted_draft(card, reopening.entry.session.id);
         }
         self.persist();
-        self.open_placed_chat(card, session)
+        Task::batch([
+            self.open_placed_chat(card, session),
+            self.release_saved_direct_queue(card, release),
+        ])
     }
 
     /// Shows in the pane why its conversation could not be prepared. It
@@ -2295,6 +2452,14 @@ impl Cagents {
         if !drafts.contains_key(&card)
             && let Some(draft) = drafts.remove(&source)
         {
+            if draft
+                .confirmed_waiting
+                .as_ref()
+                .is_some_and(|proof| proof.direct_queue_ids.is_some())
+            {
+                drafts.insert(source, draft);
+                return;
+            }
             if let Some(receipt) = draft.restored_queue.clone() {
                 drafts.insert(
                     source,
@@ -2341,6 +2506,7 @@ impl Cagents {
                 updated_at_unix_ms: 0,
             },
             stage: ReopenStage::Preparing,
+            direct_history: false,
         };
         self.insert_resumed_chat_card(session, Some(beside), None, None, Some(reopening))
             .0
@@ -2370,6 +2536,11 @@ impl Cagents {
         });
         // What it had not sent when its card closed comes back with it, once
         // it starts.
+        let release = if attempt.is_none() {
+            self.direct_queue_release(entry.card)
+        } else {
+            None
+        };
         let draft_from =
             (attempt.is_none() && self.reclaim_kept_draft(entry.card)).then_some(entry.card);
         let title = entry.title.clone();
@@ -2379,6 +2550,7 @@ impl Cagents {
             attempt,
             entry,
             stage: ReopenStage::Preparing,
+            direct_history: false,
         });
         let (card, insert) =
             self.insert_resumed_chat_card(session, replace, user_title, draft_from, reopening);
@@ -2392,7 +2564,15 @@ impl Cagents {
             self.persist();
         }
         let discard = replace.map_or_else(Task::none, |card| self.close_card_unasked(card));
-        (card, Task::batch([scope, insert, discard]))
+        (
+            card,
+            Task::batch([
+                scope,
+                insert,
+                discard,
+                self.release_saved_direct_queue(card, release),
+            ]),
+        )
     }
 
     fn defer_retiring_conversation(&mut self, entry: &SavedConversation) -> Option<Task<Message>> {
@@ -3742,7 +3922,10 @@ mod tests {
             card,
             attempt,
             Err("Could not prepare the successor".into()),
-            Some(exited_queue([already_returned, unseen.clone()])),
+            Some(ReopeningQueue::Retained(exited_queue([
+                already_returned,
+                unseen.clone(),
+            ]))),
         )));
         assert!(app.reopen_failed(card));
         let saved = app.persistent_workspace();
@@ -3761,7 +3944,7 @@ mod tests {
             card,
             attempt,
             Ok(Some(Box::new(prepared.clone()))),
-            Some(exited_queue([stale])),
+            Some(ReopeningQueue::Retained(exited_queue([stale]))),
         )));
         assert_eq!(
             app.durable.kept_chat_drafts[&old_card].waiting,
@@ -3811,10 +3994,9 @@ mod tests {
         // start is left to give up.
         assert!(!app.chat_ui.transition_pending());
 
-        let late_queue = Some(exited_queue([chat::QueuedMessage::new(
-            "late".into(),
-            "Held text".into(),
-        )]));
+        let late_queue = Some(ReopeningQueue::Retained(exited_queue([
+            chat::QueuedMessage::new("late".into(), "Held text".into()),
+        ])));
         drop(app.update_resume(Action::Prepared(
             card,
             attempt,
@@ -3917,7 +4099,7 @@ mod tests {
             card,
             attempt,
             Ok(Some(Box::new(prepared.clone()))),
-            Some(queue.clone()),
+            Some(ReopeningQueue::Retained(queue.clone())),
         );
         drop(app.update_resume(receipt.clone()));
         drop(app.update_resume(receipt));
@@ -3952,13 +4134,13 @@ mod tests {
 
         // A second independently admitted preparation can replay the same
         // exact receipt after the first placeholder has already gone.
-        drop(app.reopen_before_preparation(entry));
+        drop(app.reopen_before_preparation(entry, false));
         let (repeated, attempt) = reopening(&app);
         drop(app.update_resume(Action::Prepared(
             repeated,
             attempt,
             Ok(Some(Box::new(prepared))),
-            Some(queue),
+            Some(ReopeningQueue::Retained(queue)),
         )));
         drop(app.update(Message::CommitClose(repeated)));
         assert_eq!(app.chat_waiting_to_save(existing).messages, [still_held]);
@@ -4014,7 +4196,7 @@ mod tests {
             card,
             attempt,
             Ok(Some(Box::new(prepared.clone()))),
-            Some(exited_queue([queued.clone()])),
+            Some(ReopeningQueue::Retained(exited_queue([queued.clone()]))),
         )));
         assert!(app.reopen_failed(card));
         assert!(app.held_chat_draft(terminal).is_none());
@@ -4343,7 +4525,7 @@ mod tests {
             current,
             attempt,
             Ok(Some(Box::new(prepared))),
-            Some(receipt),
+            Some(ReopeningQueue::Retained(receipt)),
         )));
         let target = chat_runtime_attempt(&app, current);
         let handle = fixture_handle(&app, current, named.as_deref());
@@ -4355,6 +4537,105 @@ mod tests {
         assert_eq!(saved.chat_drafts[&inert].lines().count(), 2);
         assert!(!saved.kept_chat_drafts.contains_key(&entry.card));
         assert_eq!(saved.returned_chat_queues[&entry.card].len(), 1);
+    }
+
+    #[test]
+    fn direct_history_queue_releases_from_the_original_row_after_escrow_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("direct-history.sqlite3");
+        let boot = crate::model::BootId::new("direct-history");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut entry = retained(directory.path());
+        entry.session.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(CardState {
+            id: entry.card,
+            generation: 0,
+            title: entry.title.clone(),
+            width_fraction: 0.5,
+            existence: Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: unix_millis(),
+                    reason: None,
+                },
+            },
+            kind: CardKind::Chat(entry.session.clone()),
+        });
+        durable.kept_chat_drafts.insert(
+            entry.card,
+            crate::model::KeptChatDraft {
+                text: "An earlier queued message".into(),
+                restored_queue: Some(crate::model::RestoredQueue {
+                    source: entry.session.id,
+                    ids: vec!["first".into()],
+                }),
+                closed_at_unix_ms: unix_millis(),
+                ..Default::default()
+            },
+        );
+        let (writer, _) = SessionRuntime::open(&path, boot).unwrap();
+        app.session = Some(writer);
+        let first = chat::QueuedMessage::new("first".into(), "An earlier queued message".into());
+        let last = chat::QueuedMessage::new("last".into(), "The unseen queued message".into());
+        let receipt = exited_queue([first, last.clone()]);
+        let key = chat_ui::completed_queue_key(entry.session.id, &receipt.messages).unwrap();
+        drop(app.resume_saved_conversation(entry.clone()));
+        let (placeholder, attempt) = reopening(&app);
+        assert!(app.resume_ui.reopening[&placeholder].direct_history);
+        let failed = app.update_resume(Action::Prepared(
+            placeholder,
+            attempt,
+            Err("Preparation was refused".into()),
+            Some(ReopeningQueue::Direct(receipt)),
+        ));
+        assert_eq!(failed.units(), 0, "kept escrow cannot release the archive");
+        app.forget_reopening(placeholder);
+        app.persist();
+        let writer = app.session.take().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let store = writer.operation_store();
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert!(!store.has_returned_chat_queue(entry.card, key).unwrap());
+        assert_eq!(saved.kept_chat_drafts[&entry.card].waiting, [last]);
+        assert!(!saved.kept_chat_drafts.contains_key(&placeholder));
+        drop(app);
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace = Cagents::rebuild_workspace(&saved);
+        app.chat_ui = chat_ui::State::for_workspace(&saved);
+        app.durable = Arc::new(saved);
+        app.session = Some(writer);
+        let release = app.direct_queue_release(entry.card).unwrap();
+        assert_eq!(release.source, entry.session);
+        assert_eq!(release.ids, ["first", "last"]);
+        assert_eq!(release.key, key);
+        let unrelated = CardId::new();
+        assert_eq!(
+            app.release_saved_direct_queue(unrelated, Some(release))
+                .units(),
+            0
+        );
+
+        // The background lookup found no returned checkpoint. Select the
+        // escrow as the pager would after that lookup.
+        let task = app.resume_saved_conversation_checked(entry.clone());
+        let recipient = app.workspace.focused().unwrap();
+        assert_ne!(recipient, entry.card);
+        assert!(task.units() > 0);
+        drop(task);
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        assert!(store.has_returned_chat_queue(entry.card, key).unwrap());
+        assert!(!store.has_returned_chat_queue(recipient, key).unwrap());
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        assert_eq!(
+            saved.chat_drafts[&recipient].trim(),
+            "The unseen queued message\nAn earlier queued message",
+        );
     }
 
     #[test]
@@ -4380,6 +4661,7 @@ mod tests {
                     account_scope: None,
                     confirmed_session: entry.session.launch.session_id.clone(),
                     fingerprint: Some(fingerprint),
+                    direct_queue_ids: None,
                 })),
                 closed_at_unix_ms: unix_millis(),
                 ..Default::default()

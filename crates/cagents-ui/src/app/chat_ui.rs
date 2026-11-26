@@ -13623,30 +13623,36 @@ impl Cagents {
         self.restore_authenticated_chat_exit_queue(target.card, source, messages);
         Some(
             completed_queue_key(source, messages).map_or_else(Task::none, |receipt| {
-                self.release_completed_queue_after_save(target.card, session, receipt, messages)
+                self.release_completed_queue_after_save(
+                    target.card,
+                    target.card,
+                    session,
+                    receipt,
+                    messages.iter().map(|message| message.id.clone()).collect(),
+                )
             }),
         )
     }
 
-    fn release_completed_queue_after_save(
+    pub(super) fn release_completed_queue_after_save(
         &self,
-        card: CardId,
+        recipient: CardId,
+        origin: CardId,
         source: chat::Session,
         key: ExitedQueueKey,
-        messages: &[chat::QueuedMessage],
+        ids: Vec<String>,
     ) -> Task<Message> {
         let Some(writer) = self.session.as_ref() else {
             return Task::none();
         };
-        let Ok(receipt) = writer.request_pane_flush(card) else {
+        let Ok(receipt) = writer.request_pane_flush(recipient) else {
             return Task::none();
         };
         let store = writer.operation_store();
-        let ids = messages.iter().map(|message| message.id.clone()).collect();
         iced::Task::future(async move {
             let _ = tokio::task::spawn_blocking(move || {
                 if !matches!(receipt.recv(), Ok(Ok(())))
-                    || !matches!(store.has_returned_chat_queue(card, key), Ok(true))
+                    || !matches!(store.has_returned_chat_queue(origin, key), Ok(true))
                 {
                     return;
                 }
@@ -14351,9 +14357,10 @@ impl Cagents {
                             .map_or_else(Task::none, |(session, key)| {
                                 self.release_completed_queue_after_save(
                                     target.card,
+                                    target.card,
                                     session,
                                     key,
-                                    &messages,
+                                    messages.iter().map(|message| message.id.clone()).collect(),
                                 )
                             })
                     }
