@@ -4376,6 +4376,21 @@ impl ReadyAdmission {
         &self.authority.checkpoint_hash
     }
 
+    /// Persist the work and window scope just verified by the startup publisher.
+    pub fn remember_cutover(&self, successor: &HostSessionProof) -> Result<(), String> {
+        let authority = &self.authority;
+        crate::update::record_ready_cutover(
+            &authority.job,
+            &authority.job_request_hash,
+            &authority.checkpoint_hash,
+            &authority.target,
+            &authority.source,
+            successor,
+            &authority.windows,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn verify_live_inventory(
         &self,
         serving: &HostSessionProof,

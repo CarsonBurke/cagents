@@ -5,6 +5,10 @@
 mod cancellation;
 mod candidate;
 mod confirmation;
+#[cfg(target_os = "macos")]
+mod cutover;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use cutover::record as record_ready_cutover;
 mod feed;
 mod floor;
 mod floor_display;
@@ -1526,6 +1530,13 @@ fn start_job(
     recovery::inspect_pending_current()?;
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
+    #[cfg(target_os = "macos")]
+    if let Some(previous) = cutover::read_job(&state)? {
+        let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+        if cutover::pending_selected(&layout, &state, &previous)? {
+            return Err(UpdateError::Busy);
+        }
+    }
     retention::before_start(&state);
     let id = uuid::Uuid::new_v4().to_string();
     let job = UpdateJob {
@@ -1618,6 +1629,16 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
         Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(target_os = "macos")]
+    if job.phase == UpdatePhase::Failed {
+        let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+        if cutover::pending_selected(&layout, &state, &job)? {
+            job.phase = UpdatePhase::Installing;
+            job.message = "Finishing the update".into();
+            job.refusal = None;
+            return Ok(Some(job));
+        }
+    }
     if !job.phase.is_terminal() {
         match acquire_lock(&state) {
             Ok(_lock) => {
@@ -1628,6 +1649,13 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
                     JOB_STATE_LIMIT,
                 )?)?;
                 if !job.phase.is_terminal() {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+                        if cutover::pending_selected(&layout, &state, &job)? {
+                            return Ok(Some(job));
+                        }
+                    }
                     job.phase = UpdatePhase::Failed;
                     job.confirmation = None;
                     job.message =
@@ -2083,7 +2111,10 @@ pub fn settle_as_successor(serving: crate::model::HostSessionProof) {
         thread::Builder::new().name("update-settle".into()).spawn(
             move || match settle_after_worker(&layout, &state, &serving) {
                 Ok(Some(job)) => {
-                    tracing::info!(job, "settled an older worker's update failure as complete");
+                    tracing::info!(
+                        job,
+                        "completed the installed update after the worker exited"
+                    );
                 }
                 Ok(None) => (),
                 Err(error) => tracing::warn!(%error, "could not settle the last update's record"),
@@ -2110,6 +2141,10 @@ fn settle_after_worker(
         Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(target_os = "macos")]
+    if let Some(completed) = cutover::finish(layout, state, serving, job.clone())? {
+        return Ok(Some(completed));
+    }
     if job.phase != UpdatePhase::Failed
         || job.version != layout.version
         || !protocol_check_could_have_failed_it(&job)

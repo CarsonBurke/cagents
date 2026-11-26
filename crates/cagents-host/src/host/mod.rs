@@ -299,7 +299,8 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
                 }) {
                     return Err("An original conversation has not finished resuming".into());
                 }
-                admission.verify_live_inventory(state.proof(), &terminals, &chats)
+                admission.verify_live_inventory(state.proof(), &terminals, &chats)?;
+                admission.remember_cutover(state.proof())
             }
         }?;
         publication
@@ -955,6 +956,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     // An older worker may record the update that started this daemon as
     // failed; once it finishes, this daemon's own receipt settles that.
+    #[cfg(not(target_os = "macos"))]
     crate::update::settle_as_successor(
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1092,12 +1094,22 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     }
     #[cfg(target_os = "linux")]
     acknowledge_standby(standby.take());
+    #[cfg(target_os = "macos")]
+    let mut settle_startup_update = true;
     loop {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         publish_restored_selection(&host, &mut pending_publication);
         #[cfg(target_os = "macos")]
         if pending_publication.is_none() {
             acknowledge_standby(standby.take());
+            if std::mem::take(&mut settle_startup_update) {
+                crate::update::settle_as_successor(
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .proof()
+                        .clone(),
+                );
+            }
         }
         reap_finished(&mut clients);
         if daemon::termination_requested() {
