@@ -265,13 +265,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_pane_whose_agent_names_another_process_stays_as_the_agent_knows_it() {
-        let (live, stamped) = chat();
-        let serving = live.proof.clone().unwrap();
-        let (mut registry, _directory, channel, pane) = registry_with(&stamped);
+    fn open_agent(registry: &Registry, channel: ChannelId, session: &Session) {
         let mut agent = crate::agent_execution::Agent::fixture_placed_in(channel);
-        agent.session = Some(HostedSession::Chat(stamped.clone()));
+        agent.session = Some(HostedSession::Chat(session.clone()));
         registry
             .db
             .execute(
@@ -280,16 +276,37 @@ mod tests {
                 rusqlite::params![
                     agent.id.to_string(),
                     serde_json::to_string(&agent).unwrap(),
-                    live.id.to_string()
+                    session.id.to_string()
                 ],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_pane_whose_agent_names_another_process_stays_as_the_agent_knows_it() {
+        let (live, stamped) = chat();
+        let serving = live.proof.clone().unwrap();
+        let (mut registry, _directory, channel, pane) = registry_with(&stamped);
+        open_agent(&registry, channel, &stamped);
 
         assert!(!registry.adopt_foreign_chat_pane(&live, &serving).unwrap());
         assert_eq!(
             shown(&registry, channel, pane).kind,
             CardKind::Chat(stamped)
         );
+    }
+
+    /// As in #4118: restore has rebound the agent to the chat this daemon
+    /// serves, and only its pane still names the other daemon.
+    #[test]
+    fn a_pane_whose_agent_names_the_served_chat_is_restamped() {
+        let (live, stamped) = chat();
+        let serving = live.proof.clone().unwrap();
+        let (mut registry, _directory, channel, pane) = registry_with(&stamped);
+        open_agent(&registry, channel, &live);
+
+        assert!(registry.adopt_foreign_chat_pane(&live, &serving).unwrap());
+        assert_eq!(shown(&registry, channel, pane).kind, CardKind::Chat(live));
     }
 
     #[test]
