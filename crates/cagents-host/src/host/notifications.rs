@@ -1457,8 +1457,18 @@ mod tests {
             sequence: 4,
         };
         let resolved = |id, sequence| Ok(id == automation && sequence <= 4);
-        let mut event = attention_event(TerminalId::new(), "automation-paused");
-        event.target = target.clone();
+        let event = Event {
+            target: target.clone(),
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{automation}:lifecycle:4"),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+            content: None,
+        };
         let mut journal = Journal::open(&path).unwrap();
         let notice = journal.record(event, false).unwrap().unwrap();
         journal.delivered(notice.id).unwrap();
