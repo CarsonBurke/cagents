@@ -296,6 +296,7 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
         CodexExecution, ExecutionEnd, codex_execution, execution_end,
     };
     use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    use std::os::fd::AsRawFd;
 
     const RESTART: &str =
         "host::state::native_upgrade_tests::darwin_ordinary_upgrade_restarts_nonretained_codex";
@@ -411,6 +412,25 @@ fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
     state.codex_listeners = super::super::chat::CodexListenerRoots::at(root.clone());
     let host = Arc::new(HostLock::new(state));
     host.lock().unwrap().register_client(0);
+    let lock = crate::chat::protocol::codex::thread_writer_lock(&saved.launch, THREAD).unwrap();
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let competing_writer = fs::File::create(&lock).unwrap();
+    // SAFETY: competing_writer owns the live descriptor for this fixture's lock.
+    assert_eq!(
+        unsafe { libc::flock(competing_writer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let refusal = super::super::update_recovery::restore_ordinary(&host).unwrap_err();
+    assert!(
+        refusal.contains(&format!(
+            "Cannot inspect Codex thread writer lock {}",
+            lock.display()
+        )),
+        "{refusal}"
+    );
+    assert_eq!(store.load().unwrap().unwrap().phase, Phase::Ready);
+    assert!(!control.exists() && !listener.exists());
+    drop(competing_writer);
     super::super::update_recovery::restore_ordinary(&host).unwrap();
     let unattached = store.unattached().unwrap();
     assert!(
