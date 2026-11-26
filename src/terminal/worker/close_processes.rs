@@ -196,6 +196,7 @@ impl FrozenFamily {
                 if process.session != root.process.session
                     && !family.targets.iter().any(|parent| {
                         parent.identity.pid == process.parent
+                            && parent.identity.start <= process.start
                             && matches!(parent.pidfd.reaped(), Ok(false))
                     })
                 {
