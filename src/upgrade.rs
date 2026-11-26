@@ -1441,6 +1441,46 @@ pub mod handoff {
         decode_checkpoint(bytes).map(|_| ())
     }
 
+    #[cfg(any(feature = "host", test))]
+    fn encode_checkpoint(checkpoint: &Checkpoint) -> Result<Vec<u8>, String> {
+        checkpoint.validate()?;
+        #[derive(Serialize)]
+        struct Versioned<'a> {
+            version: u16,
+            #[serde(flatten)]
+            checkpoint: &'a Checkpoint,
+        }
+        encode_bounded(
+            &Versioned {
+                version: checkpoint.format(),
+                checkpoint,
+            },
+            "Upgrade checkpoint exceeds the 8 MiB durable byte limit; reduce the session inventory or launch environment before updating",
+        )
+    }
+
+    impl Checkpoint {
+        /// Normal restoration changes only the phase before beginning work.
+        /// Reverse that change only if the payload authorizes holder adoption
+        /// for every original owner.
+        #[cfg(any(test, all(target_os = "macos", feature = "host")))]
+        pub(crate) fn adoption_ready_digest(mut self) -> Result<Option<String>, String> {
+            if self.phase != Phase::Restoring
+                || !self.preserve_carried
+                || !self.terminals.is_empty()
+                || self
+                    .chats
+                    .iter()
+                    .any(|chat| !chat.source.native_continuity.retains_provider())
+            {
+                return Ok(None);
+            }
+            self.phase = Phase::Ready;
+            let bytes = encode_checkpoint(&self)?;
+            Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+        }
+    }
+
     fn decode_checkpoint(bytes: &[u8]) -> Result<Checkpoint, String> {
         if bytes.len() as u64 > MAX_BYTES {
             return Err("Upgrade checkpoint exceeds the 8 MiB durable byte limit".into());
@@ -2063,22 +2103,19 @@ pub mod handoff {
 
         #[cfg(any(feature = "host", test))]
         pub fn save(&self, checkpoint: &Checkpoint) -> Result<(), String> {
-            checkpoint.validate()?;
-            #[derive(Serialize)]
-            struct Versioned<'a> {
-                version: u16,
-                #[serde(flatten)]
-                checkpoint: &'a Checkpoint,
-            }
-            let versioned = Versioned {
-                version: checkpoint.format(),
-                checkpoint,
-            };
-            let bytes = encode_bounded(
-                &versioned,
-                "Upgrade checkpoint exceeds the 8 MiB durable byte limit; reduce the session inventory or launch environment before updating",
-            )?;
-            self.write_named(FILE, &bytes)
+            self.write_named(FILE, &encode_checkpoint(checkpoint)?)
+        }
+
+        #[cfg(all(target_os = "macos", feature = "host"))]
+        pub(crate) fn load_with_digest(&self) -> Result<Option<(Checkpoint, String)>, String> {
+            self.read_bytes()?
+                .map(|bytes| {
+                    Ok((
+                        decode_checkpoint(&bytes)?,
+                        format!("{:x}", Sha256::digest(&bytes)),
+                    ))
+                })
+                .transpose()
         }
 
         /// Atomically and durably replaces `name` with `bytes`.
@@ -2667,6 +2704,36 @@ pub mod handoff {
                 write_status_fixture(&store, &serde_json::to_vec(&envelope).unwrap());
                 assert!(store.checkpoint_status().unwrap().is_some());
             }
+        }
+
+        #[test]
+        fn adoption_ready_digest_reverses_only_a_strict_restoring_phase() {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::open(root.path()).unwrap();
+            let proof = HostSessionProof {
+                host_session_id: "restore".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "source".into(),
+            };
+            let mut checkpoint = Checkpoint::new(proof, vec![], vec![], vec![]);
+            checkpoint.preserve_carried = true;
+            checkpoint.phase = Phase::Ready;
+            store.save(&checkpoint).unwrap();
+            let acknowledged = store.checkpoint_status().unwrap().unwrap().digest;
+            assert_eq!(checkpoint.clone().adoption_ready_digest().unwrap(), None);
+            checkpoint.phase = Phase::Restoring;
+            store.save(&checkpoint).unwrap();
+            let restored = store.load().unwrap().unwrap();
+            assert_eq!(
+                restored.adoption_ready_digest().unwrap().as_deref(),
+                Some(acknowledged.as_str())
+            );
+            checkpoint.preserve_carried = false;
+            assert_eq!(checkpoint.adoption_ready_digest().unwrap(), None);
+            assert_eq!(
+                store.checkpoint_status().unwrap().unwrap().phase,
+                Phase::Restoring
+            );
         }
 
         #[test]

@@ -36,17 +36,47 @@ pub(crate) struct Original<'a> {
 }
 
 #[cfg(feature = "host")]
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StartupCheckpoint {
     Absent,
+    AdoptionOnly {
+        source: HostSessionProof,
+        restoring_digest: String,
+        ready_digest: String,
+    },
     Unsettled,
 }
 
 #[cfg(feature = "host")]
+impl StartupCheckpoint {
+    pub fn restoring_digest(&self) -> Option<&str> {
+        match self {
+            Self::AdoptionOnly {
+                restoring_digest, ..
+            } => Some(restoring_digest),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "host")]
 pub fn startup_checkpoint() -> StartupCheckpoint {
-    match recovery::checkpoint_status() {
+    use crate::upgrade::handoff::Store;
+    let checkpoint = Store::existing()
+        .and_then(|store| store.map_or(Ok(None), |store| store.load_with_digest()));
+    match checkpoint {
         Ok(None) => StartupCheckpoint::Absent,
-        _ => StartupCheckpoint::Unsettled,
+        Ok(Some((checkpoint, restoring_digest))) => {
+            let source = checkpoint.proof.clone();
+            match checkpoint.adoption_ready_digest() {
+                Ok(Some(ready_digest)) => StartupCheckpoint::AdoptionOnly {
+                    source,
+                    restoring_digest,
+                    ready_digest,
+                },
+                _ => StartupCheckpoint::Unsettled,
+            }
+        }
+        Err(_) => StartupCheckpoint::Unsettled,
     }
 }
 
@@ -456,11 +486,16 @@ pub(super) fn finish(
         intent.verify_request(state)?;
         let mut client = intent.verify_serving(layout, successor)?;
         if reentered {
-            // A no-replay completion is available only if the checkpoint
-            // was already retired before this daemon began restoring.
-            if entry_checkpoint != StartupCheckpoint::Absent
-                || recovery::checkpoint_status()?.is_some()
-            {
+            let adoption_only = match entry_checkpoint {
+                StartupCheckpoint::Absent => true,
+                StartupCheckpoint::AdoptionOnly {
+                    source,
+                    ready_digest,
+                    ..
+                } => source == intent.source && ready_digest == intent.checkpoint_digest,
+                StartupCheckpoint::Unsettled => false,
+            };
+            if !adoption_only || recovery::checkpoint_status()?.is_some() {
                 return Err(invalid(
                     "Saved work had not finished reopening before the daemon restarted",
                 ));
