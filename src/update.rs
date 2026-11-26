@@ -2899,13 +2899,9 @@ pub(crate) fn owned_cli_protocol(
     subject: &str,
     operation: &'static str,
 ) -> Result<u16, UpdateError> {
-    let envelope = companion_read(
-        executable,
-        &["--json", "daemon", "protocol-version"],
-        None,
-        subject,
-        operation,
-    )?;
+    let mut command = Command::new(executable);
+    command.args(["--json", "daemon", "protocol-version"]);
+    let envelope = companion_read(command, subject, operation, &CancellationToken::new(), None)?;
     envelope
         .get("data")
         .and_then(|data| data.get("protocol_version"))
@@ -2925,12 +2921,16 @@ pub(crate) fn companion_identity(
         "cagents-namespace-inspect-{}",
         uuid::Uuid::new_v4()
     ));
+    let mut command = Command::new(executable);
+    command
+        .args(["--json", "daemon", "status"])
+        .env("XDG_RUNTIME_DIR", isolated);
     let envelope = companion_read(
-        executable,
-        &["--json", "daemon", "status"],
-        Some(&isolated),
+        command,
         CEDITOR_COMPANION,
         "editor companion instance check",
+        &CancellationToken::new(),
+        None,
     )?;
     match envelope
         .get("data")
@@ -2953,47 +2953,48 @@ pub(crate) fn companion_identity(
 }
 
 fn companion_read(
-    executable: &Path,
-    arguments: &[&str],
-    runtime: Option<&Path>,
+    mut command: Command,
     subject: &str,
     operation: &'static str,
+    cancellation: &CancellationToken,
+    expected: Option<&fs::Metadata>,
 ) -> Result<serde_json::Value, UpdateError> {
-    let before = fs::symlink_metadata(executable)?;
+    let before = fs::symlink_metadata(command.get_program())?;
     if !before.is_file()
         || !crate::install_guard::trusted_executable_owner(before.uid())
         || before.mode() & 0o022 != 0
     {
         return Err(invalid(format!("{subject} is not an owned executable")));
     }
-    let mut command = Command::new(executable);
+    if expected.is_some_and(|expected| !same_companion_executable(expected, &before)) {
+        return Err(invalid(format!("{subject} changed before preflight")));
+    }
     crate::install_guard::sanitize_child_environment(&mut command);
     command.env_remove(crate::agent_execution::AUTHORITY_ENV);
-    command.args(arguments);
-    if let Some(runtime) = runtime {
-        command.env("XDG_RUNTIME_DIR", runtime);
-    }
     let mut output = bounded_command(
         &mut command,
         operation,
         SMALL_ASSET_LIMIT,
         Duration::from_secs(5),
-        &CancellationToken::new(),
+        cancellation,
     )?;
-    let after = fs::symlink_metadata(executable)?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-        || before.uid() != after.uid()
-        || before.mode() != after.mode()
-    {
+    let after = fs::symlink_metadata(command.get_program())?;
+    if !same_companion_executable(&before, &after) {
         return Err(invalid(format!("{subject} changed during preflight")));
     }
     Ok(serde_json::from_reader(&mut output)?)
+}
+
+fn same_companion_executable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && before.uid() == after.uid()
+        && before.mode() == after.mode()
 }
 
 fn observe_impact(
