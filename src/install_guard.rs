@@ -1370,7 +1370,7 @@ fn execute(command: &mut Command) -> io::Result<()> {
     }
 }
 
-#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
