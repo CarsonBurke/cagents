@@ -160,8 +160,8 @@ is staged beside the one it replaces, so it can be published by rename even when
 the prefix is on another volume. The installer checks that each program runs
 from its version tree before it switches `current`, the bundle, the links and
 the login item. Renaming the record of the previous version commits the
-installation. A failure or interrupt before that restores the previous
-installation.
+installation. Before that commit, error handling and soft signals roll back
+the publication.
 
 `--uninstall` uses the installed CLI to acquire the fence, then removes the
 installation, its links and its login item. `--purge` also removes saved app
