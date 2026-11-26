@@ -1712,6 +1712,9 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     let mut track = |id: TerminalId| {
         let socket = registry::socket(&native_directory, id);
         let record = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
+        cleanup
+            .0
+            .extend([record.holder.clone(), record.root.clone()]);
         #[cfg(target_os = "linux")]
         for process in [&record.holder, &record.root] {
             // The recovery census reads real kernel state for every provider
@@ -1722,9 +1725,6 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
                 assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
             }
         }
-        cleanup
-            .0
-            .extend([record.holder.clone(), record.root.clone()]);
         record
     };
 
