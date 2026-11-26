@@ -593,22 +593,23 @@ fn taken_within(guard: &Path, within: Duration) -> bool {
     }
 }
 
-/// Whether anybody holds the runtime lock at `path`. A lock that no longer
-/// exists, as after its runtime directory was removed, or that is not this
-/// user's lock file, is nobody's runtime lock.
+/// Whether a recorded runtime lock remains held or cannot safely be inspected.
+/// A missing name can be released, including when its runtime directory ended.
 fn guard_held(path: &Path) -> bool {
-    let Ok(lock) = OpenOptions::new()
+    let lock = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
-    else {
-        return false;
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
     let Ok(metadata) = lock.metadata() else {
-        return false;
+        return true;
     };
     if !metadata.is_file() || metadata.uid() != current_uid() {
-        return false;
+        return true;
     }
     #[cfg(target_os = "linux")]
     match listed_flock(&lock, &metadata) {
@@ -1168,6 +1169,36 @@ mod tests {
         assert!(acquire(&claim, oversize, Claimant::Daemon, Duration::ZERO).is_err());
         assert_eq!(read_path(&claim).unwrap(), Some(valid.clone()));
         acquire(&claim, valid, Claimant::Daemon, Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn a_runtime_guard_that_cannot_be_inspected_is_not_free() {
+        let first = Runtime::new();
+        let second = Runtime::new();
+        let claims = tempfile::tempdir().unwrap();
+        let path = claims.path().join(DAEMON_CLAIM);
+        let prior = record(&first.lock, None).unwrap();
+        let _maintenance = first.hold();
+        let _next = second.hold();
+        drop(create_claim(&path, &prior).unwrap());
+        let parent = first.lock.parent().unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let inaccessible = fs::File::open(&first.lock).is_err();
+        let attempt = acquire(
+            &path,
+            record(&second.lock, None).unwrap(),
+            Claimant::Daemon,
+            Duration::ZERO,
+        );
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                inaccessible,
+                "permission changes must exercise the inspection failure"
+            );
+        }
+        assert!(state_in_use(&attempt.unwrap_err()).is_some());
+        assert_eq!(read_path(&path).unwrap(), Some(prior));
     }
 
     #[test]
