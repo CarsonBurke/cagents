@@ -3,6 +3,7 @@
 //! a daemon or authorize another checkpoint restore.
 use super::*;
 use crate::model::HostSessionProof;
+#[cfg(feature = "host")]
 use crate::terminal_ipc::StartupState;
 
 #[derive(Serialize, Deserialize)]
@@ -16,7 +17,16 @@ struct Intent {
     window_image: (u64, u64),
     source: HostSessionProof,
     successor: HostSessionProof,
+    process: crate::daemon::holder_registry::Process,
     windows: Vec<String>,
+    stage: Stage,
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Stage {
+    Pending,
+    Deferred,
 }
 
 fn path(state: &Path, job: &str) -> PathBuf {
@@ -60,6 +70,8 @@ impl Intent {
             || !self.successor.is_complete()
             || self.source == self.successor
             || self.source.boot_id != self.successor.boot_id
+            || self.process.pid <= 1
+            || self.process.start == 0
             || self.windows.len() > 1024
             || self
                 .windows
@@ -76,6 +88,7 @@ impl Intent {
         Ok(())
     }
 
+    #[cfg(feature = "host")]
     fn verify_request(&self, state: &Path) -> Result<(), UpdateError> {
         let request = read_private(
             &state.join(format!("{}.request", self.job)),
@@ -101,6 +114,7 @@ impl Intent {
             && (ui.dev(), ui.ino()) == self.window_image)
     }
 
+    #[cfg(feature = "host")]
     fn verify_serving(&self, layout: &InstallLayout) -> Result<(), UpdateError> {
         if !self.names_selected(layout)? {
             return Err(invalid("The restored build is no longer selected"));
@@ -117,6 +131,23 @@ impl Intent {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "host")]
+    fn persist(&self, state: &Path) -> Result<(), UpdateError> {
+        let temporary = state.join(format!(".cutover-{}", uuid::Uuid::new_v4()));
+        let saved = (|| {
+            let mut file = private_create(&temporary)?;
+            serde_json::to_writer(&mut file, self)?;
+            file.sync_all()?;
+            fs::rename(&temporary, path(state, &self.job))?;
+            File::open(state)?.sync_all()?;
+            Ok(())
+        })();
+        if saved.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        saved
     }
 }
 
@@ -157,23 +188,13 @@ pub(crate) fn record(
         window_image: (ui.dev(), ui.ino()),
         source: source.clone(),
         successor: successor.clone(),
+        process: crate::daemon::holder_registry::Process::read(std::process::id() as i32)?,
         windows: windows.to_vec(),
+        stage: Stage::Pending,
     };
     intent.validate()?;
     intent.verify_request(&state)?;
-    let temporary = state.join(format!(".cutover-{}", uuid::Uuid::new_v4()));
-    let saved = (|| {
-        let mut file = private_create(&temporary)?;
-        serde_json::to_writer(&mut file, &intent)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path(&state, job))?;
-        File::open(&state)?.sync_all()?;
-        Ok(())
-    })();
-    if saved.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    saved
+    intent.persist(&state)
 }
 
 /// An unrelated job must not replace the unfinished status between the
@@ -183,14 +204,28 @@ pub(super) fn pending_selected(
     state: &Path,
     job: &UpdateJob,
 ) -> Result<bool, UpdateError> {
-    if job.phase.is_terminal() || layout.version != job.version {
+    if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
+        || layout.version != job.version
+    {
         return Ok(false);
     }
     let Some(intent) = read(state, &job.id)? else {
         return Ok(false);
     };
-    intent.verify_request(state)?;
-    Ok(intent.verify_serving(layout).is_ok())
+    if intent.stage != Stage::Pending
+        || !intent.names_selected(layout)?
+        || crate::daemon::read_boot_id()? != intent.successor.boot_id
+    {
+        return Ok(false);
+    }
+    // Kernel identity is available during socket contention and before the
+    // listener starts accepting. A transient query error cannot authorize an
+    // unrelated job to replace this job's saved-window scope.
+    match crate::daemon::holder_registry::Process::read(intent.process.pid) {
+        Ok(current) => Ok(current == intent.process),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(feature = "host")]
@@ -205,10 +240,14 @@ pub(super) fn finish(
     {
         return Ok(None);
     }
-    let Some(intent) = read(state, &job.id)? else {
+    let Some(mut intent) = read(state, &job.id)? else {
         return Ok(None);
     };
-    if &intent.successor != successor || !intent.names_selected(layout)? {
+    if intent.stage != Stage::Pending
+        || &intent.successor != successor
+        || intent.process.pid != std::process::id() as i32
+        || !intent.names_selected(layout)?
+    {
         return Ok(None);
     }
     let finished = finish_windows(&intent, layout, state);
@@ -227,6 +266,10 @@ pub(super) fn finish(
         }
     }
     write_job(state, &job)?;
+    if finished.is_err() {
+        intent.stage = Stage::Deferred;
+        intent.persist(state)?;
+    }
     retention::remember_success(state, &job.id, &job.phase);
     finished.map(|()| Some(job.id))
 }
@@ -241,10 +284,11 @@ fn finish_windows(
     intent.verify_serving(layout)?;
     let ui = layout.version_root.join("bin/cagents-ui");
     if !intent.windows.is_empty() {
-        let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+        let mut guard = crate::instance::UiUpdateGuard::acquire_for_cutover()?;
         guard.set_recovery_restore_only();
         guard.relaunch_missing_windows(&intent.windows, &ui)?;
-        crate::instance::UiUpdateGuard::acquire()?.verify_cutover_windows(&intent.windows, &ui)?;
+        crate::instance::UiUpdateGuard::acquire_for_cutover()?
+            .verify_cutover_windows(&intent.windows, &ui)?;
     }
     intent.verify_serving(layout)
 }
@@ -272,7 +316,9 @@ mod tests {
                 ..source.clone()
             },
             source,
+            process: crate::daemon::holder_registry::Process { pid: 42, start: 17 },
             windows: vec!["main".into()],
+            stage: Stage::Pending,
         };
         intent.validate().unwrap();
         intent.windows.push("main".into());

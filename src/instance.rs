@@ -716,8 +716,11 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_os = "macos", any(feature = "ui", feature = "host")))]
+const CUTOVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(target_os = "macos", feature = "ui"))]
-static UI_RESTORATION_READY: AtomicBool = AtomicBool::new(false);
+static UI_RESTORATION_READY: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
 /// Records that the UI's main window is on screen. A failure after this ends
 /// a running window, not its startup.
@@ -743,7 +746,13 @@ fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
         #[cfg(all(target_os = "macos", feature = "ui"))]
-        UI_RESTORATION_READY.store(true, Ordering::Release);
+        {
+            let (ready, changed) = &UI_RESTORATION_READY;
+            *ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
         crate::diagnostics::record(crate::diagnostics::Event::Ready);
     }
     if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -1845,10 +1854,37 @@ impl UiUpdateGuard {
     }
 
     pub fn acquire() -> io::Result<Self> {
+        Self::acquire_with_operation(libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    /// Let a window that is already taking its slot reach the fence naturally.
+    /// The detached flock waiter owns no update lease if this budget expires.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn acquire_for_cutover() -> io::Result<Self> {
+        match Self::acquire() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+            result => return result,
+        }
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("cutover-launch-fence".into())
+            .spawn(move || {
+                let _ = send.send(Self::acquire_with_operation(libc::LOCK_EX));
+            })?;
+        receive
+            .recv_timeout(CUTOVER_READY_TIMEOUT)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "The saved window launch fence was unavailable: {error}"
+                ))
+            })?
+    }
+
+    fn acquire_with_operation(operation: libc::c_int) -> io::Result<Self> {
         let runtime = runtime_directory()?;
         let lock = owned_lock(
             &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
-            libc::LOCK_EX | libc::LOCK_NB,
+            operation,
         )?;
         let legacy = owned_lock(
             &runtime.join(APPLICATION_LOCK_FILE),
@@ -2289,7 +2325,7 @@ impl UiUpdateGuard {
                 ));
             }
             stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-            stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+            stream.set_read_timeout(Some(CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT))?;
             writeln!(&mut stream, "update-ready")?;
             if read_capped_line(&stream)? != "ready" || !owner.still_owns_lease()? {
                 return Err(io::Error::other("A saved window is still reopening"));
@@ -3161,11 +3197,15 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
             Ok(ActivationRequest::Shutdown) => break,
             #[cfg(target_os = "macos")]
             Ok(ActivationRequest::UpdateReady) => {
-                let response = if UI_RESTORATION_READY.load(Ordering::Acquire) {
-                    "ready"
-                } else {
-                    "pending"
-                };
+                let (ready, changed) = &UI_RESTORATION_READY;
+                let readiness = ready
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (readiness, _) = changed
+                    .wait_timeout_while(readiness, CUTOVER_READY_TIMEOUT, |ready| !*ready)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let response = if *readiness { "ready" } else { "pending" };
+                drop(readiness);
                 let _ = writeln!(&stream, "{response}");
             }
             Ok(ActivationRequest::Activate(token)) => {

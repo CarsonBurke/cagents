@@ -1629,6 +1629,16 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
         Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(target_os = "macos")]
+    if job.phase == UpdatePhase::Failed {
+        let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+        if cutover::pending_selected(&layout, &state, &job)? {
+            job.phase = UpdatePhase::Installing;
+            job.message = "Finishing the update".into();
+            job.refusal = None;
+            return Ok(Some(job));
+        }
+    }
     if !job.phase.is_terminal() {
         match acquire_lock(&state) {
             Ok(_lock) => {
