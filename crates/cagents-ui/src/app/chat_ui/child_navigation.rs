@@ -4,12 +4,13 @@ use super::*;
 mod reveal;
 
 /// Where the chooser lists a child: what asks something of the reader first,
-/// then what is still going, then what has finished.
+/// then what is still going, what finished, and earlier observations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Section {
     Attention,
     Working,
     Finished,
+    Earlier,
 }
 
 impl Section {
@@ -17,6 +18,7 @@ impl Section {
         match rank(child) {
             0 => Self::Working,
             FINISHED => Self::Finished,
+            EARLIER => Self::Earlier,
             _ => Self::Attention,
         }
     }
@@ -26,6 +28,7 @@ impl Section {
             Self::Attention => "Needs attention",
             Self::Working => "Working",
             Self::Finished => "Finished",
+            Self::Earlier => "Earlier",
         }
     }
 }
@@ -56,6 +59,9 @@ fn child_key(id: &str) -> [u8; 32] {
 /// Working children lead, so what is still running is what the reader sees
 /// first; a question or a failure follows them, and finished work goes last.
 fn rank(child: &chat::Subagent) -> u8 {
+    if child.last_seen_running() {
+        return EARLIER;
+    }
     match child.status {
         // A child waiting on its own background work is alive and asks nothing
         // of anyone, so it stays with the working ones rather than in attention.
@@ -70,6 +76,7 @@ fn rank(child: &chat::Subagent) -> u8 {
 /// The rank of a child that finished, stopped or ended. Finished children
 /// fold into one control on the strip rather than each keeping a tab.
 const FINISHED: u8 = 3;
+const EARLIER: u8 = 4;
 
 fn needs_attention(child: &chat::Subagent) -> bool {
     matches!(rank(child), 1 | 2)
@@ -323,6 +330,7 @@ fn span(millis: u64) -> String {
 /// long ago any other child last did something.
 fn row_time(child: &chat::Subagent, report: Option<&chat::Item>, now: u64) -> Option<String> {
     match Section::of(child) {
+        Section::Earlier => None,
         Section::Working => first_activity(child).map(|start| span(now.saturating_sub(start))),
         _ => last_activity(child, report).map(|last| {
             cagents::account::format_ago(
@@ -558,6 +566,10 @@ impl Runtime {
     /// the child's ID is the provider's address for it, not a name.
     pub(super) fn child_choice_name(&self, child: &chat::Subagent, label: &str) -> String {
         let status = self.native_child_status(child);
+        if child.last_seen_running() {
+            return status.to_owned();
+        }
+
         match Self::native_child_task(child).filter(|_| !Self::named_by_task(child)) {
             Some(task) => format!(
                 "{label} · {status} · Task: {}",
@@ -1052,8 +1064,12 @@ mod tests {
     fn a_listed_unloaded_running_child_has_a_static_status_in_the_chooser() {
         let mut child = child("earlier", chat::ToolStatus::Running, false);
         child.detail = chat::UNLOADED_CHILD_RUNNING.into();
-        assert_eq!(Section::of(&child), Section::Working);
+        assert_eq!(Section::of(&child), Section::Earlier);
+        assert_eq!(row_time(&child, None, 60_000), None);
         assert_eq!(child_icon(&child), Icon::History);
+        let children = [child.clone()];
+        assert!(direct_tabs(&children, None, None).is_empty());
+        assert_eq!(direct_tabs(&children, Some(&child.id), None), [&child]);
         assert_eq!(
             super::super::view::AgentWork::default().caption(&child),
             chat::UNLOADED_CHILD_RUNNING
