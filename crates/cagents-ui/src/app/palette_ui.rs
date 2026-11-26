@@ -258,6 +258,7 @@ mod matching;
 #[cfg(test)]
 thread_local! {
     static SCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CANDIDATE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1075,6 +1076,11 @@ impl Cagents {
 
     /// Everything the palette can offer, unranked.
     fn palette_candidates(&self) -> Vec<(String, String, Message)> {
+        // The projection oracle's own full projection builds them too.
+        #[cfg(test)]
+        if !super::projection_oracle::verifying() {
+            CANDIDATE_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        }
         if let Some(card) = self.palette.move_pane {
             return self.pane_move_palette_entries(card);
         }
@@ -2123,6 +2129,37 @@ mod tests {
     }
 
     #[test]
+    fn typing_and_drawing_reuse_the_entries_the_palette_built() {
+        super::super::projection_oracle::disable_settling();
+        let mut app = settings_focus_fixture();
+        drop(app.update(Message::Palette(Action::Open)));
+        CANDIDATE_BUILDS.with(|builds| builds.set(0));
+        for query in ["s", "se", "set", "se"] {
+            drop(app.update(Message::Palette(Action::Query(query.into()))));
+            drop(app.palette_surface());
+        }
+        assert_eq!(CANDIDATE_BUILDS.with(|builds| builds.get()), 0);
+        let fresh = app.palette_entries();
+        let cached: Vec<_> = app
+            .palette
+            .results()
+            .map(|entry| (entry.label.clone(), entry.message.clone()))
+            .collect();
+        assert!(!cached.is_empty());
+        assert_eq!(
+            format!("{cached:?}"),
+            format!(
+                "{:?}",
+                fresh
+                    .into_iter()
+                    .map(|(label, _, message)| (label, message))
+                    .collect::<Vec<_>>()
+            ),
+            "a refiltered query shows what a fresh build would"
+        );
+    }
+
+    #[test]
     fn palette_filter_order_is_unchanged() {
         let mut app = settings_focus_fixture();
         let card = app.workspace.focused().unwrap();
@@ -2879,6 +2916,14 @@ mod tests {
             crate::model::WorktreeId::new(),
         );
         assert_eq!(app.palette_entries()[0].1, "• Unread");
+        // The row already built reads the new status when it draws, without
+        // a projection building the entries again.
+        let shown = app
+            .palette
+            .results()
+            .find(|entry| entry.identity == Some(EntryIdentity::Pane(target)))
+            .map(|entry| app.palette_detail(&entry.detail));
+        assert_eq!(shown, Some("• Unread"));
         let (_, messages) = palette_pointer_step(
             &app,
             &mut tree,
