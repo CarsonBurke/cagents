@@ -27,6 +27,9 @@ word:
   permission  an edit that asks for approval first; refusing fails the edit,
               stopping the turn cancels it
   hold        thinks until the turn is stopped (at most 60 seconds)
+  background  starts a command in the background and waits, silent, for it
+              to finish (FAKE_ACP_BACKGROUND_SECONDS, default 20); stopping
+              the turn fails the command
   garbage     prints a line that is not JSON in the middle of its answer
   files       asks the client to read a file and reports what it was told
   mode        switches its own mode and reports its new config options
@@ -37,6 +40,11 @@ word:
   /compact    answers as a compaction command
 
 Anything else is answered with a short thought and a streamed reply.
+
+A prompt sent while a turn runs is answered as Antigravity 1.5.17 answers
+one: the running prompt ends at once with `end_turn`, and the turn goes on
+under the new prompt, answering it before the turn's own reply. Muse's shape
+refuses it as a prompt already running.
 
 Environment switches:
   FAKE_ACP_SHAPE=agy|muse   which agent's replies to copy
@@ -49,6 +57,8 @@ Environment switches:
   FAKE_ACP_REPLAY=N         a loaded conversation starts with N extra
                             exchanges, for long histories
   FAKE_ACP_LOG=FILE         append every frame received, one per line
+  FAKE_ACP_BACKGROUND_SECONDS=N
+                            how long the `background` turn's command runs
   FAKE_ACP_WORK=FILE        Claude Code transcript lines the `work` turn
                             replays, as tests/fixtures/conversation-work.py
                             writes them
@@ -122,6 +132,8 @@ WORK = os.environ.get("FAKE_ACP_WORK")
 # session, as agy does under ~/.gemini; None for agy's own directory.
 PROBE_DATA = (os.path.join(os.path.expanduser("~/.gemini"), APP_DATA)
               if APP_DATA != "antigravity-cli" else None)
+# The tokens Antigravity reports in each prompt's reply.
+USAGE = {"totalTokens": 30, "inputTokens": 20, "outputTokens": 10}
 
 AGY_MODES = [
     ("default", "Default", "Ask before edits and commands, per your permission settings."),
@@ -327,6 +339,10 @@ class Agent:
         self.next_request = 0
         self.responses = {}
         self.cancelled = set()
+        # By session: the prompt the running turn answers last, and the
+        # messages sent into the turn that it has yet to answer.
+        self.owed = {}
+        self.steered = {}
 
     def read(self):
         # Whatever ends the input, the agent hears that it ended and exits.
@@ -402,8 +418,39 @@ class Agent:
         if handler is None:
             return fail(id, -32601, f"Method not found: {method}")
         if method == "session/prompt" and in_turn:
-            return fail(id, -32600, "A prompt is already running")
+            return self.steer(id, params)
         handler(id, params)
+
+    def steer(self, id, params):
+        """A prompt sent into the running turn: Antigravity answers the
+        prompt it was running and carries on under this one."""
+        session = self.sessions.get(params.get("sessionId"))
+        if SHAPE != "agy" or session is None or session.id not in self.owed:
+            return fail(id, -32600, "A prompt is already running")
+        blocks = params.get("prompt") or []
+        for block in blocks:
+            session.update({"sessionUpdate": "user_message_chunk", "content": block}, record=True)
+        reply(self.owed[session.id], {"stopReason": "end_turn", "usage": USAGE})
+        self.owed[session.id] = id
+        text = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        self.steered.setdefault(session.id, []).append(text)
+
+    def answer_steered(self, session):
+        """Answers each message sent into the turn with a response of its
+        own."""
+        for text in self.steered.pop(session.id, []):
+            self.say(session, "Fake answer to: " + (text.strip().splitlines() or [""])[0][:200])
+            self.usage(session)
+
+    def usage(self, session):
+        if SHAPE == "muse":
+            # Muse reports no context window size.
+            session.update({"sessionUpdate": "usage_update", "used": 0, "size": 0,
+                            "_meta": {"dev.muse": {"contextSizeUnknown": True}}}, record=False)
+        else:
+            # Antigravity reports its context window, never a cost.
+            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000},
+                           record=False)
 
     def on_initialize(self, id, params):
         if os.environ.get("FAKE_ACP_NOISE"):
@@ -539,6 +586,15 @@ class Agent:
         if marked("no-allowance"):
             return no_allowance(id)
         self.cancelled.discard(session.id)
+        self.owed[session.id] = id
+        try:
+            self.turn(session, params)
+        finally:
+            self.owed.pop(session.id, None)
+            self.steered.pop(session.id, None)
+
+    def turn(self, session, params):
+        id = self.owed[session.id]
         blocks = params.get("prompt") or []
         text = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         for block in blocks:
@@ -564,6 +620,8 @@ class Agent:
             stop = self.permission(session)
         elif "hold" in words:
             stop = self.hold(session)
+        elif "background" in words:
+            stop = self.background(session)
         elif "garbage" in words:
             self.say(session, "Before the stray line. ")
             noise("fake-acp-agent: a diagnostic line that is not JSON")
@@ -595,20 +653,15 @@ class Agent:
             self.think(session, "Considering the question.")
             self.say(session, "Fake answer to: " + text.strip().splitlines()[0][:200]
                      if text.strip() else "Fake answer.")
-        if SHAPE == "muse":
-            # Muse reports no context window size.
-            session.update({"sessionUpdate": "usage_update", "used": 0, "size": 0,
-                            "_meta": {"dev.muse": {"contextSizeUnknown": True}}}, record=False)
-        else:
-            # Antigravity reports its context window, never a cost.
-            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000},
-                           record=False)
+        if session.id not in self.cancelled:
+            self.answer_steered(session)
+        self.usage(session)
         if session.id in self.cancelled:
             stop = "cancelled"
         result = {"stopReason": stop}
         if SHAPE == "agy":
-            result["usage"] = {"totalTokens": 30, "inputTokens": 20, "outputTokens": 10}
-        reply(id, result)
+            result["usage"] = USAGE
+        reply(self.owed[session.id], result)
 
     def say(self, session, text, message=None):
         message = message or str(uuid.uuid4())
@@ -769,7 +822,36 @@ class Agent:
             self.think(session, "Still working. ")
             if self.pause(0.2, session):
                 return "cancelled"
+            self.answer_steered(session)
         self.say(session, "Finished holding.")
+        return "end_turn"
+
+    def background(self, session):
+        """Antigravity 1.5.17's `run_command` past its `WaitMsBeforeAsync`:
+        the model says it will wait, reports its usage and is silent until
+        the command ends, but to answer what is sent into the turn."""
+        seconds = float(os.environ.get("FAKE_ACP_BACKGROUND_SECONDS", "20"))
+        line = f"sleep {seconds:g} && echo built"
+        self.usage(session)
+        call = "call_" + str(uuid.uuid4().int)[:19]
+        session.update({"sessionUpdate": "tool_call", "toolCallId": call, "title": line,
+                        "kind": "execute", "status": "in_progress",
+                        "rawInput": {"CommandLine": line, "Cwd": session.cwd,
+                                     "NotificationTimeoutSeconds": 120,
+                                     "WaitMsBeforeAsync": 500}})
+        self.say(session, "I started the build in the background. Waiting for it to complete.")
+        self.usage(session)
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.pause(min(0.2, max(0.0, end - time.time())), session):
+                session.update({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                                "status": "failed"})
+                return "cancelled"
+            self.answer_steered(session)
+        session.update({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                        "status": "completed",
+                        "rawOutput": {"output": "built\n", "exit_code": 0}})
+        self.say(session, "The build finished.")
         return "end_turn"
 
     def index(self):

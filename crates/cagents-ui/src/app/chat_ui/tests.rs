@@ -26456,3 +26456,32 @@ fn a_skipped_edge_suggests_the_name_of_a_runtime_attached_since_reconciliation()
     assert_eq!(complete_reconciliations(), before, "the echo skips");
     assert_eq!(app.durable.channels[0].title, "Parser cache work");
 }
+
+/// A turn held open by background commands alone reads as waiting on them,
+/// in the header and in the row that closes the transcript, rather than as
+/// a reply still being written.
+#[test]
+fn a_turn_waiting_on_background_commands_says_so() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.detail = chat::WAITING_ON_BACKGROUND_WORK.into();
+    let waiting = chat::WAITING_ON_BACKGROUND_WORK.to_owned();
+    assert_eq!(
+        runtime.conversation_status(false),
+        (Some(Icon::AgentBackground), waiting.clone())
+    );
+    assert_eq!(
+        runtime.timeline_activity(false, None),
+        Some((Icon::AgentBackground, waiting))
+    );
+    // Back at work, it reads as working again.
+    Arc::make_mut(&mut runtime.snapshot).detail = "Working".into();
+    assert_eq!(
+        runtime.conversation_status(false).0,
+        Some(Icon::AgentWorking)
+    );
+}

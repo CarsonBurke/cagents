@@ -3694,10 +3694,16 @@ impl Actor {
             } else {
                 None
             };
-            let starts_turn = matches!(&command, Command::Prompt { .. });
-            if run.is_some() && starts_turn {
+            // A prompt made during a turn steers or queues into it; only one
+            // made between turns starts a turn, and only that one may say the
+            // conversation is waiting for it over what the provider last said.
+            let starts_turn = matches!(&command, Command::Prompt { .. })
+                && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+            if run.is_some() {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
+                if matches!(&command, Command::Prompt { .. })
+                    && (!state.ready || state.busy || state.waiting || !state.requests.is_empty())
+                {
                     let _ = refuse("The provider is no longer idle for the accepted run".into());
                     continue;
                 }

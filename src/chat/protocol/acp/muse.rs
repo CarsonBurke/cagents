@@ -35,6 +35,11 @@ pub static PROFILE: Profile = Profile {
     ],
     offers_model: crate::agent::muse_offers_model,
     sign_in_required: auth_required,
+    // Not recorded: what Muse does with a prompt sent mid-turn, or with
+    // background work when a turn is cancelled.
+    steers: false,
+    cancel_stops_background: false,
+    backgrounds_commands: false,
 };
 
 /// Muse's ACP mode identifiers.

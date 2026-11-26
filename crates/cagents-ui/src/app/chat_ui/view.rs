@@ -843,6 +843,8 @@ const QUEUE_PREVIEW_BYTES: usize = prompt::QUEUE_PREVIEW_BYTES;
 enum QueueTiming {
     NextStep,
     NextTurn,
+    /// Held by a stop or a refusal until the reader sends it.
+    Held,
     /// On its way to the agent, or back to the composer.
     Leaving,
     /// Sent, without the agent confirming it got it, and whether it can be
@@ -890,6 +892,10 @@ fn queue_row<'a>(
         QueueTiming::NextTurn => crate::interaction::tooltip(
             crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
             "Sent when this turn ends",
+        ),
+        QueueTiming::Held => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
+            "Waiting for you: send a message, or Send now",
         ),
         QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -2546,6 +2552,8 @@ impl Runtime {
             {
                 Some((glyph, label))
             }
+            // The turn stays open on its background commands alone.
+            Some(Icon::AgentBackground) if snapshot.busy => Some((Icon::AgentBackground, label)),
             // A recent failed task stays actionable even after the lead finishes.
             Some(Icon::Error) if !snapshot.subagent_activity().failed.is_empty() => {
                 Some((Icon::Error, label))
@@ -2730,7 +2738,10 @@ impl Runtime {
     /// their way back to the composer. Messages this app still holds, such
     /// as follow-ups for a provider without a queue, cannot go early.
     pub(super) fn send_now_count(&self) -> usize {
-        if !self.snapshot.capabilities.send_queued_now || !self.snapshot.busy {
+        let caps = &self.snapshot.capabilities;
+        let into_turn = caps.send_queued_now && self.snapshot.busy;
+        let held = caps.queue_holds && !self.snapshot.busy;
+        if !into_turn && !held {
             return 0;
         }
         self.snapshot
@@ -2740,6 +2751,12 @@ impl Runtime {
                 !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
             })
             .count()
+    }
+
+    /// Whether the provider holds what is queued for the reader, as a stop
+    /// or a refusal leaves it: no turn is running to send it when it ends.
+    pub(super) fn queue_held(&self) -> bool {
+        self.snapshot.capabilities.queue_holds && !self.snapshot.busy && self.send_now_count() > 0
     }
 
     /// Whether Send now can be asked for this moment: one already on its way
@@ -2766,6 +2783,7 @@ impl Runtime {
             Some(chat::SendNow::Declined) if send_now > 0 => {
                 format!("Queued · {count} · couldn't send early")
             }
+            _ if self.queue_held() => format!("Queued · {count} · waiting for you"),
             _ => format!("Queued · {count}"),
         }
     }
@@ -2797,23 +2815,29 @@ impl Runtime {
         } else {
             ("them", "they wait")
         };
+        let provider = self.session.launch.provider.label();
         let tooltip: Cow<'_, str> = match self.snapshot.send_now {
             Some(chat::SendNow::Declined) => format!(
-                "Claude couldn't take {it} early, so {they} in the queue. You can try again \
+                "{provider} couldn't take {it} early, so {they} in the queue. You can try again \
                  once the queue changes."
             )
             .into(),
             Some(_) => "Sending now…".into(),
+            None if self.queue_held() => format!(
+                "Send {it} to {provider} now, starting the next turn. A message you send goes \
+                 after {it}."
+            )
+            .into(),
             None => {
-                // Where Stop also ends background subagents, say so: that
+                // Where Stop also ends background work, say so: that
                 // is the difference that makes Send now worth choosing.
                 let stop = if self.snapshot.capabilities.interrupt_stops_background {
-                    " Stop cancels the turn and its background subagents."
+                    " Stop cancels the turn and its background work."
                 } else {
                     ""
                 };
                 format!(
-                    "Send {it} to Claude now. Subagents and background work keep running; the \
+                    "Send {it} to {provider} now. Subagents and background work keep running; the \
                      reply being written may be cut short.{stop}"
                 )
                 .into()
@@ -2941,6 +2965,14 @@ impl Runtime {
                 .any(|agent| !agent.waiting && agent.status == chat::ToolStatus::Running)
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
+        } else if snapshot.busy && snapshot.detail == chat::WAITING_ON_BACKGROUND_WORK {
+            // The turn is open but the agent is idle until its background
+            // commands finish, however long that takes; its last words
+            // would otherwise read as a reply still being written.
+            (
+                Some(Icon::AgentBackground),
+                chat::WAITING_ON_BACKGROUND_WORK,
+            )
         } else if snapshot.is_working() {
             (
                 Some(Icon::AgentWorking),
@@ -7030,6 +7062,7 @@ impl Runtime {
             })
         };
         let mut rows = Vec::new();
+        let held = self.queue_held();
         for queued in &self.snapshot.queued_messages {
             if self.taken_back.contains(&queued.id) {
                 continue;
@@ -7073,7 +7106,11 @@ impl Runtime {
             if caps.queue_start {
                 controls.push(control(
                     Icon::ChevronUp,
-                    "Send next, ahead of the rest",
+                    if held {
+                        "Send this now"
+                    } else {
+                        "Send next, ahead of the rest"
+                    },
                     available,
                     Action::Command(
                         target,
@@ -7094,6 +7131,7 @@ impl Runtime {
             rows.push(queue_row(
                 match queued.delivery {
                     _ if recalling => QueueTiming::Leaving,
+                    _ if held => QueueTiming::Held,
                     chat::QueueDelivery::NextStep => QueueTiming::NextStep,
                     chat::QueueDelivery::NextTurn => QueueTiming::NextTurn,
                 },
