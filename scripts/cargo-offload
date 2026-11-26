@@ -2239,8 +2239,8 @@ class Offload:
             return self.run_build()
         except offload_client.LocalSyncCancelled:
             return 128 + self.cancelled
-        except offload_client.LocalSyncTimeout:
-            say("build admission timed out while waiting for a local sync slot")
+        except offload_client.LocalSyncTimeout as error:
+            say(f"build admission {error}")
             return EXPIRED
         except offload_client.LocalSyncError as error:
             say(str(error))
@@ -2359,7 +2359,11 @@ class Offload:
             return None
         with builds:
             # One build at a time in the slot, as a lease of its own would be.
-            fcntl.flock(builds, fcntl.LOCK_EX)
+            deadline = admission_deadline(self.environment)
+            offload_client.acquire_held_build(
+                builds.fileno(), cancel_fd=self.cancel_reader,
+                deadline=None if deadline is None else deadline / 1e9,
+            )
             held = self.held(base, top)
             if held is None:
                 return None

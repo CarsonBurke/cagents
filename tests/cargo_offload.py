@@ -372,6 +372,21 @@ class SharedConnection(unittest.TestCase):
 
 
 class Transport(unittest.TestCase):
+    def test_a_held_build_can_time_out_while_a_sibling_still_owns_the_slot(self):
+        with FixtureDirectory() as scope:
+            lock = str(Path(scope.name, "hold"))
+            held = ("/host/slot", None, lock, None, "generation")
+            build = offload.Offload("host", offload.parse(["check"]), {
+                "CAGENTS_BUILD_ADMISSION_DEADLINE": str(time.monotonic_ns() + 250_000_000),
+            })
+            with open(lock + ".builds", "a") as owned:
+                fcntl.flock(owned, fcntl.LOCK_EX)
+                with patch.object(build, "run_build", side_effect=lambda: build.build_held(
+                        held, "base", scope.name, scope.name, scope.name, {})), \
+                        patch.object(offload, "say") as say:
+                    self.assertEqual(build.run(), 124)
+            say.assert_called_once_with("build admission timed out while waiting for another build in this hold")
+
     def test_bad_local_admission_configuration_has_a_diagnostic(self):
         build = offload.Offload("host", offload.parse(["check"]), {"CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "0"})
         with patch.object(build, "run_build", side_effect=lambda: build.local(lambda: 0)), \
