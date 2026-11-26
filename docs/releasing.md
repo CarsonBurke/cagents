@@ -141,10 +141,10 @@ cagents-VERSION/share/doc/cagents/{LICENSE,THIRD-PARTY-NOTICES}
   `~/Applications` or keep it in the Dock.
 - `~/.local/bin/cagents` links to `current/bin/cagents`.
 - `~/Library/LaunchAgents/dev.cagents.Cagents.Daemon.plist` runs
-  `versions/VERSION/bin/cagents daemon start` once at login, as Linux's
-  autostart entry does. It is not kept alive: the daemon outlives the job, and
-  `cagents daemon stop` stays the way to stop it. The installer rewrites it
-  for each version it installs.
+  `cagents daemon start` once at login. It resolves `current/bin` to the
+  selected version before starting the CLI, so the same login item works
+  after an update. The daemon outlives the job and `cagents daemon stop`
+  stops it.
 
 The installer verifies the archive against `SHA256SUMS-macos`, accepts exactly
 the release's members, refuses links in the tree, and checks every signature in
