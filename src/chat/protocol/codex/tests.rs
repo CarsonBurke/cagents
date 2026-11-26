@@ -7179,32 +7179,45 @@ fn question_and_elicitation_kinds_preserve_their_exact_reply_contracts() {
 fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
     let mut adapter = adapter();
     let request = |id: &str| json!({"id":id,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-exact","turnId":"turn","mode":"form","message":"Search","requestedSchema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}});
-    let answer = |id: &str, query: Vec<String>, limit: Vec<String>| Command::Answer {
+    let accept = |id: &str, answers: Vec<(&str, Vec<String>)>| Command::Answer {
         request_id: rpc_id(&json!(id)).unwrap(),
         action: "accept".into(),
-        answers: vec![
-            Answer {
-                field: "query".into(),
-                values: query,
-            },
-            Answer {
-                field: "limit".into(),
-                values: limit,
-            },
-        ],
+        answers: answers
+            .into_iter()
+            .map(|(field, values)| Answer {
+                field: field.into(),
+                values,
+            })
+            .collect(),
     };
+    let search = || ("query", vec!["search".to_owned()]);
     adapter.receive(request("e1")).unwrap();
     // A blank required field is missing, and the request stays pending.
     for blank in [vec![], vec![String::new()]] {
-        let error = adapter.command(answer("e1", blank, vec![])).unwrap_err();
+        let error = adapter
+            .command(accept("e1", vec![("query", blank), ("limit", vec![])]))
+            .unwrap_err();
         assert_eq!(error, "Missing answer for query");
+    }
+    // Skipping a blank answer must not hide a duplicate or unknown field.
+    for (field, expected) in [
+        ("limit", "Duplicate answer for limit"),
+        ("unknown", "Unknown form field"),
+    ] {
+        let error = adapter
+            .command(accept(
+                "e1",
+                vec![search(), ("limit", vec![]), (field, vec![])],
+            ))
+            .unwrap_err();
+        assert_eq!(error, expected);
     }
     // An untouched optional field arrives with no value; a cleared one may
     // arrive as one empty string. Either way it is left out of the reply.
     for (id, blank) in [("e2", vec![]), ("e3", vec![String::new()])] {
         adapter.receive(request(id)).unwrap();
         let step = adapter
-            .command(answer(id, vec!["search".into()], blank))
+            .command(accept(id, vec![search(), ("limit", blank)]))
             .unwrap();
         assert_eq!(
             step.writes[0]["result"],
@@ -7212,7 +7225,7 @@ fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
         );
     }
     let step = adapter
-        .command(answer("e1", vec!["search".into()], vec!["5".into()]))
+        .command(accept("e1", vec![search(), ("limit", vec!["5".into()])]))
         .unwrap();
     assert_eq!(
         step.writes[0]["result"],

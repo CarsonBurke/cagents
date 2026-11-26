@@ -11144,6 +11144,22 @@ fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
             .unwrap_err();
         assert!(error.contains("Missing required Claude field"), "{error}");
     }
+    // Skipping a blank answer must not hide a duplicate or unknown field.
+    for field in ["limit", "unknown"] {
+        let mut duplicate = answers(vec!["search".into()], vec![]);
+        duplicate.push(Answer {
+            field: field.into(),
+            values: if field == "limit" {
+                vec!["5".into()]
+            } else {
+                vec![]
+            },
+        });
+        let error = adapter
+            .answer("e1".into(), "accept".into(), duplicate)
+            .unwrap_err();
+        assert!(error.contains("unknown or duplicate field"), "{error}");
+    }
     // An untouched optional field arrives with no value; a cleared one may
     // arrive as one empty string. Either way it is left out of the reply.
     for (id, blank) in [("e2", vec![]), ("e3", vec![String::new()])] {
