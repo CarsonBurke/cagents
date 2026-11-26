@@ -4056,6 +4056,10 @@ impl RestoredUpgrade {
                 .retain_startup_recovery(message.clone());
             return Err(message);
         }
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retained_startup_checkpoint
+            .take();
         Ok(())
     }
 }
@@ -4424,10 +4428,6 @@ fn restore_upgrade_checkpoint(
             restore_relaunched_execution_authority(host, chat.source.id);
         }
     }
-    host.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_startup_checkpoint
-        .take();
     publish();
     if !unattached.is_empty() {
         tracing::warn!(

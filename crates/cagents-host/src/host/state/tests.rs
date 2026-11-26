@@ -47,6 +47,21 @@ fn restore_keeps_the_checkpoint_until_ready_publication_is_finalized() {
     let mut restored = restore(store);
     restored.finish(&host).unwrap();
     assert!(!path.exists());
+    assert!(host.lock().unwrap().retained_startup_checkpoint().is_none());
+
+    let store = Store::open(directory.path()).unwrap();
+    store.save(&checkpoint).unwrap();
+    let mut restored = restore(store);
+    // A failed retirement must keep the original identities protected even
+    // if the canonical name is already gone or can no longer be read.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(restored.finish(&host).is_err());
+    let state = host.lock().unwrap();
+    let retained = state.retained_startup_checkpoint().unwrap();
+    assert_eq!(retained.proof, checkpoint.proof);
+    assert_eq!(retained.phase, Phase::Restoring);
+    assert!(state.startup_recovery().is_some());
 }
 
 #[test]
