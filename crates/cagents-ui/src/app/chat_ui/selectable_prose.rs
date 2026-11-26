@@ -1415,21 +1415,23 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 shell.invalidate_layout();
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(key),
+                key,
+                physical_key,
                 modifiers,
                 ..
             }) if state.focused
                 && active_selection().load(Ordering::Relaxed) == state.identity
                 && modifiers.command() =>
             {
-                if key.eq_ignore_ascii_case("c") && state.anchor != state.end {
+                let letter = crate::interaction::latin_key(key, *physical_key);
+                if letter == Some('c') && state.anchor != state.end {
                     super::text_copy::invalidate();
                     clipboard.write(
                         iced::advanced::clipboard::Kind::Standard,
                         state.copied(state.anchor.min(state.end)..state.anchor.max(state.end)),
                     );
                     shell.capture_event();
-                } else if key.eq_ignore_ascii_case("a") {
+                } else if letter == Some('a') {
                     state.anchor = 0;
                     state.end = state.plain.len();
                     shell.capture_event();

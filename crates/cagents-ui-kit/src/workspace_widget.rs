@@ -15,6 +15,7 @@ use cosmic::{Element, Renderer, Task, Theme};
 
 use crate::{
     input_trace::InputTrace,
+    interaction::latin_key,
     model::CardId,
     settings::{KeyboardShortcuts, ShortcutBinding, ShortcutKey, format_chords, parse_shortcut},
     workspace::{
@@ -1101,19 +1102,6 @@ pub fn deferred_shortcut_taken(
         } => captured && defers_to_focused_editor(key, *physical_key, *modifiers, focused),
         _ => false,
     }
-}
-
-fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
-    if let keyboard::Key::Character(value) = key.as_ref() {
-        let mut characters = value.chars();
-        if let (Some(character), None) = (characters.next(), characters.next())
-            && character.is_ascii_graphic()
-        {
-            return Some(character.to_ascii_lowercase());
-        }
-    }
-    key.to_latin(physical_key)
-        .map(|key| key.to_ascii_lowercase())
 }
 
 fn physical_digit(physical_key: keyboard::key::Physical) -> Option<char> {

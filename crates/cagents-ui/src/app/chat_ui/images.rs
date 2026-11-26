@@ -1865,9 +1865,7 @@ impl Cagents {
                     modifiers.alt(),
                     modifiers.logo(),
                 ) && !modifiers.shift()
-                    && key
-                        .to_latin(*physical_key)
-                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
+                    && crate::interaction::latin_key(key, *physical_key) == Some('c') =>
             {
                 // A held chord copies once.
                 if *repeat {

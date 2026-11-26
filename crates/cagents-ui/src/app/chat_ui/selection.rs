@@ -1258,16 +1258,17 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         );
         let command = match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(key),
+                key,
+                physical_key,
                 modifiers,
                 ..
             }) if state.focused
                 && active().load(Ordering::Relaxed) == state.identity
                 && modifiers.command()
-                && !shell.is_event_captured()
-                && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("a")) =>
+                && !shell.is_event_captured() =>
             {
-                Some(key.as_str())
+                crate::interaction::latin_key(key, *physical_key)
+                    .filter(|key| matches!(key, 'c' | 'a'))
             }
             _ => None,
         };
@@ -1417,7 +1418,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                     }
                 }
                 captured = true;
-            } else if command.is_some_and(|key| key.eq_ignore_ascii_case("a")) {
+            } else if command == Some('a') {
                 if let Some(catalog) = self.catalog() {
                     let endpoints = catalog.endpoints();
                     state.anchor = endpoints.map(|(anchor, _)| anchor);
@@ -1444,7 +1445,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 state.dragging = false;
                 state.link = None;
             }
-            if command.is_some_and(|key| key.eq_ignore_ascii_case("c"))
+            if command == Some('c')
                 && let Some(ranges) = &ranges
             {
                 let text = read.copy(ranges);
