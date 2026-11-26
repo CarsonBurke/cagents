@@ -534,6 +534,7 @@ fn create_inner(
             subagent_status: None,
             subagent_waiting: false,
             subagent_detail: String::new(),
+            unloaded_notice_pending: false,
             ready: false,
             attached: false,
             direct_input: false,
@@ -772,6 +773,8 @@ struct Codex {
     subagent_status: Option<ToolStatus>,
     subagent_waiting: bool,
     subagent_detail: String,
+    /// A catalog notice is still in the projection after promoting this child.
+    unloaded_notice_pending: bool,
     ready: bool,
     attached: bool,
     direct_input: bool,
@@ -1163,17 +1166,9 @@ impl Codex {
                 child.subagent_status = Some(ToolStatus::Running);
                 child.subagent_detail = chat::UNLOADED_CHILD_RUNNING.into();
             }
+            child.unloaded_notice_pending = previous.is_some();
             self.children.insert(id.into(), Box::new(child));
             newly_loaded = previous.is_some() && !awaiting_observation;
-            if newly_loaded {
-                // The server supplied fresh evidence while starting the read.
-                step.events.extend(chat::child_events(
-                    id,
-                    vec![Event::ItemsRemoved {
-                        ids: vec![unloaded_notice_id(id)],
-                    }],
-                ));
-            }
             self.child_buffer.insert(id.into(), Vec::new());
             // Codex resumes a nested child only through its loaded parent and
             // refuses it while that parent's own read is still outstanding,
@@ -1204,13 +1199,10 @@ impl Codex {
             if child.subagent_detail == chat::UNLOADED_CHILD_RUNNING && !only_listed_running {
                 child.subagent_detail.clear();
                 newly_loaded = true;
-                step.events.extend(chat::child_events(
-                    id,
-                    vec![Event::ItemsRemoved {
-                        ids: vec![unloaded_notice_id(id)],
-                    }],
-                ));
             }
+        }
+        if let Some(child) = self.children.get_mut(id) {
+            child.remove_unloaded_notice(id, step);
         }
         let projecting_unloaded = self
             .children
@@ -1458,19 +1450,17 @@ impl Codex {
                     | Event::TurnFinished { .. }
                     | Event::Ready(false)
             )
-        }) {
-            let child = self.children.get(id);
+        }) && let Some(child) = self.children.get_mut(id)
+        {
+            child.remove_unloaded_notice(id, step);
             step.events.push(Event::Subagent {
-                model: child.and_then(|child| child.selected.clone()),
-                waiting: child.map(|child| child.subagent_waiting),
-                detail: child.map(|child| child.subagent_detail.clone()),
+                model: child.selected.clone(),
+                waiting: Some(child.subagent_waiting),
+                detail: Some(child.subagent_detail.clone()),
                 id: id.into(),
                 kind: String::new(),
                 description: String::new(),
-                status: self
-                    .children
-                    .get(id)
-                    .and_then(|child| child.subagent_status),
+                status: child.subagent_status,
                 background: None,
             });
         }
@@ -1500,6 +1490,16 @@ impl Codex {
             }
         }
         Ok(())
+    }
+    fn remove_unloaded_notice(&mut self, id: &str, step: &mut Step) {
+        if self.subagent_detail != chat::UNLOADED_CHILD_RUNNING
+            && std::mem::take(&mut self.unloaded_notice_pending)
+        {
+            step.events.push(Event::SubagentItemsRemoved {
+                id: id.into(),
+                ids: vec![unloaded_notice_id(id)],
+            });
+        }
     }
     fn finish_execution(
         &mut self,
@@ -3590,18 +3590,12 @@ impl Codex {
                     }
                     if let Some(child) = self.children.get_mut(&id) {
                         let mut content = Step::default();
-                        let was_unloaded = child.subagent_detail == chat::UNLOADED_CHILD_RUNNING;
                         child.selected = result["model"]
                             .as_str()
                             .filter(|model| !model.is_empty())
                             .map(str::to_owned)
                             .or_else(|| child.selected.clone());
                         child.thread_state(&result["thread"], true, &mut content)?;
-                        if was_unloaded && child.subagent_detail != chat::UNLOADED_CHILD_RUNNING {
-                            content.events.push(Event::ItemsRemoved {
-                                ids: vec![unloaded_notice_id(&id)],
-                            });
-                        }
                         child.ready = true;
                         child.materialized = true;
                         if result["initialTurnsPage"].is_object() {

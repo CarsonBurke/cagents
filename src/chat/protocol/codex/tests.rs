@@ -2234,6 +2234,7 @@ fn adapter() -> Codex {
         subagent_status: None,
         subagent_waiting: false,
         subagent_detail: String::new(),
+        unloaded_notice_pending: false,
         ready: true,
         attached: true,
         direct_input: true,
@@ -4029,7 +4030,13 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
 
 #[test]
 fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state() {
-    for (relisted, confirmed) in [(false, false), (false, true), (true, false), (true, true)] {
+    for (relisted, confirmed, buffered_turn) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
         let mut parent = adapter();
         let id = "older-child";
         parent.listed_unloaded.insert(id.into(), true);
@@ -4078,12 +4085,29 @@ fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state(
         crate::chat::runtime::project_events_for_test(&mut state, sparse.events);
         assert!(state.subagents[0].last_seen_running());
         assert!(!state.holds_work());
+        let notice = unloaded_notice_id(id);
+        let has_notice = |state: &chat::Snapshot| {
+            state.subagents[0]
+                .items
+                .iter()
+                .any(|item| item.id == notice)
+        };
+        assert!(has_notice(&state));
         assert!(
             parent
                 .command(Command::StopSubagent { id: id.into() })
                 .is_err()
         );
 
+        if buffered_turn {
+            let early = parent
+                .receive(json!({"method":"turn/started","params":{"threadId":id,
+                    "turn":{"id":"live","status":"inProgress","items":[]}}}))
+                .unwrap();
+            crate::chat::runtime::project_events_for_test(&mut state, early.events);
+            assert!(state.subagents[0].last_seen_running());
+            assert!(has_notice(&state));
+        }
         let response = if confirmed {
             json!({"id":request,"result":{
                 "thread":{"id":id,"status":{"type":"idle"}},
@@ -4096,13 +4120,29 @@ fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state(
         if confirmed {
             assert_eq!(state.subagents[0].status, ToolStatus::Succeeded);
             assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+        } else if buffered_turn {
+            assert_eq!(state.subagents[0].status, ToolStatus::Running);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+            assert!(state.holds_work());
         } else {
             assert!(state.subagents[0].last_seen_running());
+            assert!(has_notice(&state));
             assert!(
                 parent
                     .command(Command::StopSubagent { id: id.into() })
                     .is_err()
             );
+            let observed = parent
+                .receive(json!({"method":"thread/status/changed","params":{
+                    "threadId":id,"status":{"type":"active","activeFlags":[]}}}))
+                .unwrap();
+            crate::chat::runtime::project_events_for_test(&mut state, observed.events);
+            assert_eq!(state.subagents[0].status, ToolStatus::Running);
+            assert!(!state.subagents[0].last_seen_running());
+            assert!(!has_notice(&state));
+            assert!(state.holds_work());
         }
     }
 }
