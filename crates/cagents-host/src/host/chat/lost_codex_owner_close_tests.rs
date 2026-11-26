@@ -1259,7 +1259,13 @@ static OFFLINE_CODEX_SERVER: extern "C" fn() = {
         let Some(marker) = std::env::var_os(CODEX_FIXTURE_MARKER) else {
             return;
         };
-        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+        let Ok(arguments) = std::env::args_os()
+            .skip(1)
+            .map(std::ffi::OsString::into_string)
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return;
+        };
         if !matches!(arguments.as_slice(), [server, listen, endpoint]
             if server == "app-server" && listen == "--listen" && endpoint.starts_with("unix://"))
         {
@@ -2091,6 +2097,14 @@ fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
         );
         assert!(!root.join("started-argv").exists());
         assert!(fixture.socket().parent().unwrap().is_dir());
+        assert!(
+            registry::execution_record(&registry::socket(
+                &registry::directory(Kind::Native).unwrap(),
+                id
+            ))
+            .unwrap()
+            .is_none()
+        );
         let state = fixture.host.lock().unwrap();
         assert!(state.chat_spawning.is_empty());
         assert!(state.chats.is_empty());
