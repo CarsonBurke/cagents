@@ -307,11 +307,13 @@ impl Pending {
 
     /// Apply the courier's latest inbox snapshot. That snapshot is complete,
     /// so it retires inbox attention only when its mail is gone; offline
-    /// recipients keep theirs. Without the journal's notices it stays queued.
+    /// recipients keep theirs. New mail is recorded either way; without the
+    /// journal's notices the retirements stay queued.
     fn reconcile_inboxes(&mut self, journal: &mut Journal) -> Result<(), String> {
-        let Some(inboxes) = self.inboxes.take() else {
+        let Some(mut inboxes) = self.inboxes.take() else {
             return Ok(());
         };
+        self.events.append(&mut inboxes.events);
         let notices = match journal.list() {
             Ok(notices) => notices,
             Err(error) => {
@@ -326,7 +328,6 @@ impl Pending {
                 self.retired.insert(Target::SessionInbox(lineage));
             }
         }
-        self.events.extend(inboxes.events);
         Ok(())
     }
 
@@ -1841,11 +1842,10 @@ async fn run(
     let mut retry_delay = RETRY_DELAY;
     let mut withdrawal_retry = None;
     let mut automation_retry = AutomationRetry::default();
-    // Inbox reconciliation that could not read the journal. The courier
-    // publishes again only when its mail changes, so retry on a timer, backing
-    // off while a notice stays unreadable.
     // An inbox snapshot the journal could not reconcile, and when to retry it.
-    // It is held apart from `deferred`, which later failures in a pass replace.
+    // The courier publishes again only when its mail changes, so retry on a
+    // timer, backing off while a notice stays unreadable. The snapshot is held
+    // apart from `deferred`, which later failures in a pass replace.
     let mut inbox_retry: Option<(Instant, InboxAttention)> = None;
     let mut inbox_retry_delay = RETRY_DELAY;
     let mut snapshot = Snapshot {
@@ -1907,10 +1907,15 @@ async fn run(
             break;
         };
         let mut pending = std::mem::take(&mut deferred).followed_by(take_pending(&core));
-        // A newer courier publication replaces a held one; a failure below
-        // holds the snapshot again.
-        if let Some((_, inboxes)) = inbox_retry.take() {
-            pending.inboxes.get_or_insert(inboxes);
+        // A newer courier publication replaces a held snapshot, which is
+        // otherwise retried once due; a failure below holds it again.
+        if pending.inboxes.is_some() {
+            inbox_retry = None;
+        } else if inbox_retry
+            .as_ref()
+            .is_some_and(|(due, _)| *due <= Instant::now())
+        {
+            pending.inboxes = inbox_retry.take().map(|(_, inboxes)| inboxes);
         }
         let current_presence = pending.presence_changed.then(|| {
             core.presence
@@ -3922,13 +3927,31 @@ mod tests {
         writer
             .execute("UPDATE notices SET event = 'unreadable'", [])
             .unwrap();
+        let other = crate::agent_execution::Lineage(TerminalId::new());
+        let arrived = Event {
+            target: Target::SessionInbox(other),
+            ..inbox.clone()
+        };
         let mut pending = Pending {
-            inboxes: Some(InboxAttention::default()),
+            inboxes: Some(InboxAttention {
+                pending: BTreeSet::from([other]),
+                events: BTreeMap::from([(arrived.target(), arrived.clone())]),
+            }),
             ..Pending::default()
         };
 
         assert!(pending.reconcile_inboxes(&mut journal).is_err());
-        assert!(pending.inboxes.is_some());
+        // New mail is still recorded; only the retirements wait.
+        assert_eq!(
+            pending.events.keys().collect::<Vec<_>>(),
+            [&arrived.target()]
+        );
+        assert!(
+            pending
+                .inboxes
+                .as_ref()
+                .is_some_and(|inboxes| inboxes.events.is_empty())
+        );
         assert!(pending.retired.is_empty());
 
         writer
@@ -3940,6 +3963,7 @@ mod tests {
         pending.reconcile_inboxes(&mut journal).unwrap();
         assert!(pending.inboxes.is_none());
         assert_eq!(pending.retired, BTreeSet::from([inbox.target()]));
+        assert_eq!(pending.events.len(), 1);
     }
 
     #[test]
