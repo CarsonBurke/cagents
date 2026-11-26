@@ -3694,7 +3694,7 @@ fn validate_lock(file: &File) -> Result<(), UpdateError> {
     }
     Ok(())
 }
-fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
+fn inherited_lock(state: &Path) -> Result<File, UpdateError> {
     // SAFETY: F_GETFD probes existence before taking ownership of the reserved fd.
     if unsafe { libc::fcntl(WORKER_LOCK_FD, libc::F_GETFD) } == -1 {
         return Err(invalid(
@@ -3712,7 +3712,9 @@ fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateErro
     if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(lock)
+    // The successor may inherit this same description with the acknowledged
+    // checkpoint. The worker must close its copy without issuing LOCK_UN.
+    Ok(lock.into_file())
 }
 
 /// Stream a subprocess into sealed storage without buffering a release binary
@@ -4361,6 +4363,50 @@ mod tests {
             matches!(lock_file(path_only), Err(UpdateError::Io(error)) if error.raw_os_error() == Some(libc::EBADF))
         );
         drop(held);
+    }
+
+    #[test]
+    fn inherited_update_worker_lock_survives_worker_scope_exit() {
+        const STATE: &str = "CAGENTS_TEST_INHERITED_UPDATE_WORKER_STATE";
+        if let Some(state) = std::env::var_os(STATE) {
+            io::stdin().read_exact(&mut [0]).unwrap();
+            let state = Path::new(&state);
+            let worker = inherited_lock(state).unwrap();
+            let successor = worker.try_clone().unwrap();
+            drop(worker);
+            assert!(matches!(acquire_lock(state), Err(UpdateError::Busy)));
+            drop(successor);
+            assert!(acquire_lock(state).is_ok());
+            return;
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let lease = acquire_lock(state.path()).unwrap();
+        let fd = lease.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "update::tests::inherited_update_worker_lock_survives_worker_scope_exit",
+            ])
+            .env(STATE, state.path())
+            .stdin(Stdio::piped());
+        // SAFETY: The caller keeps the descriptor alive through spawn and the
+        // hook only makes it available in the child's reserved slot.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, WORKER_LOCK_FD) == -1
+                    || libc::fcntl(WORKER_LOCK_FD, libc::F_SETFD, 0) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(lease.into_file());
+        child.stdin.take().unwrap().write_all(&[0]).unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]
