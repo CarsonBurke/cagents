@@ -5326,7 +5326,7 @@ pub(super) fn close_captured(
     let chat_id = target.source.id;
     let handle = target.handle.clone();
     let source = target.source.clone();
-    let (closing, completed_source) = {
+    let closing = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
             .chats
@@ -5338,11 +5338,7 @@ pub(super) fn close_captured(
             ));
         };
         let current = record.current_session();
-        let completed_source = handle.is_completed().then(|| current.clone());
-        (
-            capacity::Reservation::removing(host, &mut state, &source, current)?,
-            completed_source,
-        )
+        capacity::Reservation::removing(host, &mut state, &source, current)?
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
@@ -5363,15 +5359,12 @@ pub(super) fn close_captured(
         unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")
     })?;
     target.require_current(host)?;
-    if let Some(current) = completed_source {
-        archive_completed_queue(host, &source, current, target.instance, &handle)?;
-    }
-    let (retained, pending_cleanup, registered_codex_pair) = {
+    let (current, retained, pending_cleanup, registered_codex_pair) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
             .get(&chat_id)
-            .filter(|record| target.matches(record))
+            .filter(|record| target.matches(record) && closing.holds(&state, chat_id))
             .ok_or_else(|| {
                 unavailable("The thread changed while its previous actor was closing.")
             })?;
@@ -5406,8 +5399,16 @@ pub(super) fn close_captured(
                 .filter(|source| **source == removal.source)
                 .unwrap_or(&removal.current)
         });
-        (retained.clone(), pending.is_some(), issued_pair.is_some())
+        (
+            record.current_session(),
+            retained.clone(),
+            pending.is_some(),
+            issued_pair.is_some(),
+        )
     };
+    // This close may itself have joined a provider that was still running
+    // at admission. Only the completed handle can prove its final held input.
+    archive_completed_queue(host, &source, current, target.instance, &handle)?;
     if handle.actor_identity().is_some() || registered_codex_pair {
         // The actor's final transcript is available, but its paired console
         // still needs an authenticated terminal cleanup receipt. Keep helper
