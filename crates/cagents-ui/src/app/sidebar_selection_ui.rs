@@ -151,6 +151,39 @@ pub(in crate::app) mod tests {
         assert_eq!(app.sidebar_navigation_action(row), None);
     }
 
+    /// Enter on a search that finds only a folder goes into the folder, as a
+    /// search finding a pane goes to the pane: it does not fold the folder.
+    #[test]
+    fn entering_a_search_that_finds_only_a_folder_opens_it() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let folder = ProjectId::new();
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                folder,
+                RepositoryId::new(),
+                "fieldnotes".into(),
+                "/fieldnotes".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(
+            "fieldnotes".into(),
+        ))));
+        assert_eq!(app.visible_sidebar_rows(), [SelectionRow::Project(folder)]);
+        let expanded = app.sidebar_state.project_expanded(folder);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenFirstSearchResult)));
+        assert_eq!(app.sidebar_state.project_expanded(folder), expanded);
+        assert_eq!(
+            app.sidebar_state
+                .active_worktree()
+                .map(|key| key.canonical_path.clone()),
+            Some("/fieldnotes".into()),
+            "the folder's root is where the user now works"
+        );
+    }
+
     #[test]
     fn closing_search_clears_query_and_restores_toggle_focus_in_both_densities() {
         for compact in [false, true] {
