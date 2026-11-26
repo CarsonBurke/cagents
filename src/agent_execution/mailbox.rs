@@ -361,6 +361,9 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
     parse(framed)
 }
 
+/// What a question says of itself where a window lists it.
+const ASKS: &str = "Asks for a reply";
+
 /// A frame's words before its seal, read as the message they give.
 fn parse(framed: &str) -> Option<Opened> {
     let (heading, rest) = framed.strip_prefix(OPENING)?.split_once("]\n")?;
@@ -394,7 +397,7 @@ fn parse(framed: &str) -> Option<Opened> {
     };
     let summary = match (kind, original) {
         (_, Some(original)) => format!("Reply to {original}"),
-        ("question", _) => "Asks for a reply".to_owned(),
+        ("question", _) => ASKS.to_owned(),
         _ => String::new(),
     };
     Some(Opened {
@@ -542,7 +545,18 @@ fn delivery(mut opened: Vec<Opened>) -> crate::chat::ItemContent {
         kind: DeliveryKind::Message,
         from: String::new(),
         sender: String::new(),
-        summary: format!("{} messages from {named}", opened.len()),
+        // A sender waiting on an answer is worth seeing without opening it.
+        summary: match opened.iter().filter(|frame| frame.summary == ASKS).count() {
+            0 => format!("{} messages from {named}", opened.len()),
+            1 => format!(
+                "{} messages from {named} · 1 asks for a reply",
+                opened.len()
+            ),
+            asking => format!(
+                "{} messages from {named} · {asking} ask for a reply",
+                opened.len()
+            ),
+        },
         body,
     }
 }
@@ -1154,6 +1168,38 @@ mod tests {
         // A window that reads seals only by their shape still sees a message.
         let one = open_all(&seal.seal(&messages[0], 0), &SealShaped).expect("frame-shaped");
         assert_eq!(one.len(), 1);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_delivery_of_several_says_how_many_ask_for_a_reply() {
+        use crate::chat::ItemContent;
+        let opened = |summary: &str| Opened {
+            from: "Review".into(),
+            sender: String::new(),
+            summary: summary.into(),
+            body: "Body".into(),
+        };
+        let summary = |frames| match delivery(frames) {
+            ItemContent::Delivery { summary, .. } => summary,
+            content => panic!("{content:?}"),
+        };
+        assert_eq!(
+            summary(vec![opened(""), opened(ASKS)]),
+            "2 messages from Review · 1 asks for a reply"
+        );
+        assert_eq!(
+            summary(vec![
+                opened(ASKS),
+                opened(ASKS),
+                opened("Reply to 1234abcd")
+            ]),
+            "3 messages from Review · 2 ask for a reply"
+        );
+        assert_eq!(
+            summary(vec![opened(""), opened("")]),
+            "2 messages from Review"
+        );
     }
 
     #[cfg(feature = "host")]
