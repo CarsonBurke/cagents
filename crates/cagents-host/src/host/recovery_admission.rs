@@ -314,7 +314,7 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
     let access = access(request);
     let mut guard = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut state: &mut HostState = &mut guard;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if state.publishing_startup && !matches!(access, Access::Open | Access::Close(_)) {
         return Err(ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,

@@ -321,7 +321,7 @@ pub(crate) struct HostState {
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) publishing_startup: bool,
     publication_pending: BTreeMap<TerminalId, PendingPublication>,
     /// Missing original owners after an acknowledged incomplete update. Their
@@ -549,7 +549,7 @@ impl HostState {
             spawning_terminals: BTreeMap::new(),
             handoff_terminals: BTreeMap::new(),
             startup_custody: BTreeSet::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             publishing_startup: false,
             publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
@@ -2643,7 +2643,7 @@ impl HostState {
     /// never cleared, so waiting on the remaining custody cannot finish startup.
     pub(super) fn startup_state(&self) -> StartupState {
         let state = self.startup_state_before_publication();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.publishing_startup && state == StartupState::Ready {
             return StartupState::Restoring { awaiting: 0 };
         }
@@ -2688,7 +2688,7 @@ impl HostState {
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
         if self.startup_recovery.is_none() {
             self.startup_recovery = Some(message);
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if self.publishing_startup {
                 crate::daemon::wake();
             }
@@ -2740,7 +2740,7 @@ impl HostState {
     }
 
     pub(super) fn startup_blocks_shutdown(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.publishing_startup {
             return true;
         }

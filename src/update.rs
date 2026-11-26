@@ -12,9 +12,9 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
-#[cfg(all(target_os = "linux", feature = "host"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
 mod publication;
-#[cfg(all(target_os = "linux", feature = "host"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
 #[doc(hidden)]
 pub use publication::LocalPublication;
 mod pending_recovery;
