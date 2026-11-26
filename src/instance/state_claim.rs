@@ -228,7 +228,9 @@ pub fn daemon_served_elsewhere(lock: &Path) -> io::Result<Option<StateInUse>> {
 /// or window already admitted in another runtime still holds its state claim.
 #[cfg(target_os = "macos")]
 pub(crate) fn require_idle_for_installation() -> io::Result<()> {
-    let entries = match fs::read_dir(claims_directory()?) {
+    let claims = claims_directory()?;
+    crate::secure_file::reject_symlink_components(&claims)?;
+    let entries = match fs::read_dir(claims) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),

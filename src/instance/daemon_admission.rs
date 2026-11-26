@@ -551,7 +551,7 @@ impl DaemonAdmissionGuard {
         let inherited = inherited_fence()?;
         #[cfg(target_os = "macos")]
         let publication = if inherited.is_none() {
-            crate::install_guard::admit_darwin_installed_build()?
+            crate::install_guard::admit_darwin_state_access()?
         } else {
             None
         };

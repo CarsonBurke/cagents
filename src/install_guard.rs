@@ -221,15 +221,16 @@ fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
     Ok(crate::instance::darwin_runtime_base()?.with_file_name("cagents.install-publication.lock"))
 }
 
-/// An ordinary installed process cannot select its version before an offline
-/// installer finishes, even when their application runtimes differ. The caller
-/// retains admission until the process claims its saved state.
+/// Serialize ordinary access to production state with offline publication.
+/// Installed processes also prove they are running the selected executable.
+/// The caller retains admission until it acquires its own state claim.
+#[doc(hidden)]
 #[cfg(target_os = "macos")]
-pub(crate) fn admit_darwin_installed_build() -> io::Result<Option<crate::instance::OwnedLock>> {
+pub fn admit_darwin_state_access() -> io::Result<Option<crate::instance::OwnedLock>> {
     let executable = crate::process::current_executable()?;
-    if installed_version_root(&executable).is_none()
-        && !std::env::current_exe().is_ok_and(|path| installed_version_root(&path).is_some())
-    {
+    let installed = installed_version_root(&executable).is_some()
+        || std::env::current_exe().is_ok_and(|path| installed_version_root(&path).is_some());
+    if !installed && crate::instance::IS_DEVELOPMENT {
         return Ok(None);
     }
     let lock =
@@ -241,12 +242,15 @@ pub(crate) fn admit_darwin_installed_build() -> io::Result<Option<crate::instanc
                     error
                 }
             })?;
+    if !installed {
+        return Ok(Some(lock));
+    }
     let layout = crate::update::locate(&executable).map_err(io::Error::other)?;
     let selected = std::fs::canonicalize(layout.prefix.join("current"))?;
     let named = std::fs::metadata(&executable)?;
     let mapped = crate::process::mapped_region_identity(
         std::process::id(),
-        admit_darwin_installed_build as *const () as usize as u64,
+        admit_darwin_state_access as *const () as usize as u64,
     )?;
     if selected != layout.version_root || (named.dev(), named.ino()) != mapped {
         return Err(io::Error::other(

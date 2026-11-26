@@ -248,6 +248,25 @@ cli --no-start daemon status --json > "$ROOT/status.json" \
     || fail 'the original runtime stopped serving after the refused purge'
 cli --no-start daemon stop >> "$ROOT/daemon.log" 2>&1 || fail 'could not stop the daemon started through the link'
 
+# An unreadable claim cannot prove that saved state is free. A daemon using
+# this same state must also refuse to start without an authenticated claim.
+claims=${data%/*}/claims
+mv "$claims" "$ROOT/saved-claims"
+mkdir "$ROOT/other-claims"
+ln -s "$ROOT/other-claims" "$claims"
+if cli daemon start > "$ROOT/unclaimed-start.log" 2>&1; then
+    fail 'the selected daemon served saved work without its state claim'
+fi
+if install_release --no-start > "$ROOT/unclaimed-install.log" 2>&1; then
+    fail 'the installer treated unverifiable claim storage as idle'
+fi
+grep -q 'symbolic links are not allowed' "$ROOT/unclaimed-install.log" \
+    || { cat "$ROOT/unclaimed-install.log" >&2; fail 'the installer did not report the unsafe claim path'; }
+[ -f "$data" ] && [ -f "$AGENT" ] && [ "$(readlink "$PREFIX/current")" = "versions/$VERSION" ] \
+    || fail 'claim refusal changed the installation or saved work'
+rm "$claims"
+mv "$ROOT/saved-claims" "$claims"
+
 unregister
 
 touch "$PREFIX/versions/$VERSION/.smoke-damaged-member"

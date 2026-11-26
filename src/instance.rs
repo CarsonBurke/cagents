@@ -463,7 +463,11 @@ impl WindowLease {
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<Self> {
         #[cfg(target_os = "macos")]
-        let _publication = crate::install_guard::admit_darwin_installed_build()?;
+        let publication = crate::install_guard::admit_darwin_state_access()?;
+        #[cfg(target_os = "macos")]
+        let require_state = publication.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let require_state = false;
         // A window here would need a daemon here, which would refuse to serve
         // data a daemon in another runtime directory serves. Say so first:
         // that daemon's session, not this window, is what is in the way.
@@ -476,12 +480,18 @@ impl WindowLease {
                 }
             }
         }
-        let claims = state_claim::claims_directory()
-            .inspect_err(|error| tracing::warn!(%error, "window claims are unavailable"))
-            .ok();
+        let claims = match state_claim::claims_directory() {
+            Ok(claims) => Some(claims),
+            Err(error) if require_state => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "window claims are unavailable");
+                None
+            }
+        };
         let (lease, slot) = Self::acquire_waiting_in(
             &runtime_directory()?,
             claims.as_deref(),
+            require_state,
             new_window,
             requested,
             daemon_admission::admission_wait_timeout(),
@@ -511,6 +521,7 @@ impl WindowLease {
         Self::acquire_waiting_in(
             runtime,
             None,
+            false,
             new_window,
             requested,
             Duration::ZERO,
@@ -523,6 +534,7 @@ impl WindowLease {
     fn acquire_waiting_in(
         runtime: &Path,
         claims: Option<&Path>,
+        require_state: bool,
         new_window: bool,
         requested: Option<&str>,
         admission_timeout: Duration,
@@ -571,6 +583,7 @@ impl WindowLease {
                                 }
                                 return Err(error);
                             }
+                            Err(error) if require_state => return Err(error),
                             // A claim that can't be taken for another reason,
                             // such as a read-only data directory, leaves the
                             // window as it was before claims.
@@ -5618,6 +5631,7 @@ mod startup_update_tests {
             WindowLease::acquire_waiting_in(
                 runtime.path(),
                 Some(claims.path()),
+                false,
                 new_window,
                 None,
                 Duration::ZERO,
@@ -5706,6 +5720,7 @@ mod startup_update_tests {
             runtime.path(),
             None,
             false,
+            false,
             None,
             Duration::from_secs(30),
             &mut |elapsed| {
@@ -5726,6 +5741,7 @@ mod startup_update_tests {
         let error = WindowLease::acquire_waiting_in(
             runtime.path(),
             None,
+            false,
             false,
             None,
             Duration::from_millis(60),
