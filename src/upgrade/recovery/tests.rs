@@ -2763,6 +2763,43 @@ fn complete_files(files: &SettledFiles) {
 }
 
 #[test]
+fn explicit_retry_reads_only_the_exact_completed_archive() {
+    let files = settled_files();
+    let hash = &files.record.checkpoint_hash;
+    let capture = CapturedCensus {
+        producer: Some(CaptureProducer::Acknowledged {
+            job: files.record.job.clone(),
+            request_hash: files.record.job_request_hash.clone(),
+        }),
+        source: files.record.source.clone(),
+        checkpoint_hash: Some(hash.clone()),
+        census: files.record.census.clone(),
+        windows: files.record.windows.clone(),
+    };
+    persist_bound_capture(&files.checkpoint, &capture).unwrap();
+    let inspect =
+        |hash| PendingRecovery::inspect_archived_at(&files.checkpoint, hash, &files.target);
+    assert!(inspect(hash).unwrap().is_none());
+
+    complete_files(&files);
+    let pending = inspect(hash).unwrap().unwrap();
+    assert!(pending.original_census_complete);
+    assert_eq!(pending.census, capture.census);
+    assert_eq!(pending.windows, capture.windows);
+    assert!(inspect(&"0".repeat(64)).unwrap().is_none());
+
+    let archived = pending.checkpoint_path;
+    let hidden = archived.with_extension("hidden");
+    fs::rename(&archived, &hidden).unwrap();
+    assert!(inspect(hash).is_err());
+    fs::rename(&hidden, &archived).unwrap();
+    save(&files.checkpoint, br#"{"phase":"Ready"}"#);
+    assert!(inspect(hash).unwrap().is_none());
+    assert_eq!(fs::read(&archived).unwrap(), files.checkpoint_bytes);
+    assert_eq!(fs::read(&files.outcome).unwrap(), files.outcome_bytes);
+}
+
+#[test]
 fn daemon_upgrade_retention_keeps_the_active_bundle_and_expires_an_older_one() {
     use std::time::{Duration, SystemTime};
 

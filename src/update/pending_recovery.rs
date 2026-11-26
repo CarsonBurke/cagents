@@ -28,9 +28,17 @@ pub(crate) fn run(
     let layout = locate(&cli)?;
     let daemon = layout.version_root.join("bin/cagentsd");
     let ui = layout.version_root.join("bin/cagents-ui");
-    let pending = PendingRecovery::inspect()
-        .map_err(invalid)?
-        .ok_or_else(|| invalid("There is no retained Prepared checkpoint to recover"))?;
+    let (pending, archived) = match PendingRecovery::inspect().map_err(invalid)? {
+        Some(pending) => (pending, false),
+        None => (
+            PendingRecovery::inspect_archived(checkpoint, &daemon)
+                .map_err(invalid)?
+                .ok_or_else(|| {
+                    invalid("There is no retained Prepared checkpoint matching this request")
+                })?,
+            true,
+        ),
+    };
     let pending = match original_census {
         Some(path) => pending.with_original_census(path).map_err(invalid)?,
         None => pending,
@@ -64,8 +72,8 @@ pub(crate) fn run(
         .and_then(installed::Selection::previous_link);
     // Re-observe AFTER taking the real fences. A settled recovery can be
     // verified without restarting or stopping the recognized serving owner.
-    let settled = match verify_settled(&pending, &daemon) {
-        Ok(_) => true,
+    let settled_job = match verify_settled(&pending, &daemon) {
+        Ok(job) => Some(job),
         // A daemon is serving but would not answer the check. Nothing has
         // been closed or started yet, so this recovery can simply be repeated.
         Err(error @ UpdateError::SourceBusy { .. }) => {
@@ -73,29 +81,43 @@ pub(crate) fn run(
                 "{error}. Nothing was closed or started; repeat this recovery once the daemon finishes"
             )));
         }
-        Err(_) => false,
+        Err(error) if archived => {
+            return Err(invalid(format!(
+                "The archived recovery's serving daemon could not be verified: {error}. Its saved work was kept"
+            )));
+        }
+        Err(_) => None,
     };
-    if settled {
+    if let Some(settled_job) = settled_job {
         let switch = selection
             .as_ref()
             .map(|selection| selection.prepare(&layout))
             .transpose()?
             .flatten();
         installed::complete_selection(switch, &layout)?;
-        // A pre-existing UI may have ordinary restore policy. Close and reopen
-        // it under the same guarded policy instead of merely activating it.
-        let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
-        let windows = recovery_window_slots(&pending.windows, &current_windows);
-        guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
-        guard.relaunch_windows(&windows, &ui)?;
-        let outcome = verify(&pending, &daemon).and_then(|_| {
-            recovery::retire_current_service(source::BusyPatience::for_one_run())?;
+        let outcome = if archived {
+            guard.relaunch_missing_windows(&pending.windows, &ui)?;
             verify(&pending, &daemon)
-        });
+        } else {
+            // A pre-existing UI may have ordinary restore policy. Close and
+            // reopen it under the same guarded policy as the active recovery.
+            let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
+            let windows = recovery_window_slots(&pending.windows, &current_windows);
+            guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
+            guard.relaunch_windows(&windows, &ui)?;
+            verify(&pending, &daemon).and_then(|_| {
+                recovery::retire_current_service(source::BusyPatience::for_one_run())?;
+                verify(&pending, &daemon)
+            })
+        };
         return match outcome {
-            Ok((_, outcome)) => Ok(report(&outcome)),
+            Ok((_, outcome)) => {
+                let message = report(&outcome);
+                finish_settled_job(&state, &settled_job, &message)?;
+                Ok(message)
+            }
             Err(error @ UpdateError::SourceBusy { .. }) => Err(invalid(format!(
-                "Recovery could not be verified: {error}. The serving daemon was kept and its windows were reopened; repeat this recovery once the daemon finishes"
+                "Recovery could not be verified: {error}. The serving daemon was kept; repeat this recovery once the daemon finishes"
             ))),
             Err(error) => Err(error),
         };
@@ -233,11 +255,9 @@ pub(crate) fn run(
     });
     match result {
         Ok((_, outcome)) => {
-            job.phase = UpdatePhase::Complete;
-            job.message = report(&outcome);
-            write_job(&state, &job)?;
-            retention::remember_success(&state, &job.id, &job.phase);
-            Ok(job.message)
+            let message = report(&outcome);
+            record_completion(&state, &mut job, &message)?;
+            Ok(message)
         }
         Err(error) => {
             job.phase = UpdatePhase::Failed;
@@ -260,6 +280,29 @@ pub(crate) fn run(
     }
 }
 
+fn finish_settled_job(state: &Path, id: &str, message: &str) -> Result<(), UpdateError> {
+    // The caller retains the update lock. Leave any later job's status alone.
+    let mut job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if job.id == id && job.phase != UpdatePhase::Complete {
+        record_completion(state, &mut job, message)?;
+    }
+    Ok(())
+}
+
+fn record_completion(state: &Path, job: &mut UpdateJob, message: &str) -> Result<(), UpdateError> {
+    job.phase = UpdatePhase::Complete;
+    job.confirmation = None;
+    job.refusal = None;
+    job.message = message.to_owned();
+    write_job(state, job)?;
+    retention::remember_success(state, &job.id, &job.phase);
+    Ok(())
+}
+
 fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> {
     let mut windows = pending.to_vec();
     for slot in current {
@@ -270,7 +313,7 @@ fn recovery_window_slots(pending: &[String], current: &[String]) -> Vec<String> 
     windows
 }
 
-fn verify_settled(pending: &PendingRecovery, daemon: &Path) -> Result<(), UpdateError> {
+fn verify_settled(pending: &PendingRecovery, daemon: &Path) -> Result<String, UpdateError> {
     verify(pending, daemon)?;
     let store = crate::upgrade::handoff::Store::existing()
         .map_err(invalid)?
@@ -281,7 +324,8 @@ fn verify_settled(pending: &PendingRecovery, daemon: &Path) -> Result<(), Update
     let settled = pending_retirement(&store.path, daemon)
         .map_err(invalid)?
         .ok_or_else(|| invalid("The installed recovery has no settled Prepared record"))?;
-    recovery::require_prepared_scope(pending, &settled, daemon)
+    recovery::require_prepared_scope(pending, &settled, daemon)?;
+    Ok(settled.job)
 }
 
 /// One recovery check. Its fences and census share one busy patience, so a
@@ -426,6 +470,37 @@ fn reserve_worker_descriptor(worker: &File) -> Result<File, UpdateError> {
 
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
+    #[test]
+    fn completing_an_archived_recovery_only_updates_its_own_job() {
+        use super::*;
+
+        let state = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let failed = UpdateJob {
+            id: id.clone(),
+            version: crate::version().into(),
+            phase: UpdatePhase::Failed,
+            message: "Retirement did not finish".into(),
+            log_path: state.path().join("retained.log"),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: Some(crate::version().into()),
+        };
+        write_job(state.path(), &failed).unwrap();
+        let status = state.path().join("status.json");
+        let before = fs::read(&status).unwrap();
+        finish_settled_job(state.path(), &uuid::Uuid::new_v4().to_string(), "Ready").unwrap();
+        assert_eq!(fs::read(&status).unwrap(), before);
+
+        finish_settled_job(state.path(), &id, "Ready").unwrap();
+        let completed: UpdateJob = serde_json::from_slice(&fs::read(&status).unwrap()).unwrap();
+        assert_eq!(completed.phase, UpdatePhase::Complete);
+        assert_eq!(completed.log_path, failed.log_path);
+        assert_eq!(completed.message, "Ready");
+        assert!(state.path().join(format!("{id}.complete")).is_file());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn refused_start_transport_keeps_current() {
