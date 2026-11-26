@@ -9707,7 +9707,12 @@ impl Cagents {
                     Some(CardRuntime::Repository(runtime))
                         if runtime.descriptor.worktree == source.key.canonical_path =>
                     {
-                        runtime.selected_path()
+                        runtime.selected_path().map(|path| {
+                            (
+                                path,
+                                runtime.shows_diff().then(|| runtime.selected_diff_basis()),
+                            )
+                        })
                     }
                     _ => None,
                 });
