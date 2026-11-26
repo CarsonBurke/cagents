@@ -3478,23 +3478,31 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
             )
         };
         #[cfg(target_os = "macos")]
-        let status = std::thread::scope(|scope| {
-            // The worker normally drains terminal output. XNU waits for this
-            // before it reports the shell's exit, including diagnostics from
-            // the sleep process interrupted by hangup.
+        let status = {
+            // XNU waits for the master to drain before reporting the shell's
+            // exit. Use the same cancellable reader as the normal worker.
+            drop(reader);
             let Reader {
-                output,
+                output: _output,
                 wake,
+                done,
                 thread,
+                discard_pending,
                 ..
             } = Reader::start(TerminalId::new(), &held.master, 8, Vec::new()).unwrap();
-            let drain = scope.spawn(move || while output.recv().is_ok() {});
+            discard_pending.store(true, Ordering::Release);
             let result = shutdown();
             drop(wake);
+            assert!(
+                matches!(
+                    done.recv_timeout(READER_SHUTDOWN_GRACE),
+                    Err(RecvTimeoutError::Disconnected)
+                ),
+                "the held PTY reader did not stop after shutdown"
+            );
             thread.join().unwrap();
-            drain.join().unwrap();
             result
-        });
+        };
         #[cfg(target_os = "linux")]
         let status = shutdown();
         let status = status.unwrap_or_else(|error| {
