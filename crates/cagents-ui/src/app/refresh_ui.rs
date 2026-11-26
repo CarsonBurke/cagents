@@ -20,6 +20,10 @@ const MAX_PROJECT_BACKOFF: Duration = Duration::from_secs(30 * 60);
 /// State reconciliation that has no completion event gets a bounded retry,
 /// but never keeps a permanent application clock alive.
 const RECONCILIATION_RETRY: Duration = Duration::from_secs(10);
+/// How long after a watched change to the Changes panel's checkout the panel
+/// reads it again. An agent's edits come in bursts, and every change of one
+/// lands in that one read.
+pub(super) const SOURCE_RELOAD_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 pub(super) struct State {
@@ -28,6 +32,11 @@ pub(super) struct State {
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
+    /// When the Changes panel reads its checkout again because the watcher
+    /// saw it change since the last read began. Unlike the periodic
+    /// refresh, this runs unfocused and under a modal: watching agents work
+    /// from another window is what the panel is for.
+    pub(super) source_reload_due: Option<Instant>,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
     /// The next retry for consumers which have no completion-driven wake.
     /// This is state, rather than a fresh `now + interval` in
@@ -205,6 +214,15 @@ impl State {
         self.reconciliation_due = None;
     }
 
+    /// The watcher saw the Changes panel's checkout change. The first change
+    /// of a burst sets the deadline and the rest join it, so a stream of
+    /// writes still reads at most once per [`SOURCE_RELOAD_DELAY`] while
+    /// each read is quick, and once per read when they are slower.
+    pub(super) fn owe_source_reload(&mut self, now: Instant) {
+        self.source_reload_due
+            .get_or_insert(now + SOURCE_RELOAD_DELAY);
+    }
+
     pub(super) fn schedule_remote_started(&mut self, project_id: ProjectId) {
         self.schedule.started(project_id, Instant::now());
     }
@@ -245,12 +263,27 @@ impl Drop for State {
 pub enum Action {
     Tick,
     Focused(window::Id, bool),
+    /// [`State::source_reload_due`] arrived.
+    SourceReload,
 }
 
 /// The exact refresh deadline is the subscription identity, so replacing it
 /// cancels the older sleep instead of leaving a periodic wake behind.
 #[derive(Hash)]
 struct RefreshDeadline(Instant);
+
+#[derive(Hash)]
+struct SourceReloadDeadline(Instant);
+
+fn source_reload_stream(
+    deadline: &SourceReloadDeadline,
+) -> impl cosmic::iced::futures::Stream<Item = Message> + use<> {
+    let deadline = tokio::time::Instant::from_std(deadline.0);
+    cosmic::iced::futures::stream::once(async move {
+        tokio::time::sleep_until(deadline).await;
+        Message::RefreshUi(Action::SourceReload)
+    })
+}
 
 fn refresh_deadline_stream(
     deadline: &RefreshDeadline,
@@ -301,13 +334,67 @@ impl Cagents {
     }
 
     pub(super) fn refresh_subscription(&self) -> Subscription<Message> {
+        // A read in flight already began after every change but those seen
+        // since, which wait for it to finish rather than cancel it: under a
+        // steady stream of writes, cancelling would never let one finish.
+        let source = self
+            .refresh_ui
+            .source_reload_due
+            .filter(|_| self.refresh_ui.source_cancel.is_none())
+            .map_or_else(Subscription::none, |due| {
+                Subscription::run_with(SourceReloadDeadline(due), source_reload_stream)
+            });
         if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
-            return Subscription::none();
+            return source;
         }
-        self.refresh_deadline(Instant::now())
+        let refresh = self
+            .refresh_deadline(Instant::now())
             .map_or_else(Subscription::none, |deadline| {
                 Subscription::run_with(RefreshDeadline(deadline), refresh_deadline_stream)
-            })
+            });
+        Subscription::batch([source, refresh])
+    }
+
+    /// Whether a watched change in `project` can change what the Changes
+    /// panel shows: its own checkout's files, untracked ones included, or
+    /// refs and configuration every checkout shares.
+    pub(super) fn source_control_watch_changed(
+        &self,
+        project: ProjectId,
+        change: &crate::git_watch::Change,
+    ) -> bool {
+        self.workspace_view_shown().is_some()
+            && self
+                .sidebar_model
+                .source_control
+                .as_ref()
+                .is_some_and(|source| {
+                    let worktree = source.key.worktree_id;
+                    source.key.project_id == project
+                        && (change.worktrees.contains(&worktree)
+                            || change.untracked.contains(&worktree)
+                            || change.references
+                            || change.configuration
+                            || change.rescan)
+                })
+    }
+
+    fn source_reload_due(&mut self) -> Task<Message> {
+        self.refresh_ui.source_reload_due = None;
+        if self.workspace_view_shown().is_none() {
+            return Task::none();
+        }
+        // A mutation reads the worktree again when it finishes.
+        match self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| !source.busy())
+            .map(|source| source.key.clone())
+        {
+            Some(key) => self.reload_source_control(&key),
+            None => Task::none(),
+        }
     }
 
     /// The one next refresh wake.  This is deliberately a deadline instead of
@@ -444,6 +531,7 @@ impl Cagents {
                 self.main_window_focus_changed(focused)
             }
             Action::Focused(..) => Task::none(),
+            Action::SourceReload => self.source_reload_due(),
         }
     }
 
@@ -830,6 +918,74 @@ mod tests {
             app.refresh_deadline(Instant::now())
                 .is_some_and(|deadline| deadline <= Instant::now() + RECONCILIATION_RETRY)
         );
+    }
+
+    /// A burst of watched changes to the panel's checkout reads it once, the
+    /// window unfocused; a change to any other checkout reads nothing.
+    #[test]
+    fn watched_changes_to_the_shown_checkout_reload_the_panel_once() {
+        use super::super::context_sections::{Action as ContextAction, WorkspaceView};
+        use crate::git_watch::Change;
+        use crate::model::WorktreeId;
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().expect("fixture has a focused card");
+        app.sidebar_model = sidebar::test_support::panel_model();
+        app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+        app.open_pane_inspector_now(card);
+        drop(app.handle_context_section(ContextAction::Show(WorkspaceView::SourceControl)));
+        let key = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .key
+            .clone();
+        // The read showing the panel started has finished.
+        app.cancel_source_read();
+        app.refresh_ui.focused = false;
+        assert_eq!(app.refresh_subscription().units(), 0);
+
+        let change = |worktree| Change {
+            worktrees: BTreeSet::from([worktree]),
+            ..Change::default()
+        };
+        assert!(!app.source_control_watch_changed(key.project_id, &change(WorktreeId::new())));
+        assert!(!app.source_control_watch_changed(ProjectId::new(), &change(key.worktree_id)));
+        let untracked = Change {
+            untracked: BTreeSet::from([key.worktree_id]),
+            ..Change::default()
+        };
+        assert!(app.source_control_watch_changed(key.project_id, &untracked));
+        assert!(app.refresh_ui.source_reload_due.is_none());
+
+        let now = Instant::now();
+        for offset in 0..1_000 {
+            if app.source_control_watch_changed(key.project_id, &change(key.worktree_id)) {
+                app.refresh_ui
+                    .owe_source_reload(now + Duration::from_micros(offset));
+            }
+        }
+        assert_eq!(
+            app.refresh_ui.source_reload_due,
+            Some(now + SOURCE_RELOAD_DELAY)
+        );
+        assert_ne!(
+            app.refresh_subscription().units(),
+            0,
+            "an unfocused window still wakes for the panel"
+        );
+        let generation = app.refresh_ui.source_generation;
+        drop(app.update(Message::RefreshUi(Action::SourceReload)));
+        assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1));
+        assert!(app.refresh_ui.source_reload_due.is_none());
+
+        // A change during that read waits for it rather than cancelling it.
+        app.refresh_ui.owe_source_reload(Instant::now());
+        assert!(app.refresh_ui.source_cancel.is_some());
+        assert_eq!(app.refresh_subscription().units(), 0);
+        app.cancel_source_read();
+        assert_ne!(app.refresh_subscription().units(), 0);
     }
 
     #[test]

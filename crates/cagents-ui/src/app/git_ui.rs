@@ -266,7 +266,11 @@ impl State {
             })
             .filter_map(move |(record, _)| {
                 let key = (project, record.id);
-                let interval = if self.work.get(&key) == Some(&git_watch::Interest::Active) {
+                let interval = if self
+                    .work
+                    .get(&key)
+                    .is_some_and(|interest| *interest <= git_watch::Interest::Active)
+                {
                     FALLBACK_INTERVAL
                 } else if self.work.contains_key(&key) || newly_shown(&key) {
                     SHOWN_STALE
@@ -685,6 +689,16 @@ impl Cagents {
         if let Some(selected) = self.sidebar_state.selected_checkout() {
             work.insert(selected, git_watch::Interest::Active);
         }
+        // The Changes panel lists untracked files too, so its checkout also
+        // reports paths the index does not track.
+        if self.workspace_view_shown().is_some()
+            && let Some(source) = self.sidebar_model.source_control.as_ref()
+        {
+            work.insert(
+                (source.key.project_id, source.key.worktree_id),
+                git_watch::Interest::Inspected,
+            );
+        }
         self.refresh_ui.git.set_work(work);
         self.start_git_reads()
     }
@@ -886,6 +900,9 @@ impl Cagents {
                         self.status = Some(TransientNotice::warning(format!(
                             "Local Git watching unavailable; checking once a minute: {error}"
                         )));
+                    }
+                    if self.source_control_watch_changed(project, &change) {
+                        self.refresh_ui.owe_source_reload(Instant::now());
                     }
                     self.refresh_ui.git.changed(project, change);
                 }

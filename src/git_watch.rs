@@ -255,6 +255,10 @@ impl StatusRead {
 /// owner that only needs some worktrees current says which.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Interest {
+    /// Its untracked files are on screen, as in a Changes panel: a path the
+    /// index does not track that changes beside tracked ones is reported in
+    /// [`Change::untracked`]. Otherwise watched as [`Self::Active`].
+    Inspected,
     /// Someone works in it now.
     Active,
     /// Shown without anyone working in it, such as a project's own checkout.
@@ -717,10 +721,23 @@ impl Project {
                                 | EventKind::Modify(notify::event::ModifyKind::Name(_))
                         );
                     change.topology |= path == &worktree.root;
+                } else if worktree.interest == Interest::Inspected
+                    && path
+                        .parent()
+                        .is_some_and(|parent| worktree.tracks(parent) == Some(Tracked::Directory))
+                {
+                    // Watches are on tracked directories, so this is a file
+                    // created, edited or removed directly in one: untracked,
+                    // or ignored, which only a read can tell apart.
+                    change.untracked.insert(worktree.id);
                 }
             }
         }
-        (change.topology || change.references || !change.worktrees.is_empty()).then_some(change)
+        (change.topology
+            || change.references
+            || !change.worktrees.is_empty()
+            || !change.untracked.is_empty())
+        .then_some(change)
     }
 }
 
@@ -755,6 +772,10 @@ fn access_only(event: &Event) -> bool {
 pub struct Change {
     /// Worktrees whose own files, index or `HEAD` changed.
     pub worktrees: BTreeSet<WorktreeId>,
+    /// [`Interest::Inspected`] worktrees where a path the index does not
+    /// track changed in a tracked directory. Nothing the index or `HEAD`
+    /// describes moved, so status without untracked files stands.
+    pub untracked: BTreeSet<WorktreeId>,
     /// Shared refs changed: a commit, fetch or branch update. Any
     /// worktree's comparison may have moved, but its status only where its
     /// own `HEAD` did, which a consumer can tell from the refs.
@@ -799,6 +820,7 @@ impl Change {
 
     pub fn merge(&mut self, other: Self) {
         self.worktrees.extend(other.worktrees);
+        self.untracked.extend(other.untracked);
         self.references |= other.references;
         self.configuration |= other.configuration;
         self.rescan |= other.rescan;
@@ -2393,6 +2415,46 @@ mod tests {
 
     fn modified(path: PathBuf) -> Event {
         Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(path)
+    }
+
+    /// Only the worktree whose untracked files are on screen reports paths
+    /// the index does not track, and only beside tracked ones: those are
+    /// the directories watched, and a deeper path is no event at all.
+    #[test]
+    fn an_inspected_worktree_reports_untracked_paths_beside_tracked_ones() {
+        use notify::event::CreateKind;
+
+        let mut project = project(Path::new("/repo"));
+        project.worktrees[0].interest = Interest::Inspected;
+        let inspected = &project.worktrees[0];
+        let linked = &project.worktrees[1];
+        for event in [
+            Event::new(EventKind::Create(CreateKind::File))
+                .add_path(inspected.root.join("src/new.rs")),
+            modified(inspected.root.join("notes.txt")),
+        ] {
+            let change = project.change(&event).unwrap();
+            assert_eq!(change.untracked, BTreeSet::from([inspected.id]));
+            assert!(change.worktrees.is_empty(), "nothing tracked changed");
+            assert!(!change.membership && !change.topology && !change.references);
+        }
+        assert!(
+            project
+                .change(&modified(inspected.root.join("src/deep/new.rs")))
+                .is_none(),
+            "an untracked directory's contents are not watched"
+        );
+        assert!(
+            project
+                .change(&modified(linked.root.join("src/untracked.log")))
+                .is_none(),
+            "a worktree not inspected keeps ignoring untracked paths"
+        );
+        let change = project
+            .change(&modified(inspected.root.join("src/main.rs")))
+            .unwrap();
+        assert_eq!(change.worktrees, BTreeSet::from([inspected.id]));
+        assert!(change.untracked.is_empty());
     }
 
     #[test]

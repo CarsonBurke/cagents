@@ -14800,6 +14800,8 @@ impl Cagents {
             return Task::none();
         }
         self.cancel_source_read();
+        // This read begins after every change the watcher has reported.
+        self.refresh_ui.source_reload_due = None;
         let request = self.refresh_ui.source_generation;
         let cancellation = CancellationToken::default();
         self.refresh_ui.source_cancel = Some(cancellation.clone());
