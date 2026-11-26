@@ -260,22 +260,68 @@ pub fn admit_darwin_state_access() -> io::Result<Option<crate::instance::OwnedLo
     Ok(Some(lock))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn inherit_darwin_publication(
+    command: &mut Command,
+    publication: &File,
+) -> io::Result<()> {
+    let inherited = publication.try_clone()?;
+    command.env(PUBLICATION_FD_ENV, inherited.as_raw_fd().to_string());
+    // SAFETY: the closure holds the cloned File. The hook clears
+    // close-on-exec only on the child's copy of the descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(inherited.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn inherited_darwin_publication() -> io::Result<Option<(File, i32)>> {
+    let Some(value) = std::env::var_os(PUBLICATION_FD_ENV) else {
+        return Ok(None);
+    };
+    let fd = value
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|fd| *fd >= 3)
+        .ok_or_else(|| io::Error::other("invalid inherited publication fence descriptor"))?;
+    // SAFETY: check the inherited descriptor before borrowing. The verifier
+    // owns no other handle that could close its original descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
+    crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
+    Ok(Some((file, fd)))
+}
+
+/// Consume the installed updater's exact account fence at standby entry.
+/// The caller must still be single-threaded.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) unsafe fn take_darwin_publication() -> io::Result<Option<File>> {
+    let Some((file, fd)) = inherited_darwin_publication()? else {
+        return Ok(None);
+    };
+    // SAFETY: the caller is single-threaded and supplied the inherited
+    // descriptor. `file` retains the same lock when the original closes.
+    unsafe {
+        std::env::remove_var(PUBLICATION_FD_ENV);
+        libc::close(fd);
+    }
+    Ok(Some(file))
+}
+
 pub(crate) fn verify_publication() -> io::Result<()> {
     crate::instance::validate_install_guard()?;
     #[cfg(target_os = "macos")]
     {
-        let fd = std::env::var(PUBLICATION_FD_ENV)
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .filter(|fd| *fd >= 3)
+        let _publication = inherited_darwin_publication()?
             .ok_or_else(|| io::Error::other("installer has no inherited publication fence"))?;
-        // SAFETY: the descriptor is checked before borrowing, and no other
-        // code in the verifier can close an inherited descriptor.
-        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
-        crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
         crate::instance::state_claim::require_idle_for_installation()?;
     }
     Ok(())
@@ -311,18 +357,7 @@ pub(crate) fn run(
             // The publishing shell may outlive this coordinator. It holds
             // both fences until it has finished mutating the installation.
             let publication = reserve_darwin_publication()?;
-            let fd = publication.as_raw_fd();
-            command.env(PUBLICATION_FD_ENV, fd.to_string());
-            // SAFETY: the File is retained through execute. The hook only
-            // clears close-on-exec on the child's copy of the description.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
+            inherit_darwin_publication(&mut command, &publication)?;
             publication
         };
         let published = execute(&mut command);

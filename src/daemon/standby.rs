@@ -173,6 +173,8 @@ pub(crate) struct Parked {
     transferred: bool,
     #[cfg(target_os = "macos")]
     image: Option<ParkedImage>,
+    #[cfg(target_os = "macos")]
+    _publication: fs::File,
 }
 
 #[cfg(target_os = "macos")]
@@ -240,6 +242,10 @@ impl Parked {
         // SAFETY: the hook marks unrelated descriptors close-on-exec.
         unsafe { command.pre_exec(super::seal_inherited_descriptors) };
         guard.inherit_for_install(&mut command)?;
+        #[cfg(target_os = "macos")]
+        let publication = crate::install_guard::reserve_darwin_publication()?;
+        #[cfg(target_os = "macos")]
+        crate::install_guard::inherit_darwin_publication(&mut command, &publication)?;
         let child = command.spawn()?;
         // Command retains its socket copy for possible reuse. Only the
         // replacement should own the other end after this launch.
@@ -251,6 +257,8 @@ impl Parked {
             transferred: false,
             #[cfg(target_os = "macos")]
             image: None,
+            #[cfg(target_os = "macos")]
+            _publication: publication,
         };
         parked.channel.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
         parked.verify_launch(pid, expected)?;
@@ -436,6 +444,8 @@ pub struct Activated {
     publication: Option<crate::update::LocalPublication>,
     #[cfg(target_os = "macos")]
     _legacy_fence: crate::instance::OwnedLock,
+    #[cfg(target_os = "macos")]
+    _publication: Option<File>,
 }
 
 #[cfg(feature = "host")]
@@ -472,6 +482,10 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
     crate::instance::validate_stage_guard()?;
     #[cfg(target_os = "macos")]
     let legacy_fence = crate::instance::reserve_standby_legacy_fence()?;
+    // SAFETY: this is the single-threaded standby entry. The sender's copy
+    // remains held until publication, even after the successor sends Started.
+    #[cfg(target_os = "macos")]
+    let publication = unsafe { crate::install_guard::take_darwin_publication()? };
     #[cfg(target_os = "linux")]
     let publication = std::env::var_os(LOCAL_PREVIOUS_CURRENT)
         .map(|expected| {
@@ -559,6 +573,8 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         publication,
         #[cfg(target_os = "macos")]
         _legacy_fence: legacy_fence,
+        #[cfg(target_os = "macos")]
+        _publication: publication,
     })
 }
 
