@@ -50,6 +50,19 @@ class ConversationTest {
     }
 
     @Test
+    fun anOrderNamingAnItemNeverSentIsOutOfStep() {
+        val held = loaded(text("a", "A"), text("b", "B"))
+        // "c" was in an update the app missed.
+        val applied = held.apply(ConversationUpdate(s, order = listOf("a", "c", "b", "d"), items = listOf(text("d", "D"))))
+        assertTrue(applied.desynced)
+        assertSame(held, applied.conversation)
+        // An order that drops an item removes it; that is no sign of a miss.
+        val removed = held.apply(ConversationUpdate(s, order = listOf("b")))
+        assertFalse(removed.desynced)
+        assertEquals(listOf("b"), removed.conversation.items.map { it.id })
+    }
+
+    @Test
     fun anAppendThatDoesNotFollowOnIsOutOfStep() {
         val held = loaded(text("a", "Hello"))
         for (append in listOf(TextAppend("a", 3, "x"), TextAppend("missing", 0, "x"))) {

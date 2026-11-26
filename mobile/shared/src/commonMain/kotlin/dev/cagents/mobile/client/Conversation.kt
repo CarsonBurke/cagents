@@ -24,9 +24,10 @@ data class Conversation(
 
     /**
      * Applies [update] as docs/mobile-api.md#conversations describes. An
-     * update before the first reset, or an append whose offset doesn't match
-     * the held text, means something was missed: the conversation is returned
-     * unchanged with `desynced` set, and the caller watches it again.
+     * update before the first reset, an append whose offset doesn't match the
+     * held text, or an `order` naming an item neither held nor sent means
+     * something was missed: the conversation is returned unchanged with
+     * `desynced` set, and the caller watches it again.
      */
     fun apply(update: ConversationUpdate): Applied {
         if (!update.reset && !loaded) return Applied(this, desynced = true)
@@ -50,14 +51,13 @@ data class Conversation(
                 ?: return Applied(this, desynced = true)
         }
 
+        val placed = ArrayList<Item>(order.size)
+        for (id in order) {
+            // A reset holds only what it sends, so there is nothing to have missed.
+            placed += byId[id] ?: if (update.reset) continue else return Applied(this, desynced = true)
+        }
         return Applied(
-            Conversation(
-                session = session,
-                state = update.state,
-                items = order.mapNotNull { byId[it] },
-                loaded = true,
-                ended = null,
-            ),
+            Conversation(session = session, state = update.state, items = placed, loaded = true, ended = null),
             desynced = false,
         )
     }
