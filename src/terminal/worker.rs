@@ -3826,16 +3826,6 @@ impl Worker {
             }
         }
 
-        // A readable root pidfd only selected this reconciliation route. The
-        // actual holder report and PTY EOF together prove natural completion.
-        let natural_close = self.natural_close.take().map(|close| {
-            let drained = !shutting_down
-                && !self.checked_close_started
-                && self.pty_eof
-                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
-            (close, drained)
-        });
-
         // A last bell may still be waiting for its cadence deadline when the
         // PTY drains. Deliver its attention before completion, without holding
         // teardown open for a timer.
@@ -3861,7 +3851,21 @@ impl Worker {
             // Nothing will end a synchronized update the child left open.
             self.capture_when_ready(false);
         }
-        let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
+        // Darwin revokes the controlling tty when its session leader exits.
+        // EOF can arrive while other processes in that session are still live.
+        let natural_census = cfg!(target_os = "macos")
+            && !shutting_down
+            && self.pty_eof
+            && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+        let shutdown_cleanup_confirmed = if (shutting_down || natural_census) && !self.carried {
+            #[cfg(target_os = "macos")]
+            if shutting_down {
+                // XNU drains the controlling tty before notifying the root's
+                // exit. This worker has published its final grid and no longer
+                // consumes the reader queue. Drain through that backpressure
+                // until process cleanup has finished and the wake pipe closes.
+                self.reader_discard_pending.store(true, Ordering::Release);
+            }
             let budget = self.published.shutdown_budget();
             if exited {
                 let cleanup = if self.checked_shutdown {
@@ -3936,6 +3940,14 @@ impl Worker {
         // The shared input seal alone is insufficient: carry also uses it.
         let family_cleanup_confirmed =
             shutdown_cleanup_confirmed && (!self.checked_close_started || self.checked_shutdown);
+        let natural_close = self.natural_close.take().map(|close| {
+            let drained = !shutting_down
+                && !self.checked_close_started
+                && family_cleanup_confirmed
+                && self.pty_eof
+                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+            (close, drained)
+        });
         let completion = self.root_exit.take().and_then(|event| match event {
             TerminalEvent::Exited {
                 exit_code,
@@ -4004,7 +4016,7 @@ impl Worker {
             {
                 self.error("retain unconfirmed terminal screen", error);
             }
-            if shutting_down {
+            if shutting_down || natural_census {
                 self.holder.leave_after_unconfirmed_shutdown();
             } else {
                 self.holder.leave_for_successor();
@@ -6397,6 +6409,28 @@ fn confirm_exited_family(
             .map_err(|error| format!("observe child exit: {error}"))?
             && close_processes::session_is_empty(child.pid(), deadline)?)
     };
+    if cfg!(target_os = "macos") {
+        // Darwin's PTY EOF can precede the last job's exit, and the master
+        // does not wake a poll with no requested events. Wait for bounded
+        // session observations instead.
+        let deadline = deadline.min(Instant::now() + CHILD_SHUTDOWN_DEADLINE);
+        let mut delay = Duration::from_millis(20);
+        loop {
+            let result = ended(deadline);
+            if matches!(result, Ok(true)) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "could not confirm the terminal family's cleanup");
+                }
+                return Err("Terminal process cleanup remains unconfirmed".into());
+            }
+            std::thread::sleep(delay.min(remaining));
+            delay = (delay * 2).min(Duration::from_millis(250));
+        }
+    }
     // Usually the family is already gone. A process outside it (one that left
     // the session, such as `setsid -f`) may keep the PTY open indefinitely;
     // cleanup never claims or depends on it, so its PTY is no reason to wait.
@@ -6826,6 +6860,8 @@ fn send_pty_message(
             if cancellation.revents != 0 {
                 return false;
             }
+            #[cfg(target_os = "macos")]
+            return true;
         }
         match sender.send_timeout(message, READER_SEND_POLL) {
             Ok(()) => return true,
