@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import dev.cagents.mobile.android.data.ConnectionSettings
 import dev.cagents.mobile.android.graph
 import dev.cagents.mobile.android.ssh.PhoneKey
+import dev.cagents.mobile.android.ssh.Replacement
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.ConnectionLost
 import dev.cagents.mobile.client.RemoteState
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
@@ -37,6 +39,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _phoneKey = MutableStateFlow<Result<PhoneKeyInfo>?>(null)
     val phoneKey: StateFlow<Result<PhoneKeyInfo>?> = _phoneKey.asStateFlow()
+
+    private val _phoneKeyBusy = MutableStateFlow(false)
+    /** Whether the phone's key is being loaded again or made anew. */
+    val phoneKeyBusy: StateFlow<Boolean> = _phoneKeyBusy.asStateFlow()
+
+    private val _newPhoneKeys = Channel<Unit>(Channel.CONFLATED)
+    /** Each time the person made a new key, to show it to them. */
+    val newPhoneKeys: Flow<Unit> = _newPhoneKeys.receiveAsFlow()
 
     /** The fingerprint trusted at each of the configured computer's addresses that has one, in their order. */
     val pinnedFingerprints: StateFlow<Map<String, String>> = combine(settings, graph.hostKeys.revision) { settings, _ ->
@@ -82,9 +92,42 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val messages = _messages.receiveAsFlow()
 
     init {
+        reloadPhoneKey()
+    }
+
+    /** Loads the phone's key again, such as after a failure that may have passed. */
+    fun reloadPhoneKey() = changePhoneKey { PhoneKey.reload(getApplication()) }
+
+    /** Loads the phone's key again if it failed, since the failure may have passed. */
+    fun recheckPhoneKey() {
+        if (_phoneKey.value?.isFailure == true) reloadPhoneKey()
+    }
+
+    /**
+     * Makes a new key in place of one that fails to load. Computers that
+     * trusted the old key must be told of the new one.
+     */
+    fun makeNewPhoneKey() = changePhoneKey { PhoneKey.replace(getApplication()) }
+
+    /** Unless the key is already changing, runs [change] off the main thread and shows the key it leaves. */
+    private fun changePhoneKey(change: () -> Replacement) {
+        if (_phoneKeyBusy.value) return
+        _phoneKeyBusy.value = true
         viewModelScope.launch {
-            _phoneKey.value = withContext(Dispatchers.IO) {
-                runCatching { PhoneKey.get(app).let { PhoneKeyInfo(it.openSsh, it.fingerprint, it.hardwareBacked) } }
+            try {
+                val result = withContext(Dispatchers.IO) { runCatching(change) }
+                val failedBefore = _phoneKey.value?.isFailure == true
+                _phoneKey.value = result.map { PhoneKeyInfo(it.key.openSsh, it.key.fingerprint, it.key.hardwareBacked) }
+                val replacement = result.getOrNull() ?: return@launch
+                if (replacement.made) {
+                    _messages.trySend("Made a new key. Pair again with your computer, or add the new key there.")
+                    _newPhoneKeys.trySend(Unit)
+                    graph.exportPublicKeyForDevelopment()
+                }
+                // A connection held up for want of a usable key tries again with this one.
+                if (failedBefore && settings.value.isComplete) controller.retryNow()
+            } finally {
+                _phoneKeyBusy.value = false
             }
         }
     }

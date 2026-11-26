@@ -100,14 +100,18 @@ class AppGraph(private val app: Application) {
             },
         )
 
-        if (BuildConfig.DEBUG) exportPublicKeyForDevelopment()
+        exportPublicKeyForDevelopment()
     }
 
     /**
      * Debug builds leave the public key where `adb shell run-as` can read it,
      * so a developer can authorize the phone without retyping it.
      */
-    private fun exportPublicKeyForDevelopment() = scope.launch(Dispatchers.IO) {
+    fun exportPublicKeyForDevelopment() {
+        if (BuildConfig.DEBUG) scope.launch(Dispatchers.IO) { writePublicKeyForDevelopment() }
+    }
+
+    private fun writePublicKeyForDevelopment() {
         runCatching {
             val key = PhoneKey.get(app)
             File(app.filesDir, "cagents-phone.pub").writeText(key.openSsh + "\n")

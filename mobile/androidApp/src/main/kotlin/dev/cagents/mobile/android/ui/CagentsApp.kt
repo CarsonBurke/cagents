@@ -78,6 +78,7 @@ fun CagentsApp(vm: MainViewModel = viewModel()) {
                     session = route.session,
                     snackbar = snackbar,
                     onBack = { backStack.removeAt(backStack.lastIndex) },
+                    onSettings = { backStack.add(SettingsRoute) },
                 )
             }
             entry<SettingsRoute> {
