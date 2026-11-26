@@ -2534,7 +2534,7 @@ mod tests {
                 overlay.position..overlay.position + overlay.original.len(),
                 [overlay.argument.clone()],
             );
-            let marker = |overlay| {
+            let marker = |overlay: &ClaudeAttributionOverlay| {
                 format!(
                     "{CLAUDE_ATTRIBUTION_OVERLAY}={}\0",
                     serde_json::to_string(overlay).unwrap()
