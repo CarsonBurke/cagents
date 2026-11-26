@@ -5645,37 +5645,60 @@ mod startup_update_tests {
 
     #[test]
     fn a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere() {
-        let claims = tempfile::tempdir().unwrap();
-        let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-        for runtime in &runtimes {
-            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        // The daemon in the first session holds its runtime lock and claims
-        // the saved data under it, as `cagents-host` does at startup.
-        let lock = daemon_lock_in(runtimes[0].path());
-        fs::create_dir_all(lock.parent().unwrap()).unwrap();
-        let _held = owned_lock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
-        let _claim = state_claim::claim_daemon_state_in(
-            claims.path(),
-            &lock,
-            Some("session"),
-            state_claim::Claimant::Daemon,
-        )
-        .unwrap();
-        let claim = claims.path().join("daemon.lock");
+        use std::os::unix::fs::DirBuilderExt;
 
-        // A window in that session names the same lock, so it is served here.
-        assert_eq!(
-            state_claim::served_elsewhere(&claim, &daemon_lock_in(runtimes[0].path())).unwrap(),
-            None
-        );
-        // A window in another session is still told which daemon is in the way.
-        let refusal =
-            state_claim::served_elsewhere(&claim, &daemon_lock_in(runtimes[1].path())).unwrap();
-        assert_eq!(
-            refusal.and_then(|refusal| refusal.pid()),
-            Some(process::id())
-        );
+        const DAEMON_RUNTIME: &str = "CAGENTS_TEST_WINDOW_DAEMON_RUNTIME";
+        if let Some(daemon_runtime) = env::var_os(DAEMON_RUNTIME).map(PathBuf::from) {
+            let lock = daemon_lock_in(&daemon_runtime);
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let _held = owned_lock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+            let _claim = state_claim::claim_daemon_state(&lock, "test-session").unwrap();
+
+            let lease = WindowLease::acquire(false, None);
+            if runtime_directory().unwrap().canonicalize().unwrap() == daemon_runtime {
+                lease.unwrap_or_else(|error| panic!("window refused its own daemon: {error}"));
+            } else {
+                let error = lease.err().expect("window accepted a foreign daemon");
+                assert_eq!(
+                    state_claim::state_in_use(&error).and_then(|refusal| refusal.pid()),
+                    Some(process::id()),
+                    "{error}"
+                );
+            }
+            return;
+        }
+
+        // Each child gets its own environment and window slot.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let daemon_runtime = root.join("daemon");
+        let foreign_runtime = root.join("foreign");
+        for directory in [&home, &daemon_runtime, &foreign_runtime] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+        }
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        for runtime in [alias.join("daemon"), foreign_runtime] {
+            let output = process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::startup_update_tests::a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere",
+                ])
+                .env(DAEMON_RUNTIME, &daemon_runtime)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "window launch with runtime {} failed: {}{}",
+                runtime.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]
