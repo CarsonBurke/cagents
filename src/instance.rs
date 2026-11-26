@@ -29,6 +29,10 @@ use std::{
 };
 
 mod daemon_admission;
+#[cfg(target_os = "macos")]
+pub(crate) mod ui_startup;
+#[cfg(all(target_os = "macos", feature = "ui"))]
+pub use ui_startup::connect_ui_launcher;
 pub mod state_claim;
 #[doc(hidden)]
 pub mod ui_options;
@@ -694,9 +698,10 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
                 "saved conversation inventory exceeds the recovery limit",
             ));
         }
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}")?;
-        stdout.flush()?;
+        write_ui_launch_line(
+            &format!("{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}"),
+            false,
+        )?;
     }
     Ok(())
 }
@@ -739,11 +744,20 @@ fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()
             Ok(_) => UI_LAUNCH_READY.to_owned(),
             Err(error) => format!("{UI_LAUNCH_ERROR_PREFIX}{error}").replace('\n', " "),
         };
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{message}")?;
-        stdout.flush()?;
+        write_ui_launch_line(&message, true)?;
     }
     Ok(())
+}
+
+fn write_ui_launch_line(message: &str, final_response: bool) -> io::Result<()> {
+    #[cfg(all(target_os = "macos", feature = "ui"))]
+    if let Some(result) = ui_startup::write_reply(message, final_response) {
+        return result;
+    }
+    let _ = final_response;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{message}")?;
+    stdout.flush()
 }
 
 pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};

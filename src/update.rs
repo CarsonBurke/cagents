@@ -362,7 +362,10 @@ pub(crate) fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
 
 /// The stable launch bundle can resolve only the currently selected build.
 #[cfg(target_os = "macos")]
-pub(crate) fn stable_ui_bundle(executable: &Path) -> Result<Option<PathBuf>, UpdateError> {
+pub(crate) fn stable_ui_bundle(
+    executable: &Path,
+    launcher: &Path,
+) -> Result<Option<PathBuf>, UpdateError> {
     if executable
         .file_name()
         .is_none_or(|name| name != "cagents-ui")
@@ -374,7 +377,11 @@ pub(crate) fn stable_ui_bundle(executable: &Path) -> Result<Option<PathBuf>, Upd
         Err(UpdateError::UnsupportedInstallation) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if served_version_root(&layout)? != layout.version_root {
+    // A recovery coordinator from another build cannot assume its UI speaks
+    // the new startup connection. Keep direct startup for that fallback.
+    if !locate(launcher).is_ok_and(|caller| caller.version_root == layout.version_root)
+        || served_version_root(&layout)? != layout.version_root
+    {
         return Ok(None);
     }
     let bundle = layout.prefix.join("Cagents.app");
@@ -4141,7 +4148,8 @@ mod tests {
         std::os::unix::fs::symlink("versions/1.2.3", prefix.join("current")).unwrap();
         let selected = prefix.join("versions/1.2.3/bin/cagents-ui");
         let staged = prefix.join("versions/1.2.4/bin/cagents-ui");
-        assert!(stable_ui_bundle(&selected).unwrap().is_none());
+        let cli = prefix.join("versions/1.2.3/bin/cagents");
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
 
         let bundle = prefix.join("Cagents.app");
         let launcher = bundle.join("Contents/MacOS/Cagents");
@@ -4152,12 +4160,13 @@ mod tests {
             .mode(0o700)
             .open(&launcher)
             .unwrap();
-        assert_eq!(stable_ui_bundle(&selected).unwrap(), Some(bundle));
-        assert!(stable_ui_bundle(&staged).unwrap().is_none());
+        assert_eq!(stable_ui_bundle(&selected, &cli).unwrap(), Some(bundle));
+        assert!(stable_ui_bundle(&staged, &cli).unwrap().is_none());
+        assert!(stable_ui_bundle(&selected, &staged).unwrap().is_none());
 
         fs::remove_file(&launcher).unwrap();
         std::os::unix::fs::symlink(&selected, launcher).unwrap();
-        assert!(stable_ui_bundle(&selected).unwrap().is_none());
+        assert!(stable_ui_bundle(&selected, &cli).unwrap().is_none());
     }
 
     #[test]

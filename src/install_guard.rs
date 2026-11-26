@@ -152,6 +152,8 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
     ] {
         command.env_remove(name);
     }
+    #[cfg(target_os = "macos")]
+    command.env_remove(crate::instance::ui_startup::SOCKET_ENV);
 }
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);

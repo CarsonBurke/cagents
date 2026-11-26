@@ -4608,8 +4608,11 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<Option<Strin
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
         .env(UI_LAUNCH_PANE_NOTES_ENV, "1");
     #[cfg(target_os = "macos")]
-    if let Some(bundle) = crate::update::stable_ui_bundle(Path::new(command.get_program()))
-        .map_err(io::Error::other)?
+    if let Some(bundle) = crate::update::stable_ui_bundle(
+        Path::new(command.get_program()),
+        &crate::process::current_executable()?,
+    )
+    .map_err(io::Error::other)?
     {
         return darwin_ui::launch(command, &bundle, timeout);
     }

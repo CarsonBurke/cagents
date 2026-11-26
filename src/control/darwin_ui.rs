@@ -1,11 +1,21 @@
 //! Launch an installed window through its stable LaunchServices identity.
 
-use super::{Command, Duration, Path, Stdio, io, read_ui_launch_handshake};
-use crate::pinned_process::PinnedProcess;
+use super::{Command, Duration, Instant, Path, Stdio, io, read_ui_launch_handshake};
+use crate::{
+    descriptor_frame::{FrameByteOrder, receive_json_with_fds_until},
+    instance::ui_startup::{CONNECT_TIMEOUT, HANDSHAKE_LIMIT, Identity, SOCKET_ENV},
+    pinned_process::{PinnedProcess, peer_credentials},
+};
 use std::{
-    ffi::CString,
-    fs::OpenOptions,
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt},
+    fs,
+    os::{
+        fd::AsFd,
+        unix::{
+            fs::MetadataExt,
+            net::{UnixListener, UnixStream},
+            process::CommandExt,
+        },
+    },
 };
 
 const OPEN_DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -15,24 +25,19 @@ pub(super) fn launch(
     bundle: &Path,
     timeout: Duration,
 ) -> io::Result<Option<String>> {
-    // LaunchServices opens the named stdout when it dispatches the app. The
-    // read-only descriptor sees EOF if that app exits before acknowledging.
-    let directory = tempfile::tempdir()?;
-    let readiness = directory.path().join("startup");
-    let name = CString::new(readiness.as_os_str().as_bytes())?;
-    // SAFETY: name is a NUL-terminated path inside our fresh private directory.
-    if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut response = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&readiness)?;
+    // Keep the rendezvous private and its pathname within sockaddr_un even
+    // when the installation or the user's preferred temporary path is long.
+    let directory = tempfile::Builder::new()
+        .prefix("cgl.")
+        .tempdir_in("/private/tmp")?;
+    let socket = directory.path().join("startup");
+    let listener = UnixListener::bind(&socket)?;
+    listener.set_nonblocking(true)?;
+    let executable = Path::new(command.get_program()).canonicalize()?;
+    let expected = fs::metadata(&executable)?;
     let mut open = Command::new("/usr/bin/open");
     open.args(["-n", "-a"])
         .arg(bundle)
-        .arg("--stdout")
-        .arg(&readiness)
         .arg("--args")
         .args(command.get_args())
         .stdin(Stdio::null())
@@ -47,12 +52,60 @@ pub(super) fn launch(
             open.env_remove(key);
         }
     }
+    open.env(SOCKET_ENV, socket);
     // SAFETY: The hook seals inherited descriptors before exec.
     unsafe {
         open.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
     dispatch(&mut open)?;
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    if !crate::descriptor::wait_for_activity(listener.as_fd(), libc::POLLIN, Some(deadline))? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Cagents.app did not connect to its launcher",
+        ));
+    }
+    let (mut response, _) = crate::descriptor::accept(&listener)?;
+    verify_window(
+        &response,
+        &executable,
+        (expected.dev(), expected.ino()),
+        deadline,
+    )?;
     read_ui_launch_handshake(&mut response, timeout)
+}
+
+fn verify_window(
+    stream: &UnixStream,
+    executable: &Path,
+    image: (u64, u64),
+    deadline: Instant,
+) -> io::Result<()> {
+    let peer = peer_credentials(stream)?;
+    if peer.uid != crate::daemon::current_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "The opening window belongs to another account",
+        ));
+    }
+    let (identity, _): (Identity, _) = receive_json_with_fds_until(
+        stream,
+        deadline,
+        HANDSHAKE_LIMIT,
+        0,
+        FrameByteOrder::LittleEndian,
+    )
+    .map_err(io::Error::other)?;
+    let process = PinnedProcess::open_started(peer.pid, identity.started)?;
+    if process.executable()? != executable
+        || crate::process::mapped_region_identity(peer.pid, identity.address)? != image
+        || process.exited()?
+    {
+        return Err(io::Error::other(
+            "The opening window runs a different installed build",
+        ));
+    }
+    Ok(())
 }
 
 fn dispatch(open: &mut Command) -> io::Result<()> {
