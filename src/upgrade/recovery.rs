@@ -4384,7 +4384,10 @@ impl ReadyAdmission {
             &authority.job_request_hash,
             &authority.checkpoint_hash,
             &authority.target,
-            &authority.source,
+            crate::update::ReadyCutoverOriginal {
+                source: &authority.source,
+                inventory: &authority.census,
+            },
             successor,
             &authority.windows,
         )

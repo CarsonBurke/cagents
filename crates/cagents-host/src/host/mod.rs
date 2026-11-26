@@ -1103,12 +1103,26 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         if pending_publication.is_none() {
             acknowledge_standby(standby.take());
             if std::mem::take(&mut settle_startup_update) {
-                crate::update::settle_as_successor(
-                    host.lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .proof()
-                        .clone(),
-                );
+                let serving = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone();
+                let host = Arc::clone(&host);
+                crate::update::settle_as_successor(serving, move || {
+                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut chats = chat::chat_list_inventory(&state);
+                    chats.retain(|session| {
+                        state.chats.get(&session.id).is_some_and(|record| {
+                            record.handle.owns_work() && !record.handle.is_completed()
+                        })
+                    });
+                    crate::update::CutoverLiveInventory {
+                        terminals: state.list(0),
+                        chats,
+                        adopted_sources: state.upgrade_chats.clone(),
+                    }
+                });
             }
         }
         reap_finished(&mut clients);
