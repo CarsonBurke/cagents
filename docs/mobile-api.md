@@ -254,6 +254,8 @@ A client keeps a conversation's items by `id` and shows them in `order`:
 - `state` is sent whole every time.
 - `order`, when present, is every item's ID in display order.
 - `items` are new or changed items, each replacing what is held under its ID.
+  So every ID in `order` is either held or in `items`; an ID that is neither
+  means the client missed an update, and it should watch the conversation again.
 - `appends` add streamed text to held text items, in order. `offset` is the held text's
   length in UTF-16 code units, which is what a Kotlin or Java `String`
   counts. If a client's copy has a different length, it missed something and

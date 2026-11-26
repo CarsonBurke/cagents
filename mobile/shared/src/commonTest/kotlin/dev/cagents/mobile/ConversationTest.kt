@@ -60,6 +60,10 @@ class ConversationTest {
         val removed = held.apply(ConversationUpdate(s, order = listOf("b")))
         assertFalse(removed.desynced)
         assertEquals(listOf("b"), removed.conversation.items.map { it.id })
+        // A reset holds only what it sends, so it has nothing to have missed.
+        val reset = held.apply(ConversationUpdate(s, reset = true, order = listOf("x", "c"), items = listOf(text("c", "C"))))
+        assertFalse(reset.desynced)
+        assertEquals(listOf("c"), reset.conversation.items.map { it.id })
     }
 
     @Test
