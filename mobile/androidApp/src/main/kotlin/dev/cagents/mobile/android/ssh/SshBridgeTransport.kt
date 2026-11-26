@@ -36,21 +36,31 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.security.PrivateKey
 import java.security.PublicKey
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
- * The phone's key from [load], or the failure that tells the person what to
- * do: a key that can't be used stops the connection until they make a new
- * one; any other failure may pass, so connecting goes on trying.
+ * Loads the phone's key for each connection, failing in a way that tells the
+ * person what to do. A key that can't be used stops connecting until they
+ * make a new one. Any other failure may pass, such as the Keystore before the
+ * phone is first unlocked, so connecting goes on trying; but after [patience]
+ * of them in a row it stops too, pointing to Settings, which can try again or
+ * make a new key.
  */
-internal fun <K> keyForConnecting(load: () -> K): K = try {
-    load()
-} catch (e: PhoneKeyUnusable) {
-    throw ConnectFailure.Refused(e.message.orEmpty())
-} catch (e: Exception) {
-    // The Keystore failing for now, such as before the phone is first unlocked.
-    throw ConnectFailure.Network("This phone couldn't load its key just now.", e)
+internal class KeyForConnecting<K>(private val load: () -> K, private val patience: Int = 3) {
+    private val failures = AtomicInteger()
+
+    fun get(): K = try {
+        load().also { failures.set(0) }
+    } catch (e: PhoneKeyUnusable) {
+        throw ConnectFailure.Refused(e.message.orEmpty())
+    } catch (e: Exception) {
+        if (failures.incrementAndGet() >= patience) {
+            throw ConnectFailure.Refused("This phone couldn't load its key. Try again in Settings.")
+        }
+        throw ConnectFailure.Network("This phone couldn't load its key just now.", e)
+    }
 }
 
 /**
@@ -59,10 +69,11 @@ internal fun <K> keyForConnecting(load: () -> K): K = try {
  * the remote command, its standard input and output carrying the API.
  */
 class SshBridgeTransport(
-    private val phoneKey: () -> PhoneKey,
+    phoneKey: () -> PhoneKey,
     private val settings: () -> ConnectionSettings,
     private val hostKeys: HostKeyStore,
 ) : BridgeTransport {
+    private val phoneKey = KeyForConnecting(phoneKey)
 
     override suspend fun open(): LineChannel {
         val target = settings()
@@ -73,7 +84,7 @@ class SshBridgeTransport(
                 hosts = target.hosts,
                 port = target.port,
                 user = target.user,
-                key = keyForConnecting(phoneKey),
+                key = phoneKey.get(),
                 hostKeys = StoredHostKeys(hostKeys, target),
                 command = target.command,
                 // A computer named by its pairing code was paired; one set up by hand has no name.

@@ -428,10 +428,14 @@ private fun PhoneKeyProblem(problem: Throwable, busy: Boolean, onTryAgain: () ->
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
-                    confirming = false
-                    onMakeNew()
-                }) { Text("Make a new key", color = MaterialTheme.colorScheme.error) }
+                TextButton(
+                    onClick = {
+                        confirming = false
+                        onMakeNew()
+                    },
+                    // Not while the key is reloading, which may find it working after all.
+                    enabled = !busy,
+                ) { Text("Make a new key", color = MaterialTheme.colorScheme.error.copy(alpha = if (busy) 0.38f else 1f)) }
             },
             dismissButton = { TextButton(onClick = { confirming = false }) { Text("Cancel") } },
         )

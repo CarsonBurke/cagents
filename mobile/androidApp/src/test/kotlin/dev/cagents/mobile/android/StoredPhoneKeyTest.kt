@@ -2,7 +2,7 @@ package dev.cagents.mobile.android
 
 import dev.cagents.mobile.android.ssh.PhoneKey
 import dev.cagents.mobile.android.ssh.PhoneKeyUnusable
-import dev.cagents.mobile.android.ssh.keyForConnecting
+import dev.cagents.mobile.android.ssh.KeyForConnecting
 import dev.cagents.mobile.android.ssh.keyIsBroken
 import dev.cagents.mobile.client.ConnectFailure
 import java.io.IOException
@@ -84,8 +84,8 @@ class StoredPhoneKeyTest {
 
     @Test
     fun theKeystoreFailingForNowIsNotBroken() {
-        // System error, the Keystore not yet unlocked, KeyMint and Keystore failures, and a busy secure element.
-        for (code in listOf(1, 2, 3, 4, 10, 11, 16)) {
+        // Other, authentication required, not yet initialized, a system error, and KeyMint and Keystore failures.
+        for (code in listOf(1, 2, 3, 4, 10, 11)) {
             assertFalse(broken(UnrecoverableKeyException("Failed to obtain information about key").causedBy(KeystoreError(code))), "code $code")
             assertFalse(broken(InvalidKeyException("Keystore operation failed", KeystoreError(code))), "code $code")
         }
@@ -103,16 +103,26 @@ class StoredPhoneKeyTest {
     }
 
     @Test
-    fun aKeyThatCantBeUsedStopsConnectingAndOtherFailuresRetry() {
-        assertEquals("key", keyForConnecting { "key" })
+    fun aKeyThatCantBeUsedStopsConnecting() {
+        assertEquals("key", KeyForConnecting(load = { "key" }).get())
         val stopped = assertFailsWith<ConnectFailure.Refused> {
-            keyForConnecting<String> { throw PhoneKeyUnusable(AEADBadTagException()) }
+            KeyForConnecting<String>(load = { throw PhoneKeyUnusable(AEADBadTagException()) }).get()
         }
         assertFalse(stopped.retry)
         assertTrue("Settings" in stopped.message.orEmpty())
-        val passing = assertFailsWith<ConnectFailure.Network> {
-            keyForConnecting<String> { throw ProviderException("Keystore operation failed") }
-        }
-        assertTrue(passing.retry)
+    }
+
+    @Test
+    fun otherFailuresRetryUntilTheyKeepHappening() {
+        var fails = true
+        val keys = KeyForConnecting({ if (fails) throw ProviderException("Keystore operation failed") else "key" }, patience = 3)
+        repeat(2) { assertTrue(assertFailsWith<ConnectFailure.Network> { keys.get() }.retry) }
+        // A success in between starts the count again.
+        fails = false
+        assertEquals("key", keys.get())
+        fails = true
+        repeat(2) { assertFailsWith<ConnectFailure.Network> { keys.get() } }
+        val stopped = assertFailsWith<ConnectFailure.Refused> { keys.get() }
+        assertTrue("Settings" in stopped.message.orEmpty())
     }
 }

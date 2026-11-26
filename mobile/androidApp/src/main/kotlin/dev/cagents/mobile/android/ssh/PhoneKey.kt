@@ -54,6 +54,7 @@ class PhoneKey private constructor(
         private const val SIGNING_ALIAS = "cagents-ssh-ed25519"
         private const val WRAPPING_ALIAS = "cagents-ssh-seed-wrap"
         private const val SEED_FILE = "ssh-ed25519.seed"
+        private const val REPLACING_FILE = "ssh-ed25519.replacing"
 
         @Volatile
         private var loaded: PhoneKey? = null
@@ -68,6 +69,16 @@ class PhoneKey private constructor(
         }
 
         /**
+         * [get], and whether the key is new: made by a [replace] that was
+         * interrupted after it discarded the old key, which the person
+         * should hear about.
+         */
+        fun reload(context: Context): Replacement = synchronized(this) {
+            val key = get(context)
+            Replacement(key, made = replacing(context).delete())
+        }
+
+        /**
          * Makes a new key in place of one that fails to load, for whatever
          * reason. A key that loads now is kept instead, since computers may
          * trust it. Computers that trusted a replaced key won't accept the
@@ -75,21 +86,47 @@ class PhoneKey private constructor(
          */
         fun replace(context: Context): Replacement = synchronized(this) {
             val app = context.applicationContext
-            loaded?.let { return Replacement(it, made = false) }
-            runCatching { load(app) }.onSuccess {
+            val marker = replacing(app)
+            (loaded ?: runCatching { load(app) }.getOrNull())?.let {
                 loaded = it
-                return Replacement(it, made = false)
+                return Replacement(it, made = marker.delete())
             }
-            // Deleting an entry that isn't there succeeds; any other failure leaves the old key for another try.
-            KeyStore.getInstance(KEYSTORE).apply { load(null) }.run {
-                deleteEntry(SIGNING_ALIAS)
-                deleteEntry(WRAPPING_ALIAS)
-            }
+            val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
             val seedFile = File(app.noBackupFilesDir, SEED_FILE)
-            File(seedFile.parentFile, "${seedFile.name}.tmp").delete()
-            check(!seedFile.exists() || seedFile.delete()) { "Couldn't remove the old key" }
-            Replacement(load(app).also { loaded = it }, made = true)
+            val temporary = File(seedFile.parentFile, "${seedFile.name}.tmp")
+            // What the old key is made of goes last: until then, a failure leaves
+            // it as it was, for another try. Deleting an entry that isn't there succeeds.
+            if (seedFile.exists()) {
+                keyStore.deleteEntry(SIGNING_ALIAS)
+                keyStore.deleteEntry(WRAPPING_ALIAS)
+                temporary.delete()
+                discarding(marker) { check(seedFile.delete()) { "Couldn't remove the old key" } }
+            } else {
+                keyStore.deleteEntry(WRAPPING_ALIAS)
+                discarding(marker) { keyStore.deleteEntry(SIGNING_ALIAS) }
+            }
+            val key = load(app)
+            loaded = key
+            marker.delete()
+            Replacement(key, made = true)
         }
+
+        /**
+         * Notes in [marker], for [reload], that the old key is being
+         * discarded, so the next load makes a new one, whether or not
+         * this replacement gets that far.
+         */
+        private inline fun discarding(marker: File, discard: () -> Unit) {
+            marker.createNewFile()
+            try {
+                discard()
+            } catch (e: Exception) {
+                marker.delete()
+                throw e
+            }
+        }
+
+        private fun replacing(context: Context) = File(context.applicationContext.noBackupFilesDir, REPLACING_FILE)
 
         private fun load(context: Context): PhoneKey {
             val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }

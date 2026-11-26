@@ -6,6 +6,7 @@ import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.pairing.PairOutcome
 import dev.cagents.mobile.pairing.PairingCode
 import dev.cagents.mobile.pairing.PairingExchange
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -28,7 +29,15 @@ class Pairing(
      * person. Cancelling it closes the connection, which withdraws the request.
      */
     suspend fun pair(code: PairingCode, onWaiting: () -> Unit): PairOutcome {
-        val key = withContext(Dispatchers.IO) { phoneKey() }
+        val key = try {
+            withContext(Dispatchers.IO) { phoneKey() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: PhoneKeyUnusable) {
+            return PairOutcome.Failed(e.message.orEmpty(), retry = false)
+        } catch (e: Exception) {
+            return PairOutcome.Failed("This phone couldn't load its key just now. Try again in a moment.", retry = true)
+        }
         val channel = try {
             openSsh(
                 SshTarget(

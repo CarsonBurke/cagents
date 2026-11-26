@@ -96,7 +96,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Loads the phone's key again, such as after a failure that may have passed. */
-    fun reloadPhoneKey() = changePhoneKey { Replacement(PhoneKey.get(getApplication()), made = false) }
+    fun reloadPhoneKey() = changePhoneKey { PhoneKey.reload(getApplication()) }
 
     /** Loads the phone's key again if it failed, since the failure may have passed. */
     fun recheckPhoneKey() {
