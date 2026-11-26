@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn a_listed_unloaded_running_child_has_a_static_status_in_the_chooser() {
-        let mut child = child("earlier", chat::ToolStatus::Running, false);
+        let mut child = active(child("earlier", chat::ToolStatus::Running, false), 1, 1);
         child.detail = chat::UNLOADED_CHILD_RUNNING.into();
         assert_eq!(Section::of(&child), Section::Earlier);
         assert_eq!(row_time(&child, None, 60_000), None);
