@@ -3715,6 +3715,59 @@ fn a_worktree_callers_child_lands_in_a_channel_for_its_checkout() {
     );
 }
 
+/// #3432: the working directory bounds what a child's provider approves on
+/// its own, so a request naming one outside its project is refused here,
+/// whatever client sent it, including a directory no open project contains.
+#[test]
+fn a_new_agent_works_only_in_a_directory_inside_its_project() {
+    if isolated("a_new_agent_works_only_in_a_directory_inside_its_project").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_path_buf();
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    // A link inside the project names where it leads.
+    let link = root.join("project").join("out");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    for (key, directory) in [
+        ("parent", root.clone()),
+        ("sibling", elsewhere),
+        ("link", link),
+    ] {
+        let mut outside = request.clone();
+        outside.idempotency_key = key.into();
+        let Destination::New(spec) = &mut outside.destination else {
+            unreachable!()
+        };
+        spec.target.directory = directory.clone();
+        let error = submit(&host, &Authority::default(), outside).unwrap_err();
+        assert!(
+            error.contains("is not in the project"),
+            "{key}: {directory:?} was not refused: {error}"
+        );
+    }
+    let open = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agents(None)
+        .unwrap();
+    assert!(open.is_empty(), "a refused request records no agent");
+
+    // A folder inside the project is the project's.
+    let nested = root.join("project").join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let mut inside = request;
+    let Destination::New(spec) = &mut inside.destination else {
+        unreachable!()
+    };
+    spec.target.directory = nested.clone();
+    let accepted = submit(&host, &Authority::default(), inside).unwrap();
+    assert_eq!(accepted.agent.spec.target.directory, nested);
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+}
+
 #[test]
 fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     use crate::agent_execution::directory::{Owner, Relation, Scope};

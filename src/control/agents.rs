@@ -330,6 +330,32 @@ impl ShowArgs {
     }
 }
 
+/// Refuses a working directory that the open project `containing` it, if
+/// any, shows is not in `project`. The refusal names the project by the
+/// checkout a person opened, not its Git directory.
+///
+/// A `keyed` request may retry one the daemon accepted while its directory
+/// was there; once gone, that directory is in no project, so the daemon,
+/// which knows the first acceptance, judges it.
+fn inside_project(
+    directory: &Path,
+    project: &Path,
+    containing: Option<&Path>,
+    keyed: bool,
+) -> Result<(), AppError> {
+    if containing == Some(project) || (containing.is_none() && keyed) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "target",
+        format!(
+            "{} is not in the project {}; pass a directory inside it",
+            super::format::location(directory, None),
+            super::format::location(primary_checkout(project), None)
+        ),
+    ))
+}
+
 pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
     match state {
         crate::agent_execution::State::Accepted => "Queued",
@@ -1306,19 +1332,17 @@ pub(super) fn execute_with_context(
                     match given {
                         // A target given in full is sent as given, so retrying
                         // it stays exact even after its directory has moved;
-                        // only a directory known to be elsewhere is refused.
+                        // only a directory known to be elsewhere is refused,
+                        // including one no open project contains. The daemon
+                        // refuses it too; this says so before anything is sent.
                         Some(_) => {
-                            if let (Ok(named), Some(containing)) = (&named, &containing)
-                                && named != containing
-                            {
-                                return Err(AppError::new(
-                                    "target",
-                                    format!(
-                                        "{} is not in the project {}",
-                                        here.display(),
-                                        named.display()
-                                    ),
-                                ));
+                            if let Ok(named) = &named {
+                                inside_project(
+                                    &here,
+                                    named,
+                                    containing.as_deref(),
+                                    retry.idempotency_key.is_some(),
+                                )?;
                             }
                             let repository = if project.is_absolute() {
                                 project
@@ -4801,6 +4825,26 @@ mod tests {
             Path::new("/repo")
         );
         assert_eq!(primary_checkout(Path::new("/notes")), Path::new("/notes"));
+    }
+
+    /// #3432: an explicit directory is refused unless the open project
+    /// containing it is the one named, including when no open project
+    /// contains it at all, such as the home directory.
+    #[test]
+    fn an_explicit_directory_must_be_in_the_named_project() {
+        let project = Path::new("/srv/app/.git");
+        assert!(inside_project(Path::new("/srv/app/src"), project, Some(project), false).is_ok());
+        let other = Some(Path::new("/srv/other/.git"));
+        for (containing, keyed) in [(None, false), (other, false), (other, true)] {
+            let error = inside_project(Path::new("/srv"), project, containing, keyed).unwrap_err();
+            assert_eq!(error.kind, "target");
+            assert_eq!(
+                error.message,
+                "/srv is not in the project /srv/app; pass a directory inside it"
+            );
+        }
+        // A keyed retry whose directory is gone is the daemon's to judge.
+        assert!(inside_project(Path::new("/srv/gone"), project, None, true).is_ok());
     }
 
     #[test]

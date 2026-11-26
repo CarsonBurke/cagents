@@ -283,6 +283,23 @@ fn accept(
         if !selected.target.directory.is_dir() {
             return Err("The agent working directory is not a directory".into());
         }
+        // The working directory bounds what the provider approves and lets
+        // the child write on its own, so it must lie in the project the agent
+        // is for: its checkout, one of its worktrees, or a folder in them.
+        // Projects can nest, so this is the nearest open one, as `sessions`
+        // and the CLI name it. The registry refuses a project that is not
+        // open; say that rather than that the directory is outside it.
+        if model.project(&selected.target.repository).is_none() {
+            return Err("The target project is not open".into());
+        }
+        let containing = crate::project_location::place(&selected.target.directory, &model).project;
+        if containing.as_ref() != Some(&selected.target.repository) {
+            return Err(format!(
+                "{} is not in the project {}; pass a directory inside it",
+                selected.target.directory.display(),
+                crate::workspace_model::primary_checkout(&selected.target.repository).display()
+            ));
+        }
         // An agent never gives its child more than it has itself.
         if let Some(ceiling) = caller_ceiling(host, authority)? {
             selected.permission_mode =
