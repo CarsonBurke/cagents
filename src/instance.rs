@@ -2219,6 +2219,20 @@ impl UiUpdateGuard {
             .map(|_| ())
     }
 
+    pub(crate) fn relaunch_missing_windows(
+        self,
+        slots: &[String],
+        executable: &Path,
+    ) -> io::Result<()> {
+        let running = running_window_slots(&self.runtime)?;
+        let missing: Vec<_> = slots
+            .iter()
+            .filter(|slot| !running.contains(slot))
+            .cloned()
+            .collect();
+        self.relaunch_windows(&missing, executable)
+    }
+
     fn relaunch_windows_with_notes(
         mut self,
         slots: &[String],

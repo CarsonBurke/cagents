@@ -932,6 +932,37 @@ impl PendingRecovery {
         Self::inspect_at(&store.path)
     }
 
+    /// Recover the original scope of an already archived request. This is for
+    /// verifying its serving successor, with no authority to start a daemon.
+    pub(crate) fn inspect_archived(hash: &str, target: &Path) -> Result<Option<Self>, String> {
+        let Some(store) = super::handoff::Store::existing()? else {
+            return Ok(None);
+        };
+        Self::inspect_archived_at(&store.path, hash, target)
+    }
+
+    fn inspect_archived_at(
+        canonical: &Path,
+        hash: &str,
+        target: &Path,
+    ) -> Result<Option<Self>, String> {
+        if read_checkpoint(canonical)?.is_some() {
+            return Ok(None);
+        }
+        let Some(archive) = archived_proof(canonical, target)? else {
+            return Ok(None);
+        };
+        if archive.checkpoint_sha256 != hash {
+            return Ok(None);
+        }
+        let original = Self::inspect_at(&archive.archive_path)?
+            .ok_or("The exact archived Prepared checkpoint disappeared")?;
+        if original.checkpoint_hash != hash {
+            return Err("The archived Prepared checkpoint changed during inspection".into());
+        }
+        Ok(Some(original))
+    }
+
     fn inspect_at(path: &Path) -> Result<Option<Self>, String> {
         let Some(bytes) = read_checkpoint(path)? else {
             return Ok(None);
@@ -2548,6 +2579,8 @@ pub struct SettledWitness {
 /// This value carries no locks, receipt, or authority to replay or adopt owners.
 #[derive(Clone, Debug)]
 pub struct AlreadyRecovered {
+    pub(crate) job: String,
+    pub(crate) windows: Vec<String>,
     pub source: HostSessionProof,
     pub census: Census,
     pub paused_terminals: Vec<TerminalId>,
@@ -3064,6 +3097,8 @@ fn recovered_data(
     descriptors.extend(additional);
     AlreadyRecovered {
         witness,
+        job: record.job,
+        windows: record.windows,
         source: record.source,
         census: record.census,
         paused_terminals: record.paused_terminals,
