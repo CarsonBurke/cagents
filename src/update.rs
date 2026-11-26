@@ -1527,6 +1527,14 @@ fn start_job(
     version: &str,
     request: &UpdateRequest,
 ) -> Result<UpdateJob, UpdateError> {
+    #[cfg(target_os = "macos")]
+    let _publication = crate::install_guard::admit_darwin_update_start().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            UpdateError::Busy
+        } else {
+            error.into()
+        }
+    })?;
     recovery::inspect_pending_current()?;
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
