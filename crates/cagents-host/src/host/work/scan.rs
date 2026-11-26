@@ -16,6 +16,7 @@ use std::{
 
 use crate::{
     git_watch,
+    github::{GitHubRepoKey, remote_repository_key},
     linear::context::LinkedIssue,
     model::{ProjectId, WorktreeId},
     repository::{
@@ -70,6 +71,9 @@ pub(super) struct ForgeHints {
     pub branches: BTreeSet<String>,
     /// Branch to the head commits of its merged pull requests.
     pub merged: BTreeMap<String, BTreeSet<String>>,
+    /// Branch to the head commits of its open pull requests, each with the
+    /// repository the pull request comes from.
+    pub open: BTreeMap<String, BTreeMap<String, GitHubRepoKey>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,9 +87,16 @@ pub(super) struct Local {
     pub branches: BTreeMap<String, Branch>,
     /// Every local branch name, for telling remote-only pull requests apart.
     pub branch_names: BTreeSet<String>,
-    /// Whether a local commit is the merged pull request head or its
-    /// ancestor, by (local commit, pull request head).
+    /// Whether a pull request's head contains a local branch's commit: is
+    /// that commit or a descendant of it, by (local commit, pull request
+    /// head). A missing entry is no.
     pub ancestry: BTreeMap<(String, String), bool>,
+    /// Git's answers to whether one commit is the other or its ancestor,
+    /// by (ancestor, descendant), which never change.
+    reachable: HashMap<(String, String), bool>,
+    /// Commits Git could not answer for when last asked, such as a pull
+    /// request head it does not have, not asked again until the refs move.
+    unreadable: BTreeSet<String>,
     pub plan: Option<Arc<git_watch::Project>>,
     pub plan_error: Option<String>,
     /// Checkouts a failed plan read was asked to re-read. A retry re-reads
@@ -99,6 +110,10 @@ pub(super) struct Local {
     status_reads: HashMap<WorktreeId, git_watch::StatusRead>,
     base_ref: Option<String>,
     tips: Arc<[RefTip]>,
+    /// The open pull requests' branches and repositories the census read
+    /// remote-tracking branches for, and those branches' full ref names.
+    tracked: Vec<(String, GitHubRepoKey)>,
+    tracking: BTreeMap<String, Vec<String>>,
     /// When the worktree list was last read; a project the watcher cannot
     /// see re-reads it on a timer.
     pub listed_at: Option<Instant>,
@@ -171,23 +186,37 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         .map(|record| record.path.clone());
     // The default branch and the branch tips move only with the refs, and
     // with the configuration that names a remote's default branch.
-    let (base_ref, tips) = match previous {
-        Some(previous) if !listed && !change.references && !change.configuration => {
-            (previous.base_ref.clone(), previous.tips.clone())
+    // An open pull request's branch is also read as each remote that names
+    // its repository last fetched it, which remotes the configuration says.
+    let tracked = tracked_branches(hints);
+    let (base_ref, tips, tracking) = match previous {
+        Some(previous)
+            if !listed
+                && !change.references
+                && !change.configuration
+                && previous.tracked == tracked =>
+        {
+            (
+                previous.base_ref.clone(),
+                previous.tips.clone(),
+                previous.tracking.clone(),
+            )
         }
         _ => {
             let base_ref = git
                 .default_branch_ref(repository, cancellation)
                 .map_err(text)?;
+            let tracking = tracking_refs(&git, repository, &tracked, cancellation);
             let mut patterns = vec!["refs/heads"];
             if let Some(base) = &base_ref {
                 patterns.push(base);
             }
+            patterns.extend(tracking.values().flatten().map(String::as_str));
             let tips = git
                 .ref_tips(repository, &patterns, cancellation)
                 .map_err(text)?
                 .into();
-            (base_ref, tips)
+            (base_ref, tips, tracking)
         }
     };
     let base = base_ref.as_ref().and_then(|refname| {
@@ -503,6 +532,45 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         }
     }
 
+    // Git's answers are kept by commit, so a rescan asks only about commits
+    // that moved. A commit Git could not answer for, such as a pull request
+    // head it was never sent, is asked about again once the refs move, as a
+    // fetch that brings it moves them.
+    let census_kept = previous.is_some_and(|previous| Arc::ptr_eq(&previous.tips, &tips));
+    let mut reachable = HashMap::new();
+    let mut unreadable = BTreeSet::new();
+    let mut contains = |ancestor: &str, descendant: &str| -> Option<bool> {
+        if ancestor == descendant {
+            return Some(true);
+        }
+        let key = (ancestor.to_owned(), descendant.to_owned());
+        let known = reachable
+            .get(&key)
+            .or_else(|| previous.and_then(|previous| previous.reachable.get(&key)))
+            .copied();
+        if let Some(contained) = known {
+            reachable.insert(key, contained);
+            return Some(contained);
+        }
+        if unreadable.contains(descendant)
+            || census_kept
+                && previous.is_some_and(|previous| previous.unreadable.contains(descendant))
+        {
+            unreadable.insert(descendant.to_owned());
+            return None;
+        }
+        match git.is_ancestor(repository, ancestor, descendant, cancellation) {
+            Ok(contained) => {
+                reachable.insert(key, contained);
+                Some(contained)
+            }
+            Err(_) => {
+                unreadable.insert(descendant.to_owned());
+                None
+            }
+        }
+    };
+
     // A merged pull request lands a card only when nothing local remains
     // beyond its head. A head that is not present locally (GitHub's "Update
     // branch", say) is not an answer; the default branch containing the local
@@ -513,25 +581,47 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             continue;
         };
         for head in heads {
-            let key = (branch.oid.clone(), head.clone());
-            let known = (branch.oid == *head)
-                .then_some(true)
-                .or_else(|| previous.and_then(|previous| previous.ancestry.get(&key).copied()));
-            let contained = match known {
-                Some(contained) => Some(contained),
-                None => git
-                    .is_ancestor(repository, &branch.oid, head, cancellation)
-                    .ok()
-                    .or_else(|| {
-                        let base = base.as_ref()?;
-                        git.is_ancestor(repository, &branch.oid, &base.oid, cancellation)
-                            .ok()
-                            .filter(|merged| *merged)
-                    }),
-            };
+            let contained = contains(&branch.oid, head).or_else(|| {
+                let base = base.as_ref()?;
+                contains(&branch.oid, &base.oid).filter(|merged| *merged)
+            });
             if let Some(contained) = contained {
-                ancestry.insert(key, contained);
+                ancestry.insert((branch.oid.clone(), head.clone()), contained);
             }
+        }
+    }
+    // An open pull request lacks unpushed commits when its head contains the
+    // local branch, which is then behind it or at it. A head Git does not
+    // have (a push from another machine, a suggestion committed on GitHub) is
+    // not an answer; the branch as its remote last fetched it containing the
+    // local commit says that commit was pushed there.
+    let tracking_tips = tracking
+        .values()
+        .flatten()
+        .filter_map(|refname| {
+            let tip = tips
+                .iter()
+                .find(|tip| tip.refname.as_os_str() == OsStr::new(refname))?;
+            Some((refname.as_str(), tip.oid.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (name, heads) in &hints.open {
+        let Some(branch) = branches.get(name) else {
+            continue;
+        };
+        let fetched = tracking
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|refname| tracking_tips.get(refname.as_str()).copied())
+            .collect::<Vec<_>>();
+        for head in heads.keys() {
+            let contained = contains(&branch.oid, head).unwrap_or_else(|| {
+                fetched
+                    .iter()
+                    .any(|fetched| contains(&branch.oid, fetched) == Some(true))
+            });
+            ancestry.insert((branch.oid.clone(), head.clone()), contained);
         }
     }
 
@@ -654,6 +744,8 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         branches,
         branch_names: local_tips.into_keys().collect(),
         ancestry,
+        reachable,
+        unreadable,
         plan,
         plan_error,
         plan_retry,
@@ -662,8 +754,65 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         status_reads,
         base_ref,
         tips,
+        tracked,
+        tracking,
         listed_at,
     })
+}
+
+/// Each open pull request's branch with the repository it comes from, once.
+fn tracked_branches(hints: &ForgeHints) -> Vec<(String, GitHubRepoKey)> {
+    let mut tracked = Vec::<(String, GitHubRepoKey)>::new();
+    for (name, heads) in &hints.open {
+        for repository in heads.values() {
+            if !tracked
+                .iter()
+                .any(|(known, key)| known == name && key.same_repository(repository))
+            {
+                tracked.push((name.clone(), repository.clone()));
+            }
+        }
+    }
+    tracked
+}
+
+/// Each tracked branch's remote-tracking refs: the branch under every remote
+/// that names the repository its pull request comes from. A configuration
+/// Git cannot read names none.
+fn tracking_refs(
+    git: &RepositoryService,
+    repository: &Path,
+    tracked: &[(String, GitHubRepoKey)],
+    cancellation: &CancellationToken,
+) -> BTreeMap<String, Vec<String>> {
+    let mut tracking = BTreeMap::<String, Vec<String>>::new();
+    if tracked.is_empty() {
+        return tracking;
+    }
+    let remotes = match git.remotes(repository, cancellation) {
+        Ok(remotes) => remotes,
+        Err(error) => {
+            tracing::debug!(%error, "reading remotes for pull request branches");
+            return tracking;
+        }
+    };
+    for remote in &remotes {
+        let keys = [remote.fetch_url.as_deref(), remote.push_url.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(remote_repository_key)
+            .collect::<Vec<_>>();
+        for (name, repository) in tracked {
+            if keys.iter().any(|key| key.same_repository(repository)) {
+                let refs = tracking.entry(name.clone()).or_default();
+                let refname = format!("refs/remotes/{}/{name}", remote.name);
+                if !refs.contains(&refname) {
+                    refs.push(refname);
+                }
+            }
+        }
+    }
+    tracking
 }
 
 fn branch_ref(identity: &str) -> OsString {
@@ -857,6 +1006,28 @@ mod tests {
         in_use: &BTreeSet<PathBuf>,
         now_unix_ms: u64,
     ) -> Local {
+        let hints = ForgeHints {
+            branches: BTreeSet::from(["mine".to_owned()]),
+            merged: BTreeMap::from([(
+                "feature".to_owned(),
+                BTreeSet::from([git(&fixture.root, &["rev-parse", "feature"])
+                    .trim()
+                    .to_owned()]),
+            )]),
+            open: BTreeMap::new(),
+        };
+        run_hinted(fixture, previous, change, full, in_use, now_unix_ms, &hints)
+    }
+
+    fn run_hinted(
+        fixture: &Fixture,
+        previous: Option<&Local>,
+        change: &git_watch::Change,
+        full: bool,
+        in_use: &BTreeSet<PathBuf>,
+        now_unix_ms: u64,
+        hints: &ForgeHints,
+    ) -> Local {
         let repository = fixture.root.join(".git");
         // A project keeps its ID across scans, as the board's does.
         let id = previous
@@ -869,19 +1040,156 @@ mod tests {
             change,
             full,
             in_use,
-            hints: &ForgeHints {
-                branches: BTreeSet::from(["mine".to_owned()]),
-                merged: BTreeMap::from([(
-                    "feature".to_owned(),
-                    BTreeSet::from([git(&fixture.root, &["rev-parse", "feature"])
-                        .trim()
-                        .to_owned()]),
-                )]),
-            },
+            hints,
             now_unix_ms,
             cancellation: &CancellationToken::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn an_open_pull_request_contains_a_branch_it_is_ahead_of() {
+        let fixture = fixture();
+        let rev = |revision: &str| {
+            git(&fixture.root, &["rev-parse", revision])
+                .trim()
+                .to_owned()
+        };
+        let commit_on = |parent: &str, message: &str| {
+            git(
+                &fixture.root,
+                &["commit-tree", "feature^{tree}", "-p", parent, "-m", message],
+            )
+            .trim()
+            .to_owned()
+        };
+        let local = rev("feature");
+        let parent = rev("feature^");
+        // A suggestion committed on GitHub and fetched, but not pulled.
+        let behind = commit_on("feature", "suggestion");
+        // The local commit amended, and another pushed in its place.
+        let diverged = commit_on("feature^", "elsewhere");
+        // A head Git does not have: the suggestion, not yet fetched.
+        let unfetched = "0123456789abcdef0123456789abcdef01234567".to_owned();
+        let repository = GitHubRepoKey::new("github.com", None, "me", "repo").unwrap();
+        let hints = ForgeHints {
+            branches: BTreeSet::from(["feature".to_owned()]),
+            merged: BTreeMap::new(),
+            open: BTreeMap::from([(
+                "feature".to_owned(),
+                [&behind, &parent, &diverged, &unfetched]
+                    .into_iter()
+                    .map(|head| (head.clone(), repository.clone()))
+                    .collect(),
+            )]),
+        };
+        let scan = |previous: Option<&Local>, change: &git_watch::Change| {
+            run_hinted(
+                &fixture,
+                previous,
+                change,
+                false,
+                &BTreeSet::new(),
+                crate::chat::now_ms().unwrap(),
+                &hints,
+            )
+        };
+        let contains = |scanned: &Local, head: &str| {
+            scanned
+                .ancestry
+                .get(&(local.clone(), head.to_owned()))
+                .copied()
+        };
+        let fetched = |oid: &str| {
+            git(
+                &fixture.root,
+                &["update-ref", "refs/remotes/origin/feature", oid],
+            );
+        };
+        let moved = git_watch::Change {
+            references: true,
+            configuration: true,
+            ..git_watch::Change::default()
+        };
+
+        git(
+            &fixture.root,
+            &["remote", "add", "origin", "https://github.com/me/repo.git"],
+        );
+        // A fork's same-named branch is not the pull request's.
+        git(
+            &fixture.root,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/someone/repo.git",
+            ],
+        );
+        git(
+            &fixture.root,
+            &["update-ref", "refs/remotes/fork/feature", &local],
+        );
+        let first = scan(None, &git_watch::Change::default());
+        assert_eq!(
+            contains(&first, &behind),
+            Some(true),
+            "a branch behind its pull request has nothing unpushed"
+        );
+        assert_eq!(
+            contains(&first, &parent),
+            Some(false),
+            "a branch ahead of its pull request has unpushed commits"
+        );
+        assert_eq!(contains(&first, &diverged), Some(false));
+        assert_eq!(
+            contains(&first, &unfetched),
+            Some(false),
+            "a branch never pushed to the pull request's repository is unpushed"
+        );
+
+        // Pushed before the suggestion, with no upstream configured: the
+        // branch as the remote last fetched it holds the local commit.
+        fetched(&local);
+        let pushed = scan(Some(&first), &moved);
+        assert_eq!(contains(&pushed, &unfetched), Some(true));
+        assert_eq!(contains(&pushed, &behind), Some(true));
+        assert_eq!(contains(&pushed, &parent), Some(false));
+
+        // `git worktree add -b feature PATH origin/main` tracks main, which
+        // the branch is not pushed to.
+        git(
+            &fixture.root,
+            &["config", "branch.feature.remote", "origin"],
+        );
+        git(
+            &fixture.root,
+            &["config", "branch.feature.merge", "refs/heads/main"],
+        );
+        let tracking_main = scan(Some(&pushed), &moved);
+        assert_eq!(contains(&tracking_main, &unfetched), Some(true));
+
+        // Committed on after the push, or rewritten since.
+        fetched(&parent);
+        let ahead = scan(Some(&tracking_main), &moved);
+        assert_eq!(contains(&ahead, &unfetched), Some(false));
+        fetched(&diverged);
+        let rewritten = scan(Some(&ahead), &moved);
+        assert_eq!(contains(&rewritten, &unfetched), Some(false));
+        assert_eq!(contains(&rewritten, &behind), Some(true));
+
+        // Git's answers are by commit: a rescan, even after the refs move,
+        // asks Git again only about commits it did not answer for.
+        let mut answered = rewritten.clone();
+        answered
+            .reachable
+            .insert((local.clone(), behind.clone()), false);
+        let unchanged = scan(Some(&answered), &git_watch::Change::default());
+        assert_eq!(contains(&unchanged, &behind), Some(false));
+        assert!(unchanged.unreadable.contains(&unfetched));
+        let refetched = scan(Some(&unchanged), &moved);
+        assert_eq!(contains(&refetched, &behind), Some(false));
+        assert_eq!(contains(&refetched, &unfetched), Some(false));
     }
 
     #[test]
