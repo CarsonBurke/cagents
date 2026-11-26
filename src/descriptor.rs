@@ -24,21 +24,6 @@ pub(crate) fn wait_for_activity(
     events: libc::c_short,
     deadline: Option<Instant>,
 ) -> io::Result<bool> {
-    wait_for_events(
-        &mut [libc::pollfd {
-            fd: descriptor.as_raw_fd(),
-            events,
-            revents: 0,
-        }],
-        deadline,
-    )
-}
-
-/// Wait for any of the requested descriptor events, preserving the ready set.
-pub(crate) fn wait_for_events(
-    watched: &mut [libc::pollfd],
-    deadline: Option<Instant>,
-) -> io::Result<bool> {
     loop {
         let timeout = if let Some(deadline) = deadline {
             let now = Instant::now();
@@ -50,9 +35,13 @@ pub(crate) fn wait_for_events(
         } else {
             -1
         };
-        // SAFETY: the entire slice is writable storage for the system call.
-        let ready =
-            unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as libc::nfds_t, timeout) };
+        let mut watched = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: the descriptor is borrowed, and poll sees one live pollfd.
+        let ready = unsafe { libc::poll(&mut watched, 1, timeout) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -60,16 +49,10 @@ pub(crate) fn wait_for_events(
             }
             return Err(error);
         }
-        if watched
-            .iter()
-            .any(|entry| entry.revents & libc::POLLNVAL != 0)
-        {
+        if watched.revents & libc::POLLNVAL != 0 {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
-        if watched
-            .iter()
-            .any(|entry| entry.revents & (entry.events | libc::POLLHUP | libc::POLLERR) != 0)
-        {
+        if watched.revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
             return Ok(true);
         }
     }

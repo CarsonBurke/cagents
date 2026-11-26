@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd},
+        fd::{AsFd, AsRawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -4700,16 +4700,6 @@ fn read_ui_launch_handshake(
     response_stream: &mut (impl Read + AsFd),
     timeout: Duration,
 ) -> io::Result<Option<String>> {
-    read_ui_launch_handshake_with(response_stream, timeout, |descriptor, deadline| {
-        crate::descriptor::wait_for_activity(descriptor, libc::POLLIN, Some(deadline))
-    })
-}
-
-fn read_ui_launch_handshake_with(
-    response_stream: &mut (impl Read + AsFd),
-    timeout: Duration,
-    wait: impl Fn(BorrowedFd<'_>, Instant) -> io::Result<bool>,
-) -> io::Result<Option<String>> {
     crate::descriptor::set_nonblocking(response_stream.as_fd())?;
 
     let started = Instant::now();
@@ -4757,7 +4747,11 @@ fn read_ui_launch_handshake_with(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !wait(response_stream.as_fd(), deadline)? {
+                if !crate::descriptor::wait_for_activity(
+                    response_stream.as_fd(),
+                    libc::POLLIN,
+                    Some(deadline),
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         if recovery_announced {
