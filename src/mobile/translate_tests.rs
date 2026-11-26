@@ -309,3 +309,37 @@ fn only_unacknowledged_notices_reach_the_phone_newest_first() {
     };
     assert!(!notices(&finished_snapshot)[0].asks);
 }
+
+#[test]
+fn tool_preview_flags_distinguish_clipped_input_and_output() {
+    let make_tool = |input: String, output: String| chat::Item {
+        id: "tool".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Tool {
+            name: "Build".into(),
+            input,
+            output,
+            status: chat::ToolStatus::Running,
+        },
+        at: None,
+        started_at: None,
+    };
+    let long_input = make_tool("args".repeat(INPUT_HEAD_BYTES), "ok".into());
+    assert!(matches!(
+        item(&long_input).body,
+        api::ItemBody::Tool {
+            clipped: true,
+            output_clipped: false,
+            ..
+        }
+    ));
+    let long_output = make_tool("args".into(), "output".repeat(OUTPUT_TAIL_BYTES));
+    assert!(matches!(
+        item(&long_output).body,
+        api::ItemBody::Tool {
+            clipped: true,
+            output_clipped: true,
+            ..
+        }
+    ));
+}

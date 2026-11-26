@@ -148,6 +148,8 @@ libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 notify = "=9.0.0-rc.8"
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
+# The mobile bridge validates PNG bytes before staging an attachment.
+png = "0.18"
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
 # binary payload; a self-describing text format costs ~24x more bytes and one
 # heap allocation per character cell on both sides. postcard is already in the
@@ -187,6 +189,11 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c255
 # opens with open(1) and has no tray yet.
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"], optional = true }
 ksni = { version = "0.3.6", optional = true }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# Exact recovery repeatedly authenticates large executable images. This
+# version selects the arm64 SHA instructions in Rust without a C build.
+sha2-image = { package = "sha2", version = "0.11" }
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["test-util"] }

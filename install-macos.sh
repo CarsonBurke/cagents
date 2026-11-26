@@ -65,15 +65,17 @@ PURGE=0
 PUBLISH_TREE=
 PUBLISHER=
 PUBLISH_REMOVAL=0
+EXTRACT_DIR=
 while [ "$#" -gt 0 ]; do
     case $1 in
-        --version|--prefix|--publish-tree|--publisher)
+        --version|--prefix|--publish-tree|--publisher|--extract-update)
             [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$1 requires a value"
             case $1 in
                 --version) VERSION=${2#v} ;;
                 --prefix) PREFIX=$2 ;;
                 --publish-tree) PUBLISH_TREE=$2 ;;
                 --publisher) PUBLISHER=$2 ;;
+                --extract-update) EXTRACT_DIR=$2 ;;
             esac
             shift 2
             ;;
@@ -97,9 +99,26 @@ case $HOME in
     /*) ;;
     *) fail 'HOME must be an absolute path' ;;
 esac
-for command in awk cmp codesign curl diff ditto find launchctl ln mkdir mktemp mv osascript plutil rm shasum tar; do
+for command in awk cmp codesign curl diff ditto find launchctl ln mkdir mktemp mv osascript plutil rm shasum stat tar; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+
+if [ -n "$EXTRACT_DIR" ]; then
+    [ "$UNINSTALL" -eq 0 ] && [ "$PUBLISH_REMOVAL" -eq 0 ] \
+        && [ -z "$PUBLISH_TREE" ] && [ -z "$PUBLISHER" ] \
+        || fail 'an update extraction cannot publish or remove an installation'
+    [ -n "$PREFIX" ] && [ -n "$VERSION" ] || fail 'update extraction needs --prefix and --version'
+    case ${CAGENTS_ARCHIVE:-} in
+        /*) ;;
+        *) fail 'update extraction needs an absolute CAGENTS_ARCHIVE file path' ;;
+    esac
+    case ${CAGENTS_CHECKSUMS:-} in
+        /*) ;;
+        *) fail 'update extraction needs an absolute CAGENTS_CHECKSUMS file path' ;;
+    esac
+    [ -f "$CAGENTS_ARCHIVE" ] && [ -f "$CAGENTS_CHECKSUMS" ] \
+        || fail 'update extraction needs the local archive and checksum files'
+fi
 
 PREFIX=${PREFIX:-"$HOME/Library/Application Support/cagents-install"}
 case $PREFIX in
@@ -136,6 +155,34 @@ register_app() {
 # The installation this script made, or nothing at PREFIX at all.
 owned_prefix() {
     [ -f "$MARKER" ] && [ ! -L "$MARKER" ] && [ "$(cat "$MARKER")" = "$MARKER_TEXT" ]
+}
+
+# The update worker owns this directory for the lifetime of the extraction.
+# Work inside it so publishing the validated tree needs only a local rename.
+verify_extract_dir() {
+    uid=$(id -u)
+    [ "$PREFIX" = "$(CDPATH= cd -P "$PREFIX" && pwd -P)" ] && owned_prefix \
+        && [ "$(stat -f %u "$PREFIX")" = "$uid" ] \
+        || fail 'update extraction needs an owned, physical installation prefix'
+    prefix_mode=$(stat -f %Lp "$PREFIX") || fail 'cannot inspect the installation permissions'
+    [ "$((0$prefix_mode & 022))" -eq 0 ] || fail 'the installation directory is writable by others'
+    [ "${EXTRACT_DIR%/*}" = "$PREFIX/.update" ] \
+        && [ "$EXTRACT_DIR" = "$(CDPATH= cd -P "$EXTRACT_DIR" && pwd -P)" ] \
+        || fail 'update extraction needs a physical directory directly under .update'
+    [ "$(stat -f '%u:%Lp' "$PREFIX/.update")" = "$uid:700" ] \
+        && [ "$(stat -f '%u:%Lp' "$EXTRACT_DIR")" = "$uid:700" ] \
+        || fail 'the update extraction directories must be private'
+    entries=$(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -print) \
+        || fail 'cannot inspect the update extraction directory'
+    [ -z "$entries" ] || fail 'the update extraction directory must be empty'
+}
+
+verify_program_versions() {
+    for program in cagents cagentsd cagents-ui cagents-dictate; do
+        reported=$("$1/bin/$program" --version) || fail "cagents $VERSION could not run $program on this Mac"
+        [ "$reported" = "$program $VERSION" ] \
+            || fail "the release holds $reported, expected $program $VERSION"
+    done
 }
 
 # Removes LINK when it is a symbolic link to TARGET, and only then.
@@ -283,15 +330,22 @@ fi
 [ "$PUBLISH_REMOVAL" -eq 0 ] || fail 'invalid publication request'
 
 if [ -z "$PUBLISH_TREE" ]; then
-    STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cagents-download.XXXXXX")
+    if [ -n "$EXTRACT_DIR" ]; then
+        verify_extract_dir
+        STAGE=$(mktemp -d "$EXTRACT_DIR/.unpacking.XXXXXX")
+    else
+        STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cagents-download.XXXXXX")
+    fi
     trap 'rm -rf "$STAGE"' EXIT
     trap 'exit 1' HUP INT TERM
 
-    REPOSITORY=${CAGENTS_REPOSITORY:-$DEFAULT_REPOSITORY}
-    case $REPOSITORY in
-        '<OWNER>/<REPO>'|'') fail 'set CAGENTS_REPOSITORY to the GitHub OWNER/REPO for this project' ;;
-        */*/*|*[!A-Za-z0-9._/-]*) fail "invalid repository: $REPOSITORY" ;;
-    esac
+    if [ -z "$EXTRACT_DIR" ]; then
+        REPOSITORY=${CAGENTS_REPOSITORY:-$DEFAULT_REPOSITORY}
+        case $REPOSITORY in
+            '<OWNER>/<REPO>'|'') fail 'set CAGENTS_REPOSITORY to the GitHub OWNER/REPO for this project' ;;
+            */*/*|*[!A-Za-z0-9._/-]*) fail "invalid repository: $REPOSITORY" ;;
+        esac
+    fi
     CURL_OPTIONS='--disable --proto =https --tlsv1.2 --fail --location --silent --show-error'
     LOCAL_ARCHIVE=${CAGENTS_ARCHIVE:-}
     LOCAL_CHECKSUMS=${CAGENTS_CHECKSUMS:-}
@@ -334,7 +388,6 @@ if [ -z "$PUBLISH_TREE" ]; then
     # Accept exactly the release's members, so the archive cannot place files
     # anywhere else or smuggle links into the version tree.
     tar -tzf "$STAGE/$ARCHIVE_NAME" > "$STAGE/members" || fail "cannot read $ARCHIVE_NAME"
-    LC_ALL=C sort -o "$STAGE/members" "$STAGE/members"
     for member in \
         '' bin/ bin/cagents bin/cagents-dictate bin/cagents-ui bin/cagentsd \
         Cagents.app/ Cagents.app/Contents/ Cagents.app/Contents/Info.plist \
@@ -344,21 +397,34 @@ if [ -z "$PUBLISH_TREE" ]; then
         share/ share/doc/ share/doc/cagents/ share/doc/cagents/LICENSE share/doc/cagents/THIRD-PARTY-NOTICES
     do
         printf '%s\n' "$TOP_LEVEL/$member"
-    done | sed 's|/$||' | LC_ALL=C sort > "$STAGE/expected"
-    sed 's|/$||' "$STAGE/members" | LC_ALL=C sort | cmp -s - "$STAGE/expected" \
+    done > "$STAGE/expected"
+    sed 's|/$||' "$STAGE/expected" | LC_ALL=C sort > "$STAGE/expected-paths"
+    sed 's|/$||' "$STAGE/members" | LC_ALL=C sort | cmp -s - "$STAGE/expected-paths" \
         || fail "$ARCHIVE_NAME has missing or unexpected members"
     mkdir "$STAGE/tree"
     tar -xzf "$STAGE/$ARCHIVE_NAME" -C "$STAGE/tree" --no-same-owner || fail "cannot unpack $ARCHIVE_NAME"
     NEW=$STAGE/tree/$TOP_LEVEL
-    find "$NEW" -type l | grep -q . && fail "$ARCHIVE_NAME holds symbolic links"
+    while IFS= read -r member; do
+        path=$STAGE/tree/${member%/}
+        [ ! -L "$path" ] || fail "$ARCHIVE_NAME holds a symbolic link at $member"
+        case $member in
+            */) [ -d "$path" ] || fail "$ARCHIVE_NAME needs a directory at $member" ;;
+            *) [ -f "$path" ] && [ "$(stat -f %l "$path")" = 1 ] \
+                || fail "$ARCHIVE_NAME needs a regular, unlinked file at $member" ;;
+        esac
+    done < "$STAGE/expected"
     # A download through a browser carries quarantine, which Gatekeeper would
     # turn into a refusal for an ad hoc signed app the person chose to install.
     xattr -dr com.apple.quarantine "$NEW" 2>/dev/null || :
     for path in "$NEW/bin/cagents" "$NEW/bin/cagentsd" "$NEW/bin/cagents-ui" "$NEW/bin/cagents-dictate" "$NEW/Cagents.app"; do
         codesign --verify --strict "$path" 2>/dev/null || fail "${path#"$NEW/"} is not intact; download the release again"
     done
-    reported=$("$NEW/bin/cagents" --version) || fail 'the downloaded cagents does not run on this Mac'
-    [ "$reported" = "cagents $VERSION" ] || fail "the archive holds $reported, not cagents $VERSION"
+    verify_program_versions "$NEW"
+
+    if [ -n "$EXTRACT_DIR" ]; then
+        mv "$NEW" "$EXTRACT_DIR/$TOP_LEVEL" || fail 'cannot keep the verified update tree'
+        exit 0
+    fi
 
     NEW=$(cd "$NEW" && pwd -P) || fail 'cannot locate the verified release tree'
     publisher=$NEW/bin/cagents
@@ -651,10 +717,7 @@ else
     mv "$NEW" "$TARGET_DIR" || fail 'cannot move the release into place'
 fi
 # Ready means every program answers from where it will run.
-for program in cagents cagentsd cagents-ui cagents-dictate; do
-    [ "$("$TARGET_DIR/bin/$program" --version 2>/dev/null)" = "$program $VERSION" ] \
-        || fail "the installed $program does not run"
-done
+verify_program_versions "$TARGET_DIR"
 
 { rm -f "$PREFIX/.current.$$" && ln -s "versions/$VERSION" "$PREFIX/.current.$$" \
     && mv -fh "$PREFIX/.current.$$" "$PREFIX/current"; } || fail 'cannot select the new version'

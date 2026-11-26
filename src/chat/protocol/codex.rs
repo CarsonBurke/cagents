@@ -261,23 +261,27 @@ pub(crate) fn create_with_listener(
     create_with_listener_for_start(launch, socket).map_err(|error| error.to_string())
 }
 
+// All sockaddr_un fields are integers, so its all-zero value is valid.
+pub const OWNED_LISTENER_PATH_CAPACITY: usize = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+    .sun_path
+    .len();
+
+/// Whether Codex can pass this listener path as a Unix socket address.
+pub fn owned_listener_path_fits(socket: &std::path::Path) -> bool {
+    let bytes = socket.as_os_str().as_encoded_bytes();
+    socket.to_str().is_some()
+        && !bytes.is_empty()
+        && !bytes.contains(&0)
+        && bytes.len() < OWNED_LISTENER_PATH_CAPACITY
+}
+
 pub fn create_with_listener_for_start(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
-    let bytes = socket.as_os_str().as_encoded_bytes();
-    // Match the actual platform Unix address before any provider can start.
-    // All sockaddr_un fields are integers, so its all-zero value is valid.
-    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
-        .sun_path
-        .len();
-    if socket.to_str().is_none()
-        || bytes.is_empty()
-        || bytes.contains(&0)
-        || bytes.len() >= capacity
-    {
+    if !owned_listener_path_fits(&socket) {
         return Err(super::SetupError::Invalid(format!(
-            "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter UTF-8 temporary directory"
+            "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {OWNED_LISTENER_PATH_CAPACITY} bytes; use a shorter UTF-8 temporary directory"
         )));
     }
     create_inner(launch, Some(socket), None)

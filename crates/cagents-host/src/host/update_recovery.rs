@@ -33,6 +33,23 @@ pub(super) fn restore_settled_from(
 /// Ordinary startup restores only current, authenticated holders and the
 /// current Ready checkpoint. Archived update evidence cannot recreate panes.
 pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
+    restore_ordinary_with(host, state::restore_upgrade)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn restore_ordinary_with_process_fixture(
+    host: &SharedHost,
+    processes: &std::path::Path,
+) -> Result<(), String> {
+    restore_ordinary_with(host, |host| {
+        state::restore_upgrade_with_process_fixture(host, processes)
+    })
+}
+
+fn restore_ordinary_with(
+    host: &SharedHost,
+    restore_upgrade: impl FnOnce(&SharedHost) -> Result<Vec<crate::model::TerminalId>, String>,
+) -> Result<(), String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: previous boot history", None);
     chat::retained_actor::reconcile_previous_boot_history(host)?;
@@ -41,7 +58,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     let ready_capture = crate::upgrade::recovery::verified::ready::capture()?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
-    let unattached = state::restore_upgrade(host)?;
+    let unattached = restore_upgrade(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;

@@ -136,6 +136,10 @@ pub enum UpdateError {
     UnsupportedInstallation,
     #[error("{0}")]
     Invalid(String),
+    #[error("No published release of cagents offers in-app updates yet.")]
+    NoPublishedRelease,
+    #[error("The release server has no asset at {0}.")]
+    ReleaseAssetMissing(String),
     #[error("another update is already running")]
     Busy,
     #[error(transparent)]
@@ -578,10 +582,17 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
         Ok(feed) => feed,
         Err(reason) => return Ok(UpdateState::Unsupported { reason }),
     };
-    let release = feed.latest(
+    let release = match feed.latest(
         |version| offers_release(&installation, version),
         cancellation,
-    )?;
+    ) {
+        Err(error @ UpdateError::NoPublishedRelease) => {
+            return Ok(UpdateState::Unsupported {
+                reason: error.to_string(),
+            });
+        }
+        result => result?,
+    };
     Ok(match release {
         Some(release) => offered(release, cfg!(target_os = "macos")),
         None => UpdateState::Current {
@@ -2402,23 +2413,12 @@ fn perform_update(
         UpdatePhase::Downloading,
         "Downloading the release",
     )?;
-    // The signed metadata names every digest. The checksum file the installer
-    // reads again must agree with it, or the two would vouch for different
-    // bytes.
-    let mut checksums = feed.download(&release, &release.checksums, &cancellation)?;
-    let mut manifest = String::new();
-    checksums.read_to_string(&mut manifest)?;
-    checksums.seek(SeekFrom::Start(0))?;
+    let feed::VerifiedAssets {
+        installer,
+        archive,
+        checksums,
+    } = feed.verified_assets(&release, &cancellation)?;
     let archive_hash = release.archive.sha256;
-    if checksum_for(&manifest, &release.archive.name)? != archive_hash
-        || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
-    {
-        return Err(invalid(
-            "the release's checksum file disagrees with its signed metadata",
-        ));
-    }
-    let installer = feed.download(&release, &release.installer, &cancellation)?;
-    let archive = feed.download(&release, &release.archive, &cancellation)?;
     set_phase(
         state,
         job,
@@ -3724,6 +3724,24 @@ fn bounded_command(
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<File, UpdateError> {
+    bounded_command_with_stderr(
+        command,
+        operation,
+        limit,
+        timeout,
+        cancellation,
+        Stdio::null(),
+    )
+}
+
+fn bounded_command_with_stderr(
+    command: &mut Command,
+    operation: &'static str,
+    limit: u64,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    stderr: Stdio,
+) -> Result<File, UpdateError> {
     if cancellation.cancelled() {
         return Err(UpdateError::Cancelled);
     }
@@ -3731,7 +3749,7 @@ fn bounded_command(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0);
     let child = command
         .spawn()
