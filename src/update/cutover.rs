@@ -297,14 +297,13 @@ fn finish_windows(
 mod tests {
     use super::*;
 
-    #[test]
-    fn selector_intent_requires_the_exact_same_boot_scope_and_unique_windows() {
+    fn intent() -> Intent {
         let source = HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("original-ready"),
             boot_id: crate::model::BootId::new("same-boot"),
             host_incarnation: crate::model::HostIncarnation::new("original"),
         };
-        let mut intent = Intent {
+        Intent {
             job: uuid::Uuid::new_v4().to_string(),
             request_digest: "a".repeat(64),
             checkpoint_digest: "b".repeat(64),
@@ -319,7 +318,12 @@ mod tests {
             process: crate::daemon::holder_registry::Process { pid: 42, start: 17 },
             windows: vec!["main".into()],
             stage: Stage::Pending,
-        };
+        }
+    }
+
+    #[test]
+    fn selector_intent_requires_the_exact_same_boot_scope_and_unique_windows() {
+        let mut intent = intent();
         intent.validate().unwrap();
         intent.windows.push("main".into());
         assert!(intent.validate().is_err());
@@ -330,5 +334,61 @@ mod tests {
         assert!(intent.validate().is_err());
         intent.successor.boot_id = crate::model::BootId::new("another-boot");
         assert!(intent.validate().is_err());
+    }
+
+    #[test]
+    fn a_live_selected_intent_reserves_its_job_even_after_a_worker_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().canonicalize().unwrap();
+        let version = "0.2.4";
+        let version_root = prefix.join("versions").join(version);
+        fs::create_dir_all(version_root.join("bin")).unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for name in ["cagents", "cagentsd", "cagents-ui"] {
+            File::create(version_root.join("bin").join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink(Path::new("versions").join(version), prefix.join("current"))
+            .unwrap();
+        let layout = locate(&version_root.join("bin/cagentsd")).unwrap();
+        let state = state_dir(&prefix).unwrap();
+        let mut intent = intent();
+        intent.target = version_root.join("bin/cagentsd");
+        let daemon = fs::metadata(&intent.target).unwrap();
+        intent.target_image = (daemon.dev(), daemon.ino());
+        let window = fs::metadata(version_root.join("bin/cagents-ui")).unwrap();
+        intent.window_image = (window.dev(), window.ino());
+        intent.process =
+            crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
+        intent.successor.boot_id = crate::daemon::read_boot_id().unwrap();
+        intent.source.boot_id = intent.successor.boot_id.clone();
+        let job = UpdateJob {
+            id: intent.job.clone(),
+            version: version.into(),
+            phase: UpdatePhase::Failed,
+            message: "Worker exited after selection".into(),
+            log_path: state.join("update.log"),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: None,
+        };
+        let record = path(&state, &job.id);
+        let save = |intent: &Intent| {
+            fs::write(&record, serde_json::to_vec(intent).unwrap()).unwrap();
+            fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        save(&intent);
+        assert!(pending_selected(&layout, &state, &job).unwrap());
+        intent.stage = Stage::Deferred;
+        save(&intent);
+        assert!(!pending_selected(&layout, &state, &job).unwrap());
+        intent.stage = Stage::Pending;
+        intent.process.start += 1;
+        save(&intent);
+        assert!(!pending_selected(&layout, &state, &job).unwrap());
     }
 }
