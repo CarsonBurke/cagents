@@ -250,10 +250,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
                 modifiers,
                 ..
             }) if state.focused && modifiers.command() && !modifiers.alt() => {
-                let message = match key
-                    .to_latin(*physical_key)
-                    .map(|letter| letter.to_ascii_lowercase())
-                {
+                let message = match crate::interaction::latin_key(key, *physical_key) {
                     Some('z') if modifiers.shift() => self.on_redo.clone(),
                     Some('z') => self.on_undo.clone(),
                     Some('y') if !modifiers.shift() => self.on_redo.clone(),

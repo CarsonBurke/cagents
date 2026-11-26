@@ -188,6 +188,24 @@ fn saving_by_shortcut_answers_within_its_own_update() {
     projection_oracle::assert_projected(&mut app);
 }
 
+#[test]
+fn saving_by_shortcut_works_on_a_non_latin_layout() {
+    // On a Russian layout the S key types "ы"; the chord is read through the
+    // physical key, as undo and redo are.
+    let (mut app, card) = repository_app();
+    let save = press(
+        keyboard::Key::Character("ы".into()),
+        Code::KeyS,
+        keyboard::Modifiers::COMMAND,
+    );
+    drop(app.update(save));
+    assert!(
+        matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+        if runtime.save_error() == Some("The original read root is unavailable; reopen this file before saving.")),
+        "Ctrl+S on a Cyrillic layout attempts the save"
+    );
+}
+
 /// Every command that stands for another message, chosen from the palette,
 /// projects the workspace once, however the message it stands for answers.
 #[test]
