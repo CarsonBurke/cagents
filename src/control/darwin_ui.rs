@@ -98,8 +98,9 @@ fn verify_window(
         FrameByteOrder::LittleEndian,
     )
     .map_err(io::Error::other)?;
-    let process = PinnedProcess::open_started(peer.pid, identity.started)?;
-    if process.executable()? != executable
+    let process = PinnedProcess::open(peer.pid)?;
+    if process.started_ticks() != identity.started
+        || process.executable()? != executable
         || crate::process::mapped_region_identity(peer.pid, identity.address)? != image
         || process.exited()?
     {
