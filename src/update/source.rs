@@ -898,7 +898,7 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     ),
     (
         209,
-        "intermediate #4305 review monitor protocol; no released install was qualified as a live-update source",
+        "intermediate #4310 review monitor protocol; no released install was qualified as a live-update source",
     ),
 ];
 
