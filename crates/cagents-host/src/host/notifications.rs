@@ -885,8 +885,15 @@ async fn run(
             // Retained shutdown can enqueue its final settlement immediately
             // before the broker's drop. Finish those durable clears without
             // calling the portal or accepting any new work.
-            if let Ok(journal) = store.journal() {
-                settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting);
+            if !pending.cleared_waiting.is_empty() {
+                match store.journal_for_shutdown() {
+                    Ok(journal) => {
+                        settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not reopen attention journal at shutdown")
+                    }
+                }
             }
             break;
         }
@@ -1981,6 +1988,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(journal.list().unwrap(), [new]);
+    }
+
+    #[test]
+    fn shutdown_reopens_a_recovered_journal_before_the_waiting_retry_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let session = TerminalId::new();
+        let mut store = journal::Reopening::open(Some(path), Instant::now());
+        let mut event = attention_event(session, "question");
+        event.evidence.kind = Kind::Waiting;
+        store.journal().unwrap().record(event, false).unwrap();
+        let failed = Instant::now();
+        store.retry_failed_write("temporary fixture failure".into(), failed);
+        assert!(store.reopen_if_due(failed).is_none());
+        let journal = store.journal_for_shutdown().unwrap();
+        commit_waiting_clears(journal, &[Target::Session(session)].into(), |_, _| {}).unwrap();
+        assert!(journal.list().unwrap()[0].acknowledged);
     }
 
     #[test]

@@ -474,6 +474,16 @@ impl Reopening {
         self.next_attempt
     }
 
+    /// One final write may still succeed before scheduled background retry.
+    pub(super) fn journal_for_shutdown(&mut self) -> Result<&mut Journal, &String> {
+        if self.journal.is_err()
+            && let Some(path) = &self.path
+        {
+            self.journal = Journal::open(path);
+        }
+        self.journal()
+    }
+
     /// When a failed journal is next tried, if it can be.
     pub(super) fn retry_at(&self) -> Option<Instant> {
         (self.journal.is_err() && self.path.is_some()).then_some(self.next_attempt)
