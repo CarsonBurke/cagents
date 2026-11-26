@@ -23,6 +23,9 @@ pub(super) enum Format {
 #[derive(Default)]
 pub(super) struct Edges {
     pub started: bool,
+    /// Whether this read's completion follows its latest root Claude input.
+    /// The live census still decides whether a turn started.
+    pub claude_ordered_notice: bool,
     pub notice: Option<Evidence>,
 }
 
@@ -104,6 +107,7 @@ impl Tails {
         let end = size.min(cursor.offset.saturating_add(MAX_READ));
         let mut buffer = [0; 64 * 1024];
         let mut edges = Edges::default();
+        let mut claude_input = false;
         while cursor.offset < end {
             let length = (end - cursor.offset).min(buffer.len() as u64) as usize;
             file.read_exact_at(&mut buffer[..length], cursor.offset)?;
@@ -132,7 +136,12 @@ impl Tails {
                                 // not come back after the next turn cleared it.
                                 edges.notice = None;
                             }
+                            Some(Boundary::ClaudeInput) => {
+                                claude_input = true;
+                                edges.claude_ordered_notice = false;
+                            }
                             Some(Boundary::Outcome(kind, identity)) => {
+                                edges.claude_ordered_notice = claude_input;
                                 edges.notice = Some(Evidence {
                                     key: identity.unwrap_or_else(|| {
                                         format!("log:{}:{}:{}", key.2, key.3, cursor.offset)
@@ -170,6 +179,7 @@ fn main_codex_rollout(file: &File) -> io::Result<Option<bool>> {
 
 enum Boundary {
     Started,
+    ClaudeInput,
     Outcome(Kind, Option<String>),
 }
 
@@ -180,7 +190,7 @@ fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
             b"\"task_complete\"",
             b"\"turn_aborted\"",
         ],
-        Format::Claude => &[b"\"end_turn\""],
+        Format::Claude => &[b"\"end_turn\"", b"\"user\""],
     };
     if !markers
         .iter()
@@ -201,6 +211,9 @@ fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
             // distinguishes repeated provider turn IDs in imported history.
             Some(Boundary::Outcome(kind, None))
         }
+        Format::Claude if value["type"] == "user" && claude_root_input(&value) => {
+            Some(Boundary::ClaudeInput)
+        }
         Format::Claude if value["type"] == "assistant" && value["isSidechain"] != true => {
             let kind = match value["message"]["stop_reason"].as_str()? {
                 "end_turn" => Kind::Succeeded,
@@ -214,6 +227,50 @@ fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
         }
         _ => None,
     }
+}
+
+fn claude_root_input(value: &serde_json::Value) -> bool {
+    if value["message"]["role"] != "user"
+        || value["uuid"].as_str().is_none_or(str::is_empty)
+        || !value["parent_tool_use_id"].is_null()
+        || !value["sourceToolUseID"].is_null()
+        || value["teamName"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty())
+        || value
+            .get("origin")
+            .is_some_and(|origin| origin["kind"] != "human")
+        || [
+            "isMeta",
+            "isSidechain",
+            "isSynthetic",
+            "isReplay",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ]
+        .iter()
+        .any(|key| value[*key] == true)
+    {
+        return false;
+    }
+    let text = |value: &serde_json::Value| {
+        value.as_str().is_some_and(|text| {
+            let text = text.trim();
+            // Legacy Claude can store wrapped hooks, reminders and local
+            // command output as user text without an explicit origin.
+            !text.is_empty() && !text.starts_with('<')
+        })
+    };
+    let content = &value["message"]["content"];
+    text(content)
+        || content.as_array().is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| match block["type"].as_str() {
+                    Some("text") => text(&block["text"]),
+                    Some("image" | "document") => block["source"].is_object(),
+                    _ => false,
+                })
+        })
 }
 
 #[cfg(test)]

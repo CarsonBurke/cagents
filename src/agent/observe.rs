@@ -247,7 +247,7 @@ impl Observer {
             }
             Inventory::Codex(_) => None,
         };
-        let attention = match census {
+        let edges = match census {
             Inventory::Claude(census) => {
                 claude::session(census, process.pid, &recipe.working_directory)
                     .and_then(|id| {
@@ -272,10 +272,10 @@ impl Observer {
                                 (process.pid, process.start),
                             )
                             .ok()
-                            .and_then(|edges| edges.notice)
                     })
+                    .unwrap_or_default()
             }
-            Inventory::Codex(_) => None,
+            Inventory::Codex(_) => attention::Edges::default(),
         };
         let previous = (|| {
             // Claude's PID-scoped inventory explicitly distinguishes waiting.
@@ -306,11 +306,19 @@ impl Observer {
                 key: format!("waiting:{}", uuid::Uuid::new_v4()),
                 kind: crate::notifications::Kind::Waiting,
             });
+        let clear_attention = observed_claude_progress(previous, state);
+        // A live census and a transcript tail are independent observations.
+        // A completion read alongside a new start may be the previous turn's
+        // late write. Keep it only when a root input ordered it after the
+        // earlier work. Codex's explicit rollout boundaries are handled above.
+        let attention = edges.notice.filter(|_| {
+            clear_attention != Some(AttentionClear::TurnStarted) || edges.claude_ordered_notice
+        });
         Ok(Observation {
             activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
             title,
             attention: waiting.or(attention),
-            clear_attention: observed_claude_progress(previous, state),
+            clear_attention,
         })
     }
 }
@@ -468,6 +476,98 @@ mod tests {
             entry.clone(),
         );
         entry
+    }
+
+    #[test]
+    fn claude_terminal_orders_same_sample_success_after_real_root_input() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let process = process(&root, root.join("unused-census"));
+        let id = "00000000-0000-4000-8000-000000000001";
+        let project_key: String = root
+            .to_str()
+            .unwrap()
+            .encode_utf16()
+            .map(|unit| match u8::try_from(unit) {
+                Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+                _ => '-',
+            })
+            .collect();
+        let project = root.join("projects").join(project_key);
+        std::fs::create_dir_all(&project).unwrap();
+        let mut transcript = std::fs::File::create(project.join(format!("{id}.jsonl"))).unwrap();
+
+        let observer = Observer::new();
+        let entry = cached_account(&observer, &process, ActivityState::Idle, "Fixture");
+        let observe = |state| {
+            {
+                let mut entry = entry.lock().unwrap();
+                entry.checked = Some(Instant::now());
+                let Some(Inventory::Claude(census)) = &mut entry.census else {
+                    panic!("missing process census");
+                };
+                let record = census.get_mut(&process.pid).unwrap();
+                record.1 = state;
+                record.3 = Some(id.into());
+            }
+            observer
+                .try_observe(&process)
+                .unwrap_or_else(|_| panic!("fixture census failed"))
+        };
+        let mut append = |frame: serde_json::Value| writeln!(transcript, "{frame}").unwrap();
+        let result = |id| {
+            serde_json::json!({
+                "type": "assistant", "uuid": id, "message": {"stop_reason": "end_turn"}
+            })
+        };
+        let input = |id, content| {
+            serde_json::json!({
+                "type": "user", "uuid": id, "message": {"role": "user", "content": content}
+            })
+        };
+
+        assert!(observe(ActivityState::Idle).attention.is_none());
+        append(input("tool", serde_json::json!([{"type": "tool_result"}])));
+        append(result("previous"));
+        let observation = observe(ActivityState::Working);
+        assert_eq!(
+            observation.clear_attention,
+            Some(AttentionClear::TurnStarted)
+        );
+        assert!(observation.attention.is_none());
+        assert!(observe(ActivityState::Working).attention.is_none());
+
+        append(result("later"));
+        let observation = observe(ActivityState::Idle);
+        assert_eq!(observation.clear_attention, None);
+        assert_eq!(observation.attention.unwrap().key, "claude:later");
+
+        append(result("before-unconfirmed-input"));
+        append(input(
+            "human-queued",
+            serde_json::json!("Read the next issue"),
+        ));
+        let observation = observe(ActivityState::Idle);
+        assert_eq!(observation.clear_attention, None);
+        assert_eq!(
+            observation.attention.unwrap().key,
+            "claude:before-unconfirmed-input"
+        );
+
+        append(result("before-input"));
+        append(input(
+            "human",
+            serde_json::json!("Search for the next issue"),
+        ));
+        append(result("after-input"));
+        let observation = observe(ActivityState::Working);
+        assert_eq!(
+            observation.clear_attention,
+            Some(AttentionClear::TurnStarted)
+        );
+        assert_eq!(observation.attention.unwrap().key, "claude:after-input");
     }
 
     fn poison_fresh_census(entry: &Mutex<Entry>) {
