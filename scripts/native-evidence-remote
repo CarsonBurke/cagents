@@ -140,7 +140,7 @@ transfer_seconds=${CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS-180}
 command_seconds=${CAGENTS_BUILD_REMOTE_COMMAND_TIMEOUT_SECONDS-7200}
 
 transfer() {
-    "${client[@]}" local "${supervisor[@]}" --drain-on-exit --timeout "$transfer_seconds" /dev/null "$@"
+    "${client[@]}" local --supervise native-evidence-remote --drain-on-exit --timeout "$transfer_seconds" /dev/null "$@"
 }
 
 remote_command() {

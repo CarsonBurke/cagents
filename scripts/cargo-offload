@@ -653,6 +653,13 @@ def require_generation(slot, generation=None, operation=None):
     except OSError:
         pass
     sys.exit(255)
+
+def sources_sealed(slot, generation, operation):
+    try:
+        with open(os.path.join(slot, "sources-sealed")) as completed:
+            return completed.read() == f"{generation} {operation or ''}"
+    except FileNotFoundError:
+        return False
 '''
 
 
@@ -1666,7 +1673,17 @@ elif command == "prune":
     # command, so the next build's copy cannot lose files to this walk.
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
-    require_generation(base, *sys.argv[4:])
+    generation, operation = (sys.argv[4:] + [None, None])[:2]
+    require_generation(base, generation, operation)
+    if generation is not None:
+        if sources_sealed(base, generation, operation):
+            sys.exit(255)
+        seal = os.path.join(base, "sources-sealed")
+        # No upload for this build can start once pruning is admitted.
+        # The client sends this once and runs Cargo only after it succeeds.
+        with open(seal + ".new", "w") as file:
+            file.write(f"{generation} {operation or ''}")
+        os.replace(seal + ".new", seal)
     keep_dirs = {b"."}
     for path in keep:
         parts = path.split(b"/")
@@ -2019,7 +2036,9 @@ def install(staged, path, expected):
 
 RSYNC_SERVER = "import fcntl, os, sys\n" + LEASE_PROOF + """
 require_generation(sys.argv[1], sys.argv[2], sys.argv[3] or None)
-os.execvp("rsync", ["rsync", *sys.argv[4:]])
+if sys.argv[4] == "upload" and sources_sealed(sys.argv[1], sys.argv[2], sys.argv[3]):
+    sys.exit(255)
+os.execvp("rsync", ["rsync", *sys.argv[5:]])
 """
 
 
@@ -2116,7 +2135,7 @@ class Offload:
             child.terminate()
         return child
 
-    def transfer(self, command, *, rsync=False, data=None, **options):
+    def transfer(self, command, *, rsync=False, data=None, retry=True, **options):
         """Run a replayable transport operation, retrying one connection failure."""
         failures = {EXPIRED, 255}
         if rsync:
@@ -2127,7 +2146,7 @@ class Offload:
                                stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                                **options)
             output, errors = child.communicate(data)
-            if self.cancelled or child.returncode not in failures or attempt:
+            if self.cancelled or child.returncode not in failures or attempt or not retry:
                 return subprocess.CompletedProcess(command, child.returncode, output, errors)
             say(f"transfer with {self.host} failed (status {child.returncode}); retrying once")
 
@@ -2764,7 +2783,8 @@ class Offload:
         # when this worktree's copy is older than the one previously built.
         source = f"{slot}/src"
         sync = self.transfer(
-            ["rsync", self.rsync_path(slot), "-rlpgoD", "--checksum", "-z", "--from0", "--files-from=-", "-e", shell,
+            ["rsync", self.rsync_path(slot, upload=True), "-rlpgoD", "--checksum", "-z",
+             "--from0", "--files-from=-", "-e", shell,
              "./", f"{self.host}:{source}/"],
             cwd=top, data=listing, stdout=subprocess.DEVNULL, rsync=True,
         )
@@ -2775,7 +2795,8 @@ class Offload:
             say(f"could not copy the sources to {self.host} (rsync exited {status})")
         if not status and not self.cancelled:
             status = self.transfer(
-                self.remote("prune", slot, len(listing), *self.generation_arguments()), data=listing
+                self.remote("prune", slot, len(listing), *self.generation_arguments()),
+                data=listing, retry=False,
             ).returncode
             if status and not self.cancelled:
                 say(f"could not remove stale sources on {self.host} (status {status})")
@@ -2845,7 +2866,7 @@ class Offload:
             relative = os.path.relpath(local, base)
             destination = os.path.join(slot, "inputs", kind)
             status = self.transfer(
-                ["rsync", self.rsync_path(slot), "-a", "--modify-window=-1", "-z", "-R",
+                ["rsync", self.rsync_path(slot, upload=True), "-a", "--modify-window=-1", "-z", "-R",
                  f"--link-dest={link}", "-e", shell,
                  f"{base}/./{relative}", f"{self.host}:{destination}/"], rsync=True).returncode
             if self.cancelled:
@@ -2859,7 +2880,7 @@ class Offload:
     def generation_arguments(self):
         return [value for value in (self.slot_generation, self.held_operation) if value is not None]
 
-    def rsync_path(self, slot):
+    def rsync_path(self, slot, *, upload=False):
         # The next lease waits for this hold before reusing the checkout.
         # Check identity under it too: a channel delayed in SSH may start
         # after the new lease has already taken the slot.
@@ -2868,7 +2889,7 @@ class Offload:
             command.append("rsync")
         else:
             command += ["/usr/bin/python3", "-c", RSYNC_SERVER, slot, self.slot_generation,
-                        self.held_operation or ""]
+                        self.held_operation or "", "upload" if upload else "download"]
         return "--rsync-path=" + shlex.join(command)
 
     def fetch(self, slot, remote, local, shell, *, files=None, delete=False, missing_ok=False):

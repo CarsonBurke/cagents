@@ -524,7 +524,7 @@ class Transport(unittest.TestCase):
             rsync.chmod(0o700)
             build = offload.Offload("host", offload.parse(["check"]), {})
             build.slot_generation = "first"
-            command = shlex.split(build.rsync_path(str(slot)).removeprefix("--rsync-path="))
+            command = shlex.split(build.rsync_path(str(slot), upload=True).removeprefix("--rsync-path="))
             environment = os.environ | {"PATH": f"{slot}:{os.environ['PATH']}"}
             with proof.open("w") as lease:
                 fcntl.flock(lease, fcntl.LOCK_EX)
@@ -544,6 +544,10 @@ class Transport(unittest.TestCase):
                         self.assertEqual(transfer.wait(timeout=HANG_GUARD), 0)
                     finally:
                         transfer.stdin.close()
+                (slot / "sources-sealed").write_text("first ")
+                sealed = subprocess.run(command, env=environment, capture_output=True,
+                                        stdin=subprocess.DEVNULL, timeout=HANG_GUARD)
+                self.assertEqual(sealed.returncode, 255)
             # Even before its successor starts, a finished lease cannot
             # admit another rsync through a delayed channel.
             result = subprocess.run(command, env=environment, capture_output=True,
@@ -2429,6 +2433,16 @@ class RemoteRun(unittest.TestCase):
                 old.communicate(b"\0", timeout=HANG_GUARD)
                 self.assertEqual(old.returncode, 255)
                 self.assertTrue(added.is_file())
+                listing = b"new-source\0"
+                current = self.agent(scope, "prune", str(slot), str(len(listing)), "still-held", "2",
+                                     stdin=subprocess.PIPE)
+                current.communicate(listing, timeout=HANG_GUARD)
+                self.assertEqual(current.returncode, 0)
+                duplicate = self.agent(scope, "prune", str(slot), "1", "still-held", "2",
+                                       stdin=subprocess.PIPE)
+                duplicate.communicate(b"\0", timeout=HANG_GUARD)
+                self.assertEqual(duplicate.returncode, 255)
+                self.assertTrue(added.is_file())
 
     def test_the_build_host_uses_the_fixtures_private_gate(self):
         for override in (False, True):
@@ -2550,8 +2564,10 @@ class RemoteRun(unittest.TestCase):
                 with self.assertRaises(TimeoutError):
                     lines.next(1)
             line = lines.next(HANG_GUARD)
-            self.assertEqual(json.loads(line.removeprefix("slot ")),
-                             {"index": 0, "path": os.path.realpath(Path(base, "slot-0"))})
+            leased = json.loads(line.removeprefix("slot "))
+            self.assertEqual(leased["index"], 0)
+            self.assertEqual(leased["path"], os.path.realpath(Path(base, "slot-0")))
+            self.assertRegex(leased["generation"], r"^[0-9a-f]{32}$")
             lease.stdin.close()
             self.assertEqual(lease.wait(timeout=HANG_GUARD), 0)
 

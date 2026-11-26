@@ -161,7 +161,9 @@ def run_local(function, *, environment=os.environ, cancel_fd=None, deadline=None
 
 
 def main(arguments):
-    if len(arguments) > 1 and arguments[0] in ("local", "low"):
+    supervised = arguments[:2] == ["local", "--supervise"]
+    if (len(arguments) > 1 and arguments[0] in ("local", "low")
+            and (not supervised or len(arguments) >= 5)):
         phase = local_phase() if arguments[0] == "local" else nullcontext()
         try:
             with phase as descriptor:
@@ -170,11 +172,18 @@ def main(arguments):
                     # The slot lasts until the command and any processes
                     # still doing the transfer close the descriptor.
                     os.set_inheritable(descriptor, True)
+                    if supervised:
+                        name = arguments[2]
+                        helper = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                              "cargo-gate-command.py")
+                        os.execv(sys.executable, [sys.executable, "-I", helper, "--wrapper", name,
+                                                  "--hold-fd", str(descriptor), *arguments[3:]])
                 os.execvp(arguments[1], arguments[1:])
         except (OSError, ValueError, RuntimeError) as error:
             print(f"offload_client: {error}", file=sys.stderr)
             return 1
-    print("usage: offload_client.py {local|low} COMMAND [ARGS...]", file=sys.stderr)
+    print("usage: offload_client.py {local|low} COMMAND [ARGS...] or local --supervise NAME ARGS...",
+          file=sys.stderr)
     return 2
 
 
