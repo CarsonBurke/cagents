@@ -267,6 +267,8 @@ class RecordedMessagesTest {
             "conversation.unwatch" to Call.UnwatchConversation(session),
             "terminal.watch" to Call.WatchTerminal(session),
             "terminal.unwatch" to Call.UnwatchTerminal(session),
+            "conversation.read_checkpoint" to Call.RefreshReadCheckpoint(session),
+            "conversation.read" to Call.ReadConversation(session, "1d79da8a-cd02-454c-a74e-411012875f33"),
             "conversation.load_earlier" to Call.LoadEarlier(session),
             "conversation.send" to Call.Send(session, "Run the tests", SendMode.Steer),
             "conversation.output" to Call.ReadDetail(session, "c", DetailKind.Output),

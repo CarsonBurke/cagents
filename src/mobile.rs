@@ -523,6 +523,10 @@ impl Bridge {
                 }
                 Ok(Answered::Now)
             }
+            api::Call::RefreshReadCheckpoint { session } => self.to_conversation(
+                &session,
+                conversation::Command::RefreshReadCheckpoint { id },
+            ),
             api::Call::ReadConversation {
                 session,
                 checkpoint,

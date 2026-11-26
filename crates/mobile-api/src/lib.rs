@@ -138,6 +138,9 @@ pub enum Call {
     WatchTerminal { session: String },
     #[serde(rename = "terminal.unwatch")]
     UnwatchTerminal { session: String },
+    /// Capture a fresh read checkpoint on the current watch, without reopening it.
+    #[serde(rename = "conversation.read_checkpoint")]
+    RefreshReadCheckpoint { session: String },
     /// The phone displayed a watched conversation to the person.
     #[serde(rename = "conversation.read")]
     ReadConversation { session: String, checkpoint: String },
@@ -220,6 +223,8 @@ impl Call {
         "conversation.unwatch",
         "terminal.watch",
         "terminal.unwatch",
+        "conversation.read_checkpoint",
+        "conversation.read",
         "conversation.load_earlier",
         "conversation.output",
         "conversation.diff",
@@ -355,6 +360,11 @@ pub enum ErrorCode {
 pub enum Event {
     Sessions(Sessions),
     Conversation(Box<ConversationUpdate>),
+    /// An exact read checkpoint captured for this watch without resetting it.
+    ConversationReadCheckpoint {
+        session: String,
+        checkpoint: String,
+    },
     /// A watched conversation can no longer be followed: it closed, or its
     /// provider was replaced. The watch has ended.
     ConversationEnded {

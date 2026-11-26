@@ -124,7 +124,7 @@ fun ConversationScreen(
         vm.remote.value.conversations[session]?.readCheckpoint
     }
     // A back-stack watch can stay open while Settings covers this route.
-    // Request a fresh presentation for this visit before reporting a read.
+    // Get a fresh checkpoint from the same watch before reporting a read.
     LaunchedEffect(session, visible, previouslyDisplayed) {
         if (visible && previouslyDisplayed != null) vm.refreshConversationForRead(session)
     }

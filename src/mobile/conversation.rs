@@ -58,6 +58,9 @@ pub enum Command {
         mode: api::SendMode,
         slot: Arc<()>,
     },
+    RefreshReadCheckpoint {
+        id: u64,
+    },
     Read {
         id: u64,
         checkpoint: uuid::Uuid,
@@ -154,17 +157,10 @@ impl Watch {
                 // Capture the exact old notice before attaching and reading
                 // the snapshot the phone will display. Later notices keep
                 // their own identities, even for this same conversation.
-                let notice = control.read_notifications().ok().and_then(|snapshot| {
-                    snapshot
-                        .notices
-                        .into_iter()
-                        .find(|notice| {
-                            !notice.acknowledged
-                                && notice.event.target
-                                    == crate::notifications::Target::Session(chat_id)
-                        })
-                        .map(|notice| notice.id)
-                });
+                let notice = control
+                    .read_notifications()
+                    .ok()
+                    .and_then(|snapshot| unread_session_notice(snapshot, chat_id));
                 let (stream, proof, next_request_id) = control.into_unsubscribed_stream();
                 Ok(Opening {
                     session,
@@ -294,6 +290,9 @@ enum Pending {
     Read {
         final_read: bool,
     },
+    ReadCheckpoint {
+        id: u64,
+    },
     AcknowledgeChat {
         id: u64,
         notice: Option<uuid::Uuid>,
@@ -334,6 +333,7 @@ struct Followed {
     reading: bool,
     read_epoch: u64,
     read_checkpoint: uuid::Uuid,
+    read_checkpoint_request: Option<u64>,
     read_notice: Option<uuid::Uuid>,
     /// The daemon removed the chat or its provider completed. Try one
     /// final presentation read before ending the watch.
@@ -373,6 +373,7 @@ impl Connection {
             reading: false,
             read_epoch: 0,
             read_checkpoint: uuid::Uuid::new_v4(),
+            read_checkpoint_request: None,
             read_notice: notice,
             ending: false,
         };
@@ -475,6 +476,9 @@ impl Connection {
                         Ok(())
                     }
                 },
+                Ok(Input::Command(Command::RefreshReadCheckpoint { id })) => {
+                    self.refresh_read_checkpoint(&mut followed, id)
+                }
                 Ok(Input::Command(Command::Read { id, checkpoint })) => {
                     self.acknowledge_view(&mut followed, id, checkpoint)
                 }
@@ -520,12 +524,27 @@ impl Connection {
             .into_values()
             .filter_map(|pending| match pending {
                 Pending::Chat { id, .. }
+                | Pending::ReadCheckpoint { id }
                 | Pending::AcknowledgeChat { id, .. }
                 | Pending::Detail { id, .. } => Some(id),
                 Pending::Read { .. } => None,
             })
             .chain(waiting_requests(&self.inputs));
         fail_requests(requests, &self.outbox, message);
+    }
+
+    fn refresh_read_checkpoint(&mut self, followed: &mut Followed, id: u64) -> Result<(), End> {
+        match self.request(ClientRequest::ReadNotifications) {
+            Ok(request) => {
+                followed.read_checkpoint_request = Some(request);
+                self.pending.insert(request, Pending::ReadCheckpoint { id });
+                Ok(())
+            }
+            Err(error) => {
+                self.outbox.error(Some(id), unavailable(&error));
+                Err(End::Daemon(lost(&error)))
+            }
+        }
     }
 
     fn acknowledge_view(
@@ -753,6 +772,35 @@ impl Connection {
                     return Err(End::Conversation("The conversation ended.".into()));
                 }
             }
+            Some(Pending::ReadCheckpoint { id }) => {
+                if followed.read_checkpoint_request != Some(request_id) {
+                    self.outbox.ok(id);
+                } else {
+                    followed.read_checkpoint_request = None;
+                    match envelope.message {
+                        ServerMessage::Response {
+                            response: ServerResponse::Notifications { snapshot },
+                        } => {
+                            followed.read_checkpoint = uuid::Uuid::new_v4();
+                            followed.read_notice = unread_session_notice(snapshot, self.chat_id);
+                            if !self.current.send(|| {
+                                self.outbox.ok(id);
+                                self.outbox.event(api::Event::ConversationReadCheckpoint {
+                                    session: followed.session.clone(),
+                                    checkpoint: followed.read_checkpoint.to_string(),
+                                });
+                            }) {
+                                self.outbox.error(Some(id), stopped_during_attach());
+                            }
+                        }
+                        ServerMessage::Error(error) => self.outbox.error(Some(id), refused(&error)),
+                        _ => self.outbox.error(
+                            Some(id),
+                            internal("The daemon answered a read checkpoint unexpectedly."),
+                        ),
+                    }
+                }
+            }
             Some(Pending::AcknowledgeChat { id, notice }) => match envelope.message {
                 ServerMessage::Response {
                     response: ServerResponse::Accepted,
@@ -884,12 +932,27 @@ impl Connection {
     }
 }
 
+fn unread_session_notice(
+    snapshot: crate::notifications::Snapshot,
+    chat_id: TerminalId,
+) -> Option<uuid::Uuid> {
+    snapshot
+        .notices
+        .into_iter()
+        .find(|notice| {
+            !notice.acknowledged
+                && notice.event.target == crate::notifications::Target::Session(chat_id)
+        })
+        .map(|notice| notice.id)
+}
+
 fn waiting_requests(inputs: &Receiver<Input>) -> impl Iterator<Item = u64> + '_ {
     inputs.try_iter().filter_map(|input| match input {
         Input::Command(
             Command::Chat { id, .. }
             | Command::Detail { id, .. }
             | Command::ImagePrompt { id, .. }
+            | Command::RefreshReadCheckpoint { id }
             | Command::Read { id, .. },
         ) => Some(id),
         _ => None,

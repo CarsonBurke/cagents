@@ -339,15 +339,20 @@ class RemoteController(
     suspend fun answer(session: String, request: String, action: String, answers: List<FieldAnswer>) =
         call(Call.Answer(session, request, action, answers))
 
-    /** Request a fresh presentation when an already followed route is shown. */
-    fun refreshConversationForRead(session: String) {
-        if (session in _state.value.conversations) sync(session, SyncKind.Watch)
+    /** Refresh the read checkpoint without replacing the existing watch. */
+    suspend fun refreshConversationForRead(session: String) {
+        if (session in _state.value.conversations) {
+            callForVisibleConversation(Call.RefreshReadCheckpoint(session))
+        }
     }
 
-    suspend fun readConversation(session: String, checkpoint: String) {
+    suspend fun readConversation(session: String, checkpoint: String) =
+        callForVisibleConversation(Call.ReadConversation(session, checkpoint))
+
+    private suspend fun callForVisibleConversation(request: Call.OnSession) {
         if (!foreground.value) return
         try {
-            call(Call.ReadConversation(session, checkpoint))
+            call(request)
         } catch (_: RequestFailed) {
             // Older bridges and a watch that was just closed can refuse this.
         } catch (_: ConnectionLost) {
@@ -618,6 +623,13 @@ class RemoteController(
                     recovering -> Unit
                     else -> resync(session, UNREADABLE)
                 }
+            }
+            is Event.ConversationReadCheckpoint -> _state.update { state ->
+                val held = state.conversations[event.session] ?: return@update state
+                if (held.ended != null) return@update state
+                state.copy(conversations = state.conversations + (
+                    event.session to held.copy(readCheckpoint = event.checkpoint)
+                ))
             }
             is Event.ConversationEnded -> markEnded(event.session, event.message)
             is Event.TerminalScreenUpdated, is Event.TerminalWatchEnded,

@@ -749,6 +749,41 @@ class RemoteControllerTest {
     }
 
     @Test
+    fun returningToAConversationRefreshesItsReadCheckpointWithoutReplacingAPendingSend() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.loadHello(controller)
+        val sent = async { controller.send(S, "Fix it", SendMode.Queue) }
+        val send = connection.nextRequest()
+        assertEquals("conversation.send", send.op)
+
+        val refresh = async { controller.refreshConversationForRead(S) }
+        val request = connection.nextRequest()
+        assertEquals("conversation.read_checkpoint", request.op)
+        assertEquals(S, request.params["session"]!!.jsonPrimitive.content)
+        connection.ok(request)
+        connection.send("""{"type":"event","event":"conversation_read_checkpoint","data":{"session":"$S","checkpoint":"fresh"}}""")
+        refresh.await()
+        controller.await { it.conversations[S]?.readCheckpoint == "fresh" }
+        assertEquals(false, sent.isCompleted)
+
+        val read = async { controller.readConversation(S, "fresh") }
+        val acknowledge = connection.nextRequest()
+        assertEquals("conversation.read", acknowledge.op)
+        assertEquals("fresh", acknowledge.params["checkpoint"]!!.jsonPrimitive.content)
+        connection.ok(acknowledge)
+        read.await()
+
+        connection.ok(send)
+        sent.await()
+        runCurrent()
+        assertTrue(connection.isQuiet())
+    }
+
+    @Test
     fun aConversationWithARequestInFlightIsUnwatchedOnceItIsAnswered() = runTest {
         val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
         controller.start()

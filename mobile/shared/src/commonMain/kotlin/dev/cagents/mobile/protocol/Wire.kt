@@ -51,6 +51,7 @@ sealed interface Event {
     data class TerminalScreenUpdated(val screen: TerminalScreen) : Event
     data class TerminalWatchEnded(val ending: TerminalEnded) : Event
     data class Conversation(val update: ConversationUpdate) : Event
+    data class ConversationReadCheckpoint(val session: String, val checkpoint: String) : Event
     data class ConversationEnded(val session: String, val message: String) : Event
     data class Closing(val message: String) : Event
 
@@ -86,6 +87,15 @@ private fun decodeEvent(name: String?, data: JsonElement): Event = when (name) {
     "sessions" -> Event.Sessions(WireJson.decodeFromJsonElement<SessionList>(data).sessions)
     "notifications" -> Event.Notifications(WireJson.decodeFromJsonElement<NoticeList>(data).notices)
     "conversation" -> Event.Conversation(WireJson.decodeFromJsonElement(data))
+    "conversation_read_checkpoint" -> data.jsonObject.let {
+        val session = it.string("session")
+        val checkpoint = it.string("checkpoint")
+        if (session != null && checkpoint != null) {
+            Event.ConversationReadCheckpoint(session, checkpoint)
+        } else {
+            Event.Unknown(name)
+        }
+    }
     "terminal_screen" -> Event.TerminalScreenUpdated(WireJson.decodeFromJsonElement(data))
     "terminal_ended" -> Event.TerminalWatchEnded(WireJson.decodeFromJsonElement(data))
     "conversation_ended" -> data.jsonObject.let {
@@ -176,6 +186,7 @@ sealed class Call(val op: String) {
     data class UnwatchConversation(override val session: String) : OnSession("conversation.unwatch")
     data class WatchTerminal(override val session: String) : OnSession("terminal.watch")
     data class UnwatchTerminal(override val session: String) : OnSession("terminal.unwatch")
+    data class RefreshReadCheckpoint(override val session: String) : OnSession("conversation.read_checkpoint")
     data class ReadConversation(override val session: String, val checkpoint: String) : OnSession("conversation.read") {
         override fun params(): JsonObject = buildJsonObject {
             put("session", session)

@@ -280,6 +280,116 @@ fn finish_watch(removed: bool) {
 }
 
 #[test]
+fn refreshing_a_read_checkpoint_keeps_pending_commands_on_the_same_watch() {
+    use crate::notifications::{Event, Evidence, Kind, Notice, Snapshot};
+
+    let (bridge, daemon) = UnixStream::pair().unwrap();
+    daemon.set_read_timeout(Some(WAIT)).unwrap();
+    let (outbox, lines) = Outbox::new();
+    let mut daemon = Daemon(daemon);
+    let session = session();
+    let chat_id = session.id;
+    let watch =
+        start_scripted(1, session.clone(), bridge, proof(), outbox, None, |_, _| {}).unwrap();
+    let attach = daemon.receive();
+    daemon.respond(
+        &attach,
+        ServerResponse::ChatAttached {
+            session,
+            snapshot: chat::Snapshot::default(),
+        },
+    );
+    let visibility = daemon.receive();
+    daemon.respond(&visibility, ServerResponse::Accepted);
+    daemon.approve_watch(chat_id);
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1, page: None });
+    let api::ServerLine::Event(api::Event::Conversation(initial)) = next_line(&lines) else {
+        panic!("the watch did not publish its reset");
+    };
+    let old_checkpoint = initial.read_checkpoint.unwrap().parse().unwrap();
+    let initial_read = daemon.receive();
+    assert!(matches!(
+        initial_read.request,
+        ClientRequest::ChatRead { .. }
+    ));
+
+    assert!(watch.send(Command::Chat {
+        id: 2,
+        command: chat::Command::Interrupt,
+    }));
+    let interrupt = daemon.receive();
+    assert!(matches!(
+        interrupt.request,
+        ClientRequest::ChatCommand { .. }
+    ));
+
+    assert!(watch.send(Command::RefreshReadCheckpoint { id: 3 }));
+    let refresh = daemon.receive();
+    assert_eq!(refresh.request, ClientRequest::ReadNotifications);
+    let notice = Notice {
+        id: uuid::Uuid::new_v4(),
+        event: Event::session(
+            chat_id,
+            Provider::Claude,
+            "/fixture/project".into(),
+            Evidence {
+                key: "new".into(),
+                kind: Kind::Waiting,
+            },
+        ),
+        delivered: true,
+        acknowledged: false,
+        window: None,
+    };
+    daemon.respond(
+        &refresh,
+        ServerResponse::Notifications {
+            snapshot: Snapshot {
+                notices: vec![notice.clone()],
+                diagnostic: None,
+            },
+        },
+    );
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 3, page: None });
+    let api::ServerLine::Event(api::Event::ConversationReadCheckpoint {
+        session,
+        checkpoint,
+    }) = next_line(&lines)
+    else {
+        panic!("the watch did not publish its new read checkpoint");
+    };
+    assert_eq!(session, chat_id.to_string());
+    let checkpoint = checkpoint.parse().unwrap();
+    assert_ne!(old_checkpoint, checkpoint);
+
+    assert!(watch.send(Command::Read {
+        id: 4,
+        checkpoint: old_checkpoint
+    }));
+    assert!(matches!(
+        next_line(&lines),
+        api::ServerLine::Error { id: Some(4), error } if error.code == api::ErrorCode::NotWatching
+    ));
+    assert!(watch.send(Command::Read { id: 5, checkpoint }));
+    let read = daemon.receive();
+    assert!(matches!(
+        read.request,
+        ClientRequest::ChatAcknowledge { .. }
+    ));
+    daemon.respond(&read, ServerResponse::Accepted);
+    let dismiss = daemon.receive();
+    assert_eq!(
+        dismiss.request,
+        ClientRequest::AcknowledgeNotification { id: notice.id }
+    );
+    daemon.respond(&dismiss, ServerResponse::Accepted);
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 5, page: None });
+
+    daemon.respond(&interrupt, ServerResponse::Accepted);
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 2, page: None });
+}
+
+#[test]
 fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("daemon");
