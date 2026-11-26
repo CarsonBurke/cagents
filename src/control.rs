@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsFd, AsRawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -4644,7 +4644,15 @@ fn finish_ui_launch(
                             Ok(0) => break,
                             Ok(_) => {}
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(100))
+                                if crate::descriptor::wait_for_activity(
+                                    stdout.as_fd(),
+                                    libc::POLLIN,
+                                    None,
+                                )
+                                .is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                             Err(_) => break,
@@ -4680,17 +4688,10 @@ fn handshake_reports_already_running(error: &io::Error) -> bool {
 }
 
 fn read_ui_launch_handshake(
-    stdout: &mut ChildStdout,
+    response_stream: &mut (impl Read + AsFd),
     timeout: Duration,
 ) -> io::Result<Option<String>> {
-    let descriptor = stdout.as_raw_fd();
-    // SAFETY: fcntl receives a live descriptor and integer flags only.
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-    if flags == -1
-        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
+    crate::descriptor::set_nonblocking(response_stream.as_fd())?;
 
     let started = Instant::now();
     let mut deadline = started + timeout;
@@ -4698,7 +4699,7 @@ fn read_ui_launch_handshake(
     let mut response = Vec::new();
     let mut buffer = [0_u8; 256];
     loop {
-        match stdout.read(&mut buffer) {
+        match response_stream.read(&mut buffer) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -4737,7 +4738,11 @@ fn read_ui_launch_handshake(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
+                if !crate::descriptor::wait_for_activity(
+                    response_stream.as_fd(),
+                    libc::POLLIN,
+                    Some(deadline),
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         if recovery_announced {
@@ -4751,7 +4756,6 @@ fn read_ui_launch_handshake(
                         },
                     ));
                 }
-                thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -12007,6 +12011,19 @@ mod tests {
         assert_eq!(
             spawn_ui_process(&mut command).unwrap().as_deref(),
             Some("One pane could not reconnect. Another is still reconnecting.")
+        );
+    }
+
+    #[test]
+    fn ui_launch_handshake_keeps_buffered_readiness_after_socket_close() {
+        let (mut parent, mut window) = UnixStream::pair().unwrap();
+        window
+            .write_all(b"recovering: 1\nready-with-pane-notes: Exact pane kept.\n")
+            .unwrap();
+        drop(window);
+        assert_eq!(
+            read_ui_launch_handshake(&mut parent, Duration::from_secs(5)).unwrap(),
+            Some("Exact pane kept.".into())
         );
     }
 
