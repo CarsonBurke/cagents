@@ -20,6 +20,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.jsonArray
@@ -701,7 +702,13 @@ class RemoteControllerTest {
 
         // Back within the grace: the same connection watches it again, for what was missed.
         controller.setForeground(true)
-        connection.ok(connection.expect("conversation.watch"))
+        val pending = mutableSetOf("ping", "sessions.watch", "notifications.watch", "conversation.watch")
+        while (pending.isNotEmpty()) {
+            val request = connection.next()
+            pending.remove(request.op)
+            connection.ok(request)
+        }
+        assertEquals(1, bridge.opens)
         connection.send(conversation(reset = true, order = """["a","b"]""", items = "[${text("a", "Hello")},${text("b", "Missed")}]"))
         controller.await { it.conversations[S]?.items?.size == 2 }
     }
@@ -715,37 +722,106 @@ class RemoteControllerTest {
 
         controller.setForeground(false)
         controller.setForeground(true)
-        // The next request is for this one, not an unwatch or a watch of the first.
         controller.open("other")
-        val next = connection.nextRequest()
-        assertEquals("conversation.watch", next.op)
-        assertEquals("other", next.params["session"]!!.jsonPrimitive.content)
+        val requests = List(2) { connection.next().also(connection::ok) }
+        assertEquals(setOf("ping", "conversation.watch"), requests.map { it.op }.toSet())
+        val watch = requests.single { it.op == "conversation.watch" }
+        assertEquals("other", watch.params["session"]!!.jsonPrimitive.content)
     }
 
     @Test
-    fun aConversationOpenedInTheBackgroundIsWatchedOnReturn() = runTest {
-        val controller = controller(ControllerConfig(pingInterval = 10.hours, backgroundGrace = 30.seconds))
+    fun aBackgroundDisconnectWaitsForReturnAndKeepsTheOpenConversation() = runTest {
+        val controller = controller(ControllerConfig(
+            pingInterval = 10.hours,
+            backgroundGrace = 30.seconds,
+        ))
         controller.start()
         val connection = bridge.acceptWelcomed()
+        connection.loadHello(controller)
+
+        val leftAt = testScheduler.currentTime
+        controller.setForeground(false)
+        advanceTimeBy(5.seconds)
+        connection.hangUp()
+        controller.await { it.connection == ConnectionState.Offline }
+        assertEquals(5.seconds, (testScheduler.currentTime - leftAt).milliseconds)
+        advanceTimeBy(15.seconds)
+        assertEquals(1, bridge.opens)
+        assertTrue(controller.state.value.conversations.getValue(S).loaded)
+
+        val returnedAt = testScheduler.currentTime
+        controller.setForeground(true)
+        val again = bridge.acceptWelcomed()
+        assertEquals(returnedAt, testScheduler.currentTime)
+        val watches = List(3) { again.nextRequest().also(again::ok).op }
+        assertEquals(setOf("sessions.watch", "notifications.watch", "conversation.watch"), watches.toSet())
+        again.send(conversation(reset = true, order = """["a","b"]""", items = "[${text("a", "Hello")},${text("b", "Back")}]"))
+        controller.await { it.conversations[S]?.items?.size == 2 }
+    }
+
+    @Test
+    fun returningChecksAnUnresponsiveConnectionBeforeTheNextKeepalive() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 10.hours))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
         connection.ok(connection.expect("notifications.watch"))
 
         controller.setForeground(false)
-        controller.open(S)
         connection.ok(connection.expect("sessions.unwatch"))
         connection.ok(connection.expect("notifications.unwatch"))
-        runCurrent()
-        assertTrue(connection.isQuiet(), "opened in the background, it isn't watched")
-        // Reconnecting in the background watches nothing either.
-        connection.hangUp()
-        val again = bridge.acceptWelcomed()
-        controller.await { it.connection == ConnectionState.Connected }
-        runCurrent()
-        assertTrue(again.isQuiet(), "reconnected in the background, it isn't watched")
-
+        advanceTimeBy(5.seconds)
+        assertTrue(connection.isQuiet())
+        val returnedAt = testScheduler.currentTime
+        // The socket accepts the resume probe, then stalls in its write.
+        connection.stallPingWrite = true
         controller.setForeground(true)
-        val watch = again.expect("conversation.watch")
-        assertEquals("conversation.watch", watch.op)
-        assertEquals(S, watch.params["session"]!!.jsonPrimitive.content)
+        while (connection.next().op != "ping") {
+            // Overview reattaches can reach the write lock before the probe.
+        }
+        bridge.acceptWelcomed()
+        assertEquals(5.seconds, (testScheduler.currentTime - returnedAt).milliseconds)
+        assertTrue(connection.isClosedByClient())
+        assertEquals(2, bridge.opens)
+    }
+
+    @Test
+    fun returningShortensTheDeadlineOfAnOutstandingKeepalive() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 25.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        assertEquals("ping", connection.next().op)
+
+        controller.setForeground(false)
+        // The computer stops replying while a periodic ping is pending.
+        val unwatches = List(2) { connection.next().op }
+        assertEquals(setOf("sessions.unwatch", "notifications.unwatch"), unwatches.toSet())
+        advanceTimeBy(5.seconds)
+        val returnedAt = testScheduler.currentTime
+        controller.setForeground(true)
+
+        bridge.acceptWelcomed()
+        assertEquals(5.seconds, (testScheduler.currentTime - returnedAt).milliseconds)
+        assertEquals(2, bridge.opens)
+    }
+
+    @Test
+    fun anEndedBridgeClosesTheSocketBeforeWaitingForABlockedWriter() = runTest {
+        val controller = controller(ControllerConfig(pingInterval = 25.seconds))
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.stallPingWrite = true
+        assertEquals("ping", connection.next().op)
+
+        val hungUpAt = testScheduler.currentTime
+        connection.hangUp()
+        controller.await { it.connection is ConnectionState.Retrying }
+        assertEquals(hungUpAt, testScheduler.currentTime)
+        assertTrue(connection.isClosedByClient())
     }
 
     @Test

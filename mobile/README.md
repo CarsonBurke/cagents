@@ -18,9 +18,10 @@ What it does:
 - **Messages.** Send a message. While a turn runs, steer it now or queue the
   message for after it, or stop the turn. Use the attachment button to send
   a photo to a conversation that accepts images.
-- **Reconnection.** A dropped connection comes back with backoff, and the app
-  watches again what it was showing. In the background it stops watching
-  and closes the connection after 30 seconds.
+- **Reconnection.** The app stops watching in the background and keeps an
+  existing connection for up to 30 seconds if Android allows it. When you
+  return, the app checks the connection or reconnects, then resumes watching
+  what you had open. Repeated failures while you are using the app back off.
 
 The app lists terminal agents. The API supports a read-only terminal view
 that the app does not yet display.
