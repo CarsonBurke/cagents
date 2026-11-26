@@ -183,22 +183,18 @@ pub(super) fn perform(
     )?;
     let before = stamp(root)?;
     let identity = digest(root)?;
-    let mut executable = anonymous_file()?;
-    let mut source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root.join("bin/cagents"))?;
-    io::copy(
-        &mut Read::by_ref(&mut source).take(512 * 1024 * 1024 + 1),
-        &mut executable,
-    )?;
-    if executable.metadata()?.len() > 512 * 1024 * 1024 {
-        return Err(invalid("installed CLI exceeds update size limit"));
-    }
-    let executable = seal_file(executable)?;
     let cancellation = CancellationToken::for_job(state, &job.id)?;
-    let staged =
-        candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
+    let staged = candidate::Staged::from_installed(
+        root.join("bin/cagents"),
+        job.version.clone(),
+        identity,
+        &cancellation,
+    )?;
+    if stamp(root)? != before {
+        return Err(invalid(
+            "the installed application changed during verification",
+        ));
+    }
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
         if Selection::capture(&layout)? != selection || stamp(root)? != before {

@@ -2905,6 +2905,7 @@ pub(crate) fn owned_cli_protocol(
         None,
         subject,
         operation,
+        &CancellationToken::new(),
     )?;
     envelope
         .get("data")
@@ -2931,6 +2932,7 @@ pub(crate) fn companion_identity(
         Some(&isolated),
         CEDITOR_COMPANION,
         "editor companion instance check",
+        &CancellationToken::new(),
     )?;
     match envelope
         .get("data")
@@ -2958,6 +2960,7 @@ fn companion_read(
     runtime: Option<&Path>,
     subject: &str,
     operation: &'static str,
+    cancellation: &CancellationToken,
 ) -> Result<serde_json::Value, UpdateError> {
     let before = fs::symlink_metadata(executable)?;
     if !before.is_file()
@@ -2978,22 +2981,25 @@ fn companion_read(
         operation,
         SMALL_ASSET_LIMIT,
         Duration::from_secs(5),
-        &CancellationToken::new(),
+        cancellation,
     )?;
     let after = fs::symlink_metadata(executable)?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-        || before.uid() != after.uid()
-        || before.mode() != after.mode()
-    {
+    if !same_companion_executable(&before, &after) {
         return Err(invalid(format!("{subject} changed during preflight")));
     }
     Ok(serde_json::from_reader(&mut output)?)
+}
+
+fn same_companion_executable(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+        && before.uid() == after.uid()
+        && before.mode() == after.mode()
 }
 
 fn observe_impact(
