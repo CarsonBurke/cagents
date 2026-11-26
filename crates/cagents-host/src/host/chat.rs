@@ -698,6 +698,7 @@ fn changed_for_instance(
                 message: ServerMessage::ChatQueueEnded {
                     source: source.clone(),
                     execution: record.execution_instance,
+                    current: true,
                 },
             });
         }
@@ -857,7 +858,7 @@ fn current_session_snapshot(
     Ok(response)
 }
 
-fn announce_prior_queue(
+fn announce_exited_queues_after_attach(
     host: &SharedHost,
     client: ClientId,
     requested: &Session,
@@ -865,24 +866,21 @@ fn announce_prior_queue(
     resident: uuid::Uuid,
 ) {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state.shutting_down
-        || attached.proof.as_ref() != Some(state.proof())
-        || state.chats.get(&attached.id).is_none_or(|record| {
-            record.execution_instance != resident
-                || record.returning_terminal
-                || record.handle.is_completed()
-                || record.handle.is_read_only_history()
-                || record.handle.actor_identity().is_some()
-                || !record.subscribers.contains_key(&client)
-        })
-    {
+    if state.shutting_down || attached.proof.as_ref() != Some(state.proof()) {
         return;
     }
-    if let Some(execution) = state
-        .exited_queue_archive
-        .prior_execution(requested, attached, resident)
-        && let Some(delivery) = state.clients.get(&client)
-    {
+    let Some(record) = state.chats.get(&attached.id).filter(|record| {
+        record.execution_instance == resident
+            && !record.returning_terminal
+            && !record.handle.is_read_only_history()
+            && record.subscribers.contains_key(&client)
+    }) else {
+        return;
+    };
+    let Some(delivery) = state.clients.get(&client) else {
+        return;
+    };
+    let announce = |execution, current| {
         let _ = delivery.push(ServerEnvelope {
             version: PROTOCOL_VERSION,
             request_id: None,
@@ -890,8 +888,21 @@ fn announce_prior_queue(
             message: ServerMessage::ChatQueueEnded {
                 source: attached.clone(),
                 execution,
+                current,
             },
         });
+    };
+    if record.handle.actor_identity().is_none()
+        && let Some(execution) = state
+            .exited_queue_archive
+            .prior_execution(requested, attached, resident)
+    {
+        announce(execution, false);
+    }
+    if completed_queue_owner(record, requested, Some(resident))
+        && completed_queue_owner(record, attached, Some(resident))
+    {
+        announce(resident, true);
     }
 }
 
@@ -4881,7 +4892,7 @@ fn process_inner(
                 session: attached, ..
             } = &response
             {
-                announce_prior_queue(host, client, &session, attached, attachment.2);
+                announce_exited_queues_after_attach(host, client, &session, attached, attachment.2);
             }
             Ok(response)
         }

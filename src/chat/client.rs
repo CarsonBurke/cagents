@@ -277,14 +277,39 @@ pub enum Wake {
     ExitedQueue(TerminalId, Vec<super::QueuedMessage>),
     /// The authenticated source and whole queue of an attached or archived
     /// ended provider, independent of the current presentation descriptor.
-    CompletedQueue(Session, Vec<super::QueuedMessage>),
+    CompletedQueue {
+        source: Session,
+        messages: Vec<super::QueuedMessage>,
+        current: bool,
+    },
 }
 #[derive(Clone)]
 pub struct ClientHandle {
     inner: Arc<Inner>,
 }
-struct CompletedQueueRead {
+struct CompletedQueueNotice {
     source: Session,
+    execution: Option<uuid::Uuid>,
+    current: bool,
+}
+
+fn remember_queue_execution(
+    seen: &mut [Option<uuid::Uuid>; 2],
+    execution: uuid::Uuid,
+) -> Result<bool, &'static str> {
+    if seen.contains(&Some(execution)) {
+        return Ok(false);
+    }
+    let slot = seen
+        .iter_mut()
+        .find(|entry| entry.is_none())
+        .ok_or("Too many native queue receipts for one attachment")?;
+    *slot = Some(execution);
+    Ok(true)
+}
+
+struct CompletedQueueRead {
+    notice: CompletedQueueNotice,
     request: u64,
     collector: Option<ipc::ExitedQueueCollector>,
 }
@@ -294,10 +319,9 @@ impl CompletedQueueRead {
         wire: &Mutex<Wire>,
         proof: &HostSessionProof,
         next: &AtomicU64,
-        source: Session,
-        execution: Option<uuid::Uuid>,
+        notice: CompletedQueueNotice,
     ) -> Result<Self, String> {
-        if source.proof.as_ref() != Some(proof) {
+        if notice.source.proof.as_ref() != Some(proof) {
             return Err("Completed chat queue names a different daemon".into());
         }
         let request = next.fetch_add(1, Ordering::Relaxed);
@@ -306,12 +330,12 @@ impl CompletedQueueRead {
             proof,
             request,
             ClientRequest::ChatReadExitedQueue {
-                source: source.clone(),
-                execution,
+                source: notice.source.clone(),
+                execution: notice.execution,
             },
         )?;
         Ok(Self {
-            source,
+            notice,
             request,
             collector: None,
         })
@@ -328,7 +352,7 @@ impl CompletedQueueRead {
         match message {
             ServerMessage::Response {
                 response: ServerResponse::ChatExitedQueue { source, queued },
-            } if self.collector.is_none() && source == self.source.id => {
+            } if self.collector.is_none() && source == self.notice.source.id => {
                 let Some(first) = queued else {
                     return Ok(None);
                 };
@@ -361,7 +385,11 @@ impl CompletedQueueRead {
         let queue = collector
             .finish()
             .map_err(|_| "Invalid completed chat queue payload")?;
-        wake(Wake::CompletedQueue(self.source, queue.messages));
+        wake(Wake::CompletedQueue {
+            source: self.notice.source,
+            messages: queue.messages,
+            current: self.notice.current,
+        });
         Ok(None)
     }
 }
@@ -2991,9 +3019,8 @@ impl ClientHandle {
         let mut early_limit = None;
         let mut early_addresses = AgentAddresses::default();
         let mut early_model = None;
-        let mut queue_ended = None;
-        let mut next_queue_ended = None;
-        let mut last_queue_execution = None;
+        let mut ended_queues = VecDeque::new();
+        let mut seen_queue_executions = [None; 2];
         let (session, mut initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
@@ -3020,19 +3047,17 @@ impl ClientHandle {
                 return Err("Daemon identity changed during native chat attachment".into());
             }
             match envelope.message {
-                ServerMessage::ChatQueueEnded { source, execution }
-                    if source.id == id && envelope.request_id.is_none() =>
-                {
-                    if last_queue_execution != Some(execution) {
-                        let notice = (source, Some(execution));
-                        if queue_ended.is_none() {
-                            queue_ended = Some(notice);
-                        } else if next_queue_ended.is_none() {
-                            next_queue_ended = Some(notice);
-                        } else {
-                            return Err("Too many native queue receipts during attachment".into());
-                        }
-                        last_queue_execution = Some(execution);
+                ServerMessage::ChatQueueEnded {
+                    source,
+                    execution,
+                    current,
+                } if source.id == id && envelope.request_id.is_none() => {
+                    if remember_queue_execution(&mut seen_queue_executions, execution)? {
+                        ended_queues.push_back(CompletedQueueNotice {
+                            source,
+                            execution: Some(execution),
+                            current,
+                        });
                     }
                 }
                 ServerMessage::ChatActivity {
@@ -3128,12 +3153,17 @@ impl ClientHandle {
             initial.active_model_revision = revision;
             initial.active_model = model;
         }
-        let queue_ended = queue_ended.or_else(|| {
-            (initial.exited
-                && !initial.queued_messages.is_empty()
-                && !session.closes_without_hosted_actor())
-            .then(|| (session.clone(), None))
-        });
+        if ended_queues.is_empty()
+            && initial.exited
+            && !initial.queued_messages.is_empty()
+            && !session.closes_without_hosted_actor()
+        {
+            ended_queues.push_back(CompletedQueueNotice {
+                source: session.clone(),
+                execution: None,
+                current: false,
+            });
+        }
         let upgrade_recovery = upgrade_recovery
             .map(|(source, resolved)| {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
@@ -3281,8 +3311,9 @@ impl ClientHandle {
             // Since when the agent's process has been missing reads, and when
             // it last missed one.
             let mut unanswered: Option<(Instant, Instant)> = None;
-            let first_queue_read = queue_ended
-                .map(|(source, execution)| CompletedQueueRead::begin(&wire, &proof, &next, source, execution))
+            let first_queue_read = ended_queues
+                .pop_front()
+                .map(|notice| CompletedQueueRead::begin(&wire, &proof, &next, notice))
                 .transpose();
             let failure = match first_queue_read {
                 Err(error) => error,
@@ -3301,9 +3332,9 @@ impl ClientHandle {
                         Err(error) => break error,
                     }
                     if queue_read.is_none()
-                        && let Some((source, execution)) = next_queue_ended.take()
+                        && let Some(notice) = ended_queues.pop_front()
                     {
-                        match CompletedQueueRead::begin(&wire, &proof, &next, source, execution) {
+                        match CompletedQueueRead::begin(&wire, &proof, &next, notice) {
                             Ok(read) => queue_read = Some(read),
                             Err(error) => break error,
                         }
@@ -3387,23 +3418,24 @@ impl ClientHandle {
                     continue;
                 }
                 match envelope.message {
-                    ServerMessage::ChatQueueEnded { source, execution }
+                    ServerMessage::ChatQueueEnded { source, execution, current }
                         if source.id == id && envelope.request_id.is_none() =>
                     {
-                        if last_queue_execution != Some(execution) {
-                            last_queue_execution = Some(execution);
-                            if queue_read.is_none() {
-                                match CompletedQueueRead::begin(&wire, &proof, &next, source, Some(execution)) {
-                                    Ok(read) => queue_read = Some(read),
-                                    Err(error) => break error,
+                        match remember_queue_execution(&mut seen_queue_executions, execution) {
+                            Ok(false) => {},
+                            Ok(true) => {
+                                let notice = CompletedQueueNotice { source, execution: Some(execution), current };
+                                if queue_read.is_none() {
+                                    match CompletedQueueRead::begin(&wire, &proof, &next, notice) {
+                                        Ok(read) => queue_read = Some(read),
+                                        Err(error) => break error,
+                                    }
+                                } else {
+                                    // The host stores one transfer per connection.
+                                    ended_queues.push_back(notice);
                                 }
-                            } else if next_queue_ended.is_none() {
-                                // The host stores one transfer per connection.
-                                // Finish the prior receipt before asking for this one.
-                                next_queue_ended = Some((source, Some(execution)));
-                            } else {
-                                break "Too many native queue receipts are pending".into();
                             }
+                            Err(error) => break error.into(),
                         }
                     },
                     ServerMessage::ChatChanged { chat_id } if chat_id == id && visible.load(Ordering::Acquire) => {

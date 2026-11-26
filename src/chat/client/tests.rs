@@ -1864,6 +1864,7 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
             ServerMessage::ChatQueueEnded {
                 source: session.clone(),
                 execution,
+                current: false,
             },
         );
         let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
@@ -1887,6 +1888,21 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
             ServerMessage::ChatQueueEnded {
                 source: replacement_source.clone(),
                 execution: replacement,
+                current: true,
+            },
+        );
+        // A runtime completion can be sent both by the attachment path and
+        // the worker observer. Ignore a duplicate even after another receipt
+        // was announced while the first read was in progress.
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            None,
+            &proof,
+            ServerMessage::ChatQueueEnded {
+                source: session.clone(),
+                execution,
+                current: false,
             },
         );
         handoff_reply(
@@ -1959,23 +1975,30 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
         None,
         None,
         move |wake| {
-            if let Wake::CompletedQueue(source, messages) = wake {
-                let _ = send.send((source, messages));
+            if let Wake::CompletedQueue {
+                source,
+                messages,
+                current,
+            } = wake
+            {
+                let _ = send.send((source, messages, current));
             }
         },
     )
     .unwrap();
     end_tx.send(()).unwrap();
-    let (source, messages) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (source, messages, current) = received.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(source, expected_prior);
+    assert!(!current);
     assert_eq!(messages.len(), 3);
     assert!(
         messages
             .iter()
             .all(|message| message.text == "ø".repeat(384 * 1024))
     );
-    let (source, messages) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (source, messages, current) = received.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(source, expected_replacement);
+    assert!(current);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].text, "replacement");
     assert!(
