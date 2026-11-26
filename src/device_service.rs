@@ -610,6 +610,18 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
             let destination = root.join(".worktrees").join(name);
             crate::secure_file::reject_symlink_components(&destination)
                 .map_err(|error| error.to_string())?;
+            // Git refuses a dirty worktree itself, but not one whose detached
+            // HEAD is the only thing holding its commits.
+            let service = crate::repository::RepositoryService::system("git");
+            let cancellation = CancellationToken::new();
+            if let Some(record) = service
+                .list_worktrees(root, &cancellation)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .find(|record| record.path == destination)
+            {
+                service.refuse_losing_detached_commits(root, record, &cancellation)?;
+            }
             command.args(["worktree", "remove", "--"]).arg(destination)
         }
         GitOperation::Diff { staged } => {
@@ -1359,6 +1371,46 @@ mod tests {
         std::fs::remove_file(root.join(".worktrees/dev/untracked")).unwrap();
         invoke(GitOperation::RemoveWorktree { name: "dev".into() }).unwrap();
         assert!(!root.join(".worktrees/dev").exists());
+        // A detached worktree whose HEAD alone holds a commit is kept; once
+        // a branch holds that commit it is removed.
+        invoke(GitOperation::CreateWorktree {
+            name: "detached".into(),
+            branch: "feature/detached".into(),
+        })
+        .unwrap();
+        let detached = root.join(".worktrees/detached");
+        let run_in = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&detached)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_in(&["switch", "--detach"]);
+        run_in(&["commit", "--allow-empty", "-m", "detached only"]);
+        let refusal = invoke(GitOperation::RemoveWorktree {
+            name: "detached".into(),
+        })
+        .unwrap_err();
+        assert!(refusal.contains("1 commit on no branch"), "{refusal}");
+        assert!(detached.is_dir());
+        run_in(&["branch", "rescue"]);
+        invoke(GitOperation::RemoveWorktree {
+            name: "detached".into(),
+        })
+        .unwrap();
+        assert!(!detached.exists());
         // The remote project can itself be an external linked checkout.
         // Remove the prior rule so this exercises its real policy write.
         let linked_directory = crate::repository::retained_managed_fixture_directory();

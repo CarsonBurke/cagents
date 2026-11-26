@@ -2005,18 +2005,27 @@ impl Cagents {
         None
     }
 
-    fn worktree_deletion_warning(&self, target: &Target) -> Option<String> {
-        let dirty = self
-            .sidebar_model
+    fn deletion_target_row(&self, target: &Target) -> Option<&SidebarWorktree> {
+        self.sidebar_model
             .projects
             .iter()
-            .find(|project| project.id == target.project)
-            .and_then(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .find(|worktree| Some(worktree.id) == target.worktree)
-            })
+            .find(|project| project.id == target.project)?
+            .worktrees
+            .iter()
+            .find(|worktree| Some(worktree.id) == target.worktree)
+    }
+
+    /// The sentence naming the branch a deletion keeps. A detached HEAD has
+    /// none to name, and its commits are guarded when deletion runs instead.
+    fn worktree_retained_branch(&self, target: &Target) -> Option<String> {
+        let row = self.deletion_target_row(target)?;
+        let branch = row.branch.as_deref().filter(|_| !row.detached)?;
+        Some(format!("The branch {branch} is kept."))
+    }
+
+    fn worktree_deletion_warning(&self, target: &Target) -> Option<String> {
+        let dirty = self
+            .deletion_target_row(target)
             .and_then(|worktree| worktree.dirty.as_ref())
             .is_some_and(crate::repository::DirtyState::is_dirty);
         let unsaved = self.cards.values().any(|runtime| {
@@ -2118,10 +2127,12 @@ impl Cagents {
             super::notice_detail(target.path.display().to_string()),
             super::notice_detail(
                 "Git will remove this worktree directory, including uncommitted, untracked and ignored files such as .env. \
-                 The branch is retained. Terminals and chats running in it, including detached ones, \
-                 are closed first.",
+                 Terminals and chats running in it, including detached ones, are closed first.",
             ),
         ];
+        if let Some(branch) = self.worktree_retained_branch(target) {
+            rows.push(super::notice_detail(branch));
+        }
         if let Some(warning) = self.worktree_deletion_warning(target) {
             rows.push(super::notice_body(warning));
         }
@@ -2713,6 +2724,9 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     if record.lock.locked {
         return Err("The worktree is locked; unlock it explicitly in Git first.".into());
     }
+    // Checked before any session closes, so a refusal leaves everything
+    // running. The dialog's consent covers files, not commits it never named.
+    service.refuse_losing_detached_commits(&target.repository, record, &cancellation)?;
     let removed = service
         .common_dir(&target.repository, &cancellation)
         .and_then(|common_dir| {
@@ -5185,5 +5199,135 @@ pub(in crate::app) mod tests {
             original_head.unwrap()
         );
         assert!(repository.join("tracked.txt").exists());
+    }
+
+    /// Removing a detached worktree drops its HEAD. When nothing else holds
+    /// the commits there, deletion is refused before any session closes;
+    /// once a branch or tag holds them, or the worktree is on a branch,
+    /// nothing is refused and Git removes it.
+    #[test]
+    fn deletion_keeps_commits_only_a_detached_head_holds() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("checkout");
+        git(&root, &["init", "-b", "main", "checkout"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        let detached = root.join("detached");
+        let branched = root.join("branched");
+        let reachable = root.join("reachable");
+        git(
+            &repository,
+            &["worktree", "add", "--detach", detached.to_str().unwrap()],
+        );
+        git(&detached, &["commit", "--allow-empty", "-m", "first"]);
+        git(&detached, &["commit", "--allow-empty", "-m", "second"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                branched.to_str().unwrap(),
+            ],
+        );
+        git(&branched, &["commit", "--allow-empty", "-m", "unpushed"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                reachable.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let records = service.list_worktrees(&repository, &cancellation).unwrap();
+        let record = |path: &Path| records.iter().find(|record| record.path == path).unwrap();
+        let target = |path: &Path| Target {
+            project: ProjectId::new(),
+            worktree: Some(record(path).id),
+            repository: repository.clone(),
+            path: path.to_path_buf(),
+            label: "linked".into(),
+        };
+        let head = record(&detached).head_oid.clone().unwrap();
+        let short = &head[..12];
+
+        let refusal = delete_worktree(&target(&detached)).unwrap_err();
+        assert_eq!(
+            refusal,
+            format!(
+                "Detached HEAD {short} has 2 commits on no branch, tag or remote, which deleting \
+                 the worktree would lose. Keep them on a branch first, for example with \
+                 `git branch NAME {short}`."
+            )
+        );
+        assert!(detached.is_dir());
+
+        // A tag holds them as well as a branch would.
+        git(&repository, &["tag", "kept", &head]);
+        let refreshed = service.list_worktrees(&repository, &cancellation).unwrap();
+        for path in [&detached, &branched, &reachable] {
+            let record = refreshed
+                .iter()
+                .find(|record| &record.path == path)
+                .unwrap();
+            assert_eq!(
+                service.refuse_losing_detached_commits(&repository, record, &cancellation),
+                Ok(()),
+                "{}",
+                path.display()
+            );
+        }
+        for path in [&detached, &branched, &reachable] {
+            let command = worktree_removal_command(&target(path));
+            SystemProcessExecutor
+                .execute(&command, &cancellation)
+                .unwrap()
+                .require_success(&command.program)
+                .unwrap();
+            assert!(!path.exists(), "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn deletion_dialog_names_the_kept_branch_and_none_for_a_detached_head() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        }));
+        let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
+        assert_eq!(
+            app.worktree_retained_branch(&target).as_deref(),
+            Some("The branch feature is kept.")
+        );
+        let row = app
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|row| row.id == project)
+            .unwrap()
+            .worktrees
+            .iter_mut()
+            .find(|row| row.id == linked.id)
+            .unwrap();
+        row.detached = true;
+        assert_eq!(app.worktree_retained_branch(&target), None);
     }
 }
