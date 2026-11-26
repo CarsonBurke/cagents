@@ -533,7 +533,7 @@ fn restore(
     policy: &Preferences,
     snapshot: &mut Snapshot,
     withdrawals: &mut Withdrawals,
-) {
+) -> Result<(), String> {
     if !policy.message_previews {
         match journal.clear_content() {
             Ok(notices) => {
@@ -551,9 +551,7 @@ fn restore(
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
-    if let Err(error) = reserve_withdrawals(journal, snapshot, withdrawals) {
-        snapshot.diagnostic = Some(error);
-    }
+    reserve_withdrawals(journal, snapshot, withdrawals).map(|_| ())
 }
 
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
@@ -598,6 +596,49 @@ fn action_notice(snapshot: &Snapshot, id: Uuid) -> Option<&Notice> {
             notice.id == id || batching::desktop_id(&notice.event.target) == id
         }
     })
+}
+
+fn action_if_current<T>(
+    notice: &Notice,
+    resolved: impl FnOnce(Uuid, u64) -> Result<bool, String>,
+    route: impl FnOnce() -> T,
+) -> Result<Option<T>, String> {
+    if let Target::Automation { id, sequence } = notice.event.target
+        && resolved(id, sequence)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(route()))
+}
+
+fn route_notification_action(
+    host: &SharedHost,
+    notice: &Notice,
+) -> Result<Option<crate::notifications::Destination>, String> {
+    let route = || {
+        host.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .activate_notification_destination(
+                notice.event.target(),
+                notice.event.source_session(),
+                notice.window.as_deref(),
+                notice.event.destination.as_ref(),
+            )
+    };
+    if !matches!(notice.event.target, Target::Automation { .. }) {
+        return Ok(Some(route()));
+    }
+    let registry = super::agent_execution::registry(host)?;
+    // Serialize exact action authorization and its nonblocking routing with
+    // resume, edit, and removal. Launching or raising a window comes later.
+    let registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    action_if_current(
+        notice,
+        |id, seq| registry.automation_attention_resolved(id, seq),
+        route,
+    )
 }
 
 fn delivery_batch(
@@ -909,7 +950,11 @@ async fn run(
     };
     match store.journal() {
         Ok(journal) => {
-            restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
+                next_attempt = Instant::now() + RETRY_DELAY;
+                withdrawal_retry = Some((next_attempt, error.clone()));
+                snapshot.diagnostic = Some(error);
+            }
             restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, true);
         }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
@@ -930,7 +975,7 @@ async fn run(
         }
         .into_iter()
         .chain(store.retry_at())
-        .chain(withdrawal_retry)
+        .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
         .min(),
     )
     .await
@@ -966,7 +1011,9 @@ async fn run(
             if snapshot.diagnostic.as_ref() == Some(&recovered) {
                 snapshot.diagnostic.clone_from(&settings_error);
             }
-            restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
+                snapshot.diagnostic = Some(error);
+            }
             restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, true);
         }
         let journal = match store.journal() {
@@ -1165,7 +1212,11 @@ async fn run(
         let persisted_withdrawals = match reserve_withdrawals(journal, &snapshot, &mut withdrawals)
         {
             Ok(groups) => {
-                withdrawal_retry = None;
+                if let Some((_, error)) = withdrawal_retry.take()
+                    && snapshot.diagnostic.as_deref() == Some(error.as_str())
+                {
+                    snapshot.diagnostic = settings_error.clone();
+                }
                 groups
             }
             Err(error) => {
@@ -1179,10 +1230,10 @@ async fn run(
                     }
                 }
                 publish(&shared, &host, snapshot.clone());
-                answer_tests(&pending.tests, &TestOutcome::Unavailable(error));
+                answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
                 proxy = None;
                 next_attempt = Instant::now() + retry_delay;
-                withdrawal_retry = Some(next_attempt);
+                withdrawal_retry = Some((next_attempt, error));
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
                 continue;
             }
@@ -1379,15 +1430,14 @@ async fn run(
             if let Some(notice) = action_notice(&snapshot, action)
                 && let Some(host) = host.upgrade()
             {
-                let window = host
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .activate_notification_destination(
-                        notice.event.target(),
-                        notice.event.source_session(),
-                        notice.window.as_deref(),
-                        notice.event.destination.as_ref(),
-                    );
+                let window = match route_notification_action(&host, notice) {
+                    Ok(Some(window)) => window,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        snapshot.diagnostic = Some(error);
+                        continue;
+                    }
+                };
                 // Activation and the matched executable handshake can wait;
                 // they never run under the daemon's session lock.
                 match crate::instance::activate_destination(&window, token.as_deref()) {
@@ -1611,7 +1661,8 @@ mod tests {
             &Preferences::default(),
             &mut snapshot,
             &mut withdrawals,
-        );
+        )
+        .unwrap();
         assert_eq!(snapshot.notices, [current]);
         assert!(withdrawals.contains(&batching::desktop_id(&target)));
     }
@@ -1663,7 +1714,8 @@ mod tests {
             &Preferences::default(),
             &mut snapshot,
             &mut withdrawals,
-        );
+        )
+        .unwrap();
         assert_eq!(snapshot.notices, [replacement]);
         assert!(action_notice(&snapshot, group).is_none());
         assert!(action_notice(&snapshot, previous.id).is_none());
@@ -2302,6 +2354,54 @@ mod tests {
             2,
             "new delivery must follow withdrawal, otherwise cleanup would delete its replacement"
         );
+    }
+
+    #[test]
+    fn automation_click_checks_the_exact_witness_even_if_projection_is_stale() {
+        let id = Uuid::new_v4();
+        let sequence = 18;
+        let notice = Notice {
+            id: Uuid::new_v4(),
+            event: Event {
+                target: Target::Automation { id, sequence },
+                source_session: None,
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: crate::notifications::Evidence {
+                    key: format!("automation:{id}:lifecycle:{sequence}"),
+                    kind: crate::notifications::Kind::AutomationBlocked,
+                },
+                content: None,
+            },
+            acknowledged: false,
+            delivered: true,
+            window: None,
+        };
+        let snapshot = Snapshot {
+            notices: vec![notice.clone()],
+            ..Snapshot::default()
+        };
+        let still_visible = action_notice(&snapshot, notice.id).unwrap();
+        for state in [
+            Ok(true),
+            Err("automation registry unavailable".into()),
+            Ok(false),
+        ] {
+            let mut routed = false;
+            let actual = action_if_current(
+                still_visible,
+                |current, witness| {
+                    assert_eq!((current, witness), (id, sequence));
+                    state.clone()
+                },
+                || {
+                    routed = true;
+                },
+            );
+            assert_eq!(routed, state == Ok(false));
+            assert_eq!(actual, state.map(|resolved| (!resolved).then_some(())));
+        }
     }
 
     #[test]
