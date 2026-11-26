@@ -196,6 +196,10 @@ impl Handle {
         let _ = self.0.wake.try_send(());
     }
 
+    pub(super) fn reconcile_automation_attention(&self) {
+        self.change(|_| {});
+    }
+
     pub fn record(&self, event: Event) {
         if event.validate().is_err() {
             return;
@@ -734,29 +738,68 @@ fn protect_automation_toast(
     Ok(())
 }
 
+#[derive(Default)]
+struct AutomationRetry(Option<(Instant, String)>);
+
+impl AutomationRetry {
+    fn deadline(&self) -> Option<Instant> {
+        self.0.as_ref().map(|(due, _)| *due)
+    }
+
+    fn update(&mut self, result: Result<(), String>, snapshot: &mut Snapshot, now: Instant) {
+        match result {
+            Ok(()) => {
+                if let Some((_, error)) = self.0.take()
+                    && snapshot.diagnostic.as_deref() == Some(error.as_str())
+                {
+                    snapshot.diagnostic = None;
+                }
+            }
+            Err(error) => {
+                let due = self
+                    .deadline()
+                    .filter(|due| *due > now)
+                    .unwrap_or(now + RETRY_DELAY);
+                snapshot.diagnostic = Some(error.clone());
+                self.0 = Some((due, error));
+            }
+        }
+    }
+}
+
 fn restore_automation_attention(
     journal: &mut Journal,
     host: &Weak<HostLock>,
     snapshot: &mut Snapshot,
     withdrawals: &mut Withdrawals,
     reopening: bool,
+    retry: &mut AutomationRetry,
 ) {
+    let result = check_automation_attention(journal, host, snapshot, withdrawals, reopening);
+    retry.update(result, snapshot, Instant::now());
+}
+
+fn check_automation_attention(
+    journal: &mut Journal,
+    host: &Weak<HostLock>,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    reopening: bool,
+) -> Result<(), String> {
     if !snapshot.notices.iter().any(|notice| {
         matches!(notice.event.target, Target::Automation { .. })
             && (reopening || !notice.acknowledged)
     }) {
-        return;
+        return Ok(());
     }
     let Some(host) = host.upgrade() else {
-        return;
+        return Ok(());
     };
-    let Ok(registry) = super::agent_execution::registry(&host) else {
-        return;
-    };
+    let registry = super::agent_execution::registry(&host)?;
     let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
     reconcile_automation_attention(journal, snapshot, withdrawals, reopening, |id, sequence| {
         registry.automation_attention_resolved(id, sequence)
-    });
+    })
 }
 
 fn reconcile_automation_attention(
@@ -765,7 +808,8 @@ fn reconcile_automation_attention(
     withdrawals: &mut Withdrawals,
     reopening: bool,
     resolved: impl Fn(uuid::Uuid, u64) -> Result<bool, String>,
-) {
+) -> Result<(), String> {
+    let mut failure = None;
     for notice in &mut snapshot.notices {
         let Target::Automation { id, sequence } = notice.event.target else {
             continue;
@@ -779,7 +823,7 @@ fn reconcile_automation_attention(
                     match journal.acknowledge(notice.id) {
                         Ok(_) => notice.acknowledged = true,
                         Err(error) => {
-                            snapshot.diagnostic = Some(error);
+                            failure = Some(error);
                             continue;
                         }
                     }
@@ -789,9 +833,10 @@ fn reconcile_automation_attention(
                 withdraw_notice(withdrawals, notice);
             }
             Ok(false) => {}
-            Err(error) => snapshot.diagnostic = Some(error),
+            Err(error) => failure = Some(error),
         }
     }
+    failure.map_or(Ok(()), Err)
 }
 
 fn record_attention_committed(
@@ -944,6 +989,7 @@ async fn run(
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
     let mut withdrawal_retry = None;
+    let mut automation_retry = AutomationRetry::default();
     let mut snapshot = Snapshot {
         diagnostic: settings_error.clone(),
         ..Default::default()
@@ -955,7 +1001,14 @@ async fn run(
                 withdrawal_retry = Some((next_attempt, error.clone()));
                 snapshot.diagnostic = Some(error);
             }
-            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, true);
+            restore_automation_attention(
+                journal,
+                &host,
+                &mut snapshot,
+                &mut withdrawals,
+                true,
+                &mut automation_retry,
+            );
         }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
@@ -976,6 +1029,7 @@ async fn run(
         .into_iter()
         .chain(store.retry_at())
         .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
+        .chain(automation_retry.deadline())
         .min(),
     )
     .await
@@ -1014,7 +1068,14 @@ async fn run(
             if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
                 snapshot.diagnostic = Some(error);
             }
-            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, true);
+            restore_automation_attention(
+                journal,
+                &host,
+                &mut snapshot,
+                &mut withdrawals,
+                true,
+                &mut automation_retry,
+            );
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -1208,7 +1269,14 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
-        restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, false);
+        restore_automation_attention(
+            journal,
+            &host,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            &mut automation_retry,
+        );
         let persisted_withdrawals = match reserve_withdrawals(journal, &snapshot, &mut withdrawals)
         {
             Ok(groups) => {
@@ -1414,7 +1482,14 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
-        restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, false);
+        restore_automation_attention(
+            journal,
+            &host,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            &mut automation_retry,
+        );
         if !withdrawals.is_empty()
             && proxy.is_some()
             && let Some(shared) = shared.upgrade()
@@ -1597,7 +1672,8 @@ mod tests {
             &mut withdrawals,
             false,
             resolved,
-        );
+        )
+        .unwrap();
         let desktop = batching::desktop_id(&target);
         assert!(withdrawals.contains(&desktop));
 
@@ -1613,7 +1689,8 @@ mod tests {
             &mut withdrawals,
             false,
             resolved,
-        );
+        )
+        .unwrap();
         assert!(withdrawals.is_empty());
         reconcile_automation_attention(
             &mut journal,
@@ -1621,10 +1698,67 @@ mod tests {
             &mut withdrawals,
             true,
             resolved,
-        );
+        )
+        .unwrap();
         assert_eq!(withdrawals.pop_first().unwrap().id(), desktop);
         assert_eq!(withdrawals.pop_first().unwrap().id(), notice.id);
         assert!(withdrawals.is_empty());
+    }
+
+    #[test]
+    fn failed_automation_acknowledgement_retries_even_with_no_portal_work() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let id = Uuid::new_v4();
+        let event = Event {
+            target: Target::Automation { id, sequence: 1 },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{id}:lifecycle:1"),
+                kind: crate::notifications::Kind::AutomationPaused,
+            },
+            content: None,
+        };
+        let notice = journal.record(event, false).unwrap().unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER refuse_ack BEFORE UPDATE OF acknowledged ON notices BEGIN SELECT raise(ABORT, 'temporarily cannot write'); END;").unwrap();
+        let mut snapshot = Snapshot {
+            notices: vec![notice],
+            ..Default::default()
+        };
+        let mut withdrawals = Withdrawals::default();
+        let mut retry = AutomationRetry::default();
+        let now = Instant::now();
+        let result = reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            true,
+            |_, _| Ok(true),
+        );
+        assert!(result.is_err());
+        retry.update(result, &mut snapshot, now);
+        assert_eq!(retry.deadline(), Some(now + RETRY_DELAY));
+        assert!(!snapshot.notices[0].acknowledged);
+        assert!(withdrawals.is_empty());
+
+        db.execute_batch("DROP TRIGGER refuse_ack").unwrap();
+        let result = reconcile_automation_attention(
+            &mut journal,
+            &mut snapshot,
+            &mut withdrawals,
+            false,
+            |_, _| Ok(true),
+        );
+        retry.update(result, &mut snapshot, now + RETRY_DELAY);
+        assert_eq!(retry.deadline(), None);
+        assert!(snapshot.notices[0].acknowledged);
+        assert!(snapshot.diagnostic.is_none());
+        assert!(!withdrawals.is_empty());
     }
 
     #[test]
