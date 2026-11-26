@@ -31,6 +31,7 @@ const INSTALL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a process found in the worktree gets to leave before it refuses
 /// the removal.
+#[cfg(target_os = "linux")]
 const OCCUPANT_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub(super) struct Scope {
@@ -245,6 +246,7 @@ impl Reservation {
     /// Refuses while any process this user can inspect has its working
     /// directory, root, executable, open file or mapped file inside the worktree.
     /// This sees what the daemon does not host: shells, editors, build watchers.
+    #[cfg(target_os = "linux")]
     pub(crate) fn ensure_no_processes(&self) -> Result<(), String> {
         let scan = || occupant(Path::new("/proc"), &self.scope.path, std::process::id());
         let mut found = scan();
@@ -263,6 +265,15 @@ impl Reservation {
                 "Cannot check processes using the worktree: {error}"
             )),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ensure_no_processes(&self) -> Result<(), String> {
+        // PROC_PIDREGIONPATHINFO can omit the vnode for a submap or a
+        // mapping whose vnode it cannot reacquire. The result does not
+        // distinguish those gaps from anonymous memory. Keep destructive
+        // removal closed when an external process could still map a file.
+        Err("macOS cannot verify all process mappings that may hold this worktree".into())
     }
 
     /// A relative directory names nothing the daemon can resolve, and one it
@@ -390,6 +401,7 @@ pub(super) fn ensure_outside_directory(
 /// The first process under `proc` other than `own` with its working
 /// directory, root, executable, open descriptor or mapped file inside `scope`.
 /// Processes that vanish, or that belong to another user, are skipped.
+#[cfg(any(target_os = "linux", test))]
 fn occupant(proc: &Path, scope: &Path, own: u32) -> io::Result<Option<(u32, String)>> {
     let inside = |link: &Path| match std::fs::read_link(link) {
         Ok(target) => Ok(Path::new(
@@ -470,6 +482,7 @@ fn occupant(proc: &Path, scope: &Path, own: u32) -> io::Result<Option<(u32, Stri
     Ok(None)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn skippable(error: &io::Error) -> bool {
     matches!(
         error.kind(),

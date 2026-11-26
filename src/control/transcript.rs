@@ -277,6 +277,8 @@ fn render(entry: &Entry) -> String {
             let heading = match kind {
                 DeliveryKind::Notice if from.is_empty() => format!("[{summary}]"),
                 DeliveryKind::Notice => format!("[{from}: {summary}]"),
+                // Several messages at once name their senders in the summary.
+                _ if from.is_empty() && !summary.is_empty() => format!("[{summary}]"),
                 kind if summary.is_empty() => format!("[{} {from}]", kind.verb().to_lowercase()),
                 kind => format!("[{} {from}] {summary}", kind.verb().to_lowercase()),
             };
@@ -591,6 +593,23 @@ mod tests {
                 ],
                 "earlier": cursor("u0"),
             })
+        );
+    }
+
+    #[test]
+    fn messages_handed_over_together_are_headed_by_their_senders() {
+        let delivery = entry(
+            "d1",
+            Content::Delivery {
+                kind: DeliveryKind::Message,
+                from: String::new(),
+                summary: "2 messages from reviewer and you".into(),
+                body: text("**reviewer**\n\nShip it", 0),
+            },
+        );
+        assert_eq!(
+            render(&delivery),
+            "[2 messages from reviewer and you]\n  **reviewer**\n\n  Ship it"
         );
     }
 

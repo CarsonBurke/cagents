@@ -86,8 +86,8 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | New terminal | `Ctrl+Shift+T` |
 | New native thread tab | `Ctrl+T` or `Ctrl+Shift+N` |
 | Choose native chat account | `Ctrl+Shift+A` |
-| Choose native chat model | `Ctrl+Shift+M` |
-| Choose native chat permission mode | `Ctrl+Shift+O` |
+| Choose native chat model | `Ctrl+M` |
+| Choose native chat permission mode | `Ctrl+O` |
 | Command palette | `Ctrl+Shift+P` |
 | Open settings | `Ctrl+Comma` |
 | Open worktrees | `Ctrl+Shift+E` |

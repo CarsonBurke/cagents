@@ -409,6 +409,10 @@ impl Drop for Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn preserved_retry_authenticates_original_native_owner_without_reopening_paused_chat() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -682,14 +686,14 @@ fn start_ordinary_terminal(
 
 fn with_private_socket<T>(fixture: &Fixture, operation: impl FnOnce() -> T) -> T {
     let socket = crate::daemon::RuntimePaths::discover().unwrap().socket;
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let host = fixture.host().clone();
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server_stopped = stopped.clone();
     let server = thread::spawn(move || {
         let mut readers = Vec::new();
         for client in 17.. {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::descriptor::accept(&listener).unwrap();
             if server_stopped.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
@@ -729,6 +733,10 @@ fn verify_over_private_socket(
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn settled_cold_host_keeps_real_actors_and_terminal_then_verifies_original_census() {
     if crate::retained_fixture::run_isolated_with_timeout(Duration::from_secs(1020)) {
         return;

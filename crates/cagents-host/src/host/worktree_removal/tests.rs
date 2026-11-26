@@ -110,6 +110,7 @@ fn installation_waits_for_launches_already_admitted() {
     });
 }
 
+#[cfg(target_os = "linux")] // Exercises the live procfs cwd and descriptor census.
 #[test]
 fn the_process_scan_finds_working_directories_and_open_files() {
     let (root, worktree) = tree();
@@ -142,6 +143,17 @@ fn the_process_scan_finds_working_directories_and_open_files() {
     writer.kill().unwrap();
     writer.wait().unwrap();
     assert_eq!(scan(), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn removal_refuses_when_mapped_file_occupancy_cannot_be_checked() {
+    let (_root, worktree) = tree();
+    let host = host();
+    let reservation = Reservation::install(&host, &worktree).unwrap();
+    let error = reservation.ensure_no_processes().unwrap_err();
+    assert!(error.contains("process mappings"), "{error}");
+    assert!(worktree.is_dir());
 }
 
 #[test]

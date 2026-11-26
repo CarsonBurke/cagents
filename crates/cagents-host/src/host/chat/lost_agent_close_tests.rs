@@ -45,7 +45,7 @@ impl Fixture {
 /// A retained Claude conversation saved under `saved_boot`, with its saved
 /// transcript on disk and a provider that only records that it was started.
 fn retained_source(host: &SharedHost, saved_boot: &str) -> Fixture {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::fixture_tempdir().unwrap();
     let registry =
         super::super::model::Registry::at(&directory.path().join("lost-agent.sqlite")).unwrap();
     host.lock().unwrap().execution_registry = Some(Arc::new(std::sync::Mutex::new(registry)));

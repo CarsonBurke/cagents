@@ -46,7 +46,9 @@ pub(super) mod floor;
 pub(super) use execution::{AuthorityError, ResidentRelease, confirmed_identity_update};
 mod lineage;
 mod mailbox;
-pub(super) use execution::{EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUSAL};
+pub(super) use execution::{
+    AgentRunUpdateRisk, EARLIER_MESSAGES, UNVERIFIED_BEHIND, UNVERIFIED_REFUSAL,
+};
 pub(super) use mailbox::{MESSAGE_RUN_KEY, MessageHandoff};
 mod native_actor;
 mod native_actor_retirement;
@@ -69,7 +71,7 @@ mod views;
 mod workspace_snapshot_tests;
 mod worktree_repair;
 
-const SCHEMA_VERSION: u32 = 31;
+const SCHEMA_VERSION: u32 = 33;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -224,10 +226,7 @@ impl Registry {
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
-        let view = views::store::owner(&self.db, pane)?
-            .map(|scope| views::store::read_stored(&self.db, &scope))
-            .transpose()?
-            .flatten();
+        let view = self.pane_view_in_snapshot(pane)?;
         snapshot.commit().map_err(|error| error.to_string())?;
         Ok(view)
     }
@@ -249,6 +248,28 @@ impl Registry {
         channel_row(&self.db, id)
     }
 
+    fn pane_view_in_snapshot(
+        &self,
+        pane: crate::model::CardId,
+    ) -> Result<Option<crate::workspace_model::views::View>, String> {
+        views::store::owner(&self.db, pane)?
+            .map(|scope| views::store::read_stored(&self.db, &scope))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn identity(&self) -> Result<Uuid, String> {
+        let identity: String = self
+            .db
+            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        identity
+            .parse()
+            .map_err(|error: uuid::Error| error.to_string())
+    }
+
     /// Metadata-only queries pin the same coherent WAL snapshot as full reads.
     pub(crate) fn metadata(
         &self,
@@ -259,15 +280,7 @@ impl Registry {
             .db
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
-        let identity: String = self
-            .db
-            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| error.to_string())?;
-        let identity = identity
-            .parse()
-            .map_err(|error: uuid::Error| error.to_string())?;
+        let identity = self.identity()?;
         let reply = match query {
             Query::Identity => Reply::Identity(identity),
             Query::Projects => Reply::Projects {
@@ -411,7 +424,7 @@ impl Registry {
         {
             Self::pending_terminal_save_fixture_error()?;
         }
-        self.apply_delta_guarded(edit, |_, _| Ok(()))
+        self.apply_delta_guarded(edit, None, |_, _| Ok(()))
     }
 
     /// Acquire SQL writer admission before retaining resident serialization.
@@ -419,10 +432,12 @@ impl Registry {
     pub(crate) fn apply_delta_guarded<G>(
         &mut self,
         edit: &ModelEdit,
+        serving: Option<&crate::model::HostSessionProof>,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
     ) -> Result<DeltaApplied, String> {
         self.commit_delta(
             edit,
+            serving,
             |seen, sql| guard(seen, sql).map(|guard| (guard, false)),
             true,
         )
@@ -439,7 +454,7 @@ impl Registry {
     where
         E: From<String>,
     {
-        self.commit_delta(edit, |_, sql| guard(sql), true)
+        self.commit_delta(edit, None, |_, sql| guard(sql), true)
     }
 
     #[cfg(test)]
@@ -457,6 +472,7 @@ impl Registry {
     fn commit_delta<G, E>(
         &mut self,
         edit: &ModelEdit,
+        serving: Option<&crate::model::HostSessionProof>,
         guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<(G, bool), E>,
         check_schema: bool,
     ) -> Result<DeltaApplied, E>
@@ -480,7 +496,7 @@ impl Registry {
         let mut recorder = views::Recorder::default();
         let mut removed_channels = Vec::new();
         let changed = match edit {
-            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder)?,
+            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder, serving)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service"
@@ -1215,6 +1231,14 @@ fn migrate_through(
         execution::migrate_courier_runs(tx)?;
         schema::migration_checkpoint(31)?;
     }
+    if version < 32 && target >= 32 {
+        automation_notifications::migrate_attention_resolution(tx)?;
+        schema::migration_checkpoint(32)?;
+    }
+    if version < 33 && target >= 33 {
+        lineage::migrate_predecessors(tx)?;
+        schema::migration_checkpoint(33)?;
+    }
     Ok(())
 }
 
@@ -1762,7 +1786,7 @@ mod tests {
 
     #[test]
     fn legacy_channel_names_migrate_as_authoritative() {
-        let (mut registry, directory) = registry();
+        let (mut registry, _directory) = registry();
         registry.apply(&open("/project")).unwrap();
         let id = ChannelId::new();
         registry
@@ -1774,42 +1798,7 @@ mod tests {
                 checkout: None,
             })
             .unwrap();
-        // Build the legacy store with no live Registry connection: its TEMP
-        // execution triggers describe the current schema, not the old one.
-        drop(registry);
-        let path = directory.path().join("model.sqlite3");
-        let legacy = Connection::open(&path).unwrap();
-        legacy
-            .execute_batch(
-                "ALTER TABLE channels DROP COLUMN checkout;
-                 DROP TABLE deleted_channels;
-                 DROP TABLE pane_chat_allocations;
-                 DROP TABLE pane_chat_starts;
-                 DROP TABLE terminal_pane_bindings;
-                 DROP TRIGGER session_channel_insert;
-                 DROP TRIGGER session_channel_move;
-                 DROP TABLE session_channels;
-                 DROP TABLE console_relaunches;
-                 DROP TABLE automation_precheck_history_cleanup;
-                 DROP TABLE automation_retired_manual_requests;
-                 DROP INDEX automation_removed_history;
-                 DROP INDEX automation_firing_successors;
-                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
-                 DROP TABLE automation_run_attention;
-                 DROP TABLE shared_terminal_retention_pins;
-                 DROP TABLE terminal_retention_pins;
-                 DROP TABLE shared_view_terminal_sources;
-                 DROP TABLE view_operations;
-                 DROP TABLE retired_panes;
-                 DROP TABLE panes;
-                 DROP TABLE view_scopes;
-                 DROP TABLE view_revision_clock;
-                 DROP TABLE automation_notifications;
-                 DROP TABLE automation_lifecycle;
-                 ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
-            )
-            .unwrap();
-        drop(legacy);
+        let path = automation_proposals::published_fixture_from_rows(&registry, 2);
         let mut restored = Registry::at(&path).unwrap();
         assert!(
             !restored
@@ -1842,10 +1831,7 @@ mod tests {
             .unwrap();
         drop(registry);
         let path = directory.path().join("model.sqlite3");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch("ALTER TABLE channels DROP COLUMN checkout; PRAGMA user_version = 29;")
-            .unwrap();
+        assert_eq!(schema::downgrade(&path, 29).unwrap(), Some(SCHEMA_VERSION));
         let mut upgraded = Registry::at(&path).unwrap();
         assert_eq!(schema::stored_version(&path).unwrap(), Some(SCHEMA_VERSION));
         assert_eq!(upgraded.model().unwrap().channels[0].checkout, None);

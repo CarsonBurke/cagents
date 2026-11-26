@@ -678,6 +678,10 @@ impl ExecutionEvidence {
             .filter(|(pane, _)| *pane == source.id)
             .map(|(_, owner)| owner)
             .collect::<Vec<_>>();
+        #[cfg(target_os = "macos")]
+        if self.processes == Path::new("/proc") {
+            return self.running_darwin_pid(source, &owners);
+        }
         for owner in &owners {
             for expected in [&owner.root, &owner.holder] {
                 let stat = self.processes.join(expected.pid.to_string()).join("stat");
@@ -733,6 +737,60 @@ impl ExecutionEvidence {
                 && arguments
                     .windows(marker.len())
                     .any(|window| window == marker.as_bytes())
+            {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn running_darwin_pid(
+        &self,
+        source: &Session,
+        owners: &[&crate::daemon::holder_registry::Record],
+    ) -> Option<i32> {
+        if source.launch.provider == crate::agent::Provider::Codex {
+            return match self.codex_execution(source) {
+                CodexExecution::Running { pid: Some(pid), .. } => i32::try_from(pid).ok(),
+                _ => None,
+            };
+        }
+        let check = || self.deadline.map_or(Ok(()), check_deadline).ok();
+        let live_pid = |expected: &crate::daemon::holder_registry::Process| {
+            let pid = u32::try_from(expected.pid).ok()?;
+            let pin = crate::daemon::PinnedProcess::open(pid).ok()?;
+            (expected.is_current() && matches!(pin.exited(), Ok(false))).then_some(expected.pid)
+        };
+        let discovered = self.native_holders.as_ref().ok().and_then(|directory| {
+            use crate::daemon::holder_registry::{self, Kind};
+            holder_registry::recovery_candidate(
+                &holder_registry::socket(directory, source.id),
+                Kind::Native,
+            )
+            .ok()
+            .flatten()
+        });
+        let owners = owners.iter().copied().chain(discovered.as_ref());
+        for owner in owners.filter(|owner| owner.boot == self.boot) {
+            check()?;
+            if let Some(pid) = live_pid(&owner.root).or_else(|| live_pid(&owner.holder)) {
+                return Some(pid);
+            }
+            let Ok(members) = crate::daemon::lost_processes::census(&owner.holder, &owner.root)
+            else {
+                continue;
+            };
+            check()?;
+            if let Some(pid) = members
+                .iter()
+                .filter(|member| !member.zombie && member.proved)
+                .find_map(|member| {
+                    live_pid(&crate::daemon::holder_registry::Process {
+                        pid: member.pid,
+                        start: member.start,
+                    })
+                })
             {
                 return Some(pid);
             }
@@ -847,7 +905,14 @@ impl ExecutionEvidence {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
+                #[cfg(target_os = "linux")]
                 Err(_) => return SavedExecution::Unchecked,
+                #[cfg(target_os = "macos")]
+                Err(_) => {
+                    if execution != SavedExecution::Running {
+                        execution = SavedExecution::Unchecked;
+                    }
+                }
             }
             match &self.retired {
                 Ok(retired) => unrecorded |= unnamed && !retired.contains(owner),
@@ -901,6 +966,8 @@ impl ExecutionEvidence {
         };
         owners.extend(&discovered);
         let mut execution = SavedExecution::Ended;
+        #[cfg(target_os = "macos")]
+        let mut missing_retirement = false;
         for owner in owners {
             if self
                 .deadline
@@ -909,7 +976,12 @@ impl ExecutionEvidence {
                 return SavedExecution::Unchecked;
             }
             if !retired.contains(owner) {
+                #[cfg(target_os = "linux")]
                 return SavedExecution::Unproved;
+                #[cfg(target_os = "macos")]
+                {
+                    missing_retirement = true;
+                }
             }
             if owner.boot != self.boot {
                 continue;
@@ -917,8 +989,19 @@ impl ExecutionEvidence {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
+                #[cfg(target_os = "linux")]
                 Err(_) => return SavedExecution::Unchecked,
+                #[cfg(target_os = "macos")]
+                Err(_) => {
+                    if execution != SavedExecution::Running {
+                        execution = SavedExecution::Unchecked;
+                    }
+                }
             }
+        }
+        #[cfg(target_os = "macos")]
+        if execution != SavedExecution::Running && missing_retirement {
+            return SavedExecution::Unproved;
         }
         execution
     }
@@ -926,15 +1009,26 @@ impl ExecutionEvidence {
     /// Classify execution independently of adoption capabilities. Missing
     /// listener ownership or continuity is not evidence of a surviving writer.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
-        saved_codex_execution(self.codex_execution(source))
+        saved_codex_execution(self.codex_retirement(source))
     }
 
     fn codex_execution(&self, source: &Session) -> CodexExecution {
-        self.inspect_codex_execution(source)
+        self.inspect_codex_execution(source, false)
             .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
     }
 
-    fn inspect_codex_execution(&self, source: &Session) -> Result<CodexExecution, String> {
+    // Saved-source inspection and lost Close can retire authority. They
+    // require the old source's exact proof when Darwin observes no writer.
+    fn codex_retirement(&self, source: &Session) -> CodexExecution {
+        self.inspect_codex_execution(source, true)
+            .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
+    }
+
+    fn inspect_codex_execution(
+        &self,
+        source: &Session,
+        require_receipt: bool,
+    ) -> Result<CodexExecution, String> {
         use crate::daemon::holder_registry::{self, Kind};
         let native_holders = self.native_holders.as_ref().map_err(Clone::clone)?;
         let mut controls = vec![holder_registry::socket(native_holders, source.id)];
@@ -1048,9 +1142,35 @@ impl ExecutionEvidence {
             self.starting_patience,
             self.deadline,
         );
+        #[cfg(target_os = "linux")]
+        let _ = require_receipt;
+        #[cfg(target_os = "macos")]
+        let scan = if require_receipt
+            && self.processes == Path::new("/proc")
+            && !earlier_boot
+            && matches!(scan, Ok(CodexExecution::Ended))
+            && (source.proof.is_some()
+                || source.terminal.is_some()
+                || source.owned_codex_listener.is_some()
+                || source.recorded_codex_socket().is_some()
+                || holders.iter().any(Option::is_some))
+            && !(holders.iter().all(Option::is_none)
+                && crate::chat::native_holder::inspect_closed_source(source, &self.boot)?)
+        {
+            Ok(CodexExecution::Unproved {
+                reason: "No exact retirement proves the prior Darwin Codex writer is gone".into(),
+            })
+        } else {
+            scan
+        };
         if let Some(deadline) = self.deadline {
             check_deadline(deadline)?;
         }
+        // An older source boot cannot settle a possibly current Darwin writer.
+        // Callers with the exact issued source can separately inspect its close
+        // receipt. The census also accepts successor and fresh descriptors.
+        #[cfg(target_os = "macos")]
+        let earlier_boot = earlier_boot && self.processes != Path::new("/proc");
         match (scan, retained_processes, unreadable_listener) {
             (Ok(running @ CodexExecution::Running { .. }), _, _) => Ok(running),
             (_, true, _) => Ok(CodexExecution::RetainedProcesses),
@@ -1126,8 +1246,8 @@ pub(super) fn codex_execution(source: &Session, boot: &crate::model::BootId) -> 
     ExecutionEvidence::codex(boot).codex_execution(source)
 }
 
-/// Whether nothing of a Codex pane of `boot` can still run, by the evidence
-/// an upgrade requires before it replaces the service that ran it.
+/// Whether the Codex writer, holder, and listener observations are clear.
+/// A caller requiring exact retirement also verifies its issued receipt.
 pub(super) fn codex_execution_ended(source: &Session, boot: &crate::model::BootId) -> bool {
     codex_execution(source, boot) == CodexExecution::Ended
 }
@@ -1176,7 +1296,7 @@ pub(super) fn execution_end(
         ..ExecutionEvidence::codex(boot)
     };
     let saved = if source.launch.provider == crate::agent::Provider::Codex {
-        match evidence.codex_execution(source) {
+        match evidence.codex_retirement(source) {
             CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING => {
                 return ExecutionEnd::Starting;
             }
@@ -1222,6 +1342,10 @@ fn codex_listener_survives(
     patience: Duration,
     inspection_deadline: Option<Instant>,
 ) -> Result<CodexExecution, String> {
+    #[cfg(target_os = "macos")]
+    if processes == Path::new("/proc") {
+        return darwin_codex_execution(pane, conversation, sockets, inspection_deadline);
+    }
     let patience = Instant::now() + patience;
     let marker = format!("cagents-codex-{pane}");
     let process = CodexProcessJudge {
@@ -1322,6 +1446,134 @@ fn codex_listener_survives(
         _ if !settled => Err(CODEX_PROCESS_STARTING.into()),
         Ok(None) => unreadable.map_or(Ok(CodexExecution::Ended), Err),
         Err(reason) => Err(unreadable.unwrap_or(reason)),
+    }
+}
+
+/// Inspect only pinned processes belonging to this account. A socket node
+/// can outlive its listener, so a remaining node without a verified writer
+/// is uncertainty. A writer that unlinked its listener is still detectable
+/// through its exact issued arguments.
+#[cfg(target_os = "macos")]
+fn darwin_codex_execution(
+    pane: crate::model::TerminalId,
+    conversation: Option<&str>,
+    sockets: &[&Path],
+    deadline: Option<Instant>,
+) -> Result<CodexExecution, String> {
+    let marker = format!("cagents-codex-{pane}");
+    let (writer, uncertainty) = darwin_codex_writer(deadline, marker.as_bytes(), conversation)?;
+    if let Some(writer) = writer {
+        return Ok(CodexExecution::Running {
+            pid: Some(writer.pid as u32),
+            socket: sockets
+                .first()
+                .map_or_else(PathBuf::new, |path| path.to_path_buf()),
+        });
+    }
+    for socket in sockets {
+        match std::fs::symlink_metadata(socket) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot verify the prior Codex listener: {error}")),
+            Ok(_) => return Ok(CodexExecution::RetainedProcesses),
+        }
+    }
+    if let Some(reason) = uncertainty {
+        return Err(reason);
+    }
+    Ok(CodexExecution::Ended)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_codex_writer(
+    deadline: Option<Instant>,
+    marker: &[u8],
+    conversation: Option<&str>,
+) -> Result<
+    (
+        Option<crate::daemon::holder_registry::Process>,
+        Option<String>,
+    ),
+    String,
+> {
+    let uid = crate::daemon::current_uid();
+    let pids = crate::process::table::list(uid)
+        .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+    let mut uncertainty = None;
+    for pid in pids
+        .into_iter()
+        .filter(|&pid| pid > 1 && pid != std::process::id())
+    {
+        if let Some(deadline) = deadline {
+            check_deadline(deadline)?;
+        }
+        let observation = observe_darwin_codex_process(deadline, || {
+            let Some(program) = crate::process::inspect_account_program(pid, uid, |executable| {
+                let name = executable.file_name().unwrap_or_default();
+                named_codex_writer(name) || codex_interpreter(name)
+            })?
+            else {
+                return Ok(None);
+            };
+            darwin_writer_matches(program.executable, &program.arguments, marker, conversation)
+                .map(|matches| matches.then_some(program.process))
+        });
+        match observation {
+            Ok(Some(owner)) => return Ok((Some(owner), None)),
+            Ok(None) => {}
+            Err(error) => {
+                uncertainty.get_or_insert_with(|| {
+                    let reason = error.to_string();
+                    if reason == CODEX_PROCESS_STARTING {
+                        reason
+                    } else {
+                        format!("Cannot inspect possible Codex writer {pid}: {reason}")
+                    }
+                });
+            }
+        }
+    }
+    Ok((None, uncertainty))
+}
+
+#[cfg(target_os = "macos")]
+fn observe_darwin_codex_process(
+    deadline: Option<Instant>,
+    mut observe: impl FnMut() -> io::Result<Option<crate::daemon::holder_registry::Process>>,
+) -> io::Result<Option<crate::daemon::holder_registry::Process>> {
+    let result = observe();
+    if result
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(libc::EIO))
+        && deadline.is_none_or(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) > STARTING_RETRY
+        })
+    {
+        // XNU can fail to copy the argument stack while a process changes.
+        // Only another observation can establish unrelatedness or exit.
+        std::thread::sleep(STARTING_RETRY);
+        if deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            return observe();
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_writer_matches(
+    executable: io::Result<PathBuf>,
+    argv: &[u8],
+    marker: &[u8],
+    conversation: Option<&str>,
+) -> io::Result<bool> {
+    if argv.iter().all(|&byte| byte == 0) {
+        return Err(io::Error::other(CODEX_PROCESS_STARTING));
+    }
+    // Arguments can exclude this conversation even if proc_pidpath failed.
+    // Arguments that do name it still need a verified Codex executable.
+    match executable {
+        Ok(path) => Ok(codex_writer_arguments(&path, argv, marker, conversation)),
+        Err(error) if codex_writer_target(argv, marker, conversation) => Err(error),
+        Err(_) => Ok(false),
     }
 }
 
@@ -1517,6 +1769,7 @@ fn bound_socket(processes: &Path, sockets: &[&Path]) -> io::Result<Option<PathBu
 /// [`crate::daemon::lost_processes`]). A process that merely names the
 /// listener, such as one listing its directory, is not one. A process still
 /// starting is not judged: the next look sees it.
+#[cfg(target_os = "linux")]
 pub(super) fn codex_listener_providers(
     pane: crate::model::TerminalId,
     socket: &Path,
@@ -1524,6 +1777,7 @@ pub(super) fn codex_listener_providers(
     processes_serving_listener(Path::new("/proc"), pane, socket, EXEC_SETTLE)
 }
 
+#[cfg(target_os = "linux")]
 fn processes_serving_listener(
     processes: &Path,
     pane: crate::model::TerminalId,
@@ -1588,6 +1842,7 @@ fn processes_serving_listener(
 
 /// Whether `argv` gives exactly `socket` to listen on, as `--listen
 /// unix://<socket>` or `--listen=unix://<socket>`.
+#[cfg(any(target_os = "linux", test))]
 fn serves_listener(socket: &Path, argv: &[u8]) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let mut endpoint = b"unix://".to_vec();
@@ -1636,38 +1891,43 @@ fn codex_writer_arguments(
     conversation: Option<&str>,
 ) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let named_writer = |name: &std::ffi::OsStr| {
-        let name = name.as_bytes();
-        let name = name.strip_suffix(b" (deleted)").unwrap_or(name);
-        name == b"codex"
-            || name == b"cagents"
-            || name == b"cagentsd"
-            || name.starts_with(b"cagents-")
-    };
     let name = executable.file_name().unwrap_or_default();
     // Interpreter installations publish the script as argv[1]. Verify the
     // interpreter too, so `ls /path/codex` or `exec -a codex ls` cannot acquire
     // writer identity. Native Codex is identified even with a rewritten argv[0].
-    let interpreter = name
-        .to_str()
+    let script = codex_interpreter(name)
+        && argv.split(|byte| *byte == 0).nth(1).is_some_and(|script| {
+            Path::new(std::ffi::OsStr::from_bytes(script))
+                .file_name()
+                .is_some_and(|name| named_codex_writer(name) || name == "codex.js")
+        });
+    (named_codex_writer(name) || script) && codex_writer_target(argv, marker, conversation)
+}
+
+fn codex_writer_target(argv: &[u8], marker: &[u8], conversation: Option<&str>) -> bool {
+    argv.split(|byte| *byte == 0).any(|arg| {
+        arg.windows(marker.len()).any(|window| window == marker)
+            || conversation
+                .filter(|id| !id.is_empty())
+                .is_some_and(|id| arg.windows(id.len()).any(|window| window == id.as_bytes()))
+    })
+}
+
+fn named_codex_writer(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let name = name.as_bytes();
+    let name = name.strip_suffix(b" (deleted)").unwrap_or(name);
+    matches!(name, b"codex" | b"cagents" | b"cagentsd") || name.starts_with(b"cagents-")
+}
+
+fn codex_interpreter(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    name.to_str()
         .is_some_and(crate::agent::Provider::is_interpreter)
         || matches!(
             name.as_bytes(),
             b"sh" | b"bash" | b"dash" | b"python" | b"python3"
-        );
-    let script = interpreter
-        && argv.split(|byte| *byte == 0).nth(1).is_some_and(|script| {
-            Path::new(std::ffi::OsStr::from_bytes(script))
-                .file_name()
-                .is_some_and(|name| named_writer(name) || name == "codex.js")
-        });
-    (named_writer(name) || script)
-        && argv.split(|byte| *byte == 0).any(|arg| {
-            arg.windows(marker.len()).any(|window| window == marker)
-                || conversation
-                    .filter(|id| !id.is_empty())
-                    .is_some_and(|id| arg.windows(id.len()).any(|window| window == id.as_bytes()))
-        })
+        )
 }
 
 /// A leader that called pthread_exit no longer exposes /proc/PID/exe even
@@ -1866,7 +2126,7 @@ const PF_EXITING: u64 = 0x4;
 fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
     use rusqlite::{Connection, OpenFlags, config::DbConfig};
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -1903,7 +2163,7 @@ fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry
 fn read_census(path: &Path) -> Result<Census, String> {
     use rusqlite::{Connection, OpenFlags, config::DbConfig};
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -2155,6 +2415,110 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_process_io_error_gets_one_fresh_observation() {
+        let mut calls = 0;
+        let result = observe_darwin_codex_process(None, || {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(None)
+            }
+        });
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(calls, 2);
+
+        calls = 0;
+        let error = observe_darwin_codex_process(None, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, 2);
+
+        calls = 0;
+        let error = observe_darwin_codex_process(Some(Instant::now()), || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_unreadable_image_needs_independent_evidence() {
+        let inspect = |argv: &[u8]| {
+            darwin_writer_matches(
+                Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                argv,
+                b"cagents-codex-pane",
+                Some("saved-conversation"),
+            )
+        };
+        assert!(!inspect(b"codex\0resume\0different-conversation\0").unwrap());
+        for args in [
+            &b"codex\0unix:///tmp/cagents-codex-pane/control.sock\0"[..],
+            &b"codex\0resume\0saved-conversation\0"[..],
+        ] {
+            assert_eq!(
+                inspect(args).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        for args in [&b""[..], &b"\0"[..]] {
+            assert_eq!(
+                inspect(args).unwrap_err().to_string(),
+                CODEX_PROCESS_STARTING
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_finds_a_live_codex_writer_without_a_listener_node() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::Builder::new()
+            .prefix("codex-writer-")
+            .tempdir()
+            .unwrap();
+        let script = directory.path().join("codex");
+        std::fs::write(&script, "printf 'ready\\n'\nIFS= read -r line || true\n").unwrap();
+        let pane = crate::model::TerminalId::new();
+        let marker = format!("cagents-codex-{pane}");
+        let socket = directory.path().join("listener");
+        let mut child = Command::new("/bin/bash")
+            .arg(script)
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let observed = darwin_codex_execution(pane, None, &[&socket], None);
+        let pid = child.id();
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert!(status.success(), "fixture shell exited with {status}");
+        assert_eq!(ready, "ready\n");
+        assert_eq!(
+            observed.unwrap(),
+            CodexExecution::Running {
+                pid: Some(pid),
+                socket,
+            }
+        );
+    }
+
     #[test]
     fn inspector_and_lifecycle_admit_exactly_the_same_source_protocols() {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2186,6 +2550,7 @@ mod tests {
                 187,
                 191,
                 198,
+                203,
                 crate::terminal_ipc::PROTOCOL_VERSION
             ]
         );
@@ -2617,6 +2982,14 @@ mod tests {
         }
     }
 
+    // Those fixtures record an ended PID and a database row. The Darwin
+    // read-only source inspection cannot authenticate detached cleanup from
+    // either. The lease-holding destination inspects the retirement receipt.
+    #[cfg(target_os = "linux")]
+    const ABSENT_WITHOUT_RECEIPT: SavedExecution = SavedExecution::Ended;
+    #[cfg(target_os = "macos")]
+    const ABSENT_WITHOUT_RECEIPT: SavedExecution = SavedExecution::Unchecked;
+
     fn evidence(
         holders: &Path,
         census: Vec<(TerminalId, crate::daemon::holder_registry::Record)>,
@@ -2633,25 +3006,32 @@ mod tests {
         }
     }
 
-    /// Real kernel process and socket data, restricted to this fixture's
-    /// explicitly owned processes. An unrelated exec is not part of its input.
+    /// The proc parser's fixture, scoped to this test's explicitly owned
+    /// Linux processes and sockets, or an empty synthetic table on Darwin.
     struct LiveProcesses(tempfile::TempDir);
 
     impl LiveProcesses {
         fn new() -> Self {
             let processes = Self(tempfile::tempdir_in("/var/tmp").unwrap());
             std::fs::create_dir(processes.0.path().join("net")).unwrap();
-            std::os::unix::fs::symlink("/proc/net/unix", processes.0.path().join("net/unix"))
-                .unwrap();
-            processes.include(std::process::id());
+            let sockets = processes.0.path().join("net/unix");
+            #[cfg(target_os = "linux")]
+            {
+                std::os::unix::fs::symlink("/proc/net/unix", sockets).unwrap();
+                processes.include(std::process::id());
+            }
+            #[cfg(target_os = "macos")]
+            std::fs::write(sockets, "Num RefCount Protocol Flags Type St Inode Path\n").unwrap();
             processes
         }
 
+        #[cfg(target_os = "linux")]
         fn include(&self, pid: u32) {
             std::os::unix::fs::symlink(format!("/proc/{pid}"), self.0.path().join(pid.to_string()))
                 .unwrap();
         }
 
+        #[cfg(target_os = "linux")]
         fn remove(&self, pid: u32) {
             std::fs::remove_file(self.0.path().join(pid.to_string())).unwrap();
         }
@@ -2737,18 +3117,22 @@ mod tests {
         // Verified retirement removed the discovery record.
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let mut evidence = evidence(holders.path(), census);
-        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        assert_eq!(evidence.classify(&card), ABSENT_WITHOUT_RECEIPT);
         assert_eq!(
             evidence.classify(&issued),
-            SavedExecution::Unrecorded,
+            if cfg!(target_os = "macos") {
+                SavedExecution::Unchecked
+            } else {
+                SavedExecution::Unrecorded
+            },
             "a pre-ID card reopens only what a recorded retirement confirmed"
         );
         evidence.retired = read_retired_owners(&path);
         assert_eq!(evidence.retired, Ok(vec![retired.clone()]));
         assert_eq!(
             evidence.classify(&issued),
-            SavedExecution::Ended,
-            "a pre-ID card whose actor retired holds no live work either"
+            ABSENT_WITHOUT_RECEIPT,
+            "a registry row alone cannot confirm Darwin detached cleanup"
         );
         drop(registry);
         assert!(read_census(&root.path().join("absent.sqlite3")).is_err());
@@ -2787,7 +3171,7 @@ mod tests {
         let census = vec![(card.id, abandoned.clone()), (card.id, older_boot)];
         assert_eq!(
             evidence(holders.path(), census).classify(&card),
-            SavedExecution::Ended
+            ABSENT_WITHOUT_RECEIPT
         );
         for (holder, root) in [
             (running_process(), ended_process()),
@@ -2813,10 +3197,10 @@ mod tests {
             .create(holders.path())
             .unwrap();
         let census = vec![(card.id, owner(&card, ended_process(), ended_process()))];
-        assert_eq!(
-            evidence(holders.path(), census).classify(&card),
-            SavedExecution::Running
-        );
+        let evidence = evidence(holders.path(), census);
+        assert_eq!(evidence.classify(&card), SavedExecution::Running);
+        #[cfg(target_os = "macos")]
+        assert_eq!(evidence.running_pid(&card), Some(std::process::id() as i32));
     }
 
     #[test]
@@ -2890,7 +3274,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
-                SavedExecution::Ended
+                ABSENT_WITHOUT_RECEIPT
             );
             // A prior-boot record cannot name a surviving holder, even when
             // its PID and start time happen to match a process of this boot.
@@ -2916,6 +3300,9 @@ mod tests {
     /// one among every other process on the host. A process of this user
     /// that hides its executable, as `systemd --user` or ssh-agent do on a
     /// real host, is among them.
+    // Linux only: it hides a process with `prctl` and scans `/proc`, which the
+    // Linux upgrade inspection reads.
+    #[cfg(target_os = "linux")]
     #[test]
     fn real_exec_churn_reports_only_explicit_argument_settlement_uncertainty() {
         use std::os::unix::process::CommandExt;
@@ -3254,6 +3641,8 @@ mod tests {
     }
 
     #[test]
+    // The fixture checks bound sockets through Linux's /proc/net/unix.
+    #[cfg(target_os = "linux")]
     fn codex_pane_with_a_surviving_server_or_holder_is_live_work() {
         use std::io::Read;
         // Other tests must not fork while this test owns a listener whose
@@ -3305,7 +3694,7 @@ mod tests {
             assert_eq!(named, SavedExecution::Running);
             // A server under another name still bound to the listener path.
             std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-            let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let bound = crate::descriptor::bind(&socket).unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Running
@@ -3322,7 +3711,7 @@ mod tests {
             let runtime = tempfile::tempdir_in("/var/tmp").unwrap();
             let target = runtime.path().join("served");
             std::os::unix::fs::symlink(&target, &socket).unwrap();
-            let bound = std::os::unix::net::UnixListener::bind(&target).unwrap();
+            let bound = crate::descriptor::bind(&target).unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Running,
@@ -3459,6 +3848,8 @@ mod tests {
     }
 
     #[test]
+    // The fixture checks bound sockets through Linux's /proc/net/unix.
+    #[cfg(target_os = "linux")]
     fn codex_long_holder_socket_alias_blocks_until_listener_exits() {
         // A concurrent fork can retain a listener until its child execs. Keep
         // final-close assertions in a child where other tests cannot fork it.
@@ -4169,7 +4560,10 @@ mod tests {
     #[test]
     fn ended_panes_stay_unchanged_and_live_unlisted_panes_report_recovery() {
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        #[cfg(target_os = "linux")]
         let retired = retained_card(current_boot());
+        #[cfg(target_os = "macos")]
+        let retired = retained_card(BootId::new("prior-retirement-boot"));
         let previous = retained_card(BootId::new("previous-boot"));
         let live = retained_card(current_boot());
         let held = retained_card(current_boot());
@@ -4250,40 +4644,53 @@ mod tests {
             ),
         ];
         let mut evidence = evidence(holders.path(), census);
-        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unrecorded);
         assert_eq!(evidence.classify(&running), SavedExecution::Running);
-        let (reason, recovery) = saved_chat_problem(&unrecorded, &[], &evidence, || {
-            panic!("an ended unrecorded pane needs no qualification")
-        })
-        .unwrap();
-        let mut inspection = SourceInspection::default();
-        inspection.stop(unrecorded.id, StoppedKind::Chat, &reason, recovery);
-        assert_eq!(
-            inspection.stopped[0].reason,
-            "ended before it recorded its conversation"
-        );
-        assert_eq!(
-            inspection.stopped[0].recovery,
-            "Choose Resume conversation in the new tab (+) menu to find a saved conversation, or start a new conversation"
-        );
-        assert!(
-            saved_chat_problem(&running, &[], &evidence, || Err("unqualified".into())).is_some()
-        );
-        assert_eq!(
-            saved_chat_problem(
-                &unrecorded,
-                std::slice::from_ref(&unrecorded),
-                &evidence,
-                || Err("unqualified".into())
-            )
-            .unwrap()
-            .0,
-            "its conversation could not be confirmed"
-        );
-        evidence.retired = Ok(vec![ended]);
-        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Ended);
-        evidence.retired = Err("unreadable".into());
-        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+            let problem =
+                saved_chat_problem(&unrecorded, &[], &evidence, || Err("unqualified".into()));
+            assert_eq!(problem, Some((UNCHECKED.into(), CHAT_RECOVERY)));
+            evidence.retired = Ok(vec![ended]);
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unrecorded);
+            let (reason, recovery) = saved_chat_problem(&unrecorded, &[], &evidence, || {
+                panic!("an ended unrecorded pane needs no qualification")
+            })
+            .unwrap();
+            let mut inspection = SourceInspection::default();
+            inspection.stop(unrecorded.id, StoppedKind::Chat, &reason, recovery);
+            assert_eq!(
+                inspection.stopped[0].reason,
+                "ended before it recorded its conversation"
+            );
+            assert_eq!(
+                inspection.stopped[0].recovery,
+                "Choose Resume conversation in the new tab (+) menu to find a saved conversation, or start a new conversation"
+            );
+            assert!(
+                saved_chat_problem(&running, &[], &evidence, || Err("unqualified".into()))
+                    .is_some()
+            );
+            assert_eq!(
+                saved_chat_problem(
+                    &unrecorded,
+                    std::slice::from_ref(&unrecorded),
+                    &evidence,
+                    || Err("unqualified".into())
+                )
+                .unwrap()
+                .0,
+                "its conversation could not be confirmed"
+            );
+            evidence.retired = Ok(vec![ended]);
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Ended);
+            evidence.retired = Err("unreadable".into());
+            assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+        }
     }
 
     #[test]
@@ -4602,7 +5009,7 @@ mod tests {
             vec![(card.id, ended.clone()), (card.id, earlier.clone())],
         );
         retired.retired = Ok(vec![ended.clone(), earlier.clone()]);
-        assert_eq!(retired.classify(&card), SavedExecution::Ended);
+        assert_eq!(retired.classify(&card), ABSENT_WITHOUT_RECEIPT);
 
         // A recorded retirement is required for every owner, in any boot.
         let mut unrecorded = evidence(
@@ -4613,8 +5020,11 @@ mod tests {
         assert_eq!(unrecorded.classify(&card), SavedExecution::Unproved);
 
         // A retirement record does not outweigh a process that remains.
-        let mut alive = evidence(holders.path(), vec![(card.id, running.clone())]);
-        alive.retired = Ok(vec![running]);
+        let mut alive = evidence(
+            holders.path(),
+            vec![(card.id, ended.clone()), (card.id, running.clone())],
+        );
+        alive.retired = Ok(vec![ended.clone(), running]);
         assert_eq!(alive.classify(&card), SavedExecution::Running);
 
         // No census owner is no evidence of what ran the pane.

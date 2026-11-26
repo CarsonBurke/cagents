@@ -376,7 +376,7 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
     host.lock().unwrap().enable_holder_recovery();
     // Inject a real bind failure after acquiring the actual lease. This socket
     // is only this fixture's blocker; it never accepts or serves a client.
-    let blocker = UnixListener::bind(&paths.socket).unwrap();
+    let blocker = crate::descriptor::bind(&paths.socket).unwrap();
     let blocker_stat = fs::symlink_metadata(&paths.socket).unwrap();
     let restored = Cell::new(false);
     let restore = || {
@@ -621,6 +621,10 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -632,6 +636,10 @@ fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -647,6 +655,10 @@ fn ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners()
 /// finish that exit before any client connects, not adopt the closed helper
 /// as a live conversation that blocks its own resume.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn next_daemon_finishes_an_exit_interrupted_between_close_and_retirement() {
     if crate::retained_fixture::run_isolated() {
         return;

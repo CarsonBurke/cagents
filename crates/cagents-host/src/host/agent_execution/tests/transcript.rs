@@ -438,22 +438,31 @@ fn a_saved_pane_that_is_not_hosted_is_listed_and_its_conversation_read() {
     assert!(live.sessions.iter().all(|entry| entry.id != session.id));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn undisplayed_retained_agent_saves_confirmed_identity_before_restart() {
     retained_identity_case(false, Confirmation::WhileServing, ProviderHome::Original);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn confirmed_identity_retries_after_census_publication_failure() {
     retained_identity_case(true, Confirmation::WhileServing, ProviderHome::Original);
 }
 
 /// #2849: a drain that published no identity (none was confirmed yet) must
 /// not settle a run whose outcome it reads after the provider confirmed one.
-#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn identity_confirmed_after_drain_publication_still_gates_the_run_outcome() {
     retained_identity_case(
         true,
@@ -462,8 +471,11 @@ fn identity_confirmed_after_drain_publication_still_gates_the_run_outcome() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn shutdown_saves_identity_confirmed_after_background_broker_stops() {
     retained_identity_case(
         false,
@@ -472,14 +484,20 @@ fn shutdown_saves_identity_confirmed_after_background_broker_stops() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn shutdown_saves_confirmed_identity_after_provider_home_is_removed() {
     retained_identity_case(false, Confirmation::AfterBrokerStops, ProviderHome::Removed);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn shutdown_saves_confirmed_identity_after_provider_home_is_replaced() {
     retained_identity_case(
         false,
@@ -488,7 +506,6 @@ fn shutdown_saves_confirmed_identity_after_provider_home_is_replaced() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProviderHome {
     Original,
@@ -498,7 +515,6 @@ enum ProviderHome {
 
 /// When the provider confirms its conversation relative to the daemon's
 /// outcome broker.
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirmation {
     /// While the broker serves the actor normally.
@@ -510,7 +526,6 @@ enum Confirmation {
     AfterBrokerStops,
 }
 
-#[cfg(target_os = "linux")]
 fn retained_identity_case(fail_census: bool, confirmation: Confirmation, home: ProviderHome) {
     if super::retained_automation::isolated_retained() {
         return;

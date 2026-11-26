@@ -302,7 +302,7 @@ impl Reservation {
             return Err(error("Chat is already starting or closing"));
         }
         state.chat_spawning.insert(source.id, source.clone());
-        state.inventory_generation += 1;
+        state.inventory_changed();
         Ok(Self {
             host: host.clone(),
             source: source.clone(),
@@ -472,7 +472,7 @@ impl Reservation {
             require_available(&state)?;
         }
         state.chat_spawning.insert(source.id, source.clone());
-        state.inventory_generation += 1;
+        state.inventory_changed();
         Ok(Some(Self {
             host: host.clone(),
             source: source.clone(),
@@ -525,7 +525,7 @@ impl Drop for Reservation {
         }
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
             state.chat_spawning.remove(&self.source.id);
-            state.inventory_generation += 1;
+            state.inventory_changed();
             crate::daemon::wake();
         }
     }
@@ -883,7 +883,7 @@ pub(super) fn restore_saved_history(
                 .map_err(retryable_unavailable)?;
             state.chats.insert(id, record);
             state.chat_added(id);
-            state.inventory_generation += 1;
+            state.inventory_changed();
             Ok(response)
         }
     };
@@ -1088,8 +1088,8 @@ pub(in crate::host) fn release(
                 "The exact native history reader changed; its successor was preserved",
             ));
         }
-        state.inventory_generation += 1;
-        let retired = state.chats.remove(&proof.session.id);
+        state.inventory_changed();
+        let retired = state.remove_chat(proof.session.id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(proof.session.id);
         }
@@ -1157,7 +1157,7 @@ mod tests {
             "misnamed close",
         ] {
             let cleanup = matches!(purpose, "close" | "named close");
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::fixture_tempdir().unwrap();
             let host = host();
             host.lock()
                 .unwrap()
@@ -1380,7 +1380,7 @@ mod tests {
     }
 
     fn history_reader(host: &SharedHost, close: bool) -> (tempfile::TempDir, Session, Handle) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::fixture_tempdir().unwrap();
         let registry = super::super::super::model::Registry::at(
             &directory.path().join("capacity-model.sqlite"),
         )

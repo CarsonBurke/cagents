@@ -96,26 +96,23 @@ impl Reservation {
         }
         let writer = crate::host::workspace::writer(host)?;
         let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
-        let model = registry.model().map_err(unavailable)?;
+        let target = registry
+            .pane_chat_start_view(request.card)
+            .map_err(unavailable)?;
         if request.registry != crate::workspace_model::NO_REGISTRY
-            && model.identity != request.registry
+            && target.identity != request.registry
         {
             return Err(error(
                 "The shared workspace changed before this conversation started",
             ));
         }
-        let canonical = model.views.iter().find_map(|view| {
+        let canonical = target.view.as_ref().and_then(|view| {
             view.panes
                 .iter()
                 .find(|pane| pane.id == request.card)
                 .map(|pane| (view, pane))
         });
-        if canonical.is_none()
-            && model
-                .views
-                .iter()
-                .any(|view| view.retired.contains(&request.card))
-        {
+        if target.retired {
             return Err(error(crate::host::model::Registry::VIEW_SOURCE_CONFLICT));
         }
         let binding = registry
@@ -393,7 +390,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::fixture_tempdir().unwrap();
             let source = Session {
                 id: TerminalId::new(),
                 proof: None,

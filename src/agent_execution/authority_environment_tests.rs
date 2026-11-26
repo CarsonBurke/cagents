@@ -113,7 +113,7 @@ fn present_authority_never_downgrades_terminal_or_work_cli_to_user() {
     let role = role.to_str().unwrap().to_owned();
     let socket = daemon_socket_path().unwrap();
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new("fixture-host"),
@@ -127,17 +127,10 @@ fn present_authority_never_downgrades_terminal_or_work_cli_to_user() {
         let mut operations = 0;
         let mut reads = 0;
         for operation in ["spawn", "write", "close", "pin", "unpin", "plan", "remove"] {
-            // Ordinary User --no-start checks socket liveness first. Scoped
-            // terminal and service contexts use the captured existing endpoint
-            // directly, including the unauthenticated Work removal-plan read.
-            if peer_role == "user" {
-                let mut probe = accept(&listener);
-                assert!(
-                    read_frame::<ClientEnvelope>(&mut probe).unwrap().is_none(),
-                    "the liveness probe unexpectedly sent a request"
-                );
-                drop(probe);
-            }
+            // Every caller, User --no-start included, makes its request on the
+            // connection that first reached the daemon (#3951); scoped terminal
+            // and service contexts also use it for the unauthenticated Work
+            // removal-plan read.
             let mut stream = accept(&listener);
             let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             assert_eq!(connect.version, PROTOCOL_VERSION);
@@ -374,7 +367,7 @@ fn accept(listener: &UnixListener) -> UnixStream {
         revents: 0,
     };
     assert_eq!(unsafe { libc::poll(&mut target, 1, 5000) }, 1);
-    let (stream, _) = listener.accept().unwrap();
+    let (stream, _) = crate::descriptor::accept(listener).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();

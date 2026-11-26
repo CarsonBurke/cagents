@@ -104,7 +104,7 @@ pub(super) fn config_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf>
     storage_root(launch, home, "XDG_CONFIG_HOME")
 }
 
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", any(target_os = "linux", test)))]
 pub(super) fn state_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
     storage_root(launch, home, "XDG_STATE_HOME")
 }

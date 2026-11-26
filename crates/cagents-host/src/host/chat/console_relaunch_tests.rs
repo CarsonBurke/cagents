@@ -9,28 +9,40 @@ use crate::{
         views::{Pane, Scope},
     },
 };
-use std::{
-    fs,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
-    path::Path,
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn daemon_eof_relaunches_only_the_console_and_keeps_its_running_turn() {
     run_case(None);
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn console_replacement_recovers_a_crash_after_unpair_ack() {
     run_case(Some("unpair"));
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn console_replacement_recovers_spawn_before_its_holder_receipt_is_saved() {
     run_case(Some("spawn"));
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn console_replacement_recovers_pair_ack_before_registry_commit() {
     run_case(Some("pair"));
 }
@@ -151,7 +163,7 @@ while True:
 "#,
     );
     fs::write(root.join("lease-third-frame-gate"), b"hold").unwrap();
-    let listener = UnixListener::bind(root.join("old.sock")).unwrap();
+    let listener = crate::descriptor::bind(root.join("old.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let paths = crate::daemon::RuntimePaths::discover().unwrap();
     fs::write(root.join("console-lock-path"), paths.lock.to_str().unwrap()).unwrap();
@@ -261,7 +273,9 @@ while True:
     let mut connection = None;
     wait(
         || {
-            connection = listener.accept().ok().map(|(stream, _)| stream);
+            connection = crate::descriptor::accept(&listener)
+                .ok()
+                .map(|(stream, _)| stream);
             connection.is_some()
         },
         "fake console never connected to its old daemon",

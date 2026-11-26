@@ -35,8 +35,12 @@ kotlin {
 // The recorded example of every message the bridge's API version 1 has had.
 // The app must keep decoding it; see docs/mobile-api.md#compatibility.
 val apiFixture = rootProject.layout.projectDirectory.file("../crates/mobile-api/fixtures/v1.jsonl")
+// A pairing code as the computer writes it; see RecordedPairingCodeTest.
+val pairingCodeFixture = rootProject.layout.projectDirectory.file("../crates/mobile-api/fixtures/pairing-code-v1.txt")
 
 tasks.withType<Test>().configureEach {
     inputs.file(apiFixture).withPathSensitivity(PathSensitivity.NONE)
+    inputs.file(pairingCodeFixture).withPathSensitivity(PathSensitivity.NONE)
     systemProperty("cagents.mobileApiFixture", apiFixture.asFile.absolutePath)
+    systemProperty("cagents.pairingCodeFixture", pairingCodeFixture.asFile.absolutePath)
 }

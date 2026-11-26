@@ -28,7 +28,7 @@ fn connect(path: &Path, readonly: bool) -> Result<Connection, String> {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     };
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         access | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|e| e.to_string())?;
@@ -238,6 +238,14 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            33 => {
+                tx.execute_batch("DROP TABLE session_lineage_predecessors;")
+                    .map_err(|error| error.to_string())?;
+            }
+            32 => {
+                tx.execute_batch("DROP TABLE automation_attention_resolution;")
+                    .map_err(|error| error.to_string())?;
+            }
             31 => {
                 tx.execute_batch(
                     "DROP INDEX agent_runs_unfinished_by_agent; DROP INDEX agent_runs_by_message;",
@@ -324,7 +332,7 @@ fn reject_unjournaled_layout(path: &Path) -> Result<(), String> {
     // Use the default SQLite VFS so closing this connection still respects the
     // other connections' same-process POSIX lock ownership.
     let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
-    let mut uri = url::Url::from_file_path(absolute)
+    let mut uri = url::Url::from_file_path(crate::secure_file::sqlite_path(&absolute))
         .map_err(|_| "workspace registry path cannot be represented as a file URL")?;
     uri.query_pairs_mut()
         .append_pair("mode", "ro")
@@ -409,6 +417,8 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_NINE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -430,6 +440,8 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         29 => &TWENTY_NINE,
         30 => &THIRTY,
         31 => &THIRTY_ONE,
+        32 => &THIRTY_TWO,
+        33 => &THIRTY_THREE,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -1373,7 +1385,8 @@ mod tests {
             // channel work, schema 28 adds private pane chat ownership,
             // schema 29 retains explicitly deleted channel identities, and
             // schema 30 records each channel's checkout, and schema 31 adds
-            // indexes for mailbox run receipts and unfinished runs.
+            // indexes for mailbox run receipts and unfinished runs. Schema 32
+            // keeps automation attention resolution outside the bounded audit.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1393,6 +1406,8 @@ mod tests {
                 "deleted_channels",
                 "agent_runs_by_message",
                 "agent_runs_unfinished_by_agent",
+                "automation_attention_resolution",
+                "session_lineage_predecessors",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1783,7 +1798,7 @@ mod tests {
         let _clear = Clear;
         for step in [
             1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26, 27, 28, 29, 30, 31,
+            26, 27, 28, 29, 30, 31, 32,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
@@ -1846,13 +1861,17 @@ mod tests {
 
     #[test]
     fn unjournaled_wal_refusal_preserves_absent_sidecars_and_literal_filename() {
-        use std::os::unix::{ffi::OsStringExt, fs::MetadataExt};
+        #[cfg(target_os = "linux")]
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::MetadataExt;
         for future in [false, true] {
             let dir = fixture_dir();
-            // URI metacharacters and a non-UTF8 byte are literal filename data.
-            let path = dir.path().join(std::ffi::OsString::from_vec(
-                b"refusal ?#%\xff.sqlite3".to_vec(),
-            ));
+            // Path components must reach SQLite as literal filename data.
+            #[cfg(target_os = "linux")]
+            let name = std::ffi::OsString::from_vec(b"refusal ?#%\xff.sqlite3".to_vec());
+            #[cfg(target_os = "macos")]
+            let name = "refusal ?#%é.sqlite3";
+            let path = dir.path().join(name);
             drop(Registry::at(&path).unwrap());
             let db = Connection::open(&path).unwrap();
             if future {

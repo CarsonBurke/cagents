@@ -189,6 +189,9 @@ pub enum HostError {
     Platform(String),
     #[error("cagents daemon I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// Another runtime directory's daemon serves this instance's saved data.
+    #[error("{0}")]
+    StateInUse(crate::instance::state_claim::StateInUse),
 }
 
 impl From<PlatformError> for HostError {
@@ -235,6 +238,103 @@ pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
     lease: Option<std::fs::File>,
     retirement_owned_by_updater: bool,
+    standby: Option<daemon::standby::Activated>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct StartupPublication {
+    publication: crate::update::LocalPublication,
+    _admission: DaemonAdmission,
+    #[cfg(target_os = "macos")]
+    recovered: Option<InstalledRestoration>,
+}
+
+#[cfg(target_os = "macos")]
+enum InstalledRestoration {
+    Prepared(crate::upgrade::recovery::RecoveryRecord),
+    Ready {
+        admission: crate::upgrade::recovery::ReadyAdmission,
+        restored: state::RestoredUpgrade,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPublication>) {
+    if pending.is_none() {
+        return;
+    }
+    use crate::terminal_ipc::StartupState;
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let readiness = state.startup_state_before_publication();
+    if matches!(readiness, StartupState::Restoring { .. }) {
+        return;
+    }
+    let publication = pending.take().unwrap();
+    // Linux keeps its established matched inspection route for retained work.
+    #[cfg(target_os = "linux")]
+    let result = publication
+        .publication
+        .publish()
+        .map_err(|error| error.to_string());
+    #[cfg(target_os = "macos")]
+    let result = (|| {
+        if readiness != StartupState::Ready {
+            return Err("The replacement retained the original owners for inspection".into());
+        }
+        let recovered = publication
+            .recovered
+            .ok_or("The replacement did not settle the original checkpoint")?;
+        let terminals = state.list(0);
+        match &recovered {
+            InstalledRestoration::Prepared(record) => {
+                let chats = update_recovery::live_chat_descriptors(&state);
+                record.verify_live_inventory(state.proof(), &terminals, &chats)
+            }
+            InstalledRestoration::Ready { admission, .. } => {
+                let chats = chat::chat_list_inventory(&state);
+                if chats.iter().any(|session| {
+                    state.chats.get(&session.id).is_none_or(|record| {
+                        record.handle.is_completed() || !record.handle.owns_work()
+                    })
+                }) {
+                    return Err("An original conversation has not finished resuming".into());
+                }
+                admission.verify_live_inventory(state.proof(), &terminals, &chats)?;
+                admission.remember_cutover(state.proof())
+            }
+        }?;
+        publication
+            .publication
+            .publish()
+            .map_err(|error| error.to_string())?;
+        if let InstalledRestoration::Ready { mut restored, .. } = recovered {
+            restored.finish_locked(&mut state)?;
+        }
+        Ok::<_, String>(())
+    })();
+    if let Err(error) = result {
+        let detail = format!("Could not select the restored application: {error}");
+        state.retain_startup_recovery(detail.clone());
+        tracing::error!(%detail, "restored startup owners were kept");
+    }
+    state.publishing_startup = false;
+}
+
+fn acknowledge_standby(standby: Option<daemon::standby::Activated>) {
+    if let Some(standby) = standby
+        && let Err(error) = standby.started()
+    {
+        // The host owns the restored state even after the coordinator exits.
+        tracing::warn!(%error, "replacement daemon startup acknowledgement was not delivered");
+    }
+}
+
+impl DaemonAdmission {
+    #[doc(hidden)]
+    pub fn with_update_standby(mut self, standby: Option<daemon::standby::Activated>) -> Self {
+        self.standby = standby;
+        self
+    }
 }
 
 /// Authenticate startup authority before diagnostics or runtime threads exist.
@@ -261,6 +361,7 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
         _guard: admission,
         lease,
         retirement_owned_by_updater,
+        standby: None,
     })
 }
 
@@ -364,8 +465,18 @@ fn collect_runtime_directory(
         Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
         Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
     }
-    // Its own connection, so a batch never waits on or holds the host lock.
+    // Inventory reads use their own connection. Only final admission takes
+    // the workspace writer and host locks.
     if let Some(model) = model {
+        match service::attempt("closed-session notice collection", || {
+            notifications::orphaned::collect(&host, model)
+        }) {
+            Ok(0) => {}
+            Ok(notices) => tracing::debug!(notices, "acknowledged attention for closed sessions"),
+            Err(error) => {
+                tracing::debug!(%error, "closed-session attention inventory is incomplete")
+            }
+        }
         match service::attempt("pane change collection", || model.collect_view_operations()) {
             Ok(0) => {}
             Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
@@ -409,7 +520,7 @@ fn listener_before_restore(
     paths: &RuntimePaths,
     restore: impl FnOnce() -> Result<(), HostError>,
 ) -> Result<UnixListener, HostError> {
-    let listener = UnixListener::bind(&paths.socket)?;
+    let listener = crate::descriptor::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     restore()?;
@@ -422,6 +533,12 @@ fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, 
     let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
     let inherited =
         daemon::lease_handoff::clone_inherited_lease().map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    let _publication = if inherited.is_none() {
+        crate::install_guard::admit_darwin_state_access().map_err(|error| error.to_string())?
+    } else {
+        None
+    };
     let _lease =
         HostLease::acquire_for_store_maintenance(&paths, inherited).map_err(
             |error| match error {
@@ -432,6 +549,10 @@ fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, 
                 error => error.to_string(),
             },
         )?;
+    // A daemon in another runtime directory must not open the store while
+    // this converts it. Released before the lease.
+    let _state = crate::instance::state_claim::claim_store_maintenance(&paths.lock)
+        .map_err(|error| error.to_string())?;
     work()
 }
 
@@ -515,6 +636,28 @@ fn save_abandoned_identities(host: &SharedHost) {
     }
 }
 
+/// Saves each open agent's conversation ID to its pane where the pane shows
+/// the same process without one, so a chat whose process is gone reopens its
+/// conversation instead of reporting that cagents lost track of it.
+fn save_agent_pane_identities(host: &SharedHost) {
+    let Ok(registry) = agent_execution::registry(host) else {
+        return;
+    };
+    let saved = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .save_agent_pane_identities();
+    if let Some(error) = saved.unread {
+        tracing::warn!(%error, "cannot read the agents whose panes lack their conversation ID");
+    }
+    if !saved.written.is_empty() {
+        tracing::info!(chats = ?saved.written, "saved agents' conversation IDs to the panes that lacked them");
+    }
+    for (chat, error) in saved.failed {
+        tracing::warn!(%chat, %error, "cannot save this agent's conversation ID to its pane; a later start tries again");
+    }
+}
+
 fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
     use crate::chat::runtime::Deliveries;
 
@@ -563,6 +706,11 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     observe_fixture_startup("host run entered", None);
     daemon::install_signal_handlers()?;
     crate::descriptor_limit::raise();
+    // Holders start from this image; pin it before an update replaces the
+    // installed daemon.
+    if let Err(error) = crate::process::pin_own_image() {
+        tracing::warn!(%error, "terminal and chat holders cannot be started");
+    }
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,
@@ -570,6 +718,11 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
+    let mut standby = admission.standby.take();
+    #[cfg(target_os = "macos")]
+    let mut ready_admission = standby
+        .as_mut()
+        .and_then(daemon::standby::Activated::take_ready_admission);
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -577,6 +730,28 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let _lease = match admission.lease.take() {
         Some(lease) => HostLease::acquire_with_handoff(&paths, &proof, Some(lease))?,
         None => HostLease::acquire(&paths, &proof)?,
+    };
+    // The lease excludes daemons only in this runtime directory. Before this
+    // daemon restores, publishes or saves anything, it also claims the saved
+    // data, which a daemon in another runtime directory may already serve.
+    // Declared after the lease, it is released first. Darwin's installer
+    // checks the production claim before changing or removing any saved data.
+    let _state = match crate::instance::state_claim::claim_daemon_state(
+        &paths.lock,
+        proof.host_session_id.as_str(),
+    ) {
+        Ok(claim) => Some(claim),
+        Err(error) => match crate::instance::state_claim::state_in_use(&error) {
+            Some(refusal) => return Err(HostError::StateInUse(refusal.clone())),
+            #[cfg(target_os = "macos")]
+            None if !crate::instance::IS_DEVELOPMENT || crate::update::runs_from_installation() => {
+                return Err(error.into());
+            }
+            None => {
+                tracing::warn!(%error, "could not claim this instance's saved data; a daemon in another runtime directory is not kept away from it");
+                None
+            }
+        },
     };
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("daemon lease acquired", None);
@@ -589,6 +764,18 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             %error,
             "sessions will name this version's CLI directory, which a later update does not follow"
         );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Capture the login shell's PATH before admitting native provider
+        // launches. The bounded shell probe imports only PATH and is cached.
+        // LaunchServices and launchd can both start with a shorter PATH.
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            let _ = runtime.block_on(crate::account::probe::search_path());
+        }
     }
     let mut initial = HostState::new(proof);
     initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
@@ -635,7 +822,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("workspace model opened", None);
     let notification_application = crate::instance::notification_daemon_application(
-        &std::env::current_exe()?,
+        &crate::process::current_executable()?,
         std::env::args_os()
             .any(|argument| argument == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT),
     )?;
@@ -668,12 +855,28 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("activity monitor started", None);
     let mut recovered_prepared = false;
+    #[cfg(target_os = "macos")]
+    let mut installed_restoration = None;
     let listener = listener_before_restore(&paths, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
         let restored = (|| -> io::Result<()> {
-            if update_recovery::restore(&host).map_err(io::Error::other)? {
+            #[cfg(target_os = "macos")]
+            if let Some(admission) = ready_admission.take() {
+                let restored = update_recovery::restore_installed_ready(&host, &admission)
+                    .map_err(io::Error::other)?;
+                installed_restoration = Some(InstalledRestoration::Ready {
+                    admission,
+                    restored,
+                });
+                return Ok(());
+            }
+            if let Some(_record) = update_recovery::restore(&host).map_err(io::Error::other)? {
                 recovered_prepared = true;
+                #[cfg(target_os = "macos")]
+                {
+                    installed_restoration = Some(InstalledRestoration::Prepared(_record));
+                }
                 return Ok(());
             }
             #[cfg(all(test, target_os = "linux"))]
@@ -693,7 +896,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         // saves them instead.
         if restored.is_ok() {
             save_abandoned_identities(&host);
+            // A second daemon over the same data may have stamped panes of
+            // chats this one serves with its own proof (#4118).
+            workspace::adopt_foreign_panes(&host);
         }
+        // An open agent's own ID is the daemon's record whatever restore
+        // reached, so its pane learns it before any client reads the pane.
+        save_agent_pane_identities(&host);
         match restored {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -720,12 +929,34 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     })?;
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("restore complete; release admission", None);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut pending_publication = if let Some(publication) = standby
+        .as_mut()
+        .and_then(daemon::standby::Activated::take_local_publication)
+    {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publishing_startup = true;
+        Some(StartupPublication {
+            publication,
+            _admission: admission,
+            #[cfg(target_os = "macos")]
+            recovered: installed_restoration,
+        })
+    } else {
+        drop(admission);
+        None
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    publish_restored_selection(&host, &mut pending_publication);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     drop(admission);
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("admission released", None);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
     // An older worker may record the update that started this daemon as
     // failed; once it finishes, this daemon's own receipt settles that.
+    #[cfg(not(target_os = "macos"))]
     crate::update::settle_as_successor(
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -737,7 +968,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         tracing::warn!(%error, "Codex listeners in the temporary directory will not be kept fresh");
     }
     let tally_host = Arc::downgrade(&host);
-    let _tray = crate::tray::start(move || {
+    let tally_updates = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).tally_updates);
+    let _tray = crate::tray::start(tally_updates, move || {
         let host = tally_host.upgrade()?;
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         Some(state.agent_tally())
@@ -860,7 +1092,25 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             tracing::warn!(%error, "recovery completion proof could not be scheduled; serving owners were kept");
         }
     }
+    #[cfg(target_os = "linux")]
+    acknowledge_standby(standby.take());
+    #[cfg(target_os = "macos")]
+    let mut settle_startup_update = true;
     loop {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        publish_restored_selection(&host, &mut pending_publication);
+        #[cfg(target_os = "macos")]
+        if pending_publication.is_none() {
+            acknowledge_standby(standby.take());
+            if std::mem::take(&mut settle_startup_update) {
+                crate::update::settle_as_successor(
+                    host.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .proof()
+                        .clone(),
+                );
+            }
+        }
         reap_finished(&mut clients);
         if daemon::termination_requested() {
             host.lock()
@@ -927,7 +1177,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             // A pending drain must keep accepting inspection and checked Close.
             continue;
         }
-        let fatal = match listener.accept() {
+        let fatal = match crate::descriptor::accept(&listener) {
             Ok((stream, _address)) => {
                 match daemon::peer_uid(&stream) {
                     Ok(uid) if uid == daemon::current_uid() => {}
@@ -1160,6 +1410,19 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         };
         match closed {
             Ok(()) if !upgrading => {
+                {
+                    let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // An already-acknowledged helper outbox can be empty at
+                    // close even though its published request is still unread.
+                    if state
+                        .chats
+                        .get(&session.id)
+                        .is_some_and(|record| record.handle.same_attachment(&chat))
+                        && let Some(notifications) = &state.notifications
+                    {
+                        notifications.clear_session_waiting(session.id);
+                    }
+                }
                 // Ordinary shutdown proved this exact provider stopped. End its
                 // delegated authority and runs before a new daemon can resume
                 // the UI descriptor with another proof; absence alone cannot do

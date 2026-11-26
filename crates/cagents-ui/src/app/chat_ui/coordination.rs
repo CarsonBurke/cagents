@@ -2112,7 +2112,10 @@ impl Runtime {
         if spawn.waits || coordinated.reading.cli {
             return None;
         }
-        let agents: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
+        let agents: Vec<&chat::Subagent> = self
+            .listed_subagents(coordinated)
+            .filter(|agent| !agent.last_seen_running())
+            .collect();
         let any = |wanted: ToolStatus| agents.iter().any(|agent| agent.status == wanted);
         if agents.is_empty() {
             None

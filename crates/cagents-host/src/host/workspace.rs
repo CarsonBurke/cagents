@@ -5,7 +5,7 @@ use super::{
     state::{ClientId, SharedHost},
 };
 use crate::{
-    model::{CardId, CardKind, TerminalId, TerminalSession},
+    model::{CardId, CardKind, HostSessionProof, TerminalId, TerminalSession},
     terminal_ipc::{ProtocolError, ProtocolErrorCode},
     workspace_model::{
         ModelEdit, WorkspaceModel,
@@ -17,12 +17,15 @@ use std::{
     time::Instant,
 };
 
+mod foreign_proof;
 mod pane_move;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod pending_tests;
 #[cfg(test)]
 mod tests;
 pub(super) mod titles;
+
+pub(super) use foreign_proof::adopt_foreign_panes;
 
 #[cfg(test)]
 thread_local! {
@@ -153,10 +156,11 @@ fn edit_then<T>(
     // Always acquire this mutex outside HostState. Retain it through
     // publication so concurrent layout requests publish in commit order.
     let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
-    {
+    let serving = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.ensure_view_retention_available(&edit)?;
-    }
+        state.proof().clone()
+    };
     let replay = match &edit {
         ModelEdit::ChangeView { operation, .. } => registry
             .view_operation_seen(*operation)
@@ -176,7 +180,7 @@ fn edit_then<T>(
             ..
         }
     ) {
-        apply_delta_guarded(&mut registry, &edit, |seen, sql| {
+        apply_delta_guarded(&mut registry, &edit, Some(&serving), |seen, sql| {
             if seen {
                 return Ok(None);
             }
@@ -200,7 +204,7 @@ fn edit_then<T>(
             Ok(Some(state))
         })?
     } else {
-        apply_delta(&mut registry, &edit)?
+        apply_delta_guarded(&mut registry, &edit, Some(&serving), |_, _| Ok(()))?
     };
     if applied.changed {
         let waiting = Instant::now();
@@ -281,12 +285,13 @@ pub(super) fn apply_delta(
     registry: &mut Registry,
     edit: &ModelEdit,
 ) -> Result<DeltaApplied, ProtocolError> {
-    apply_delta_guarded(registry, edit, |_, _| Ok(()))
+    apply_delta_guarded(registry, edit, None, |_, _| Ok(()))
 }
 
 fn apply_delta_guarded<G>(
     registry: &mut Registry,
     edit: &ModelEdit,
+    serving: Option<&HostSessionProof>,
     guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
 ) -> Result<DeltaApplied, ProtocolError> {
     if let ModelEdit::ChangeView {
@@ -328,30 +333,38 @@ fn apply_delta_guarded<G>(
             }
         }
     }
-    registry.apply_delta_guarded(edit, guard).map_err(|error| {
-        if error == Registry::VIEW_REMOVAL_CONFLICT {
-            return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
-        }
-        // Stale-precondition refusals the client resolves by reading again,
-        // the confirmed project close's channel set among them.
-        if error == Registry::VIEW_SOURCE_CONFLICT
-            || error == Registry::VIEW_REVISION_CONFLICT
-            || error == Registry::PROJECT_CHANNELS_CONFLICT
-        {
-            return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
-        }
-        // Execution retirement may close the scope after the preflight read.
-        if let ModelEdit::ChangeView { scope, change, .. } = edit {
-            match registry.view_change_refusal(scope, change) {
-                Ok(Some(reason)) => {
-                    return ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false);
-                }
-                Err(storage) => return unavailable(storage),
-                Ok(None) => {}
+    registry
+        .apply_delta_guarded(edit, serving, guard)
+        .map_err(|error| {
+            if error == Registry::VIEW_REMOVAL_CONFLICT
+                || error == Registry::VIEW_FOREIGN_CHAT_PROOF
+            {
+                return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
             }
-        }
-        unavailable(error)
-    })
+            // Stale-precondition refusals the client resolves by reading again,
+            // the confirmed project close's channel set among them.
+            if error == Registry::VIEW_SOURCE_CONFLICT
+                || error == Registry::VIEW_REVISION_CONFLICT
+                || error == Registry::PROJECT_CHANNELS_CONFLICT
+            {
+                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
+            }
+            // Execution retirement may close the scope after the preflight read.
+            if let ModelEdit::ChangeView { scope, change, .. } = edit {
+                match registry.view_change_refusal(scope, change) {
+                    Ok(Some(reason)) => {
+                        return ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            reason,
+                            false,
+                        );
+                    }
+                    Err(storage) => return unavailable(storage),
+                    Ok(None) => {}
+                }
+            }
+            unavailable(error)
+        })
 }
 
 /// An automatic terminal's pane, as the daemon accepted it.

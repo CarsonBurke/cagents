@@ -1,0 +1,33 @@
+#!/bin/sh
+# A C compiler for aarch64-apple-darwin on a Linux build host, so Cargo can
+# run the build scripts of a macOS type-check (scripts/check-macos). Zig ships
+# Darwin's libc headers; frameworks are only needed to link, which a check
+# never does.
+#
+#   darwin-cc [cc|ar] ARGS...
+#
+# cc-rs passes clang's --target=arm64-apple-macosx, which zig rejects, so it
+# is dropped in favour of zig's own -target.
+set -eu
+tool=cc
+case "${1-}" in cc|ar) tool=$1; shift ;; esac
+version=$(sed -n 's/^zig *= *"\(.*\)"$/\1/p' "$(dirname "$0")/../mise.toml")
+# The zig on PATH if it is the pinned one; otherwise mise's install of it. A
+# mise shim answers only inside a trusted checkout, which the build host's copy
+# of the sources isn't.
+zig=
+if command -v zig >/dev/null 2>&1 && [ "$(zig version 2>/dev/null)" = "$version" ]; then
+    zig=zig
+else
+    data=${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}
+    for candidate in "$data/installs/zig/$version/bin/zig" "$data/installs/zig/$version/zig"; do
+        [ -x "$candidate" ] && { zig=$candidate; break; }
+    done
+    [ -n "$zig" ] || { echo "darwin-cc: zig $version is not installed; run mise install" >&2; exit 1; }
+fi
+[ "$tool" = ar ] && exec "$zig" ar "$@"
+for argument in "$@"; do
+    shift
+    case "$argument" in --target=*) ;; *) set -- "$@" "$argument" ;; esac
+done
+exec "$zig" cc -target aarch64-macos "$@"

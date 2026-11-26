@@ -14,3 +14,9 @@ use cagents::*;
 pub mod host;
 
 cagents::test_binary_setup!();
+
+/// Temporary storage for fixtures that publish paths as durable identities.
+#[cfg(test)]
+fn fixture_tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
+}

@@ -217,13 +217,55 @@ fn completion_wait_until(mut ready: impl FnMut() -> bool) {
 }
 
 #[test]
+fn mobile_inventory_and_conversation_watches_see_provider_completion() {
+    use crate::terminal_ipc::MobileWatch;
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = completion_wake_host();
+    let id = TerminalId::new();
+    let weak = Arc::downgrade(&host);
+    let (handle, launch) = direct_completion_actor(
+        "IFS= read -r line; printf '{}\n'",
+        directory.path(),
+        move |update| changed(&weak, id, update),
+    );
+    completion_wake_record(&host, id, uuid::Uuid::new_v4(), handle.clone(), launch);
+    let (overview, conversation) = {
+        let mut state = host.lock().unwrap();
+        let overview = state.register_client(1);
+        let conversation = state.register_client(2);
+        state
+            .chats
+            .get_mut(&id)
+            .unwrap()
+            .subscribers
+            .insert(2, true);
+        state.watch_mobile(1, MobileWatch::Sessions).unwrap();
+        state
+            .watch_mobile(2, MobileWatch::Conversation(id))
+            .unwrap();
+        (overview, conversation)
+    };
+    handle.close().unwrap();
+    assert!(host.lock().unwrap().chats.contains_key(&id));
+    for (queue, topic) in [
+        (overview, MobileWatch::Sessions),
+        (conversation, MobileWatch::Conversation(id)),
+    ] {
+        queue.close_after_drain();
+        assert!(std::iter::from_fn(|| queue.pop()).any(|frame|
+            matches!(frame.message, ServerMessage::MobileChanged { topic: actual } if actual == topic)));
+    }
+}
+
+#[test]
 fn hidden_completion_wakes_parked_daemon_after_rearm_is_consumed_and_fences_old_owners() {
     if isolated_completion_wake_case("CAGENTS_LOCAL_COMPLETION_WAKE_CASE") {
         return;
     }
     let directory = tempfile::tempdir().unwrap();
     let listener_path = directory.path().join("idle.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+    let listener = crate::descriptor::bind(&listener_path).unwrap();
     let host = completion_wake_host();
     let id = TerminalId::new();
     let instance = uuid::Uuid::new_v4();
@@ -506,7 +548,7 @@ IFS= read -r finish < finish
         }
     };
     let listener_path = directory.path().join("idle.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+    let listener = crate::descriptor::bind(&listener_path).unwrap();
     crate::daemon::wake();
     crate::daemon::wait_for_activity(&listener).unwrap();
     let parked = listener.try_clone().unwrap();
@@ -2319,10 +2361,9 @@ fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread
         );
         return;
     }
-    use std::os::unix::net::UnixListener;
     let (directory, host, mut saved) = upgrade_fixture();
     let socket = directory.path().join("codex.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let home = directory.path().join("codex-home");
     std::fs::create_dir(&home).unwrap();
     let identity = saved.launch.session_id.clone().unwrap();
@@ -2333,7 +2374,7 @@ fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(12);
         let stream = loop {
-            match listener.accept() {
+            match crate::descriptor::accept(&listener) {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(
@@ -3403,10 +3444,10 @@ fn control_client_closes_chat_as(slow: bool, return_terminal: bool, provider: Pr
         },
     );
     let socket = directory.path().join("cagentsd.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let listener = crate::descriptor::bind(&socket).unwrap();
     let server_host = Arc::clone(&host);
     let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         super::super::client::serve(stream, 1, server_host);
     });
 
@@ -3768,4 +3809,24 @@ fn acknowledgement_race(before_rearm: bool) {
     drop(pending);
     drop(release);
     handle.close().unwrap();
+}
+
+#[test]
+fn fresh_launch_preserves_path_order_and_adds_missing_login_search_directories() {
+    let mut recipe = crate::model::LaunchRecipe {
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: "/project".into(),
+        environment: BTreeMap::from([("PATH".into(), "/selected:/shared".into())]),
+        unset_environment: Default::default(),
+    };
+    assert_eq!(
+        combined_login_search_path(&recipe, std::ffi::OsStr::new("/shared:./local:/login"))
+            .as_deref(),
+        Some("/selected:/shared:/login"),
+    );
+
+    recipe.environment.remove("PATH");
+    recipe.unset_environment.insert("PATH".into());
+    assert!(combined_login_search_path(&recipe, std::ffi::OsStr::new("/login")).is_none());
 }

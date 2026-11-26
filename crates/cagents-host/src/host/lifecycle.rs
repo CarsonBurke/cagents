@@ -4,7 +4,6 @@ use super::state::{Retirement, SharedHost};
 use crate::{daemon::child_reaper, model::TerminalId, terminal::TerminalRetirement};
 use std::{
     collections::BTreeSet,
-    fs::File,
     sync::{Arc, Mutex, TryLockError},
     time::{Duration, Instant},
 };
@@ -19,7 +18,7 @@ pub(super) struct Lifecycle {
     retention: Duration,
     retention_error_reported: bool,
     idle: IdleTimer,
-    waiting: Vec<Arc<File>>,
+    waiting: Vec<Arc<crate::daemon::PinnedProcess>>,
     settlement_retry: Option<Instant>,
     custody_retry: Option<Instant>,
 }
@@ -58,7 +57,7 @@ impl Lifecycle {
         }
     }
 
-    pub(super) fn waiting_holders(&self) -> &[Arc<File>] {
+    pub(super) fn waiting_holders(&self) -> &[Arc<crate::daemon::PinnedProcess>] {
         &self.waiting
     }
 
@@ -259,7 +258,7 @@ impl Lifecycle {
             if let Some(error) = error {
                 tracing::warn!(terminal = %id, %error, "Completed terminal remains listed for explicit cleanup");
                 state.terminal_retirements.get_mut(&id).unwrap().failure = Some(error);
-                state.inventory_generation += 1;
+                state.inventory_changed();
             } else {
                 retired.push(state.retire_terminal_if_current(id, &handle));
             }
@@ -334,7 +333,7 @@ impl Lifecycle {
                 state
                     .terminal_retirements
                     .insert(*id, Retirement::submitting(handle.clone()));
-                state.inventory_generation += 1;
+                state.inventory_changed();
             }
             handles
         };
@@ -436,13 +435,7 @@ fn holders_empty() -> bool {
 /// Absence observation must never repair permissions, parse away uncertainty,
 /// remove a stale holder's still-live root evidence, or contact a process.
 fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> {
-    use std::{
-        fs, io,
-        os::{
-            fd::AsRawFd,
-            unix::fs::{MetadataExt, OpenOptionsExt},
-        },
-    };
+    use std::{fs, io, os::unix::fs::MetadataExt};
     crate::secure_file::reject_symlink_components(directory)?;
     let private = |metadata: &fs::Metadata| {
         metadata.is_dir()
@@ -473,10 +466,7 @@ fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> 
             "unsafe holder directory",
         ));
     }
-    let held = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory)?;
+    let held = crate::fs_safety::Root::open(directory)?;
     let opened = held.metadata()?;
     if !private(&opened) || (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
         return Err(io::Error::other(
@@ -485,16 +475,18 @@ fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> 
     }
     // Readdir is bound to the already-validated directory, even if its public
     // name is replaced while scanning. No record bytes or targets are opened.
-    for (index, entry) in fs::read_dir(format!("/proc/self/fd/{}", held.as_raw_fd()))?.enumerate() {
-        if index >= 8192 {
-            return Err(io::Error::other("holder absence census limit exceeded"));
-        }
-        if std::path::Path::new(&entry?.file_name())
+    let (names, more) =
+        crate::fs_safety::first_entries_beneath(&held, std::path::Path::new(""), 8192)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    if names.iter().any(|name| {
+        std::path::Path::new(name)
             .extension()
             .is_some_and(|extension| extension == "json")
-        {
-            return Ok(false);
-        }
+    }) {
+        return Ok(false);
+    }
+    if more {
+        return Err(io::Error::other("holder absence census limit exceeded"));
     }
     let after = fs::symlink_metadata(directory)?;
     if !private(&after) || (after.dev(), after.ino()) != (opened.dev(), opened.ino()) {
@@ -505,7 +497,7 @@ fn holder_directory_empty(directory: &std::path::Path) -> std::io::Result<bool> 
     Ok(true)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -522,12 +514,9 @@ mod tests {
     };
     use std::{
         collections::BTreeMap,
-        fs,
+        fs::{self, File},
         io::Write,
-        os::{
-            fd::FromRawFd,
-            unix::fs::{MetadataExt, PermissionsExt, symlink},
-        },
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
         process::{Child, Command, Stdio},
         thread,
     };
@@ -607,7 +596,7 @@ mod tests {
     struct CensusChild {
         child: Child,
         identity: Process,
-        _original: File,
+        _original: crate::daemon::PinnedProcess,
     }
     impl CensusChild {
         fn start() -> Self {
@@ -618,17 +607,15 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            // SAFETY: this original unreaped Child is blocked on its private
-            // stdin; pidfd_open takes scalar arguments and returns a fresh fd.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("pin actual census child: {error}");
-            }
-            // SAFETY: the successful syscall above transferred this fresh fd.
-            let original = unsafe { File::from_raw_fd(fd as i32) };
+            // This original unreaped Child is blocked on its private stdin.
+            let original = match crate::daemon::PinnedProcess::open(child.id()) {
+                Ok(original) => original,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("pin actual census child: {error}");
+                }
+            };
             let identity = Process::read(child.id() as i32).unwrap();
             Self {
                 child,
@@ -673,17 +660,17 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("pin suspended custody child: {error}");
-        }
-        let pidfd = unsafe { File::from_raw_fd(fd as i32) };
+        let pin = match child_reaper::PinnedChild::of(&child) {
+            Ok(pin) => pin,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("pin suspended custody child: {error}");
+            }
+        };
         let mut stdin = child.stdin.take().unwrap();
         reservation.quarantine();
-        reservation.preserve_suspended(child, Some(pidfd), "fixture");
+        reservation.preserve_suspended(child, Some(pin), "fixture");
         assert!(child_reaper::reserve().is_err());
 
         Lifecycle::testing(Duration::from_secs(600)).maintain(&host, false);

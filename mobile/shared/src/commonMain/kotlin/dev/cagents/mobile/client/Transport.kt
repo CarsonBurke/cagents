@@ -28,19 +28,27 @@ interface LineChannel {
 sealed class ConnectFailure(message: String, cause: Throwable? = null) : Exception(message, cause) {
     abstract val retry: Boolean
 
-    /** The computer couldn't be reached or dropped the connection. */
-    class Network(message: String, cause: Throwable? = null) : ConnectFailure(message, cause) {
+    /**
+     * The computer couldn't be reached or dropped the connection.
+     * [refusedBy] is the address that answered but refused the connection
+     * on that port, which says more than an address that never answered.
+     */
+    class Network(message: String, cause: Throwable? = null, val refusedBy: String? = null) :
+        ConnectFailure(message, cause) {
         override val retry get() = true
     }
 
-    /** The computer's host key isn't pinned yet; the person must decide whether to trust it. */
-    class UnknownHostKey(val fingerprint: String, val keyType: String) :
+    /**
+     * The computer's host key isn't pinned yet; the person must decide
+     * whether to trust it. [host] is the address that presented it.
+     */
+    class UnknownHostKey(val fingerprint: String, val keyType: String, val host: String = "") :
         ConnectFailure("This computer's identity isn't trusted yet.") {
         override val retry get() = false
     }
 
-    /** The computer presented a different host key from the one pinned. */
-    class HostKeyChanged(val fingerprint: String, val pinned: String) :
+    /** The computer at [host] presented a different host key from the one pinned. */
+    class HostKeyChanged(val fingerprint: String, val pinned: String, val host: String = "") :
         ConnectFailure("This computer's identity changed since you trusted it.") {
         override val retry get() = false
     }

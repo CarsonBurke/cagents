@@ -285,6 +285,8 @@ fn the_conversation_work_fixture_reads_as_its_documented_work() {
             (edited("cache-key/src"), Relation::Edited),
             (edited("retry-budget/src"), Relation::Edited),
             (pushed("feat/retry-budget"), Relation::Pushed),
+            (edited("cache-metrics/src"), Relation::Edited),
+            (pushed("feat/cache-metrics"), Relation::Pushed),
             (Reference::Number(35), Relation::Updated),
             (edited("locale-notes/docs"), Relation::Edited),
             (pull_request(41), Relation::Mentioned),

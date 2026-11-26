@@ -55,7 +55,7 @@ fn read_binding(
     source: &Session,
 ) -> Result<(Agent, NativeActorOwnership), String> {
     let db = Connection::open_with_flags(
-        path,
+        crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -224,11 +224,14 @@ fn qualify_binding(
     let Some(selected) = executable(issued) else {
         return Err(UNQUALIFIED);
     };
-    let Some(running) = executable(
-        &Path::new("/proc")
-            .join(console.root.pid.to_string())
-            .join("exe"),
-    ) else {
+    // Darwin names only the image's pathname: an executable replaced there
+    // since the console started leaves it unqualified.
+    let Some(running) = console
+        .root
+        .executable()
+        .ok()
+        .and_then(|path| executable(&path))
+    else {
         return Err(UNQUALIFIED);
     };
     if !issued.is_absolute()
@@ -272,7 +275,7 @@ mod tests {
             let metadata = std::fs::metadata(&home).unwrap();
             let scope = LaunchAccountScope {
                 provider: Provider::Claude,
-                canonical_home: home.clone(),
+                canonical_home: home.canonicalize().unwrap(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 registered_id: None,

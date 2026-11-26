@@ -7,6 +7,12 @@
 //! of a loaded thread by holding the thread's writer lock in its account home,
 //! so the lock's holder is that writer. Releases without the lock still keep
 //! the thread's current rollout open for writing while it is loaded.
+//!
+//! Linux names the lock's holder from the kernel's lock table and finds a
+//! rollout's writer by walking `/proc`. Darwin has no lock table, so there a
+//! held lock is told by a refused probe and its holder named by a census of
+//! this account's processes for one that has the lock open; a lock held by a
+//! process the census cannot see is an error rather than an absent writer.
 use std::{
     io,
     os::{
@@ -17,6 +23,7 @@ use std::{
 };
 
 /// Bounds a census of a host that is spawning processes without end.
+#[cfg(target_os = "linux")]
 const MAX_PROCESSES: usize = 65_536;
 
 /// A process with the thread loaded.
@@ -43,6 +50,7 @@ pub(super) fn writer(lock: Option<&Path>, thread: &str) -> io::Result<Option<Wri
     Ok(pid.map(|pid| Writer { pid }))
 }
 
+#[cfg(target_os = "linux")]
 fn lock_table() -> Result<String, String> {
     #[cfg(test)]
     if let Some(table) = LOCK_TABLE.with(|slot| {
@@ -58,12 +66,12 @@ fn lock_table() -> Result<String, String> {
     read("/proc/locks")
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 std::thread_local! {
     static LOCK_TABLE: std::cell::RefCell<Option<TestLockTable>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct TestLockTable {
     values: Vec<String>,
     reads: std::rc::Rc<std::cell::Cell<usize>>,
@@ -71,13 +79,13 @@ struct TestLockTable {
 
 /// A synchronous request's controlled table input, never shared with another
 /// test thread. The Rc also prevents moving its restoration guard to one.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) struct LockTableScope {
     previous: Option<TestLockTable>,
     reads: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl LockTableScope {
     pub(super) fn new(value: String) -> Self {
         Self::reads_of(vec![value])
@@ -101,13 +109,50 @@ impl LockTableScope {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for LockTableScope {
     fn drop(&mut self) {
         LOCK_TABLE.with(|slot| slot.replace(self.previous.take()));
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+std::thread_local! {
+    static HIDDEN_HOLDERS: std::cell::RefCell<Option<std::rc::Rc<std::cell::Cell<usize>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Darwin has no lock table, so a scope can only stand for an empty one: it
+/// hides every holder from the census that names one, as a table missing the
+/// holder's row hides it on Linux. A held lock then has no holder to name.
+#[cfg(all(test, target_os = "macos"))]
+pub(super) struct LockTableScope {
+    previous: Option<std::rc::Rc<std::cell::Cell<usize>>>,
+    reads: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl LockTableScope {
+    pub(super) fn new(value: String) -> Self {
+        assert!(value.is_empty(), "Darwin has no lock table rows to supply");
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let previous = HIDDEN_HOLDERS.with(|slot| slot.replace(Some(reads.clone())));
+        Self { previous, reads }
+    }
+
+    pub(super) fn reads(&self) -> usize {
+        self.reads.get()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for LockTableScope {
+    fn drop(&mut self) {
+        HIDDEN_HOLDERS.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn read(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|error| format!("Cannot read {path}: {error}"))
 }
@@ -115,6 +160,7 @@ fn read(path: &str) -> Result<String, String> {
 /// The holder of `lock`. A held lock missing from one read of the table is
 /// read for again: see `crate::flock::proven_owners` for why a read can skip
 /// it.
+#[cfg(target_os = "linux")]
 fn held_lock_holder(lock: &Path) -> io::Result<Option<libc::pid_t>> {
     let mut reads = 1;
     loop {
@@ -132,10 +178,12 @@ fn held_lock_holder(lock: &Path) -> io::Result<Option<libc::pid_t>> {
 
 /// The process holding the lock at `lock`, according to the kernel's `locks`
 /// table. Waiters queued behind the holder are not writers.
+#[cfg(target_os = "linux")]
 fn lock_holder(lock: &Path, table: &str) -> io::Result<Option<libc::pid_t>> {
     lock_holder_before_check(lock, table, || Ok(()))
 }
 
+#[cfg(target_os = "linux")]
 fn lock_holder_before_check(
     lock: &Path,
     table: &str,
@@ -200,29 +248,106 @@ fn lock_holder_before_check(
     if !same_lock(&pinned, &probed) {
         return Err(inspect(io::Error::from_raw_os_error(libc::ESTALE)));
     }
+    unheld_while_probed(lock, &pinned, probe, before_check).map_err(inspect)?;
+    Ok(None)
+}
+
+/// The process holding the lock at `lock`. Darwin keeps no table of locks, so
+/// a probe on a description of its own tells whether the lock is held, and a
+/// census names a process of this account that has the lock open. With
+/// several open, the one named may be waiting behind the holder rather than
+/// holding it; either is a live writer of the thread. A held lock that no
+/// process the census can see has open, as a more privileged process's
+/// descriptors are hidden, is an error, never an absent writer.
+#[cfg(target_os = "macos")]
+fn held_lock_holder(lock: &Path) -> io::Result<Option<libc::pid_t>> {
+    lock_holder_before_check(lock, || Ok(()))
+}
+
+#[cfg(target_os = "macos")]
+fn lock_holder_before_check(
+    lock: &Path,
+    before_check: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Option<libc::pid_t>> {
+    let inspect = |error| inspect_error(lock, error);
+    // Darwin has no O_PATH to pin the file without opening it, so check its
+    // kind before opening it at all, then that the open reached that file.
+    let pinned = match std::fs::metadata(lock) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(inspect(error)),
+    };
+    if !pinned.is_file() {
+        return Err(inspect(io::Error::from_raw_os_error(libc::EINVAL)));
+    }
+    // A description of this probe's own, so it cannot acquire a lock already
+    // owned through one this process shares. Read-only, as on Linux.
+    let probe = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(lock)
+    {
+        Ok(probe) => probe,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(inspect(error)),
+    };
+    let probed = probe.metadata().map_err(&inspect)?;
+    if !same_lock(&pinned, &probed) {
+        return Err(inspect(io::Error::from_raw_os_error(libc::ESTALE)));
+    }
+    let refused = match unheld_while_probed(lock, &pinned, probe, before_check) {
+        Ok(()) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => error,
+        Err(error) => return Err(inspect(error)),
+    };
+    #[cfg(test)]
+    if let Some(reads) = HIDDEN_HOLDERS.with(|slot| slot.borrow().clone()) {
+        reads.set(reads.get() + 1);
+        return Err(inspect(refused));
+    }
+    let (device, inode) = (pinned.dev(), pinned.ino());
+    match crate::process::account_process_holding(|file| {
+        file.device == device && file.inode == inode
+    }) {
+        Ok(Some(pid)) => Ok(Some(pid as libc::pid_t)),
+        Ok(None) => Err(inspect(refused)),
+        Err(error) => Err(inspect(error)),
+    }
+}
+
+/// Proves the lock at `lock`, whose file is `pinned`, unheld for an instant by
+/// taking it through `probe`, a description of its own, then releasing it. A
+/// held lock refuses with `WouldBlock`.
+fn unheld_while_probed(
+    lock: &Path,
+    pinned: &std::fs::Metadata,
+    probe: std::fs::File,
+    before_check: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    // SAFETY: flock takes a descriptor `probe` owns and scalar flags.
     if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(inspect(io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     // Check the original pathname while the independent probe is held, then
     // release it on every path. It is an observation, not a reservation that
     // can exclude an external writer starting after this function returns.
     let checked = before_check().and_then(|()| {
         let current = std::fs::metadata(lock)?;
-        if same_lock(&pinned, &current) {
+        if same_lock(pinned, &current) {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(libc::ESTALE))
         }
     });
+    // SAFETY: as above; this releases the lock the probe took.
     let released = if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     };
     drop(probe);
-    checked.map_err(&inspect)?;
-    released.map_err(&inspect)?;
-    Ok(None)
+    checked?;
+    released
 }
 
 fn same_lock(expected: &std::fs::Metadata, actual: &std::fs::Metadata) -> bool {
@@ -240,6 +365,7 @@ fn inspect_error(lock: &Path, error: io::Error) -> io::Error {
 }
 
 /// Device used by the kernel lock table for this exact open mount.
+#[cfg(target_os = "linux")]
 fn kernel_device(file: &std::fs::File) -> Result<(u32, u32), String> {
     let info = read(&format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
     let mount = info
@@ -250,6 +376,7 @@ fn kernel_device(file: &std::fs::File) -> Result<(u32, u32), String> {
         .ok_or_else(|| "Cannot identify the Codex writer lock's kernel device".into())
 }
 
+#[cfg(target_os = "linux")]
 fn mount_device(mount: &str, table: &str) -> Option<(u32, u32)> {
     table.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -263,6 +390,7 @@ fn mount_device(mount: &str, table: &str) -> Option<(u32, u32)> {
 }
 
 /// A process of this account with one of `thread`'s rollouts open for writing.
+#[cfg(target_os = "linux")]
 fn rollout_writer(thread: &str) -> Result<Option<libc::pid_t>, String> {
     let account = unsafe { libc::geteuid() };
     let own = std::process::id() as libc::pid_t;
@@ -297,6 +425,7 @@ fn rollout_writer(thread: &str) -> Result<Option<libc::pid_t>, String> {
 
 /// Whether the process at `process` has one of `thread`'s rollouts open for
 /// writing. A reader, such as a picker listing past sessions, writes nothing.
+#[cfg(target_os = "linux")]
 fn writes_rollout(process: &Path, thread: &str) -> Result<bool, String> {
     let descriptors = match std::fs::read_dir(process.join("fd")) {
         Ok(descriptors) => descriptors,
@@ -328,6 +457,16 @@ fn writes_rollout(process: &Path, thread: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+/// A process of this account, other than this one, with one of `thread`'s
+/// rollouts open for writing. A reader writes nothing. A process whose
+/// descriptors Darwin hides from this account is passed over, as on Linux.
+#[cfg(target_os = "macos")]
+fn rollout_writer(thread: &str) -> Result<Option<libc::pid_t>, String> {
+    crate::process::account_process_holding(|file| file.writable && rollout_of(&file.path, thread))
+        .map(|pid| pid.map(|pid| pid as libc::pid_t))
+        .map_err(|error| format!("Cannot take a census of processes: {error}"))
+}
+
 /// Whether `target` is a rollout of `thread`: its first segment, named
 /// `rollout-<time>-<thread>.jsonl`, or a later one, `…-<thread>_<segment>.jsonl`.
 fn rollout_of(target: &Path, thread: &str) -> bool {
@@ -350,6 +489,7 @@ fn rollout_of(target: &Path, thread: &str) -> bool {
         .any(|(index, _)| named(&stem[index + 1..]))
 }
 
+#[cfg(target_os = "linux")]
 fn opened_for_writing(info: &Path) -> bool {
     std::fs::read_to_string(info).is_ok_and(|info| {
         info.lines()
@@ -360,6 +500,7 @@ fn opened_for_writing(info: &Path) -> bool {
 }
 
 /// A process that exited after being listed.
+#[cfg(target_os = "linux")]
 fn exited(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
 }
@@ -384,6 +525,16 @@ mod tests {
             assert!(Instant::now() < deadline, "never observed");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Whether `pid` has opened the file its shell redirected.
+    fn has_opened(pid: libc::pid_t) -> bool {
+        #[cfg(target_os = "linux")]
+        return std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| fds.count() > 3);
+        #[cfg(target_os = "macos")]
+        // The shell opens it before it becomes sleep.
+        return crate::process::program_of(pid as u32)
+            .is_ok_and(|(executable, _)| executable == Path::new("/bin/sleep"));
     }
 
     #[test]
@@ -416,6 +567,18 @@ mod tests {
         }
     }
 
+    /// The absence probe, with no lock table rows to name a holder from.
+    fn probe_absence(
+        lock: &Path,
+        before_check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Option<libc::pid_t>> {
+        #[cfg(target_os = "linux")]
+        return lock_holder_before_check(lock, "", before_check);
+        #[cfg(target_os = "macos")]
+        return lock_holder_before_check(lock, before_check);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_lock_holder_is_read_from_the_kernel_table_and_waiters_are_not() {
         let directory = tempfile::tempdir().unwrap();
@@ -471,6 +634,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_missing_lock_table_row_cannot_hide_real_contention() {
         let directory = tempfile::tempdir().unwrap();
@@ -532,7 +696,7 @@ mod tests {
             let lock = directory.path().join("thread.lock");
             std::fs::write(&lock, b"original").unwrap();
             let original = std::fs::File::open(&lock).unwrap();
-            let failure = lock_holder_before_check(&lock, "", || {
+            let failure = probe_absence(&lock, || {
                 std::fs::remove_file(&lock)?;
                 if replace {
                     std::fs::write(&lock, b"replacement")?;
@@ -548,11 +712,13 @@ mod tests {
                     io::ErrorKind::NotFound
                 }
             );
-            independent_flock(Path::new(&format!(
-                "/proc/self/fd/{}",
-                original.as_raw_fd()
-            )))
-            .unwrap();
+            // The original's description is not the probe's, so it takes
+            // the lock only once the probe has released it.
+            // SAFETY: flock takes a descriptor `original` owns and scalar flags.
+            assert_eq!(
+                unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
         }
     }
 
@@ -563,7 +729,7 @@ mod tests {
         std::fs::write(&target, b"unchanged").unwrap();
         let lock = directory.path().join("thread.lock");
         std::os::unix::fs::symlink(&target, &lock).unwrap();
-        assert_eq!(lock_holder(&lock, "").unwrap(), None);
+        assert_eq!(probe_absence(&lock, || Ok(())).unwrap(), None);
         assert!(
             std::fs::symlink_metadata(&lock)
                 .unwrap()
@@ -571,16 +737,14 @@ mod tests {
                 .is_symlink()
         );
         independent_flock(&target).unwrap();
-        let failure = lock_holder_before_check(&lock, "", || {
-            Err(io::Error::from_raw_os_error(libc::EACCES))
-        })
-        .unwrap_err();
+        let failure =
+            probe_absence(&lock, || Err(io::Error::from_raw_os_error(libc::EACCES))).unwrap_err();
         assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
         independent_flock(&target).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
         let replacement = directory.path().join("replacement");
         std::fs::write(&replacement, b"other inode").unwrap();
-        let failure = lock_holder_before_check(&lock, "", || {
+        let failure = probe_absence(&lock, || {
             std::fs::remove_file(&lock)?;
             std::os::unix::fs::symlink(&replacement, &lock)
         })
@@ -593,14 +757,17 @@ mod tests {
         independent_flock(&replacement).unwrap();
 
         assert_eq!(
-            lock_holder(directory.path(), "").unwrap_err().kind(),
+            probe_absence(directory.path(), || Ok(()))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
         let absent = directory.path().join("absent.lock");
-        assert_eq!(lock_holder(&absent, "").unwrap(), None);
+        assert_eq!(probe_absence(&absent, || Ok(())).unwrap(), None);
         assert!(!absent.exists(), "inspection must not create an SDK lock");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_lock_uses_its_exact_mounts_kernel_device_including_btrfs_subvolumes() {
         let mounts = "31 20 0:30 /@home /home rw - btrfs /dev/nvme0n1p2 rw\n\
@@ -612,6 +779,48 @@ mod tests {
         assert_eq!(mount_device("43", mounts), Some((0, 58)));
         assert_eq!(mount_device("4", mounts), None);
         assert_eq!(mount_device("42", "42 20 not-a-device / /tmp"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_lock_names_a_process_with_it_open_or_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("thread.lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert_eq!(held_lock_holder(&lock).unwrap(), None);
+
+        // This process holds the lock; the census passes over this process,
+        // so until another has it open, nothing it can see is the holder.
+        // Another test's child can briefly share the description between
+        // fork and exec, so each answer is awaited rather than read once.
+        let held = std::fs::File::open(&lock).unwrap();
+        // SAFETY: flock takes a descriptor `held` owns and scalar flags.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        eventually(|| {
+            held_lock_holder(&lock).is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+        });
+        let mut opener = holder(&lock, "<");
+        let pid = opener.id() as libc::pid_t;
+        eventually(|| has_opened(pid));
+        eventually(|| held_lock_holder(&lock).is_ok_and(|holder| holder == Some(pid)));
+        eventually(|| {
+            writer(Some(&lock), "unrelated").is_ok_and(|writer| writer == Some(Writer { pid }))
+        });
+        let hidden = LockTableScope::new(String::new());
+        assert_eq!(
+            held_lock_holder(&lock).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(hidden.reads(), 1);
+        drop(hidden);
+
+        // Released, the lock has no holder even while a process has it open.
+        // SAFETY: as above; this releases the lock `held` took.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert_eq!(held_lock_holder(&lock).unwrap(), None);
+        independent_flock(&lock).unwrap();
+        opener.kill().unwrap();
+        opener.wait().unwrap();
     }
 
     #[test]
@@ -638,9 +847,7 @@ mod tests {
             ),
         ];
         let last = readers[2].id() as libc::pid_t;
-        eventually(|| {
-            std::fs::read_dir(format!("/proc/{last}/fd")).is_ok_and(|fds| fds.count() > 3)
-        });
+        eventually(|| has_opened(last));
         assert_eq!(
             writer(None, &thread).unwrap(),
             None,

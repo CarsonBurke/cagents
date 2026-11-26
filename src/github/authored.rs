@@ -3,7 +3,7 @@
 //! process and a request for each.
 use super::*;
 
-const IDENTITY: &str = "number title state isDraft headRefName headRefOid headRepository{name} headRepositoryOwner{login} baseRefName updatedAt url";
+const IDENTITY: &str = "number title state isDraft headRefName headRefOid headRepository{name} headRepositoryOwner{login} baseRefName updatedAt mergedAt closedAt url";
 /// A check run or status context, in the shape gh's rollup gives it.
 macro_rules! context {
     () => {
@@ -277,10 +277,15 @@ mod tests {
         let mut unchecked = node(3, "OPEN");
         unchecked["commits"] =
             serde_json::json!({"nodes": [{"commit": {"statusCheckRollup": null}}]});
+        // A finished pull request says when it finished, which tells work
+        // left in its worktree from work begun there after.
+        let mut merged = node(1, "MERGED");
+        merged["mergedAt"] = "2026-11-12T00:00:00Z".into();
+        merged["closedAt"] = "2026-11-12T00:00:00Z".into();
         let response = serde_json::json!({"data": {
             "viewer": {"login": "me"},
             "open": {"nodes": [checked, unchecked]},
-            "all": {"nodes": [node(2, "OPEN"), node(1, "MERGED"), {}]},
+            "all": {"nodes": [node(2, "OPEN"), merged, {}]},
         }});
         let executor = Arc::new(Answer(Mutex::default(), response.to_string()));
         let service = GitHubService::new("gh", executor.clone());
@@ -315,6 +320,13 @@ mod tests {
             [2, 1]
         );
         assert_eq!(listing.all[0].status_check_rollup, None);
+        assert_eq!(
+            (
+                listing.all[0].merged_at.as_deref(),
+                listing.all[1].merged_at.as_deref()
+            ),
+            (None, Some("2026-11-12T00:00:00Z"))
+        );
 
         let commands = executor.0.lock().unwrap();
         assert_eq!(commands.len(), 1, "both searches share one request");
@@ -332,6 +344,11 @@ mod tests {
         );
         assert!(arguments.contains(&"openLimit=50".to_owned()));
         assert!(arguments.contains(&"allLimit=100".to_owned()));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument.contains("updatedAt mergedAt closedAt url"))
+        );
     }
 
     /// Answers each request with the next response, recording the requests,

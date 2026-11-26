@@ -1,7 +1,10 @@
 /// This fixture runs only an owned exit7 shell through the actual same-head
 /// precheck supervisor. It never accepts or dispatches an agent/provider.
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "a precheck needs a subreaper to prove its executor's tree is gone, which Darwin lacks (#4045)"
+)]
 fn retired_precheck_worker_keeps_retry_custody_until_history_ack_commits() {
     use crate::{
         host::model::Registry,

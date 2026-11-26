@@ -2,7 +2,6 @@ mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
 mod pane_move;
-#[cfg(target_os = "linux")]
 mod retained_automation;
 mod transcript;
 
@@ -22,6 +21,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     isolated_child(name, false, false)
 }
 
+#[cfg(target_os = "linux")]
 fn isolated_with_process_namespace(name: &str, private_proc: bool) -> Option<tempfile::TempDir> {
     isolated_child(name, private_proc, false)
 }
@@ -2643,10 +2643,10 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
             assert!(Instant::now() < deadline, "Codex server was not launched");
             std::thread::sleep(Duration::from_millis(10));
         };
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stream = loop {
-            match listener.accept() {
+            match crate::descriptor::accept(&listener) {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(
@@ -2804,8 +2804,8 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
             assert!(Instant::now() < deadline, "Codex server was not launched");
             std::thread::sleep(Duration::from_millis(10));
         };
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let (stream, _) = listener.accept().unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .unwrap();
@@ -2930,6 +2930,8 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
 /// the successor daemon relaunches its server and resumes the saved thread.
 /// The agent must then follow its relaunched conversation instead of refusing
 /// every prompt as an unavailable conversation, through successive updates.
+// The real upgrade census is isolated with a Linux PID namespace and procfs.
+#[cfg(target_os = "linux")]
 #[test]
 fn updated_codex_agent_answers_through_its_relaunched_server() {
     if isolated_with_process_namespace(
@@ -2993,10 +2995,10 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
             };
             // The stand-in, not the stopped stub, owned the previous socket.
             let _ = std::fs::remove_file(&socket);
-            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let listener = crate::descriptor::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let stream = loop {
-                match listener.accept() {
+                match crate::descriptor::accept(&listener) {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
@@ -3879,6 +3881,87 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
 }
 
 #[test]
+fn a_message_to_an_agent_whose_window_holds_a_followup_waits_behind_it() {
+    use crate::agent_execution::mailbox::{Handoff, State as Delivery};
+    if isolated("a_message_to_an_agent_whose_window_holds_a_followup_waits_behind_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = accepted.agent.id;
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let holds = |held| {
+        super::super::chat::process(
+            &host,
+            17,
+            ClientRequest::ChatHoldsFollowups {
+                chat_id: session.id,
+                held,
+            },
+        )
+        .unwrap()
+    };
+    holds(true);
+    let handed = deliver(&host, agent.to_string(), "Review the result");
+    assert!(
+        matches!(handed.agent, Some(Handoff::Held { .. })),
+        "{handed:?}"
+    );
+    let message = || {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(handed.delivery.sent.message.id)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert_eq!(message(), Delivery::Pending);
+    assert_eq!(prompts(root), 1, "the person's follow-up goes first");
+    // Writing a follow-up is not taking the agent over; sending it is.
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap()
+    );
+
+    // The window lets it go unsent, so the agent takes the message as a run,
+    // as it would have.
+    let courier = mailbox::Courier::start(&host).unwrap();
+    holds(false);
+    eventually(
+        || message() == Delivery::Delivered,
+        "the message never reached the agent",
+    );
+    eventually(|| prompts(root) == 2, "the agent never took the message");
+    drop(courier);
+}
+
+#[test]
 fn only_an_agents_owner_reads_its_requests_and_controls_it() {
     if isolated("only_an_agents_owner_reads_its_requests_and_controls_it").is_some() {
         return;
@@ -4039,18 +4122,11 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
             "work"
         )
         .unwrap_err(),
-        "This agent runs in default mode, so it can't start a child in bypassPermissions."
+        "This agent runs in default mode, so it can't start a child in bypassPermissions. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
     );
     assert_eq!(
-        spawn(
-            &agent,
-            "unranked",
-            Provider::Claude,
-            Some("dontAsk"),
-            "work"
-        )
-        .unwrap_err(),
-        "cagents can't compare Claude Code mode dontAsk with this agent's own, so an agent can't start a child in it; start it yourself."
+        spawn(&agent, "unranked", Provider::Omp, Some("write"), "work").unwrap_err(),
+        "cagents can't compare Oh My Pi mode write with this agent's own, so an agent can't start a child in it; start it yourself."
     );
     assert_eq!(
         spawn(
@@ -4061,7 +4137,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
             "work"
         )
         .unwrap_err(),
-        "This agent runs in default mode, so it can't start a Codex child in never/workspace-write."
+        "This agent runs in default mode, so it can't start a Codex child in never/workspace-write. Without --permission-mode it starts in untrusted/workspace-write, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
     );
 
     // An omitted mode is the parent's own.
@@ -4104,7 +4180,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
     };
     assert_eq!(
         control(answer("allow")).unwrap_err(),
-        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+        "This agent runs in default mode, so it can't approve its child's tool requests. Ask the person to answer it in the child's pane in cagents; the child stays yours."
     );
     assert!(control(answer("allow_session")).is_err());
     assert!(!root.join("decisions").exists(), "nothing was approved");
@@ -4134,7 +4210,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
             "work"
         )
         .unwrap_err(),
-        "This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a child in acceptEdits."
+        "This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a child in acceptEdits. Without --permission-mode it starts in default, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode."
     );
     let asking = spawn(&unknown, "unknown-asking", Provider::Claude, None, "work").unwrap();
     assert_eq!(mode(&asking).as_deref(), Some("default"));
@@ -4244,13 +4320,126 @@ done
     };
     assert_eq!(
         answer("submit").unwrap_err(),
-        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+        "This agent runs in default mode, so it can't approve its child's tool requests. Ask the person to answer it in the child's pane in cagents; the child stays yours."
     );
     assert!(!root.join("omp-answer").exists(), "nothing was confirmed");
     answer("cancel").unwrap();
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
     let answered = std::fs::read_to_string(root.join("omp-answer")).unwrap();
     assert!(answered.contains(r#""cancelled":true"#), "{answered}");
+}
+
+/// A person answers the tool request a limited agent was refused in its
+/// child's pane, and the agent keeps its child: answering what the agent may
+/// not grant is not taking the child over.
+#[test]
+fn a_person_approving_a_limited_agent_s_child_leaves_the_child_with_it() {
+    if isolated("a_person_approving_a_limited_agent_s_child_leaves_the_child_with_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let spawn = |authority: &Authority, key: &str, mode: Option<&str>, prompt: &str| {
+        let mut request = request.clone();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.permission_mode = mode.map(str::to_owned);
+        request.prompt = prompt.into();
+        request.idempotency_key = key.into();
+        submit(&host, authority, request).unwrap()
+    };
+    let parent = spawn(&Authority::default(), "parent", Some("default"), "parent");
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let lead = agent_authority(&host, parent.agent.id);
+    let child = spawn(&lead, "child", None, "ASK_PERMISSION");
+    let asked = pending(&host, &lead, child.agent.id);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(child.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let approved = super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatCommand {
+            chat_id: session.id,
+            command: Command::Answer {
+                request_id: asked.id.clone(),
+                action: "allow".into(),
+                answers: Vec::new(),
+            },
+        },
+    );
+    assert!(
+        matches!(approved, Ok(ServerResponse::Accepted)),
+        "{approved:?}"
+    );
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "allow\n"
+    );
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(child.agent.id)
+            .unwrap()
+    );
+
+    // The agent still answers and refuses its child's next request itself.
+    let followup = submit(
+        &host,
+        &lead,
+        Submit {
+            name: None,
+            destination: Destination::Existing(child.agent.id),
+            prompt: "ASK_PERMISSION again".into(),
+            idempotency_key: "again".into(),
+        },
+    )
+    .unwrap();
+    let asked = pending(&host, &lead, child.agent.id);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    let refused = process(
+        &host,
+        lead.clone(),
+        Operation::Control {
+            agent: child.agent.id,
+            command: Control::Answer {
+                request_id: asked.id.clone(),
+                action: "deny".into(),
+                answers: Vec::new(),
+            },
+        },
+    );
+    assert!(matches!(refused, Ok(Reply::Requests(_))), "{refused:?}");
+    assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "allow\ndeny\n"
+    );
 }
 
 fn pending(host: &SharedHost, authority: &Authority, agent: AgentId) -> Vec<chat::Request> {
@@ -7063,6 +7252,89 @@ fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
 
     std::fs::write(root.join("cleanup-release"), "").unwrap();
     assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let next = settled(&host, queued);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(prompts(root), 2);
+    drop(courier);
+}
+
+#[test]
+fn a_message_waiting_as_a_run_goes_after_the_persons_followups() {
+    use crate::agent_execution::{Start, mailbox::Handoff};
+    if isolated("a_message_waiting_as_a_run_goes_after_the_persons_followups").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request, root);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    let handed = deliver(&host, first.agent.id.to_string(), "After your run");
+    let Some(Handoff::Run {
+        run: queued,
+        start: Start::Queued { .. },
+        ..
+    }) = handed.agent
+    else {
+        panic!("a busy agent queues the message as its next run: {handed:?}");
+    };
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(first.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let holds = |held| {
+        super::super::chat::process(
+            &host,
+            17,
+            ClientRequest::ChatHoldsFollowups {
+                chat_id: session.id,
+                held,
+            },
+        )
+        .unwrap()
+    };
+    // The person writes a follow-up during the run; when it ends, the
+    // window sends it before the message's run starts.
+    holds(true);
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    eventually(
+        || {
+            host.lock()
+                .unwrap()
+                .chats
+                .get(&session.id)
+                .is_some_and(|record| record.handle.is_idle())
+        },
+        "the conversation never became idle",
+    );
+    courier.wake_and_wait_for_scan();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_run_is_queued(queued)
+            .unwrap(),
+        "the message's run waits for the person's follow-up"
+    );
+    assert_eq!(prompts(root), 1);
+
+    holds(false);
     let next = settled(&host, queued);
     assert_eq!(next.state, State::Succeeded, "{next:?}");
     assert_eq!(prompts(root), 2);

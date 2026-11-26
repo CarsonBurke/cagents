@@ -57,7 +57,7 @@ for entry do
     else
         # An accessible, empty uninitialized child is safe. A nonempty omitted
         # child may contain local data even though Git does not visit it.
-        contents=$(/usr/bin/find "$selected" -mindepth 1 -maxdepth 1 -printf x -quit) || refuse
+        contents=$(/usr/bin/find "$selected" -mindepth 1 -maxdepth 1 -print -quit) || refuse
         [ -z "$contents" ] || refuse
     fi
 done

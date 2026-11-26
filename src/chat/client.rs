@@ -204,7 +204,7 @@ fn trace_worker_stack(role: &'static str) {
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
-    let result = UnixStream::connect(path);
+    let result = crate::descriptor::connect_settled(path);
     #[cfg(feature = "ui")]
     crate::daemon_health::connection_io(path, &result, health_request);
     result
@@ -806,10 +806,24 @@ struct InnerPayload {
     file_pending: FilePending,
     text_copy_pending: TextCopyPending,
     text_copies: AtomicUsize,
+    /// Wakes the worker that tells the daemon this window's visibility and
+    /// whether it holds follow-ups, as `presence` says which changed.
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
+    presence: Arc<Presence>,
     #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
+}
+
+/// What the visibility worker has yet to tell the daemon. Both are
+/// replaceable state, so only the latest of each is sent.
+#[derive(Default)]
+struct Presence {
+    /// Whether visibility changed since the worker last sent it.
+    visibility: AtomicBool,
+    /// Whether the window holds follow-ups the person wrote for the chat's
+    /// next turn, which the daemon's courier lets go first.
+    holds_followups: AtomicBool,
 }
 
 impl Inner {
@@ -1495,6 +1509,7 @@ fn set_chat_timeouts(stream: &UnixStream) -> Result<(), String> {
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())
 }
+
 fn receive_handshake(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
@@ -1976,6 +1991,7 @@ impl ClientHandle {
                     text_copies: AtomicUsize::new(0),
                     visibility_tx,
                     visibility_worker: Mutex::new(None),
+                    presence: Arc::default(),
                     retirement_complete: None,
                 },
                 retirement,
@@ -2925,7 +2941,7 @@ impl ClientHandle {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
             })
             .transpose()?;
-        stream.set_read_timeout(None).map_err(|e| e.to_string())?;
+        crate::descriptor::set_read_timeout_or_hangup(&stream, None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
         let body_requested = Arc::new(AtomicBool::new(true));
@@ -2968,6 +2984,7 @@ impl ClientHandle {
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let text_copy_pending: TextCopyPending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
+        let presence = Arc::new(Presence::default());
         let inner = Arc::new(Inner::new(
             InnerPayload {
                 id,
@@ -2997,6 +3014,7 @@ impl ClientHandle {
                 text_copies: AtomicUsize::new(0),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
+                presence: presence.clone(),
                 #[cfg(any(test, feature = "test-support"))]
                 retirement_complete: None,
             },
@@ -3011,22 +3029,33 @@ impl ClientHandle {
             .name(format!("chat-visibility-{id}"))
             .spawn(move || {
                 trace_worker_stack("chat_visibility");
+                // The daemon starts out knowing of no follow-ups held here.
+                let mut holds_followups = false;
                 while visibility_rx.recv().is_ok() {
                     if !visibility_alive.load(Ordering::Acquire) {
                         break;
                     }
-                    let request = ClientRequest::ChatVisibility {
-                        chat_id: id,
-                        visible: visibility_value.load(Ordering::Acquire),
-                    };
-                    if transmit(
-                        &visibility_wire,
-                        &visibility_proof,
-                        visibility_next.fetch_add(1, Ordering::Relaxed),
-                        request,
-                    )
-                    .is_err()
-                    {
+                    let held = presence.holds_followups.load(Ordering::Acquire);
+                    let requests = [
+                        (held != holds_followups)
+                            .then_some(ClientRequest::ChatHoldsFollowups { chat_id: id, held }),
+                        presence.visibility.swap(false, Ordering::AcqRel).then(|| {
+                            ClientRequest::ChatVisibility {
+                                chat_id: id,
+                                visible: visibility_value.load(Ordering::Acquire),
+                            }
+                        }),
+                    ];
+                    holds_followups = held;
+                    let sent = requests.into_iter().flatten().try_for_each(|request| {
+                        transmit(
+                            &visibility_wire,
+                            &visibility_proof,
+                            visibility_next.fetch_add(1, Ordering::Relaxed),
+                            request,
+                        )
+                    });
+                    if sent.is_err() {
                         let _ = visibility_wire
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
@@ -3796,6 +3825,30 @@ impl ClientHandle {
         }
         // Visibility is replaceable state, not an ordered provider frame. Coalesce
         // transitions without socket IO or acknowledgement waits on the UI thread.
+        self.inner
+            .presence
+            .visibility
+            .store(true, Ordering::Release);
+        self.notify_presence()
+    }
+    /// Tells the daemon whether this window holds follow-ups the person
+    /// wrote for the chat's next turn, which its provider has no queue to
+    /// take, so its courier starts no turn ahead of them. Cheap to call on
+    /// every change of the window: only a change reaches the daemon, from
+    /// the worker, never from the caller's thread.
+    pub fn set_holds_followups(&self, held: bool) -> Result<(), String> {
+        if self
+            .inner
+            .presence
+            .holds_followups
+            .swap(held, Ordering::AcqRel)
+            == held
+        {
+            return Ok(());
+        }
+        self.notify_presence()
+    }
+    fn notify_presence(&self) -> Result<(), String> {
         match self.inner.visibility_tx.try_send(()) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(()),
             Err(crossbeam_channel::TrySendError::Disconnected(())) => {

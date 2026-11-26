@@ -97,7 +97,9 @@ fn transcribe(file: &Path, id: &str, realtime: bool, json: bool) -> Result<(), S
             let length = std::time::Duration::from_secs_f64(audio_seconds + 1.5);
             thread::spawn(move || {
                 thread::sleep(length);
-                control.stop.store(true, std::sync::atomic::Ordering::Release);
+                control
+                    .stop
+                    .store(true, std::sync::atomic::Ordering::Release);
             })
         });
         pipeline::capture(

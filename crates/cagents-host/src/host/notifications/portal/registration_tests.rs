@@ -1,4 +1,5 @@
 //! Real private D-Bus calls exercise registration before notification delivery.
+use super::super::*;
 use super::*;
 use crate::process::ProcessExecutor;
 use std::collections::HashMap;

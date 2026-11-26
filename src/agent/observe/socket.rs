@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::{
     io,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::{
             fs::{FileTypeExt, MetadataExt},
             net::UnixStream,
@@ -19,6 +19,9 @@ pub struct JoinError {
     /// Nothing is accepting connections there. A server that is still
     /// starting binds its socket before it listens, so this is not final
     /// for a listener whose launch is being awaited.
+    ///
+    /// On Darwin it is inferred from refusals that persist, which a listener
+    /// with a full backlog also gives; see `descriptor::retry_refusal`.
     pub not_listening: bool,
 }
 
@@ -71,27 +74,32 @@ pub fn connect(path: &Path, device: u64, inode: u64) -> Result<UnixStream, JoinE
     for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
         *target = *byte as _;
     }
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error().to_string().into());
-    }
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    let result = unsafe {
-        libc::connect(
-            fd,
-            (&address as *const libc::sockaddr_un).cast(),
-            (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as _,
-        )
-    };
-    if result < 0 {
-        // No retry on backlog pressure or endpoint replacement.
+    let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as _;
+    let refusing_since = std::time::Instant::now();
+    let stream = loop {
+        let stream = UnixStream::from(
+            crate::descriptor::unix_socket(libc::SOCK_STREAM, true)
+                .map_err(|error| JoinError::from(error.to_string()))?,
+        );
+        // SAFETY: the address is initialized up to `length`, and the
+        // descriptor is the live socket `stream` owns.
+        let result = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                length,
+            )
+        };
+        if result == 0 {
+            break stream;
+        }
         let failure = io::Error::last_os_error();
+        // No retry on backlog pressure or endpoint replacement, except for
+        // the refusals Darwin also gives a full backlog.
+        if crate::descriptor::retry_refusal(&failure, refusing_since) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
         return Err(JoinError {
             message: format!(
                 "Cannot join existing Codex socket {}: {failure}",
@@ -99,23 +107,9 @@ pub fn connect(path: &Path, device: u64, inode: u64) -> Result<UnixStream, JoinE
             ),
             not_listening: failure.kind() == io::ErrorKind::ConnectionRefused,
         });
-    }
-    verify_socket(path, device, inode)?;
-    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut peer as *mut libc::ucred).cast(),
-            &mut length,
-        )
     };
-    if result < 0
-        || length as usize != std::mem::size_of::<libc::ucred>()
-        || peer.uid != unsafe { libc::geteuid() }
-    {
+    verify_socket(path, device, inode)?;
+    if crate::pinned_process::peer_uid(&stream).ok() != Some(crate::daemon::current_uid()) {
         return Err("Cannot verify Codex daemon peer account".into());
     }
     Ok(stream)

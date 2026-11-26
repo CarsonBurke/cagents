@@ -8,10 +8,14 @@ use std::{
 /// Portal replacement identity is stable across notice revisions. The journal
 /// UUID remains the exact acknowledgement identity, independent of delivery.
 pub(super) fn desktop_id(target: &Target) -> uuid::Uuid {
+    desktop_id_for_key(&target.storage_key())
+}
+
+pub(super) fn desktop_id_for_key(key: &str) -> uuid::Uuid {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
     digest.update(b"cagents.desktop-notification.v1\0");
-    digest.update(target.storage_key().as_bytes());
+    digest.update(key.as_bytes());
     let digest = digest.finalize();
     let mut id = [0; 16];
     id.copy_from_slice(&digest[..16]);

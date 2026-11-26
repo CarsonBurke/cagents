@@ -7,7 +7,11 @@ import kotlinx.coroutines.flow.asStateFlow
 
 /** Where the computer is and how to start the bridge there. */
 data class ConnectionSettings(
-    val host: String = "",
+    /**
+     * The computer's addresses, in the order to try them. A pairing code
+     * gives its Tailscale name and address first, then local ones.
+     */
+    val hosts: List<String> = emptyList(),
     val port: Int = 22,
     val user: String = "",
     /**
@@ -15,14 +19,43 @@ data class ConnectionSettings(
      * authorized_keys runs that command whatever this says.
      */
     val command: String = DEFAULT_COMMAND,
+    /** What to call the computer, from its pairing code; empty when set up by hand. */
+    val name: String = "",
 ) {
-    val isComplete: Boolean get() = host.isNotBlank() && user.isNotBlank() && port in 1..65535
+    /** The preferred address. */
+    val host: String get() = hosts.firstOrNull().orEmpty()
 
-    /** Which pinned host key applies. */
-    val hostKeyId: String get() = "${host.trim().lowercase()}:$port"
+    /** How to refer to the computer. */
+    val label: String get() = name.ifBlank { host }
+
+    val isComplete: Boolean get() = hosts.isNotEmpty() && user.isNotBlank() && port in 1..65535
+
+    /** Which pinned host key applies to [host]. */
+    fun hostKeyId(host: String): String = "${host.trim().lowercase()}:$port"
+
+    val hostKeyIds: List<String> get() = hosts.map(::hostKeyId)
+
+    /**
+     * Whether [other] reaches the same computer, the same way: what it
+     * sends belongs to both. Trying the same addresses in another order,
+     * or renaming it, doesn't make it another computer.
+     */
+    fun sameComputer(other: ConnectionSettings): Boolean =
+        hostKeyIds.toSet() == other.hostKeyIds.toSet() && user == other.user && command == other.command
 
     companion object {
         const val DEFAULT_COMMAND = "cagents daemon bridge --mobile"
+
+        /**
+         * The addresses as saved: [hosts], one per line, or, from before
+         * there could be several, the single [host].
+         */
+        fun storedHosts(hosts: String?, host: String?): List<String> =
+            (hosts ?: host).orEmpty().lines().map(String::trim).filter(String::isNotEmpty)
+
+        /** Addresses as typed: separated by commas or spaces. */
+        fun parseHosts(text: String): List<String> =
+            text.split(',', ' ', '\n').map(String::trim).filter(String::isNotEmpty).distinct()
     }
 }
 
@@ -32,23 +65,28 @@ class SettingsStore(context: Context) {
     val settings: StateFlow<ConnectionSettings> = _settings.asStateFlow()
 
     private fun read() = ConnectionSettings(
-        host = prefs.getString("host", "").orEmpty(),
+        // "host" alone is how settings were kept before there could be several.
+        hosts = ConnectionSettings.storedHosts(prefs.getString("hosts", null), prefs.getString("host", null)),
         port = prefs.getInt("port", 22),
         user = prefs.getString("user", "").orEmpty(),
         command = prefs.getString("command", null) ?: ConnectionSettings.DEFAULT_COMMAND,
+        name = prefs.getString("name", "").orEmpty(),
     )
 
     fun save(settings: ConnectionSettings) {
         val clean = settings.copy(
-            host = settings.host.trim(),
+            hosts = settings.hosts.map(String::trim).filter(String::isNotEmpty).distinct(),
             user = settings.user.trim(),
             command = settings.command.trim().ifEmpty { ConnectionSettings.DEFAULT_COMMAND },
+            name = settings.name.trim(),
         )
         prefs.edit()
+            .putString("hosts", clean.hosts.joinToString("\n"))
             .putString("host", clean.host)
             .putInt("port", clean.port)
             .putString("user", clean.user)
             .putString("command", clean.command)
+            .putString("name", clean.name)
             .apply()
         _settings.value = clean
     }

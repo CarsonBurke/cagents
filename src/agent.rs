@@ -681,7 +681,7 @@ impl Provider {
         (self.adapter().session_root)(launch, &home).map(|root| launch.working_directory.join(root))
     }
 
-    #[cfg(feature = "host")]
+    #[cfg(all(feature = "host", any(target_os = "linux", test)))]
     pub(crate) fn session_state_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
         if self == Self::Omp {
             omp::state_root(

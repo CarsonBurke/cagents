@@ -135,14 +135,8 @@ pub(super) fn collect_at(
         .ok_or("Recovery storage has no directory")?;
     validate_private_directory(directory)?;
     let root = Root::open(directory).map_err(|error| error.to_string())?;
-    let names = fs::read_dir(root.process_path())
-        .map_err(|error| error.to_string())?
-        .map(|entry| {
-            entry
-                .map(|entry| entry.file_name())
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let names = fs_safety::directory_entries_beneath(&root, Path::new(""), usize::MAX)
+        .map_err(|error| error.to_string())?;
     let names: Vec<_> = names.iter().filter_map(|name| name.to_str()).collect();
     if names.iter().any(|name| {
         Some(OsStr::new(name)) == checkpoint.file_name()

@@ -38,7 +38,10 @@ pub fn reject_symlink_components(path: &Path) -> io::Result<()> {
     ancestors.reverse();
     for component in ancestors {
         match fs::symlink_metadata(component) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && !is_sealed_system_link(component, &metadata) =>
+            {
                 return Err(storage_error(component, "symbolic links are not allowed"));
             }
             Ok(_) => {}
@@ -47,6 +50,74 @@ pub fn reject_symlink_components(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `path` as SQLite must be given it to open a store with
+/// `SQLITE_OPEN_NOFOLLOW`. That flag refuses a symbolic link anywhere in the
+/// path, not only at the database itself, so a path that leads through one of
+/// the sealed system links [`reject_symlink_components`] accepts, as every
+/// path under Darwin's `/tmp` and `$TMPDIR` does, is named through the link's
+/// target. Any other link is left for SQLite to refuse. Linux has no sealed
+/// link, so there `path` is returned as it is.
+pub fn sqlite_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    sealed_system_path(path)
+}
+
+/// Spell a path through the target of Darwin's immutable system link, when
+/// present. Other components are carried over without resolving them.
+pub(crate) fn sealed_system_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut components = path.components();
+        if let (Some(std::path::Component::RootDir), Some(std::path::Component::Normal(name))) =
+            (components.next(), components.next())
+        {
+            let link = Path::new("/").join(name);
+            if fs::symlink_metadata(&link)
+                .is_ok_and(|metadata| is_sealed_system_link(&link, &metadata))
+            {
+                let mut target = Path::new("/private").join(name);
+                let rest = components.as_path();
+                if !rest.as_os_str().is_empty() {
+                    target.push(rest);
+                }
+                return target.into();
+            }
+        }
+    }
+    path.into()
+}
+
+/// Darwin reaches `/var`, `/tmp` and `/etc` through root-owned links in the
+/// sealed system volume, which even root cannot rewrite while it is mounted
+/// read-only. Such a link cannot be substituted, so it is no hazard, and every
+/// component after it is still checked. Only those `/<name> -> private/<name>`
+/// links qualify, not other root links such as `synthetic.conf` entries.
+/// Linux has no equivalent.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_sealed_system_link(component: &Path, metadata: &fs::Metadata) -> bool {
+    let Some(name) = component.file_name() else {
+        return false;
+    };
+    if component.parent() != Some(Path::new("/"))
+        || metadata.uid() != 0
+        || !matches!(name.as_encoded_bytes(), b"tmp" | b"var" | b"etc")
+        || fs::read_link(component).ok() != Some(Path::new("private").join(name))
+    {
+        return false;
+    }
+    let mut root = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: the path literal is static and statvfs fills the buffer.
+    if unsafe { libc::statvfs(c"/".as_ptr(), root.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: statvfs succeeded, so the buffer is initialized.
+    unsafe { root.assume_init() }.f_flag & libc::ST_RDONLY != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn is_sealed_system_link(_component: &Path, _metadata: &fs::Metadata) -> bool {
+    false
 }
 
 pub fn validate_owned_directory(path: &Path) -> io::Result<()> {
@@ -223,5 +294,67 @@ mod readonly_tests {
         fs::remove_file(&alias).unwrap();
         fs::hard_link(&path, &alias).unwrap();
         assert!(open_existing_private_file_readonly(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_paths_pass_through_every_link_but_a_sealed_system_one() {
+        let directory = tempfile::tempdir().unwrap();
+        // Resolve the fixture root before adding the ordinary link. The
+        // temporary directory itself may be beneath a sealed system link.
+        let root = directory.path().canonicalize().unwrap();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = link.join("store.sqlite3");
+        // An ordinary link is SQLite's to refuse.
+        assert_eq!(sqlite_path(&store), store.as_path());
+        assert_eq!(
+            sqlite_path(Path::new("relative.sqlite3")),
+            Path::new("relative.sqlite3")
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sqlite_path(Path::new("/tmp/store.sqlite3")),
+            Path::new("/tmp/store.sqlite3")
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                sqlite_path(Path::new("/tmp/a/store.sqlite3")),
+                Path::new("/private/tmp/a/store.sqlite3")
+            );
+            assert_eq!(sqlite_path(Path::new("/var")), Path::new("/private/var"));
+            assert_eq!(
+                sqlite_path(Path::new("/private/tmp/store.sqlite3")),
+                Path::new("/private/tmp/store.sqlite3")
+            );
+        }
+    }
+
+    /// A store under a sealed system link, as every store a test keeps in
+    /// Darwin's `$TMPDIR` is, opens with `SQLITE_OPEN_NOFOLLOW` through it.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_store_opens_nofollow_through_its_sqlite_path() {
+        use rusqlite::{Connection, OpenFlags};
+        let directory = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let path = directory.path().join("store.sqlite3");
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Connection::open_with_flags(sqlite_path(&path), flags)
+            .unwrap()
+            .execute_batch("CREATE TABLE t (x)")
+            .unwrap();
+        // The database itself must still not be a link.
+        let link = directory.path().join("link.sqlite3");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(Connection::open_with_flags(sqlite_path(&link), flags).is_err());
     }
 }
