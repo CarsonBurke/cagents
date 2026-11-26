@@ -228,6 +228,21 @@ pub(super) fn to_agent(
     if !eligible || previous.is_some() {
         return Ok(None);
     }
+    // What the person wrote for its conversation goes first, and the message
+    // after it, together with any other waiting, as a person's conversation
+    // takes messages. Writing does not take the agent over; sending does.
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .held_followups
+        .contains_key(&session.id)
+    {
+        return Ok(Some(Handoff::Held {
+            agent: agent.id,
+            reason: "A person wrote its conversation a prompt; it receives the message after that"
+                .into(),
+        }));
+    }
     if unverified {
         return Ok(Some(Handoff::Held {
             agent: agent.id,
@@ -1087,20 +1102,110 @@ impl Handle {
             .filter(|at| *at >= 0)
             .map(|at| (at as u64).saturating_mul(1000))
             .min();
-        let queued_failed = self.start_queued(host);
+        self.forget_yields(host);
+        let (queued_failed, deferred) = self.start_queued(host);
         let (released, pending) = self.deliver_messages(host, &limits)?;
         let outstanding = (queued_failed || pending || !limits.is_empty())
             .then(|| super::now().saturating_add(FALLBACK.as_millis() as u64));
-        Ok([released, reset, outstanding].into_iter().flatten().min())
+        Ok([released, reset, outstanding, deferred]
+            .into_iter()
+            .flatten()
+            .min())
     }
 
-    /// Starts the prompts agents hold behind work that has since ended.
-    /// Returns whether one failed to start, or the queue could not be read.
-    fn start_queued(&self, host: &SharedHost) -> bool {
-        super::start_queued(host).unwrap_or_else(|error| {
+    /// Starts the prompts agents hold behind work that has since ended,
+    /// except a message that would go before what the person wrote for its
+    /// conversation. Returns whether one failed to start, or the queue could
+    /// not be read, and when to look again for one that waits.
+    fn start_queued(&self, host: &SharedHost) -> (bool, Option<u64>) {
+        let now = super::now();
+        let mut due: Option<u64> = None;
+        let failed = super::start_queued(host, |accepted| {
+            match self.waits_for_person(host, accepted, now) {
+                Some(until) => {
+                    if let Some(until) = until {
+                        due = Some(due.map_or(until, |due| due.min(until)));
+                    }
+                    true
+                }
+                None => false,
+            }
+        })
+        .unwrap_or_else(|error| {
             tracing::warn!(%error, "cannot start queued agent prompts");
             true
-        })
+        });
+        (failed, due)
+    }
+
+    /// Whether `accepted`, a message an agent takes as a run, waits for what
+    /// the person wrote for the agent's idle conversation, and until when if
+    /// it is a window that holds it. `None` when it need not wait.
+    fn waits_for_person(
+        &self,
+        host: &SharedHost,
+        accepted: &crate::agent_execution::Accepted,
+        now: u64,
+    ) -> Option<Option<u64>> {
+        let Some(crate::agent_execution::HostedSession::Chat(session)) = &accepted.agent.session
+        else {
+            return None;
+        };
+        let (handle, held) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state.chats.get(&session.id)?;
+            (
+                record.handle.clone(),
+                state.held_followups.contains_key(&session.id),
+            )
+        };
+        // A conversation at work, or one that has ended, is the run's own
+        // to wait for or reopen.
+        if !handle.is_idle() {
+            return None;
+        }
+        let message = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .run_is_message(accepted.run.id)
+            .unwrap_or(false);
+        if !message {
+            return None;
+        }
+        if !handle.takes_courier() {
+            // The provider holds a message the person queued; its turn ends
+            // in a wake.
+            return Some(None);
+        }
+        held.then(|| self.yields(session.id, now))
+            .flatten()
+            .map(Some)
+    }
+
+    /// Forgets when each conversation began to wait for the person's
+    /// follow-ups once it no longer does: idle, with a window holding them.
+    /// The next time it does, it waits as long again.
+    fn forget_yields(&self, host: &SharedHost) {
+        let held: Vec<(TerminalId, chat::runtime::Handle)> = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .held_followups
+                .keys()
+                .filter_map(|id| Some((*id, state.chats.get(id)?.handle.clone())))
+                .collect()
+        };
+        let waiting: BTreeSet<TerminalId> = held
+            .into_iter()
+            .filter(|(_, handle)| handle.takes_courier())
+            .map(|(id, _)| id)
+            .collect();
+        self.0
+            .yielding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|id, _| waiting.contains(id));
     }
 
     /// Returns when the courier must look again for a held reply's release
@@ -1138,11 +1243,6 @@ impl Handle {
             notifications.reconcile_inboxes(pending_lineages, events);
         }
         if pending.is_empty() {
-            self.0
-                .yielding
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clear();
             return Ok((released, outstanding));
         }
         let chats: Vec<Conversation> = {
@@ -1164,18 +1264,6 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .session_lineages(chats.iter().map(|chat| chat.id))?;
-        // A conversation stops yielding once it is no longer idle with a
-        // person's follow-ups held, so that the next time it is, it yields
-        // for as long again.
-        self.0
-            .yielding
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|id, _| {
-                chats
-                    .iter()
-                    .any(|chat| chat.id == *id && chat.held && chat.handle.takes_courier())
-            });
         let mut due = released;
         let mut prompted = BTreeSet::new();
         for message in pending {
@@ -1937,7 +2025,9 @@ mod tests {
         }
 
         /// One courier pass; when it must look again.
+        /// One of the courier's passes over the messages, as `deliver` makes.
         fn pass(&self) -> Option<u64> {
+            self.courier.forget_yields(&self.host);
             self.courier
                 .deliver_messages(&self.host, &BTreeMap::new())
                 .unwrap()
@@ -2072,8 +2162,12 @@ mod tests {
     fn a_window_that_never_sends_its_followups_holds_messages_back_only_so_long() {
         let mut fixture = Delivering::new(&["First", "Second"]);
         fixture.hold_followups(true);
-        assert!(fixture.pass().is_some());
+        let until = fixture.pass().expect("the courier looks again");
         assert_eq!(fixture.actor.prompt_count(), 0);
+        // Passes while it waits, with or without messages to deliver, keep
+        // when the wait began.
+        fixture.courier.forget_yields(&fixture.host);
+        assert_eq!(fixture.pass(), Some(until));
         // As if the window had held them, unsent, for the whole wait.
         *fixture
             .courier

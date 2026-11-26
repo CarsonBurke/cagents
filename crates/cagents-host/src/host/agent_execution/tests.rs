@@ -3878,6 +3878,87 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
 }
 
 #[test]
+fn a_message_to_an_agent_whose_window_holds_a_followup_waits_behind_it() {
+    use crate::agent_execution::mailbox::{Handoff, State as Delivery};
+    if isolated("a_message_to_an_agent_whose_window_holds_a_followup_waits_behind_it").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = accepted.agent.id;
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let holds = |held| {
+        super::super::chat::process(
+            &host,
+            17,
+            ClientRequest::ChatHoldsFollowups {
+                chat_id: session.id,
+                held,
+            },
+        )
+        .unwrap()
+    };
+    holds(true);
+    let handed = deliver(&host, agent.to_string(), "Review the result");
+    assert!(
+        matches!(handed.agent, Some(Handoff::Held { .. })),
+        "{handed:?}"
+    );
+    let message = || {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .message(handed.delivery.sent.message.id)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert_eq!(message(), Delivery::Pending);
+    assert_eq!(prompts(root), 1, "the person's follow-up goes first");
+    // Writing a follow-up is not taking the agent over; sending it is.
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap()
+    );
+
+    // The window lets it go unsent, so the agent takes the message as a run,
+    // as it would have.
+    let courier = mailbox::Courier::start(&host).unwrap();
+    holds(false);
+    eventually(
+        || message() == Delivery::Delivered,
+        "the message never reached the agent",
+    );
+    eventually(|| prompts(root) == 2, "the agent never took the message");
+    drop(courier);
+}
+
+#[test]
 fn only_an_agents_owner_reads_its_requests_and_controls_it() {
     if isolated("only_an_agents_owner_reads_its_requests_and_controls_it").is_some() {
         return;
@@ -7168,6 +7249,89 @@ fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
 
     std::fs::write(root.join("cleanup-release"), "").unwrap();
     assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let next = settled(&host, queued);
+    assert_eq!(next.state, State::Succeeded, "{next:?}");
+    assert_eq!(prompts(root), 2);
+    drop(courier);
+}
+
+#[test]
+fn a_message_waiting_as_a_run_goes_after_the_persons_followups() {
+    use crate::agent_execution::{Start, mailbox::Handoff};
+    if isolated("a_message_waiting_as_a_run_goes_after_the_persons_followups").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request, root);
+    let courier = mailbox::Courier::start(&host).unwrap();
+    let handed = deliver(&host, first.agent.id.to_string(), "After your run");
+    let Some(Handoff::Run {
+        run: queued,
+        start: Start::Queued { .. },
+        ..
+    }) = handed.agent
+    else {
+        panic!("a busy agent queues the message as its next run: {handed:?}");
+    };
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(first.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let holds = |held| {
+        super::super::chat::process(
+            &host,
+            17,
+            ClientRequest::ChatHoldsFollowups {
+                chat_id: session.id,
+                held,
+            },
+        )
+        .unwrap()
+    };
+    // The person writes a follow-up during the run; when it ends, the
+    // window sends it before the message's run starts.
+    holds(true);
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    eventually(
+        || {
+            host.lock()
+                .unwrap()
+                .chats
+                .get(&session.id)
+                .is_some_and(|record| record.handle.is_idle())
+        },
+        "the conversation never became idle",
+    );
+    courier.wake_and_wait_for_scan();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_run_is_queued(queued)
+            .unwrap(),
+        "the message's run waits for the person's follow-up"
+    );
+    assert_eq!(prompts(root), 1);
+
+    holds(false);
     let next = settled(&host, queued);
     assert_eq!(next.state, State::Succeeded, "{next:?}");
     assert_eq!(prompts(root), 2);
