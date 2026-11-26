@@ -15842,7 +15842,10 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
     let fifo = project.join(".claude/settings.json");
     let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
-    assert_eq!(settings(&launch), system_overlay);
+    assert_eq!(
+        terminal_overlay(&launch.recipe).as_deref(),
+        Some(r#"--settings={"attribution":{"commit":"","pr":"custom"}}"#)
+    );
     std::fs::remove_file(fifo).unwrap();
 
     // This linked checkout has a different parent directory from its primary
