@@ -1,5 +1,6 @@
 //! Single-writer durable attention, independent of workspace/card persistence.
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -42,9 +43,14 @@ mod schema {
             identity -> Text,
         }
     }
+    diesel::table! {
+        portal_group_withdrawals (id) {
+            id -> Text,
+        }
+    }
     diesel::allow_tables_to_appear_in_same_query!(notices, seen, owners, review_requests_seen);
 }
-use schema::{notices, owners, review_requests_seen, seen};
+use schema::{notices, owners, portal_group_withdrawals, review_requests_seen, seen};
 
 // PRAGMAs describe the SQLite connection rather than application rows.
 #[derive(diesel::QueryableByName)]
@@ -198,7 +204,9 @@ impl Journal {
                 for (key, id) in evicted {
                     // The portal may already display this notice, including a
                     // previously resolved automation that has not been withdrawn.
-                    remember_notice_withdrawal(connection, &key, &id)?;
+                    if key.starts_with("automation:") {
+                        remember_notice_withdrawal(connection, &key, &id)?;
+                    }
                     diesel::delete(notices::table.find(&key)).execute(connection)?;
                 }
                 diesel::delete(
@@ -270,22 +278,35 @@ impl Journal {
             .map_err(|error: diesel::result::Error| error.to_string())
     }
 
+    #[cfg(test)]
     pub fn group_withdrawals(&mut self) -> Result<Vec<Uuid>, String> {
-        #[derive(diesel::QueryableByName)]
-        struct Group {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            id: String,
+        self.group_withdrawals_for(&[])
+            .map(|groups| groups.into_iter().collect())
+    }
+
+    /// Drain a bounded page. A group that could be posted now is always
+    /// looked up even when older withdrawals fill that page.
+    pub fn group_withdrawals_for(&mut self, current: &[Uuid]) -> Result<BTreeSet<Uuid>, String> {
+        let durable = portal_group_withdrawals::table;
+        let mut ids: Vec<String> = durable
+            .select(portal_group_withdrawals::id)
+            .order(portal_group_withdrawals::id)
+            .limit(MAX_SESSIONS)
+            .load(&mut self.0)
+            .map_err(|error| error.to_string())?;
+        if !current.is_empty() {
+            ids.extend(
+                durable
+                    .filter(
+                        portal_group_withdrawals::id.eq_any(current.iter().map(Uuid::to_string)),
+                    )
+                    .select(portal_group_withdrawals::id)
+                    .load::<String>(&mut self.0)
+                    .map_err(|error| error.to_string())?,
+            );
         }
-        diesel::sql_query("SELECT id FROM portal_group_withdrawals")
-            .load::<Group>(&mut self.0)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|group| {
-                group
-                    .id
-                    .parse()
-                    .map_err(|error: uuid::Error| error.to_string())
-            })
+        ids.into_iter()
+            .map(|id| id.parse().map_err(|error: uuid::Error| error.to_string()))
             .collect()
     }
 
@@ -348,7 +369,9 @@ impl Journal {
                     return Ok(None);
                 };
                 if !acknowledged {
-                    remember_notice_withdrawal(connection, &key, &id)?;
+                    if key.starts_with("automation:") {
+                        remember_notice_withdrawal(connection, &key, &id)?;
+                    }
                     diesel::update(notice)
                         .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
                         .execute(connection)?;

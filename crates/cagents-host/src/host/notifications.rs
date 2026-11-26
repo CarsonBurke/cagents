@@ -551,20 +551,9 @@ fn restore(
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
-    match journal.group_withdrawals() {
-        Ok(groups) => {
-            for group in groups {
-                withdrawals.group(group);
-            }
-        }
-        Err(error) => snapshot.diagnostic = Some(error),
+    if let Err(error) = reserve_withdrawals(journal, snapshot, withdrawals) {
+        snapshot.diagnostic = Some(error);
     }
-    withdrawals.protect(
-        snapshot
-            .notices
-            .iter()
-            .map(|notice| batching::desktop_id(&notice.event.target)),
-    );
 }
 
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
@@ -583,11 +572,31 @@ fn revoke_previews(snapshot: &mut Snapshot, withdrawals: &mut Withdrawals) {
     }
 }
 
+fn reserve_withdrawals(
+    journal: &mut Journal,
+    snapshot: &Snapshot,
+    withdrawals: &mut Withdrawals,
+) -> Result<BTreeSet<Uuid>, String> {
+    let current: Vec<_> = snapshot
+        .notices
+        .iter()
+        .map(|notice| batching::desktop_id(&notice.event.target))
+        .collect();
+    withdrawals.protect(current.iter().copied());
+    let durable = journal.group_withdrawals_for(&current)?;
+    for id in &durable {
+        withdrawals.group(*id);
+    }
+    Ok(durable)
+}
+
 fn action_notice(snapshot: &Snapshot, id: Uuid) -> Option<&Notice> {
     snapshot.notices.iter().find(|notice| {
-        notice.id == id
-            || (!matches!(notice.event.target, Target::Automation { .. })
-                && batching::desktop_id(&notice.event.target) == id)
+        if matches!(notice.event.target, Target::Automation { .. }) {
+            !notice.acknowledged && notice.id == id
+        } else {
+            notice.id == id || batching::desktop_id(&notice.event.target) == id
+        }
     })
 }
 
@@ -1151,16 +1160,12 @@ async fn run(
             Err(error) => snapshot.diagnostic = Some(error),
         }
         restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals, false);
-        let persisted_withdrawals = match journal.group_withdrawals() {
-            Ok(groups) => {
-                for group in &groups {
-                    withdrawals.group(*group);
-                }
-                groups
-            }
+        let persisted_withdrawals = match reserve_withdrawals(journal, &snapshot, &mut withdrawals)
+        {
+            Ok(groups) => groups,
             Err(error) => {
                 snapshot.diagnostic = Some(error);
-                Vec::new()
+                BTreeSet::new()
             }
         };
         pending
@@ -1171,12 +1176,6 @@ async fn run(
                 notice.event.content = None;
             }
         }
-        withdrawals.protect(
-            snapshot
-                .notices
-                .iter()
-                .map(|notice| batching::desktop_id(&notice.event.target)),
-        );
         for notice in delivery.values_mut() {
             if let Some(current) = snapshot
                 .notices
@@ -1557,6 +1556,45 @@ mod tests {
         assert_eq!(withdrawals.pop_first().unwrap().id(), desktop);
         assert_eq!(withdrawals.pop_first().unwrap().id(), notice.id);
         assert!(withdrawals.is_empty());
+    }
+
+    #[test]
+    fn a_returning_automation_reserves_its_withdrawal_even_with_a_full_old_backlog() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("attention.sqlite3")).unwrap();
+        let id = Uuid::new_v4();
+        let target = Target::Automation { id, sequence: 6 };
+        let event = Event {
+            target: target.clone(),
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("automation:{id}:lifecycle:6"),
+                kind: Kind::AutomationPaused,
+            },
+            content: None,
+        };
+        let current = journal.record(event, false).unwrap().unwrap();
+        journal
+            .remember_notice_withdrawal(&target, Uuid::new_v4())
+            .unwrap();
+        let old = (0..MAX_PENDING).map(|index| Uuid::from_u128(index as u128));
+        let mut withdrawals = Withdrawals::default();
+        withdrawals.protect(old.clone());
+        for id in old {
+            withdrawals.group(id);
+        }
+        let mut snapshot = Snapshot::default();
+        restore(
+            &mut journal,
+            &Preferences::default(),
+            &mut snapshot,
+            &mut withdrawals,
+        );
+        assert_eq!(snapshot.notices, [current]);
+        assert!(withdrawals.contains(&batching::desktop_id(&target)));
     }
 
     #[test]
