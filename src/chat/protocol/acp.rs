@@ -272,10 +272,10 @@ struct Turn {
     on_background: bool,
 }
 
-/// Why a message cannot steer a turn that answers a correlated run: it
-/// would change the answer the run's caller is waiting for.
+/// Why the queue cannot be sent into a turn that answers a correlated run:
+/// it would change the answer the run's caller is waiting for.
 const RUN_TURN_REFUSAL: &str = "This turn is answering a message that waits for its reply, and \
-     steering it would change that reply. Queue the message for the next turn.";
+     sending more into it would change that reply. The queue goes when the turn ends.";
 
 /// A message written during a turn, held for the next one.
 struct Queued {
@@ -1654,9 +1654,10 @@ impl Adapter for Acp {
                             "{label} cannot take a message mid-turn; queue it for the next turn."
                         ));
                     }
-                    (Some(turn), PromptMode::Steer) if turn.run.is_some() => {
-                        return Err(RUN_TURN_REFUSAL.into());
-                    }
+                    // Steered into a turn that answers a correlated run, it
+                    // would change the reply the run's caller waits for; it
+                    // waits for the next turn instead.
+                    (Some(turn), PromptMode::Steer) if turn.run.is_some() => PromptMode::Queue,
                     (Some(_), mode) => mode,
                 };
                 if mode == PromptMode::Send {

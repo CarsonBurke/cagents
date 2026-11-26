@@ -2285,7 +2285,7 @@ fn a_correlated_run_never_takes_the_readers_held_queue() {
 }
 
 /// A run's caller waits for its turn's answer, which a message steered in
-/// would change: the message waits for the next turn instead.
+/// would change: the message is queued for the next turn instead.
 #[test]
 fn a_correlated_runs_turn_is_never_steered() {
     let mut acp = adapter(&[], None);
@@ -2293,10 +2293,10 @@ fn a_correlated_runs_turn_is_never_steered() {
     let run = crate::model::RunId::new();
     acp.command_for_run(run, send("the run's", PromptMode::Send))
         .unwrap();
-    let refused = acp.command(send("mine", PromptMode::Steer)).unwrap_err();
-    assert!(refused.contains("Queue the message"), "{refused}");
-    acp.command(send("mine", PromptMode::Queue)).unwrap();
-    assert!(acp.command(Command::SendQueuedNow).is_err());
+    let step = acp.command(send("mine", PromptMode::Steer)).unwrap();
+    assert!(step.writes.is_empty(), "{:?}", step.writes);
+    let refused = acp.command(Command::SendQueuedNow).unwrap_err();
+    assert!(refused.contains("when the turn ends"), "{refused}");
     assert_eq!(acp.queued.len(), 1);
     assert_eq!(acp.turn.as_ref().unwrap().requests.len(), 1);
 }
