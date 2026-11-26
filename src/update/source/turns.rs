@@ -4,10 +4,7 @@
 //! A parent completion must leave the idle wait, but cannot authorize ending
 //! those children. Present them for explicit stop review instead.
 use super::{Client, UpdateError, impact, invalid};
-use crate::{
-    chat::{Snapshot, ToolStatus},
-    model::TerminalId,
-};
+use crate::{chat::Snapshot, model::TerminalId};
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -78,7 +75,7 @@ impl From<Snapshot> for TurnActivity {
             background: snapshot
                 .subagents
                 .into_iter()
-                .filter(|child| child.background && child.status == ToolStatus::Running)
+                .filter(|child| child.background && child.is_running())
                 .map(|child| child.id)
                 .collect(),
             interrupted,
@@ -202,6 +199,7 @@ impl TurnReview {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+    use crate::chat::ToolStatus;
     use crate::{
         control::ControlClient,
         model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe},
@@ -282,10 +280,17 @@ mod tests {
 
     #[test]
     fn working_review_discloses_exact_background_interruption_before_the_choice() {
+        let mut unloaded = child(ToolStatus::Running);
+        unloaded.id = "unloaded-child".into();
+        unloaded.detail = crate::chat::UNLOADED_CHILD_RUNNING.into();
         let mut snapshot = Snapshot {
             ready: true,
             busy: true,
-            subagents: vec![child(ToolStatus::Running), child(ToolStatus::Succeeded)],
+            subagents: vec![
+                child(ToolStatus::Running),
+                unloaded,
+                child(ToolStatus::Succeeded),
+            ],
             ..Default::default()
         };
         snapshot.capabilities.interrupt_stops_background = true;

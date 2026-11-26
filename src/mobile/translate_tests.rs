@@ -49,6 +49,30 @@ fn snapshot(items: Vec<chat::Item>) -> chat::Snapshot {
 }
 
 #[test]
+fn an_unloaded_codex_child_does_not_count_as_live_mobile_work() {
+    let child = |id: &str, detail: &str| chat::Subagent {
+        id: id.into(),
+        kind: "agent".into(),
+        description: String::new(),
+        status: chat::ToolStatus::Running,
+        model: None,
+        waiting: false,
+        detail: detail.into(),
+        background: true,
+        items: Vec::new(),
+    };
+    let mut snapshot = snapshot(Vec::new());
+    snapshot.subagents = vec![
+        child("listed", chat::UNLOADED_CHILD_RUNNING),
+        child("followed", ""),
+    ];
+    let state = conversation_state(&snapshot);
+    assert_eq!(state.subagents.len(), 1);
+    assert_eq!(state.subagents[0].id, "followed");
+    assert_eq!(state.subagents[0].status, api::ToolStatus::Running);
+}
+
+#[test]
 fn a_watch_starts_with_everything_and_then_streams_text_as_appends() {
     let mut mirror = Mirror::default();
     let first = mirror
