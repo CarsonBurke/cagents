@@ -11122,6 +11122,58 @@ fn rejected_model_change_does_not_apply_or_report_effort() {
 }
 
 #[test]
+fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
+    let mut adapter = Claude::default();
+    adapter.receive(json!({"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+    let answers = |query: Vec<String>, limit: Vec<String>| {
+        vec![
+            Answer {
+                field: "query".into(),
+                values: query,
+            },
+            Answer {
+                field: "limit".into(),
+                values: limit,
+            },
+        ]
+    };
+    // A blank required field is missing, and the request stays pending.
+    for blank in [vec![], vec![String::new()]] {
+        let error = adapter
+            .answer("e1".into(), "accept".into(), answers(blank, vec![]))
+            .unwrap_err();
+        assert!(error.contains("Missing required Claude field"), "{error}");
+    }
+    // An untouched optional field arrives with no value; a cleared one may
+    // arrive as one empty string. Either way it is left out of the reply.
+    for (id, blank) in [("e2", vec![]), ("e3", vec![String::new()])] {
+        adapter.receive(json!({"type":"control_request","request_id":id,"request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+        let step = adapter
+            .answer(
+                id.into(),
+                "accept".into(),
+                answers(vec!["search".into()], blank),
+            )
+            .unwrap();
+        assert_eq!(
+            step.writes[0]["response"]["response"],
+            json!({"action":"accept","content":{"query":"search"}})
+        );
+    }
+    let step = adapter
+        .answer(
+            "e1".into(),
+            "accept".into(),
+            answers(vec!["search".into()], vec!["5".into()]),
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"query":"search","limit":5}})
+    );
+}
+
+#[test]
 fn elicitation_answers_preserve_boolean_and_numeric_types() {
     let mut adapter = Claude::default();
     adapter.receive(json!({"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"integer"}},"required":["enabled","count"]}}})).unwrap();

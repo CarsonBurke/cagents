@@ -5583,13 +5583,15 @@ fn elicitation_answers(
             Err(_) if !required && !answers.iter().any(|a| a.field == field.id) => continue,
             Err(error) => return Err(error),
         };
-        if answer.values.len() != 1 {
-            return Err(format!("Expected one value for {}", field.id));
-        }
-        let raw = &answer.values[0];
-        if !required && raw.is_empty() {
+        if super::blank_form_answer(&answer.values) {
+            if required {
+                return Err(format!("Missing answer for {}", field.id));
+            }
             continue;
         }
+        let [raw] = answer.values.as_slice() else {
+            return Err(format!("Expected one value for {}", field.id));
+        };
         let property = &schema["properties"][&field.id];
         let value = match string(property, "type")? {
             "string" => json!(raw),

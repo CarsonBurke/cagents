@@ -10286,9 +10286,10 @@ impl Claude {
                     let schema = &request["requested_schema"];
                     let fields = elicitation_fields(schema)?;
                     let mut content = serde_json::Map::new();
+                    let mut answered = HashSet::new();
                     for answer in &answers {
                         if !fields.iter().any(|field| field.id == answer.field)
-                            || content.contains_key(&answer.field)
+                            || !answered.insert(answer.field.as_str())
                         {
                             return Err(
                                 "Claude elicitation answer has an unknown or duplicate field"
@@ -10296,6 +10297,13 @@ impl Claude {
                             );
                         }
                         let field_schema = &schema["properties"][&answer.field];
+                        // A blank scalar is an absent field: an optional one is
+                        // omitted, and a required one is reported missing below.
+                        if string(field_schema, "type") != "array"
+                            && super::blank_form_answer(&answer.values)
+                        {
+                            continue;
+                        }
                         let value = elicitation_value(field_schema, &answer.values)?;
                         content.insert(answer.field.clone(), value);
                     }
