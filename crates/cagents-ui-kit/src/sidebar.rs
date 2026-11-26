@@ -9611,7 +9611,11 @@ fn context_controls_with_display<'a>(
     }
     crate::interaction::context_menu_lazy(content, move || {
         let mut commands = vec![
-            ("Open folder".to_owned(), None, ProjectCommand::Reveal),
+            (
+                "Show in file manager".to_owned(),
+                None,
+                ProjectCommand::Reveal,
+            ),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
             (
                 project_channel_command_label(worktree_id).to_owned(),

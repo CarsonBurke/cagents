@@ -753,8 +753,8 @@ impl<'a> View<'a> {
             let mut items: Vec<Element<'a, Action>> = vec![
                 popover_item(
                     Icon::OpenFolder.handle(),
-                    "Open folder",
-                    "In the file manager",
+                    "Show in file manager",
+                    "Outside cagents",
                     command(ProjectCommand::Reveal),
                 )
                 .into(),
@@ -1354,8 +1354,8 @@ impl<'a> View<'a> {
             items.push(
                 popover_item(
                     Icon::OpenFolder.handle(),
-                    "Open folder",
-                    "In the file manager",
+                    "Show in file manager",
+                    "Outside cagents",
                     command(ProjectCommand::Reveal),
                 )
                 .into(),
