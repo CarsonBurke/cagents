@@ -393,7 +393,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::fixture_tempdir().unwrap();
             let source = Session {
                 id: TerminalId::new(),
                 proof: None,

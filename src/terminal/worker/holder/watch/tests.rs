@@ -198,18 +198,21 @@ fn thirty_original_holder_streams_share_one_io_thread_and_keep_control_writes_bl
         );
         assert!(stream.exits.try_recv().is_err());
     }
-    let threads = std::fs::read_dir("/proc/self/task")
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|task| {
-            std::fs::read_to_string(task.path().join("comm"))
-                .is_ok_and(|name| name.trim() == "terminal-io")
-        })
-        .count();
-    assert_eq!(
-        threads, 1,
-        "30 live control observers must use one I/O thread"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let threads = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|task| {
+                std::fs::read_to_string(task.path().join("comm"))
+                    .is_ok_and(|name| name.trim() == "terminal-io")
+            })
+            .count();
+        assert_eq!(
+            threads, 1,
+            "30 live control observers must use one I/O thread"
+        );
+    }
     let began = Instant::now();
     for stream in &mut streams {
         assert!(stream.stop(), "observer must stop without abort fallback");

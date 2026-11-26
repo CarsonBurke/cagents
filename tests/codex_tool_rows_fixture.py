@@ -55,9 +55,9 @@ class CodexToolRowsFixture(unittest.TestCase):
             if failures:
                 raise failures[0]
 
-    def paused_turn(self, scenario):
+    def paused_turn(self, scenario, home="/private/codex"):
         replies = scenario.request({"id": 1, "method": "turn/start", "params": {
-            "threadId": scenario.thread}}, "/private/codex")
+            "threadId": scenario.thread}}, str(home))
         generations = scenario.playback(replies)
         origin = replies[0]["result"]["turn"]["id"]
         pause = next(index for index, reply in enumerate(replies) if "_sleep" in reply)
@@ -193,6 +193,50 @@ class CodexToolRowsFixture(unittest.TestCase):
             read = scenario.request({"id": 3, "method": "thread/resume", "params": {
                 "threadId": scenario.child}}, str(home))
             self.assertEqual(read[0]["result"]["thread"]["agentNickname"], "Quinn")
+
+    def test_multi_agent_v2_announces_children_only_by_activity_and_lists_them_once_started(self):
+        with tempfile.TemporaryDirectory(prefix="codex-multi-agent-v2-") as directory:
+            home = Path(directory)
+            (home / "fixture-multi-agent-v2").touch()
+            scenario = PEER["Scenario"]()
+            children = [scenario.child, scenario.second]
+            self.assertEqual(scenario.request({"id": 1, "method": "thread/list"}, str(home))[0]
+                             ["result"]["data"], [])
+            _, remaining, generations = self.paused_turn(scenario, home)
+            methods = [reply.get("method") for reply in remaining]
+            items = [reply["params"]["item"] for reply in remaining
+                     if reply.get("method", "").startswith("item/")]
+            # Like Codex 0.172: no thread/started, and no call names a child.
+            self.assertNotIn("thread/started", methods)
+            self.assertTrue(all(item.get("receiverThreadIds", []) == [] for item in items
+                                if item["type"] == "collabAgentToolCall"))
+            started = [item for item in scenario.latest["items"] if item["type"] == "subAgentActivity"]
+            self.assertEqual([(item["kind"], item["agentThreadId"], item["agentPath"]) for item in started],
+                             [("started", children[0], "/root/review_tool_rows"),
+                              ("started", children[1], "/root/check_docs_links")])
+            for child in children:
+                self.assertEqual(scenario.metadata(child)["status"]["type"], "active")
+            listed = scenario.request({"id": 2, "method": "thread/list"}, str(home))[0]["result"]["data"]
+            self.assertEqual([(thread["id"], thread["agentNickname"],
+                               thread["source"]["subAgent"]["thread_spawn"]["agent_path"])
+                              for thread in listed],
+                             [(children[1], "Hume", "/root/check_docs_links"),
+                              (children[0], "Arendt", "/root/review_tool_rows")])
+            # Its history is read with full items, as the app asks for it.
+            self.assertEqual(scenario.latest["itemsView"], "full")
+            self.publish(scenario, remaining, generations)
+            self.assertEqual(scenario.latest["status"], "completed")
+            self.assertEqual(scenario.latest["itemsView"], "full")
+            self.assertEqual([item["kind"] for item in scenario.latest["items"]
+                              if item["type"] == "subAgentActivity"],
+                             ["started", "started", "completed", "completed"])
+            for child in children:
+                read = scenario.request({"id": 3, "method": "thread/resume", "params": {
+                    "threadId": child}}, str(home))[0]["result"]
+                self.assertEqual(read["thread"]["status"]["type"], "idle")
+                report = read["initialTurnsPage"]["data"][0]
+                self.assertEqual(report["status"], "completed")
+                self.assertEqual(report["items"][0]["type"], "agentMessage")
 
     def test_restarted_server_lists_unloaded_children_and_reads_nested_ones_through_parents(self):
         with tempfile.TemporaryDirectory(prefix="codex-nested-child-") as directory:

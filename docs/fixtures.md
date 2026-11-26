@@ -556,6 +556,16 @@ Codex, the peer lists a child it hasn't loaded since it started as
 `notLoaded`, and refuses to read Ada until the child's own read has loaded it:
 the state a restarted daemon restores nested subagents from.
 
+With `home/.codex/fixture-multi-agent-v2` present, each prompt to the
+`tool-rows` peer plays a turn of Codex's second multi-agent version instead, as
+Codex 0.172 sends one. It starts two subagents, Arendt and Hume, and announces
+each only with a `subAgentActivity` item: no `thread/started` and no
+collaboration call names either. It waits for both to report, then answers.
+The thread listing names each child, with its agent path, once its turn has
+started, so a chat opened before the prompt lists none. Create the marker
+before the prompt, as with `evidence env touch
+'{fixture}/home/.codex/fixture-multi-agent-v2'` in a steps file.
+
 The `tool-rows` peer also reads an optional `model/list` result from
 `home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
 ID on each entry; `displayName`, `supportedReasoningEfforts`,

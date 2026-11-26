@@ -15,6 +15,256 @@ const MODE: &str = "CAGENTS_UPGRADE_NATIVE_TEST";
 const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ROLLOUT_MISSING: &str = "no rollout found for thread id";
 
+#[cfg(target_os = "macos")]
+#[test]
+fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
+    use crate::host::upgrade_inspect::{CodexExecution, codex_execution};
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    use std::io;
+
+    struct CloseFixtureChat<'a>(&'a SharedHost, Option<TerminalId>);
+    impl Drop for CloseFixtureChat<'_> {
+        fn drop(&mut self) {
+            if let Some(chat_id) = self.1 {
+                let _ = super::super::client::process_request(
+                    self.0,
+                    1,
+                    ClientRequest::ChatClose { chat_id },
+                );
+            }
+        }
+    }
+
+    const PAIRED_TEST: &str = "host::state::native_upgrade_tests::paired_codex_close_prepares_floor_resume_with_exact_receipts";
+    if std::env::var(MODE).as_deref() != Ok("paired-floor") {
+        let fixture = tempfile::Builder::new()
+            .prefix("cp.")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let root = fixture.path();
+        for path in ["home/.codex", "project", "run", "bin"] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        fs::set_permissions(root.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let output = Command::new(&executable)
+            .args(["--exact", PAIRED_TEST, "--nocapture"])
+            .env(MODE, "paired-floor")
+            .env("CAGENTS_UPGRADE_ROOT", root)
+            .env("CAGENTS_UPGRADE_EXE", &executable)
+            .env("HOME", root.join("home"))
+            .env("CODEX_HOME", root.join("home/.codex"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env(crate::instance::DEVELOPMENT_INSTANCE_ENV, "pair")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "paired Darwin close and resume failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    let program = install_provider(&root);
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("paired-floor-fixture"),
+        host_incarnation: HostIncarnation::new("source"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+    };
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut state = HostState::new(proof.clone());
+    state.enable_holder_recovery();
+    let host = Arc::new(HostLock::new(state));
+    host.lock().unwrap().register_client(1);
+    let source = provider_session(&root, &program, &proof);
+    let chat_id = source.id;
+    super::super::chat::start_execution(
+        &host,
+        1,
+        source,
+        Arc::new(crate::chat::protocol::ExecutionContext::default()),
+    )
+    .unwrap();
+    let mut close_source = CloseFixtureChat(&host, Some(chat_id));
+    let handle = host.lock().unwrap().chats[&chat_id].handle.clone();
+    wait_durable(&handle);
+
+    let (view, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatReturnTerminal { chat_id },
+    )
+    .unwrap();
+    let ServerResponse::ChatTerminal {
+        session: terminal, ..
+    } = view
+    else {
+        panic!("expected the registered terminal view, got {view:?}");
+    };
+    wait_until(
+        || root.join("console-ready").is_file(),
+        "the fixture did not start the paired CLI in its PTY",
+    );
+    let (issued, terminal_owner) = {
+        let state = host.lock().unwrap();
+        (
+            state.chats[&chat_id].current_session(),
+            state.terminals[&terminal.id]
+                .handle
+                .holder_identity()
+                .unwrap()
+                .clone(),
+        )
+    };
+    assert_eq!(issued.terminal.as_deref(), Some(&terminal));
+    assert!(terminal_owner.root.is_current());
+    let native_directory = registry::directory(Kind::Native).unwrap();
+    let native_control = registry::socket(&native_directory, chat_id);
+    let native_owner = registry::evidence(&native_control, Kind::Native)
+        .unwrap()
+        .unwrap();
+    let listener = issued.recorded_codex_socket().unwrap();
+    assert_eq!(
+        listener,
+        issued.owned_codex_listener.as_ref().unwrap().socket
+    );
+    assert!(fs::symlink_metadata(&listener).is_ok());
+    let paired_listener = crate::chat::recorded_codex_socket(&terminal.launch).unwrap();
+    assert!(fs::symlink_metadata(&paired_listener).is_ok());
+
+    let (closed, _, _) =
+        super::super::client::process_request(&host, 1, ClientRequest::ChatClose { chat_id })
+            .unwrap();
+    let ServerResponse::ChatClosed { snapshot, .. } = closed else {
+        panic!("expected an ordinary close, got {closed:?}");
+    };
+    close_source.1 = None;
+    drop(close_source);
+    wait_until(
+        || !native_owner.holder.is_current() && !terminal_owner.holder.is_current(),
+        "original holders survived close",
+    );
+    assert!(!native_owner.root.is_current());
+    assert!(!terminal_owner.root.is_current());
+    for path in [&native_control, &listener, &paired_listener] {
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "{}",
+            path.display()
+        );
+    }
+    let source_receipt = crate::chat::native_holder::closed_source(&issued, &proof).unwrap();
+    let (closed_owner, paired_closed) =
+        source_receipt.expect("missing receipt for the issued pair");
+    assert_eq!(closed_owner, native_owner);
+    assert!(
+        paired_closed,
+        "native receipt did not settle its registered terminal"
+    );
+    assert!(
+        crate::chat::native_holder::inspect_closed_source(&issued, &proof.boot_id).unwrap(),
+        "native holder published only scoped close evidence"
+    );
+    assert_eq!(
+        codex_execution(&issued, &proof.boot_id),
+        CodexExecution::Ended
+    );
+
+    let mut floor =
+        crate::upgrade::floor::Record::new(proof.clone(), vec![issued.clone()], vec![terminal.id]);
+    floor
+        .snapshots
+        .push(crate::upgrade::floor::StoppedSnapshot {
+            source: issued.clone(),
+            snapshot,
+            limitation: None,
+        });
+    floor.save().unwrap();
+    drop(handle);
+    drop(host);
+    drop(lease);
+    let proof = HostSessionProof {
+        host_incarnation: HostIncarnation::new("successor"),
+        ..proof
+    };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let host = Arc::new(HostLock::new(HostState::new(proof)));
+    host.lock().unwrap().register_client(1);
+    let resume = || {
+        super::super::client::process_request(
+            &host,
+            1,
+            ClientRequest::ChatPrepareResume {
+                source: issued.clone(),
+            },
+        )
+    };
+    let receipt = crate::terminal::holder::directory().unwrap().join(format!(
+        "{}-{}-{}.closed",
+        terminal.id, terminal_owner.holder.pid, terminal_owner.holder.start
+    ));
+    let withheld = receipt.with_extension("withheld");
+    fs::rename(&receipt, &withheld).unwrap();
+    let rejected = resume();
+    fs::rename(withheld, receipt).unwrap();
+    assert!(
+        rejected
+            .unwrap_err()
+            .message
+            .contains("console's end could not be proved")
+    );
+    let (prepared, _, _) = resume().unwrap();
+    let ServerResponse::ChatResumePrepared { session } = prepared else {
+        panic!("expected a new allocation for the same conversation, got {prepared:?}");
+    };
+    assert_ne!(session.id, chat_id);
+    assert_eq!(session.launch.session_id.as_deref(), Some(THREAD));
+    assert!(
+        session.terminal.is_none()
+            && session.owned_codex_listener.is_none()
+            && session.proof.is_none()
+    );
+    let resumed_id = session.id;
+    let (resumed, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatStart {
+            session,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
+    let mut close_resumed = CloseFixtureChat(&host, Some(resumed_id));
+    assert!(matches!(resumed, ServerResponse::ChatAttached { .. }));
+    let resumed_handle = host.lock().unwrap().chats[&resumed_id].handle.clone();
+    wait_durable(&resumed_handle);
+    let resumed_control = registry::socket(&native_directory, resumed_id);
+    let resumed_owner = registry::evidence(&resumed_control, Kind::Native)
+        .unwrap()
+        .unwrap();
+    let (closed, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatClose {
+            chat_id: resumed_id,
+        },
+    )
+    .unwrap();
+    assert!(matches!(closed, ServerResponse::ChatClosed { .. }));
+    close_resumed.1 = None;
+    wait_until(
+        || !resumed_owner.holder.is_current() && !resumed_owner.root.is_current(),
+        "the resumed fixture provider survived close",
+    );
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",
@@ -1715,12 +1965,16 @@ fn install_provider(root: &std::path::Path) -> std::path::PathBuf {
         format!(
             r#"#!/bin/sh
 set -eu
+if [ "${{1:-}}" = resume ]; then
+  : > "${{0%/*}}/../console-ready"
+  exec /bin/sleep 300
+fi
 for arg in "$@"; do
   case "$arg" in unix://*) export CAGENTS_UPGRADE_SOCKET="${{arg#unix://}}" ;; esac
 done
 echo launch >> "$CAGENTS_UPGRADE_ROOT/provider-launches"
 export {MODE}=provider
-exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --nocapture
+exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --include-ignored --nocapture
 "#
         ),
     )

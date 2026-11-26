@@ -790,7 +790,7 @@ impl ShutdownTarget {
     }
 }
 
-fn lease_owner_process(
+pub(crate) fn lease_owner_process(
     lock_path: &Path,
     proof: &HostSessionProof,
 ) -> Result<(u32, PinnedProcess), PlatformError> {
@@ -2679,7 +2679,11 @@ while True: time.sleep(1)
         let error = HostLease::acquire_with_handoff(&expected, &proof(), Some(unheld))
             .err()
             .expect("an unlocked descriptor is not a handoff");
-        assert!(error.to_string().contains("unheld lease"), "{error}");
+        #[cfg(target_os = "linux")]
+        let reason = "unheld lease";
+        #[cfg(target_os = "macos")]
+        let reason = "inherited description has never held a flock";
+        assert!(error.to_string().contains(reason), "{error}");
         assert!(HostLease::is_held(&unrelated).unwrap());
         assert!(!HostLease::is_held(&expected).unwrap());
     }

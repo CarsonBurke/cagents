@@ -1157,7 +1157,7 @@ mod tests {
             "misnamed close",
         ] {
             let cleanup = matches!(purpose, "close" | "named close");
-            let directory = tempfile::tempdir().unwrap();
+            let directory = crate::fixture_tempdir().unwrap();
             let host = host();
             host.lock()
                 .unwrap()
@@ -1380,7 +1380,7 @@ mod tests {
     }
 
     fn history_reader(host: &SharedHost, close: bool) -> (tempfile::TempDir, Session, Handle) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::fixture_tempdir().unwrap();
         let registry = super::super::super::model::Registry::at(
             &directory.path().join("capacity-model.sqlite"),
         )

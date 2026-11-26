@@ -90,8 +90,9 @@ pub fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
 /// Darwin splits them across two options. `LOCAL_PEERCRED` answers the
 /// effective uid recorded at `connect`, as Linux does. `LOCAL_PEERPID` does
 /// not: it names the last process to use the peer's socket, which a server
-/// socket takes from its listener, and it fails with `ENOTCONN` once the peer
-/// closes. The pid is therefore only a candidate; every caller compares it to
+/// socket takes from its listener. After the peer closes, the option may
+/// return the last recorded pid or fail with `ENOTCONN`. The pid is only a
+/// candidate; every caller compares it to
 /// an owner it has already proven, or pins it and then verifies the peer's
 /// proof.
 ///
@@ -269,6 +270,21 @@ impl PinnedProcess {
         Ok(Self { pid, pin })
     }
 
+    /// Pins a live process at the given start epoch without waiting for XNU
+    /// to publish an exiting process's zombie record.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn open_live_started(pid: u32, started: u64) -> io::Result<Self> {
+        if pid <= 1 || libc::pid_t::try_from(pid).is_err() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"));
+        }
+        let pin = imp::Pin::open_with_zombies(pid, false)?;
+        let process = Self { pid, pin };
+        if process.started_ticks() != started || process.exited()? {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        Ok(process)
+    }
+
     /// A second pin of the same process, sharing its exit readiness.
     ///
     /// # Errors
@@ -392,6 +408,14 @@ impl PinnedProcess {
     #[cfg(all(target_os = "macos", feature = "host"))]
     pub(crate) fn parent_pid(&self) -> io::Result<u32> {
         self.while_running(imp::bsd_info(self.pid).map(|info| info.pbi_ppid))
+    }
+
+    /// Foreground group of the expected controlling terminal of this root.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn terminal_foreground_group(&self, device: u64) -> Option<libc::pid_t> {
+        let info = self.while_running(imp::bsd_info(self.pid)).ok()?;
+        let group = libc::pid_t::try_from(info.e_tpgid).ok()?;
+        (u64::from(info.e_tdev) == device && group > 0).then_some(group)
     }
 
     /// The files the pinned process holds open.
@@ -1053,6 +1077,10 @@ mod imp {
         }
 
         pub(super) fn open(pid: u32) -> io::Result<Self> {
+            Self::open_with_zombies(pid, true)
+        }
+
+        pub(super) fn open_with_zombies(pid: u32, allow_zombie: bool) -> io::Result<Self> {
             let watch = queue()?;
             // The registration binds to whichever process held the pid at that
             // instant. The start time read on both sides of it names that
@@ -1074,7 +1102,7 @@ mod imp {
                     Ok(Self { watch, start })
                 }
                 // XNU refuses to watch a process that is exiting or a zombie.
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) && allow_zombie => {
                     let start = zombie_start(pid)?;
                     if before.is_ok_and(|before| before != start) {
                         return Err(io::Error::from(io::ErrorKind::NotFound));
@@ -1082,7 +1110,7 @@ mod imp {
                     latch(&watch)?;
                     Ok(Self { watch, start })
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(vanished(error)),
             }
         }
 
@@ -1616,7 +1644,7 @@ mod tests {
     }
 
     /// A peer that has closed keeps its uid, which a check after its reply
-    /// relies on; only Darwin stops reporting its pid.
+    /// relies on. Darwin may stop reporting its PID.
     #[cfg(feature = "host")]
     #[test]
     fn a_closed_peer_keeps_its_uid() {
@@ -1625,10 +1653,10 @@ mod tests {
         // SAFETY: geteuid has no preconditions.
         assert_eq!(peer_uid(&ours).unwrap(), unsafe { libc::geteuid() });
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            peer_credentials(&ours).unwrap_err().raw_os_error(),
-            Some(libc::ENOTCONN)
-        );
+        match peer_credentials(&ours) {
+            Ok(peer) => assert_eq!(peer.pid, std::process::id()),
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ENOTCONN)),
+        }
     }
 
     /// The pinned process's arguments read as Linux's `/proc/<pid>/cmdline`

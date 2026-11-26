@@ -189,6 +189,9 @@ pub enum HostError {
     Platform(String),
     #[error("cagents daemon I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// Another runtime directory's daemon serves this instance's saved data.
+    #[error("{0}")]
+    StateInUse(crate::instance::state_claim::StateInUse),
 }
 
 impl From<PlatformError> for HostError {
@@ -471,6 +474,10 @@ fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, 
                 error => error.to_string(),
             },
         )?;
+    // A daemon in another runtime directory must not open the store while
+    // this converts it. Released before the lease.
+    let _state = crate::instance::state_claim::claim_store_maintenance(&paths.lock)
+        .map_err(|error| error.to_string())?;
     work()
 }
 
@@ -647,6 +654,25 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let _lease = match admission.lease.take() {
         Some(lease) => HostLease::acquire_with_handoff(&paths, &proof, Some(lease))?,
         None => HostLease::acquire(&paths, &proof)?,
+    };
+    // The lease excludes daemons only in this runtime directory. Before this
+    // daemon restores, publishes or saves anything, it also claims the saved
+    // data, which a daemon in another runtime directory may already serve.
+    // Declared after the lease, it is released first. A claim that fails for
+    // any other reason than that daemon, such as a read-only data directory,
+    // leaves this daemon serving what it can, as it did before claims.
+    let _state = match crate::instance::state_claim::claim_daemon_state(
+        &paths.lock,
+        proof.host_session_id.as_str(),
+    ) {
+        Ok(claim) => Some(claim),
+        Err(error) => match crate::instance::state_claim::state_in_use(&error) {
+            Some(refusal) => return Err(HostError::StateInUse(refusal.clone())),
+            None => {
+                tracing::warn!(%error, "could not claim this instance's saved data; a daemon in another runtime directory is not kept away from it");
+                None
+            }
+        },
     };
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("daemon lease acquired", None);

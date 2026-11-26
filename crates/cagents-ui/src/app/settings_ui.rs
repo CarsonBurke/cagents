@@ -2651,10 +2651,7 @@ mod tests {
         use cosmic::iced::futures::{StreamExt, pin_mut};
         use std::{
             os::unix::fs::PermissionsExt,
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            },
+            sync::{Arc, atomic::AtomicUsize},
         };
 
         let directory = tempfile::tempdir().unwrap();
@@ -2690,8 +2687,11 @@ mod tests {
                 .await
                 .is_err()
         );
+        // FSEvents can deliver the fixture's initial save after the watch is
+        // armed. It may cause a read without publishing changed preferences.
+        #[cfg(target_os = "linux")]
         assert_eq!(
-            load_count.load(Ordering::Relaxed),
+            load_count.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "a mode change, such as the one each settings read makes, schedules no reload"
         );

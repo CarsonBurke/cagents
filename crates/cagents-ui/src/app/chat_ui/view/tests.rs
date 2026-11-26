@@ -6500,6 +6500,8 @@ pub(super) struct Laid {
     pub(super) placed_text: Vec<(iced::Rectangle, String)>,
     /// What assistive technology is told inside the footer.
     footer_names: Vec<String>,
+    /// Where each of `footer_names` is drawn.
+    footer_name_bounds: Vec<iced::Rectangle>,
     /// The far edge of whatever the footer draws, text or named glyph.
     footer_drawn_right: f32,
 }
@@ -6509,6 +6511,24 @@ pub(super) fn lay_out(
     width: f32,
     accounts: Option<ChatAccounts>,
     roles: &[&str],
+) -> Laid {
+    lay_out_on(
+        runtime,
+        width,
+        accounts,
+        roles,
+        Some("feature/a-long-branch-name"),
+    )
+}
+
+/// [`lay_out`] on `branch`, or in a place with no branch to show, such as a
+/// detached worktree.
+fn lay_out_on(
+    runtime: &Runtime,
+    width: f32,
+    accounts: Option<ChatAccounts>,
+    roles: &[&str],
+    branch: Option<&str>,
 ) -> Laid {
     use iced::advanced::{
         Layout, layout,
@@ -6554,7 +6574,7 @@ pub(super) fn lay_out(
         width,
         0.0,
         Place {
-            branch: Some("feature/a-long-branch-name".into()),
+            branch: branch.map(Into::into),
         },
         true,
         accounts,
@@ -6625,6 +6645,7 @@ pub(super) fn lay_out(
             .map(|(bounds, _)| bounds.x + bounds.width)
             .fold(f32::MIN, f32::max),
         footer_text: text.into_iter().map(|(_, text)| text).collect(),
+        footer_name_bounds: named.iter().map(|(bounds, _)| *bounds).collect(),
         footer_names: named.into_iter().map(|(_, name)| name).collect(),
     }
 }
@@ -6946,6 +6967,111 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
             assert!(
                 !text.contains(status),
                 "{status} in footer at {width}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn footer_starts_and_ends_beneath_the_composer_glyphs() {
+    let roles = [
+        "chat-actions",
+        "chat-account-picker",
+        "chat-permission-picker",
+        "chat-submit-0",
+        "chat-dictate",
+    ];
+    let glyph = f32::from(design::ROW_ICON_SIZE);
+    // Where the composer's `+` glyph starts, and where its last control's
+    // glyph ends: the insets the footer's outer glyphs share.
+    let glyph_left = |laid: &Laid| {
+        let plus = laid.controls["chat-actions"];
+        plus.x + (plus.width - glyph) / 2.0
+    };
+    let glyph_right = |laid: &Laid| {
+        let last = ["chat-submit-0", "chat-dictate"]
+            .iter()
+            .filter_map(|role| laid.controls.get(*role))
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .expect("the composer has a trailing control");
+        last.x + (last.width + glyph) / 2.0
+    };
+    // A draft with something to send, so the composer ends on a control,
+    // and nothing spent yet.
+    let draft = || {
+        let (mut runtime, handle) = furnished_runtime();
+        runtime.connection = Connection::Draft;
+        Arc::make_mut(&mut runtime.snapshot).usage = Default::default();
+        runtime
+            .attachments
+            .push(chat::Attachment::file("/project/screenshot.png"));
+        (runtime, handle)
+    };
+    for width in [320.0_f32, 470.0, 900.0] {
+        // A draft's account is a picker. Leading the row, as it does where
+        // there is no branch to show, its glyph starts beneath the `+`,
+        // inside its own padding, and its hover background stays inside
+        // the composer's edge.
+        let (runtime, _handle) = draft();
+        let laid = lay_out_on(&runtime, width, Some(fixture_accounts()), &roles, None);
+        let picker = laid.controls["chat-account-picker"];
+        assert!(
+            (picker.x + CONTROL_PADDING[1] - glyph_left(&laid)).abs() <= 1.0,
+            "account glyph starts beneath `+` at {width}: {picker:?} vs {}",
+            glyph_left(&laid)
+        );
+        assert!(
+            picker.x >= laid.footer.x + step::GAP_M,
+            "hover background stays in the column at {width}: {picker:?}"
+        );
+        // Nothing spent yet: the footer ends on the permission picker,
+        // whose chevron ends beneath the composer's last glyph and whose
+        // hover background stays inside the composer.
+        let permissions = laid.controls["chat-permission-picker"];
+        assert!(
+            (permissions.x + permissions.width - CONTROL_PADDING[1] - glyph_right(&laid)).abs()
+                <= 1.0,
+            "permission chevron ends beneath the composer's last glyph at {width}: \
+             {permissions:?} vs {}",
+            glyph_right(&laid)
+        );
+        assert!(
+            permissions.x + permissions.width <= laid.footer.x + laid.footer.width - step::GAP_M,
+            "hover background stays in the column at {width}: {permissions:?}"
+        );
+        // A branch, where one is shown, leads in the picker's place: its
+        // icon, then its name.
+        let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
+        if FooterFit::for_width(width) == FooterFit::Wide {
+            let branch = laid
+                .placed_text
+                .iter()
+                .find(|(bounds, text)| {
+                    text.starts_with("feature/") && laid.footer.contains(bounds.center())
+                })
+                .unwrap_or_else(|| panic!("branch shown at {width}"))
+                .0;
+            let icon_left = branch.x - 12.0 - step::GAP_XS;
+            assert!(
+                (icon_left - glyph_left(&laid)).abs() <= 1.0,
+                "branch starts beneath `+` at {width}: {icon_left} vs {}",
+                glyph_left(&laid)
+            );
+        } else {
+            // Once the conversation starts the account is a label, its
+            // glyph where the picker's was.
+            let (runtime, _handle) = furnished_runtime();
+            let laid = lay_out(&runtime, width, Some(fixture_accounts()), &roles);
+            let account = laid
+                .footer_names
+                .iter()
+                .zip(&laid.footer_name_bounds)
+                .find(|(name, _)| name.starts_with("Account: "))
+                .unwrap_or_else(|| panic!("account glyph named at {width}"))
+                .1;
+            assert!(
+                (account.x - (picker.x + CONTROL_PADDING[1])).abs() <= 1.0,
+                "account label keeps the picker's place at {width}: {account:?} vs {picker:?}"
             );
         }
     }

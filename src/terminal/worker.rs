@@ -1311,6 +1311,16 @@ impl TerminalHandle {
             .try_clone_to_owned()
             .map(File::from)
     }
+    /// PID from the exact root pin retained by the test's input worker.
+    #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+    pub fn original_root_pid_for_test(&self) -> Option<u32> {
+        self.inner
+            .published
+            .test_input_root_pidfd
+            .get()
+            .map(PinnedProcess::pid)
+    }
+
     /// Physical provenance of the original PTY launch, not caller authority.
     /// A caller must still revalidate its current Host record/source ownership;
     /// these atomic worker checks do not make a source mutation atomic.
@@ -1822,7 +1832,7 @@ impl TerminalHandle {
             worker.run();
         });
         join_owner.install(worker);
-        if let Err(error) = initialized.recv_timeout(Duration::from_secs(5)) {
+        if let Err(error) = initialized.recv_timeout(crate::terminal::SPAWN_START_TIMEOUT) {
             published.request_shutdown();
             joins::request(&join_owner, true, true);
             panic!("test terminal initialization did not finish: {error}");
@@ -3816,16 +3826,6 @@ impl Worker {
             }
         }
 
-        // A readable root pidfd only selected this reconciliation route. The
-        // actual holder report and PTY EOF together prove natural completion.
-        let natural_close = self.natural_close.take().map(|close| {
-            let drained = !shutting_down
-                && !self.checked_close_started
-                && self.pty_eof
-                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
-            (close, drained)
-        });
-
         // A last bell may still be waiting for its cadence deadline when the
         // PTY drains. Deliver its attention before completion, without holding
         // teardown open for a timer.
@@ -3851,7 +3851,21 @@ impl Worker {
             // Nothing will end a synchronized update the child left open.
             self.capture_when_ready(false);
         }
-        let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
+        // Darwin revokes the controlling tty when its session leader exits.
+        // EOF can arrive while other processes in that session are still live.
+        let natural_census = cfg!(target_os = "macos")
+            && !shutting_down
+            && self.pty_eof
+            && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+        let shutdown_cleanup_confirmed = if (shutting_down || natural_census) && !self.carried {
+            #[cfg(target_os = "macos")]
+            if shutting_down {
+                // XNU drains the controlling tty before notifying the root's
+                // exit. This worker has published its final grid and no longer
+                // consumes the reader queue. Drain through that backpressure
+                // until process cleanup has finished and the wake pipe closes.
+                self.reader_discard_pending.store(true, Ordering::Release);
+            }
             let budget = self.published.shutdown_budget();
             if exited {
                 let cleanup = if self.checked_shutdown {
@@ -3926,6 +3940,14 @@ impl Worker {
         // The shared input seal alone is insufficient: carry also uses it.
         let family_cleanup_confirmed =
             shutdown_cleanup_confirmed && (!self.checked_close_started || self.checked_shutdown);
+        let natural_close = self.natural_close.take().map(|close| {
+            let drained = !shutting_down
+                && !self.checked_close_started
+                && family_cleanup_confirmed
+                && self.pty_eof
+                && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
+            (close, drained)
+        });
         let completion = self.root_exit.take().and_then(|event| match event {
             TerminalEvent::Exited {
                 exit_code,
@@ -3994,7 +4016,7 @@ impl Worker {
             {
                 self.error("retain unconfirmed terminal screen", error);
             }
-            if shutting_down {
+            if shutting_down || natural_census {
                 self.holder.leave_after_unconfirmed_shutdown();
             } else {
                 self.holder.leave_for_successor();
@@ -5451,11 +5473,9 @@ impl Worker {
             .as_ref()
             .ok_or("Child identity unavailable")?;
         let family = FrozenFamily::capture(root, deadline)?;
-        // SAFETY: this worker owns the live PTY throughout the frozen census.
-        let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        if foreground <= 0 {
-            return Err("Foreground process group unavailable".into());
-        }
+        let foreground = self
+            .foreground_group()
+            .ok_or("Foreground process group unavailable")?;
         // Process-only policy deliberately permits terminating shell builtins.
         // The original executable check still prevents an exec'd agent or
         // command from inheriting an idle shell's authority.
@@ -5480,9 +5500,14 @@ impl Worker {
     }
 
     fn foreground_group(&self) -> Option<libc::pid_t> {
-        // SAFETY: this worker owns the live master descriptor.
-        let group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        (group > 0).then_some(group)
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: this worker owns the live master descriptor.
+            let group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+            (group > 0).then_some(group)
+        }
+        #[cfg(target_os = "macos")]
+        self.child.foreground_group(&self.master)
     }
 
     fn observe_agent_process(&mut self) -> Option<&AgentProcess> {
@@ -5810,21 +5835,9 @@ impl Worker {
             self.handle_command(command);
         }
         let _admitted = if conventional_interrupt {
-            // TIOCSIG targets the foreground group bound to this exact PTY.
-            // Raw applications and extended key encodings retain their bytes.
-            // Darwin declares the request narrower than `ioctl` takes it.
-            #[cfg(target_os = "linux")]
-            let request = libc::TIOCSIG;
-            #[cfg(target_os = "macos")]
-            let request = libc::c_ulong::from(libc::TIOCSIG);
-            let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), request, libc::SIGINT) };
-            if result < 0 {
-                self.error(
-                    "interrupt terminal",
-                    std::io::Error::last_os_error().to_string(),
-                );
-            }
-            result >= 0
+            // Reply and cleanup sends above may have started a protocol
+            // frame since the original cancellation decision.
+            self.signal_interrupt(!can_flush_kernel || !self.pending_input.can_flush_kernel())
         } else if let Some(input) = interrupt_key {
             let mut release = input.clone();
             release.action = KeyAction::Release;
@@ -5851,6 +5864,115 @@ impl Worker {
             admitted
         };
         boundary
+    }
+
+    fn signal_interrupt(&self, preserve_kernel: bool) -> bool {
+        #[cfg(target_os = "macos")]
+        if preserve_kernel {
+            // Darwin TIOCSIG can flush both tty queues. In particular, a
+            // bracketed paste must never lose the opener it already sent.
+            return match self.interrupt_foreground_without_flushing() {
+                Ok(()) => true,
+                Err(message) => {
+                    self.input_notice("interrupt terminal", message);
+                    false
+                }
+            };
+        }
+        #[cfg(target_os = "linux")]
+        let _ = preserve_kernel;
+        #[cfg(target_os = "linux")]
+        let request = libc::TIOCSIG;
+        #[cfg(target_os = "macos")]
+        let request = libc::c_ulong::from(libc::TIOCSIG);
+        // SAFETY: the live master targets its bound tty and TIOCSIG takes
+        // the signal number by value.
+        let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), request, libc::SIGINT) };
+        if result < 0 {
+            self.error(
+                "interrupt terminal",
+                std::io::Error::last_os_error().to_string(),
+            );
+        }
+        result >= 0
+    }
+
+    #[cfg(target_os = "macos")]
+    fn interrupt_foreground_without_flushing(&self) -> Result<(), String> {
+        use crate::process::{group_members, table};
+
+        // PROC_FLAG_CONTROLT from <sys/proc_info.h>. The tty driver also
+        // skips group members that have given up their controlling tty.
+        const CONTROLLING_TTY: u32 = 0x80;
+        const MAX_GROUP_MEMBERS: usize = 256;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let within_budget = || {
+            (Instant::now() < deadline)
+                .then_some(())
+                .ok_or("The foreground interrupt exceeded its process inspection budget")
+        };
+        let group = self
+            .foreground_group()
+            .ok_or("Cannot identify the terminal's foreground job")?;
+        let session = self.child.pid();
+        let matching_epoch = |pid| -> Result<Option<u64>, String> {
+            let record = match table::record(pid) {
+                Ok(record) => record,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.to_string()),
+            };
+            if record.bsd.pbsi_status == libc::SZOMB || record.bsd.pbsi_flags & CONTROLLING_TTY == 0
+            {
+                return Ok(None);
+            }
+            if record.bsd.pbsi_pgid != group as u32 || record.session != Some(session) {
+                return Err(
+                    "The terminal's foreground job changed before it could be interrupted".into(),
+                );
+            }
+            record
+                .start
+                .map(Some)
+                .ok_or_else(|| "Cannot verify a foreground process's identity".into())
+        };
+        let members = group_members(group as u32).map_err(|error| error.to_string())?;
+        if members.len() > MAX_GROUP_MEMBERS {
+            return Err("The foreground group is too large to interrupt without flushing".into());
+        }
+        let mut targets = Vec::new();
+        for pid in members {
+            within_budget()?;
+            if let Some(start) = matching_epoch(pid)? {
+                match crate::pinned_process::PinnedProcess::open_live_started(pid as u32, start) {
+                    Ok(pin) => targets.push((pid, start, pin)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        // A numeric group cannot authorize a broadcast. Only captured
+        // members that still belong to the exact held tty receive SIGINT.
+        // Older Darwin releases have no public atomic pin-to-signal call.
+        // Recheck membership and the pin as close to delivery as possible.
+        let mut delivered = false;
+        for (pid, start, pin) in targets {
+            within_budget()?;
+            if self.foreground_group() != Some(group) {
+                return Err(
+                    "The terminal's foreground job changed before the interrupt finished".into(),
+                );
+            }
+            if matching_epoch(pid)? == Some(start) {
+                within_budget()?;
+                delivered |= pin
+                    .signal(libc::SIGINT)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if !delivered {
+            return Err("No verified foreground process could be interrupted".into());
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -6287,6 +6409,28 @@ fn confirm_exited_family(
             .map_err(|error| format!("observe child exit: {error}"))?
             && close_processes::session_is_empty(child.pid(), deadline)?)
     };
+    if cfg!(target_os = "macos") {
+        // Darwin's PTY EOF can precede the last job's exit, and the master
+        // does not wake a poll with no requested events. Wait for bounded
+        // session observations instead.
+        let deadline = deadline.min(Instant::now() + CHILD_SHUTDOWN_DEADLINE);
+        let mut delay = Duration::from_millis(20);
+        loop {
+            let result = ended(deadline);
+            if matches!(result, Ok(true)) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "could not confirm the terminal family's cleanup");
+                }
+                return Err("Terminal process cleanup remains unconfirmed".into());
+            }
+            std::thread::sleep(delay.min(remaining));
+            delay = (delay * 2).min(Duration::from_millis(250));
+        }
+    }
     // Usually the family is already gone. A process outside it (one that left
     // the session, such as `setsid -f`) may keep the PTY open indefinitely;
     // cleanup never claims or depends on it, so its PTY is no reason to wait.
@@ -6716,6 +6860,8 @@ fn send_pty_message(
             if cancellation.revents != 0 {
                 return false;
             }
+            #[cfg(target_os = "macos")]
+            return true;
         }
         match sender.send_timeout(message, READER_SEND_POLL) {
             Ok(()) => return true,

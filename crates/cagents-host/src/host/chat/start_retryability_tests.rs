@@ -21,8 +21,16 @@ fn isolated(name: &str) -> Option<PathBuf> {
                 .into(),
         );
     }
+    #[cfg(target_os = "linux")]
     let directory = tempfile::tempdir().unwrap();
+    #[cfg(target_os = "macos")]
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    #[cfg(target_os = "linux")]
     let root = directory.path();
+    #[cfg(target_os = "macos")]
+    let canonical = directory.path().canonicalize().unwrap();
+    #[cfg(target_os = "macos")]
+    let root = canonical.as_path();
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     for path in [
         "home/.codex",
@@ -45,6 +53,10 @@ fn isolated(name: &str) -> Option<PathBuf> {
         ])
         .env_clear()
         .envs(crate::retained_fixture::owner_env())
+        .envs(
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .map(|authority| (crate::agent_execution::AUTHORITY_ENV, authority)),
+        )
         .env(MODE, name)
         .env("CAGENTS_START_RETRYABILITY_ROOT", root)
         .env("HOME", root.join("home"))
@@ -252,11 +264,8 @@ for line in sys.stdin:
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn codex_recipe_thread_conflict_is_blocked_without_launching_a_provider() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -760,11 +769,8 @@ fn managed_account_registry_io_is_retryable_but_malformed_data_is_blocked() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn invalid_resume_continuity_stays_blocked_through_prepare_handshake() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -992,11 +998,8 @@ fn codex_endpoint_repair_retries_the_same_socket_and_thread() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn connect_shutdown_can_retry_but_an_exact_other_host_is_blocked() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1163,11 +1166,8 @@ fn publication_retries_transient_changes_and_blocks_a_lost_reservation() {
 /// An update floor the daemon cannot read is no reason to give up on a start:
 /// the read can succeed later, and nothing was launched.
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn an_unreadable_update_floor_keeps_retry_without_launching() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }

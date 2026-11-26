@@ -149,6 +149,31 @@ fn original_reader_cancellation_escapes_a_full_output_queue() {
     assert!(output.try_recv().is_err());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn destructive_shutdown_keeps_draining_a_full_pty_output_queue() {
+    let (reader, mut slave) = private_pty();
+    let readiness = reader.try_clone().unwrap().into();
+    let (observed, read) = crossbeam_channel::bounded(1);
+    let (sender, output) = crossbeam_channel::bounded(1);
+    sender
+        .send(PtyMessage::Bytes(b"already queued".to_vec()))
+        .unwrap();
+    let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
+    slave.write_all(b"a").unwrap();
+    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+    owner.discard_pending.store(true, Ordering::Release);
+    slave.write_all(b"b").unwrap();
+    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+    assert!(matches!(
+        output.try_recv().unwrap(),
+        PtyMessage::Bytes(bytes) if bytes == b"already queued"
+    ));
+    owner.cancel();
+    owner.finish();
+    assert!(output.try_recv().is_err());
+}
+
 #[test]
 fn actual_pty_output_survives_parser_backpressure_in_order_until_eof() {
     let (reader, mut slave) = private_pty();

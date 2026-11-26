@@ -2918,7 +2918,7 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         (false, true, false, false, true),
         (false, true, true, true, true),
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let original = root.path().join("original");
         let moved = root.path().join("moved");
         std::fs::create_dir(&original).unwrap();
@@ -3936,6 +3936,20 @@ fn native_child_receives_only_the_preserved_source_environment() {
         working_directory: std::env::temp_dir(),
         environment: environment.clone(),
     };
+    // The Command Line Tools Python launcher may set SDK variables before
+    // invoking Python. Measure its output from the same exact clean input.
+    #[cfg(target_os = "macos")]
+    let environment = {
+        let output = std::process::Command::new(&spec.program)
+            .args(["-c", "import json,os; print(json.dumps(dict(os.environ)))"])
+            .current_dir(&spec.working_directory)
+            .env_clear()
+            .envs(&environment)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<BTreeMap<String, String>>(&output.stdout).unwrap()
+    };
     let mut adapter: Box<dyn Adapter> = Box::new(Echo);
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
@@ -4066,7 +4080,7 @@ fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory
         transport: TransportSpec::OwnedUnixWebSocket {
             socket: socket.clone(),
         },
-        program: "/bin/false".into(),
+        program: "/usr/bin/false".into(),
         arguments: Vec::new(),
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
@@ -5934,8 +5948,11 @@ fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
 
     let working = tempfile::tempdir().unwrap();
     let recipe = crate::model::LaunchRecipe {
-        program: "/usr/bin/printenv".into(),
-        arguments: ["TMPDIR", "TMP", "TEMP"].map(str::to_owned).to_vec(),
+        program: "/bin/sh".into(),
+        arguments: vec![
+            "-c".into(),
+            r#"printf '%s\n' "$TMPDIR" "$TMP" "$TEMP""#.into(),
+        ],
         working_directory: working.path().to_path_buf(),
         environment: BTreeMap::from([
             ("TMPDIR".into(), ".".into()),
@@ -5967,7 +5984,13 @@ fn codex_stdio_overrides_temporary_variables_in_the_launch_directory() {
     );
     std::fs::create_dir(temp.join(".git")).unwrap();
     drop(child);
+    #[cfg(target_os = "linux")]
     assert!(!temp.exists());
+    #[cfg(target_os = "macos")]
+    assert!(
+        temp.is_dir(),
+        "Darwin retains potentially occupied directories"
+    );
 }
 
 #[test]

@@ -2042,7 +2042,7 @@ mod tests {
         let renderer = crate::app::tests::headless_renderer();
         for (enter_sends, modifiers) in [
             (true, keyboard::Modifiers::empty()),
-            (false, keyboard::Modifiers::CTRL),
+            (false, keyboard::Modifiers::COMMAND),
         ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             app.settings.chat_enter_sends = enter_sends;

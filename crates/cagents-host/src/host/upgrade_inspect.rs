@@ -1375,9 +1375,7 @@ fn darwin_codex_execution(
     deadline: Option<Instant>,
 ) -> Result<CodexExecution, String> {
     let marker = format!("cagents-codex-{pane}");
-    let (writer, uncertainty) = darwin_codex_writer(deadline, |executable, argv| {
-        codex_writer_arguments(executable, argv, marker.as_bytes(), conversation)
-    })?;
+    let (writer, uncertainty) = darwin_codex_writer(deadline, marker.as_bytes(), conversation)?;
     if let Some(writer) = writer {
         return Ok(CodexExecution::Running {
             pid: Some(writer.pid as u32),
@@ -1402,7 +1400,8 @@ fn darwin_codex_execution(
 #[cfg(target_os = "macos")]
 fn darwin_codex_writer(
     deadline: Option<Instant>,
-    matches: impl Fn(&Path, &[u8]) -> bool,
+    marker: &[u8],
+    conversation: Option<&str>,
 ) -> Result<
     (
         Option<crate::daemon::holder_registry::Process>,
@@ -1410,8 +1409,8 @@ fn darwin_codex_writer(
     ),
     String,
 > {
-    use crate::daemon::holder_registry::Process;
-    let pids = crate::process::table::list(crate::daemon::current_uid())
+    let uid = crate::daemon::current_uid();
+    let pids = crate::process::table::list(uid)
         .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
     let mut uncertainty = None;
     for pid in pids
@@ -1422,32 +1421,51 @@ fn darwin_codex_writer(
             check_deadline(deadline)?;
         }
         let observation = (|| {
-            let before = Process::read(pid as i32)?;
-            let executable = before.executable()?;
-            let name = executable.file_name().unwrap_or_default();
-            if !named_codex_writer(name) && !codex_interpreter(name) {
+            let Some(program) = crate::process::inspect_account_program(pid, uid, |executable| {
+                let name = executable.file_name().unwrap_or_default();
+                named_codex_writer(name) || codex_interpreter(name)
+            })?
+            else {
                 return Ok(None);
-            }
-            let (executable, argv) = crate::process::program_of(pid)?;
-            let after = Process::read(pid as i32)?;
-            if before != after {
-                return Ok(None);
-            }
-            if argv.is_empty() {
-                return Err(io::Error::other(CODEX_PROCESS_STARTING));
-            }
-            Ok(matches(&executable, &argv).then_some(before))
+            };
+            darwin_writer_matches(program.executable, &program.arguments, marker, conversation)
+                .map(|matches| matches.then_some(program.process))
         })();
         match observation {
             Ok(Some(owner)) => return Ok((Some(owner), None)),
             Ok(None) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
-                uncertainty.get_or_insert_with(|| error.to_string());
+                uncertainty.get_or_insert_with(|| {
+                    let reason = error.to_string();
+                    if reason == CODEX_PROCESS_STARTING {
+                        reason
+                    } else {
+                        format!("Cannot inspect possible Codex writer {pid}: {reason}")
+                    }
+                });
             }
         }
     }
     Ok((None, uncertainty))
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_writer_matches(
+    executable: io::Result<PathBuf>,
+    argv: &[u8],
+    marker: &[u8],
+    conversation: Option<&str>,
+) -> io::Result<bool> {
+    if argv.iter().all(|&byte| byte == 0) {
+        return Err(io::Error::other(CODEX_PROCESS_STARTING));
+    }
+    // Arguments can exclude this conversation even if proc_pidpath failed.
+    // Arguments that do name it still need a verified Codex executable.
+    match executable {
+        Ok(path) => Ok(codex_writer_arguments(&path, argv, marker, conversation)),
+        Err(error) if codex_writer_target(argv, marker, conversation) => Err(error),
+        Err(_) => Ok(false),
+    }
 }
 
 /// What one process of the table says of a Codex pane's execution.
@@ -1774,13 +1792,16 @@ fn codex_writer_arguments(
                 .file_name()
                 .is_some_and(|name| named_codex_writer(name) || name == "codex.js")
         });
-    (named_codex_writer(name) || script)
-        && argv.split(|byte| *byte == 0).any(|arg| {
-            arg.windows(marker.len()).any(|window| window == marker)
-                || conversation
-                    .filter(|id| !id.is_empty())
-                    .is_some_and(|id| arg.windows(id.len()).any(|window| window == id.as_bytes()))
-        })
+    (named_codex_writer(name) || script) && codex_writer_target(argv, marker, conversation)
+}
+
+fn codex_writer_target(argv: &[u8], marker: &[u8], conversation: Option<&str>) -> bool {
+    argv.split(|byte| *byte == 0).any(|arg| {
+        arg.windows(marker.len()).any(|window| window == marker)
+            || conversation
+                .filter(|id| !id.is_empty())
+                .is_some_and(|id| arg.windows(id.len()).any(|window| window == id.as_bytes()))
+    })
 }
 
 fn named_codex_writer(name: &std::ffi::OsStr) -> bool {
@@ -2284,6 +2305,35 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_unreadable_image_needs_independent_evidence() {
+        let inspect = |argv: &[u8]| {
+            darwin_writer_matches(
+                Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                argv,
+                b"cagents-codex-pane",
+                Some("saved-conversation"),
+            )
+        };
+        assert!(!inspect(b"codex\0resume\0different-conversation\0").unwrap());
+        for args in [
+            &b"codex\0unix:///tmp/cagents-codex-pane/control.sock\0"[..],
+            &b"codex\0resume\0saved-conversation\0"[..],
+        ] {
+            assert_eq!(
+                inspect(args).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        for args in [&b""[..], &b"\0"[..]] {
+            assert_eq!(
+                inspect(args).unwrap_err().to_string(),
+                CODEX_PROCESS_STARTING
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
