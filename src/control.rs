@@ -423,6 +423,9 @@ pub enum TopCommand {
         /// Publish files while preserving running windows and the daemon.
         #[arg(long)]
         stage_only: bool,
+        /// Run an offline publication script under the launch fence.
+        #[arg(long, conflicts_with = "stage_only")]
+        publish_only: bool,
         #[arg(last = true)]
         #[arg(help = "Arguments passed to the installer after --.")]
         arguments: Vec<OsString>,
@@ -4316,15 +4319,26 @@ fn execute_with_model_context(
             prefix,
             installer,
             stage_only,
+            publish_only,
             arguments,
         } => {
-            crate::install_guard::run(&prefix, &installer, &arguments, stage_only)
+            use crate::install_guard::InstallMode;
+            let mode = if publish_only {
+                InstallMode::Publish
+            } else if stage_only {
+                InstallMode::Stage
+            } else {
+                InstallMode::Replace
+            };
+            crate::install_guard::run(&prefix, &installer, &arguments, mode)
                 .map_err(|error| AppError::new("install", error))?;
             let selected = stage_only && arguments.iter().any(|argument| argument == "--select");
             Ok(CommandOutput {
                 command: "update.coordinate_install",
-                data: json!({"reopened": !stage_only, "staged": stage_only, "selected": selected}),
-                human: if selected {
+                data: json!({"reopened": !stage_only && !publish_only, "staged": stage_only, "selected": selected}),
+                human: if publish_only {
+                    "Installation published"
+                } else if selected {
                     "Installed version selected; running windows and daemon preserved"
                 } else if stage_only {
                     "Update staged; running windows and daemon preserved"
