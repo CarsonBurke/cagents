@@ -183,25 +183,7 @@ pub fn window_slot() -> &'static str {
         .unwrap_or(PRIMARY_WINDOW)
 }
 
-// Earlier clients reject the dot. Only clients that recheck the named inode
-// after locking can ever acquire or reopen a slot in this namespace.
-const FRESH_DEVICE_WINDOW_SUFFIX: &str = ".fresh";
-
-fn fresh_device_window_slot(slot: &str) -> bool {
-    slot.strip_prefix("device-")
-        .and_then(|slot| slot.strip_suffix(FRESH_DEVICE_WINDOW_SUFFIX))
-        .is_some_and(|key| {
-            key.len() == 16
-                && key
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-}
-
 pub fn validate_window_slot(slot: &str) -> io::Result<()> {
-    if fresh_device_window_slot(slot) {
-        return Ok(());
-    }
     if slot == "update"
         || slot.is_empty()
         || slot.len() > 40
@@ -497,12 +479,6 @@ impl WindowLease {
                 }
             }
         }
-        let device = crate::device::selected();
-        let requested = if new_window && device.is_some() {
-            None
-        } else {
-            requested
-        };
         let claims = match state_claim::claims_directory() {
             Ok(claims) => Some(claims),
             Err(error) if require_state => return Err(error),
@@ -517,7 +493,6 @@ impl WindowLease {
             require_state,
             new_window,
             requested,
-            device.map(|device| device.name.as_str()),
             daemon_admission::admission_wait_timeout(),
             waiting,
         )?;
@@ -548,7 +523,6 @@ impl WindowLease {
             false,
             new_window,
             requested,
-            None,
             Duration::ZERO,
             &mut |_| {},
         )
@@ -562,7 +536,6 @@ impl WindowLease {
         require_state: bool,
         new_window: bool,
         requested: Option<&str>,
-        device: Option<&str>,
         admission_timeout: Duration,
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<(Self, String)> {
@@ -581,35 +554,17 @@ impl WindowLease {
         if let Some(slot) = requested {
             validate_window_slot(slot)?;
         }
-        let fresh_device = device.filter(|_| new_window && requested.is_none());
         if let Some(claims) = claims {
             state_claim::prepare_claim_directory(claims, state_claim::Claimant::Window)?;
-            if fresh_device.is_some() {
-                state_claim::prune_fresh_device_claims(claims);
-            }
         }
         for index in 1..=1024 {
-            let slot = if let Some(slot) = requested {
-                slot.to_owned()
-            } else if let Some(device) = fresh_device {
-                // A new device window has no old layout. In particular, a
-                // source window must seed it even when other windows closed.
-                let key = uuid::Uuid::new_v4().to_string();
-                format!(
-                    "{}{FRESH_DEVICE_WINDOW_SUFFIX}",
-                    crate::device::scoped_window_slot(device, &key)
-                )
-            } else {
-                let slot = if new_window {
-                    format!("window-{}", index + 1)
-                } else {
+            let slot = requested.map(str::to_owned).unwrap_or_else(|| {
+                if !new_window {
                     PRIMARY_WINDOW.into()
-                };
-                match device {
-                    Some(device) => crate::device::scoped_window_slot(device, &slot),
-                    None => slot,
+                } else {
+                    format!("window-{}", index + 1)
                 }
-            };
+            });
             match owned_lock(
                 &runtime.join(slot_lock_name(&slot)),
                 libc::LOCK_EX | libc::LOCK_NB,
@@ -624,17 +579,19 @@ impl WindowLease {
                             Ok(claim) => Some(claim),
                             // Another session has this saved window open; a
                             // new window takes the next free one instead.
-                            Err(error) if state_claim::state_in_use(&error).is_some() => {
+                            Err(error)
                                 if new_window
                                     && requested.is_none()
                                     && state_claim::state_in_use(&error)
-                                        .is_some_and(|reason| !reason.unreadable())
-                                {
-                                    continue;
-                                }
+                                        .is_some_and(|reason| !reason.unreadable()) =>
+                            {
+                                continue;
+                            }
+                            Err(error)
+                                if require_state || state_claim::state_in_use(&error).is_some() =>
+                            {
                                 return Err(error);
                             }
-                            Err(error) if require_state => return Err(error),
                             // A claim that can't be taken for another reason,
                             // such as a read-only data directory, leaves the
                             // window as it was before claims.
@@ -5685,7 +5642,6 @@ mod startup_update_tests {
                 false,
                 new_window,
                 None,
-                None,
                 Duration::ZERO,
                 &mut |_| {},
             )
@@ -5762,50 +5718,6 @@ mod startup_update_tests {
     }
 
     #[test]
-    fn remote_new_window_claims_leave_distinct_layouts_and_release_their_files() {
-        let claims = tempfile::tempdir().unwrap();
-        let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-        for runtime in &runtimes {
-            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let open = |runtime: usize, slot: Option<&str>| {
-            WindowLease::acquire_waiting_in(
-                runtimes[runtime].path(),
-                Some(claims.path()),
-                false,
-                slot.is_none(),
-                slot,
-                Some("remote"),
-                Duration::ZERO,
-                &mut |_| {},
-            )
-        };
-        let (first, slot) = open(0, None).unwrap();
-        assert!(fresh_device_window_slot(&slot));
-        let file = claims.path().join(format!("window.{slot}.lock"));
-        let earlier_reader = fs::File::open(&file).unwrap();
-        let error = open(1, Some(&slot))
-            .err()
-            .expect("the remote layout is held");
-        assert!(state_claim::state_in_use(&error).is_some());
-        let (second, different) = open(1, None).unwrap();
-        assert_ne!(slot, different);
-        assert!(file.exists());
-        drop(first);
-        assert!(!file.exists());
-        assert_eq!(earlier_reader.metadata().unwrap().nlink(), 0);
-        let (_next, next_slot) = open(0, None).unwrap();
-        assert_ne!(next_slot, slot);
-        assert_ne!(next_slot, different);
-        let (reopened, same_slot) = open(0, Some(&slot)).unwrap();
-        assert_eq!(same_slot, slot);
-        drop(reopened);
-        assert!(!file.exists());
-        drop(second);
-        assert_eq!(fs::read_dir(claims.path()).unwrap().count(), 1);
-    }
-
-    #[test]
     fn new_window_reports_an_unreadable_claim_directory_before_allocating_a_slot() {
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
@@ -5818,7 +5730,6 @@ mod startup_update_tests {
             Some(&claims),
             false,
             true,
-            None,
             None,
             Duration::ZERO,
             &mut |_| {},
