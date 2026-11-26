@@ -160,11 +160,11 @@ fn destructive_shutdown_keeps_draining_a_full_pty_output_queue() {
         .send(PtyMessage::Bytes(b"already queued".to_vec()))
         .unwrap();
     let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
-    slave.write_all(b"first").unwrap();
-    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 5);
+    slave.write_all(b"a").unwrap();
+    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
     owner.discard_pending.store(true, Ordering::Release);
-    slave.write_all(b"second").unwrap();
-    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 6);
+    slave.write_all(b"b").unwrap();
+    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
     assert!(matches!(
         output.try_recv().unwrap(),
         PtyMessage::Bytes(bytes) if bytes == b"already queued"
