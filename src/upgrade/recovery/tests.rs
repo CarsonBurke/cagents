@@ -112,7 +112,7 @@ fn preparation(root: &Path) -> Preparation {
 #[cfg(target_os = "macos")]
 #[test]
 fn standby_retry_requires_the_original_ready_inode_even_with_identical_bytes() {
-    let directory = private_root();
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
     let mut preparation = preparation(directory.path());
     let bytes = checkpoint(&preparation, "Ready");
     let canonical = preparation.authority.checkpoint_path.clone();

@@ -39,6 +39,8 @@ pub const ARGUMENT: &str = "--await-update-handoff";
 const LOCAL_PREVIOUS_CURRENT: &str = "CAGENTS_UPDATE_PREVIOUS_CURRENT";
 const FRAME_LIMIT: usize = 4096;
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const STARTUP_EXIT_SETTLEMENT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
 const DESCRIPTOR_LIMIT: usize = 1 + RECEIPT_DESCRIPTORS.len();
 #[cfg(target_os = "macos")]
@@ -122,14 +124,15 @@ fn expect(mut stream: &UnixStream, status: Status) -> io::Result<()> {
         1 => Status::Parked,
         2 => Status::Started,
         3 => {
-            let (reason, _): (String, _) = receive_json_with_fds_until(
+            let reason = receive_json_with_fds_until::<String>(
                 stream,
                 Instant::now() + TRANSFER_TIMEOUT,
                 FRAME_LIMIT,
                 0,
                 FrameByteOrder::LittleEndian,
             )
-            .map_err(io::Error::other)?;
+            .map(|(reason, _)| reason)
+            .unwrap_or_else(|_| "The replacement daemon refused startup".to_owned());
             return Err(io::Error::other(AdmissionRejected(reason)));
         }
         _ => return Err(io::Error::other("invalid replacement daemon startup reply")),
@@ -288,15 +291,25 @@ impl Parked {
     /// refusal should also be reported as such instead of attempted again.
     #[cfg(target_os = "macos")]
     pub(crate) fn exited_during_start(&mut self, error: &io::Error) -> bool {
-        !error
+        if error
             .get_ref()
             .is_some_and(|cause| cause.is::<AdmissionRejected>())
-            && self
-                .child
-                .as_mut()
-                .unwrap()
-                .try_wait()
-                .is_ok_and(|status| status.is_some())
+        {
+            return false;
+        }
+        let child = self.child.as_mut().unwrap();
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return true;
+        }
+        // The transport can close before the child exits. Frame writes also
+        // wrap socket errors, so settle the exact process for any failure
+        // other than a typed refusal. The caller revalidates untouched Ready.
+        self.image.as_ref().is_some_and(|image| {
+            image
+                .process
+                .wait_for_exit(STARTUP_EXIT_SETTLEMENT)
+                .is_ok_and(|exited| exited)
+        }) && child.wait().is_ok()
     }
 
     /// The prior child is reaped. Keep the same account publication
@@ -479,7 +492,9 @@ impl Parked {
             // publish ownership. Settle that exact child before rolling back.
             let child = self.child.as_mut().unwrap();
             let _ = child.kill();
-            child.wait()?;
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "could not reap the refused standby");
+            }
         }
         result
     }
@@ -931,6 +946,15 @@ mod tests {
                 "fixture refusal".into()
             )))
         );
+    }
+
+    #[test]
+    fn a_truncated_refusal_reason_does_not_turn_refusal_into_transport_loss() {
+        let (worker, mut daemon) = UnixStream::pair().unwrap();
+        daemon.write_all(&[3]).unwrap();
+        drop(daemon);
+        let error = wait_for_start(&worker, TRANSFER_TIMEOUT, || {}).unwrap_err();
+        assert!(error.get_ref().unwrap().is::<AdmissionRejected>());
     }
 
     #[test]
