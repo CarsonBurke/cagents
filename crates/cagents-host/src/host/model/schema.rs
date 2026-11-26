@@ -1379,7 +1379,8 @@ mod tests {
             // channel work, schema 28 adds private pane chat ownership,
             // schema 29 retains explicitly deleted channel identities, and
             // schema 30 records each channel's checkout, and schema 31 adds
-            // indexes for mailbox run receipts and unfinished runs.
+            // indexes for mailbox run receipts and unfinished runs. Schema 32
+            // keeps automation attention resolution outside the bounded audit.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1399,6 +1400,7 @@ mod tests {
                 "deleted_channels",
                 "agent_runs_by_message",
                 "agent_runs_unfinished_by_agent",
+                "automation_attention_resolution",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1789,7 +1791,7 @@ mod tests {
         let _clear = Clear;
         for step in [
             1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26, 27, 28, 29, 30, 31,
+            26, 27, 28, 29, 30, 31, 32,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");

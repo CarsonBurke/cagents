@@ -639,21 +639,19 @@ fn record_broker_event(
     registry: impl FnOnce() -> Result<super::agent_execution::SharedRegistry, String>,
 ) -> Result<Option<Notice>, String> {
     if let Target::Automation { id, sequence } = event.target {
-        let current = registry().and_then(|registry| {
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .automation_attention_resolved(id, sequence)
-        });
-        if !matches!(current, Ok(false)) {
-            // The management transaction may have removed the outbox row
-            // after its transfer already queued this event. Its resolution
-            // is authoritative before the journal publishes any unread edge.
-            if let Some(receipt) = receipt {
-                receipt.finish(current.clone().map(|_| ()));
+        // Management uses this registry guard. The journal edge must be
+        // admitted before that transaction resolves it, or skipped afterward.
+        let recorded = registry().and_then(|registry| {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            if registry.automation_attention_resolved(id, sequence)? {
+                return Ok(None);
             }
-            return current.map(|_| None);
+            record_attention_committed_policy(journal, event, suppressed, None, policy)
+        });
+        if let Some(receipt) = receipt {
+            receipt.finish(recorded.as_ref().map(|_| ()).map_err(Clone::clone));
         }
+        return recorded;
     }
     record_attention_committed_policy(journal, event, suppressed, receipt, policy)
 }
@@ -1096,6 +1094,7 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
+        restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals);
         if !policy.message_previews {
             for notice in &mut snapshot.notices {
                 notice.event.content = None;
@@ -1123,7 +1122,7 @@ async fn run(
             .iter()
             .map(|notice| notice.id)
             .collect::<BTreeSet<_>>();
-        delivery.retain(|_, notice| retained.contains(&notice.id));
+        delivery.retain(|_, notice| !notice.acknowledged && retained.contains(&notice.id));
         // A delayed completion stops being a desktop alert once the user has
         // returned to that pane or disabled its category.
         delivery.retain(|_, notice| {
@@ -1182,6 +1181,45 @@ async fn run(
             for notice in batch {
                 if stopped(&shared) {
                     return;
+                }
+                // Portal connection and test delivery can each await. An
+                // automation may have been resolved after this batch started.
+                if let Target::Automation { id, sequence } = notice.event.target {
+                    let resolved = host
+                        .upgrade()
+                        .ok_or_else(|| "The daemon has stopped".to_owned())
+                        .and_then(|host| super::agent_execution::registry(&host))
+                        .and_then(|registry| {
+                            registry
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .automation_attention_resolved(id, sequence)
+                        });
+                    match resolved {
+                        Ok(true) => {
+                            match journal.acknowledge(notice.id) {
+                                Ok(_) => {
+                                    delivery.remove(&notice.event.target());
+                                    if let Some(current) = snapshot
+                                        .notices
+                                        .iter_mut()
+                                        .find(|current| current.id == notice.id)
+                                    {
+                                        current.acknowledged = true;
+                                    }
+                                    withdraw_notice(&mut withdrawals, &notice);
+                                }
+                                Err(error) => snapshot.diagnostic = Some(error),
+                            }
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            snapshot.diagnostic = Some(error);
+                            failed = true;
+                            break;
+                        }
+                    }
                 }
                 match send(backend, &notice, activation.receives_actions()).await {
                     Ok(()) => {
