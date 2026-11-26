@@ -656,7 +656,7 @@ mod tests {
             destination: None,
             evidence: Evidence {
                 key: "unrelated completion".into(),
-                kind: Kind::Finished,
+                kind: Kind::Succeeded,
             },
             content: None,
         };
