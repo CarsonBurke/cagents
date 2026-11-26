@@ -2180,6 +2180,10 @@ impl Snapshot {
     pub fn holds_work(&self) -> bool {
         self.turn_accepted() || self.subagents.iter().any(Subagent::is_live)
     }
+    /// Whether the running turn is being stopped: see [`TURN_STOPPING`].
+    pub fn stopping(&self) -> bool {
+        self.busy && self.detail == TURN_STOPPING
+    }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy || self.subagents.iter().any(Subagent::is_running)
@@ -3058,6 +3062,11 @@ pub const STOPPED_NOTICE: &str = "You stopped this turn";
 /// The status detail of a conversation whose last turn was stopped before it
 /// finished, whichever provider ran it.
 pub const TURN_INTERRUPTED: &str = "Turn interrupted";
+
+/// The status detail of a turn the provider has been asked to stop and has
+/// not yet ended. It takes no message meanwhile: what is queued waits for
+/// the turn to stop.
+pub const TURN_STOPPING: &str = "Stopping";
 
 /// Where the person stopped a turn: a quiet marker in the timeline, in place
 /// of the provider's own record of the interruption, which reads as a
