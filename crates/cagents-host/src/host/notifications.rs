@@ -1903,8 +1903,13 @@ mod tests {
         );
         assert_eq!(snapshot.notices, [newer]);
         let group = batching::desktop_id(&target);
-        assert_eq!(withdrawals.pop_first().unwrap().id(), group);
-        journal.finish_group_withdrawal(group).unwrap();
+        let mut expected = [group, prior.id];
+        expected.sort();
+        for id in expected {
+            assert_eq!(withdrawals.pop_first().unwrap().id(), id);
+            journal.finish_group_withdrawal(id).unwrap();
+        }
+        assert!(withdrawals.pop_first().is_none());
         assert!(journal.group_withdrawals().unwrap().is_empty());
     }
 

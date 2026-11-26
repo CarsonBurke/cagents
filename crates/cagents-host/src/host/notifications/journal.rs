@@ -357,9 +357,10 @@ impl Journal {
             return Ok(None);
         }
         let id = id.parse::<Uuid>().map_err(|error| error.to_string())?;
-        // Reserve the idempotent portal removal before this row can be
+        // Reserve both portal removal IDs before this row can be
         // acknowledged and replaced with a different request.
         self.remember_group_withdrawal(super::batching::desktop_id(target))?;
+        self.remember_group_withdrawal(id)?;
         self.acknowledge(id)?;
         Ok(Some(id))
     }
