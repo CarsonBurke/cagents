@@ -414,17 +414,22 @@ fn poll_with(
                 _ => Vec::new(),
             },
         };
+        let same_viewer = previous_viewer.as_deref() == Some(viewer.as_str());
         let applied = match reply {
             Reply::Page(page) => {
                 let first = matches!(work, Work::Page { cursor: None });
-                let same_viewer = previous_viewer.as_deref() == Some(viewer.as_str());
                 if !first && !same_viewer {
                     stored.attention_scan_start = None;
                 }
                 finished_census = page.next_cursor.is_none() && (first || same_viewer);
                 stored.scan.page(&work, page)
             }
-            Reply::History(page) => stored.scan.history(&work, page),
+            Reply::History(page) => {
+                if !same_viewer {
+                    stored.attention_scan_start = None;
+                }
+                stored.scan.history(&work, page)
+            }
         };
         if stored
             .scan
@@ -437,7 +442,11 @@ fn poll_with(
         applied
     });
     if applied.is_err() {
-        stored.attention_scan_start = None;
+        // Timeline classification is independent of the repository's complete
+        // pagination. Only a failed repository page invalidates that census.
+        if matches!(work, Work::Page { .. }) {
+            stored.attention_scan_start = None;
+        }
         stored.scan.failed_history(&work);
         observed.clear();
         stored.failures = stored.failures.saturating_add(1);
@@ -1216,6 +1225,86 @@ pub(crate) mod tests {
         let failed = run(1067, Some(Err(GitHubError::Inspection("offline".into()))));
         assert!(failed.error.is_some());
         assert!(failed.census.is_none());
+    }
+
+    #[test]
+    fn failed_review_history_does_not_invalidate_a_complete_repository_census() {
+        use crate::github::review_requests::Reviewer;
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let repository = repository();
+        let run = |now, expected: &Work, reply| {
+            poll_with(
+                root.path(),
+                "account",
+                &repository,
+                &cancel,
+                || now,
+                |actual, _| {
+                    assert_eq!(actual, expected);
+                    reply
+                },
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        let Reply::Page(mut first_page) = page("viewer", &[1], Some("next")) else {
+            unreachable!()
+        };
+        let request = first_page.entries[0]
+            .viewer_latest_review_request
+            .as_mut()
+            .unwrap();
+        request.requested_reviewer = Some(Reviewer {
+            kind: "User".into(),
+            id: Some("viewer".into()),
+        });
+        let history = Work::History {
+            number: 1,
+            request: request.clone(),
+            before: None,
+        };
+        let first = run(
+            1000,
+            &Work::Page { cursor: None },
+            Ok(Reply::Page(first_page)),
+        );
+        assert!(first.census.is_none());
+        let failed = run(
+            1006,
+            &history,
+            Err(GitHubError::Inspection("timeline unavailable".into())),
+        );
+        assert!(failed.error.is_some());
+        assert!(failed.census.is_none());
+        let completed = run(
+            failed.due,
+            &Work::Page {
+                cursor: Some("next".into()),
+            },
+            Ok(page("viewer", &[2], None)),
+        );
+        assert!(completed.error.is_none());
+        assert!(
+            !completed.scan.settled(),
+            "the request history is still unread"
+        );
+        let census = completed.census.unwrap();
+        assert_eq!(census.repository, repository);
+        assert_eq!(census.viewer, "viewer");
+        assert_eq!(
+            census.start,
+            ScanPoint {
+                incarnation: first.observation.0,
+                revision: 0,
+                at: 1000
+            }
+        );
+        assert_eq!(
+            census.current,
+            [(1, "request-1".into()), (2, "request-2".into())].into()
+        );
     }
 
     #[test]
