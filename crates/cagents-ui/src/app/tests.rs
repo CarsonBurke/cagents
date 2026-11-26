@@ -3686,8 +3686,9 @@ fn editor_input_projects_only_when_it_changes_what_the_projection_reads() {
     assert_eq!(projections(), before, "pane-local input projects nothing");
     assert_eq!(app.context_sections_height, Some(240.0));
 
-    // A clean file's first edit makes it block navigation, which the
-    // worktree protections read, so it projects; a further edit does not.
+    // A clean file's first edit makes it block navigation. The capture
+    // treats that as projected state, though no stage reads it yet, so the
+    // edit projects; a further edit does not.
     let (clean, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved\n");
     app.cards
         .insert(card, CardRuntime::Repository(Box::new(clean)));
