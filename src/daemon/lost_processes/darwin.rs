@@ -1,6 +1,6 @@
 use super::{PinnedProcess, Process, Survivor, command_for_display};
 use crate::process::table::{self, Record};
-use std::{os::unix::ffi::OsStrExt, path::Path};
+use std::{io, os::unix::ffi::OsStrExt, path::Path, time::Duration};
 
 /// A reused leader PID excludes its new group or session. An absent leader
 /// leaves the numeric boundary visible, but only the original leader can
@@ -12,20 +12,29 @@ enum Leader {
     Reused,
 }
 
-fn read(pid: i32) -> Result<Option<Record>, String> {
+fn read(pid: i32) -> io::Result<Option<Record>> {
     match table::record(pid) {
         Ok(record) => Ok(Some(record)),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
-        Err(error) => Err(format!("Cannot read process {pid}: {error}")),
+        Err(error) => Err(error),
     }
 }
 
+fn read_error(pid: i32, error: io::Error) -> String {
+    format!("Cannot read process {pid}: {error}")
+}
+
 fn leader(original: &Process) -> Result<Leader, String> {
-    Ok(match read(original.pid)?.and_then(|record| record.start) {
-        Some(start) if start == original.start => Leader::Original,
-        Some(_) => Leader::Reused,
-        None => Leader::Unknown,
-    })
+    Ok(
+        match read(original.pid)
+            .map_err(|error| read_error(original.pid, error))?
+            .and_then(|record| record.start)
+        {
+            Some(start) if start == original.start => Leader::Original,
+            Some(_) => Leader::Reused,
+            None => Leader::Unknown,
+        },
+    )
 }
 
 /// Every observable member of the recorded helper session or provider group.
@@ -122,17 +131,54 @@ fn still_proves(record: &Record, original: &Process, before: Leader) -> Result<b
 }
 
 fn scan(
-    mut member: impl FnMut(&Record) -> Result<Option<Survivor>, String>,
+    member: impl FnMut(&Record) -> Result<Option<Survivor>, String>,
 ) -> Result<Vec<Survivor>, String> {
     let pids = table::list_all()
         .map_err(|error| format!("Cannot enumerate processes for exact absence: {error}"))?;
+    scan_records(pids.into_iter().map(|pid| pid as i32), read, member)
+}
+
+fn scan_records(
+    pids: impl IntoIterator<Item = i32>,
+    mut read: impl FnMut(i32) -> io::Result<Option<Record>>,
+    mut member: impl FnMut(&Record) -> Result<Option<Survivor>, String>,
+) -> Result<Vec<Survivor>, String> {
     let mut found = Vec::new();
-    for pid in pids {
-        if let Some(record) = read(pid as i32)?
-            && let Some(survivor) = member(&record)?
-        {
-            found.push(survivor);
+    let mut pending = Vec::new();
+    let mut visit = |pid| match read(pid) {
+        Ok(Some(record)) => {
+            found.extend(member(&record)?);
+            Ok(false)
         }
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(read_error(pid, error)),
+    };
+    for pid in pids {
+        if visit(pid)? {
+            pending.push(pid);
+        }
+    }
+    // XNU can change a row between BSD, session, and Mach reads. Revisit
+    // only those rows, after a brief settle, instead of restarting the table
+    // among unrelated process churn. A row that remains uncertain refuses.
+    for delay in [5, 10, 20, 40] {
+        if pending.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(delay));
+        let mut still_pending = Vec::new();
+        for pid in pending {
+            if visit(pid)? {
+                still_pending.push(pid);
+            }
+        }
+        pending = still_pending;
+    }
+    if let Some(pid) = pending.first() {
+        return Err(format!(
+            "Cannot read process {pid}: process changed during census"
+        ));
     }
     found.sort_by_key(|survivor| survivor.pid);
     Ok(found)
@@ -171,20 +217,21 @@ fn survivor(record: &Record, proved: bool) -> Survivor {
 pub(super) fn pin_matching(survivor: &Survivor) -> Result<Option<PinnedProcess>, String> {
     let process = PinnedProcess::open_started(survivor.pid as u32, survivor.start)
         .map_err(|error| format!("Cannot hold process {}: {error}", survivor.pid))?;
-    let still_matches = read(survivor.pid)?.is_some_and(|record| {
-        record.start == Some(survivor.start)
-            && record.bsd.pbsi_pgid as i32 == survivor.group
-            && record.bsd.pbsi_ruid == crate::daemon::current_uid()
-            && record.session == Some(survivor.session)
-            && record.bsd.pbsi_status != libc::SZOMB
-    });
+    let still_matches = read(survivor.pid)
+        .map_err(|error| read_error(survivor.pid, error))?
+        .is_some_and(|record| {
+            record.start == Some(survivor.start)
+                && record.bsd.pbsi_pgid as i32 == survivor.group
+                && record.bsd.pbsi_ruid == crate::daemon::current_uid()
+                && record.session == Some(survivor.session)
+                && record.bsd.pbsi_status != libc::SZOMB
+        });
     Ok(still_matches.then_some(process))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 
@@ -195,6 +242,33 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn changing_process_rows_settle_without_restarting_the_table() {
+        let mut reads = Vec::new();
+        let found = scan_records(
+            [11, 12],
+            |pid| {
+                reads.push(pid);
+                if pid == 11 && reads.len() == 1 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                Ok(None)
+            },
+            |_| panic!("absent rows cannot describe a survivor"),
+        )
+        .unwrap();
+        assert!(found.is_empty());
+        assert_eq!(reads, [11, 12, 11]);
+
+        let error = scan_records(
+            [13],
+            |_| Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            |_| panic!("unsettled rows cannot describe a survivor"),
+        )
+        .unwrap_err();
+        assert!(error.contains("process 13"), "{error}");
     }
 
     #[test]
