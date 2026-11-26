@@ -783,7 +783,11 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     let registry = super::super::agent_execution::registry(host)?;
     let mut execution_owner = None;
     target.handle.refresh_retained_state()?;
-    reconcile_waiting(host, &target, None)?;
+    if let Some(receipt) = admit_waiting_resolution(host, &target, None)? {
+        receipt
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "The notification journal did not confirm the waiting settlement")??;
+    }
     persist_confirmed_identity(host, &target, &registry)?;
     #[cfg(test)]
     drain_fence::pass(id);
@@ -920,20 +924,20 @@ pub(in crate::host) mod drain_fence {
 /// Read the actor's latest activity under the same ownership lock that
 /// queues its resolution. A delayed retained outbox entry cannot bring
 /// back a waiting notice after that resolution.
-fn reconcile_waiting(
+fn admit_waiting_resolution(
     host: &SharedHost,
     target: &SemanticTarget,
     through: Option<u64>,
-) -> Result<bool, String> {
+) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let resolved = waiting_resolution(&state, target, through)? == RetainedWaiting::Resolved;
-    if resolved
+    if waiting_resolution(&state, target, through)? == RetainedWaiting::Resolved
         && let Some(notifications) = &state.notifications
-        && !notifications.try_clear_session_waiting(target.source.id)
     {
-        return Err("Waiting attention settlement has not been admitted".into());
+        return notifications
+            .commit_waiting_clear(target.source.id)
+            .map(Some);
     }
-    Ok(resolved)
+    Ok(None)
 }
 
 fn waiting_resolution(
@@ -1578,10 +1582,12 @@ mod startup_retryability_tests {
             );
             assert!(queue_attention(&host, &target, waiting.clone(), 5).is_err());
             assert!(!journal.waiting_clear_pending(source.id));
-            assert_eq!(reconcile_waiting(&host, &target, None).unwrap(), proved);
+            let resolution = admit_waiting_resolution(&host, &target, None).unwrap();
+            assert_eq!(resolution.is_some(), proved);
             assert_eq!(journal.waiting_clear_pending(source.id), proved);
-            if proved {
+            if let Some(resolution) = resolution {
                 journal.flush_waiting_clears().unwrap();
+                resolution.try_recv().unwrap().unwrap();
                 let existing = target
                     .notifications
                     .as_ref()

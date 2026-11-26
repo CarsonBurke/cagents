@@ -86,6 +86,7 @@ struct Pending {
     inboxes: Option<InboxAttention>,
     retired: BTreeSet<Target>,
     cleared_waiting: BTreeSet<Target>,
+    waiting_clear_receipts: Vec<(Target, CommitReceipt)>,
     acknowledged: BTreeSet<Uuid>,
     predecessor_reads: BTreeMap<Uuid, TerminalId>,
     presence_changed: bool,
@@ -136,6 +137,12 @@ impl Pending {
                 self.committed_events.push_back((event, receipt));
             }
         }
+        self.waiting_clear_receipts.extend(
+            newer
+                .waiting_clear_receipts
+                .into_iter()
+                .filter(|(target, _)| self.cleared_waiting.contains(target)),
+        );
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
         }
@@ -171,6 +178,13 @@ impl Pending {
         }
         self.cleared_waiting.insert(target);
         true
+    }
+
+    fn finish_waiting_clears(&mut self) {
+        self.cleared_waiting.clear();
+        for (_, receipt) in self.waiting_clear_receipts.drain(..) {
+            receipt.finish(Ok(()));
+        }
     }
 
     fn read_predecessors(&mut self, reads: BTreeMap<Uuid, TerminalId>) {
@@ -335,16 +349,33 @@ impl Handle {
     }
 
     pub fn clear_session_waiting(&self, session: TerminalId) {
-        self.try_clear_session_waiting(session);
+        self.admit_waiting_clear(session, None);
     }
 
-    pub(super) fn try_clear_session_waiting(&self, session: TerminalId) -> bool {
+    pub(super) fn commit_waiting_clear(
+        &self,
+        session: TerminalId,
+    ) -> Result<CommitAcknowledgement, String> {
+        let (reply, result) = std::sync::mpsc::channel();
+        if self.admit_waiting_clear(session, Some(CommitReceipt::new(reply))) {
+            Ok(result)
+        } else {
+            Err("Waiting attention settlement has not been admitted".into())
+        }
+    }
+
+    fn admit_waiting_clear(&self, session: TerminalId, receipt: Option<CommitReceipt>) -> bool {
         let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let target = Target::Session(session);
         if pending.stopped
             || self.0.wake.is_closed()
-            || !pending.clear_waiting(Target::Session(session))
+            || (receipt.is_some() && pending.waiting_clear_receipts.len() >= MAX_PENDING)
+            || !pending.clear_waiting(target.clone())
         {
             return false;
+        }
+        if let Some(receipt) = receipt {
+            pending.waiting_clear_receipts.push((target, receipt));
         }
         drop(pending);
         let _ = self.0.wake.try_send(());
@@ -1207,7 +1238,7 @@ impl JournalTestBridge {
     pub(in crate::host) fn flush_waiting_clears(&mut self) -> Result<(), String> {
         let mut pending = self.handle.0.pending.lock().unwrap();
         commit_waiting_clears(&mut self.journal, &pending.cleared_waiting, |_, _| {})?;
-        pending.cleared_waiting.clear();
+        pending.finish_waiting_clears();
         Ok(())
     }
 
@@ -1450,7 +1481,7 @@ async fn run(
             deferred = pending.deferred();
             continue;
         }
-        pending.cleared_waiting.clear();
+        pending.finish_waiting_clears();
         if let Some(current) = current_presence {
             for (client, update) in &current {
                 if settle_attention_at_shutdown(
@@ -3017,6 +3048,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let receipt = handle.record_resolved_waiting(waiting.clone()).unwrap();
+        let standalone = handle.commit_waiting_clear(session).unwrap();
         let deferred = Pending {
             cleared_waiting: (0..MAX_PENDING)
                 .map(|_| Target::Session(TerminalId::new()))
@@ -3026,7 +3058,9 @@ mod tests {
         let merged = deferred.followed_by(take_pending(&handle.0));
         assert_eq!(merged.cleared_waiting.len(), MAX_PENDING);
         assert!(merged.committed_events.is_empty());
+        assert!(merged.waiting_clear_receipts.is_empty());
         assert!(receipt.try_recv().unwrap().is_err());
+        assert!(standalone.try_recv().unwrap().is_err());
         assert!(bridge.list().unwrap().contains(&existing));
 
         let receipt = handle.record_resolved_waiting(waiting).unwrap();
@@ -3045,7 +3079,7 @@ mod tests {
         let reference = Arc::downgrade(&shared);
         assert!(!waiting_clear_admitted(&reference, &waiting));
 
-        assert!(handle.try_clear_session_waiting(session));
+        handle.clear_session_waiting(session);
         assert!(waiting_clear_admitted(&reference, &waiting));
         assert!(!waiting_clear_admitted(
             &reference,
