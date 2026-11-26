@@ -857,6 +857,41 @@ fn current_session_snapshot(
     Ok(response)
 }
 
+fn announce_prior_queue(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    resident: uuid::Uuid,
+) {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.shutting_down
+        || source.proof.as_ref() != Some(state.proof())
+        || state.chats.get(&source.id).is_none_or(|record| {
+            record.execution_instance != resident
+                || record.returning_terminal
+                || record.handle.is_completed()
+                || record.handle.is_read_only_history()
+                || record.handle.actor_identity().is_some()
+                || !record.subscribers.contains_key(&client)
+        })
+    {
+        return;
+    }
+    if let Some(execution) = state.exited_queue_archive.prior_execution(source, resident)
+        && let Some(delivery) = state.clients.get(&client)
+    {
+        let _ = delivery.push(ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: None,
+            proof: state.proof().clone(),
+            message: ServerMessage::ChatQueueEnded {
+                source: source.clone(),
+                execution,
+            },
+        });
+    }
+}
+
 fn same_conversation(a: &chat::Launch, b: &chat::Launch) -> bool {
     a.provider == b.provider && a.session_id.is_some() && a.session_id == b.session_id
 }
@@ -4477,9 +4512,8 @@ fn completed_queue_page(
         validate_proof(source.proof.as_ref(), state.proof())?;
         let owner = state.chats.get(&source.id);
         let resident = owner.filter(current);
-        if owner.is_some()
-            && resident.is_none()
-            && execution.is_none_or(|execution| {
+        if resident.is_none()
+            && execution.is_some_and(|execution| {
                 owner.is_some_and(|record| record.execution_instance == execution)
             })
         {
@@ -4490,19 +4524,34 @@ fn completed_queue_page(
             Arc::clone(&state.exited_queue_archive),
         )
     };
-    let bytes = match &owner {
-        Some((instance, handle)) if !archive.returned(*instance) => capture_exited_queue(handle)
-            .map(|queue| queue_transfer::encode(&queue))
-            .transpose()?,
-        Some(_) => None,
-        None => archive.read(source, execution)?,
+    // History names an exact descriptor without an execution. A replacement
+    // may already own the pane ID, but the prior archived receipt still needs
+    // to be returned before that ID can archive another receipt.
+    let archived = if execution.is_none() || owner.is_none() {
+        archive.read(source, execution)?
+    } else {
+        None
+    };
+    let (bytes, used_resident) = if let Some(bytes) = archived {
+        (Some(bytes), None)
+    } else if let Some((instance, handle)) = &owner
+        && !archive.returned(*instance)
+    {
+        (
+            capture_exited_queue(handle)
+                .map(|queue| queue_transfer::encode(&queue))
+                .transpose()?,
+            Some((instance, handle)),
+        )
+    } else {
+        (None, None)
     };
     let Some(bytes) = bytes else {
         return Ok(None);
     };
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     validate_proof(source.proof.as_ref(), state.proof())?;
-    let same_source = match &owner {
+    let same_source = match used_resident {
         Some((instance, handle)) => {
             state
                 .chats
@@ -4514,8 +4563,11 @@ fn completed_queue_page(
                         && !archive.returned(*instance)
                 })
         }
-        None => state.chats.get(&source.id).is_none_or(|record| {
-            execution.is_some_and(|execution| record.execution_instance != execution)
+        None => execution.is_none_or(|execution| {
+            state
+                .chats
+                .get(&source.id)
+                .is_none_or(|record| record.execution_instance != execution)
         }),
     };
     if state.shutting_down || !same_source {
@@ -4820,7 +4872,12 @@ fn process_inner(
                 record.execution_instance,
             );
             drop(state);
-            current_session_snapshot(host, attachment.0, attachment.1, attachment.2)
+            let response =
+                current_session_snapshot(host, attachment.0, attachment.1, attachment.2)?;
+            if let ServerResponse::ChatAttached { session, .. } = &response {
+                announce_prior_queue(host, client, session, attachment.2);
+            }
+            Ok(response)
         }
         ClientRequest::ChatDetach { chat_id } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());

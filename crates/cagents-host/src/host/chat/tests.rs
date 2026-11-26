@@ -89,7 +89,7 @@ fn isolated_completion_wake_case(marker: &str) -> bool {
     true
 }
 
-fn completion_wake_host() -> SharedHost {
+pub(super) fn completion_wake_host() -> SharedHost {
     Arc::new(HostLock::new(HostState::new(HostSessionProof {
         host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
         host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
@@ -97,7 +97,7 @@ fn completion_wake_host() -> SharedHost {
     })))
 }
 
-fn completion_wake_record(
+pub(super) fn completion_wake_record(
     host: &SharedHost,
     id: TerminalId,
     instance: uuid::Uuid,
@@ -131,7 +131,7 @@ fn completion_wake_record(
     session
 }
 
-fn direct_completion_actor(
+pub(super) fn direct_completion_actor(
     script: &str,
     cwd: &std::path::Path,
     notify: impl Fn(Update) + Send + Sync + 'static,

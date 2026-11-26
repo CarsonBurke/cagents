@@ -327,19 +327,22 @@ impl CompletedQueueRead {
                 let Some(first) = queued else {
                     return Ok(None);
                 };
-                self.collector = ipc::ExitedQueueCollector::start(source, first).ok();
+                self.collector = Some(
+                    ipc::ExitedQueueCollector::start(source, first)
+                        .map_err(|_| "Invalid first page of a completed chat queue")?,
+                );
             }
             ServerMessage::Response {
                 response: ServerResponse::ChatExitedQueuePage { source, page },
             } => {
-                let Some(collector) = &mut self.collector else {
-                    return Ok(None);
-                };
-                if collector.append(source, page).is_err() {
-                    return Ok(None);
-                }
+                self.collector
+                    .as_mut()
+                    .ok_or("Unexpected continuation of a completed chat queue")?
+                    .append(source, page)
+                    .map_err(|_| "Invalid continuation of a completed chat queue")?;
             }
-            _ => return Ok(None),
+            ServerMessage::Error(_) => return Ok(None),
+            _ => return Err("Unexpected response to a completed chat queue read".into()),
         }
         let Some(collector) = self.collector.take() else {
             return Ok(None);
@@ -350,9 +353,10 @@ impl CompletedQueueRead {
             self.collector = Some(collector);
             return Ok(Some(self));
         }
-        if let Ok(queue) = collector.finish() {
-            wake(Wake::CompletedQueue(self.source, queue.messages));
-        }
+        let queue = collector
+            .finish()
+            .map_err(|_| "Invalid completed chat queue payload")?;
+        wake(Wake::CompletedQueue(self.source, queue.messages));
         Ok(None)
     }
 }
@@ -2630,6 +2634,16 @@ impl ClientHandle {
     /// host tests, without discovering or launching any external daemon.
     #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
     pub fn fixture_restore(stream: UnixStream, session: Session) -> Result<Self, StartFailure> {
+        Self::fixture_restore_on(stream, session, |_| {})
+    }
+
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    #[doc(hidden)]
+    pub fn fixture_restore_on(
+        stream: UnixStream,
+        session: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
         Self::connect_on(
             stream,
             session,
@@ -2639,7 +2653,7 @@ impl ClientHandle {
             None,
             None,
             None,
-            |_| {},
+            wake,
         )
     }
 
@@ -2973,6 +2987,8 @@ impl ClientHandle {
         let mut early_addresses = AgentAddresses::default();
         let mut early_model = None;
         let mut queue_ended = None;
+        let mut next_queue_ended = None;
+        let mut last_queue_execution = None;
         let (session, mut initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
@@ -3002,7 +3018,17 @@ impl ClientHandle {
                 ServerMessage::ChatQueueEnded { source, execution }
                     if source.id == id && envelope.request_id.is_none() =>
                 {
-                    queue_ended = Some((source, Some(execution)));
+                    if last_queue_execution != Some(execution) {
+                        let notice = (source, Some(execution));
+                        if queue_ended.is_none() {
+                            queue_ended = Some(notice);
+                        } else if next_queue_ended.is_none() {
+                            next_queue_ended = Some(notice);
+                        } else {
+                            return Err("Too many native queue receipts during attachment".into());
+                        }
+                        last_queue_execution = Some(execution);
+                    }
                 }
                 ServerMessage::ChatActivity {
                     chat_id,
@@ -3250,7 +3276,6 @@ impl ClientHandle {
             // Since when the agent's process has been missing reads, and when
             // it last missed one.
             let mut unanswered: Option<(Instant, Instant)> = None;
-            let mut tried_queue_execution = queue_ended.as_ref().and_then(|(_, execution)| *execution);
             let first_queue_read = queue_ended
                 .map(|(source, execution)| CompletedQueueRead::begin(&wire, &proof, &next, source, execution))
                 .transpose();
@@ -3269,6 +3294,14 @@ impl ClientHandle {
                     match read.accept(&wire, &proof, &next, envelope.message, wake.as_ref()) {
                         Ok(read) => queue_read = read,
                         Err(error) => break error,
+                    }
+                    if queue_read.is_none()
+                        && let Some((source, execution)) = next_queue_ended.take()
+                    {
+                        match CompletedQueueRead::begin(&wire, &proof, &next, source, execution) {
+                            Ok(read) => queue_read = Some(read),
+                            Err(error) => break error,
+                        }
                     }
                     continue;
                 }
@@ -3352,11 +3385,19 @@ impl ClientHandle {
                     ServerMessage::ChatQueueEnded { source, execution }
                         if source.id == id && envelope.request_id.is_none() =>
                     {
-                        if tried_queue_execution != Some(execution) {
-                            tried_queue_execution = Some(execution);
-                            match CompletedQueueRead::begin(&wire, &proof, &next, source, Some(execution)) {
-                                Ok(read) => queue_read = Some(read),
-                                Err(error) => break error,
+                        if last_queue_execution != Some(execution) {
+                            last_queue_execution = Some(execution);
+                            if queue_read.is_none() {
+                                match CompletedQueueRead::begin(&wire, &proof, &next, source, Some(execution)) {
+                                    Ok(read) => queue_read = Some(read),
+                                    Err(error) => break error,
+                                }
+                            } else if next_queue_ended.is_none() {
+                                // The host stores one transfer per connection.
+                                // Finish the prior receipt before asking for this one.
+                                next_queue_ended = Some((source, Some(execution)));
+                            } else {
+                                break "Too many native queue receipts are pending".into();
                             }
                         }
                     },

@@ -261,6 +261,124 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_recovers_the_prior_exact_queue_while_its_replacement_runs() {
+        use crate::{
+            chat::{
+                QueuedMessage,
+                client::{ClientHandle, Wake},
+            },
+            control::ControlClient,
+            host::{
+                chat::tests::{
+                    completion_wake_host, completion_wake_record, direct_completion_actor,
+                },
+                client,
+            },
+        };
+        use std::{os::unix::net::UnixStream, sync::Arc, thread};
+
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let host = completion_wake_host();
+        let id = TerminalId::new();
+        let replacement = Uuid::new_v4();
+        let (handle, launch) = direct_completion_actor("exec /bin/cat", root.path(), |_| {});
+        let original = completion_wake_record(&host, id, replacement, handle.clone(), launch);
+        let (source, archive) = {
+            let state = host.lock().unwrap();
+            (
+                state.chats[&id].current_session(),
+                Arc::clone(&state.exited_queue_archive),
+            )
+        };
+        let execution = Uuid::new_v4();
+        let message = QueuedMessage {
+            id: "prior-input".into(),
+            text: "The previous provider died while this was held.".into(),
+            editable: true,
+            delivery: Default::default(),
+            attachments: vec![],
+        };
+        let queue = ExitedQueue {
+            messages: vec![message.clone()],
+            account_scope: None,
+            confirmed_session: source.launch.session_id.clone(),
+        };
+        archive
+            .retain_in(
+                root.path(),
+                original.clone(),
+                source.clone(),
+                execution,
+                crate::chat::exited_queue_fingerprint([message.id.as_str()]),
+                &encode(&queue).unwrap(),
+            )
+            .unwrap();
+        let connect = |id| {
+            let (window, daemon) = UnixStream::pair().unwrap();
+            let host = Arc::clone(&host);
+            (
+                window,
+                thread::spawn(move || client::serve(daemon, id, host)),
+            )
+        };
+        // Lose a window after it read the bytes but before its save/ACK.
+        let (window, worker) = connect(91);
+        let mut lost = ControlClient::from_stream(window).unwrap();
+        assert_eq!(
+            lost.read_exited_chat_queue(original).unwrap(),
+            Some(queue.clone())
+        );
+        drop(lost);
+        worker.join().unwrap();
+
+        let (window, worker) = connect(92);
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let native = ClientHandle::fixture_restore_on(window, source.clone(), move |wake| {
+            if let Wake::CompletedQueue(id, messages) = wake {
+                let _ = send.try_send((id, messages));
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (id, vec![message.clone()])
+        );
+
+        let (window, history_worker) = connect(93);
+        let mut history = ControlClient::from_stream(window).unwrap();
+        let mut mismatch = source.clone();
+        mismatch
+            .launch
+            .recipe
+            .arguments
+            .push("different exact launch".into());
+        assert!(history.read_exited_chat_queue(mismatch).unwrap().is_none());
+        assert_eq!(
+            history.read_exited_chat_queue(source.clone()).unwrap(),
+            Some(queue)
+        );
+        history
+            .commit_exited_chat_queue(source.clone(), vec!["different-id".into()])
+            .unwrap();
+        assert!(archive.read(&source, Some(execution)).unwrap().is_some());
+        history
+            .commit_exited_chat_queue(source.clone(), vec![message.id])
+            .unwrap();
+        assert!(history.read_exited_chat_queue(source).unwrap().is_none());
+        assert_eq!(archive.state.lock().unwrap().bytes, 0);
+        assert_eq!(
+            host.lock().unwrap().chats[&id].execution_instance,
+            replacement
+        );
+        assert!(!handle.is_completed());
+        drop(history);
+        history_worker.join().unwrap();
+        drop(native);
+        worker.join().unwrap();
+        handle.close().unwrap();
+    }
+
+    #[test]
     fn a_lost_close_reply_does_not_make_the_exact_receipt_unreadable() {
         use crate::{
             agent::Provider,
@@ -640,5 +758,19 @@ impl Archive {
             retryable_unavailable(format!("Could not read retained queued input: {failure}"))
         })?;
         Ok(Some(bytes))
+    }
+
+    pub(super) fn prior_execution(
+        &self,
+        source: &crate::chat::Session,
+        resident: Uuid,
+    ) -> Option<Uuid> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .iter()
+            .find(|entry| entry.execution != resident && entry.names(source))
+            .map(|entry| entry.execution)
     }
 }

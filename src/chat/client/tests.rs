@@ -1818,7 +1818,7 @@ fn direct_same_id_start_waits_for_the_exact_queue_and_keeps_it_on_start_refusal(
 }
 
 #[test]
-fn a_hidden_native_reader_fetches_the_exact_completed_provider_queue() {
+fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
     let source = omp_card(Some(CONVERSATION), None);
     let id = source.id;
     let (client, mut server) = UnixStream::pair().unwrap();
@@ -1871,6 +1871,17 @@ fn a_hidden_native_reader_fetches_the_exact_completed_provider_queue() {
         let queue = exited_queue_fixture(&session, 3, &"ø".repeat(384 * 1024));
         let bytes = postcard::to_allocvec(&queue).unwrap();
         let receipt = uuid::Uuid::new_v4();
+        let replacement = uuid::Uuid::new_v4();
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            None,
+            &proof,
+            ServerMessage::ChatQueueEnded {
+                source: session.clone(),
+                execution: replacement,
+            },
+        );
         handoff_reply(
             &mut server,
             &mut codec,
@@ -1905,6 +1916,29 @@ fn a_hidden_native_reader_fetches_the_exact_completed_provider_queue() {
                 },
             },
         );
+        let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert_eq!(read.proof, Some(proof.clone()));
+        assert_eq!(
+            read.request,
+            ClientRequest::ChatReadExitedQueue {
+                source: session.clone(),
+                execution: Some(replacement),
+            }
+        );
+        let next =
+            postcard::to_allocvec(&exited_queue_fixture(&session, 1, "replacement")).unwrap();
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            Some(read.request_id),
+            &proof,
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueue {
+                    source: id,
+                    queued: Some(queue_page(uuid::Uuid::new_v4(), &next, 0)),
+                },
+            },
+        );
     });
     let (send, received) = std::sync::mpsc::channel();
     let handle = ClientHandle::connect_on(
@@ -1932,6 +1966,10 @@ fn a_hidden_native_reader_fetches_the_exact_completed_provider_queue() {
             .iter()
             .all(|message| message.text == "ø".repeat(384 * 1024))
     );
+    let (source, messages) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(source, id);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "replacement");
     assert!(
         !handle.snapshot().exited,
         "the hidden body supplied no exit presentation"
