@@ -2246,7 +2246,7 @@ impl Runtime {
         // for copying; the tab says what it means. A finished child's detail
         // is its own report, whose prose may merely mention such words.
         let detail = agent.detail.trim();
-        if !detail.is_empty() {
+        if !detail.is_empty() && !agent.last_seen_running() {
             identity.push_str(" · ");
             let failure = (agent.waiting
                 || agent.status == chat::ToolStatus::Failed
@@ -6618,7 +6618,13 @@ impl Runtime {
         hasher: &mut crate::fingerprint::Hasher,
     ) {
         use std::hash::Hash;
-        (agent.status, agent.waiting, self.agent_work.get(&agent.id)).hash(hasher);
+        (
+            agent.status,
+            agent.waiting,
+            agent.last_seen_running(),
+            self.agent_work.get(&agent.id),
+        )
+            .hash(hasher);
         // Its time counts up while it works, at the second it is shown to.
         agent_elapsed_ms(agent, now)
             .map(|millis| millis / 1_000)
