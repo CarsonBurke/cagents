@@ -437,6 +437,19 @@ mod tests {
                 }),
             )
             .unwrap();
+            // The test binary raises its soft limit on startup. Lower it in
+            // this private child after initialization, with all ordinary
+            // recovery descriptors still available below 200.
+            let mut limits = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: the calls read and update this fixture child's limit.
+            unsafe {
+                assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits), 0);
+                limits.rlim_cur = 200;
+                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limits), 0);
+            }
             let error = run(&pending.checkpoint_hash, true, Some(&census)).unwrap_err();
             // The attempt reached startup after obtaining all its leases and
             // validating the checkpoint. Forwarding requires a descriptor
@@ -475,8 +488,7 @@ mod tests {
         fs::write(candidate.join("cagents-ui"), b"unused window").unwrap();
         let runtime = fixture.path().join("runtime");
         crate::secure_file::prepare_private_directory(&runtime).unwrap();
-        let mut command = Command::new(cli);
-        command
+        let output = Command::new(cli)
             .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env(FIXTURE, &prefix)
             .env("XDG_RUNTIME_DIR", &runtime)
@@ -484,25 +496,9 @@ mod tests {
             .env("XDG_CONFIG_HOME", fixture.path().join("config"))
             .env("XDG_STATE_HOME", fixture.path().join("state"))
             .env("XDG_CACHE_HOME", fixture.path().join("cache"))
-            .env("HOME", fixture.path());
-        // SAFETY: this only changes the descriptor limit of the test child.
-        unsafe {
-            command.pre_exec(|| {
-                let mut limits = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                limits.rlim_cur = 200;
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let output = command.output().unwrap();
+            .env("HOME", fixture.path())
+            .output()
+            .unwrap();
         assert!(output.status.success(), "{output:?}");
     }
 }
