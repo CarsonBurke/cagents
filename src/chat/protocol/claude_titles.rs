@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn configured_titles_use_exact_supported_roots_and_refuse_ambiguous_home() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let cwd = directory.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
         let home = cwd.join("home");
@@ -405,7 +405,7 @@ mod tests {
     }
 
     fn live_fixture() -> (tempfile::TempDir, Launch, String, PathBuf) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_fixture::tempdir().unwrap();
         let cwd = directory.path().join("work");
         std::fs::create_dir(&cwd).unwrap();
         let config = directory.path().join("config");

@@ -889,8 +889,9 @@ fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
 
 #[test]
 fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
-    // A free right edge keeps `WINDOW_RESIZE_BORDER` of the window from the
-    // content, so the third case sits exactly at the narrow threshold.
+    // The cases below specify window widths with a client resize border.
+    // Adjust the native window width so each platform tests the same content
+    // width, including the exact threshold in the third case.
     // Each pane carries its own inspector, so an open one takes nothing
     // from the window's width.
     for (window, seed, with_project, expected, measured) in [
@@ -902,6 +903,12 @@ fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
         (2000.0, 600.0, true, 0.5, 1360.0),
         (900.0, 1340.0, true, 1.0, 640.0),
     ] {
+        let border = if cfg!(target_os = "macos") {
+            0.0
+        } else {
+            design::WINDOW_RESIZE_BORDER
+        };
+        let window = window - design::WINDOW_RESIZE_BORDER + border;
         let mut app = context_inspector_test_app(false);
         app.settings.default_native_pane_fraction = 0.5;
         if with_project {
@@ -4909,7 +4916,11 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
     }
 
     let width = 1500.0;
-    let border = design::WINDOW_RESIZE_BORDER;
+    let border = if cfg!(target_os = "macos") {
+        0.0
+    } else {
+        design::WINDOW_RESIZE_BORDER
+    };
     for inspector in [false, true] {
         let mut app = context_inspector_test_app(true);
         app.settings.ui_scale = 1.0;

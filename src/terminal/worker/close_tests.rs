@@ -569,6 +569,11 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     assert!(owner.holder.is_current());
     let registered_holder = pin_shutdown_process(owner.holder.pid);
     let child = shutdown_background_job(&shell);
+    let budget = ShutdownBudget {
+        join: ShutdownBudget::PATIENT.join,
+        ..ShutdownBudget::PRODUCT
+    };
+    shell.terminal.set_shutdown_budget_for_test(budget);
     shell.terminal.input(b"exit 3\n").unwrap();
     shell.wait_for("the worker's actual shell exit report", || {
         shell.terminal.events().try_iter().any(|event| {
@@ -583,33 +588,35 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
         })
     });
     assert!(!child.0.wait_for_exit(Duration::ZERO).unwrap());
+    let mut events = Vec::new();
+    #[cfg(target_os = "macos")]
+    shell.wait_for("the natural PTY EOF cleanup decision", || {
+        events.extend(shell.terminal.events().try_iter());
+        events.iter().any(|event| {
+            matches!(event, TerminalEvent::Completed { .. }) || unconfirmed_child_cleanup(event)
+        })
+    });
     let unpublished = reaper.reserve().unwrap();
     let drain = reaper.begin_exit_drain();
-    // The job ignores its hangup and outlives the shell, so confirmation
-    // must run out: give it the product's deadline, and the caller enough
-    // patience to see the worker report that rather than give up first.
-    let budget = ShutdownBudget {
-        join: ShutdownBudget::PATIENT.join,
-        ..ShutdownBudget::PRODUCT
-    };
-    shell.terminal.set_shutdown_budget_for_test(budget);
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_err());
     assert!(started.elapsed() < budget.join);
     assert!(!shell.terminal.is_completed());
     assert!(shell.terminal.worker_joined_for_test());
-    let events = shell.terminal.events().try_iter().collect::<Vec<_>>();
+    events.extend(shell.terminal.events().try_iter());
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            TerminalEvent::Error {
-                operation: "wait for child",
-                message,
-            } if message == "Terminal process cleanup remains unconfirmed"
-        )),
+        events.iter().any(unconfirmed_child_cleanup),
         "shutdown took {:?}; events: {events:?}; one process census now: {}",
         started.elapsed(),
         census_cost()
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        crate::process::table::record(child.0.pid() as libc::pid_t)
+            .unwrap()
+            .session,
+        Some(owner.root.pid),
+        "the same-session job outlived Darwin's controlling tty"
     );
     assert!(
         !events
@@ -630,6 +637,14 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     // assertions; a live recoverable holder must not escape the test.
     drop(child);
     drop(registered_holder);
+}
+
+fn unconfirmed_child_cleanup(event: &TerminalEvent) -> bool {
+    matches!(
+        event,
+        TerminalEvent::Error { operation: "wait for child", message }
+            if message == "Terminal process cleanup remains unconfirmed"
+    )
 }
 
 #[test]
@@ -731,13 +746,26 @@ fn shutdown_job(shell: &CloseSafetyShell, command: &[u8], executable: &str) -> S
         else {
             return false;
         };
-        if !fs::read_link(format!("/proc/{pid}/exe"))
-            .is_ok_and(|path| path.file_name() == Some(OsStr::new(executable)))
+        #[cfg(target_os = "linux")]
         {
-            return false;
+            if !fs::read_link(format!("/proc/{pid}/exe"))
+                .is_ok_and(|path| path.file_name() == Some(OsStr::new(executable)))
+            {
+                return false;
+            }
+            child = Some(pin_shutdown_process(pid));
         }
-        child = Some(pin_shutdown_process(pid));
-        true
+        #[cfg(target_os = "macos")]
+        {
+            child = crate::pinned_process::PinnedProcess::open(pid as u32)
+                .ok()
+                .filter(|pin| {
+                    pin.executable()
+                        .is_ok_and(|path| path.file_name() == Some(OsStr::new(executable)))
+                })
+                .map(ShutdownJob);
+        }
+        child.is_some()
     });
     child.unwrap()
 }

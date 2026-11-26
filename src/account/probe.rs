@@ -2962,9 +2962,14 @@ exec /bin/cat >/dev/null
         .unwrap();
         make_executable(&script);
         let account = Account::system(Provider::Codex);
+        let start = || {
+            let mut command = command_with_path(&account, &script, None);
+            command.arg("app-server").env("TMPDIR", fixture.path());
+            Session::spawn_inner(command, true)
+        };
         let read_temp = || PathBuf::from(OsString::from_vec(std::fs::read(&record).unwrap()));
 
-        let mut first = Session::spawn_codex(&account, &script, None).await.unwrap();
+        let mut first = start().await.unwrap();
         assert_eq!(first.next().await.unwrap()["ready"], true);
         let first_path = read_temp();
         assert!(first_path.is_absolute());
@@ -2975,15 +2980,23 @@ exec /bin/cat >/dev/null
         );
         std::fs::write(first_path.join("marker"), b"temporary").unwrap();
 
-        let mut second = Session::spawn_codex(&account, &script, None).await.unwrap();
+        let mut second = start().await.unwrap();
         assert_eq!(second.next().await.unwrap()["ready"], true);
         let second_path = read_temp();
         assert_ne!(first_path, second_path);
         first.close().await;
-        assert!(!first_path.exists());
+        assert!(first_path.starts_with(fixture.path().canonicalize().unwrap()));
+        // Reclamation needs a complete census. The focused codex_temp tests
+        // cover that proof and retention under churn independently.
+        #[cfg(target_os = "macos")]
+        assert!(
+            first_path.is_dir(),
+            "Darwin retains potentially occupied directories"
+        );
         assert!(second_path.is_dir());
         second.close().await;
-        assert!(!second_path.exists());
+        #[cfg(target_os = "macos")]
+        assert!(second_path.is_dir());
     }
 
     #[tokio::test]

@@ -341,6 +341,10 @@ impl Tracker {
         Ok(())
     }
 
+    pub(crate) fn mark_incomplete(&mut self) {
+        self.lost_coverage = true;
+    }
+
     /// Called only after the owner has reaped the root. Observation of all
     /// known exits is weaker than a watch that saw no fork the entire time.
     pub(crate) fn prove_empty(&mut self) -> bool {

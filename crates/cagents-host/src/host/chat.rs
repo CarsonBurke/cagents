@@ -1842,9 +1842,9 @@ fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool
     })? == SharedCodexService::Listening)
 }
 
-/// Read the same execution evidence for restart and picker preparation, so
-/// unreadable evidence retains its concrete diagnostic in both paths.
-fn require_ended_codex_execution(
+/// Read the same execution evidence for checkpoint restore, restart and
+/// picker preparation, preserving the diagnostic for unreadable evidence.
+pub(super) fn require_ended_codex_execution(
     host: &SharedHost,
     session: &Session,
     boot: &crate::model::BootId,
@@ -4985,19 +4985,49 @@ pub(super) fn close_captured(
         unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")
     })?;
     target.require_current(host)?;
-    let (retained, pending_cleanup) = {
+    let (retained, pending_cleanup, registered_codex_pair) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let retained = state
+        let record = state
             .chats
             .get(&chat_id)
             .filter(|record| target.matches(record))
-            .map(|record| record.session.clone())
             .ok_or_else(|| {
                 unavailable("The thread changed while its previous actor was closing.")
             })?;
-        (retained, state.native_closing.contains_key(&chat_id))
+        // The holder's paired source includes the provider-confirmed continuity
+        // issued before close. The attachment's launch descriptor may predate
+        // that confirmation, so it cannot identify the paired receipt.
+        #[cfg(target_os = "macos")]
+        let issued_pair = state
+            .chat_close_reservations
+            .get(&chat_id)
+            .filter(|removal| {
+                removal.source == record.session
+                    && removal.current.launch.provider == Provider::Codex
+                    && removal.current.terminal.is_some()
+                    && matches!(
+                        removal.current.native_continuity,
+                        chat::NativeContinuity::Durable { .. }
+                    )
+                    && record
+                        .paired_terminal
+                        .as_ref()
+                        .is_some_and(|pair| pair.holder_identity().is_some())
+            });
+        #[cfg(target_os = "linux")]
+        let issued_pair: Option<&capacity::CloseRemoval> = None;
+        let pending = state.native_closing.get(&chat_id);
+        let retained = issued_pair.map_or(&record.session, |removal| {
+            // A previous retained-close request may already have matched and
+            // reserved the hosted launch descriptor. Settle that same retry.
+            pending
+                .map(native_cleanup::NativeClose::source)
+                .filter(|source| **source == removal.source)
+                .unwrap_or(&removal.current)
+        });
+        (retained.clone(), pending.is_some(), issued_pair.is_some())
     };
-    if handle.actor_identity().is_some() {
+    if handle.actor_identity().is_some() || registered_codex_pair {
         // The actor's final transcript is available, but its paired console
         // still needs an authenticated terminal cleanup receipt. Keep helper
         // discovery and exact close authority until both owners are proved

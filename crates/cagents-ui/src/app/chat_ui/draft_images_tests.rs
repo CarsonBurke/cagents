@@ -422,7 +422,7 @@ fn a_read_only_drafts_tiles_neither_remove_nor_step_its_history() {
             key(
                 keyboard::Key::Character("z".into()),
                 Code::KeyZ,
-                keyboard::Modifiers::CTRL,
+                keyboard::Modifiers::COMMAND,
             ),
         ];
         let removes = |messages: &[Message]| {

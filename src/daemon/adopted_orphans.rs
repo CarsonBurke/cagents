@@ -68,11 +68,27 @@ pub(crate) fn spawn_owned(command: &mut Command) -> io::Result<(Child, Registrat
     }
     let _gate = GATE.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     let child = command.spawn()?;
+    let registration = register(&child);
+    Ok((child, registration))
+}
+
+/// Start a watched provider under the same sole-reaper registration gate.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_tracked(
+    command: Command,
+) -> io::Result<(Child, Registration, super::descendants::Tracker)> {
+    let _gate = GATE.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (child, tracker) = super::descendants::Tracker::spawn(command)?;
+    let registration = register(&child);
+    Ok((child, registration, tracker))
+}
+
+fn register(child: &Child) -> Registration {
     let pid = child.id();
     #[cfg(test)]
     tests::after_spawn(pid);
     *owned().entry(pid).or_default() += 1;
-    Ok((child, Registration(pid)))
+    Registration(pid)
 }
 
 /// Whether this process reaps unregistered children. A process that does must

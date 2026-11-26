@@ -15,6 +15,27 @@ fn wait(mut predicate: impl FnMut() -> bool, reason: &str) {
     }
 }
 
+fn stop_fixture_process(process: &crate::daemon::holder_registry::Process) {
+    if process.pid == std::process::id() as i32 || !process.is_current() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: this is a recorded fixture process in its private runtime.
+    unsafe {
+        libc::kill(process.pid, libc::SIGKILL);
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(pin) = crate::daemon::PinnedProcess::open(process.pid as u32)
+        && process.is_current()
+        && pin.signal(libc::SIGKILL).unwrap_or(false)
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !pin.exited().unwrap_or(true) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 fn cleanup_discoveries(directory: &Path) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -31,11 +52,7 @@ fn cleanup_discoveries(directory: &Path) {
             && let Ok(owner) = serde_json::from_slice::<HolderRecord>(&bytes)
         {
             for process in [&owner.root, &owner.holder] {
-                if process.pid != std::process::id() as i32 && process.is_current() {
-                    unsafe {
-                        libc::kill(process.pid, libc::SIGKILL);
-                    }
-                }
+                stop_fixture_process(process);
             }
         }
     }
@@ -53,6 +70,7 @@ fn isolated() -> Option<PathBuf> {
         ));
     }
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let path = root.path().canonicalize().unwrap();
     for child in [
         "home/.claude",
         "run",
@@ -62,30 +80,34 @@ fn isolated() -> Option<PathBuf> {
         "bin",
         "project",
     ] {
-        fs::create_dir_all(root.path().join(child)).unwrap();
+        fs::create_dir_all(path.join(child)).unwrap();
     }
-    let stdout = root.path().join("test.stdout");
-    let stderr = root.path().join("test.stderr");
+    let stdout = path.join("test.stdout");
+    let stderr = path.join("test.stderr");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &test, "--nocapture"])
         .env_clear()
         .envs(crate::retained_fixture::owner_env())
+        .envs(
+            std::env::var_os(crate::agent_execution::AUTHORITY_ENV)
+                .map(|authority| (crate::agent_execution::AUTHORITY_ENV, authority)),
+        )
         .env(MODE, &test)
         .env(
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
             retained_actor_tests::retained_helper_executable(),
         )
         .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-        .env("CAGENTS_HOLDER_ROOT", root.path())
-        .env("HOME", root.path().join("home"))
-        .env("CLAUDE_CONFIG_DIR", root.path().join("home/.claude"))
-        .env("XDG_RUNTIME_DIR", root.path().join("run"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("CAGENTS_HOLDER_ROOT", &path)
+        .env("HOME", path.join("home"))
+        .env("CLAUDE_CONFIG_DIR", path.join("home/.claude"))
+        .env("XDG_RUNTIME_DIR", path.join("run"))
+        .env("XDG_DATA_HOME", path.join("data"))
+        .env("XDG_CONFIG_HOME", path.join("config"))
+        .env("XDG_CACHE_HOME", path.join("cache"))
         .env(
             "PATH",
-            format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            format!("{}:/usr/bin:/bin", path.join("bin").display()),
         )
         .stdout(fs::File::create(&stdout).unwrap())
         .stderr(fs::File::create(&stderr).unwrap())
@@ -103,7 +125,7 @@ fn isolated() -> Option<PathBuf> {
         }
         thread::sleep(Duration::from_millis(10));
     };
-    cleanup_discoveries(&root.path().join("run"));
+    cleanup_discoveries(&path.join("run"));
     let outcome = match status {
         Some(status) if status.success() => return None,
         Some(status) => format!("failed with {status}"),
@@ -205,10 +227,34 @@ impl Fixture {
         let identity = handle
             .actor_identity()
             .expect("actual remote helper required");
-        wait(
-            || handle.attachment_snapshot().ready,
-            "helper did not become ready",
-        );
+        let startup_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snapshot = handle.attachment_snapshot();
+            if snapshot.ready {
+                break;
+            }
+            if snapshot.exited || Instant::now() >= startup_deadline {
+                let listener = crate::daemon::holder_registry::socket(
+                    &crate::daemon::holder_registry::directory(
+                        crate::daemon::holder_registry::Kind::Native,
+                    )
+                    .unwrap(),
+                    id,
+                );
+                let record = crate::daemon::holder_registry::execution_record(&listener);
+                let image = record
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map(|owner| owner.root.executable());
+                panic!(
+                    "offline provider failed readiness: {:?}; holder {record:?}; image {image:?}; fixture trace {:?}",
+                    snapshot.error,
+                    fs::read_to_string(root.join("provider-trace.jsonl"))
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let original = host.lock().unwrap().chats[&id].session.clone();
         assert!(original.launch.session_id.is_none());
         assert!(matches!(
@@ -414,21 +460,14 @@ impl Drop for Fixture {
         }
         // Failure containment only, not a successful retirement oracle.
         for process in [&self.identity.record.root, &self.identity.record.holder] {
-            if process.is_current() {
-                unsafe {
-                    libc::kill(process.pid, libc::SIGKILL);
-                }
-            }
+            stop_fixture_process(process);
         }
     }
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -746,11 +785,8 @@ fn real_retained_update_readiness_settles_once_the_actor_applies_recorded_output
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -865,11 +901,8 @@ fn real_helper_resolution_grant_is_single_use_and_connection_scoped() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1002,11 +1035,8 @@ fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_helper_epoch_rotation_after_snapshot_rejects_cached_hydration() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -1156,11 +1186,8 @@ fn real_helper_explicit_reset_resolves_known_a_to_b_from_authenticated_lineage()
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn real_helper_snapshot_publication_rechecks_exact_host_binding() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }

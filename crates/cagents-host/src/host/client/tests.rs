@@ -2654,14 +2654,29 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
         }
     }
 
-    fn wait_file(path: &std::path::Path) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+    fn wait_file(path: &std::path::Path, terminal: Option<&crate::terminal::TerminalHandle>) {
+        #[cfg(target_os = "linux")]
+        let timeout = Duration::from_secs(2);
+        #[cfg(target_os = "macos")]
+        let timeout = Duration::from_secs(10);
+        let deadline = Instant::now() + timeout;
         while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
-            assert!(
-                Instant::now() < deadline,
-                "fixture did not start: {}",
-                path.display()
-            );
+            if Instant::now() >= deadline {
+                #[cfg(target_os = "macos")]
+                {
+                    let image = terminal
+                        .map(crate::terminal::TerminalHandle::original_root_executable_for_test);
+                    panic!(
+                        "fixture did not start: {}; terminal image {image:?}",
+                        path.display()
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = terminal;
+                    panic!("fixture did not start: {}", path.display());
+                }
+            }
             thread::sleep(Duration::from_millis(5));
         }
     }
@@ -2683,12 +2698,31 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
         }
     }
 
-    let directory = tempfile::tempdir().unwrap();
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = tempfile::tempdir_in(parent).unwrap();
     let executable = directory.path().join("claude");
-    // A real ELF foreground executable with an exact provider basename.
+    // A real foreground executable with an exact provider basename.
     // The copied shell reads our local `agents` script for the real probe;
     // no installed provider, credentials, network, or model is involved.
-    std::fs::copy("/bin/sh", &executable).unwrap();
+    #[cfg(target_os = "linux")]
+    let shell = "/bin/sh";
+    #[cfg(target_os = "macos")]
+    let shell = "/bin/bash";
+    std::fs::copy(shell, &executable).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // A copied system signature can hide the probe's source environment.
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     std::fs::write(
         directory.path().join("agents"),
         "printf '%s' \"$$\" > probe-started\nexec /bin/sleep 30\n",
@@ -2758,6 +2792,11 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
             response: ServerResponse::Connected { .. }
         }
     ));
+    // Startup execs the full holder image. Only subsequent IPC requests
+    // must answer within a second while the provider probe is running.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     send(
         &mut stream,
         &proof,
@@ -2773,8 +2812,14 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
             response: ServerResponse::Spawned { .. }
         }
     ));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
     cleanup.handle = Some(host.lock().unwrap().handle(1, terminal_id).unwrap());
-    wait_file(&directory.path().join("terminal-ready"));
+    wait_file(
+        &directory.path().join("terminal-ready"),
+        cleanup.handle.as_ref(),
+    );
     // The daemon samples without any refresh request. Process discovery is
     // separately owned by the PTY; force its initial tick for this fixture.
     assert!(
@@ -2787,7 +2832,7 @@ fn daemon_activity_pushes_without_refresh_and_slow_probe_does_not_block_ipc() {
     );
     let monitor = super::super::activity::Monitor::start(&host).unwrap();
     let started = directory.path().join("probe-started");
-    wait_file(&started);
+    wait_file(&started, None);
     let probe_pid: i32 = std::fs::read_to_string(&started).unwrap().parse().unwrap();
     // Upgrade and shutdown admission never waits for the provider listing.
     let gate = host.lock().unwrap().control_gate.clone();

@@ -29,6 +29,8 @@ cagents follows the XDG base-directory convention. Production paths are:
 - Diagnostics and the GitHub status cache: `${XDG_STATE_HOME:-$HOME/.local/state}/cagents/`
 - Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and
   browserless builds; protocol changes do not create a second owner)
+- Claims on the saved data, which keep a daemon or window from another runtime
+  directory off it: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/claims/`
 
 Development builds substitute `cagents-development` for the final `cagents`
 directory component. Program files installed by `install.sh` live separately

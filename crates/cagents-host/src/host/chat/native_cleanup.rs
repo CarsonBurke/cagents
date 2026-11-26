@@ -139,9 +139,9 @@ fn close_retained_inner(
             })
         {
             return if let Some(expected) = expected {
-                super::retained_actor::close_captured(host, source, expected, closing)
+                super::retained_actor::close_captured(host, source, expected, closing, detached)
             } else {
-                super::retained_actor::close_unattached(host, source, owner)
+                super::retained_actor::close_unattached_with(host, source, owner, detached)
             };
         }
     }

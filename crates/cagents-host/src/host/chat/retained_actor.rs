@@ -3,6 +3,7 @@
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
 use crate::chat::runtime::{OutboxEntry, RetirementInspection, VerifiedRetirement};
+use crate::daemon::owned_children::DetachedWork;
 use crate::host::model::NativeActorEvent;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1207,7 +1208,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn startup_descriptor_conflict_is_permanent_but_exact_transition_can_finish() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, context) = pending(root.path());
         let mut other = source.clone();
         other
@@ -1239,7 +1240,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn startup_cleanup_failure_and_uncertainty_can_be_retried_on_the_same_owner() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, context) = pending(root.path());
         let cleanup = Arc::new(Cleanup {
             mode: AtomicU8::new(0),
@@ -1269,7 +1270,7 @@ mod startup_retryability_tests {
     #[test]
     fn retained_restore_distinguishes_fixed_identity_conflicts_from_daemon_shutdown() {
         use crate::daemon::holder_registry::{Kind, Process, Record};
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, _) = pending(root.path());
         let proof = host.lock().unwrap().proof().clone();
         let process = Process::read(std::process::id() as i32).unwrap();
@@ -1313,7 +1314,7 @@ mod startup_retryability_tests {
     #[test]
     fn pending_enrollment_preserves_exact_owner_source_and_captured_scope() {
         use crate::daemon::holder_registry::{Kind, Process, Record};
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, _) = pending(root.path());
         let proof = host.lock().unwrap().proof().clone();
         let process = Process::read(std::process::id() as i32).unwrap();
@@ -1368,7 +1369,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn cleanup_recovery_without_a_resident_owner_can_be_retried() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, source, _) = pending(root.path());
         assert!(matches!(
             recover_cleanup_attachment_for_start(&host, &source),
@@ -1379,7 +1380,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn retained_publication_rejects_changed_source_before_private_operations() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, mut source, _) = pending(root.path());
         let handle = Handle::fixture_failed_remote();
         let identity = handle.actor_identity().unwrap();
@@ -1410,7 +1411,7 @@ mod startup_retryability_tests {
 
     #[test]
     fn exited_attachment_keeps_source_conflicts_blocked_and_registry_failure_retryable() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fixture_tempdir().unwrap();
         let (host, mut source, _) = pending(root.path());
         let handle = Handle::fixture_failed_remote();
         let identity = handle.actor_identity().unwrap();
@@ -1709,6 +1710,7 @@ fn finish_interrupted_exit_for_start(
         None,
         None,
         Ending::Stopped,
+        restart_close_scope(host, inspection.source.id),
     )
     .map_err(SetupError::Unavailable)?;
     Ok(true)
@@ -1778,9 +1780,29 @@ pub(in crate::host) fn finish_exited_attachment_for_start(
         }
         super::CloseTarget::from_record(record)
     };
-    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)
-        .map_err(chat::protocol::SetupError::Unavailable)?;
+    close_with_target(
+        host,
+        source,
+        None,
+        Some(&target),
+        None,
+        Ending::Stopped,
+        restart_close_scope(host, source.id),
+    )
+    .map_err(chat::protocol::SetupError::Unavailable)?;
     Ok(true)
+}
+
+/// Resume may finish an interrupted daemon shutdown. Reuse its normal
+/// per-conversation disposition so a completed interactive Spare can settle.
+fn restart_close_scope(host: &SharedHost, id: TerminalId) -> DetachedWork {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (host, id);
+        DetachedWork::Stop
+    }
+    #[cfg(target_os = "macos")]
+    super::super::agent_execution::detached_work_on_close(host, id)
 }
 
 /// Whether `issued`'s paired CLI view has no worker here and its original
@@ -2400,7 +2422,24 @@ pub(super) fn close_unattached(
     requested: &Session,
     discovered: Option<crate::daemon::holder_registry::Record>,
 ) -> Result<(), String> {
-    close_with_target(host, requested, discovered, None, None, Ending::Closed)
+    close_unattached_with(host, requested, discovered, DetachedWork::Stop)
+}
+
+pub(super) fn close_unattached_with(
+    host: &SharedHost,
+    requested: &Session,
+    discovered: Option<crate::daemon::holder_registry::Record>,
+    detached: DetachedWork,
+) -> Result<(), String> {
+    close_with_target(
+        host,
+        requested,
+        discovered,
+        None,
+        None,
+        Ending::Closed,
+        detached,
+    )
 }
 
 /// A hosted close must retain its exact admission capability across cleanup.
@@ -2409,8 +2448,17 @@ pub(super) fn close_captured(
     requested: &Session,
     target: &super::CloseTarget,
     closing: Option<&super::capacity::Reservation>,
+    detached: DetachedWork,
 ) -> Result<(), String> {
-    close_with_target(host, requested, None, Some(target), closing, Ending::Closed)
+    close_with_target(
+        host,
+        requested,
+        None,
+        Some(target),
+        closing,
+        Ending::Closed,
+        detached,
+    )
 }
 
 /// What a retained cleanup ends besides the helper and its provider.
@@ -2463,6 +2511,7 @@ fn close_with_target(
     expected: Option<&super::CloseTarget>,
     closing: Option<&super::capacity::Reservation>,
     ending: Ending,
+    detached: DetachedWork,
 ) -> Result<(), String> {
     struct Reservation {
         host: SharedHost,
@@ -2515,6 +2564,7 @@ fn close_with_target(
     if !present {
         let exited = match cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
             CleanupRetirement::Verified(verified) => {
+                require_retirement_scope(&verified, detached)?;
                 return close_verified_unattached(host, requested, &proof, verified, ending);
             }
             CleanupRetirement::None => None,
@@ -2652,6 +2702,7 @@ fn close_with_target(
                 )
             }
             RetirementInspection::Verified(verified) => {
+                require_retirement_scope(&verified, detached)?;
                 let receipt = verified.receipt();
                 if receipt.identity != identity {
                     return Err("The retained cleanup receipt belongs to another actor".into());
@@ -2738,6 +2789,8 @@ fn close_with_target(
         .require_current(host)
         .map_err(|error| error.message)?;
     if retired.is_none() {
+        #[cfg(target_os = "macos")]
+        handle.decide_detached_work(detached);
         handle.close()?;
     }
     target
@@ -2916,6 +2969,19 @@ fn cleanup_retirement(
             }
         }
     }
+}
+
+fn require_retirement_scope(
+    verified: &VerifiedRetirement,
+    detached: DetachedWork,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let _ = (verified, detached);
+    #[cfg(target_os = "macos")]
+    if detached == DetachedWork::Stop && !verified.receipt().detached_cleanup_proved {
+        return Err("The retained retirement does not prove detached provider cleanup".into());
+    }
+    Ok(())
 }
 
 /// A verified capsule grants no live attachment, input or account access.

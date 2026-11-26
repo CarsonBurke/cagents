@@ -763,7 +763,8 @@ mod tests {
         let root = if let Some(root) = std::env::var_os(ROOT) {
             std::path::PathBuf::from(root)
         } else {
-            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            // Keep the short socket root and use its canonical path in durable evidence.
+            let root = tempfile::tempdir_in(fs::canonicalize("/var/tmp").unwrap()).unwrap();
             for name in [
                 "home", "run", "data", "config", "cache", "project", "codex", "claude",
             ] {

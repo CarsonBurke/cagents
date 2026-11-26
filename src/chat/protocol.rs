@@ -628,7 +628,7 @@ mod launch_tests {
 
     #[test]
     fn provider_directory_observation_requires_a_pinned_exact_launch_directory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let original = root.path().join("original");
         let other = root.path().join("other");
         std::fs::create_dir(&original).unwrap();
@@ -664,7 +664,7 @@ mod launch_tests {
 
     #[test]
     fn startup_directory_io_retries_same_pin_but_replacement_and_unsafe_paths_do_not() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let original = root.path().join("original");
         let parked = root.path().join("parked");
         assert!(matches!(

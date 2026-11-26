@@ -1764,7 +1764,7 @@ mod tests {
 
     #[test]
     fn legacy_channel_names_migrate_as_authoritative() {
-        let (mut registry, directory) = registry();
+        let (mut registry, _directory) = registry();
         registry.apply(&open("/project")).unwrap();
         let id = ChannelId::new();
         registry
@@ -1776,42 +1776,7 @@ mod tests {
                 checkout: None,
             })
             .unwrap();
-        // Build the legacy store with no live Registry connection: its TEMP
-        // execution triggers describe the current schema, not the old one.
-        drop(registry);
-        let path = directory.path().join("model.sqlite3");
-        let legacy = Connection::open(&path).unwrap();
-        legacy
-            .execute_batch(
-                "ALTER TABLE channels DROP COLUMN checkout;
-                 DROP TABLE deleted_channels;
-                 DROP TABLE pane_chat_allocations;
-                 DROP TABLE pane_chat_starts;
-                 DROP TABLE terminal_pane_bindings;
-                 DROP TRIGGER session_channel_insert;
-                 DROP TRIGGER session_channel_move;
-                 DROP TABLE session_channels;
-                 DROP TABLE console_relaunches;
-                 DROP TABLE automation_precheck_history_cleanup;
-                 DROP TABLE automation_retired_manual_requests;
-                 DROP INDEX automation_removed_history;
-                 DROP INDEX automation_firing_successors;
-                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
-                 DROP TABLE automation_run_attention;
-                 DROP TABLE shared_terminal_retention_pins;
-                 DROP TABLE terminal_retention_pins;
-                 DROP TABLE shared_view_terminal_sources;
-                 DROP TABLE view_operations;
-                 DROP TABLE retired_panes;
-                 DROP TABLE panes;
-                 DROP TABLE view_scopes;
-                 DROP TABLE view_revision_clock;
-                 DROP TABLE automation_notifications;
-                 DROP TABLE automation_lifecycle;
-                 ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
-            )
-            .unwrap();
-        drop(legacy);
+        let path = automation_proposals::published_fixture_from_rows(&registry, 2);
         let mut restored = Registry::at(&path).unwrap();
         assert!(
             !restored
@@ -1844,10 +1809,7 @@ mod tests {
             .unwrap();
         drop(registry);
         let path = directory.path().join("model.sqlite3");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch("ALTER TABLE channels DROP COLUMN checkout; PRAGMA user_version = 29;")
-            .unwrap();
+        assert_eq!(schema::downgrade(&path, 29).unwrap(), Some(SCHEMA_VERSION));
         let mut upgraded = Registry::at(&path).unwrap();
         assert_eq!(schema::stored_version(&path).unwrap(), Some(SCHEMA_VERSION));
         assert_eq!(upgraded.model().unwrap().channels[0].checkout, None);

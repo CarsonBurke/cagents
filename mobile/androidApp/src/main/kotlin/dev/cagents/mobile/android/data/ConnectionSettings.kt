@@ -35,6 +35,14 @@ data class ConnectionSettings(
 
     val hostKeyIds: List<String> get() = hosts.map(::hostKeyId)
 
+    /**
+     * Whether [other] reaches the same computer, the same way: what it
+     * sends belongs to both. Trying the same addresses in another order,
+     * or renaming it, doesn't make it another computer.
+     */
+    fun sameComputer(other: ConnectionSettings): Boolean =
+        hostKeyIds.toSet() == other.hostKeyIds.toSet() && user == other.user && command == other.command
+
     companion object {
         const val DEFAULT_COMMAND = "cagents daemon bridge --mobile"
 

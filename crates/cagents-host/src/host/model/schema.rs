@@ -1846,13 +1846,17 @@ mod tests {
 
     #[test]
     fn unjournaled_wal_refusal_preserves_absent_sidecars_and_literal_filename() {
-        use std::os::unix::{ffi::OsStringExt, fs::MetadataExt};
+        #[cfg(target_os = "linux")]
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::MetadataExt;
         for future in [false, true] {
             let dir = fixture_dir();
-            // URI metacharacters and a non-UTF8 byte are literal filename data.
-            let path = dir.path().join(std::ffi::OsString::from_vec(
-                b"refusal ?#%\xff.sqlite3".to_vec(),
-            ));
+            // Path components must reach SQLite as literal filename data.
+            #[cfg(target_os = "linux")]
+            let name = std::ffi::OsString::from_vec(b"refusal ?#%\xff.sqlite3".to_vec());
+            #[cfg(target_os = "macos")]
+            let name = "refusal ?#%é.sqlite3";
+            let path = dir.path().join(name);
             drop(Registry::at(&path).unwrap());
             let db = Connection::open(&path).unwrap();
             if future {

@@ -15,6 +15,469 @@ const MODE: &str = "CAGENTS_UPGRADE_NATIVE_TEST";
 const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ROLLOUT_MISSING: &str = "no rollout found for thread id";
 
+#[cfg(target_os = "macos")]
+fn run_darwin_native_fixture(test: &str, mode: &str) {
+    let fixture = tempfile::Builder::new()
+        .prefix("cp.")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let root = fixture.path();
+    for path in ["home/.codex", "project", "run", "bin"] {
+        fs::create_dir_all(root.join(path)).unwrap();
+    }
+    fs::set_permissions(root.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let output = Command::new(&executable)
+        .args(["--exact", test, "--nocapture"])
+        .env(MODE, mode)
+        .env("CAGENTS_UPGRADE_ROOT", root)
+        .env("CAGENTS_UPGRADE_EXE", &executable)
+        .env("HOME", root.join("home"))
+        .env("CODEX_HOME", root.join("home/.codex"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env(crate::instance::DEVELOPMENT_INSTANCE_ENV, "pair")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Darwin native fixture failed ({mode}):\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+struct CloseFixtureChat<'a>(&'a SharedHost, ClientId, Option<TerminalId>);
+
+#[cfg(target_os = "macos")]
+impl Drop for CloseFixtureChat<'_> {
+    fn drop(&mut self) {
+        if let Some(chat_id) = self.2 {
+            let _ = super::super::client::process_request(
+                self.0,
+                self.1,
+                crate::terminal_ipc::ClientRequest::ChatClose { chat_id },
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn paired_codex_close_prepares_floor_resume_with_exact_receipts() {
+    use crate::host::upgrade_inspect::{CodexExecution, codex_execution};
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    use std::io;
+
+    const PAIRED_TEST: &str = "host::state::native_upgrade_tests::paired_codex_close_prepares_floor_resume_with_exact_receipts";
+    if std::env::var(MODE).as_deref() != Ok("paired-floor") {
+        run_darwin_native_fixture(PAIRED_TEST, "paired-floor");
+        return;
+    }
+
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    let program = install_provider(&root);
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("paired-floor-fixture"),
+        host_incarnation: HostIncarnation::new("source"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+    };
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut state = HostState::new(proof.clone());
+    state.enable_holder_recovery();
+    let host = Arc::new(HostLock::new(state));
+    host.lock().unwrap().register_client(1);
+    let source = provider_session(&root, &program, &proof);
+    let chat_id = source.id;
+    super::super::chat::start_execution(
+        &host,
+        1,
+        source,
+        Arc::new(crate::chat::protocol::ExecutionContext::default()),
+    )
+    .unwrap();
+    let mut close_source = CloseFixtureChat(&host, 1, Some(chat_id));
+    let handle = host.lock().unwrap().chats[&chat_id].handle.clone();
+    wait_durable(&handle);
+
+    let (view, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatReturnTerminal { chat_id },
+    )
+    .unwrap();
+    let ServerResponse::ChatTerminal {
+        session: terminal, ..
+    } = view
+    else {
+        panic!("expected the registered terminal view, got {view:?}");
+    };
+    wait_until(
+        || root.join("console-ready").is_file(),
+        "the fixture did not start the paired CLI in its PTY",
+    );
+    let (issued, terminal_owner) = {
+        let state = host.lock().unwrap();
+        (
+            state.chats[&chat_id].current_session(),
+            state.terminals[&terminal.id]
+                .handle
+                .holder_identity()
+                .unwrap()
+                .clone(),
+        )
+    };
+    assert_eq!(issued.terminal.as_deref(), Some(&terminal));
+    assert!(terminal_owner.root.is_current());
+    let native_directory = registry::directory(Kind::Native).unwrap();
+    let native_control = registry::socket(&native_directory, chat_id);
+    let native_owner = registry::evidence(&native_control, Kind::Native)
+        .unwrap()
+        .unwrap();
+    let listener = issued.recorded_codex_socket().unwrap();
+    assert_eq!(
+        listener,
+        issued.owned_codex_listener.as_ref().unwrap().socket
+    );
+    assert!(fs::symlink_metadata(&listener).is_ok());
+    let paired_listener = crate::chat::recorded_codex_socket(&terminal.launch).unwrap();
+    assert!(fs::symlink_metadata(&paired_listener).is_ok());
+
+    let (closed, _, _) =
+        super::super::client::process_request(&host, 1, ClientRequest::ChatClose { chat_id })
+            .unwrap();
+    let ServerResponse::ChatClosed { snapshot, .. } = closed else {
+        panic!("expected an ordinary close, got {closed:?}");
+    };
+    close_source.2 = None;
+    drop(close_source);
+    wait_until(
+        || !native_owner.holder.is_current() && !terminal_owner.holder.is_current(),
+        "original holders survived close",
+    );
+    assert!(!native_owner.root.is_current());
+    assert!(!terminal_owner.root.is_current());
+    for path in [&native_control, &listener, &paired_listener] {
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "{}",
+            path.display()
+        );
+    }
+    let source_receipt = crate::chat::native_holder::closed_source(&issued, &proof).unwrap();
+    let (closed_owner, paired_closed) =
+        source_receipt.expect("missing receipt for the issued pair");
+    assert_eq!(closed_owner, native_owner);
+    assert!(
+        paired_closed,
+        "native receipt did not settle its registered terminal"
+    );
+    assert!(
+        crate::chat::native_holder::inspect_closed_source(&issued, &proof.boot_id).unwrap(),
+        "native holder published only scoped close evidence"
+    );
+    assert_eq!(
+        codex_execution(&issued, &proof.boot_id),
+        CodexExecution::Ended
+    );
+
+    let mut floor =
+        crate::upgrade::floor::Record::new(proof.clone(), vec![issued.clone()], vec![terminal.id]);
+    floor
+        .snapshots
+        .push(crate::upgrade::floor::StoppedSnapshot {
+            source: issued.clone(),
+            snapshot,
+            limitation: None,
+        });
+    floor.save().unwrap();
+    drop(handle);
+    drop(host);
+    drop(lease);
+    let proof = HostSessionProof {
+        host_incarnation: HostIncarnation::new("successor"),
+        ..proof
+    };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let host = Arc::new(HostLock::new(HostState::new(proof)));
+    host.lock().unwrap().register_client(1);
+    let resume = || {
+        super::super::client::process_request(
+            &host,
+            1,
+            ClientRequest::ChatPrepareResume {
+                source: issued.clone(),
+            },
+        )
+    };
+    let receipt = crate::terminal::holder::directory().unwrap().join(format!(
+        "{}-{}-{}.closed",
+        terminal.id, terminal_owner.holder.pid, terminal_owner.holder.start
+    ));
+    let withheld = receipt.with_extension("withheld");
+    fs::rename(&receipt, &withheld).unwrap();
+    let rejected = resume();
+    fs::rename(withheld, receipt).unwrap();
+    assert!(
+        rejected
+            .unwrap_err()
+            .message
+            .contains("console's end could not be proved")
+    );
+
+    let native_receipt = native_directory.join(format!(
+        "{}-{}-{}.closed",
+        chat_id, native_owner.holder.pid, native_owner.holder.start
+    ));
+    let scoped_receipt = native_receipt.with_extension("spared");
+    fs::rename(&native_receipt, &scoped_receipt).unwrap();
+    let rejected = resume();
+    fs::rename(scoped_receipt, native_receipt).unwrap();
+    assert!(
+        rejected
+            .unwrap_err()
+            .message
+            .contains("exact close receipt is unavailable")
+    );
+
+    let (prepared, _, _) = resume().unwrap();
+    let ServerResponse::ChatResumePrepared { session } = prepared else {
+        panic!("expected a new allocation for the same conversation, got {prepared:?}");
+    };
+    assert_ne!(session.id, chat_id);
+    assert_eq!(session.launch.session_id.as_deref(), Some(THREAD));
+    assert!(
+        session.terminal.is_none()
+            && session.owned_codex_listener.is_none()
+            && session.proof.is_none()
+    );
+    let resumed_id = session.id;
+    let (resumed, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatStart {
+            session,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
+    let mut close_resumed = CloseFixtureChat(&host, 1, Some(resumed_id));
+    assert!(matches!(resumed, ServerResponse::ChatAttached { .. }));
+    let resumed_handle = host.lock().unwrap().chats[&resumed_id].handle.clone();
+    wait_durable(&resumed_handle);
+    let resumed_control = registry::socket(&native_directory, resumed_id);
+    let resumed_owner = registry::evidence(&resumed_control, Kind::Native)
+        .unwrap()
+        .unwrap();
+    let (closed, _, _) = super::super::client::process_request(
+        &host,
+        1,
+        ClientRequest::ChatClose {
+            chat_id: resumed_id,
+        },
+    )
+    .unwrap();
+    assert!(matches!(closed, ServerResponse::ChatClosed { .. }));
+    close_resumed.2 = None;
+    wait_until(
+        || !resumed_owner.holder.is_current() && !resumed_owner.root.is_current(),
+        "the resumed fixture provider survived close",
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn darwin_ordinary_upgrade_restarts_nonretained_codex() {
+    use crate::host::upgrade_inspect::{
+        CodexExecution, ExecutionEnd, codex_execution, execution_end,
+    };
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    use std::os::fd::AsRawFd;
+
+    const RESTART: &str =
+        "host::state::native_upgrade_tests::darwin_ordinary_upgrade_restarts_nonretained_codex";
+    if std::env::var(MODE).as_deref() != Ok("nonretained-restart") {
+        run_darwin_native_fixture(RESTART, "nonretained-restart");
+        return;
+    }
+
+    let root = PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    let program = install_provider(&root);
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let original = HostSessionProof {
+        host_session_id: HostSessionId::new("nonretained-fixture"),
+        host_incarnation: HostIncarnation::new("source"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+    };
+    let lease = crate::daemon::HostLease::acquire(&paths, &original).unwrap();
+    let host = Arc::new(HostLock::new(HostState::new(original.clone())));
+    host.lock().unwrap().register_client(0);
+    let mut source = provider_session(&root, &program, &original);
+    source
+        .launch
+        .recipe
+        .environment
+        .insert("CAGENTS_UPGRADE_CODEX_VERSION".into(), "0.169.0".into());
+    source
+        .launch
+        .recipe
+        .environment
+        .insert("CAGENTS_UPGRADE_EXPECT_RESUME".into(), THREAD.into());
+    let chat_id = source.id;
+    let listener = source.recorded_codex_socket().unwrap();
+    super::super::chat::start_execution(
+        &host,
+        0,
+        source,
+        Arc::new(crate::chat::protocol::ExecutionContext::default()),
+    )
+    .unwrap();
+    let mut close_source = CloseFixtureChat(&host, 0, Some(chat_id));
+    let handle = host.lock().unwrap().chats[&chat_id].handle.clone();
+    wait_until(
+        || {
+            handle.confirmed_session_id().as_deref() == Some(THREAD)
+                && handle.check_update_readiness()
+                    == Ok(crate::chat::runtime::UpdateReadiness::Idle)
+        },
+        "the original non-retained chat did not become idle",
+    );
+    assert_eq!(handle.native_continuity(), NativeContinuity::ReconnectOnly);
+    let native = registry::directory(Kind::Native).unwrap();
+    let control = registry::socket(&native, chat_id);
+    let owner = || registry::evidence(&control, Kind::Native).unwrap().unwrap();
+    let previous_owner = owner();
+    let impact =
+        super::update::inspect(&host, crate::update::impact::Policy::WhenIdle, true).unwrap();
+    let (prepared, _, shutdown) = super::super::client::process_request(
+        &host,
+        0,
+        ClientRequest::PrepareConfirmedUpgrade {
+            impact,
+            relaunch_agents: false,
+        },
+    )
+    .unwrap();
+    assert!(shutdown && matches!(prepared, ServerResponse::UpgradePrepared { .. }));
+    super::super::finish_chat_shutdown(&host).unwrap();
+    close_source.2 = None;
+    drop(close_source);
+    wait_until(
+        || !previous_owner.holder.is_current() && !previous_owner.root.is_current(),
+        "the original holder and provider did not exit",
+    );
+    assert!(!control.exists() && !listener.exists());
+    for suffix in ["closed", "spared"] {
+        let holder = &previous_owner.holder;
+        assert!(
+            !native
+                .join(format!(
+                    "{chat_id}-{}-{}.{suffix}",
+                    holder.pid, holder.start
+                ))
+                .exists()
+        );
+    }
+    let store = Store::discover().unwrap();
+    let checkpoint = store.load().unwrap().unwrap();
+    assert_eq!(checkpoint.phase, Phase::Ready);
+    let [saved] = checkpoint.chats.as_slice() else {
+        panic!("expected one saved native conversation");
+    };
+    assert_eq!(saved.source.id, chat_id);
+    assert_eq!(saved.source.proof.as_ref(), Some(&original));
+    assert_eq!(saved.launch.session_id.as_deref(), Some(THREAD));
+    assert_eq!(
+        codex_execution(&saved.source, &original.boot_id),
+        CodexExecution::Ended
+    );
+    assert_eq!(
+        execution_end(&saved.source, &original.boot_id, Ok(Vec::new())),
+        ExecutionEnd::Unproved
+    );
+    drop(handle);
+    drop(host);
+    drop(lease);
+
+    let successor = HostSessionProof {
+        host_incarnation: HostIncarnation::new("successor"),
+        ..original
+    };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &successor).unwrap();
+    let mut state = HostState::new(successor.clone());
+    state.codex_listeners = super::super::chat::CodexListenerRoots::at(root.clone());
+    let host = Arc::new(HostLock::new(state));
+    host.lock().unwrap().register_client(0);
+    let lock = crate::chat::protocol::codex::thread_writer_lock(&saved.launch, THREAD).unwrap();
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let competing_writer = fs::File::create(&lock).unwrap();
+    // SAFETY: competing_writer owns the live descriptor for this fixture's lock.
+    assert_eq!(
+        unsafe { libc::flock(competing_writer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let refusal = super::super::update_recovery::restore_ordinary(&host).unwrap_err();
+    assert!(
+        refusal.contains(&format!(
+            "Cannot inspect Codex thread writer lock {}",
+            lock.display()
+        )),
+        "{refusal}"
+    );
+    assert_eq!(store.load().unwrap().unwrap().phase, Phase::Ready);
+    assert!(!control.exists() && !listener.exists());
+    drop(competing_writer);
+    super::super::update_recovery::restore_ordinary(&host).unwrap();
+    let unattached = store.unattached().unwrap();
+    assert!(
+        unattached.is_empty(),
+        "ordinary checkpoint restart refused: {unattached:?}"
+    );
+    assert!(store.load().unwrap().is_none());
+    let current = host.lock().unwrap().chats[&chat_id].current_session();
+    assert_eq!(current.proof.as_ref(), Some(&successor));
+    assert_eq!(current.launch.session_id.as_deref(), Some(THREAD));
+    let (attached, _, _) = super::super::client::process_request(
+        &host,
+        0,
+        ClientRequest::ChatAttach { session: current },
+    )
+    .unwrap();
+    let mut close_restored = CloseFixtureChat(&host, 0, Some(chat_id));
+    assert!(matches!(attached, ServerResponse::ChatAttached { .. }));
+    let restored_owner = owner();
+    assert_ne!(restored_owner.holder, previous_owner.holder);
+    assert_ne!(restored_owner.root, previous_owner.root);
+    assert_eq!(
+        fs::read_to_string(root.join("provider-launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    let requests = fs::read_to_string(root.join("provider-requests")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "thread/resume")
+            .count(),
+        1
+    );
+    let (closed, _, _) =
+        super::super::client::process_request(&host, 0, ClientRequest::ChatClose { chat_id })
+            .unwrap();
+    assert!(matches!(closed, ServerResponse::ChatClosed { .. }));
+    close_restored.2 = None;
+    wait_until(
+        || !restored_owner.holder.is_current() && !restored_owner.root.is_current(),
+        "the restarted holder and provider survived close",
+    );
+}
+
 #[test]
 #[cfg_attr(
     target_os = "macos",
@@ -1715,12 +2178,16 @@ fn install_provider(root: &std::path::Path) -> std::path::PathBuf {
         format!(
             r#"#!/bin/sh
 set -eu
+if [ "${{1:-}}" = resume ]; then
+  : > "${{0%/*}}/../console-ready"
+  exec /bin/sleep 300
+fi
 for arg in "$@"; do
   case "$arg" in unix://*) export CAGENTS_UPGRADE_SOCKET="${{arg#unix://}}" ;; esac
 done
 echo launch >> "$CAGENTS_UPGRADE_ROOT/provider-launches"
 export {MODE}=provider
-exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --nocapture
+exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --include-ignored --nocapture
 "#
         ),
     )
@@ -1862,6 +2329,11 @@ fn provider() {
             };
             let frame: Value = serde_json::from_str(text).unwrap();
             let Some(id) = frame.get("id") else { continue };
+            if frame["method"] == "thread/resume"
+                && let Ok(thread) = std::env::var("CAGENTS_UPGRADE_EXPECT_RESUME")
+            {
+                assert_eq!(frame["params"]["threadId"].as_str(), Some(thread.as_str()));
+            }
             // Every request the one retained server ever received, in order.
             if let Some(root) = std::env::var_os("CAGENTS_UPGRADE_ROOT") {
                 use std::io::Write;

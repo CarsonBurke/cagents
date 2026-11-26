@@ -1085,8 +1085,33 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
     // A real foreground process, recognized by its provider argv. Its
     // executable is deliberately different from the recovery command, and
     // it ignores the resume picker selector a relaunch adds.
-    let executable = directory.path().join("claude");
-    fs::write(&executable, "#!/bin/bash\nexec -a \"$0\" /bin/cat\n").unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    let executable = cwd.join("claude");
+    #[cfg(target_os = "linux")]
+    let reader = "/bin/cat";
+    #[cfg(target_os = "macos")]
+    let reader = {
+        // The system cat's protected environment cannot establish the
+        // provider account. Keep the binary behavior with a local signature.
+        let reader = cwd.join("fixture-cat");
+        fs::copy("/bin/cat", &reader).unwrap();
+        let output = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&reader)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        "./fixture-cat"
+    };
+    fs::write(
+        &executable,
+        format!("#!/bin/bash\nexec -a \"$0\" {reader}\n"),
+    )
+    .unwrap();
     fs::set_permissions(
         &executable,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -1096,20 +1121,13 @@ pub(super) fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_resto
         unset_environment: Default::default(),
         program: executable.to_string_lossy().into_owned(),
         arguments: Vec::new(),
-        working_directory: directory.path().into(),
+        working_directory: cwd.clone(),
         environment: BTreeMap::from([
-            (
-                "HOME".into(),
-                directory.path().to_string_lossy().into_owned(),
-            ),
+            ("HOME".into(), cwd.to_string_lossy().into_owned()),
             // Keep Claude's account state in this fixture, not the real home.
             (
                 "CLAUDE_CONFIG_DIR".into(),
-                directory
-                    .path()
-                    .join(".claude")
-                    .to_string_lossy()
-                    .into_owned(),
+                cwd.join(".claude").to_string_lossy().into_owned(),
             ),
         ]),
     };
@@ -2051,6 +2069,61 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         thread::sleep(Duration::from_millis(10));
     };
     let original_root = crate::terminal::holder::Process::read(pid).unwrap();
+    let root_pin = |handle: &crate::terminal::TerminalHandle| {
+        let descriptor = handle.original_root_pidfd_for_test().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let fdinfo =
+                fs::read_to_string(format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd()))
+                    .unwrap();
+            let pinned_pid = fdinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("Pid:"))
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(pinned_pid, original_root.pid);
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            handle.original_root_pid_for_test(),
+            Some(original_root.pid as u32)
+        );
+        descriptor
+    };
+    let assert_pin_readiness = |descriptor: &fs::File, ready: bool| {
+        let mut readiness = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the same owned exit descriptor stays live across both polls.
+        assert_eq!(
+            unsafe { libc::poll(&mut readiness, 1, 0) },
+            i32::from(ready)
+        );
+        if ready {
+            assert_ne!(readiness.revents & libc::POLLIN, 0);
+        }
+    };
+    let assert_sleep = || {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim(),
+            "sleep"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            crate::process::program_of(pid as u32)
+                .unwrap()
+                .0
+                .file_name(),
+            Some(std::ffi::OsStr::new("sleep"))
+        );
+    };
     let old = host.lock().unwrap().terminals[&source.id].handle.clone();
     let carried_source = host
         .lock()
@@ -2150,24 +2223,8 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
             state.terminals[&source.id].handle.clone()
         };
         assert!(!handle.is_completed());
-        let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
-        let fdinfo =
-            fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd())).unwrap();
-        let pinned_pid = fdinfo
-            .lines()
-            .find_map(|line| line.strip_prefix("Pid:"))
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
-        assert_eq!(pinned_pid, original_root.pid);
-        let mut readiness = libc::pollfd {
-            fd: root_pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: the cloned original pidfd stays owned across poll.
-        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+        let descriptor = root_pin(&handle);
+        assert_pin_readiness(&descriptor, false);
         assert!(original_root.is_current());
         // Anonymous adoption intentionally unlinks its old listener;
         // the retained current worker is the reachable Close surface.
@@ -2181,17 +2238,13 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         let actual_retained: serde_json::Value =
             serde_json::from_slice(&fs::read(&retained_store.path).unwrap()).unwrap();
         assert_eq!(actual_retained, expected_retained);
-        assert_eq!(
-            fs::read_to_string(format!("/proc/{pid}/comm"))
-                .unwrap()
-                .trim(),
-            "sleep"
-        );
+        assert_sleep();
         assert_eq!(
             handle.close_checked(true),
             crate::terminal_ipc::TerminalCloseResult::Closed
         );
-        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!original_root.is_current());
+        assert_pin_readiness(&descriptor, true);
         return;
     }
 
@@ -2223,41 +2276,20 @@ fn carried_terminal_across_upgrade(invalid_successor: bool) {
         .unwrap();
     assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
     assert_eq!(descriptor.session.launch, source.launch);
-    assert_eq!(
-        fs::read_to_string(format!("/proc/{pid}/comm"))
-            .unwrap()
-            .trim(),
-        "sleep",
-        "the successor adopted the same process rather than starting another"
-    );
+    assert_sleep();
     let handle = replacement.lock().unwrap().terminals[&source.id]
         .handle
         .clone();
     assert!(!handle.is_completed());
-    let root_pidfd = handle.original_root_pidfd_for_test().unwrap();
-    let fdinfo =
-        fs::read_to_string(format!("/proc/self/fdinfo/{}", root_pidfd.as_raw_fd())).unwrap();
-    let pinned_pid = fdinfo
-        .lines()
-        .find_map(|line| line.strip_prefix("Pid:"))
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
-    assert_eq!(pinned_pid, original_root.pid);
-    let mut readiness = libc::pollfd {
-        fd: root_pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: the cloned original pidfd stays owned across poll.
-    assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+    let original_exit = root_pin(&handle);
+    assert_pin_readiness(&original_exit, false);
     assert!(original_root.is_current());
     assert_eq!(
         handle.close_checked(true),
         crate::terminal_ipc::TerminalCloseResult::Closed
     );
-    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    assert!(!original_root.is_current());
+    assert_pin_readiness(&original_exit, true);
 }
 
 #[test]
@@ -2369,6 +2401,7 @@ pub(super) fn restored_shell_links_exact_old_source_and_does_not_replay_consumed
     assert_eq!(descriptor.upgrade_sources, vec![source.clone()]);
     assert_eq!(descriptor.session.continuity.live_proof(), Some(expected));
     assert_eq!(descriptor.session.transcript_path, source.transcript_path);
+    let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
     restore_upgrade_from(
         &host,
         Store::open(directory.path()).unwrap(),
@@ -2379,85 +2412,102 @@ pub(super) fn restored_shell_links_exact_old_source_and_does_not_replay_consumed
     // Restore enqueues startup visibility controls; a descriptor and an
     // empty checkpoint read do not acknowledge their worker-side completion.
     // This existing synchronous observation follows them on the same FIFO.
-    let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
     restored.observe_agent().unwrap();
-    // A separate idle probe can resume the shell before host preparation
-    // observes it again. Retry only this exact fixture's active-shell
-    // refusal; success keeps the actual preparation snapshot frozen.
-    let expected_active = upgrade_error(upgrade_blockers_message(
-        &[describe_upgrade_blocker(&descriptor.session)],
-        false,
-    ));
-    let prepare_started = Instant::now();
-    let mut prepare_attempts = 0;
-    loop {
-        assert!(
-            // This waits on the passwd shell's own startup in a fresh HOME.
-            prepare_started.elapsed() < Duration::from_secs(60),
-            "restored shell never became eligible after {prepare_attempts} preparation attempts"
-        );
-        prepare_attempts += 1;
-        let capability = {
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            assert_eq!(state.terminals.len(), 1);
-            assert!(state.chats.is_empty());
-            assert!(state.terminals[&source.id].handle.same_worker(&restored));
-            state.shutdown_preflight(Instant::now()).unwrap().capability
-        };
-        match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
-            Ok(counts) => {
-                assert_eq!(counts, (1, 0));
-                break;
-            }
-            Err(error) if error == expected_active => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!(
-                "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
-            ),
-        }
-    }
-    finish_upgrade(&host).unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let second = store.load().unwrap().unwrap();
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0].id = TerminalId::new();
-    assert!(forged.validate().is_err());
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0]
-        .launch
-        .environment
-        .insert("UNRELATED".into(), "1".into());
-    assert!(forged.validate().is_err());
-    let mut forged = second.clone();
-    forged.terminals[0].previous_sources[0].continuity =
-        second.terminals[0].source.continuity.clone();
-    assert!(forged.validate().is_err());
-    let third = test_host_with_incarnation("third-incarnation");
-    let host = Arc::new(HostLock::new(third));
-    restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
-    let third = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .descriptor(0, source.id)
-        .unwrap();
-    assert_eq!(
-        third.upgrade_sources,
-        vec![source.clone(), second.terminals[0].source.clone()]
-    );
-    assert_ne!(
-        third.session.continuity.live_proof(),
-        descriptor.session.continuity.live_proof()
-    );
-    let handle = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let state = host.lock().unwrap();
         assert_eq!(state.terminals.len(), 1);
-        state.terminals[&source.id].handle.clone()
-    };
-    assert_eq!(
-        handle.close_checked(true),
-        crate::terminal_ipc::TerminalCloseResult::Closed
-    );
+        assert!(state.terminals[&source.id].handle.same_worker(&restored));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin can restore the checkpoint's authorized recipe. Repeating
+        // automatic shell retirement requires the mapped executable proof
+        // that the Linux implementation obtains from /proc/PID/exe.
+        assert_eq!(
+            restored.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // A separate idle probe can resume the shell before host preparation
+        // observes it again. Retry only this exact fixture's active-shell
+        // refusal; success keeps the actual preparation snapshot frozen.
+        let expected_active = upgrade_error(upgrade_blockers_message(
+            &[describe_upgrade_blocker(&descriptor.session)],
+            false,
+        ));
+        let prepare_started = Instant::now();
+        let mut prepare_attempts = 0;
+        loop {
+            assert!(
+                // This waits on the passwd shell's own startup in a fresh HOME.
+                prepare_started.elapsed() < Duration::from_secs(60),
+                "restored shell never became eligible after {prepare_attempts} preparation attempts"
+            );
+            prepare_attempts += 1;
+            let capability = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                assert_eq!(state.terminals.len(), 1);
+                assert!(state.chats.is_empty());
+                assert!(state.terminals[&source.id].handle.same_worker(&restored));
+                state.shutdown_preflight(Instant::now()).unwrap().capability
+            };
+            match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
+                Ok(counts) => {
+                    assert_eq!(counts, (1, 0));
+                    break;
+                }
+                Err(error) if error == expected_active => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "unexpected restored-shell preparation failure after {prepare_attempts} attempts: {error:?}"
+                ),
+            }
+        }
+        finish_upgrade(&host).unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let second = store.load().unwrap().unwrap();
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].id = TerminalId::new();
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0]
+            .launch
+            .environment
+            .insert("UNRELATED".into(), "1".into());
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].continuity =
+            second.terminals[0].source.continuity.clone();
+        assert!(forged.validate().is_err());
+        let third = test_host_with_incarnation("third-incarnation");
+        let host = Arc::new(HostLock::new(third));
+        restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
+        let third = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .descriptor(0, source.id)
+            .unwrap();
+        assert_eq!(
+            third.upgrade_sources,
+            vec![source.clone(), second.terminals[0].source.clone()]
+        );
+        assert_ne!(
+            third.session.continuity.live_proof(),
+            descriptor.session.continuity.live_proof()
+        );
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(state.terminals.len(), 1);
+            state.terminals[&source.id].handle.clone()
+        };
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
 }
 
 #[test]
@@ -3494,7 +3544,8 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
             })
         }
     }
-    let directory = tempfile::tempdir().unwrap();
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = tempfile::tempdir_in(parent).unwrap();
     let config = directory.path().join("claude-config");
     let project: String = directory
         .path()

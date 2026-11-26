@@ -113,8 +113,9 @@ def scenario_class(peer, storage, listener):
                 state = json.load(stream)
             if (not isinstance(state, dict)
                     or not {"thread", "child", "latest"} <= set(state)
-                    or set(state) - {"thread", "child", "grandchild", "latest", "child_latest",
-                                     "interrupting", "model", "reasoning"}):
+                    or set(state) - {"thread", "child", "grandchild", "second", "latest",
+                                     "child_latest", "second_latest", "interrupting", "model",
+                                     "reasoning"}):
                 raise ValueError("invalid persisted rehearsal app-server state")
             model = state.get("model", "fixture-mini")
             reasoning = state.get("reasoning")
@@ -124,9 +125,10 @@ def scenario_class(peer, storage, listener):
                 raise ValueError("invalid persisted rehearsal reasoning effort")
             thread_path(state["thread"])
             thread_path(state["child"])
-            if "grandchild" in state:
-                thread_path(state["grandchild"])
-            for turn in (state["latest"], state.get("child_latest")):
+            for thread in ("grandchild", "second"):
+                if thread in state:
+                    thread_path(state[thread])
+            for turn in (state["latest"], state.get("child_latest"), state.get("second_latest")):
                 if turn is not None and not isinstance(turn, dict):
                     raise ValueError("invalid persisted rehearsal turn")
             self.restore(state)

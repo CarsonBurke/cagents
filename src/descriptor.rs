@@ -423,9 +423,19 @@ pub(crate) fn reopen(file: &std::fs::File, flags: libc::c_int) -> io::Result<std
     Ok(reopened)
 }
 
+/// A path an invoked program can open for an inherited file descriptor.
+/// Darwin duplicates the open description, including its current offset.
+pub(crate) fn inherited_file_path(fd: RawFd) -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    let prefix = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    let prefix = "/dev/fd";
+    format!("{prefix}/{fd}").into()
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn path_of(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
-    Ok(format!("/proc/self/fd/{}", file.as_raw_fd()).into())
+    Ok(inherited_file_path(file.as_raw_fd()))
 }
 
 /// The kernel's current path for an open file, which follows renames.

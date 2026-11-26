@@ -1,8 +1,8 @@
 use super::*;
 
-#[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
 #[test]
 fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -28,6 +28,8 @@ fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
         );
         return;
     }
+    #[cfg(target_os = "macos")]
+    crate::daemon::adopted_orphans::become_sweeper();
     let root = tempfile::tempdir_in("/var/tmp").unwrap();
     let cwd = root.path().join("cwd");
     let home = root.path().join("claude");
@@ -403,10 +405,10 @@ fn an_ordinary_close_leaves_what_the_provider_leaves() {
     unsafe { libc::kill(-(provider.id() as i32), libc::SIGTERM) };
     provider.wait().unwrap();
     drop(registration);
-    reap_orphans(DetachedWork::Spare).unwrap();
+    reap_orphans(DetachedWork::Spare, false).unwrap();
     assert!(
         children::ends(work.running, || {
-            reap_orphans(DetachedWork::Spare).unwrap();
+            reap_orphans(DetachedWork::Spare, false).unwrap();
         }),
         "the provider stopped its own command as it quit, and it is reaped"
     );
@@ -418,7 +420,7 @@ fn an_ordinary_close_leaves_what_the_provider_leaves() {
     }
     // A close that stops everything, as for an unattended agent, reaps
     // them too.
-    reap_orphans(DetachedWork::Stop).unwrap();
+    reap_orphans(DetachedWork::Stop, false).unwrap();
     assert!(!children::exists(work.detached) && !children::exists(work.left));
 }
 

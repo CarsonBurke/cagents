@@ -275,7 +275,7 @@ mod tests {
             let metadata = std::fs::metadata(&home).unwrap();
             let scope = LaunchAccountScope {
                 provider: Provider::Claude,
-                canonical_home: home.clone(),
+                canonical_home: home.canonicalize().unwrap(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 registered_id: None,

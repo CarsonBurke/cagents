@@ -2013,6 +2013,28 @@ pub struct AgentAddress {
     pub subagent: String,
 }
 
+/// The task a Codex agent was given, in words, as its agent path names it:
+/// `/root/descendants_design` reads as Descendants design. Codex's second
+/// multi-agent version gives each agent a path from the root agent, whose
+/// last part is the name its parent chose for the task.
+pub fn codex_agent_task(path: &str) -> Option<String> {
+    // The root agent is the conversation itself, not a task.
+    if path.trim_matches('/') == "root" {
+        return None;
+    }
+    let task = path
+        .rsplit('/')
+        .find(|part| !part.trim().is_empty())?
+        .split(['_', '-', ' '])
+        .filter(|word| !word.is_empty())
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut letters = task.chars();
+    let first = letters.next()?;
+    Some(first.to_uppercase().chain(letters).take(120).collect())
+}
+
 impl Subagent {
     /// Delegated work, running or waiting on its own background work, that
     /// cancelling the parent's turn would also stop, where the provider's

@@ -158,6 +158,7 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
     private fun start(code: PairingCode) {
         _hint.value = null
         _state.value = PairingState.Connecting(code)
+        val before = graph.settings.settings.value
         job = viewModelScope.launch {
             val outcome = try {
                 val fingerprint = withContext(Dispatchers.IO) { PhoneKey.get(getApplication()).fingerprint }
@@ -171,7 +172,8 @@ class PairingViewModel(app: Application, link: String? = null) : AndroidViewMode
                 is PairOutcome.Paired -> {
                     // Connect with the phone's own key to the computer just saved.
                     // In the app's scope: leaving this screen, which comes next, mustn't cancel it.
-                    graph.scope.launch { graph.controller.restart() }
+                    val changed = !before.sameComputer(graph.settings.settings.value)
+                    graph.scope.launch { graph.controller.restart(computerChanged = changed) }
                     PairingState.Paired(code)
                 }
                 PairOutcome.Declined -> PairingState.Declined(code)

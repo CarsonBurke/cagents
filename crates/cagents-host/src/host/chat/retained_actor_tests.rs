@@ -3298,7 +3298,7 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
             })
         }
     }
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::fixture_tempdir().unwrap();
     let provider = root.path().join("provider");
     fs::write(&provider, "#!/bin/sh\nprintf spawned > \"$0.spawned\"\n").unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -5473,7 +5473,7 @@ fn a_full_daemon_stops_a_finished_hidden_chat_to_make_room() {
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_MAKE_ROOM_TEST";
     if std::env::var_os(MODE).is_none() {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = crate::fixture_tempdir().unwrap();
         let root = directory.path();
         for path in [
             "home/.claude",

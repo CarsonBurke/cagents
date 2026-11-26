@@ -160,6 +160,9 @@ pub enum HostedTerminalStartError {
     HostIncompatible { actual: u16 },
     #[error("cagents daemon exited before becoming ready at {path}: {status}")]
     HostExited { path: PathBuf, status: ExitStatus },
+    /// A daemon in another runtime directory serves this instance's data.
+    #[error("{0}")]
+    StateServedElsewhere(crate::instance::state_claim::StateInUse),
     #[error("could not connect to the cagents daemon socket at {path}: {source}")]
     HostSocket {
         path: PathBuf,
@@ -1568,9 +1571,37 @@ fn ensure_daemon_ready_at(
     let recovery = crate::upgrade::recovery::has_inherited_receipt()
         .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
     let scoped = systemd_user_manager_available() && !recovery;
+    // A daemon started here would refuse to serve data that a daemon in
+    // another runtime directory already serves, and exit with its reason on
+    // a standard error nobody reads. Say why before starting it, and again if
+    // it exits for that reason after all.
+    refuse_state_served_elsewhere(socket)?;
     start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
         spawn_daemon(&daemon_binary, application, scoped)
     })
+    // However the start failed, as a daemon that exited or, under a service
+    // manager, one that never became ready.
+    .or_else(|error| {
+        refuse_state_served_elsewhere(socket).inspect_err(|_| {
+            tracing::warn!(%error, "the daemon did not start; another one serves this data");
+        })?;
+        Err(error)
+    })
+}
+
+fn refuse_state_served_elsewhere(socket: &Path) -> Result<(), HostedTerminalStartError> {
+    match crate::instance::state_claim::daemon_served_elsewhere(
+        &socket.with_file_name("cagentsd.lock"),
+    ) {
+        Ok(None) => Ok(()),
+        Ok(Some(refusal)) => Err(HostedTerminalStartError::StateServedElsewhere(refusal)),
+        // The daemon decides for itself; a claim this cannot read only loses
+        // the explanation.
+        Err(error) => {
+            tracing::warn!(%error, "could not read which daemon serves this instance's data");
+            Ok(())
+        }
+    }
 }
 
 /// A bound listener may still be restoring, or may belong to an older build.

@@ -559,6 +559,23 @@ const QUEUE_LINE_HEIGHT: f32 = 18.0;
 /// it made a caption-height row twice the height of its own text.
 const CONTROL_PADDING: [f32; 2] = [2.0, 6.0];
 
+/// How far inside the composer's sides the footer row is drawn: where its
+/// items' content starts, the composer's glyph inset, less the inset every
+/// item carries.
+const FOOTER_INSET: f32 = COMPOSER_PADDING - CONTROL_PADDING[1];
+
+/// A status-line item that is not a control, inset as a control's content is.
+///
+/// Every footer item then starts and ends `CONTROL_PADDING` inside its slot,
+/// pressable or not, so the footer can be drawn that much further out and
+/// still begin its first glyph beneath the composer's `+`: a picker's hover
+/// background takes the inset rather than pushing its glyph inward, and a
+/// picker that becomes a plain label once the conversation starts keeps its
+/// place.
+fn footer_cell<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    widget::container(content).padding(CONTROL_PADDING).into()
+}
+
 /// The height of one completion row.
 const COMPLETION_ROW: f32 = design::DENSE_ROW_HEIGHT;
 
@@ -4727,15 +4744,16 @@ impl Runtime {
             && let Some(branch) = &place.branch
         {
             status.push(bounded(
-                widget::row::with_children(vec![
-                    crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                    crate::ui_controls::FadeText::caption(branch.clone())
-                        .limit(FOOTER_LABEL)
-                        .into(),
-                ])
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .into(),
+                footer_cell(
+                    widget::row::with_children(vec![
+                        crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
+                        crate::ui_controls::FadeText::caption(branch.clone())
+                            .limit(FOOTER_LABEL)
+                            .into(),
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                ),
                 branch,
                 "Branch",
                 FOOTER_LABEL,
@@ -4856,15 +4874,21 @@ impl Runtime {
                 crate::interaction::tooltip_above(caption, tooltip)
             });
         }
-        let spend = widget::row::with_children(spend)
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
-            .into();
+        // A footer with nothing spent yet, as a fresh draft's is, ends on its
+        // last picker rather than on an empty cell's inset.
+        if !spend.is_empty() {
+            engine.push(footer_cell(
+                widget::row::with_children(spend)
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center),
+            ));
+        }
         let mut leading = status;
         leading.extend(notice);
-        engine.push(spend);
+        // Every item carries `CONTROL_PADDING` on each side, so the items
+        // themselves sit only `GAP_XS` apart, as the composer's controls do.
         let trailing: Element<'_, Message> = widget::row::with_children(engine)
-            .spacing(step::GAP_S)
+            .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
             .into();
         let footer_row: Element<'_, Message> = if fit == FooterFit::Wide {
@@ -4875,7 +4899,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 widget::container(
                     widget::flex_row(leading)
-                        .spacing(step::GAP_S as u16)
+                        .spacing(step::GAP_XS as u16)
                         .align_items(Alignment::Center),
                 )
                 .width(Length::Fill)
@@ -4895,7 +4919,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 widget::container(crate::ui_controls::shrinkable(
                     widget::row::with_children(leading)
-                        .spacing(step::GAP_S)
+                        .spacing(step::GAP_XS)
                         .align_y(Alignment::Center),
                 ))
                 .width(Length::Fill)
@@ -4938,11 +4962,11 @@ impl Runtime {
             .height(Length::Fill)
             .width(Length::Fill)
             .into(),
+            // Drawn a control's inset further out than the composer's glyphs,
+            // which every footer item then restores: see `footer_cell`.
             widget::container(footer)
                 .id(card_control_id(target.card, "chat-footer"))
-                .padding(
-                    iced::Padding::from([0.0, step::GAP_M + COMPOSER_PADDING]).bottom(step::GAP_M),
-                )
+                .padding(iced::Padding::from([0.0, step::GAP_M + FOOTER_INSET]).bottom(step::GAP_M))
                 .into(),
         ))
         .width(Length::Fill)
@@ -5584,9 +5608,10 @@ impl Runtime {
             );
             if transitioning {
                 controls.push(bounded(
-                    crate::ui_controls::FadeText::caption(label.clone())
-                        .limit(fit.label_limit())
-                        .into(),
+                    footer_cell(
+                        crate::ui_controls::FadeText::caption(label.clone())
+                            .limit(fit.label_limit()),
+                    ),
                     &label,
                     "Model",
                     fit.label_limit(),
@@ -5600,12 +5625,11 @@ impl Runtime {
             let chosen = self.chosen_permission_mode();
             let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
-                controls.push(
-                    design::caption(selected.map_or("Permissions", |index| {
+                controls.push(footer_cell(design::caption(
+                    selected.map_or("Permissions", |index| {
                         permission_mode_label(self.session.launch.provider, &modes[index])
-                    }))
-                    .into(),
-                );
+                    }),
+                )));
             } else {
                 let open = self.permission_picker;
                 let anchor = widget::button::custom(
@@ -5701,9 +5725,11 @@ impl Runtime {
                 ),
             };
             return crate::interaction::tooltip_above(
-                widget::row::with_children(std::iter::once(avatar).chain(named.then(label)))
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
+                footer_cell(
+                    widget::row::with_children(std::iter::once(avatar).chain(named.then(label)))
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::Center),
+                ),
                 usage(format!(
                     "This conversation runs on {}. {}",
                     accounts.current,
