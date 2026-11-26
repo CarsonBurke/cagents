@@ -671,7 +671,8 @@ mod flow_tests {
                 let failure = prepared.unwrap_err();
                 assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
                 assert!(
-                    failure.message.contains("nothing was started"),
+                    failure.message.starts_with("The earlier Codex provider's")
+                        && failure.message.contains("nothing was started"),
                     "{failure:?}"
                 );
                 {
