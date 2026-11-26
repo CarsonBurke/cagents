@@ -5753,7 +5753,6 @@ mod startup_update_tests {
             false,
             false,
             None,
-            None,
             Duration::from_secs(30),
             &mut |elapsed| {
                 waited.push(elapsed);
@@ -5775,7 +5774,6 @@ mod startup_update_tests {
             None,
             false,
             false,
-            None,
             None,
             Duration::from_millis(60),
             &mut |_| {},
