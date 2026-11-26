@@ -263,6 +263,11 @@ impl Journal {
             .collect()
     }
 
+    pub fn remember_notice_withdrawal(&mut self, target: &Target, id: Uuid) -> Result<(), String> {
+        self.remember_group_withdrawal(super::batching::desktop_id(target))?;
+        self.remember_group_withdrawal(id)
+    }
+
     pub fn remember_group_withdrawal(&mut self, id: Uuid) -> Result<(), String> {
         diesel::sql_query("INSERT OR IGNORE INTO portal_group_withdrawals(id) VALUES (?1)")
             .bind::<diesel::sql_types::Text, _>(id.to_string())
@@ -378,8 +383,7 @@ impl Journal {
         let id = id.parse::<Uuid>().map_err(|error| error.to_string())?;
         // Reserve both portal removal IDs before this row can be
         // acknowledged and replaced with a different request.
-        self.remember_group_withdrawal(super::batching::desktop_id(target))?;
-        self.remember_group_withdrawal(id)?;
+        self.remember_notice_withdrawal(target, id)?;
         self.acknowledge(id)?;
         Ok(Some(id))
     }
