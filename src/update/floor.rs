@@ -227,7 +227,15 @@ fn descriptor_impact<T: Serialize>(
 /// The worker engine uses the same source operations in production and in its
 /// refused-prepare tests. The adapter owns authentication, persistence and the
 /// final lease transfer; only this engine decides when destruction is allowed.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PreparationMode {
+    #[default]
+    AllowsReviewedStops,
+    AcknowledgedOnly,
+}
+
 trait FloorSource {
+    fn preparation_mode(&self) -> PreparationMode;
     fn observe(&mut self) -> Result<impact::Preview, UpdateError>;
     fn observe_policy(&mut self, policy: impact::Policy) -> Result<impact::Preview, UpdateError>;
     fn inventory(
@@ -337,6 +345,9 @@ struct NativeSource<'a, O> {
 impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSource
     for NativeSource<'_, O>
 {
+    fn preparation_mode(&self) -> PreparationMode {
+        self.survivors.preparation_mode
+    }
     fn observe(&mut self) -> Result<impact::Preview, UpdateError> {
         (self.observe)(self.policy)
     }
@@ -789,6 +800,12 @@ fn quiesce_source(
     result.map_err(|error| completed_error(error, &completed, service_stopped, background_tasks))
 }
 
+fn acknowledged_prepare_required() -> UpdateError {
+    invalid(
+        "The installed update requires the source to checkpoint its live work. The current terminal service is still running.",
+    )
+}
+
 fn quiesce_inner(
     state: &Path,
     job: &mut UpdateJob,
@@ -810,6 +827,15 @@ fn quiesce_inner(
             "Session ownership changed before stopping the source; review the update again",
         ));
     }
+    let acknowledged_only = source.preparation_mode() == PreparationMode::AcknowledgedOnly;
+    if acknowledged_only
+        && preview
+            .daemon
+            .as_ref()
+            .is_some_and(impact::DaemonImpact::blocked)
+    {
+        return Err(acknowledged_prepare_required());
+    }
     // Finish the ordinary, cancellable wait before collecting destructive consent.
     if preview.daemon.as_ref().is_some_and(|daemon| {
         daemon
@@ -829,6 +855,9 @@ fn quiesce_inner(
         .daemon
         .as_ref()
         .ok_or_else(|| invalid("The source disappeared during update review"))?;
+    if acknowledged_only && daemon.blocked() {
+        return Err(acknowledged_prepare_required());
+    }
     // Retain the full original census before any floor action can remove a
     // conversation. A later Ready checkpoint contains only its surviving subset.
     source.capture_before_floor(state, job, daemon)?;
@@ -844,7 +873,7 @@ fn quiesce_inner(
         match source.prepare(daemon) {
             Ok(()) => return source.stopped(state, job, false),
             Err(source::PrepareError::Refused(error)) => {
-                if drained_windows {
+                if drained_windows || acknowledged_only {
                     return Err(error);
                 }
                 confirmation::resume_cancellation(state, job)?;
@@ -1252,6 +1281,7 @@ fn archive_checkpoint() -> Result<(), UpdateError> {
 /// shutdown are still visible. Shared user/application cgroups grant no link.
 #[derive(Default)]
 pub(super) struct Survivors {
+    preparation_mode: PreparationMode,
     ended: BTreeMap<(impact::SessionKind, TerminalId), super::floor_display::StopItem>,
     service_stopped: bool,
     source_prepared: bool,
@@ -1297,6 +1327,10 @@ struct InterruptedTurn {
 }
 
 impl Survivors {
+    #[cfg(target_os = "macos")]
+    pub(super) fn require_acknowledged_preparation(&mut self) {
+        self.preparation_mode = PreparationMode::AcknowledgedOnly;
+    }
     /// Run only after the original daemon exited and its exact lease was
     /// acquired. A foreign or changed Prepared checkpoint never authorizes a
     /// normal startup, even if the original prepare was acknowledged.

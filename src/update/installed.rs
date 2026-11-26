@@ -264,6 +264,10 @@ pub(super) fn perform(
         || (selection.previous_link.is_some() && confirmed.daemon.is_none());
     #[cfg(target_os = "macos")]
     let parks_successor = confirmed.replaces_daemon && selection.previous_link.is_some();
+    #[cfg(target_os = "macos")]
+    if parks_successor {
+        survivors.require_acknowledged_preparation();
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let parks_successor = false;
     let switch = if parks_successor {

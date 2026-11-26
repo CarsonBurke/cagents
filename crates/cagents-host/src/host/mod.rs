@@ -285,12 +285,21 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
             .recovered
             .ok_or("The replacement did not settle the original checkpoint")?;
         let terminals = state.list(0);
-        let chats = update_recovery::live_chat_descriptors(&state);
         match &recovered {
             InstalledRestoration::Prepared(record) => {
+                let chats = update_recovery::live_chat_descriptors(&state);
                 record.verify_live_inventory(state.proof(), &terminals, &chats)
             }
             InstalledRestoration::Ready { admission, .. } => {
+                let chats = chat::chat_list_inventory(&state);
+                if chats.iter().any(|session| {
+                    state
+                        .chats
+                        .get(&session.id)
+                        .is_none_or(|record| !record.handle.owns_work())
+                }) {
+                    return Err("An original conversation has not finished resuming".into());
+                }
                 admission.verify_live_inventory(state.proof(), &terminals, &chats)
             }
         }?;

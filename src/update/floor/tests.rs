@@ -29,6 +29,7 @@ fn inherited_checkpoint_input_opens_at_the_start_in_the_child() {
 }
 
 struct FakeSource {
+    preparation_mode: PreparationMode,
     preview: impact::Preview,
     inventory: Inventory,
     events: Arc<Mutex<Vec<String>>>,
@@ -90,6 +91,9 @@ impl FakeSource {
 }
 
 impl FloorSource for FakeSource {
+    fn preparation_mode(&self) -> PreparationMode {
+        self.preparation_mode
+    }
     fn observe(&mut self) -> Result<impact::Preview, UpdateError> {
         self.observations.fetch_add(1, Ordering::Release);
         if self.settled.load(Ordering::Acquire) {
@@ -425,6 +429,7 @@ fn fixture() -> FakeSource {
         blockers: Vec::new(),
     };
     FakeSource {
+        preparation_mode: PreparationMode::AllowsReviewedStops,
         preview: impact::Preview {
             editors: Vec::new(),
             candidate: impact::Candidate {
@@ -473,6 +478,42 @@ fn fixture() -> FakeSource {
         interrupt_pending: Vec::new(),
         change_after_interrupt: false,
         cancel_on_interrupt: None,
+    }
+}
+
+#[test]
+fn acknowledged_only_leaves_the_source_running_if_preparation_is_unavailable() {
+    for blocked in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let mut source = fixture();
+        source.preparation_mode = PreparationMode::AcknowledgedOnly;
+        source.windows_drained = false;
+        if blocked {
+            source.preview.daemon.as_mut().unwrap().sessions[0].disposition =
+                impact::Disposition::Blocked;
+        }
+        let preview = source.preview.clone();
+        let mut job = job(path);
+        let error = quiesce_source(path, &mut job, &preview, true, &mut source)
+            .unwrap_err()
+            .to_string();
+        let events = source.events.lock().unwrap();
+        assert_eq!(
+            events.as_slice(),
+            if blocked {
+                vec![]
+            } else {
+                vec!["PrepareConfirmedUpgrade refused"]
+            },
+            "{error}"
+        );
+        assert!(
+            job.confirmation
+                .as_ref()
+                .and_then(|item| item.stop.as_ref())
+                .is_none()
+        );
     }
 }
 
