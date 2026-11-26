@@ -116,12 +116,8 @@ pub(in crate::host) fn inspect(
         .unwrap_or_else(|p| p.into_inner())
         .upgrade_impact_with_agent_work(policy, &queued.keys().copied().collect(), &agent_runs)?;
     for item in &mut impact.sessions {
-        if item.kind == SessionKind::NativeChat
-            && item.disposition == Disposition::Resumes
-            && queue_ready.contains(&item.id)
-            && !item.reason.unconfirmed_agent_run()
-        {
-            item.reason = SessionCause::QueuedPromptsReady;
+        if queue_ready.contains(&item.id) {
+            mark_ready_queue(item);
         }
     }
     // Queued work no listed conversation will deliver still fences the update.
@@ -136,6 +132,16 @@ pub(in crate::host) fn inspect(
     }
     impact.blockers.extend(blockers);
     Ok(impact)
+}
+
+fn mark_ready_queue(item: &mut SessionImpact) {
+    if item.kind == SessionKind::NativeChat
+        && item.disposition == Disposition::Resumes
+        && item.checkpointed()
+        && !item.reason.unconfirmed_agent_run()
+    {
+        item.reason = SessionCause::QueuedPromptsReady;
+    }
 }
 
 impl HostState {
@@ -470,7 +476,7 @@ fn identity(value: &impl serde::Serialize) -> Result<String, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{interrupted_reason, waits_for_idle_reason};
+    use super::*;
     use crate::chat::{HeldSubagent, WorkHold};
 
     fn hold(turn: bool, agents: &[(&str, bool)]) -> WorkHold {
@@ -484,6 +490,26 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_ready_queue_does_not_change_the_checkpoint_scope_of_an_ended_provider() {
+        let mut item = SessionImpact {
+            id: TerminalId::new(),
+            kind: SessionKind::NativeChat,
+            title: String::new(),
+            identity: String::new(),
+            disposition: Disposition::Resumes,
+            reason: SessionCause::ProviderEnded,
+            interrupted_subagents: Vec::new(),
+        };
+        mark_ready_queue(&mut item);
+        assert_eq!(item.reason, SessionCause::ProviderEnded);
+        assert!(!item.checkpointed());
+        item.reason = "The conversation will resume".into();
+        mark_ready_queue(&mut item);
+        assert_eq!(item.reason, SessionCause::QueuedPromptsReady);
+        assert!(item.checkpointed());
     }
 
     #[test]

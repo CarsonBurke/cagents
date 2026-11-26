@@ -962,11 +962,13 @@ impl Courier {
             scanned: Condvar::new(),
         }));
         let owner = handle.clone();
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let thread = std::thread::Builder::new()
             .name("message-courier".into())
             .spawn(move || owner.run())
             .map_err(|error| error.to_string())?;
-        host.lock().unwrap_or_else(|p| p.into_inner()).mailbox = Some(handle.clone());
+        // The first delivery pass must see its fence before it can claim work.
+        state.mailbox = Some(handle.clone());
         Ok(Self {
             handle,
             thread: Some(thread),
