@@ -286,22 +286,15 @@ const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
 /// The lowercase Latin letter or symbol a key press names, for matching
 /// chords such as Ctrl+S.
 ///
-/// A key whose layout produces a single ASCII character is read as that
-/// character, so a remapped Latin layout (Dvorak, AZERTY) keeps its own
-/// letters. Otherwise the physical key decides, so a chord stays where it is
-/// on a Cyrillic, Greek or other non-Latin layout instead of doing nothing.
+/// A key whose layout produces a single Latin-script character is read as
+/// that character, so a remapped layout (Dvorak, AZERTY) keeps its own
+/// letters. Any other script falls back to the physical key, so a chord
+/// stays where it is on a Cyrillic, Greek or other non-Latin layout instead
+/// of doing nothing.
 pub fn latin_key(
     key: &cosmic::iced::keyboard::Key,
     physical_key: cosmic::iced::keyboard::key::Physical,
 ) -> Option<char> {
-    if let cosmic::iced::keyboard::Key::Character(value) = key.as_ref() {
-        let mut characters = value.chars();
-        if let (Some(character), None) = (characters.next(), characters.next())
-            && character.is_ascii_graphic()
-        {
-            return Some(character.to_ascii_lowercase());
-        }
-    }
     key.to_latin(physical_key)
         .map(|key| key.to_ascii_lowercase())
 }
