@@ -2427,15 +2427,19 @@ exec /bin/sleep 60
     #[cfg(target_os = "linux")] // Requires procfs inspection and proof after the provider forks.
     #[test]
     fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
+        use crate::{daemon::codex_temp::cleanup_fixture, test_timing::eventually};
         use std::os::unix::ffi::OsStrExt;
 
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST";
         if std::env::var_os(STAGE).is_none() {
             let directory = tempfile::tempdir().unwrap();
+            let census = directory.path().join("proc");
+            std::fs::create_dir(&census).unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "chat::native_holder::transport::tests::spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close", "--nocapture"])
                 .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
                 .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env(cleanup_fixture::PROC_ROOT, census)
                 .output().unwrap();
             assert!(
                 output.status.success(),
@@ -2568,12 +2572,14 @@ exec /bin/sleep 60
         assert!(record.root.is_current());
         // This sibling of the holder is outside its subreaper tree. It can
         // still use the directory after the holder has reaped its provider.
+        // Give reclamation that real process without a census of the build host.
         let mut outside = Command::new("/bin/cat")
             .env("TMPDIR", temp)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
+        cleanup_fixture::include_provider(outside.id() as i32);
         detached.close().unwrap();
         assert!(!record.root.is_current());
         let preserved = temp.join(".git").is_dir();
@@ -2597,17 +2603,13 @@ exec /bin/sleep 60
         let control = lost_reply.control.as_ref().unwrap();
         control.shutdown(std::net::Shutdown::Read).unwrap();
         send(control, &Request::Release, TIMEOUT).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if lost_reply.close().is_ok() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "lost Release reply discarded cleanup evidence"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        eventually("the exact lost Release receipt", || {
+            lost_reply
+                .identity
+                .receipt(true, DetachedWork::Stop)
+                .unwrap()
+        });
+        lost_reply.close().unwrap();
         assert!(!root.is_current());
         assert!(!lost_reply.identity.consume_receipt().unwrap());
         // Simulate losing local startup installation after the helper created
@@ -2616,14 +2618,10 @@ exec /bin/sleep 60
         let root = uninstalled.identity.record.root.clone();
         uninstalled.release_on_drop = false;
         drop(uninstalled);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while context.reconcile_cleanup().unwrap() == LaunchOutcome::Uncertain {
-            assert!(
-                Instant::now() < deadline,
-                "startup cleanup never became proved"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        eventually("proved startup cleanup", || {
+            context.reconcile_cleanup().unwrap() != LaunchOutcome::Uncertain
+        });
+        assert_eq!(context.outcome(), LaunchOutcome::TeardownProved);
         assert!(!root.is_current());
         assert!(
             std::fs::read_dir(registry::directory(Kind::Native).unwrap())
