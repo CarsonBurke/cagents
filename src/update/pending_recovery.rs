@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     daemon::lease_handoff::LeaseHandoff,
     model::HostSessionProof,
-    upgrade::recovery::{PendingRecovery, classify_retained_prepared},
+    upgrade::recovery::{PendingRecovery, pending_retirement},
 };
 
 /// Run only through the exact retained candidate named in the recovery command.
@@ -275,7 +275,10 @@ fn verify_settled(pending: &PendingRecovery, daemon: &Path) -> Result<(), Update
     let store = crate::upgrade::handoff::Store::existing()
         .map_err(invalid)?
         .ok_or_else(|| invalid("The retained checkpoint disappeared during recovery"))?;
-    let settled = classify_retained_prepared(&store.path, daemon)
+    // A serving replacement can finish retiring its canonical checkpoint
+    // while the census is in flight. The verified archive supplies the same
+    // exact scope in that case.
+    let settled = pending_retirement(&store.path, daemon)
         .map_err(invalid)?
         .ok_or_else(|| invalid("The installed recovery has no settled Prepared record"))?;
     recovery::require_prepared_scope(pending, &settled, daemon)
