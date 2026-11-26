@@ -766,11 +766,20 @@ struct Continuity {
 struct CheckpointIndex {
     version: u16,
     proof: HostSessionProof,
+    #[serde(deserialize_with = "checkpoint_phase_from_string")]
     phase: Phase,
     terminals: Vec<TerminalSource>,
     #[serde(default)]
     carried: Vec<TerminalSource>,
     chats: Vec<ChatSource>,
+}
+
+fn checkpoint_phase_from_string<'de, D>(deserializer: D) -> Result<Phase, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let phase = String::deserialize(deserializer)?;
+    Phase::deserialize(serde::de::value::StrDeserializer::new(&phase))
 }
 
 #[derive(Deserialize)]

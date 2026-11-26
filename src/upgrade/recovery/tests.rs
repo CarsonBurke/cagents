@@ -387,6 +387,23 @@ fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
 }
 
 #[test]
+fn checkpoint_discovery_requires_a_known_string_phase() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    let path = &preparation.authority.checkpoint_path;
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&checkpoint(&preparation, "Prepared")).unwrap();
+    for phase in [
+        serde_json::json!({ "Ready": null }),
+        serde_json::json!("Future"),
+    ] {
+        checkpoint["phase"] = phase;
+        save(path, &serde_json::to_vec(&checkpoint).unwrap());
+        assert!(PendingRecovery::inspect_at(path).is_err());
+    }
+}
+
+#[test]
 fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
