@@ -98,6 +98,15 @@ impl Journal {
 
     /// Coalesce latest attention without resurrecting dismissed duplicates.
     pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
+        self.record_with_resolution(event, suppressed, false)
+    }
+
+    pub fn record_with_resolution(
+        &mut self,
+        event: Event,
+        suppressed: bool,
+        resolved: bool,
+    ) -> Result<Option<Notice>, String> {
         event.validate()?;
         let session = event.target().storage_key();
         let evidence = serde_json::to_string(&event.evidence).map_err(|error| error.to_string())?;
@@ -159,15 +168,15 @@ impl Journal {
                 let notice = Notice {
                     id: Uuid::new_v4(),
                     event,
-                    delivered: suppressed,
-                    acknowledged: false,
+                    delivered: suppressed || resolved,
+                    acknowledged: resolved,
                     window,
                 };
                 let values = (
                     notices::id.eq(notice.id.to_string()),
                     notices::event.eq(&serialized),
-                    notices::delivered.eq(suppressed),
-                    notices::acknowledged.eq(false),
+                    notices::delivered.eq(notice.delivered),
+                    notices::acknowledged.eq(notice.acknowledged),
                     notices::ordinal.eq(ordinal),
                 );
                 diesel::insert_into(notices::table)
@@ -569,6 +578,25 @@ mod tests {
             .unwrap();
         assert_eq!(journal.acknowledge_waiting(&target).unwrap(), None);
         assert_eq!(journal.list().unwrap(), [finished]);
+    }
+
+    #[test]
+    fn an_already_resolved_request_is_acknowledged_when_its_evidence_is_first_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let mut waiting = event(TerminalId::new(), "turn:waiting:1");
+        waiting.evidence.kind = Kind::Waiting;
+        let notice = journal
+            .record_with_resolution(waiting.clone(), false, true)
+            .unwrap()
+            .unwrap();
+        assert!(notice.acknowledged);
+        assert!(notice.delivered);
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.list().unwrap(), [notice]);
+        assert!(journal.record(waiting, false).unwrap().is_none());
     }
 
     fn seed_owners(journal: &mut Journal) {

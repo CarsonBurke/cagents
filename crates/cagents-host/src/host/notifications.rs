@@ -642,11 +642,19 @@ fn record_attention_committed_policy(
     suppressed: bool,
     receipt: Option<CommitReceipt>,
     policy: &Preferences,
+    resolved: bool,
 ) -> Result<Option<Notice>, String> {
     if !policy.message_previews {
         event.content = None;
     }
-    record_attention_committed(journal, event, suppressed, receipt)
+    if !resolved {
+        return record_attention_committed(journal, event, suppressed, receipt);
+    }
+    // The retained actor may discard its outbox entry as soon as it receives
+    // this receipt. Persist replay evidence and the acknowledgement together.
+    let result = journal.record_with_resolution(event, suppressed, true);
+    finish_attention_receipt(&result, receipt);
+    result
 }
 
 fn record_attention_committed(
@@ -656,11 +664,18 @@ fn record_attention_committed(
     receipt: Option<CommitReceipt>,
 ) -> Result<Option<crate::notifications::Notice>, String> {
     let result = journal.record(event, suppressed);
+    finish_attention_receipt(&result, receipt);
+    result
+}
+
+fn finish_attention_receipt(
+    result: &Result<Option<Notice>, String>,
+    receipt: Option<CommitReceipt>,
+) {
     if let Some(receipt) = receipt {
         let committed = result.as_ref().map(|_| ()).map_err(Clone::clone);
         receipt.finish(committed);
     }
-    result
 }
 
 /// Drives the real bounded commit queue and journal without a portal or thread.
@@ -714,6 +729,7 @@ impl JournalTestBridge {
             suppressed,
             Some(receipt),
             policy,
+            false,
         )
     }
 
@@ -979,6 +995,21 @@ async fn run(
                 withdraw_notice(&mut withdrawals, notice);
             }
         }
+        for target in &pending.cleared_waiting {
+            if stopped(&shared) {
+                return;
+            }
+            match journal.acknowledge_waiting(target) {
+                Ok(Some(id)) => {
+                    if delivery.get(target).is_some_and(|notice| notice.id == id) {
+                        delivery.remove(target);
+                    }
+                    withdraw_target(&mut withdrawals, id, target);
+                }
+                Ok(None) => {}
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
         let events = pending
             .events
             .into_values()
@@ -1000,19 +1031,23 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
-            match record_attention_committed_policy(journal, event, suppressed, receipt, &policy) {
+            let resolved = event.evidence.kind == Kind::Waiting
+                && pending.cleared_waiting.contains(&event.target);
+            match record_attention_committed_policy(
+                journal, event, suppressed, receipt, &policy, resolved,
+            ) {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot.notices.iter().find(|old| {
                         old.event.target.storage_key() == notice.event.target.storage_key()
                     }) {
-                        if suppressed {
+                        if suppressed || resolved {
                             withdraw_notice(&mut withdrawals, old);
                         } else {
                             queue_withdrawal(&mut withdrawals, old.id);
                         }
                     }
-                    if !suppressed {
+                    if !suppressed && !resolved {
                         delivery_schedule.update(
                             notice.event.target(),
                             notice.event.evidence.kind,
@@ -1020,21 +1055,6 @@ async fn run(
                         );
                         delivery.insert(notice.event.target(), notice);
                     }
-                }
-                Ok(None) => {}
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
-        }
-        for target in pending.cleared_waiting {
-            if stopped(&shared) {
-                return;
-            }
-            match journal.acknowledge_waiting(&target) {
-                Ok(Some(id)) => {
-                    if delivery.get(&target).is_some_and(|notice| notice.id == id) {
-                        delivery.remove(&target);
-                    }
-                    withdraw_target(&mut withdrawals, id, &target);
                 }
                 Ok(None) => {}
                 Err(error) => snapshot.diagnostic = Some(error),
@@ -1388,10 +1408,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("suppressed.sqlite3");
         let mut journal = Journal::open(&path).unwrap();
-        let notice =
-            record_attention_committed_policy(&mut journal, queued, true, Some(receipt), &policy)
-                .unwrap()
-                .unwrap();
+        let notice = record_attention_committed_policy(
+            &mut journal,
+            queued,
+            true,
+            Some(receipt),
+            &policy,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             waiting.recv_timeout(Duration::from_secs(1)).unwrap(),
             Ok(())
@@ -1410,9 +1436,18 @@ mod tests {
             .committed_events
             .pop_front()
             .unwrap();
-        assert!(record_attention_committed_policy(
-            &mut reopened, queued, false, Some(receipt), &policy,
-        ).unwrap().is_none());
+        assert!(
+            record_attention_committed_policy(
+                &mut reopened,
+                queued,
+                false,
+                Some(receipt),
+                &policy,
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(replay.recv_timeout(Duration::from_secs(1)).unwrap(), Ok(()));
         drop(reopened);
         let mut final_journal = Journal::open(&path).unwrap();
@@ -1454,10 +1489,16 @@ mod tests {
                 let original = event.clone();
                 let (receipt, result) = std::sync::mpsc::channel();
                 let receipt = (path != "ordinary").then_some(CommitReceipt(Some(receipt)));
-                let notice =
-                    record_attention_committed_policy(&mut journal, event, false, receipt, &policy)
-                        .unwrap()
-                        .unwrap();
+                let notice = record_attention_committed_policy(
+                    &mut journal,
+                    event,
+                    false,
+                    receipt,
+                    &policy,
+                    false,
+                )
+                .unwrap()
+                .unwrap();
                 if path != "ordinary" {
                     assert_eq!(result.recv().unwrap(), Ok(()));
                 }
@@ -2035,6 +2076,7 @@ mod tests {
                     false,
                     Some(receipt),
                     &policy,
+                    false,
                 )
                 .unwrap()
                 .unwrap();
