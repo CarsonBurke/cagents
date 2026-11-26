@@ -230,7 +230,7 @@ pub(crate) fn claim_daemon_state_in(
     host_session: Option<&str>,
     claimant: Claimant,
 ) -> io::Result<StateClaim> {
-    crate::secure_file::prepare_private_directory(claims)?;
+    prepare_claim_directory(claims, claimant)?;
     acquire(
         &claims.join(DAEMON_CLAIM),
         record(lock, host_session)?,
@@ -325,13 +325,20 @@ pub(crate) fn claim_window_state_in(
     slot_lock: &Path,
 ) -> io::Result<StateClaim> {
     validate_window_slot(slot)?;
-    crate::secure_file::prepare_private_directory(claims)?;
+    prepare_claim_directory(claims, Claimant::Window)?;
     acquire(
         &claims.join(format!("window.{slot}.lock")),
         record(slot_lock, None)?,
         Claimant::Window,
         WINDOW_PATIENCE,
     )
+}
+
+fn prepare_claim_directory(path: &Path, claimant: Claimant) -> io::Result<()> {
+    crate::secure_file::prepare_private_directory(path).map_err(|error| {
+        tracing::debug!(directory = %path.display(), %error, "could not verify the saved-data claim directory");
+        io::Error::other(unreadable(claimant))
+    })
 }
 
 fn verified_unreadable(path: &Path) -> io::Result<Option<StateInUse>> {
@@ -466,7 +473,10 @@ fn acquire(
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                         return Err(io::Error::other(refusal(claimant, None, false)));
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        tracing::debug!(claim = %path.display(), %error, "could not publish the saved-data claim");
+                        return Err(unreadable());
+                    }
                 }
             }
             Err(_) => return Err(unreadable()),
@@ -1052,6 +1062,32 @@ mod tests {
         ));
         assert!(refusal.to_string().contains("unreadable"), "{refusal}");
         assert!(fs::symlink_metadata(path).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn a_symlinked_claim_directory_cannot_bypass_a_live_claim() {
+        let data = tempfile::tempdir().unwrap();
+        let claims = data.path().join("claims");
+        let moved = data.path().join("moved");
+        let (first, second) = (Runtime::new(), Runtime::new());
+        let _first = first.hold();
+        let _second = second.hold();
+        let _daemon = claim_daemon_state_in(&claims, &first.lock, None, Claimant::Daemon).unwrap();
+        let _window = claim_window_state_in(&claims, PRIMARY_WINDOW, &first.lock).unwrap();
+        fs::rename(&claims, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &claims).unwrap();
+        assert!(private_lock_is_held(&moved.join(DAEMON_CLAIM)).unwrap());
+        for failure in [
+            refusal_of(claim_daemon_state_in(
+                &claims,
+                &second.lock,
+                None,
+                Claimant::Daemon,
+            )),
+            refusal_of(claim_window_state_in(&claims, PRIMARY_WINDOW, &second.lock)),
+        ] {
+            assert!(failure.to_string().contains("unreadable"), "{failure}");
+        }
     }
 
     #[test]
