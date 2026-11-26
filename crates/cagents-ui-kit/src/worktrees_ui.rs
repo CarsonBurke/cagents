@@ -1090,6 +1090,20 @@ impl<'a> View<'a> {
             if let Some(checks) = pr.active_checks() {
                 facts.push(crate::sidebar::check_indicator(checks));
             }
+            // A finished pull request says so in words too, as a
+            // conversation's Work rows do, since a merged or closed
+            // checkout is the one worth cleaning up.
+            if let Some(
+                state @ (WorktreePullRequestState::Merged | WorktreePullRequestState::Closed),
+            ) = pr.state
+            {
+                facts.push(
+                    design::caption(state.label())
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                );
+            }
         }
         facts
     }

@@ -895,6 +895,9 @@ struct RowParts<'a> {
     /// The worktree's uncommitted changes. Their mark stays while the
     /// pointer is on the row, so its tooltip can be read.
     uncommitted: Option<String>,
+    /// Said when the worktree is not in Projects, which its folder's
+    /// tooltip explains.
+    unlisted: Option<&'static str>,
 }
 
 impl RowParts<'_> {
@@ -919,6 +922,7 @@ impl RowParts<'_> {
         std::iter::once(shown)
             .chain(self.marks.iter().map(|(_, said)| said.clone()))
             .chain(self.uncommitted.clone())
+            .chain(self.unlisted.map(str::to_owned))
             .chain(self.number_detail.iter().cloned())
             .collect::<Vec<_>>()
             .join(", ")
@@ -949,6 +953,7 @@ fn row_parts<'a>(
             format!("{shown}\nNot in Projects, so its changes are not shown here")
         }
     };
+    let unlisted = |path: &Path| (!openable(path)).then_some("not in Projects");
     match work {
         Work::PullRequest { row, worktree } => {
             let state = row
@@ -998,6 +1003,7 @@ fn row_parts<'a>(
                 label_tip,
                 marks: pull_request_marks(row),
                 uncommitted: worktree.and_then(uncommitted),
+                unlisted: worktree.and_then(|worktree| unlisted(&worktree.path)),
             }
         }
         Work::Worktree(worktree) => {
@@ -1015,6 +1021,7 @@ fn row_parts<'a>(
                 label_tip: Some(folder(&worktree.path)),
                 marks: Vec::new(),
                 uncommitted: uncommitted(worktree),
+                unlisted: unlisted(&worktree.path),
             }
         }
         Work::Here(path) => {
@@ -1035,6 +1042,7 @@ fn row_parts<'a>(
                 )),
                 marks: Vec::new(),
                 uncommitted: None,
+                unlisted: None,
             }
         }
     }
@@ -2176,12 +2184,18 @@ mod tests {
             "Show upstream/repo#4, state unknown"
         );
 
-        // A worktree Projects doesn't list says so on hover only.
+        // A worktree Projects doesn't list draws no mark for it: its
+        // folder's tooltip says why, and its name says so aloud.
         let edited = worktree("/repo/notes", None);
         let work = Work::Worktree(&edited);
         let parts = row_parts(list, work, &|_| false);
         assert_eq!(
             parts.described(work, true, false),
+            "repo/notes, shown below, 1 uncommitted change, not in Projects"
+        );
+        let listed = row_parts(list, work, &|_| true);
+        assert_eq!(
+            listed.described(work, true, false),
             "repo/notes, shown below, 1 uncommitted change"
         );
         assert!(

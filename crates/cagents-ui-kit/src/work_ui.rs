@@ -841,7 +841,7 @@ impl State {
         let button = widget::button::custom(content)
             .name(format!(
                 "Open {}, {}",
-                item.label(),
+                spoken_label(item),
                 status_words(item).replace(" · ", ", ")
             ))
             .class(card_style(selected))
@@ -918,7 +918,7 @@ impl State {
             widget::button::custom(widget::column::with_children(lines).spacing(space::XXS))
                 .name(format!(
                     "Open {}, {}",
-                    item.label(),
+                    spoken_label(item),
                     status_words(item).replace(" · ", ", ")
                 ))
                 .class(card_style(selected))
@@ -1328,6 +1328,21 @@ impl<'a> Leading<'a> {
 
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
     crate::interaction::tooltip(leading_glyph(item), status_words(item))
+}
+
+/// What a card or row is called aloud: a pull request's title and number,
+/// which lead what it draws, then its branch or folder; otherwise the
+/// branch or folder alone.
+fn spoken_label(item: &Item) -> String {
+    match &item.pull_request {
+        Some(pull_request) => format!(
+            "{}, #{}, {}",
+            pull_request.title,
+            pull_request.number,
+            item.label()
+        ),
+        None => item.label(),
+    }
 }
 
 /// What a card's leading glyph says, and the column it is in: `Draft pull
@@ -2051,9 +2066,8 @@ mod tests {
         );
         // Its state and column, which no word on it draws, are in its name.
         assert!(
-            names
-                .iter()
-                .any(|name| name == "Open feat/android, Open pull request, In review"),
+            names.iter().any(|name| name
+                == "Open Add the Android app, #1089, feat/android, Open pull request, In review"),
             "{names:?}"
         );
         // A branch without a pull request is named by the branch, and a
