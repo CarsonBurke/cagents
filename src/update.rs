@@ -6059,7 +6059,8 @@ finally:
             return;
         }
         let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
-        let root = tempfile::tempdir().unwrap();
+        // Recovery commands name the candidate by its physical install path.
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let paths = RuntimePaths::discover().unwrap();
         let proof = crate::model::HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("headless-recovery"),
