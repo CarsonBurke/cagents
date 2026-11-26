@@ -4029,7 +4029,7 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
 
 #[test]
 fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state() {
-    for confirmed in [false, true] {
+    for (relisted, confirmed) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut parent = adapter();
         let id = "older-child";
         parent.listed_unloaded.insert(id.into(), true);
@@ -4047,15 +4047,28 @@ fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state(
         let mut state = chat::Snapshot::default();
         crate::chat::runtime::project_events_for_test(&mut state, listed.events);
         let mut sparse = Step::default();
-        parent
-            .discover_activity_child(
-                &json!({"agentThreadId":id,"kind":"started"}),
-                "thread-exact",
-                ChildName::Recorded,
-                false,
-                &mut sparse,
-            )
-            .unwrap();
+        if relisted {
+            parent
+                .discover_child_as(
+                    id,
+                    &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                    ChildName::Listed,
+                    false,
+                    true,
+                    &mut sparse,
+                )
+                .unwrap();
+        } else {
+            parent
+                .discover_activity_child(
+                    &json!({"agentThreadId":id,"kind":"started"}),
+                    "thread-exact",
+                    ChildName::Recorded,
+                    false,
+                    &mut sparse,
+                )
+                .unwrap();
+        }
         let request = sparse
             .writes
             .iter()

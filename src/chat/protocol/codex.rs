@@ -1048,7 +1048,10 @@ impl Codex {
             _ => None,
         };
         if origin == ChildName::Current
-            && known.is_none_or(|child| child.subagent_status.is_none())
+            && known.is_none_or(|child| {
+                child.subagent_status.is_none()
+                    || child.subagent_detail == chat::UNLOADED_CHILD_RUNNING
+            })
             && let Some(hint) = hint
         {
             metadata["status"] = hint.into();
@@ -1089,6 +1092,8 @@ impl Codex {
         }
         let discovered = !self.children.contains_key(id);
         let status = agent_status(&metadata["status"]);
+        let only_listed_running =
+            origin == ChildName::Listed && status == Some(ToolStatus::Running);
         let mut newly_loaded = false;
         if discovered && load {
             if self.children.len() >= MAX_LIVE_CHILDREN {
@@ -1152,13 +1157,14 @@ impl Codex {
             child.is_child = true;
             child.parent_child = parent_thread(metadata).map(str::to_owned);
             let previous = self.listed_unloaded.remove(id);
-            let sparse = previous == Some(true) && status.is_none();
-            if sparse {
+            let awaiting_observation =
+                only_listed_running || (previous == Some(true) && status.is_none());
+            if awaiting_observation {
                 child.subagent_status = Some(ToolStatus::Running);
                 child.subagent_detail = chat::UNLOADED_CHILD_RUNNING.into();
             }
             self.children.insert(id.into(), Box::new(child));
-            newly_loaded = previous.is_some() && !sparse;
+            newly_loaded = previous.is_some() && !awaiting_observation;
             if newly_loaded {
                 // The server supplied fresh evidence while starting the read.
                 step.events.extend(chat::child_events(
@@ -1195,7 +1201,7 @@ impl Codex {
         {
             // Sparse collab metadata must not reset a known terminal outcome.
             child.subagent_status = Some(status);
-            if child.subagent_detail == chat::UNLOADED_CHILD_RUNNING {
+            if child.subagent_detail == chat::UNLOADED_CHILD_RUNNING && !only_listed_running {
                 child.subagent_detail.clear();
                 newly_loaded = true;
                 step.events.extend(chat::child_events(
@@ -1206,7 +1212,11 @@ impl Codex {
                 ));
             }
         }
-        let detail = if !load && status == Some(ToolStatus::Running) {
+        let projecting_unloaded = self
+            .children
+            .get(id)
+            .is_some_and(|child| child.subagent_detail == chat::UNLOADED_CHILD_RUNNING);
+        let detail = if projecting_unloaded || (!load && status == Some(ToolStatus::Running)) {
             Some(chat::UNLOADED_CHILD_RUNNING.into())
         } else {
             newly_loaded.then(String::new)
