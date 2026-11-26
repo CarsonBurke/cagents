@@ -1297,6 +1297,8 @@ struct Attempt {
     intent: chat::Intent,
     session: chat::Session,
     recovery: Option<AccountRecovery>,
+    /// A new reader can close before this exact attachment reaches Ready.
+    disconnect: Option<String>,
     upgrade_committed: bool,
     /// Whether the daemon-prepared successor of a stranded retained card has
     /// been saved in that card's place.
@@ -9481,6 +9483,7 @@ impl Cagents {
                 target,
                 intent: chat::Intent::Restore,
                 session: replacement.clone(),
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
@@ -12250,6 +12253,7 @@ impl Cagents {
                 intent,
                 session: session.clone(),
                 recovery: None,
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: upgrade_admission.clone(),
@@ -15107,7 +15111,23 @@ impl Cagents {
                         let limits = self.refresh_chat_limit_accounts();
                         // Reports that raced the attachment woke nothing.
                         let usage = self.take_chat_account_usage(target);
+                        let disconnect = attempt.disconnect.or_else(|| {
+                            let handle = self.chat_runtime_mut(target)?.handle()?;
+                            (!handle.is_connected())
+                                .then(|| "Conversation connection closed".into())
+                        });
+                        // Use the ordinary disconnect path after installing
+                        // the handle and any complete queue receipts, before
+                        // trying to send the draft on that handle.
+                        let disconnected = disconnect.is_some();
+                        let disconnect_task = disconnect.map_or_else(Task::none, |error| {
+                            self.handle_chat_ui_inner(Action::Wake(
+                                target,
+                                Wake::Disconnected(error),
+                            ))
+                        });
                         let submitted = automatic_submit
+                            .filter(|_| !disconnected)
                             .and_then(|(revision, mode)| match self.cards.get(&target.card) {
                                 Some(CardRuntime::Chat(runtime))
                                     if runtime.target == target && runtime.revision == revision =>
@@ -15129,6 +15149,7 @@ impl Cagents {
                         let restored_queue = self.check_saved_reopened_queue_scope(target.card);
                         return Task::batch([
                             submitted,
+                            disconnect_task,
                             usage,
                             limits,
                             opening_name,
@@ -15556,8 +15577,18 @@ impl Cagents {
                     }
                     wake => wake,
                 };
-                // Ready refreshes the new handle.
+                // Ready refreshes the new handle. An early disconnect
+                // carries a reason the handle's liveness cannot recover.
                 if self.chat_start_pending(target.card) {
+                    if let Wake::Disconnected(error) = wake {
+                        if let Some(Phase::Starting(attempt)) =
+                            self.chat_ui.phases.get_mut(&target.card)
+                            && attempt.target == target
+                        {
+                            attempt.disconnect.get_or_insert(error);
+                        }
+                        return Task::none();
+                    }
                     // The account reports go unread, as the recipe may already
                     // name the account the conversation is moving to, but
                     // not left queued: the queue wakes the surface only when

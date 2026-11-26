@@ -18744,6 +18744,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                 intent: chat::Intent::Restore,
                 session: source.clone(),
                 recovery: None,
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
@@ -18803,6 +18804,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                     intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
+                    disconnect: None,
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
@@ -24628,6 +24630,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                     committed: false,
                     submit: None,
                 }),
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
@@ -24646,6 +24649,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                     intent: chat::Intent::Restore,
                     session: other,
                     recovery: None,
+                    disconnect: None,
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
@@ -24953,6 +24957,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                 intent: chat::Intent::Restore,
                 session: source.clone(),
                 recovery: None,
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
@@ -25032,6 +25037,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                     intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
+                    disconnect: None,
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
@@ -27060,6 +27066,62 @@ fn a_later_completion_stays_after_the_recovered_prefix_or_the_edited_draft() {
         };
         assert_eq!(runtime.composer.text().trim(), text, "edited={edited}");
         assert_eq!(runtime.attachments, files, "edited={edited}");
+    }
+}
+
+#[test]
+fn refused_queue_read_before_ready_keeps_the_exact_attachment_retryable() {
+    const REFUSAL: &str = "The held input page expired";
+    for (early_refusal, dead_handle, expected) in [
+        (true, true, Some(REFUSAL)),
+        (false, false, None),
+        (false, true, Some("Conversation connection closed")),
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+        let existing = chat_runtime(&app, card);
+        let stale = existing.target;
+        let source = existing.session.clone();
+        let typed_file = Attachment::file("/project/typed.txt");
+        write(&mut app, card, "Independently typed");
+        app.chat_runtime_mut(stale)
+            .unwrap()
+            .attach([typed_file.path.clone()]);
+        drop(app.start_chat(card, source, chat::Intent::Restore, None, false));
+
+        let target = chat_runtime_attempt(&app, card);
+        assert_ne!(target, stale);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        if dead_handle {
+            handle.disconnect_for_test();
+        }
+        // An old reader's callback cannot poison this attempt.
+        drop(app.handle_chat_ui(Action::Wake(
+            stale,
+            Wake::Disconnected("Old reader closed".into()),
+        )));
+        if early_refusal {
+            // The queue reader reports a refused page as a disconnect and
+            // sends no CompletedQueue event with the partially read body.
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Disconnected(REFUSAL.into()))));
+            drop(app.handle_chat_ui(Action::Wake(
+                target,
+                Wake::Disconnected("Daemon disconnected".into()),
+            )));
+        }
+        answer_start(&mut app, target, Ok(handle));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.target, target);
+        assert_eq!(runtime.disconnected, dead_handle);
+        assert_eq!(runtime.error.as_deref(), expected);
+        assert_eq!(runtime.composer.text().trim(), "Independently typed");
+        assert_eq!(runtime.attachments, vec![typed_file]);
+        assert!(runtime.restored_queue.is_none());
+
+        if dead_handle {
+            drop(app.handle_chat_ui(Action::Reconnect(target)));
+            assert_ne!(chat_runtime_attempt(&app, card), target);
+        }
     }
 }
 
