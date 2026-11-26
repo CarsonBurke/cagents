@@ -406,8 +406,18 @@ fn collect_runtime_directory(
         Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
         Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
     }
-    // Its own connection, so a batch never waits on or holds the host lock.
+    // Inventory reads use their own connection. Only final admission takes
+    // the workspace writer and host locks.
     if let Some(model) = model {
+        match service::attempt("closed-session notice collection", || {
+            notifications::orphaned::collect(&host, model)
+        }) {
+            Ok(0) => {}
+            Ok(notices) => tracing::debug!(notices, "acknowledged attention for closed sessions"),
+            Err(error) => {
+                tracing::debug!(%error, "closed-session attention inventory is incomplete")
+            }
+        }
         match service::attempt("pane change collection", || model.collect_view_operations()) {
             Ok(0) => {}
             Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
