@@ -1508,8 +1508,9 @@ mod tests {
             true,
             resolved,
         );
-        assert!(withdrawals.contains(&desktop));
-        assert!(withdrawals.contains(&notice.id));
+        assert_eq!(withdrawals.pop_first().unwrap().id(), desktop);
+        assert_eq!(withdrawals.pop_first().unwrap().id(), notice.id);
+        assert!(withdrawals.is_empty());
     }
 
     #[test]
