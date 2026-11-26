@@ -61,6 +61,171 @@ mod tests {
         assert!(!find.truncated);
     }
 
+    /// The terminal's menu is the native menu's rows, not accent text
+    /// buttons that hug their labels (#3442): each row is as wide as the
+    /// menu, Copy waits for a selection, and a link adds its own actions.
+    #[test]
+    fn the_terminal_menu_draws_native_rows_with_copy_waiting_for_a_selection() {
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        use cosmic::iced::{Size, mouse};
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        let rows = |app: &Cagents| {
+            let items = app.terminal_menu(card).expect("an open menu");
+            let mut menu = crate::ui_controls::menu_rows(
+                items,
+                Message::TerminalFind(Action::DismissContext(card)),
+            );
+            let mut tree = Tree::new(&menu);
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let node = menu.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1000.0, 1000.0)),
+            );
+            let nodes = menu.as_widget().a11y_nodes(
+                layout::Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+                .map(|node| {
+                    let node = node.node();
+                    let bounds = node.bounds().expect("a placed row");
+                    (
+                        node.label().unwrap_or_default().to_owned(),
+                        !node.is_disabled(),
+                        bounds.x1 - bounds.x0,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        app.terminal_context = Some(Context {
+            card,
+            selection: None,
+            link: Some(Url::parse("https://example.com/").unwrap()),
+            point: iced::Point::ORIGIN,
+        });
+        let menu = rows(&app);
+        assert_eq!(
+            menu.iter()
+                .map(|(label, enabled, _)| (label.as_str(), *enabled))
+                .collect::<Vec<_>>(),
+            [
+                ("Copy", false),
+                ("Paste", true),
+                ("Select all", true),
+                ("Clear scrollback", true),
+                ("Find…", true),
+                ("Open link", true),
+                ("Copy link", true),
+            ]
+        );
+        // "Open link" and its hint estimate 241.5 pixels, which the native
+        // menu truncates; every row takes the widest row's width.
+        assert!(
+            menu.iter().all(|(_, _, width)| *width == 241.0),
+            "every row is the menu's width: {menu:?}"
+        );
+        app.terminal_context = Some(Context {
+            card,
+            selection: Some(crate::terminal::SearchMatch {
+                start_row: 0,
+                start_column: 0,
+                end_row: 0,
+                end_column: 4,
+            }),
+            link: None,
+            point: iced::Point::ORIGIN,
+        });
+        let menu = rows(&app);
+        assert_eq!(menu[0].0, "Copy");
+        assert!(menu[0].1, "a selection can be copied");
+        assert_eq!(menu.len(), 5, "no link, no link actions");
+        assert!(
+            menu.iter().all(|(_, _, width)| *width == 240.0),
+            "the native menu's narrowest width: {menu:?}"
+        );
+    }
+
+    /// Escape closes the menu before the terminal's program can take it,
+    /// and opening the link from it closes it like its other rows.
+    #[test]
+    fn escape_and_the_link_row_close_the_terminal_menu() {
+        use cosmic::iced::advanced::{Shell, clipboard, layout, widget::Tree};
+        use cosmic::iced::{Size, keyboard, mouse};
+
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        let link = Url::parse("https://example.com/").unwrap();
+        app.terminal_context = Some(Context {
+            card,
+            selection: None,
+            link: Some(link.clone()),
+            point: iced::Point::ORIGIN,
+        });
+        {
+            let items = app.terminal_menu(card).expect("an open menu");
+            let mut menu = crate::ui_controls::menu_rows(
+                items,
+                Message::TerminalFind(Action::DismissContext(card)),
+            );
+            let mut tree = Tree::new(&menu);
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let node = menu.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1000.0, 1000.0)),
+            );
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            let escape = keyboard::Key::Named(keyboard::key::Named::Escape);
+            menu.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: escape.clone(),
+                    modified_key: escape,
+                    physical_key: keyboard::key::Physical::Unidentified(
+                        keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }),
+                layout::Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &iced::Rectangle::with_size(Size::new(1000.0, 1000.0)),
+            );
+            assert!(shell.is_event_captured(), "the terminal never sees it");
+            drop(shell);
+            assert!(
+                matches!(
+                    messages.as_slice(),
+                    [Message::TerminalFind(Action::DismissContext(dismissed))] if *dismissed == card
+                ),
+                "Escape dismisses the menu"
+            );
+        }
+        drop(app.update(Message::OpenLink(
+            card,
+            link,
+            settings::LinkOpenGesture::ControlClick,
+        )));
+        assert!(
+            app.terminal_context.is_none(),
+            "the link row closes the menu"
+        );
+    }
+
     fn output_snapshot(sequence: u64) -> crate::terminal::RenderSnapshot {
         crate::terminal::RenderSnapshot {
             activity: Some(crate::model::TerminalOutputActivity {
@@ -913,55 +1078,57 @@ impl Cagents {
         )
     }
 
-    pub(super) fn terminal_menu(&self, card: CardId) -> Option<Element<'_, Message>> {
+    /// The terminal's context menu, open where the terminal took a right
+    /// click as its own: the clipboard and find, then the link under the
+    /// pointer. Copy waits for a selection.
+    pub(super) fn terminal_menu(
+        &self,
+        card: CardId,
+    ) -> Option<Vec<crate::ui_controls::MenuItem<'_, Message>>> {
+        use crate::ui_controls::{menu_divider, menu_item};
         let context = self
             .terminal_context
             .as_ref()
             .filter(|context| context.card == card)?;
-        let command = |label, action| {
-            widget::button::text(label)
-                .width(Length::Fill)
-                .on_press(Message::TerminalFind(action))
-                .into()
-        };
-        let mut items = Vec::new();
-        let mut copy = widget::button::text("Copy").width(Length::Fill);
-        if let Some(selection) = context.selection {
-            copy = copy.on_press(Message::TerminalFind(Action::CopySelection(
-                card, selection,
-            )));
-        }
-        items.push(copy.into());
-        items.push(command("Paste", Action::PasteClipboard(card)));
-        items.push(command("Select all", Action::SelectAll(card)));
-        items.push(command("Clear scrollback", Action::Clear(card)));
-        items.push(command("Find…", Action::Open(card)));
+        let command = |label, action| menu_item(label, None, Some(Message::TerminalFind(action)));
+        let mut items = vec![
+            menu_item(
+                "Copy",
+                None,
+                context
+                    .selection
+                    .map(|selection| Message::TerminalFind(Action::CopySelection(card, selection))),
+            ),
+            command("Paste", Action::PasteClipboard(card)),
+            command("Select all", Action::SelectAll(card)),
+            command("Clear scrollback", Action::Clear(card)),
+            command("Find…", Action::Open(card)),
+        ];
         if let Some(link) = &context.link {
-            items.push(
-                widget::button::text(match (link.scheme() == "file", cfg!(target_os = "macos")) {
-                    (true, false) => "Open file · Ctrl+click",
-                    (false, false) => "Open link · Ctrl+click",
-                    (true, true) => "Open file · Cmd+click",
-                    (false, true) => "Open link · Cmd+click",
-                })
-                .width(Length::Fill)
-                .on_press(Message::OpenLink(
+            items.push(menu_divider());
+            items.push(menu_item(
+                if link.scheme() == "file" {
+                    "Open file"
+                } else {
+                    "Open link"
+                },
+                Some(if cfg!(target_os = "macos") {
+                    "Cmd+click"
+                } else {
+                    "Ctrl+click"
+                }),
+                Some(Message::OpenLink(
                     card,
                     link.clone(),
                     settings::LinkOpenGesture::ControlClick,
-                ))
-                .into(),
-            );
+                )),
+            ));
             items.push(command(
                 "Copy link",
                 Action::Copy(card, link.as_str().to_owned()),
             ));
         }
-        Some(
-            widget::column::with_children(items)
-                .width(Length::Fixed(200.0))
-                .into(),
-        )
+        Some(items)
     }
 
     pub(super) fn terminal_paste_dialog(&self) -> Option<Element<'_, Message>> {
