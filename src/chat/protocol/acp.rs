@@ -100,6 +100,11 @@ pub struct Profile {
     /// Whether `session/cancel` also ends the commands the agent left
     /// running in the background, as Antigravity 1.5.17's does.
     pub cancel_stops_background: bool,
+    /// Whether a command the agent stops waiting for goes on in the
+    /// background, the turn open until it ends, as Antigravity 1.5.17's
+    /// `run_command` does past its `WaitMsBeforeAsync`. Only then is a
+    /// command left running when the agent goes on taken for one.
+    pub backgrounds_commands: bool,
 }
 
 /// The ACP server's command line, and the settings to apply once its
@@ -266,6 +271,11 @@ struct Turn {
     /// the background finish.
     on_background: bool,
 }
+
+/// Why a message cannot steer a turn that answers a correlated run: it
+/// would change the answer the run's caller is waiting for.
+const RUN_TURN_REFUSAL: &str = "This turn is answering a message that waits for its reply, and \
+     steering it would change that reply. Queue the message for the next turn.";
 
 /// A message written during a turn, held for the next one.
 struct Queued {
@@ -477,6 +487,7 @@ impl Acp {
             // One queued message can go ahead of the rest, or, held between
             // turns by a stop or a refusal, start the next turn.
             queue_start: true,
+            queue_holds: true,
             // Sending what is queued now steers it into the running turn.
             send_queued_now: self.profile.steers,
             interrupt_stops_background: self.profile.cancel_stops_background,
@@ -688,9 +699,9 @@ impl Acp {
     }
 
     /// The agent went on while its commands ran: they run in the background.
-    fn went_on(&mut self, events: &mut Vec<Event>) {
-        for (id, content) in self.calls.background_running() {
-            events.push(Event::Item(tool_item(id, content)));
+    fn went_on(&mut self) {
+        if self.profile.backgrounds_commands {
+            self.calls.background_running();
         }
     }
 
@@ -699,6 +710,9 @@ impl Acp {
     /// agent reports its usage as each model response ends. Published once,
     /// until the agent is at work again.
     fn awaits_background(&mut self, events: &mut Vec<Event>) {
+        if !self.profile.backgrounds_commands {
+            return;
+        }
         let waits = self.permissions.is_empty() && self.calls.only_background_live();
         if let Some(turn) = self.turn.as_mut().filter(|turn| !turn.cancelling)
             && waits
@@ -1243,7 +1257,7 @@ impl Acp {
                     return;
                 }
                 if live {
-                    self.went_on(&mut events);
+                    self.went_on();
                     self.at_work(&mut events);
                 }
                 self.chunk(role, kind == "agent_thought_chunk", update, &mut events);
@@ -1341,7 +1355,7 @@ impl Acp {
                 // A model response ended: what it left running runs on in
                 // the background, and may be all the turn waits for.
                 if live {
-                    self.went_on(&mut events);
+                    self.went_on();
                     self.awaits_background(&mut events);
                 }
             }
@@ -1640,6 +1654,9 @@ impl Adapter for Acp {
                             "{label} cannot take a message mid-turn; queue it for the next turn."
                         ));
                     }
+                    (Some(turn), PromptMode::Steer) if turn.run.is_some() => {
+                        return Err(RUN_TURN_REFUSAL.into());
+                    }
                     (Some(_), mode) => mode,
                 };
                 if mode == PromptMode::Send {
@@ -1863,6 +1880,9 @@ impl Adapter for Acp {
                     Some(_) if !self.profile.steers => {
                         return Err(format!("{label} cannot take a message mid-turn."));
                     }
+                    Some(turn) if turn.run.is_some() => {
+                        return Err(RUN_TURN_REFUSAL.into());
+                    }
                     Some(_) => {
                         if let Some((blocks, items)) = self.take_queued(&mut step) {
                             self.steer(blocks, items, &mut step);
@@ -1986,6 +2006,7 @@ pub(crate) static TEST_PROFILE: Profile = Profile {
     sign_in_required: auth_required,
     steers: true,
     cancel_stops_background: true,
+    backgrounds_commands: true,
 };
 
 #[cfg(test)]

@@ -3417,6 +3417,11 @@ pub struct Capabilities {
     pub queue_remove: bool,
     #[serde(default)]
     pub queue_start: bool,
+    /// Whether what is queued when a turn is stopped or refused waits for
+    /// the reader, who can send it with [`Command::SendQueuedNow`] or start
+    /// one message of it, rather than starting the next turn by itself.
+    #[serde(default)]
+    pub queue_holds: bool,
     #[serde(default)]
     pub interrupt_modes: Vec<String>,
     #[serde(default)]

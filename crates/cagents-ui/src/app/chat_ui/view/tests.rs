@@ -14015,7 +14015,30 @@ fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
     snapshot.busy = false;
     assert_eq!(runtime.send_now_count(), 0);
     assert!(!runtime.can_send_now());
-    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    assert!(!runtime.queue_held());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
+    // Unless the provider holds it, as an ACP agent does after a stop or a
+    // refusal: then nothing would send it but the reader, and the heading
+    // says so beside Send now.
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .queue_holds = true;
+    assert!(runtime.queue_held());
+    assert_eq!(runtime.send_now_count(), 2);
+    assert!(runtime.can_send_now());
+    assert_eq!(runtime.queue_title(2), "Queued · 2 · waiting for you");
+    assert!(runtime.queue_view().is_some());
+    // Without a turn running Send now needs no say-so to steer.
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .send_queued_now = false;
+    assert!(runtime.can_send_now());
+    // A turn running sends the queue when it ends, so it is not held.
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.send_queued_now = true;
+    snapshot.busy = true;
+    assert!(!runtime.queue_held());
+    assert_eq!(runtime.queue_title(2), "Queued · 2");
     runtime.disconnected = true;
     assert!(!runtime.can_send_now());
     runtime.disconnected = false;

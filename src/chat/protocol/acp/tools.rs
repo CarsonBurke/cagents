@@ -101,10 +101,9 @@ impl Calls {
     /// it is once the agent goes on without waiting for it: it writes, or
     /// reports the usage of a model response that ended after the command
     /// started. Agents report a step's calls together after its usage, so
-    /// calls made side by side are not taken for background ones. Returns
-    /// the steps that changed.
-    pub fn background_running(&mut self) -> Vec<(String, ItemContent)> {
-        let mut moved = Vec::new();
+    /// calls made side by side are not taken for background ones. Such a
+    /// command is still shown running, with its time: it is.
+    pub fn background_running(&mut self) {
         for id in &self.order {
             let Some(call) = self.calls.get_mut(id) else {
                 continue;
@@ -115,10 +114,8 @@ impl Calls {
                 && call.status == Some(ToolStatus::Running)
             {
                 call.background = true;
-                moved.push((format!("tool:{id}"), call.content()));
             }
         }
-        moved
     }
 
     /// Notes that the reader refused `id`.
@@ -187,10 +184,7 @@ impl Calls {
 
 impl Call {
     fn content(&self) -> ItemContent {
-        let status = match self.status.unwrap_or(ToolStatus::Running) {
-            ToolStatus::Running if self.background => ToolStatus::Waiting,
-            status => status,
-        };
+        let status = self.status.unwrap_or(ToolStatus::Running);
         if let Some(diffs) = &self.diffs {
             return ItemContent::Changes {
                 changes: diffs.clone(),

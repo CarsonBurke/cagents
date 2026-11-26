@@ -826,6 +826,8 @@ const QUEUE_PREVIEW_BYTES: usize = prompt::QUEUE_PREVIEW_BYTES;
 enum QueueTiming {
     NextStep,
     NextTurn,
+    /// Held by a stop or a refusal until the reader sends it.
+    Held,
     /// On its way to the agent, or back to the composer.
     Leaving,
     /// Sent, without the agent confirming it got it, and whether it can be
@@ -873,6 +875,10 @@ fn queue_row<'a>(
         QueueTiming::NextTurn => crate::interaction::tooltip(
             crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
             "Sent when this turn ends",
+        ),
+        QueueTiming::Held => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
+            "Waiting for you: send a message, or Send now",
         ),
         QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
@@ -2718,7 +2724,10 @@ impl Runtime {
     /// their way back to the composer. Messages this app still holds, such
     /// as follow-ups for a provider without a queue, cannot go early.
     pub(super) fn send_now_count(&self) -> usize {
-        if !self.snapshot.capabilities.send_queued_now || !self.snapshot.busy {
+        let caps = &self.snapshot.capabilities;
+        let into_turn = caps.send_queued_now && self.snapshot.busy;
+        let held = caps.queue_holds && !self.snapshot.busy;
+        if !into_turn && !held {
             return 0;
         }
         self.snapshot
@@ -2728,6 +2737,12 @@ impl Runtime {
                 !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
             })
             .count()
+    }
+
+    /// Whether the provider holds what is queued for the reader, as a stop
+    /// or a refusal leaves it: no turn is running to send it when it ends.
+    pub(super) fn queue_held(&self) -> bool {
+        self.snapshot.capabilities.queue_holds && !self.snapshot.busy && self.send_now_count() > 0
     }
 
     /// Whether Send now can be asked for this moment: one already on its way
@@ -2754,6 +2769,7 @@ impl Runtime {
             Some(chat::SendNow::Declined) if send_now > 0 => {
                 format!("Queued · {count} · couldn't send early")
             }
+            _ if self.queue_held() => format!("Queued · {count} · waiting for you"),
             _ => format!("Queued · {count}"),
         }
     }
@@ -2793,6 +2809,11 @@ impl Runtime {
             )
             .into(),
             Some(_) => "Sending now…".into(),
+            None if self.queue_held() => format!(
+                "Send {it} to {provider} now, starting the next turn. A message you send goes \
+                 after {it}."
+            )
+            .into(),
             None => {
                 // Where Stop also ends background work, say so: that
                 // is the difference that makes Send now worth choosing.
@@ -7015,6 +7036,7 @@ impl Runtime {
             })
         };
         let mut rows = Vec::new();
+        let held = self.queue_held();
         for queued in &self.snapshot.queued_messages {
             if self.taken_back.contains(&queued.id) {
                 continue;
@@ -7058,7 +7080,11 @@ impl Runtime {
             if caps.queue_start {
                 controls.push(control(
                     Icon::ChevronUp,
-                    "Send next, ahead of the rest",
+                    if held {
+                        "Send this now"
+                    } else {
+                        "Send next, ahead of the rest"
+                    },
                     available,
                     Action::Command(
                         target,
@@ -7079,6 +7105,7 @@ impl Runtime {
             rows.push(queue_row(
                 match queued.delivery {
                     _ if recalling => QueueTiming::Leaving,
+                    _ if held => QueueTiming::Held,
                     chat::QueueDelivery::NextStep => QueueTiming::NextStep,
                     chat::QueueDelivery::NextTurn => QueueTiming::NextTurn,
                 },

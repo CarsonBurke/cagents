@@ -1448,7 +1448,8 @@ fn a_turn_held_open_by_background_commands_says_so() {
     acp.receive(usage(12417)).unwrap();
     let step = acp.receive(with("tool_call", "in_progress")).unwrap();
     assert!(statuses(&step).is_empty());
-    // The model goes on while the command runs: it runs in the background.
+    // The model goes on while the command runs: it runs in the background,
+    // and is still shown running.
     let step = acp
         .receive(update(
             &session,
@@ -1459,14 +1460,7 @@ fn a_turn_held_open_by_background_commands_says_so() {
     assert!(
         items(&step)
             .iter()
-            .any(|item| item.id == "tool:call_12809436142955883336"
-                && matches!(
-                    item.content,
-                    ItemContent::Command {
-                        status: ToolStatus::Waiting,
-                        ..
-                    }
-                ))
+            .all(|item| item.id != "tool:call_12809436142955883336")
     );
     assert!(statuses(&step).is_empty());
     // Its response over, the turn waits on the command alone.
@@ -1494,6 +1488,37 @@ fn a_turn_held_open_by_background_commands_says_so() {
         .receive(reply(&request, json!({"stopReason": "end_turn"})))
         .unwrap();
     assert_eq!(statuses(&step), [(false, "Ready")]);
+}
+
+/// Only an agent whose commands are recorded going on in the background has
+/// its turn read as waiting on them: Muse's model going on beside a command
+/// says nothing of the kind.
+#[test]
+fn an_agent_without_background_commands_never_waits_on_them() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    acp.profile = &muse::PROFILE;
+    prompt(&mut acp, "Build it.");
+    let usage = |used: u64| {
+        update(
+            &session,
+            json!({"sessionUpdate": "usage_update", "used": used, "size": 1048576}),
+        )
+    };
+    acp.receive(usage(10)).unwrap();
+    acp.receive(update(
+        &session,
+        json!({"sessionUpdate": "tool_call", "toolCallId": "a", "kind": "execute",
+            "title": "make", "status": "in_progress"}),
+    ))
+    .unwrap();
+    acp.receive(update(
+        &session,
+        json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "Building."}}),
+    ))
+    .unwrap();
+    assert!(statuses(&acp.receive(usage(20)).unwrap()).is_empty());
 }
 
 #[test]
@@ -2257,6 +2282,23 @@ fn a_correlated_run_never_takes_the_readers_held_queue() {
     );
     assert!(acp.turn.is_none());
     assert_eq!(acp.queued.len(), 1);
+}
+
+/// A run's caller waits for its turn's answer, which a message steered in
+/// would change: the message waits for the next turn instead.
+#[test]
+fn a_correlated_runs_turn_is_never_steered() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let run = crate::model::RunId::new();
+    acp.command_for_run(run, send("the run's", PromptMode::Send))
+        .unwrap();
+    let refused = acp.command(send("mine", PromptMode::Steer)).unwrap_err();
+    assert!(refused.contains("Queue the message"), "{refused}");
+    acp.command(send("mine", PromptMode::Queue)).unwrap();
+    assert!(acp.command(Command::SendQueuedNow).is_err());
+    assert_eq!(acp.queued.len(), 1);
+    assert_eq!(acp.turn.as_ref().unwrap().requests.len(), 1);
 }
 
 #[test]

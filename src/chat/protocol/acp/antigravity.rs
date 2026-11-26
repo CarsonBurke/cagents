@@ -17,9 +17,11 @@ pub static PROFILE: Profile = Profile {
     sign_in_required: super::auth_required,
     // As recorded from 1.5.17: a prompt sent mid-turn answers the running
     // one with `end_turn` and goes on with its work, and `session/cancel`
-    // fails the background commands the turn started.
+    // fails the background commands the turn started, which run on after
+    // the model stops waiting for them.
     steers: true,
     cancel_stops_background: true,
+    backgrounds_commands: true,
 };
 
 /// What `agy acp` takes as `agy` does, with a value.

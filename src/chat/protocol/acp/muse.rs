@@ -39,6 +39,7 @@ pub static PROFILE: Profile = Profile {
     // background work when a turn is cancelled.
     steers: false,
     cancel_stops_background: false,
+    backgrounds_commands: false,
 };
 
 /// Muse's ACP mode identifiers.
