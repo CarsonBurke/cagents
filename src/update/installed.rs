@@ -13,6 +13,7 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    #[cfg(target_os = "linux")]
     pub(super) fn previous_link(&self) -> Option<&Path> {
         self.previous_link.as_deref()
     }

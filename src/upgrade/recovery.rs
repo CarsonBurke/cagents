@@ -541,6 +541,50 @@ struct ManualRequest {
     windows: Vec<String>,
 }
 
+impl ManualRequest {
+    /// The original checkpoint remains immutable across recovery attempts.
+    /// A synced request recorded before a close keeps that window in scope
+    /// even if the coordinator died before the successor claimed custody.
+    fn carried_windows(&self, state: &Path) -> Result<BTreeSet<String>, String> {
+        let mut carried = BTreeSet::new();
+        for entry in fs::read_dir(state).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let Some(job) = name.to_str().and_then(|name| name.strip_suffix(".request")) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(job).is_err() {
+                continue;
+            }
+            let Ok(Some(bytes)) = read_checkpoint(&entry.path()) else {
+                continue;
+            };
+            let Ok(prior) = serde_json::from_slice::<Self>(&bytes) else {
+                continue;
+            };
+            if prior.version == self.version
+                && prior.job == job
+                && prior.checkpoint == self.checkpoint
+                && prior.source == self.source
+                && prior.target == self.target
+                && prior.target_hash == self.target_hash
+                && prior.census_hash == self.census_hash
+            {
+                if !valid_recovery_windows(&prior.windows) {
+                    return Err("An earlier recovery recorded invalid window slots".into());
+                }
+                carried.extend(
+                    prior
+                        .windows
+                        .into_iter()
+                        .filter(|slot| !self.windows.contains(slot)),
+                );
+            }
+        }
+        Ok(carried)
+    }
+}
+
 /// A restored terminal's source/relaunch lineage is bounded by the complete
 /// checkpoint (8 MiB). Budget its published descriptor, paired sessions and
 /// current chats as well as the receipt itself before asking for shutdown.
@@ -1075,12 +1119,7 @@ impl PendingRecovery {
                                 .any(|known| known.id == paired.id && !same_terminal(known, paired))
                     })
             })
-            || self.windows.len() > 1024
-            || self
-                .windows
-                .iter()
-                .any(|slot| crate::instance::validate_window_slot(slot).is_err())
-            || self.windows.iter().collect::<BTreeSet<_>>().len() != self.windows.len()
+            || !valid_recovery_windows(&self.windows)
         {
             return Err(
                 "Retained recovery census has duplicate, foreign or unbounded original owners"
@@ -1261,9 +1300,15 @@ impl PendingRecovery {
         worker: &File,
         guard: &UiUpdateGuard,
         handoff: &LeaseHandoff,
+        windows: &[String],
     ) -> Result<Receipt, String> {
         if !yes || selected_hash != self.checkpoint_hash {
             return Err("Recovery requires --yes and the exact retained checkpoint SHA256; nothing was started".into());
+        }
+        if !valid_recovery_windows(windows)
+            || self.windows.iter().any(|slot| !windows.contains(slot))
+        {
+            return Err("Recovery requires the original saved window slots".into());
         }
         if !self.original_census_complete {
             return Err("Recovery needs the complete original census. Repeat this exact command with --census PATH naming the retained pre-update installer census; the checkpoint was preserved".into());
@@ -1341,7 +1386,7 @@ impl PendingRecovery {
             );
         }
         let target_hash = executable_hash(&target)?;
-        let request = ManualRequest {
+        let mut request = ManualRequest {
             version: 1,
             job: job.into(),
             checkpoint: self.checkpoint_hash.clone(),
@@ -1349,8 +1394,14 @@ impl PendingRecovery {
             target: target.clone(),
             target_hash: target_hash.clone(),
             census_hash: digest(&serde_json::to_vec(&self.census).map_err(|e| e.to_string())?),
-            windows: self.windows.clone(),
+            windows: windows.to_vec(),
         };
+        let carried = request.carried_windows(state)?;
+        request.windows.extend(carried);
+        if !valid_recovery_windows(&request.windows) {
+            return Err("The retained recovery window scope exceeds its limit".into());
+        }
+        let windows = request.windows.clone();
         let request = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -1369,6 +1420,7 @@ impl PendingRecovery {
             read_checkpoint(&self.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         self.validate(&bytes)?;
         let mut authority = self.authority();
+        authority.windows = windows;
         authority.job = job.into();
         authority.request_identity = digest(&request);
         authority.job_request_hash = digest(&request);
@@ -1629,6 +1681,10 @@ impl CapturedPreparation {
 }
 
 impl Receipt {
+    pub(crate) fn saved_windows(&self) -> &[String] {
+        &self.authority.windows
+    }
+
     pub(crate) fn release_daemon_reservation(&mut self) {
         self.daemon.take();
     }
@@ -2587,6 +2643,14 @@ pub struct RecoveryRecord {
     #[cfg(feature = "host")]
     #[serde(skip)]
     authority: Option<Continuity>,
+}
+
+fn valid_recovery_windows(windows: &[String]) -> bool {
+    windows.len() <= 1024
+        && windows
+            .iter()
+            .all(|slot| crate::instance::validate_window_slot(slot).is_ok())
+        && windows.iter().collect::<BTreeSet<_>>().len() == windows.len()
 }
 
 fn recovery_name(hash: &str) -> String {
