@@ -15,7 +15,7 @@ fn wait(mut predicate: impl FnMut() -> bool, reason: &str) {
     }
 }
 
-fn stop_fixture_process(process: &crate::daemon::holder_registry::Process) {
+pub(super) fn stop_fixture_process(process: &crate::daemon::holder_registry::Process) {
     if process.pid == std::process::id() as i32 || !process.is_current() {
         return;
     }
@@ -61,8 +61,8 @@ fn cleanup_discoveries(directory: &Path) {
 /// Same bounded isolated-subprocess pattern as retained_admission_tests; the
 /// parent retains its directory until the exact child exits and cleans only
 /// discovery records under that child's private runtime on failure.
-fn isolated() -> Option<PathBuf> {
-    const MODE: &str = "CAGENTS_RETAINED_RESOLUTION_TEST";
+pub(super) fn isolated() -> Option<PathBuf> {
+    const MODE: &str = "CAGENTS_RETAINED_HOST_CLAUDE_TEST";
     let test = thread::current().name().unwrap().to_owned();
     if std::env::var(MODE).as_deref() == Ok(test.as_str()) {
         return Some(PathBuf::from(
@@ -126,14 +126,16 @@ fn isolated() -> Option<PathBuf> {
         thread::sleep(Duration::from_millis(10));
     };
     cleanup_discoveries(&path.join("run"));
+    let output = fs::read_to_string(stdout).unwrap();
     let outcome = match status {
-        Some(status) if status.success() => return None,
-        Some(status) => format!("failed with {status}"),
+        Some(status) if status.success() && output.contains("test result: ok. 1 passed") => {
+            return None;
+        }
+        Some(status) => format!("did not pass its selected test ({status})"),
         None => "was killed at its 90-second deadline".to_owned(),
     };
     panic!(
-        "resolution fixture {test} {outcome}\n--- its stdout ---\n{}\n--- its stderr ---\n{}",
-        fs::read_to_string(stdout).unwrap(),
+        "retained Claude fixture {test} {outcome}\n--- its stdout ---\n{output}\n--- its stderr ---\n{}",
         fs::read_to_string(stderr).unwrap()
     );
 }
