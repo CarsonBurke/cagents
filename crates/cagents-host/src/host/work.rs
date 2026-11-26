@@ -1784,10 +1784,22 @@ impl Handle {
             if !Arc::ptr_eq(&hints, &tracked.hints) {
                 self.0.scanner.notify();
             }
+            // An inspector dates the pull requests it takes from the listing
+            // by its sync; other projects' syncs leave conversation facts be.
             let projection_changed = listing_changed
                 || match (&previous_forge, &tracked.forge) {
-                    (Forge::Synced { error: before, .. }, Forge::Synced { error: after, .. }) => {
+                    (
+                        Forge::Synced {
+                            at_unix_ms: synced_before,
+                            error: before,
+                        },
+                        Forge::Synced {
+                            at_unix_ms: synced_after,
+                            error: after,
+                        },
+                    ) => {
                         before != after
+                            || (tracked.conversation_watched && synced_before != synced_after)
                     }
                     _ => previous_forge != tracked.forge,
                 };

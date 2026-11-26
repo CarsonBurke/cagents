@@ -93,6 +93,10 @@ pub(super) struct Conversations {
     state: Mutex<State>,
     /// Only conversations with input queued need their transcript read.
     inputs_changed: Mutex<BTreeSet<TerminalId>>,
+    /// Inspected conversations whose transcript was looked for and not
+    /// found. Their provider writes it once a turn starts, which no file
+    /// watch sees, so their activity is input. Taken with no other lock.
+    unlocated: Mutex<BTreeSet<TerminalId>>,
     watching: AtomicBool,
     projection: AtomicU64,
     pub(super) signal: Signal,
@@ -203,7 +207,8 @@ struct Watched {
     /// the transcript, a search for Codex, happens once per conversation ID.
     located_id: Option<String>,
     /// Searching for a Codex rollout walks its dated directories, so a
-    /// search that found nothing is not repeated before this.
+    /// search that found nothing is not repeated before this, unless the
+    /// conversation's input or activity changes first.
     search_after: Option<Instant>,
     searches_missed: u32,
     input: InputRead,
@@ -625,7 +630,12 @@ pub(super) fn checkout_facts_changed(
                         || before.branch != after.branch
                         || before.head != after.head
                         || before.dirty != after.dirty
+                        // Whether a merged pull request's branch was left
+                        // behind reads these.
+                        || before.comparison.as_ref().map(|c| c.ahead)
+                            != after.comparison.as_ref().map(|c| c.ahead)
                 })
+            || before.ancestry != after.ancestry
     })
 }
 
@@ -660,6 +670,22 @@ impl Handle {
 
     pub(in crate::host) fn conversation_identity_changed(&self, conversation: TerminalId) {
         if self.0.conversations.watching.load(Ordering::Acquire) {
+            self.input_changed(conversation);
+        }
+    }
+
+    /// A conversation started or settled a turn. One whose inspector is
+    /// still looking for its transcript looks again: Claude writes it with
+    /// the first prompt, and Codex after a resume.
+    pub(in crate::host) fn activity_changed(&self, conversation: TerminalId) {
+        let unlocated = self
+            .0
+            .conversations
+            .unlocated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&conversation);
+        if unlocated {
             self.input_changed(conversation);
         }
     }
@@ -857,6 +883,8 @@ impl Handle {
                     }
                     if dirty.contains(id) {
                         watched.input.changed(now);
+                        // What changed may be what a missed search lacked.
+                        watched.search_after = None;
                     }
                     let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
                     (due(watched.input.due)
@@ -937,8 +965,15 @@ impl Handle {
             // cursors.
             let (scanned, again) = match &source {
                 Source::Recorded => {
-                    let (scanned, retry) = recorded(host, *conversation, &mut items);
-                    (scanned, retry.then_some(TICK))
+                    let (scanned, read) = recorded(host, *conversation, &mut items);
+                    let retry = match read {
+                        RecordRead::Complete => None,
+                        RecordRead::More => Some(TICK),
+                        // Followed conversations no one shows wait for their
+                        // next write rather than retrying unattended.
+                        RecordRead::Failed => watched.then_some(UNWATCHED_TRANSCRIPT),
+                    };
+                    (scanned, retry)
                 }
                 Source::Located(located) => {
                     let covered = files.cover(*conversation, located);
@@ -975,6 +1010,18 @@ impl Handle {
                 watched.apply(scanned, facts.get(conversation).and_then(Option::as_deref));
             }
         }
+        *self
+            .0
+            .conversations
+            .unlocated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = self
+            .conversations()
+            .watched
+            .iter()
+            .filter(|(_, watched)| !watched.watchers.is_empty() && watched.searches_missed > 0)
+            .map(|(conversation, _)| *conversation)
+            .collect();
         let deadline = self.conversation_deadline(&followed);
         if conversations.is_empty() {
             return NextPass {
@@ -2015,7 +2062,11 @@ fn read(watched: &mut Watched) {
 /// Reads what cagents' own record of the conversation gained since the last
 /// pass. Only the conversation's handle is taken under the host's lock; the
 /// record is read without it.
-fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> (Scanned, bool) {
+fn recorded(
+    host: &SharedHost,
+    conversation: TerminalId,
+    items: &mut Items,
+) -> (Scanned, RecordRead) {
     let handle = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2023,26 +2074,38 @@ fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> (
         .get(&conversation)
         .map(|record| record.handle.clone());
     let mut found = Vec::new();
-    let retry = match handle.map(|handle| handle.unread(&items.again())) {
+    let read = match handle.map(|handle| handle.unread(&items.again())) {
         Some(Ok((unread, busy))) => {
             let more = unread.more;
             items.read(unread, busy, &mut found);
-            more
+            if more {
+                RecordRead::More
+            } else {
+                RecordRead::Complete
+            }
         }
         Some(Err(error)) => {
             items.failed(error);
-            false
+            RecordRead::Failed
         }
         // Gone: what was read stays as it was.
-        None => false,
+        None => RecordRead::Complete,
     };
     (
         Scanned {
             found,
             coverage: items.coverage(),
         },
-        retry,
+        read,
     )
+}
+
+/// How far one read of a conversation's record got.
+enum RecordRead {
+    Complete,
+    /// It stopped at its batch limit with more unread.
+    More,
+    Failed,
 }
 
 /// Whether cagents' own record of `provider`'s conversations is read for

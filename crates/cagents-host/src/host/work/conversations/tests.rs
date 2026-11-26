@@ -1354,6 +1354,25 @@ fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_
 /// Hosts an Antigravity chat whose record holds `items`, the way the daemon
 /// installs one, and tells the Work tracker.
 fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> TerminalId {
+    let recipe = crate::model::LaunchRecipe {
+        program: "unused-history-reader".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    host_chat(host, Provider::Antigravity, recipe, None, items)
+}
+
+/// Hosts a `provider` chat launched from `recipe`, whose record holds
+/// `items`, and tells the Work tracker.
+fn host_chat(
+    host: &SharedHost,
+    provider: Provider,
+    recipe: crate::model::LaunchRecipe,
+    session_id: Option<String>,
+    items: Vec<crate::chat::Item>,
+) -> TerminalId {
     use crate::chat::{
         self, Command, Event, Item, ItemContent, Phase, Role,
         protocol::{Adapter, ProcessSpec, Step, TransportSpec},
@@ -1386,14 +1405,6 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
             Ok(Step::default())
         }
     }
-    let directory = std::env::temp_dir();
-    let recipe = crate::model::LaunchRecipe {
-        program: "unused-history-reader".into(),
-        arguments: Vec::new(),
-        working_directory: directory.clone(),
-        environment: Default::default(),
-        unset_environment: Default::default(),
-    };
     let spec = ProcessSpec {
         transport: TransportSpec::History,
         followed: true,
@@ -1416,9 +1427,9 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
     let session = chat::Session {
         id,
         launch: chat::Launch {
-            provider: Provider::Antigravity,
+            provider,
             recipe,
-            session_id: None,
+            session_id,
             draft_model: None,
         },
         proof: Some(state.proof().clone()),
@@ -1524,6 +1535,115 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
 
     let record = host.lock().unwrap().chats.remove(&id).unwrap();
     let _ = record.handle.close();
+}
+
+#[test]
+fn an_inspected_claude_chat_finds_its_first_transcript_when_a_turn_starts() {
+    use crate::model::{HostIncarnation, HostSessionId, HostSessionProof};
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(
+        crate::host::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        }),
+    ));
+    let work = Handle::idle(Arc::downgrade(&host));
+    host.lock().unwrap().work = Some(work.clone());
+    let signal = &work.0.conversations.signal;
+    let home = tempfile::Builder::new()
+        .prefix("cagents-conversations-claude-")
+        .tempdir()
+        .unwrap();
+    let home = home.path().canonicalize().map(|path| (path, home)).unwrap();
+    let project = home.0.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    let recipe = crate::model::LaunchRecipe {
+        program: "claude".into(),
+        arguments: Vec::new(),
+        working_directory: project.clone(),
+        environment: [("HOME".into(), home.0.to_string_lossy().into_owned())].into(),
+        unset_environment: Default::default(),
+    };
+    let id = host_chat(
+        &host,
+        Provider::Claude,
+        recipe,
+        Some(session.clone()),
+        Vec::new(),
+    );
+    let queue = Arc::new(crate::host::delivery::DeliveryQueue::new(1, 16));
+    work.watch_conversation(&host, 1, id, Arc::downgrade(&queue))
+        .unwrap();
+    let mut files = files::Watches::new(|_| {});
+
+    // Opened before its first prompt: Claude has written no transcript.
+    work.input_changed(id);
+    work.conversation_pass(&host, &mut files);
+    let missed = |work: &Handle| {
+        let state = work.conversations();
+        let watched = &state.watched[&id];
+        (watched.source == Source::Pending, watched.searches_missed)
+    };
+    assert_eq!(missed(&work), (true, 1));
+
+    // The prompt makes Claude write it, which no watch reports and the
+    // search's backoff would not look for again soon.
+    let key: String = project
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let directory = home.0.join(".claude/projects").join(key);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(format!("{session}.jsonl")), "").unwrap();
+    work.conversations()
+        .watched
+        .get_mut(&id)
+        .unwrap()
+        .input
+        .read = Some(Instant::now() - TICK);
+    work.conversation_pass(&host, &mut files);
+    assert_eq!(missed(&work), (true, 1));
+
+    // The turn starting is the conversation's input.
+    let observed = signal.observe().unwrap();
+    work.activity_changed(id);
+    assert_ne!(signal.observe(), Some(observed));
+    work.conversation_pass(&host, &mut files);
+    assert_eq!(missed(&work), (false, 0));
+
+    // Once found, activity is not input: its file watch is.
+    let observed = signal.observe().unwrap();
+    work.activity_changed(id);
+    assert_eq!(signal.observe(), Some(observed));
+
+    let record = host.lock().unwrap().chats.remove(&id).unwrap();
+    let _ = record.handle.close();
+}
+
+#[test]
+fn checkout_facts_change_with_what_a_left_behind_branch_reads() {
+    let local = |ahead: u32| {
+        let mut local = super::super::scan::Local::default();
+        local.worktrees = vec![worktree("/w/app/.worktrees/feat", "feat")];
+        local.worktrees[0].comparison = Some(crate::work::Comparison {
+            base: "main".into(),
+            ahead,
+            behind: 0,
+        });
+        local
+    };
+    assert!(!checkout_facts_changed(Some(&local(0)), &local(0)));
+    // A fetch moved the base, so its commits are now its own.
+    assert!(checkout_facts_changed(Some(&local(0)), &local(1)));
+    // A scan measured whether a merged head contains its commit.
+    let mut measured = local(0);
+    measured
+        .ancestry
+        .insert(("local".into(), "merged".into()), true);
+    assert!(checkout_facts_changed(Some(&local(0)), &measured));
 }
 
 #[test]

@@ -607,6 +607,9 @@ fn changed_for_instance(
     let proof = state.proof().clone();
     if matches!(update, Update::Activity { .. }) {
         state.tally_updates.notify_one();
+        if let Some(work) = &state.work {
+            work.activity_changed(id);
+        }
     }
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind.
