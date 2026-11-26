@@ -362,7 +362,7 @@ private fun Delivery(id: String, body: ItemBody.Delivery) {
 }
 
 @Composable
-fun Code(text: String, clipped: Boolean = false) {
+fun Code(text: String, clipped: Boolean = false, preserveTrailingWhitespace: Boolean = false) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         shape = RoundedCornerShape(8.dp),
@@ -384,7 +384,7 @@ fun Code(text: String, clipped: Boolean = false) {
                     .horizontalScroll(rememberScrollState()),
             ) {
                 Text(
-                    text.trimEnd(),
+                    if (preserveTrailingWhitespace) text else text.trimEnd(),
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                     softWrap = false,

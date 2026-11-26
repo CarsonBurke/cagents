@@ -1,5 +1,8 @@
 //! On-demand access to content owned by a watched transcript.
-use std::{io::Cursor, os::unix::fs::MetadataExt, path::Path};
+use std::{
+    io::Cursor,
+    sync::{Arc, Mutex},
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cagents_mobile_api as api;
@@ -7,12 +10,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{chat, fs_safety, terminal::ipc::ServerResponse};
+use crate::{chat, terminal::ipc::ServerResponse};
 
 const IMAGE_PAGE_BYTES: usize = 192 * 1024;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_UPLOAD_EDGE: u32 = 2048;
 const MAX_UPLOAD_DECODE: usize = 32 * 1024 * 1024;
+const MAX_ITEM_BYTES: usize = 64 * 1024;
+const MAX_PATH_BYTES: usize = 4 * 1024;
+const MAX_CURSOR_BYTES: usize = 512;
 
 pub enum Request {
     Output {
@@ -28,6 +34,93 @@ pub enum Request {
         item: String,
         cursor: Option<String>,
     },
+}
+
+impl Request {
+    fn target(&self) -> (u8, &str, &str, Option<&str>) {
+        match self {
+            Self::Output { item, cursor } => (0, item, "", cursor.as_deref()),
+            Self::Diff { item, path, cursor } => (1, item, path, cursor.as_deref()),
+            Self::Image { item, cursor } => (2, item, "", cursor.as_deref()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), api::Error> {
+        let (_, item, path, cursor) = self.target();
+        if item.len() > MAX_ITEM_BYTES || path.len() > MAX_PATH_BYTES {
+            return Err(error(
+                api::ErrorCode::BadRequest,
+                "This transcript detail has an invalid item or path.",
+            ));
+        }
+        if cursor.is_some_and(|cursor| cursor.len() > MAX_CURSOR_BYTES) {
+            return Err(bad_cursor());
+        }
+        Ok(())
+    }
+}
+
+/// Each phone connection may queue one detail request and hold one image
+/// between pages, even when it follows several conversations.
+#[derive(Default)]
+pub struct Shared {
+    slot: Arc<()>,
+    image: Mutex<Option<ImageTransfer>>,
+}
+
+impl Shared {
+    // Only the bridge's input thread admits requests. The worker keeps the
+    // returned lease until it can answer, including while the daemon reads.
+    pub fn reserve(&self) -> Option<Arc<()>> {
+        (Arc::strong_count(&self.slot) == 1).then(|| self.slot.clone())
+    }
+}
+
+pub struct Scope {
+    identity: Uuid,
+    shared: Arc<Shared>,
+}
+
+impl Scope {
+    pub fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            identity: Uuid::new_v4(),
+            shared,
+        }
+    }
+
+    fn binding(&self, kind: u8, item: &str, path: &str) -> String {
+        let mut hash = Sha256::new();
+        hash.update(self.identity.as_bytes());
+        hash.update([kind]);
+        hash.update((item.len() as u64).to_le_bytes());
+        hash.update(item.as_bytes());
+        hash.update(path.as_bytes());
+        format!("{:x}", hash.finalize())
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        let mut image = self
+            .shared
+            .image
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if image
+            .as_ref()
+            .is_some_and(|image| image.watch == self.identity)
+        {
+            *image = None;
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CursorPage {
+    binding: String,
+    #[serde(flatten)]
+    position: Continuation,
 }
 
 /// The source and its held prefix stay fixed across output pages. Diff
@@ -50,19 +143,24 @@ enum Continuation {
 }
 
 impl Continuation {
-    fn parse(cursor: Option<&str>) -> Result<Option<Self>, api::Error> {
+    fn parse(cursor: Option<&str>, binding: &str) -> Result<Option<Self>, api::Error> {
         cursor
             .map(|cursor| {
-                if cursor.len() > 512 {
+                let page: CursorPage = serde_json::from_str(cursor).map_err(|_| bad_cursor())?;
+                if page.binding != binding {
                     return Err(bad_cursor());
                 }
-                serde_json::from_str(cursor).map_err(|_| bad_cursor())
+                Ok(page.position)
             })
             .transpose()
     }
 
-    fn encode(&self) -> String {
-        serde_json::to_string(self).expect("mobile detail cursor encodes as JSON")
+    fn encode(self, binding: String) -> String {
+        serde_json::to_string(&CursorPage {
+            binding,
+            position: self,
+        })
+        .expect("mobile detail cursor encodes as JSON")
     }
 }
 
@@ -70,18 +168,20 @@ pub enum Read {
     Output {
         source: chat::TextCopySource,
         offset: u64,
+        binding: String,
     },
     Diff {
         key: chat::FileChangeKey,
         position: Option<chat::FilePatchCursor>,
         revision: u64,
+        binding: String,
     },
 }
 
 impl Read {
     pub fn command(&self) -> chat::Command {
         match self {
-            Self::Output { source, offset } => chat::Command::ReadTextCopy {
+            Self::Output { source, offset, .. } => chat::Command::ReadTextCopy {
                 source: source.clone(),
                 offset: *offset,
             },
@@ -89,6 +189,7 @@ impl Read {
                 key,
                 position,
                 revision,
+                ..
             } => chat::Command::LoadFileChangePatches {
                 request_id: 0,
                 key: key.clone(),
@@ -100,24 +201,30 @@ impl Read {
 
     pub fn finish(self, response: ServerResponse) -> Result<api::DetailPage, api::Error> {
         match (self, response) {
-            (Self::Output { source, offset }, ServerResponse::ChatTextCopy { page, .. })
-                if page.source == source && page.offset == offset =>
-            {
+            (
+                Self::Output {
+                    source,
+                    offset,
+                    binding,
+                },
+                ServerResponse::ChatTextCopy { page, .. },
+            ) if page.source == source && page.offset == offset => {
                 let next = (!page.done).then(|| {
                     Continuation::Output {
                         source,
                         offset: offset + page.text.len() as u64,
                     }
-                    .encode()
+                    .encode(binding)
                 });
                 Ok(api::DetailPage {
                     next,
                     body: api::DetailBody::Output { text: page.text },
                 })
             }
-            (Self::Diff { key, .. }, ServerResponse::ChatFileChangePatches { page, .. })
-                if page.key == key =>
-            {
+            (
+                Self::Diff { key, binding, .. },
+                ServerResponse::ChatFileChangePatches { page, .. },
+            ) if page.key == key => {
                 if let Some(message) = page.error {
                     return Err(error(api::ErrorCode::Unavailable, &message));
                 }
@@ -126,7 +233,7 @@ impl Read {
                         position,
                         revision: page.revision,
                     }
-                    .encode()
+                    .encode(binding)
                 });
                 let patches = page
                     .patches
@@ -155,11 +262,11 @@ pub enum Page {
     Local(api::DetailPage),
 }
 
-/// At most one encoded image is held on behalf of a conversation. Only the
-/// next page keeps it alive, and replacing or ending the watch releases it.
-pub struct ImageTransfer {
+/// The single image held between pages for a phone connection.
+struct ImageTransfer {
+    watch: Uuid,
     id: Uuid,
-    item: String,
+    receipt: Uuid,
     bytes: Vec<u8>,
     next: usize,
 }
@@ -167,25 +274,22 @@ pub struct ImageTransfer {
 pub fn read(
     request: Request,
     snapshot: &chat::Snapshot,
-    image: &mut Option<ImageTransfer>,
+    scope: &Scope,
 ) -> Result<Page, api::Error> {
-    let (id, cursor) = match &request {
-        Request::Output { item, cursor }
-        | Request::Diff { item, cursor, .. }
-        | Request::Image { item, cursor } => (item, Continuation::parse(cursor.as_deref())?),
-    };
+    let (kind, id, path, cursor) = request.target();
+    let binding = scope.binding(kind, id, path);
+    let cursor = Continuation::parse(cursor, &binding)?;
     let (index, item) = snapshot
         .items
         .iter()
         .enumerate()
-        .find(|(_, item)| &item.id == id)
+        .find(|(_, item)| item.id == id)
         .ok_or_else(|| {
             error(
                 api::ErrorCode::NotFound,
                 "This item is no longer in the watched transcript.",
             )
         })?;
-    let id = &item.id;
     match (request, &item.content) {
         (
             Request::Output { .. },
@@ -218,7 +322,11 @@ pub fn read(
                 }
                 _ => return Err(bad_cursor()),
             };
-            Ok(Page::Daemon(Read::Output { source, offset }))
+            Ok(Page::Daemon(Read::Output {
+                source,
+                offset,
+                binding,
+            }))
         }
         (Request::Diff { path, .. }, chat::ItemContent::Changes { changes, .. })
             if changes.iter().any(|change| change.path == path) =>
@@ -235,54 +343,18 @@ pub fn read(
                 },
                 position,
                 revision,
+                binding,
             }))
         }
         (
             Request::Image { .. },
             chat::ItemContent::Image {
-                path, reference, ..
+                reference: Some(reference),
+                ..
             },
-        ) => {
-            let mut transfer = match cursor {
-                None => {
-                    *image = None;
-                    let bytes = image_bytes(path, reference.as_ref())
-                        .map_err(|message| error(api::ErrorCode::Unavailable, &message))?;
-                    ImageTransfer {
-                        id: Uuid::new_v4(),
-                        item: id.clone(),
-                        bytes,
-                        next: 0,
-                    }
-                }
-                Some(Continuation::Image { transfer, offset })
-                    if image.as_ref().is_some_and(|held| {
-                        held.id == transfer && &held.item == id && held.next == offset
-                    }) =>
-                {
-                    image.take().expect("contiguous image transfer")
-                }
-                _ => return Err(bad_cursor()),
-            };
-            let end = (transfer.next + IMAGE_PAGE_BYTES).min(transfer.bytes.len());
-            let base64 = STANDARD.encode(&transfer.bytes[transfer.next..end]);
-            let next = if end < transfer.bytes.len() {
-                transfer.next = end;
-                let next = Continuation::Image {
-                    transfer: transfer.id,
-                    offset: end,
-                }
-                .encode();
-                *image = Some(transfer);
-                Some(next)
-            } else {
-                None
-            };
-            Ok(Page::Local(api::DetailPage {
-                next,
-                body: api::DetailBody::Image { base64 },
-            }))
-        }
+        ) => scope
+            .image_page(reference, binding, cursor)
+            .map(Page::Local),
         _ => Err(error(
             api::ErrorCode::NotFound,
             "This item has no such detail.",
@@ -290,87 +362,58 @@ pub fn read(
     }
 }
 
-/// Only managed receipts and content-addressed files in the private
-/// transcript cache can be sent. A provider's ordinary pathname is not an
-/// attachment receipt, even when its extension looks like an image.
-pub fn cached_image_path(path: &str) -> Option<(&Path, &str)> {
-    let path = Path::new(path);
-    let (hash, extension) = path
-        .file_name()?
-        .to_str()?
-        .strip_prefix("image-")?
-        .split_once('.')?;
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return None;
+impl Scope {
+    fn image_page(
+        &self,
+        reference: &chat::ImageReference,
+        binding: String,
+        cursor: Option<Continuation>,
+    ) -> Result<api::DetailPage, api::Error> {
+        let mut transfer = match cursor {
+            None => {
+                // Release the previous transfer before opening a new file.
+                *self.shared.image.lock().unwrap() = None;
+                let bytes = chat::attachment_assets::read(reference, api::MAX_DOWNLOAD_IMAGE_BYTES)
+                    .map_err(|message| error(api::ErrorCode::Unavailable, &message))?;
+                ImageTransfer {
+                    watch: self.identity,
+                    id: Uuid::new_v4(),
+                    receipt: reference.id,
+                    bytes,
+                    next: 0,
+                }
+            }
+            Some(Continuation::Image { transfer, offset }) => {
+                let mut held = self.shared.image.lock().unwrap();
+                if !held.as_ref().is_some_and(|image| {
+                    image.watch == self.identity
+                        && image.id == transfer
+                        && image.receipt == reference.id
+                        && image.next == offset
+                }) {
+                    return Err(bad_cursor());
+                }
+                held.take().expect("contiguous image transfer")
+            }
+            _ => return Err(bad_cursor()),
+        };
+        let end = (transfer.next + IMAGE_PAGE_BYTES).min(transfer.bytes.len());
+        let base64 = STANDARD.encode(&transfer.bytes[transfer.next..end]);
+        let next = (end < transfer.bytes.len()).then(|| {
+            transfer.next = end;
+            let cursor = Continuation::Image {
+                transfer: transfer.id,
+                offset: end,
+            }
+            .encode(binding);
+            *self.shared.image.lock().unwrap() = Some(transfer);
+            cursor
+        });
+        Ok(api::DetailPage {
+            next,
+            body: api::DetailBody::Image { base64 },
+        })
     }
-    let format = match extension {
-        "png" => "png",
-        "jpg" => "jpeg",
-        "gif" => "gif",
-        "webp" => "webp",
-        _ => return None,
-    };
-    let directory = path
-        .parent()?
-        .file_name()?
-        .to_str()?
-        .strip_prefix("chat-")?;
-    Uuid::parse_str(directory).ok()?;
-    Some((path, format))
-}
-
-fn image_bytes(path: &str, reference: Option<&chat::ImageReference>) -> Result<Vec<u8>, String> {
-    if let Some(reference) = reference {
-        return chat::attachment_assets::read(reference, api::MAX_DOWNLOAD_IMAGE_BYTES);
-    }
-    let unavailable = || "This image is unavailable on the phone.".to_string();
-    let (path, format) = cached_image_path(path).ok_or_else(unavailable)?;
-    let root_path = crate::daemon::RuntimePaths::discover()
-        .map_err(|_| unavailable())?
-        .directory;
-    read_cached_image(&root_path, path, format).ok_or_else(unavailable)
-}
-
-fn read_cached_image(root_path: &Path, path: &Path, format: &str) -> Option<Vec<u8>> {
-    use std::path::Component;
-    let relative = path.strip_prefix(root_path).ok()?;
-    let mut components = relative.components();
-    if !matches!(components.next(), Some(Component::Normal(_)))
-        || !matches!(components.next(), Some(Component::Normal(_)))
-        || components.next().is_some()
-    {
-        return None;
-    }
-    let root = fs_safety::Root::open(root_path).ok()?;
-    let mut file = fs_safety::open_beneath(&root, relative).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file()
-        || meta.nlink() != 1
-        || meta.uid() != crate::daemon::current_uid()
-        || meta.mode() & 0o077 != 0
-        || meta.len() > api::MAX_DOWNLOAD_IMAGE_BYTES as u64
-    {
-        return None;
-    }
-    let bytes = fs_safety::read_bounded(&mut file, api::MAX_DOWNLOAD_IMAGE_BYTES as u64).ok()?;
-    if bytes.len() as u64 != meta.len() || bytes.is_empty() {
-        return None;
-    }
-    let mut hash = Sha256::new();
-    hash.update(format!("data:image/{format};base64,"));
-    // 3-byte alignment preserves the original base64, including final padding.
-    for part in bytes.chunks(12 * 1024) {
-        hash.update(STANDARD.encode(part));
-    }
-    let expected = format!("image-{:x}.", hash.finalize());
-    path.file_name()?
-        .to_str()?
-        .starts_with(&expected)
-        .then_some(bytes)
 }
 
 pub fn upload(
@@ -478,7 +521,7 @@ fn error(code: api::ErrorCode, message: &str) -> api::Error {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+    use std::sync::Arc;
 
     #[test]
     fn upload_verifies_png_bytes_and_refuses_dimensions_before_decoding_pixels() {
@@ -501,32 +544,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_images_are_verified_and_cannot_escape_the_runtime_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join(format!("chat-{}", Uuid::new_v4()));
-        fs::create_dir(&directory).unwrap();
-        let data = b"private image data";
-        let hash = Sha256::digest(format!("data:image/png;base64,{}", STANDARD.encode(data)));
-        let path = directory.join(format!("image-{hash:x}.png"));
-        fs::write(&path, data).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            cached_image_path(path.to_str().unwrap()),
-            Some((path.as_path(), "png"))
-        );
-        assert_eq!(read_cached_image(root.path(), &path, "png").unwrap(), data);
-        assert!(read_cached_image(&directory, &path, "png").is_none());
-
-        fs::write(&path, b"different image").unwrap();
-        assert!(read_cached_image(root.path(), &path, "png").is_none());
-        fs::remove_file(&path).unwrap();
-        let replacement = root.path().join("replacement");
-        fs::write(&replacement, data).unwrap();
-        std::os::unix::fs::symlink(replacement, &path).unwrap();
-        assert!(read_cached_image(root.path(), &path, "png").is_none());
-    }
-
-    #[test]
     fn output_continuations_read_the_original_prefix_and_refuse_replacements() {
         let mut source = chat::TextCopySource {
             cache: Uuid::new_v4(),
@@ -536,12 +553,13 @@ mod tests {
             bytes: 20,
         };
         let prefix = source.clone();
+        let scope = Scope::new(Arc::default());
         let offset = 4;
         let cursor = Continuation::Output {
             source: prefix.clone(),
             offset,
         }
-        .encode();
+        .encode(scope.binding(0, "tool", ""));
         source.bytes = 25;
         let mut snapshot = chat::Snapshot {
             items: vec![Arc::new(chat::Item {
@@ -564,11 +582,129 @@ mod tests {
             cursor: Some(cursor.clone()),
         };
         assert!(matches!(
-            read(request(), &snapshot, &mut None),
-            Ok(Page::Daemon(Read::Output { source, offset: 4 })) if source == prefix
+            read(request(), &snapshot, &scope),
+            Ok(Page::Daemon(Read::Output { source, offset: 4, .. })) if source == prefix
         ));
+        assert!(read(request(), &snapshot, &Scope::new(Arc::default())).is_err());
         source.revision += 1;
         snapshot.text_copy_sources.conversation = vec![Some(source)];
-        assert!(read(request(), &snapshot, &mut None).is_err());
+        assert!(read(request(), &snapshot, &scope).is_err());
+    }
+
+    #[test]
+    fn diff_cursors_belong_to_the_original_item_path_and_watch() {
+        let shared = Arc::new(Shared::default());
+        let scope = Scope::new(shared.clone());
+        let replacement = Scope::new(shared);
+        let first = "src/first.rs";
+        let second = "src/second.rs";
+        let item = |id: &str| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                at: None,
+                started_at: None,
+                content: chat::ItemContent::Changes {
+                    status: chat::ToolStatus::Succeeded,
+                    changes: [first, second]
+                        .into_iter()
+                        .map(|path| chat::FileChange {
+                            path: path.into(),
+                            kind: chat::ChangeKind::Updated,
+                            diff: String::new(),
+                            lines: chat::LineOrigin::File,
+                        })
+                        .collect(),
+                },
+            })
+        };
+        let snapshot = chat::Snapshot {
+            items: vec![item("first"), item("second")],
+            ..Default::default()
+        };
+        let cursor = Continuation::Diff {
+            position: chat::FilePatchCursor {
+                ordinal: 5,
+                file_index: 1,
+                offset: 10,
+            },
+            revision: 3,
+        }
+        .encode(scope.binding(1, "first", first));
+        let request = |item: &str, path: &str| Request::Diff {
+            item: item.into(),
+            path: path.into(),
+            cursor: Some(cursor.clone()),
+        };
+
+        assert!(matches!(
+            read(request("first", first), &snapshot, &scope),
+            Ok(Page::Daemon(Read::Diff { .. }))
+        ));
+        assert!(read(request("first", second), &snapshot, &scope).is_err());
+        assert!(read(request("second", first), &snapshot, &scope).is_err());
+        assert!(read(request("first", first), &snapshot, &replacement).is_err());
+    }
+
+    #[test]
+    fn validates_detail_sizes_before_queueing() {
+        assert!(
+            Request::Output {
+                item: "a".repeat(MAX_ITEM_BYTES + 1),
+                cursor: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::Diff {
+                item: "item".into(),
+                path: "a".repeat(MAX_PATH_BYTES + 1),
+                cursor: None,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Request::Image {
+                item: "item".into(),
+                cursor: Some("a".repeat(MAX_CURSOR_BYTES + 1)),
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn images_without_owned_receipts_are_only_described() {
+        let snapshot = chat::Snapshot {
+            items: vec![Arc::new(chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                at: None,
+                started_at: None,
+                content: chat::ItemContent::Image {
+                    path: "chat-1/image.png".into(),
+                    description: "An image".into(),
+                    reference: None,
+                },
+            })],
+            ..Default::default()
+        };
+        let scope = Scope::new(Arc::default());
+        assert!(matches!(
+            read(
+                Request::Image {
+                    item: "image".into(),
+                    cursor: None
+                },
+                &snapshot,
+                &scope
+            ),
+            Err(api::Error {
+                code: api::ErrorCode::NotFound,
+                ..
+            }),
+        ));
     }
 }

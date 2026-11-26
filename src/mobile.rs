@@ -391,6 +391,7 @@ struct Bridge {
     conversations: Conversations,
     next_watch: u64,
     upload_slot: Arc<()>,
+    detail: Arc<details::Shared>,
     outbox: Outbox,
 }
 
@@ -404,6 +405,7 @@ impl Bridge {
             conversations: Arc::default(),
             next_watch: 0,
             upload_slot: Arc::new(()),
+            detail: Arc::default(),
             outbox,
         }
     }
@@ -485,36 +487,18 @@ impl Bridge {
                 session,
                 item,
                 cursor,
-            } => self.to_conversation(
-                &session,
-                conversation::Command::Detail {
-                    id,
-                    request: details::Request::Output { item, cursor },
-                },
-            ),
+            } => self.read_detail(id, &session, details::Request::Output { item, cursor }),
             api::Call::ReadDiff {
                 session,
                 item,
                 path,
                 cursor,
-            } => self.to_conversation(
-                &session,
-                conversation::Command::Detail {
-                    id,
-                    request: details::Request::Diff { item, path, cursor },
-                },
-            ),
+            } => self.read_detail(id, &session, details::Request::Diff { item, path, cursor }),
             api::Call::ReadImage {
                 session,
                 item,
                 cursor,
-            } => self.to_conversation(
-                &session,
-                conversation::Command::Detail {
-                    id,
-                    request: details::Request::Image { item, cursor },
-                },
-            ),
+            } => self.read_detail(id, &session, details::Request::Image { item, cursor }),
             api::Call::SendImage {
                 session,
                 text,
@@ -616,6 +600,7 @@ impl Bridge {
             self.socket.clone(),
             self.control.proof().clone(),
             self.outbox.clone(),
+            self.detail.clone(),
             move |chat_id, unfollowable| {
                 // Forget the watch, unless the phone has already replaced or
                 // stopped it. Telling the phone under the same lock keeps the
@@ -652,6 +637,22 @@ impl Bridge {
     /// Send `command` to a watched conversation; its watch answers.
     fn command(&self, id: u64, session: &str, command: chat::Command) -> Result<Answered, Failure> {
         self.to_conversation(session, conversation::Command::Chat { id, command })
+    }
+
+    fn read_detail(
+        &self,
+        id: u64,
+        session: &str,
+        request: details::Request,
+    ) -> Result<Answered, Failure> {
+        request.validate().map_err(Failure::Refused)?;
+        let slot = self.detail.reserve().ok_or_else(|| {
+            Failure::Refused(api::Error {
+                code: api::ErrorCode::Unavailable,
+                message: "Another transcript detail is still loading.".into(),
+            })
+        })?;
+        self.to_conversation(session, conversation::Command::Detail { id, request, slot })
     }
 
     fn to_conversation(

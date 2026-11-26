@@ -84,10 +84,10 @@ internal fun TranscriptDetailDialog(
                 )
                 current != null -> SelectionContainer {
                     when (current.kind) {
-                        DetailKind.Output -> if (current.text.isEmpty()) Text("No output") else Code(current.text)
+                        DetailKind.Output -> if (current.text.isEmpty()) Text("No output") else Code(current.text, preserveTrailingWhitespace = true)
                         DetailKind.Diff -> {
                             val patch = current.patches.joinToString("\n") { it.text }
-                            if (patch.isEmpty()) Text("No diff was recorded.") else Code(patch)
+                            if (patch.isEmpty()) Text("No diff was recorded.") else Code(patch, preserveTrailingWhitespace = true)
                         }
                         else -> Unit
                     }

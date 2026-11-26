@@ -293,10 +293,12 @@ opens a row, using an item ID from the current watch. A diff's path must be
 one of the files in that item. It selects reported edits in transcript order,
 including failed or pending edits that have recorded patches.
 
-The first request omits `cursor`. Subsequent requests for the same detail echo
-the reply's `page.next` as `cursor`. An absent `next` marks the last page.
-If the saved content changes or its watch ends, start over from the first
-page. The bridge serves one detail request at a time per watched conversation.
+The first request omits `cursor`. For another page, echo `page.next` as
+`cursor` with the same operation, item and path on the same watch. An absent
+`next` marks the last page. If the saved content changes or the watch ends,
+restart from the first page. The bridge accepts one detail request at a time
+per connection. Item IDs, paths and cursors may be at most 64 KiB, 4 KiB and
+512 bytes respectively.
 
 ```json
 {"type":"ok","id":20,"page":{"kind":"output","text":"Build completed.\n","next":"…"}}
@@ -311,8 +313,9 @@ page. The bridge serves one detail request at a time per watched conversation.
   starts another reported patch. Other offsets continue the preceding patch.
 - An `image` page carries up to 192 KiB of raw bytes encoded in `base64`.
   Decode each page separately and concatenate its bytes. Images up to 8 MiB
-  can be read from owned image receipts or the computer's stored transcript
-  images. Another image read in that watch starts a new transfer.
+  can be read from the computer's owned image receipts. Other image rows
+  show a description. Each connection holds one image transfer at a time.
+  Requesting a different image starts a new transfer.
 
 For `conversation.send_image`, encode a non-animated PNG up to 512 KiB and
 2048 pixels per side in standard padded base64. `name` is a display name of

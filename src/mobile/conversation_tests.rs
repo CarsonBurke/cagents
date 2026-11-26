@@ -106,6 +106,7 @@ fn start_scripted(
         id,
         session.id,
         outbox,
+        Arc::default(),
         move |stop| {
             stop.register(&stream)
                 .map_err(|error| Failure::DaemonLost(error.to_string()))?;
@@ -254,9 +255,16 @@ fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands(
     let (outbox, lines) = Outbox::new();
     let (ended, ending) = mpsc::channel();
     let chat_id = TerminalId::new();
-    let watch = Watch::connect(1, chat_id, path, proof(), outbox, move |chat, why| {
-        ended.send((chat, why)).unwrap()
-    })
+    let shared = Arc::<details::Shared>::default();
+    let watch = Watch::connect(
+        1,
+        chat_id,
+        path,
+        proof(),
+        outbox,
+        shared.clone(),
+        move |chat, why| ended.send((chat, why)).unwrap(),
+    )
     .unwrap();
     let (stream, _) = listener.accept().unwrap();
     stream.set_read_timeout(Some(WAIT)).unwrap();
@@ -283,7 +291,9 @@ fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands(
             item: "command".into(),
             cursor: None,
         },
+        slot: shared.reserve().unwrap(),
     }));
+    assert!(shared.reserve().is_none());
     let upload_slot = Arc::new(());
     assert!(watch.send(Command::ImagePrompt {
         id: 4,
@@ -312,6 +322,7 @@ fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands(
         ));
     }
     assert_eq!(Arc::strong_count(&upload_slot), 1);
+    assert!(shared.reserve().is_some());
 }
 
 #[test]

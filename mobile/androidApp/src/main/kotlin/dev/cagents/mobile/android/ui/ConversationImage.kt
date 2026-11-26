@@ -2,7 +2,7 @@ package dev.cagents.mobile.android.ui
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.net.Uri
 import android.provider.OpenableColumns
 import dev.cagents.mobile.protocol.ImageAttachment
@@ -10,6 +10,8 @@ import dev.cagents.mobile.protocol.MAX_UPLOAD_IMAGE_BYTES
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.nio.ByteBuffer
 import java.util.Base64
 
 private const val MAX_PICKED_BYTES = 24 * 1024 * 1024
@@ -46,14 +48,17 @@ internal suspend fun prepareImage(context: Context, uri: Uri): ImageAttachment =
     error("The selected image can’t be compressed to 512 KiB.")
 }
 
-/** Sample before allocating pixels, so the declared source size cannot allocate a full bitmap. */
-internal fun boundedBitmap(bytes: ByteArray, edge: Int): Bitmap? {
-    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-    val longest = maxOf(bounds.outWidth, bounds.outHeight)
-    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-    var sample = 1
-    while (longest.toLong() > edge.toLong() * sample) sample *= 2
-    val options = BitmapFactory.Options().apply { inSampleSize = sample }
-    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+/** Decode at display size and preserve the orientation recorded by the camera. */
+internal fun boundedBitmap(bytes: ByteArray, edge: Int): Bitmap? = try {
+    ImageDecoder.decodeBitmap(ImageDecoder.createSource(ByteBuffer.wrap(bytes))) { decoder, info, _ ->
+        decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+        val longest = maxOf(info.size.width, info.size.height)
+        var sample = 1
+        while (longest.toLong() > edge.toLong() * sample) sample *= 2
+        decoder.setTargetSampleSize(sample)
+    }
+} catch (_: IOException) {
+    null
+} catch (_: IllegalArgumentException) {
+    null
 }

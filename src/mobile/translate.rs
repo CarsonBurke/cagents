@@ -267,12 +267,12 @@ pub fn item(item: &chat::Item) -> api::Item {
             }
         }
         chat::ItemContent::Image {
-            path,
             description,
             reference,
+            ..
         } => api::ItemBody::Image {
             description: description.clone(),
-            available: reference.is_some() || super::details::cached_image_path(path).is_some(),
+            available: reference.is_some(),
         },
         chat::ItemContent::Delivery {
             kind,
