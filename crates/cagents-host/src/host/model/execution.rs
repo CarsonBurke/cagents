@@ -10,7 +10,7 @@ use crate::{
     model::{AgentId, ChannelId, RunId, TerminalId},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(in crate::host) struct AgentRunUpdateRisk {
     pub session: crate::chat::Session,
@@ -353,6 +353,34 @@ impl Registry {
             });
         }
         Ok(holds)
+    }
+
+    /// Sessions whose accepted prompts can wait for the successor. A matching
+    /// older run with an unproved outcome disables automatic dispatch even
+    /// when its accepted successor is now the latest directory row.
+    pub(in crate::host) fn agent_queues_ready_for_update(
+        &self,
+    ) -> Result<BTreeSet<TerminalId>, String> {
+        let mut query = self
+            .db
+            .prepare(&format!(
+                "SELECT a.session_id FROM agents a
+                 WHERE a.closed = 0 AND a.session_id IS NOT NULL
+                   AND EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id AND {UNSENT})
+                   AND NOT EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id AND
+                       (r.state IN ('running', 'waiting', 'interrupted')
+                        OR (r.state = 'accepted' AND NOT ({UNSENT}))))"
+            ))
+            .map_err(|error| error.to_string())?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .map(|id| {
+                id.map_err(|error| error.to_string())?
+                    .parse()
+                    .map_err(|_| "Invalid stored agent session ID".to_owned())
+            })
+            .collect()
     }
 
     /// Managed runs with a provider turn under way. An interruption may leave
@@ -5872,6 +5900,59 @@ mod tests {
             .unwrap();
         assert_eq!(holds.len(), 1);
         assert_eq!(unbound_hold.session, None);
+    }
+
+    #[test]
+    fn an_unsent_queue_proves_update_readiness_only_after_a_confirmed_outcome() {
+        for ending in [State::Cancelled, State::Interrupted] {
+            let (mut registry, _directory, request) = fixture();
+            let first = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let session = source();
+            registry
+                .bind_agent(first.agent.id, None, session.clone())
+                .unwrap();
+            let started = registry
+                .update_agent_run(
+                    first.run.id,
+                    first.run.revision,
+                    Update::Started {
+                        provider_key: "confirmed".into(),
+                    },
+                    2,
+                )
+                .unwrap();
+            let followup = Submit {
+                name: None,
+                destination: Destination::Existing(first.agent.id),
+                prompt: "Still waiting to be sent".into(),
+                idempotency_key: "queued-for-update".into(),
+            };
+            let queued = registry.submit_agent(&Origin::User, &followup, 3).unwrap();
+            assert!(registry.agent_queues_ready_for_update().unwrap().is_empty());
+            registry
+                .update_agent_run(
+                    first.run.id,
+                    started.revision,
+                    Update::Finished {
+                        state: ending,
+                        result: Default::default(),
+                    },
+                    4,
+                )
+                .unwrap();
+            assert_eq!(
+                registry.latest_agent_run(first.agent.id).unwrap(),
+                queued.run
+            );
+            let ready = registry.agent_queues_ready_for_update().unwrap();
+            if ending == State::Cancelled {
+                assert_eq!(ready, BTreeSet::from([session.id()]));
+                assert!(registry.claim_agent_dispatch(&queued, 5).unwrap());
+                assert!(registry.agent_queues_ready_for_update().unwrap().is_empty());
+            } else {
+                assert!(ready.is_empty());
+            }
+        }
     }
 
     #[test]

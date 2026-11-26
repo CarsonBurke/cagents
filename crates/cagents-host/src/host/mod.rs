@@ -1050,7 +1050,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut courier = if recovery_only {
         None
     } else {
-        match agent_execution::mailbox::Courier::start(&host) {
+        match agent_execution::mailbox::Courier::start_with_update_fence(&host) {
             Ok(courier) => Some(courier),
             Err(error) => {
                 tracing::warn!(%error, "messages between sessions are unavailable");

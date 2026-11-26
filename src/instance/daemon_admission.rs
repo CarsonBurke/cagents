@@ -213,7 +213,7 @@ fn fence_path() -> io::Result<PathBuf> {
     Ok(fence_path_in(&runtime_directory()?))
 }
 
-fn fence_path_in(runtime: &Path) -> PathBuf {
+pub(super) fn fence_path_in(runtime: &Path) -> PathBuf {
     runtime.join(format!("{APPLICATION_LOCK_FILE}.update"))
 }
 
