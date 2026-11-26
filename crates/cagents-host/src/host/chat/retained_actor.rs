@@ -856,9 +856,9 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         // An outcome that followed a conversation since reset republished it.
         persist_confirmed_identity(host, &target, &registry)?;
     }
-    // A separate attention-store failure must not block execution outcomes
-    // or acknowledgement of independent retained work.
-    if let Some(receipt) = admit_waiting_resolution(host, &target, None)? {
+    // Drain every available execution page before requiring a standalone
+    // acknowledgement from the independently fallible attention store.
+    if !more && let Some(receipt) = admit_waiting_resolution(host, &target, None)? {
         receipt
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "The notification journal did not confirm the waiting settlement")??;
