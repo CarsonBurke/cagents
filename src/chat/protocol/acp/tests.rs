@@ -777,6 +777,10 @@ fn stopping_answers_open_approvals_cancelled_and_waits_for_the_prompt_reply() {
         .receive(reply(&request, json!({"stopReason": "cancelled"})))
         .unwrap();
     assert_eq!(finished(&step), Some(Kind::Cancelled));
+    assert!(step.events.contains(&Event::Status {
+        busy: false,
+        detail: chat::TURN_INTERRUPTED.into(),
+    }));
     assert!(step.events.contains(&Event::TurnSettled));
     assert!(items(&step).iter().any(|item| item.id == "tool:run"
         && matches!(
@@ -1131,7 +1135,7 @@ fn a_stopped_turn_holds_its_queue_until_the_reader_starts_it() {
         .unwrap();
     // Nothing starts on its own after a Stop.
     assert_eq!(finished(&step), Some(Kind::Cancelled));
-    assert_eq!(statuses(&step), [(false, "Ready")]);
+    assert_eq!(statuses(&step), [(false, chat::TURN_INTERRUPTED)]);
     assert!(
         step.writes
             .iter()
@@ -1353,7 +1357,7 @@ fn a_stopped_steered_turn_ends_with_its_first_cancelled_reply() {
             .receive(reply(answered, json!({"stopReason": "cancelled"})))
             .unwrap();
         assert_eq!(finished(&step), Some(Kind::Cancelled), "{newest_first}");
-        assert_eq!(statuses(&step), [(false, "Ready")]);
+        assert_eq!(statuses(&step), [(false, chat::TURN_INTERRUPTED)]);
         // The other's reply, if it ever comes, belongs to no turn.
         let step = acp
             .receive(refusal(late, rpc::REQUEST_CANCELLED, "Request cancelled"))

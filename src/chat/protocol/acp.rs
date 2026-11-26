@@ -949,7 +949,12 @@ impl Acp {
         if next.is_none() {
             step.events.push(Event::Status {
                 busy: false,
-                detail: "Ready".into(),
+                detail: if kind == Kind::Cancelled {
+                    chat::TURN_INTERRUPTED
+                } else {
+                    "Ready"
+                }
+                .into(),
             });
         }
         if let Some(run) = turn.run {
