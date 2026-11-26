@@ -7720,7 +7720,19 @@ mod reconciliation_tests {
         };
         write(recovery::outcome_path(&state, JOB), "pending.json");
 
-        let step = || settle_after_worker(&layout, &state, &serving).unwrap();
+        let settle = |proof: &crate::model::HostSessionProof| {
+            settle_after_worker(
+                &layout,
+                &state,
+                proof,
+                #[cfg(target_os = "macos")]
+                CutoverStartupCheckpoint::Absent,
+                #[cfg(target_os = "macos")]
+                || unreachable!("legacy receipts do not inspect a cutover roster"),
+            )
+            .unwrap()
+        };
+        let step = || settle(&serving);
         job.phase = UpdatePhase::Failed;
         job.message =
             "The confirmed successor does not serve this update's matched protocol".into();
@@ -7733,10 +7745,7 @@ mod reconciliation_tests {
         write(recovery::outcome_path(&state, JOB), "recovery.json");
         let mut restarted = serving.clone();
         restarted.host_incarnation = crate::model::HostIncarnation::new("restarted");
-        assert_eq!(
-            settle_after_worker(&layout, &state, &restarted).unwrap(),
-            None
-        );
+        assert_eq!(settle(&restarted), None);
         assert_eq!(recorded().phase, UpdatePhase::Failed);
         // A worker that records its release reports its own verdict.
         job.recorded_by = Some("0.2.4".into());
@@ -7786,10 +7795,7 @@ mod reconciliation_tests {
         assert_eq!(history["recorded"]["message"], job.message.as_str());
         assert!(state.join(format!("{JOB}.complete")).is_file());
         // Settled for good: a later daemon finds nothing to do.
-        assert_eq!(
-            settle_after_worker(&layout, &state, &restarted).unwrap(),
-            None
-        );
+        assert_eq!(settle(&restarted), None);
         assert_eq!(recorded().phase, UpdatePhase::Complete);
     }
 }
