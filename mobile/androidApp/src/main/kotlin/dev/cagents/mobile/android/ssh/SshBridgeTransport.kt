@@ -38,6 +38,7 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.security.PrivateKey
 import java.security.PublicKey
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.time.Duration.Companion.milliseconds
@@ -353,6 +354,7 @@ private class SshLineChannel(
     private val reader = BufferedReader(InputStreamReader(command.inputStream, Charsets.UTF_8))
     private val output: OutputStream = command.outputStream
     private val writeLock = Mutex()
+    private val closed = AtomicBoolean()
     private val stderr = StringBuilder()
     private val stderrReader = thread(name = "cagents-bridge-stderr", isDaemon = true) {
         runCatching {
@@ -394,10 +396,12 @@ private class SshLineChannel(
     }
 
     /**
-     * Drops the whole connection without waiting for the computer: closing the
-     * session channel first would wait for its reply, which a dead network never sends.
+     * Close the socket first to release a reader or writer blocked on a dead
+     * network. SSHJ's graceful disconnect sends a packet on the same socket.
      */
     override fun close() {
-        runCatching { client.disconnect() }
+        if (!closed.compareAndSet(false, true)) return
+        runCatching { client.socket?.close() }
+        client.disconnectQuietly()
     }
 }

@@ -3,9 +3,14 @@ package dev.cagents.mobile
 import dev.cagents.mobile.client.BridgeTransport
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.LineChannel
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.int
@@ -54,14 +59,25 @@ class FakeBridge : BridgeTransport {
 class FakeConnection {
     private val toServer = Channel<String>(Channel.UNLIMITED)
     private val toClient = Channel<String>(Channel.UNLIMITED)
+    private val closed = CompletableDeferred<Unit>()
+    private val writing = Mutex()
+
+    /** Simulates a socket write that can only be interrupted by closing the transport. */
+    var stallPingWrite = false
 
     val clientSide = object : LineChannel {
         override suspend fun readLine(): String? = toClient.receiveCatching().getOrNull()
         override suspend fun writeLine(line: String) {
-            toServer.send(line)
+            writing.withLock {
+                toServer.send(line)
+                if (stallPingWrite && Json.parseToJsonElement(line).jsonObject.op == "ping") {
+                    withContext(NonCancellable) { closed.await() }
+                }
+            }
         }
 
         override fun close() {
+            closed.complete(Unit)
             toClient.close()
             toServer.close()
         }
