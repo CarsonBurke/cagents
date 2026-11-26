@@ -31,6 +31,8 @@ mod publication;
 pub use publication::LocalPublication;
 mod pending_recovery;
 pub mod progress;
+#[cfg(target_os = "macos")]
+mod ready_plan;
 pub mod recovery;
 #[cfg(target_os = "macos")]
 mod release_stage;

@@ -1705,6 +1705,14 @@ impl CapturedPreparation {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Serialize)]
+pub(crate) struct ReadyPlanEvidence<'a> {
+    authority: &'a Authority,
+    checkpoint: (u64, u64),
+    capture_digest: String,
+}
+
 impl Receipt {
     #[cfg(target_os = "macos")]
     pub(crate) fn is_ready(&self) -> bool {
@@ -1770,6 +1778,25 @@ impl Receipt {
             (original.dev(), original.ino()) == (current_metadata.dev(), current_metadata.ino())
                 && digest(&read_checkpoint_input(&current)?) == self.authority.checkpoint_hash,
         )
+    }
+
+    /// Evidence from the original open checkpoint, before any standby receives
+    /// permission to use the saved store.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ready_plan_evidence(&self) -> Result<ReadyPlanEvidence<'_>, String> {
+        let StandbyCheckpoint::Ready(checkpoint) = &self.checkpoint else {
+            return Err("Only an acknowledged Ready checkpoint can authorize this plan".into());
+        };
+        if !self.ready_before_restore()? {
+            return Err("The exact Ready checkpoint is no longer unclaimed".into());
+        }
+        let metadata = checkpoint.metadata().map_err(|error| error.to_string())?;
+        Ok(ReadyPlanEvidence {
+            authority: &self.authority,
+            checkpoint: (metadata.dev(), metadata.ino()),
+            capture_digest: validate_acknowledged_capture(&self.authority)?
+                .ok_or("The Ready checkpoint has no acknowledged preparation")?,
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -4358,7 +4385,7 @@ impl Inherited {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "host"))]
+#[cfg(target_os = "macos")]
 fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>, String> {
     if !matches!(authority.origin, Origin::AcknowledgedPrepare) {
         return Ok(None);
