@@ -3634,13 +3634,25 @@ fn apply_size(
 /// Returns the native conversations this restore left unattached: a retained
 /// one's reattachment was just refused, so startup must not retry it at once,
 /// and a relaunched one's failed restart was stopped for its pane to reopen.
-pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
-    restore_upgrade_from(
+pub(super) fn restore_upgrade_with_digest(
+    host: &SharedHost,
+    processes: &std::path::Path,
+    expected_digest: Option<&str>,
+) -> Result<Vec<TerminalId>, String> {
+    let store = crate::upgrade::handoff::Store::discover()?;
+    let checkpoint = store.load_for_restore(expected_digest)?;
+    restore_upgrade_checkpoint(
         host,
-        crate::upgrade::handoff::Store::discover()?,
-        std::path::Path::new("/proc"),
+        store,
+        checkpoint,
+        processes,
         holder_directory().ok().as_deref(),
     )
+}
+
+#[cfg(test)]
+pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
+    restore_upgrade_with_digest(host, std::path::Path::new("/proc"), None)
 }
 
 /// Lifecycle fixtures inspect real kernel data for their owned process roster
@@ -3650,12 +3662,7 @@ pub(in crate::host) fn restore_upgrade_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,
 ) -> Result<Vec<TerminalId>, String> {
-    restore_upgrade_from(
-        host,
-        crate::upgrade::handoff::Store::discover()?,
-        processes,
-        holder_directory().ok().as_deref(),
-    )
+    restore_upgrade_with_digest(host, processes, None)
 }
 
 /// An acknowledged incomplete update authorizes attaching its original holder
@@ -3999,20 +4006,25 @@ fn restart_or_stop(
     Ok(())
 }
 
-/// Replays a checkpoint, abandoning the replay as soon as termination is
-/// requested.
-///
-/// The accept loop is the only other place that observes
-/// `daemon::termination_requested`, and it is not reached until this returns, so
-/// without these checks the daemon kept launching checkpointed processes after
-/// `cagents daemon stop-for-rebuild` had asked it to stop, and a
-/// logout `SIGKILL` mid-restore left the checkpoint in `Phase::Restoring`, which
-/// is never automatically replayed for native sessions. Aborting through
-/// `close_failed_restore` positively closes whatever was already started and
-/// leaves the checkpoint in a replayable `Ready` phase.
+#[cfg(test)]
 fn restore_upgrade_from(
     host: &SharedHost,
     store: crate::upgrade::handoff::Store,
+    proc_root: &std::path::Path,
+    holders: Option<&std::path::Path>,
+) -> Result<Vec<TerminalId>, String> {
+    let checkpoint = store.load()?;
+    restore_upgrade_checkpoint(host, store, checkpoint, proc_root, holders)
+}
+
+/// Stop starting checkpointed processes as soon as termination is requested.
+/// On graceful abort `close_failed_restore` closes replacements already started
+/// and returns the checkpoint to Ready. Hard interruption leaves Restoring
+/// evidence, which never authorizes automatic replay of native sessions.
+fn restore_upgrade_checkpoint(
+    host: &SharedHost,
+    store: crate::upgrade::handoff::Store,
+    checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
     proc_root: &std::path::Path,
     holders: Option<&std::path::Path>,
 ) -> Result<Vec<TerminalId>, String> {
@@ -4033,11 +4045,10 @@ fn restore_upgrade_from(
             .unwrap_or_else(|p| p.into_inner())
             .upgrade_evidence = Some(store.clone());
     };
-    let Some(mut checkpoint) = store.load()? else {
+    let Some(mut checkpoint) = checkpoint else {
         publish();
         return Ok(Vec::new());
     };
-    checkpoint.validate()?;
     if checkpoint
         .chats
         .iter()

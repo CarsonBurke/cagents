@@ -5,7 +5,7 @@ use super::{
 };
 use crate::upgrade::{
     handoff::{Carried, Store},
-    recovery,
+    recovery::{self, verified::ready},
 };
 use std::collections::BTreeSet;
 
@@ -33,7 +33,7 @@ pub(super) fn restore_settled_from(
 /// Ordinary startup restores only current, authenticated holders and the
 /// current Ready checkpoint. Archived update evidence cannot recreate panes.
 pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
-    restore_ordinary_with(host, state::restore_upgrade)
+    restore_ordinary_with(host, std::path::Path::new("/proc"))
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -41,24 +41,25 @@ pub(super) fn restore_ordinary_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,
 ) -> Result<(), String> {
-    restore_ordinary_with(host, |host| {
-        state::restore_upgrade_with_process_fixture(host, processes)
-    })
+    restore_ordinary_with(host, processes)
 }
 
-fn restore_ordinary_with(
-    host: &SharedHost,
-    restore_upgrade: impl FnOnce(&SharedHost) -> Result<Vec<crate::model::TerminalId>, String>,
-) -> Result<(), String> {
+fn restore_ordinary_with(host: &SharedHost, processes: &std::path::Path) -> Result<(), String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: previous boot history", None);
     chat::retained_actor::reconcile_previous_boot_history(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: capture Ready", None);
-    let ready_capture = crate::upgrade::recovery::verified::ready::capture()?;
+    let ready_capture = ready::capture()?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
-    let unattached = restore_upgrade(host)?;
+    let unattached = state::restore_upgrade_with_digest(
+        host,
+        processes,
+        ready_capture
+            .as_ref()
+            .map(ready::ReadyCapture::checkpoint_digest),
+    )?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;
@@ -109,13 +110,7 @@ fn restore_ordinary_with(
     let executable = crate::process::current_executable().map_err(|error| error.to_string())?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
-    crate::upgrade::recovery::verified::ready::publish(
-        ready_capture,
-        &proof,
-        &executable,
-        &terminals,
-        &chats,
-    )?;
+    ready::publish(ready_capture, &proof, &executable, &terminals, &chats)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: optional archived proof", None);
     publish_archived_proof(host);
