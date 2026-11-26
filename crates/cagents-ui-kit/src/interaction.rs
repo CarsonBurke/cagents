@@ -3003,8 +3003,11 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             state.inspect_control = false;
         }
         inside &= explains_disabled || !state.disabled;
+        // A press acts, so the tip steps aside. A press on a control that is
+        // unavailable does nothing, and is when its reason is most wanted.
         if matches!(self.kind, Kind::Tooltip)
             && inside
+            && !explains_disabled
             && matches!(
                 event,
                 Event::Mouse(mouse::Event::ButtonPressed(_))
@@ -3793,8 +3796,9 @@ mod tests {
         );
     }
 
-    /// Whether `element`'s tooltip opens for a pointer that rests on it.
-    fn tip_opens(mut element: Element<'_, u8>) -> bool {
+    /// Whether `element`'s tip opens for a pointer resting on it, pressing
+    /// it first when `press`.
+    fn tip_opens(mut element: Element<'_, u8>, press: bool) -> bool {
         use cosmic::iced::advanced::clipboard;
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let mut tree = Tree::new(&element);
@@ -3806,12 +3810,18 @@ mod tests {
         let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
         let pointer = node.bounds().center();
         let mut messages = Vec::new();
-        for event in [
-            Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
-            Event::Window(window::Event::RedrawRequested(
-                Instant::now() + TOOLTIP_DELAY + Duration::from_millis(1),
-            )),
-        ] {
+        let mut events = vec![Event::Mouse(mouse::Event::CursorMoved {
+            position: pointer,
+        })];
+        if press {
+            events.push(Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left,
+            )));
+        }
+        events.push(Event::Window(window::Event::RedrawRequested(
+            Instant::now() + 2 * TOOLTIP_DELAY,
+        )));
+        for event in events {
             element.as_widget_mut().update(
                 &mut tree,
                 &event,
@@ -3829,25 +3839,40 @@ mod tests {
     /// A tooltip that names a control hides on a disabled one, whose name is
     /// no longer an offer, and a disabled checkbox is one: it has no
     /// `on_toggle` (#3514). A tooltip that says why a control is disabled
-    /// shows on it.
+    /// shows on it, even after a press, which is when the reason is wanted.
     #[test]
     fn disabled_checkboxes_hide_name_tips_and_show_disabled_reasons() {
         let checkbox = || crate::ui_controls::field::checkbox::<u8>(false).label("Selection");
         assert!(
-            tip_opens(tooltip(checkbox().on_toggle(|_| 1), "Search the selection")),
+            tip_opens(
+                tooltip(checkbox().on_toggle(|_| 1), "Search the selection"),
+                false
+            ),
             "an enabled checkbox shows its tip"
         );
         assert!(
-            !tip_opens(tooltip(checkbox(), "Search the selection")),
-            "a disabled checkbox hides its name tip"
+            !tip_opens(
+                tooltip(checkbox().on_toggle(|_| 1), "Search the selection"),
+                true
+            ),
+            "pressing an enabled checkbox puts its tip away"
         );
         assert!(
-            tip_opens(disabled_tooltip(checkbox(), "Select text first")),
-            "a disabled checkbox shows why it is disabled"
+            !tip_opens(tooltip(checkbox(), "Search the selection"), false),
+            "a disabled checkbox hides its name tip"
         );
+        for press in [false, true] {
+            assert!(
+                tip_opens(disabled_tooltip(checkbox(), "Select text first"), press),
+                "a disabled checkbox shows why it is disabled (pressed: {press})"
+            );
+        }
         let button = || cosmic::widget::button::text("Refresh");
-        assert!(!tip_opens(tooltip(button(), "Refresh")));
-        assert!(tip_opens(disabled_tooltip(button(), "Opening agent…")));
+        assert!(!tip_opens(tooltip(button(), "Refresh"), false));
+        assert!(tip_opens(
+            disabled_tooltip(button(), "Opening agent…"),
+            true
+        ));
     }
 
     /// A Work list row is a `button::custom` holding tooltip-bearing

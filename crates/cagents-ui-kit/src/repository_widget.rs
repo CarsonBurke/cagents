@@ -2395,11 +2395,11 @@ const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
 /// Room for the widest zoom step the viewer's label can hold, so the controls
 /// either side of it do not move when the step changes.
 const ZOOM_LABEL_WIDTH: f32 = 48.0;
-/// Why the find bar's Selection option is unavailable: Find captures the
-/// selection it opens with, and it opened with none.
-const FIND_SELECTION_UNAVAILABLE: &str = "Select text before opening Find to search only within it";
+/// Why the find bar's Selection option is unavailable: there is no
+/// selection to search, which selecting text while Find is open supplies.
+const FIND_SELECTION_UNAVAILABLE: &str = "Select text in the file to search only within it";
 /// Why Replace's Preserve case option is unavailable while Regex is on.
-const PRESERVE_CASE_UNAVAILABLE: &str = "Preserve case applies only to plain-text search";
+const PRESERVE_CASE_UNAVAILABLE: &str = "Turn off regular expressions (.*) to preserve case";
 /// How many committed comparisons one open file keeps.
 ///
 /// Viewed working bases stay cached until a save or mutation invalidates them.
@@ -10310,7 +10310,7 @@ fn find_strip<'a>(
             "Search the selection captured when enabled",
         )
     } else {
-        // Find captures the selection it opens with.
+        // Nothing is selected to search within.
         crate::interaction::disabled_tooltip(
             selection.description(FIND_SELECTION_UNAVAILABLE),
             FIND_SELECTION_UNAVAILABLE,
