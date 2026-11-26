@@ -411,7 +411,7 @@ api() {
         seeded "$slug" | jq -c --arg login "$login" --argjson open "$open_limit" --argjson all "$all_limit" "$checks_jq"'
             map(select(.author.login == $login)) | sort_by(.updatedAt) | reverse
             | def identity: {number, title, state, isDraft, headRefName, headRefOid,
-                headRepository, headRepositoryOwner, baseRefName, updatedAt, url};
+                headRepository, headRepositoryOwner, baseRefName, updatedAt, mergedAt, closedAt, url};
             {data: {viewer: {login: $login},
                 open: {nodes: (map(select(.state == "OPEN")) | .[:$open] | map(identity + {
                     reviewDecision, additions, deletions,

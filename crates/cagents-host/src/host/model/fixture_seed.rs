@@ -171,7 +171,7 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
 /// schema check `seed_at` already made once.
 fn seed_commit(registry: &mut Registry, edit: &ModelEdit) -> Result<(), String> {
     registry
-        .commit_delta(edit, |_, _| Ok(((), false)), false)
+        .commit_delta(edit, None, |_, _| Ok(((), false)), false)
         .map(drop)
 }
 

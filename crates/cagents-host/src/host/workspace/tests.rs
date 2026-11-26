@@ -473,16 +473,17 @@ fn source_checked_removal_sqlite_contention_keeps_terminal_input_and_inventory_r
 
 fn assert_sqlite_progress(removing: bool) {
     let (directory, host, _) = fixture();
+    let root = directory.path().canonicalize().unwrap();
     let (session, _terminal) = terminal(
         &host,
-        directory.path(),
+        &root,
         "while IFS= read -r line; do printf '%s' \"$line\" > received; done",
     );
     let edit = if removing {
-        edit(&host, 1, open_project(directory.path())).unwrap();
+        edit(&host, 1, open_project(&root)).unwrap();
         let scope = Scope::Worktree {
-            repository: directory.path().to_owned(),
-            path: directory.path().to_owned(),
+            repository: root.clone(),
+            path: root.clone(),
         };
         let source = host
             .lock()
@@ -515,7 +516,7 @@ fn assert_sqlite_progress(removing: bool) {
             operation: uuid::Uuid::new_v4(),
             change: Change::RemoveSource {
                 registry: model.identity,
-                repository: directory.path().to_owned(),
+                repository: root.clone(),
                 before: pane.clone(),
                 terminal: Some(
                     crate::workspace_model::views::TerminalRemovalBasis::Worker {
@@ -525,7 +526,7 @@ fn assert_sqlite_progress(removing: bool) {
                 ),
                 capture: Some(crate::workspace_model::views::CapturedTerminalSource {
                     registry: model.identity,
-                    repository: directory.path().to_owned(),
+                    repository: root.clone(),
                     scope,
                     view_revision: model.views[0].revision,
                     model_sequence: model.sequence,
@@ -534,9 +535,9 @@ fn assert_sqlite_progress(removing: bool) {
             },
         }
     } else {
-        open_project(directory.path())
+        open_project(&root)
     };
-    let blocker = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
+    let blocker = rusqlite::Connection::open(root.join("model.sqlite3")).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let registry = writer(&host).unwrap();
     let (finished, completion) = mpsc::channel();
@@ -565,7 +566,7 @@ fn assert_sqlite_progress(removing: bool) {
     let (responsive, response) = mpsc::channel();
     let inspector = {
         let host = host.clone();
-        let received = directory.path().join("received");
+        let received = root.join("received");
         thread::spawn(move || {
             let input = process_request(
                 &host,

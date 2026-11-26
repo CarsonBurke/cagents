@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -487,6 +487,10 @@ fn refused_native_restore(fixture: &Fixture) -> crate::chat::StartFailure {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn retained_pair_checkpoints_and_reattaches_across_multiple_upgrade_hops() {
     if std::env::var(MODE).as_deref() == Ok("provider") {
         return provider();
@@ -1987,11 +1991,11 @@ exec "${EXE}" --exact "${SELECTOR}" --nocapture --test-threads=1
 
 fn provider() {
     let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
-    let listener = UnixListener::bind(std::env::var_os(SOCKET).unwrap()).unwrap();
+    let listener = crate::descriptor::bind(std::env::var_os(SOCKET).unwrap()).unwrap();
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(75);
     while Instant::now() < deadline {
-        let (stream, _) = match listener.accept() {
+        let (stream, _) = match crate::descriptor::accept(&listener) {
             Ok(accepted) => accepted,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));

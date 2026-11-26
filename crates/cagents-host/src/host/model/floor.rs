@@ -2,8 +2,10 @@
 use super::*;
 use crate::{
     agent_execution::{Agent, HostedSession},
+    model::{HostSessionProof, TerminalId},
     upgrade::floor::{Presentation, Record},
 };
+use std::collections::BTreeSet;
 
 impl Registry {
     #[cfg(test)]
@@ -152,8 +154,10 @@ fn capture_presentations_at(path: &Path, record: &mut Record) -> Result<(), Stri
     snapshot.commit().map_err(|e| e.to_string())
 }
 
-pub(in crate::host) fn restore_presentations() -> Result<(), String> {
-    prune_history();
+pub(in crate::host) fn restore_presentations(
+    recovering: Option<&HostSessionProof>,
+) -> Result<(), String> {
+    prune_history(recovering);
     let mut ledger = crate::upgrade::floor::load()?;
     if ledger
         .records
@@ -162,7 +166,15 @@ pub(in crate::host) fn restore_presentations() -> Result<(), String> {
     {
         return Ok(());
     }
-    let mut registry = Registry::open()?;
+    // A daemon that cannot open the store still hosts terminals. The ledger
+    // keeps each unrestored presentation for the daemon that can.
+    let mut registry = match Registry::open() {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::warn!(%error, "update floor presentations wait for the shared model");
+            return Ok(());
+        }
+    };
     for record in &mut ledger.records {
         registry.restore_update_floor(record)?;
     }
@@ -171,9 +183,20 @@ pub(in crate::host) fn restore_presentations() -> Result<(), String> {
 
 /// Pruning is maintenance, never a condition for opening the app. If a saved
 /// store cannot be inspected, keep the evidence until its next successful read.
-fn prune_history() {
+fn prune_history(recovering: Option<&HostSessionProof>) {
     let result = (|| -> Result<(), String> {
-        let mut referenced = std::collections::BTreeSet::new();
+        let registry = Registry::open()?;
+        let referenced = registry.saved_session_inventory()?;
+        crate::upgrade::floor::prune_unreferenced(&referenced, recovering)
+    })();
+    if let Err(error) = result {
+        tracing::warn!(%error, "Stopped update history was kept until its panes can be inspected");
+    }
+}
+
+impl Registry {
+    pub(in crate::host) fn saved_session_inventory(&self) -> Result<BTreeSet<TerminalId>, String> {
+        let mut referenced = open_agent_sessions(&self.db)?;
         let mut remember = |kind: &crate::model::CardKind| match kind {
             crate::model::CardKind::Chat(session) => {
                 referenced.insert(session.id);
@@ -186,8 +209,7 @@ fn prune_history() {
             }
             _ => (),
         };
-        let registry = Registry::open()?;
-        for view in super::views::occupied(&registry.db)? {
+        for view in super::views::occupied(&self.db)? {
             for pane in &view.panes {
                 remember(&pane.kind);
             }
@@ -196,8 +218,10 @@ fn prune_history() {
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         );
         for path in crate::instance::window_database_paths().map_err(|error| error.to_string())? {
-            if !path.exists() {
-                continue;
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
             }
             for pane in
                 crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget)
@@ -206,11 +230,54 @@ fn prune_history() {
                 remember(&pane.kind);
             }
         }
-        crate::upgrade::floor::prune_unreferenced(&referenced)
-    })();
-    if let Err(error) = result {
-        tracing::warn!(%error, "Stopped update history was kept until its panes can be inspected");
+        Ok(referenced)
     }
+
+    pub(in crate::host) fn saved_session_inventory_sequence(&self) -> Result<u64, String> {
+        self.db
+            .query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn has_closed_session_for_attention(
+        &self,
+        id: TerminalId,
+    ) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE closed=1 AND session_id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn open_agent_sessions(db: &Connection) -> Result<BTreeSet<TerminalId>, String> {
+    let mut statement = db
+        .prepare(
+            "SELECT session_id, json_extract(record, '$.session.Chat.terminal.id')
+             FROM agents WHERE closed = 0 AND session_id IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut referenced = BTreeSet::new();
+    for row in rows {
+        let (session, paired_terminal) = row.map_err(|error| error.to_string())?;
+        for id in std::iter::once(session).chain(paired_terminal) {
+            referenced.insert(
+                id.parse::<TerminalId>()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    Ok(referenced)
 }
 
 #[cfg(test)]
@@ -387,6 +454,34 @@ mod tests {
         view.retired.push(id);
         view.revision = super::super::views::store::next_revision(&registry.db).unwrap();
         store_view(&registry.db, &view);
+    }
+
+    #[test]
+    fn a_headless_open_agent_and_its_paired_terminal_reference_saved_history() {
+        let (mut registry, _, mut agent) = paired_fixture();
+        let Some(HostedSession::Chat(chat)) = &mut agent.session else {
+            panic!("fixture starts with a paired chat");
+        };
+        let paired = TerminalId::new();
+        chat.terminal.as_mut().unwrap().id = paired;
+        let chat_id = chat.id;
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![agent.id.to_string(), serde_json::to_string(&agent).unwrap()],
+            )
+            .unwrap();
+        let mut view = super::super::views::read(&registry.db, &agent.placement).unwrap();
+        view.panes.clear();
+        store_view(&registry.db, &view);
+
+        assert_eq!(
+            open_agent_sessions(&registry.db).unwrap(),
+            BTreeSet::from([chat_id, paired]),
+        );
+        registry.close_agent(&agent.origin, agent.id).unwrap();
+        assert!(open_agent_sessions(&registry.db).unwrap().is_empty());
     }
 
     #[test]

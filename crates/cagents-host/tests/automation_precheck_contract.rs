@@ -1,3 +1,6 @@
+// Linux only: a precheck needs a subreaper to prove its executor's tree is
+// gone, which Darwin lacks (#4045), and its receipt guardian uses `prctl`.
+#![cfg(target_os = "linux")]
 #[path = "support/precheck_receipt_guardian.rs"]
 mod guardian;
 

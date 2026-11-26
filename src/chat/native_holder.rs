@@ -3,10 +3,13 @@
 
 mod cleanup;
 mod transport;
+#[cfg(target_os = "macos")]
+pub use cleanup::inspect_closed_source;
 #[cfg(any(test, feature = "test-support"))]
 pub use cleanup::publish_closed_source;
 pub use cleanup::{
-    Detached, closed_pair_holder, closed_source, confirm_pair_closed, retire_abandoned,
+    Detached, closed_pair_holder, closed_source, closed_source_for_owner, closed_source_for_stop,
+    confirm_pair_closed, retire_abandoned,
 };
 pub use transport::{Holder, adopt, inspect, spawn};
 

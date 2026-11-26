@@ -827,10 +827,7 @@ impl std::fmt::Debug for SessionRuntime {
 }
 
 impl SessionRuntime {
-    #[cfg(all(
-        any(test, feature = "test-support"),
-        not(feature = "integrated-browser")
-    ))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn poison_queue_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = self.queue.0.lock().unwrap();

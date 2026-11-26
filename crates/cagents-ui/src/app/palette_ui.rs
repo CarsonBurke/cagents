@@ -588,15 +588,14 @@ impl Cagents {
                 };
                 if let Some(name) = name {
                     let mut chord = String::new();
-                    for (held, name) in [
-                        (modifiers.control(), "Ctrl+"),
-                        (modifiers.alt(), "Alt+"),
-                        (modifiers.logo(), "Super+"),
-                        (modifiers.shift(), "Shift+"),
-                    ] {
-                        if held {
-                            chord.push_str(name);
-                        }
+                    for name in settings::ModifierNames::CURRENT.held(
+                        modifiers.control(),
+                        modifiers.alt(),
+                        modifiers.logo(),
+                        modifiers.shift(),
+                    ) {
+                        chord.push_str(name);
+                        chord.push('+');
                     }
                     chord.push_str(if name == "," {
                         "Comma"
@@ -1860,7 +1859,7 @@ mod tests {
                 modified_key: keyboard::Key::Character("t".into()),
                 physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat,
             };
@@ -3072,7 +3071,7 @@ mod settings_recorder_tests {
             drop(app.update(press(
                 keyboard::Key::Character("p".into()),
                 keyboard::key::Code::KeyP,
-                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
             )));
             assert!(app.palette.is_open());
             let event = if release_key {
@@ -3105,6 +3104,8 @@ mod settings_recorder_tests {
 
     #[test]
     fn settings_capture_yields_to_a_current_form_dialog_and_resumes_after_escape() {
+        let names = settings::ModifierNames::CURRENT;
+        let recorded = format!("{}+{}+F8", names.control, names.alt);
         for filtering in [false, true] {
             let mut app = super::super::tests::context_inspector_test_app(true);
             let field = SettingsField::ShortcutToggleProjects;
@@ -3163,14 +3164,14 @@ mod settings_recorder_tests {
                 "exposed capture accepts the fresh chord"
             );
             if filtering {
-                assert_eq!(app.settings_search, "Ctrl+Alt+F8");
+                assert_eq!(app.settings_search, recorded);
                 assert_eq!(app.settings, settings);
             } else {
                 assert!(
                     app.settings
                         .keyboard_shortcuts
                         .toggle_projects
-                        .contains(&"Ctrl+Alt+F8".into())
+                        .contains(&recorded)
                 );
                 assert!(app.settings_invalid.is_empty());
             }
@@ -3190,12 +3191,16 @@ mod settings_recorder_tests {
         };
         let modifiers =
             keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
-        for (value, physical, chord) in [
-            ("л", keyboard::key::Code::KeyK, "Ctrl+Alt+Shift+K"),
-            ("!", keyboard::key::Code::Digit1, "Ctrl+Alt+Shift+1"),
-            (",", keyboard::key::Code::Comma, "Ctrl+Alt+Shift+Comma"),
-            ("+", keyboard::key::Code::Equal, "Ctrl+Alt+Shift+Plus"),
+        let names = settings::ModifierNames::CURRENT;
+        let held = format!("{}+{}+{}", names.control, names.alt, names.shift);
+        for (value, physical, key) in [
+            ("л", keyboard::key::Code::KeyK, "K"),
+            ("!", keyboard::key::Code::Digit1, "1"),
+            (",", keyboard::key::Code::Comma, "Comma"),
+            ("+", keyboard::key::Code::Equal, "Plus"),
         ] {
+            let chord = format!("{held}+{key}");
+            let chord = chord.as_str();
             let mut app = super::super::tests::context_inspector_test_app(false);
             let field = SettingsField::ShortcutToggleProjects;
             let pressed = event(value, physical, modifiers);
@@ -3263,13 +3268,14 @@ mod settings_recorder_tests {
             .keyboard_shortcuts
             .toggle_projects
             .clone();
+        let primary = settings::ModifierNames::CURRENT.primary;
         for (chord, reason) in [
-            ("Ctrl+C", "interrupts"),
-            ("Ctrl+Tab", "Cycle recent panes"),
-            ("Ctrl+=", "Increase font size"),
+            ("Ctrl+C".to_owned(), "interrupts"),
+            ("Ctrl+Tab".to_owned(), "Cycle recent panes"),
+            (format!("{primary}+="), "Increase font size"),
         ] {
             drop(app.update_palette(Action::Record(field)));
-            drop(app.record_shortcut(field, chord.into()));
+            drop(app.record_shortcut(field, chord.clone()));
             assert!(
                 app.palette
                     .recording_error

@@ -133,7 +133,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit"],
+                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate"],
                         [str(self.root), "rustfmt", "--edition", "2024", "--check", *INCLUDED],
                     ],
                 )
@@ -154,7 +154,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit"],
+                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate"],
                         [str(self.root), "rustfmt", "--edition", "2024", *INCLUDED],
                     ],
                 )
@@ -631,11 +631,20 @@ sys.exit({status})
         # package-cache lock the builds around it take.
         home = tempfile.TemporaryDirectory(prefix="cagents-format-cargo-home-", dir="/var/tmp")
         self.addCleanup(home.cleanup)
-        self.exercise_included_sources(cargo_fixture.private_cargo_environment(home.name))
+        env = cargo_fixture.private_cargo_environment(home.name)
+        self.exercise_included_sources(env)
+
+        dictate = "crates/cagents-dictate/src/main.rs"
+        malformed = "fn   main( ) { }\n"
+        self.write(dictate, malformed)
+        checked = self.run_checker(env)
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn(dictate, checked.stdout + checked.stderr)
+        self.assertEqual((self.root / dictate).read_text(), malformed)
 
     def exercise_included_sources(self, env):
         self.write("Cargo.toml", """[workspace]
-members = [".", "crates/cagents-host", "crates/cagents-ui", "crates/cagents-ui-kit"]
+members = [".", "crates/cagents-host", "crates/cagents-ui", "crates/cagents-ui-kit", "crates/cagents-dictate"]
 [package]
 name = "cagents"
 version = "0.0.0"
@@ -651,6 +660,12 @@ name = "cagents-ui-kit"
 version = "0.0.0"
 edition = "2024"
 """)
+        self.write("crates/cagents-dictate/Cargo.toml", """[package]
+name = "cagents-dictate"
+version = "0.0.0"
+edition = "2024"
+""")
+        self.write("crates/cagents-dictate/src/main.rs", "fn main() {}\n")
         self.write("crates/cagents-ui-kit/src/lib.rs", "pub fn kit() {}\n")
         self.write("crates/cagents-host/Cargo.toml", """[package]
 name = "cagents-host"
@@ -679,7 +694,7 @@ include!("../tests/support/repository_scale.rs");
                 path.write_text(original + "fn   malformed( ) { }\n")
                 before = {path: path.read_bytes() for path in self.root.rglob("*.rs")}
                 cargo = subprocess.run(
-                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit"],
+                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate"],
                     cwd=self.root, env=env,
                     capture_output=True, text=True, timeout=HANG_GUARD,
                 )

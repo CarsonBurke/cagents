@@ -1,12 +1,18 @@
 use super::*;
 use crate::{
     model::ProjectKind,
-    terminal_ipc::ServerMessage,
     work::{Removal, Request, Response},
-    workspace_model::{ModelEdit, delta::ViewRevision, views},
+    workspace_model::ModelEdit,
+};
+#[cfg(target_os = "linux")]
+use crate::{
+    terminal_ipc::ServerMessage,
+    workspace_model::{delta::ViewRevision, views},
     worktree_content::Verdict,
 };
-use std::{os::unix::fs::PermissionsExt, process::Command, sync::Arc};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+use std::{process::Command, sync::Arc};
 
 fn git(directory: &Path, arguments: &[&str]) -> String {
     let output = Command::new("git")
@@ -92,6 +98,7 @@ impl Fixture {
 
     /// Wait for a scan that starts after a test changes the checkout topology.
     /// An already-running scan may still hold the previous branch names.
+    #[cfg(target_os = "linux")]
     fn refresh(&self) {
         let handle = self.service.handle();
         let sequence = {
@@ -157,6 +164,7 @@ impl Fixture {
     }
 }
 
+#[cfg(target_os = "linux")]
 const CHILD: &str = "CAGENTS_WORK_REMOVAL_TEST";
 
 /// Runs the test `name` again in a child process with private XDG
@@ -165,6 +173,7 @@ const CHILD: &str = "CAGENTS_WORK_REMOVAL_TEST";
 /// so where unprivileged namespaces allow, the child also gets a PID
 /// namespace of its own: an editor the developer has open is none of the
 /// fixture's.
+#[cfg(target_os = "linux")]
 fn isolated(name: &str) -> Option<PathBuf> {
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return Some(PathBuf::from(
@@ -225,6 +234,7 @@ fn isolated(name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")] // Success requires the live checkout-process census.
 #[test]
 fn unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes() {
     let Some(root) = isolated("unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes") else {
@@ -319,6 +329,7 @@ fn unsaved_work_is_kept_as_a_snapshot_before_its_worktree_goes() {
     assert!(snapshots[0].created_at_unix_ms.is_some());
 }
 
+#[cfg(target_os = "linux")] // Success requires the live checkout-process census.
 #[test]
 fn a_landed_worktree_goes_with_its_branch() {
     let Some(root) = isolated("a_landed_worktree_goes_with_its_branch") else {
@@ -422,6 +433,7 @@ fn a_landed_worktree_goes_with_its_branch() {
     assert_eq!(error, "The primary worktree is never removed");
 }
 
+#[cfg(target_os = "linux")] // APFS refuses the invalid UTF-8 ref fixture.
 #[test]
 fn invalid_byte_branch_removal_is_disabled_without_affecting_literal_branch() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
@@ -464,4 +476,28 @@ fn invalid_byte_branch_removal_is_disabled_without_affecting_literal_branch() {
         fixture.plan("legacy-\u{fffd}").inspection.branch.as_deref(),
         Some("legacy-\u{fffd}")
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unverified_removal_preserves_the_checkout_and_draft_without_creating_a_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(root.path());
+    let feature = fixture.repository.join(".worktrees/feature");
+    let plan = fixture.plan("feature");
+    let token = plan.inspection.token.unwrap();
+
+    let error = fixture
+        .remove("feature", &token, Keep::Snapshot, false)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "macOS cannot verify all process mappings that may hold this worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(feature.join("draft")).unwrap(),
+        "unsaved\n"
+    );
+    assert!(fixture.worktrees().contains(".worktrees/feature"));
+    assert!(git(&fixture.repository, &["for-each-ref", SNAPSHOT_REFS]).is_empty());
 }

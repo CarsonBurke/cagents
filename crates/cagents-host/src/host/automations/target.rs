@@ -16,7 +16,7 @@ fn open(path: &Path) -> io::Result<File> {
     }
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(crate::fs_safety::DIRECTORY_HANDLE | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
 }
 
@@ -98,18 +98,19 @@ mod tests {
 
     #[test]
     fn same_path_replacement_and_symlink_do_not_inherit_directory_consent() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("worktree");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("worktree");
         std::fs::create_dir(&path).unwrap();
         let identity = capture(&path).unwrap();
         let held = verify(&path, &identity).unwrap();
-        std::fs::rename(&path, root.path().join("old")).unwrap();
+        std::fs::rename(&path, root.join("old")).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(verify(&path, &identity).is_err());
         // The already checked handle still names the original target.
         assert_eq!(held.metadata().unwrap().ino(), identity.inode);
         std::fs::remove_dir(&path).unwrap();
-        std::os::unix::fs::symlink(root.path().join("old"), &path).unwrap();
+        std::os::unix::fs::symlink(root.join("old"), &path).unwrap();
         assert!(verify(&path, &identity).is_err());
     }
 
@@ -119,8 +120,9 @@ mod tests {
             model::ProjectKind,
             process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
         };
-        let root = tempfile::tempdir().unwrap();
-        let repository = root.path().join("project");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("project");
         std::fs::create_dir(&repository).unwrap();
         let executor = SystemProcessExecutor;
         let git = |arguments: &[&str]| {
@@ -145,7 +147,7 @@ mod tests {
             "-m",
             "initial",
         ]);
-        let linked = root.path().join("linked");
+        let linked = root.join("linked");
         git(&[
             "worktree",
             "add",
@@ -165,14 +167,6 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            project(
-                root.path(),
-                &repository.join(".git"),
-                ProjectKind::Git,
-                &executor
-            )
-            .is_err()
-        );
+        assert!(project(&root, &repository.join(".git"), ProjectKind::Git, &executor).is_err());
     }
 }

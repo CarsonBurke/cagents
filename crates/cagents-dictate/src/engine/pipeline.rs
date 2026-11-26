@@ -67,10 +67,16 @@ pub trait Recognizer: Send {
 /// Something for the recognizer to transcribe.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Job {
-    Partial { segment: u32, samples: Vec<f32> },
+    Partial {
+        segment: u32,
+        samples: Vec<f32>,
+    },
     /// An empty `samples` means an utterance detection dropped after a
     /// partial was sent: its final is empty.
-    Final { segment: u32, samples: Vec<f32> },
+    Final {
+        segment: u32,
+        samples: Vec<f32>,
+    },
 }
 
 /// Whether a partial may be asked for now, and after how much new audio.
@@ -324,9 +330,14 @@ impl Control {
 /// How a session's capture ended.
 #[derive(Clone, Debug, PartialEq)]
 pub enum End {
-    Stopped { audio_ms: u64 },
+    Stopped {
+        audio_ms: u64,
+    },
     Cancelled,
-    Failed { kind: ErrorKind, message: String },
+    Failed {
+        kind: ErrorKind,
+        message: String,
+    },
     /// Capture gave up because the recognizer could not load.
     Abandoned,
 }
@@ -565,9 +576,8 @@ impl Worker {
 
     fn job(&mut self, state: &mut Current, job: Job, superseded: bool) {
         let partial = matches!(job, Job::Partial { .. });
-        let skip = superseded
-            || state.failed.is_some()
-            || state.control.cancel.load(Ordering::Acquire);
+        let skip =
+            superseded || state.failed.is_some() || state.control.cancel.load(Ordering::Acquire);
         let (segment, samples) = match job {
             Job::Partial { segment, samples } | Job::Final { segment, samples } => {
                 (segment, samples)
@@ -732,7 +742,10 @@ mod tests {
         }
         segmenter.push(&audio(true, 0.3), closed, &mut jobs);
         segmenter.finish(&mut jobs);
-        let finals: Vec<_> = kinds(&jobs).into_iter().map(|kind| (kind.0, kind.1)).collect();
+        let finals: Vec<_> = kinds(&jobs)
+            .into_iter()
+            .map(|kind| (kind.0, kind.1))
+            .collect();
         assert_eq!(finals, vec![('f', 0), ('f', 1), ('f', 2)]);
     }
 

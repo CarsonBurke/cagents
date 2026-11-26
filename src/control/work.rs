@@ -1772,6 +1772,7 @@ mod tests {
         let root = std::fs::canonicalize(root.path()).unwrap();
         let repository = root.join("app/.git");
         std::fs::create_dir_all(repository.join("worktrees/linked")).unwrap();
+        std::fs::write(repository.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(root.join("app/src")).unwrap();
         let linked = root.join("linked");
         std::fs::create_dir_all(linked.join("src")).unwrap();

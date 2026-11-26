@@ -292,7 +292,7 @@ pub fn font_zoom_chord(
         Key,
         key::{Code, Physical},
     };
-    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+    if !crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
         return None;
     }
     match (key.as_ref(), physical) {
@@ -3957,14 +3957,14 @@ mod tests {
         };
         let equal = Physical::Code(Code::Equal);
         assert_eq!(
-            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::CTRL),
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::COMMAND),
             Some(1)
         );
         assert_eq!(
             font_zoom_chord(
                 &Key::Character("+".into()),
                 equal,
-                Modifiers::CTRL | Modifiers::SHIFT
+                Modifiers::COMMAND | Modifiers::SHIFT
             ),
             Some(1)
         );
@@ -3972,7 +3972,7 @@ mod tests {
             font_zoom_chord(
                 &Key::Character("-".into()),
                 Physical::Code(Code::Minus),
-                Modifiers::CTRL
+                Modifiers::COMMAND
             ),
             Some(-1)
         );
@@ -3980,7 +3980,7 @@ mod tests {
             font_zoom_chord(
                 &Key::Character("0".into()),
                 Physical::Code(Code::Digit0),
-                Modifiers::CTRL
+                Modifiers::COMMAND
             ),
             Some(0)
         );
@@ -3992,7 +3992,7 @@ mod tests {
             font_zoom_chord(
                 &Key::Character("=".into()),
                 equal,
-                Modifiers::CTRL | Modifiers::ALT
+                Modifiers::COMMAND | Modifiers::ALT
             ),
             None
         );

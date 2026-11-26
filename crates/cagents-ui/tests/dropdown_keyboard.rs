@@ -11,6 +11,8 @@ enum Message {
     Before,
     Selected(usize),
     After,
+    /// Only Linux's retained popup surfaces report closing.
+    #[cfg(target_os = "linux")]
     SurfaceClosed,
 }
 

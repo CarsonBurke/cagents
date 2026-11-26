@@ -5,7 +5,7 @@ use super::{
 };
 use crate::upgrade::{
     handoff::{Carried, Store},
-    recovery,
+    recovery::{self, verified::ready},
 };
 use std::collections::BTreeSet;
 
@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 /// been handled. It supplies no launch recipes or renewed execution authority.
 pub(super) fn restore_settled(host: &SharedHost) -> Result<bool, String> {
     let store = Store::discover()?;
-    let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+    let daemon = crate::process::current_executable().map_err(|error| error.to_string())?;
     restore_settled_from(host, &store.path, &daemon)
 }
 
@@ -33,15 +33,49 @@ pub(super) fn restore_settled_from(
 /// Ordinary startup restores only current, authenticated holders and the
 /// current Ready checkpoint. Archived update evidence cannot recreate panes.
 pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
+    restore_ordinary_with(host, std::path::Path::new("/proc"), None).map(|_| ())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn restore_ordinary_with_process_fixture(
+    host: &SharedHost,
+    processes: &std::path::Path,
+) -> Result<(), String> {
+    restore_ordinary_with(host, processes, None).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn restore_installed_ready(
+    host: &SharedHost,
+    admission: &recovery::ReadyAdmission,
+) -> Result<state::RestoredUpgrade, String> {
+    restore_ordinary_with(
+        host,
+        std::path::Path::new("/proc"),
+        Some(admission.checkpoint_digest()),
+    )
+}
+
+fn restore_ordinary_with(
+    host: &SharedHost,
+    processes: &std::path::Path,
+    expected_ready: Option<&str>,
+) -> Result<state::RestoredUpgrade, String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: previous boot history", None);
     chat::retained_actor::reconcile_previous_boot_history(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: capture Ready", None);
-    let ready_capture = crate::upgrade::recovery::verified::ready::capture()?;
+    let ready_capture = ready::capture()?;
+    let captured_digest = ready_capture
+        .as_ref()
+        .map(ready::ReadyCapture::checkpoint_digest);
+    if expected_ready.is_some() && captured_digest != expected_ready {
+        return Err("Installed startup lost its acknowledged Ready capture".into());
+    }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
-    let unattached = state::restore_upgrade(host)?;
+    let mut restored = state::restore_upgrade_with_digest(host, processes, captured_digest)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;
@@ -54,7 +88,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore native holders", None);
-    chat::restore_orphaned_native(host, &unattached)?;
+    chat::restore_orphaned_native(host, &restored.unattached)?;
     if let Some(detail) = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -70,7 +104,7 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
     chat::retained_actor::reconcile_startup_losses(host)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore current presentations", None);
-    model::floor::restore_presentations()?;
+    model::floor::restore_presentations(None)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: reconcile retained runs", None);
     let retained_runs = chat::retained_actor::retained_runs(host);
@@ -89,22 +123,19 @@ pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
             .collect::<Vec<_>>();
         (state.proof().clone(), state.list(0), chats)
     };
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let executable = crate::process::current_executable().map_err(|error| error.to_string())?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
-    crate::upgrade::recovery::verified::ready::publish(
-        ready_capture,
-        &proof,
-        &executable,
-        &terminals,
-        &chats,
-    )?;
+    ready::publish(ready_capture, &proof, &executable, &terminals, &chats)?;
+    if expected_ready.is_none() {
+        restored.finish(host)?;
+    }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: optional archived proof", None);
     publish_archived_proof(host);
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: complete", None);
-    Ok(())
+    Ok(restored)
 }
 
 /// Settle what agents were left doing by an earlier daemon. A committed
@@ -150,7 +181,7 @@ fn settle_agents(
 fn publish_archived_proof(host: &SharedHost) {
     let result = (|| -> Result<(), String> {
         let store = Store::discover()?;
-        let daemon = std::env::current_exe().map_err(|error| error.to_string())?;
+        let daemon = crate::process::current_executable().map_err(|error| error.to_string())?;
         let Some(settled) = recovery::archived_discovery(&store.path, &daemon)? else {
             return Ok(());
         };
@@ -220,7 +251,7 @@ fn restore_recovered(
     super::chat::retained_actor::reconcile_retired_actors(host)?;
     super::chat::retained_actor::reconcile_startup_losses(host)?;
 
-    super::model::floor::restore_presentations()?;
+    super::model::floor::restore_presentations(None)?;
     let retained_runs = super::chat::retained_actor::retained_runs(host);
     settle_agents(host, &retained_runs)?;
     ensure_no_ambiguous_adoption(host)?;
@@ -260,11 +291,11 @@ fn restore_recovered(
     Ok(true)
 }
 
-/// Returns true only for the one startup carrying a validated recovery receipt.
+/// Returns the settled record only for the startup carrying a validated receipt.
 /// Ordinary startup keeps Prepared's existing refusal and replay guarantees.
-pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
+pub(super) fn restore(host: &SharedHost) -> Result<Option<recovery::RecoveryRecord>, String> {
     let Some(mut record) = recovery::take_for_host()? else {
-        return Ok(false);
+        return Ok(None);
     };
     let store = Store::discover()?;
     let checkpoint = store
@@ -362,7 +393,7 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     paused.save()?;
     // A close performed by the already-approved floor can retire its managed
     // pane in the old registry. Restore that saved presentation, never its run.
-    super::model::floor::restore_presentations()?;
+    super::model::floor::restore_presentations(Some(&record.source))?;
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.pause_update_terminals(&record.paused_terminals);
@@ -420,11 +451,10 @@ pub(super) fn restore(host: &SharedHost) -> Result<bool, String> {
     record.adopted_terminal_descriptors = host.lock().unwrap_or_else(|p| p.into_inner()).list(0);
     // The superseding record preserves Prepared byte-for-byte. It records this
     // one adoption's result; it never grants a later plain start new authority.
-    record.finish(&successor)?;
-    Ok(true)
+    record.finish(&successor).map(Some)
 }
 
-fn live_chat_descriptors(state: &state::HostState) -> Vec<crate::chat::Session> {
+pub(super) fn live_chat_descriptors(state: &state::HostState) -> Vec<crate::chat::Session> {
     state
         .chats
         .values()
@@ -606,6 +636,69 @@ mod tests {
         (registry, pane)
     }
 
+    /// A daemon that cannot open its shared model still hosts terminals, as
+    /// its entry point documents: ordinary startup passes over the retained
+    /// receipts and losses only that model could commit, and becomes ready.
+    #[test]
+    fn ordinary_startup_without_the_shared_model_still_becomes_ready() {
+        const ROOT: &str = "CAGENTS_STORELESS_STARTUP_TEST_ROOT";
+        let Some(root) = std::env::var_os(ROOT) else {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            for name in ["home", "run", "data", "config", "cache", "state"] {
+                crate::secure_file::prepare_private_directory(&root.path().join(name)).unwrap();
+            }
+            let selector = std::thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(ROOT, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        };
+        assert!(
+            crate::instance::project_dirs()
+                .unwrap()
+                .data_dir()
+                .starts_with(&root)
+        );
+        // A directory where the store belongs: the store cannot be opened, and
+        // the host never installs a model, as at a daemon's startup.
+        let store = crate::instance::project_dirs()
+            .unwrap()
+            .data_dir()
+            .join("workspace-model.sqlite3");
+        std::fs::create_dir_all(&store).unwrap();
+        assert!(model::Registry::open().is_err());
+        let host = Arc::new(state::HostLock::new(state::HostState::new(
+            HostSessionProof {
+                host_session_id: "storeless-startup".into(),
+                boot_id: "private-test-boot".into(),
+                host_incarnation: "storeless".into(),
+            },
+        )));
+        assert!(agent_execution::registry(&host).is_err());
+        restore_ordinary(&host).unwrap();
+        assert!(matches!(
+            host.lock().unwrap().startup_state(),
+            crate::terminal_ipc::StartupState::Ready
+        ));
+    }
+
     #[test]
     fn paused_record_never_learns_missing_identity_from_later_alias() {
         let proof = |epoch: &str| HostSessionProof {
@@ -700,7 +793,8 @@ mod tests {
         let root = if let Some(root) = std::env::var_os(ROOT) {
             std::path::PathBuf::from(root)
         } else {
-            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            // Keep the short socket root and use its canonical path in durable evidence.
+            let root = tempfile::tempdir_in(fs::canonicalize("/var/tmp").unwrap()).unwrap();
             for name in [
                 "home", "run", "data", "config", "cache", "project", "codex", "claude",
             ] {
@@ -709,8 +803,11 @@ mod tests {
             let selector = std::thread::current().name().unwrap().to_owned();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
                 .env(ROOT, root.path())
                 .env("HOME", root.path().join("home"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
                 .env("XDG_RUNTIME_DIR", root.path().join("run"))
                 .env("XDG_DATA_HOME", root.path().join("data"))
                 .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -851,7 +948,7 @@ mod tests {
                 .unwrap()
                 .save()
                 .unwrap();
-            model::floor::restore_presentations().unwrap();
+            model::floor::restore_presentations(None).unwrap();
         }
         let original_agent = registry.agent_for_session(source.id).unwrap().unwrap();
         let Some(crate::agent_execution::HostedSession::Chat(latest_saved)) =
@@ -915,7 +1012,7 @@ mod tests {
                 title: "Paused Codex".into(),
                 identity: hash(&serde_json::to_vec(&source).unwrap()),
                 disposition: crate::update::impact::Disposition::Resumes,
-                reason: String::new(),
+                reason: "".into(),
                 interrupted_subagents: Vec::new(),
             }],
             blockers: Vec::new(),
@@ -1179,7 +1276,7 @@ mod tests {
         if case == SettledCase::CanonicalClose {
             // Production pruning removes the genuinely closed paused page.
             // The still-canonical settled Prepared file must never recreate it.
-            model::floor::restore_presentations().unwrap();
+            model::floor::restore_presentations(None).unwrap();
             assert!(crate::upgrade::floor::load().unwrap().records.is_empty());
             assert!(crate::upgrade::floor::snapshot(&history_source).is_err());
             let mut initial = state::HostState::new(proof("closed-canonical-restart"));
@@ -1339,8 +1436,11 @@ mod tests {
             let selector = std::thread::current().name().unwrap().to_owned();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
                 .env(ROOT, root.path())
                 .env("HOME", root.path().join("home"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
                 .env("XDG_RUNTIME_DIR", root.path().join("run"))
                 .env("XDG_DATA_HOME", root.path().join("data"))
                 .env("XDG_CONFIG_HOME", root.path().join("config"))

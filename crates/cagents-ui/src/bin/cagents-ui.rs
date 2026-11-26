@@ -96,6 +96,10 @@ pub(crate) fn main_with_before_start(
         Ok(None) => return std::process::ExitCode::SUCCESS,
         Err(error) => return report(Err(error)),
     };
+    #[cfg(target_os = "macos")]
+    if let Err(error) = cagents::instance::connect_ui_launcher() {
+        return report(Err(error.into()));
+    }
     if let Err(error) = before_start() {
         return report(Err(error));
     }
@@ -233,7 +237,7 @@ fn truncated(message: &str) -> &str {
 /// show the dialog itself: it must answer the launcher's handshake, and the
 /// launcher kills it the moment that answer is an error.
 fn spawn_startup_error_dialog(message: &str, still_starting: bool) -> std::io::Result<()> {
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(cagents::process::current_executable()?);
     command.arg(STARTUP_ERROR).arg(message);
     if still_starting {
         command.arg(STILL_STARTING);
@@ -253,7 +257,7 @@ fn spawn_startup_error_dialog(message: &str, still_starting: bool) -> std::io::R
 /// starting. The waiting process closes it once its own window opens.
 fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
     let parent = std::process::id();
-    let mut command = std::process::Command::new(std::env::current_exe()?);
+    let mut command = std::process::Command::new(cagents::process::current_executable()?);
     command
         .arg(STARTUP_WAIT)
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
@@ -266,7 +270,9 @@ fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
     unsafe {
         command.pre_exec(move || {
             // A notice must not outlive the startup it describes, even when
-            // that process dies without dismissing it.
+            // that process dies without dismissing it. Darwin has no parent
+            // death signal; the notice watches its parent itself instead.
+            #[cfg(target_os = "linux")]
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -279,11 +285,92 @@ fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
     command.spawn()
 }
 
+/// Ends this process with SIGTERM once the process that started it exits, as
+/// Linux's parent death signal does. A kqueue watches the parent's exit, and
+/// checking that the parent is unchanged after registering rules out watching
+/// a later process that reused its pid. Darwin has no subreapers, so a parent
+/// of launchd (pid 1) means the window that started this one already exited.
+#[cfg(target_os = "macos")]
+fn end_with_parent() -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: getppid has no preconditions and no failure state.
+    let parent = unsafe { libc::getppid() };
+    if parent == 1 {
+        return Err(std::io::Error::other("the waiting window has exited"));
+    }
+    // SAFETY: kqueue takes no arguments and returns a new descriptor or -1.
+    let raw = unsafe { libc::kqueue() };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful kqueue returned a fresh descriptor owned here.
+    let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: F_SETFD takes an integer flag, on the descriptor owned above.
+    if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let change = libc::kevent {
+        ident: parent as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one change record that lives for the call, and no output.
+    if unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: getppid has no preconditions and no failure state.
+    if unsafe { libc::getppid() } != parent {
+        return Err(std::io::Error::other("the waiting window has exited"));
+    }
+    std::thread::Builder::new()
+        .name("cagents-ui-parent".into())
+        .spawn(move || {
+            // SAFETY: an all-zero kevent is a valid output record.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            loop {
+                // SAFETY: one output record that lives for the call, and a
+                // null timeout waits for the parent's exit.
+                let count = unsafe {
+                    libc::kevent(
+                        queue.as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        &mut event,
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                // A watch that fails can no longer tell; end the notice too.
+                if count != -1
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+            // SAFETY: signalling this process takes scalar arguments only.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        })?;
+    Ok(())
+}
+
 fn spawn_startup_update_dialog(
     request: &cagents_ui::startup_window::Request,
 ) -> std::io::Result<()> {
     let payload = serde_json::to_string(request).map_err(std::io::Error::other)?;
-    std::process::Command::new(std::env::current_exe()?)
+    std::process::Command::new(cagents::process::current_executable()?)
         .args([STARTUP_UPDATE, &payload])
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
         .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
@@ -313,6 +400,8 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         if arguments.next().is_some() {
             return Err("invalid startup wait arguments".into());
         }
+        #[cfg(target_os = "macos")]
+        end_with_parent()?;
         return run_startup_wait_notice();
     }
     if arguments.peek() == Some(&CONFIRM_DAEMON_STOP) {
@@ -457,20 +546,35 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let _activation = activation;
     iced::daemon(
         move || {
-            let mut window_settings = iced::window::Settings {
+            let window_settings = iced::window::Settings {
                 size: iced::Size::new(1440.0, 900.0),
                 min_size: Some(iced::Size::new(900.0, 600.0)),
-                decorations: false,
-                transparent: true,
+                // AppKit keeps its titlebar, transparent over the
+                // client-drawn header, so the traffic lights, the window's
+                // shadow and its rounded corners are its own; the application
+                // leaves room for the lights and hides its own controls.
+                decorations: cfg!(target_os = "macos"),
+                transparent: !cfg!(target_os = "macos"),
                 resize_border: cagents::design::WINDOW_RESIZE_BORDER as u32,
                 exit_on_close_request: false,
                 // The startup task runs alongside window creation. Supply the
                 // icon here so no update can be dropped before the window opens.
                 icon: Some(cagents_ui::app::application_window_icon()),
+                // Wayland's app ID and X11's class name the window's desktop
+                // entry; a macOS window belongs to its application bundle.
+                #[cfg(target_os = "linux")]
+                platform_specific: iced::window::PlatformSpecific {
+                    application_id: cagents::instance::APPLICATION_ID.to_owned(),
+                    ..Default::default()
+                },
+                #[cfg(target_os = "macos")]
+                platform_specific: iced::window::PlatformSpecific {
+                    title_hidden: true,
+                    titlebar_transparent: true,
+                    fullsize_content_view: true,
+                },
                 ..iced::window::Settings::default()
             };
-            window_settings.platform_specific.application_id =
-                cagents::instance::APPLICATION_ID.to_owned();
             let (window, open) = iced::window::open(window_settings);
             let mut core = Core::default();
             core.set_main_window_id(Some(window));

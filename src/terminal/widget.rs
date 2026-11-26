@@ -297,6 +297,76 @@ fn measured_advance(sample: &str, font_size: f32, family: &'static str, key: Fac
     paragraph.min_bounds().width / sample.len() as f32
 }
 
+/// Removes every face that cannot be shaped from the shared font database,
+/// so no setting, picker or fallback ever selects one; see
+/// [`face_has_advances`]. Runs once at startup, before any text is shaped,
+/// and returns how many faces it removed.
+pub fn drop_faces_without_advances() -> usize {
+    let mut fonts = font_system()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let fonts = fonts.raw();
+    let unusable: Vec<_> = fonts
+        .db()
+        .faces()
+        .filter(|face| !face_has_advances(fonts.db(), face.id))
+        .map(|face| face.id)
+        .collect();
+    if !unusable.is_empty() {
+        let database = fonts.db_mut();
+        for face in &unusable {
+            database.remove_face(*face);
+        }
+    }
+    unusable.len()
+}
+
+/// Whether a face declares horizontal advances: an `hhea` table whose
+/// `numberOfHMetrics` is not zero.
+///
+/// macOS ships bitmap faces without them, such as GB18030 Bitmap, which
+/// reports itself monospaced. swash looks a glyph's advance up at
+/// `numberOfHMetrics - 1`, which underflows: shaping one panics wherever
+/// overflow checks are on, the development runner included, and measures
+/// zero width elsewhere. Such a face is never offered or drawn with.
+fn face_has_advances(
+    database: &cosmic_text::fontdb::Database,
+    face: cosmic_text::fontdb::ID,
+) -> bool {
+    database
+        .with_face_data(face, horizontal_metric_count)
+        .flatten()
+        .is_some_and(|count| count > 0)
+}
+
+/// `numberOfHMetrics` from the `hhea` table of face `index` in an OpenType
+/// font or collection.
+fn horizontal_metric_count(data: &[u8], index: u32) -> Option<u16> {
+    let u16_at = |offset: usize| {
+        data.get(offset..offset.checked_add(2)?)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+    };
+    let u32_at = |offset: usize| {
+        data.get(offset..offset.checked_add(4)?)
+            .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let directory = if data.get(..4)? == b"ttcf" {
+        usize::try_from(u32_at(12 + 4 * usize::try_from(index).ok()?)?).ok()?
+    } else if index == 0 {
+        0
+    } else {
+        return None;
+    };
+    let tables = usize::from(u16_at(directory + 4)?);
+    (0..tables).find_map(|table| {
+        let record = directory + 12 + table * 16;
+        if data.get(record..record + 4)? != b"hhea" {
+            return None;
+        }
+        u16_at(usize::try_from(u32_at(record + 8)?).ok()?.checked_add(34)?)
+    })
+}
+
 /// Whether `key` in `family` advances the narrow ASCII glyphs by `base` too,
 /// `base` being the advance the grid pitch is derived from.
 ///
@@ -2613,6 +2683,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
+                if !reaches_the_child(*modifiers) {
+                    return;
+                }
                 let input = key_press(
                     key,
                     modified_key,
@@ -2668,6 +2741,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
+                if !reaches_the_child(*modifiers) {
+                    return;
+                }
                 let input = key_release(key, *physical_key, *modifiers);
                 match self.handle.key(input) {
                     Ok(()) => shell.capture_event(),
@@ -2690,7 +2766,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     let cell = self.cell_at(geometry, position);
                     state.last_motion_cell = Some(cell);
                     if *button == IcedMouseButton::Left
-                        && state.modifiers.control
+                        && opens_links(&state.modifiers)
                         && let Some(open) = &self.on_open_link
                         && let Some(link) = state.links.borrow_mut().at(
                             &self.snapshot,
@@ -3452,7 +3528,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         );
         if let Some(position) = geometry.cursor_position(cursor) {
             let cell = self.cell_at(geometry, position);
-            if tree.state.downcast_ref::<WidgetState>().modifiers.control
+            if opens_links(&tree.state.downcast_ref::<WidgetState>().modifiers)
                 && self.on_open_link.is_some()
                 && tree
                     .state
@@ -4065,22 +4141,33 @@ enum ClipboardChord {
     Paste,
 }
 
-/// Ctrl+Shift+C and Ctrl+Shift+V, by the Latin key in their place so the
-/// chords survive a switch to a non-Latin layout.
+/// Ctrl+Shift+C and Ctrl+Shift+V, or Command+C and Command+V on macOS, by
+/// the Latin key in their place so the chords survive a switch to a
+/// non-Latin layout. Shift+Insert pastes on Linux, as it does on X11 and
+/// Wayland.
 fn clipboard_chord(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> Option<ClipboardChord> {
-    if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Insert)
-        && modifiers.shift()
-        && !modifiers.control()
-        && !modifiers.alt()
-        && !modifiers.logo()
+    #[cfg(target_os = "linux")]
     {
-        return Some(ClipboardChord::Paste);
+        if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Insert)
+            && modifiers.shift()
+            && !modifiers.control()
+            && !modifiers.alt()
+            && !modifiers.logo()
+        {
+            return Some(ClipboardChord::Paste);
+        }
+        if !modifiers.control() || !modifiers.shift() || modifiers.alt() || modifiers.logo() {
+            return None;
+        }
     }
-    if !modifiers.control() || !modifiers.shift() || modifiers.alt() || modifiers.logo() {
+    // Command is the application's, never the child's, so it needs no Shift
+    // to set these apart from the child's Control chords.
+    #[cfg(target_os = "macos")]
+    if !modifiers.logo() || modifiers.control() || modifiers.shift() || modifiers.alt() {
         return None;
     }
     // iced reports the key without modifiers, but a capital costs nothing to
@@ -4089,6 +4176,30 @@ fn clipboard_chord(
         'c' => Some(ClipboardChord::Copy),
         'v' => Some(ClipboardChord::Paste),
         _ => None,
+    }
+}
+
+/// Whether a click with these modifiers held opens the link under it:
+/// Ctrl+click on Linux and Command+click on macOS, as their terminals do.
+fn opens_links(modifiers: &KeyModifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.super_key
+    } else {
+        modifiers.control
+    }
+}
+
+/// Whether a key event with these modifiers goes to the program in the
+/// terminal. On macOS a Command chord belongs to the application, as in every
+/// macOS terminal: one the workspace leaves unbound is left uncaptured, so it
+/// neither types its letter nor reaches the program.
+fn reaches_the_child(modifiers: keyboard::Modifiers) -> bool {
+    #[cfg(target_os = "macos")]
+    return !modifiers.logo();
+    #[cfg(target_os = "linux")]
+    {
+        let _ = modifiers;
+        true
     }
 }
 
@@ -4306,7 +4417,11 @@ mod tests {
         );
 
         // Copy and paste follow the same key.
-        let chord = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let chord = if cfg!(target_os = "macos") {
+            keyboard::Modifiers::LOGO
+        } else {
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT
+        };
         assert_eq!(
             clipboard_chord(&key("С"), physical(keyboard::key::Code::KeyC), chord),
             Some(ClipboardChord::Copy)
@@ -4327,6 +4442,34 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Control chords are the program's on every platform: Ctrl+C interrupts
+    /// and Ctrl+V quotes the next character. Only the platform's own copy and
+    /// paste chords stay in the terminal.
+    #[test]
+    fn control_chords_reach_the_program_and_command_chords_stay_on_macos() {
+        let key = |text: &str| keyboard::Key::Character(text.into());
+        let c = keyboard::key::Physical::Code(keyboard::key::Code::KeyC);
+        let control = keyboard::Modifiers::CTRL;
+        assert_eq!(clipboard_chord(&key("c"), c, control), None);
+        assert!(reaches_the_child(control));
+        assert!(reaches_the_child(control | keyboard::Modifiers::SHIFT));
+        let command = keyboard::Modifiers::LOGO;
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                clipboard_chord(&key("c"), c, command),
+                Some(ClipboardChord::Copy)
+            );
+            assert_eq!(
+                clipboard_chord(&key("c"), c, control | keyboard::Modifiers::SHIFT),
+                None
+            );
+            assert!(!reaches_the_child(command));
+        } else {
+            assert_eq!(clipboard_chord(&key("c"), c, command), None);
+            assert!(reaches_the_child(command));
+        }
     }
 
     #[test]
@@ -5131,6 +5274,33 @@ mod tests {
         }
     }
 
+    /// Startup leaves only faces that can be shaped, in time that does not
+    /// hold up the first frame on a desktop with many fonts installed.
+    #[test]
+    fn startup_leaves_the_font_database_only_faces_that_can_be_shaped() {
+        // The installed fonts load on first use; only the check is timed.
+        drop(font_system().read());
+        let started = std::time::Instant::now();
+        let dropped = drop_faces_without_advances();
+        let elapsed = started.elapsed();
+        let guard = font_system()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let faces = guard.db().faces().count();
+        assert!(
+            guard
+                .db()
+                .faces()
+                .all(|face| face_has_advances(guard.db(), face.id))
+        );
+        drop(guard);
+        eprintln!(
+            "checked {} faces, dropped {dropped}, in {elapsed:?}",
+            faces + dropped
+        );
+        assert_eq!(drop_faces_without_advances(), 0);
+    }
+
     /// Every installed family whose faces `fontdb` flags as `monospaced` or
     /// not, interned and deduplicated.
     ///
@@ -5146,6 +5316,7 @@ mod tests {
             .db()
             .faces()
             .filter(|face| face.monospaced == monospaced)
+            .filter(|face| face_has_advances(guard.db(), face.id))
             .filter_map(|face| face.families.first())
             .map(|(name, _)| intern_family(name))
             .collect();
@@ -5163,6 +5334,58 @@ mod tests {
             advance(ADVANCE_SAMPLE, font_size, family, key)
                 .is_none_or(|base| is_fixed_pitch(font_size, family, key, base))
         })
+    }
+
+    /// An OpenType table directory holding one `hhea` table, alone or as the
+    /// second face of a collection.
+    fn font_with_metric_count(count: u16, collection: bool) -> Vec<u8> {
+        let directory = if collection { 20 } else { 0 };
+        let table = directory + 12 + 16;
+        let mut data = Vec::new();
+        if collection {
+            data.extend(b"ttcf");
+            data.extend([0, 1, 0, 0]);
+            data.extend(2u32.to_be_bytes());
+            data.extend(0u32.to_be_bytes());
+            data.extend((directory as u32).to_be_bytes());
+        }
+        data.extend([0, 1, 0, 0]);
+        data.extend(1u16.to_be_bytes());
+        data.extend([0; 6]);
+        data.extend(b"hhea");
+        data.extend([0; 4]);
+        data.extend((table as u32).to_be_bytes());
+        data.extend(36u32.to_be_bytes());
+        data.extend([0; 34]);
+        data.extend(count.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn a_face_without_horizontal_metrics_is_recognized() {
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(0, false), 0),
+            Some(0)
+        );
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(7, false), 0),
+            Some(7)
+        );
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(7, true), 1),
+            Some(7)
+        );
+        // A single font has no second face, and a truncated one no table.
+        assert_eq!(
+            horizontal_metric_count(&font_with_metric_count(7, false), 1),
+            None
+        );
+        let truncated = font_with_metric_count(7, false);
+        assert_eq!(
+            horizontal_metric_count(&truncated[..truncated.len() - 1], 0),
+            None
+        );
+        assert_eq!(horizontal_metric_count(b"", 0), None);
     }
 
     #[test]
@@ -5532,6 +5755,8 @@ mod tests {
         );
     }
 
+    /// Mac keyboards have no Insert key, so macOS binds no Insert chords.
+    #[cfg(target_os = "linux")]
     #[test]
     fn shift_insert_pastes_without_ctrl_or_alt() {
         let key = keyboard::Key::Named(keyboard::key::Named::Insert);

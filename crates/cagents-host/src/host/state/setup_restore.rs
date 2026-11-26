@@ -127,7 +127,9 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     struct CloseFixtureHandle(TerminalHandle);
+    #[cfg(target_os = "linux")]
     impl Drop for CloseFixtureHandle {
         fn drop(&mut self) {
             let _ = self.0.shutdown();

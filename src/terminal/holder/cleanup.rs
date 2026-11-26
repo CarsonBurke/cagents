@@ -187,6 +187,7 @@ fn confirmed_receipt(
 /// An orphan holder may remain a zombie until its new parent reaps it. Its
 /// exact identity still exists in /proc, but it can no longer own the socket.
 /// Keep this distinct from the root's stronger requirement to have been reaped.
+#[cfg(target_os = "linux")]
 fn holder_exited(holder: &crate::daemon::holder_registry::Process) -> Result<bool, String> {
     let stat = match fs::read(format!("/proc/{}/stat", holder.pid))
         .map_err(crate::daemon::holder_registry::exited_as_absent)
@@ -208,6 +209,12 @@ fn holder_exited(holder: &crate::daemon::holder_registry::Process) -> Result<boo
         .copied()
         .ok_or("Invalid terminal holder process state")?;
     Ok(start != holder.start || matches!(state, b'Z' | b'X'))
+}
+
+#[cfg(target_os = "macos")]
+fn holder_exited(holder: &crate::daemon::holder_registry::Process) -> Result<bool, String> {
+    let pid = u32::try_from(holder.pid).map_err(|_| "Invalid terminal holder process identity")?;
+    crate::pinned_process::exited_since(pid, holder.start).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

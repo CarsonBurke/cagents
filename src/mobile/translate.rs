@@ -13,7 +13,9 @@ use cagents_mobile_api as api;
 use crate::{
     agent::{ActivityState, Provider},
     agent_execution::{State, directory},
-    chat, notifications,
+    chat,
+    model::AgentId,
+    notifications,
 };
 
 /// Tool output is clipped to its last this many bytes: the end of a build or
@@ -24,7 +26,10 @@ const INPUT_HEAD_BYTES: usize = 2 * 1024;
 /// A delivered report is often the point of a conversation, so it keeps more.
 const DELIVERY_HEAD_BYTES: usize = 32 * 1024;
 
-pub fn session(member: &directory::Member) -> api::Session {
+pub fn session(
+    member: &directory::Member,
+    agent_labels: &HashMap<AgentId, String>,
+) -> api::Session {
     let entry = &member.session;
     api::Session {
         id: entry.id.to_string(),
@@ -35,7 +40,12 @@ pub fn session(member: &directory::Member) -> api::Session {
         },
         provider: entry.provider.map(|provider| provider_id(provider).into()),
         provider_label: entry.provider.map(|provider| provider.label().into()),
-        title: entry.title.clone(),
+        title: entry
+            .delegation
+            .as_ref()
+            .and_then(|delegation| agent_labels.get(&delegation.agent))
+            .or(entry.title.as_ref())
+            .cloned(),
         project: entry.project_name.clone(),
         directory: entry.directory.as_ref().map(|path| path_text(path)),
         activity: activity(entry.state),
@@ -56,6 +66,16 @@ pub fn session(member: &directory::Member) -> api::Session {
             run: delegation.run_state.map(run_state),
         }),
         watchable: entry.surface == directory::Surface::Chat && !member.exited,
+        terminal_watchable: terminal_provider(member).is_some(),
+    }
+}
+
+pub(super) fn terminal_provider(member: &directory::Member) -> Option<Provider> {
+    let entry = &member.session;
+    if entry.surface == directory::Surface::Terminal && !member.exited {
+        entry.provider
+    } else {
+        None
     }
 }
 
@@ -105,6 +125,7 @@ pub fn conversation_state(snapshot: &chat::Snapshot) -> api::ConversationState {
         activity: activity(snapshot.activity()),
         busy: snapshot.busy,
         ready: snapshot.ready,
+        can_attach_image: snapshot.capabilities.attachments,
         exited: snapshot.exited,
         error: snapshot.error.clone(),
         read_only: snapshot.read_only_reason.clone(),
@@ -135,6 +156,9 @@ pub fn conversation_state(snapshot: &chat::Snapshot) -> api::ConversationState {
         subagents: snapshot
             .subagents
             .iter()
+            // The phone aggregates live subagents. Unloaded catalog rows
+            // carry a desktop history observation rather than live work.
+            .filter(|agent| !agent.last_seen_running())
             .map(|agent| api::Subagent {
                 id: agent.id.clone(),
                 kind: agent.kind.clone(),
@@ -261,15 +285,17 @@ pub fn item(item: &chat::Item) -> api::Item {
                 input: input.into(),
                 output: output.into(),
                 clipped: input_clipped || output_clipped,
+                output_clipped,
                 status: tool_status(*status),
             }
         }
         chat::ItemContent::Image {
-            path: _,
             description,
-            reference: _,
+            reference,
+            ..
         } => api::ItemBody::Image {
             description: description.clone(),
+            available: reference.is_some(),
         },
         chat::ItemContent::Delivery {
             kind,
@@ -464,6 +490,7 @@ impl Mirror {
         Some(api::ConversationUpdate {
             session: session.into(),
             reset,
+            read_checkpoint: None,
             state,
             order: order_changed.then_some(order),
             items,

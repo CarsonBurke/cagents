@@ -328,14 +328,23 @@ fn settings_category_controls<'a>(
             let status = design::body(updates.status.clone())
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .width(Length::Fill);
-            let mut update_row: Vec<Element<'a, Message>> = vec![if updates.failed {
+            let status: Element<'a, Message> = if updates.failed {
                 status
                     .class(cosmic::theme::Text::Custom(design::destructive_text))
                     .into()
             } else {
                 status.into()
-            }];
-            if let Some((_, url)) = &updates.available {
+            };
+            let mut update_row: Vec<Element<'a, Message>> = vec![status];
+            if let Some((url, _)) = &updates.installer {
+                update_row.push(update_ui::release_notes_button(url));
+                update_row.push(
+                    crate::ui_controls::button::primary("Copy installer command")
+                        .id(widget::Id::new("settings.updates.copy-installer"))
+                        .on_press(Message::UpdateUi(update_ui::Action::CopyInstallerCommand))
+                        .into(),
+                );
+            } else if let Some((_, url)) = &updates.available {
                 update_row.push(update_ui::release_notes_button(url));
                 update_row.push(
                     // `Apply` is refused while this window is blocked, so the
@@ -376,11 +385,29 @@ fn settings_category_controls<'a>(
                             Some(reason) => format!("{} {reason}", updates.detail),
                             None => updates.detail.clone(),
                         },
-                        widget::row::with_children(update_row)
-                            .align_y(Alignment::Center)
-                            .spacing(space::S)
-                            .width(Length::Fill)
-                            .into(),
+                        {
+                            let row = widget::row::with_children(update_row)
+                                .align_y(Alignment::Center)
+                                .spacing(space::S)
+                                .width(Length::Fill);
+                            // The command is shown, across the whole field,
+                            // as well as copied: the person sees what they
+                            // will run.
+                            match &updates.installer {
+                                Some((_, command)) => widget::column::with_children(vec![
+                                    row.into(),
+                                    design::body(command.clone())
+                                        .font(iced::Font::MONOSPACE)
+                                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                                        .width(Length::Fill)
+                                        .into(),
+                                ])
+                                .spacing(space::S)
+                                .width(Length::Fill)
+                                .into(),
+                                None => row.into(),
+                            }
+                        },
                     ),
                     crate::settings_widgets::toggle(
                         "Check for updates automatically",
@@ -619,7 +646,11 @@ fn settings_category_controls<'a>(
                 vec![
                     crate::settings_widgets::toggle(
                         "Enter sends a chat message",
-                        "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
+                        if cfg!(target_os = "macos") {
+                            "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Cmd+Enter."
+                        } else {
+                            "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter."
+                        },
                         draft.chat_enter_sends,
                         |enabled| Message::SettingsChanged {
                             field: SettingsField::ChatEnterSends,
@@ -711,7 +742,11 @@ fn settings_category_controls<'a>(
         SettingsCategory::Editor => vec![
             settings_group(
                 "Font",
-                "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
+                if cfg!(target_os = "macos") {
+                            "Leave a field blank to follow the terminal font. Cmd+=, Cmd+− and Cmd+0 zoom the focused editor or terminal."
+                        } else {
+                            "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal."
+                        },
                 vec![
                     setting_input(
                         "Monospace font family, or blank to follow the terminal.",
@@ -992,7 +1027,11 @@ fn settings_category_controls<'a>(
                 .label_in_control(),
                 settings_choice(
                     "Open links in",
-                    "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it.",
+                    if cfg!(target_os = "macos") {
+                            "Regular clicks use this destination. Cmd+click and Cmd+Shift+click override it."
+                        } else {
+                            "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it."
+                        },
                     SettingsField::LinkOpenDestination,
                     [
                         (
@@ -1013,12 +1052,20 @@ fn settings_category_controls<'a>(
                     SettingsField::LinkOpenGesture,
                     [
                         (
-                            "Ctrl+Click",
+                            if cfg!(target_os = "macos") {
+                            "Cmd+Click"
+                        } else {
+                            "Ctrl+Click"
+                        },
                             LinkOpenGesture::ControlClick.as_str(),
                             draft.link_open_gesture == LinkOpenGesture::ControlClick,
                         ),
                         (
-                            "Ctrl+Shift+Click",
+                            if cfg!(target_os = "macos") {
+                            "Cmd+Shift+Click"
+                        } else {
+                            "Ctrl+Shift+Click"
+                        },
                             LinkOpenGesture::ControlShiftClick.as_str(),
                             draft.link_open_gesture == LinkOpenGesture::ControlShiftClick,
                         ),
@@ -2036,6 +2083,7 @@ mod keyboard_table_tests {
                 failed: false,
                 can_check: false,
                 available: None,
+                installer: None,
                 apply_blocker: None,
                 detail: String::new(),
             },
@@ -2187,6 +2235,9 @@ mod keyboard_table_tests {
         }
     }
 
+    // Spelled from the Linux table.
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn key_filter_includes_fixed_rows_and_all_matching_registered_actions() {
         let mut draft = SettingsDraft::from_settings(&AppSettings::default());
@@ -2600,10 +2651,7 @@ mod tests {
         use cosmic::iced::futures::{StreamExt, pin_mut};
         use std::{
             os::unix::fs::PermissionsExt,
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            },
+            sync::{Arc, atomic::AtomicUsize},
         };
 
         let directory = tempfile::tempdir().unwrap();
@@ -2639,8 +2687,11 @@ mod tests {
                 .await
                 .is_err()
         );
+        // FSEvents can deliver the fixture's initial save after the watch is
+        // armed. It may cause a read without publishing changed preferences.
+        #[cfg(target_os = "linux")]
         assert_eq!(
-            load_count.load(Ordering::Relaxed),
+            load_count.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "a mode change, such as the one each settings read makes, schedules no reload"
         );

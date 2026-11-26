@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command as Process, Stdio},
@@ -150,6 +150,8 @@ enum ActorCommand {
         closed: crossbeam_channel::Sender<bool>,
     },
     CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
+    #[cfg(target_os = "macos")]
+    VerifyUpdateRelease,
     PinnedLaunchDirectory(
         crossbeam_channel::Sender<
             Result<
@@ -221,6 +223,13 @@ pub enum UpdateReadiness {
     Unready,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedWaiting {
+    Current,
+    Superseded,
+    Resolved,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Update {
     /// Helper outbox has uncommitted semantic evidence; wake the host broker.
@@ -268,6 +277,10 @@ pub enum Update {
     /// A local conversation's record changed for its Work reader.
     #[serde(skip)]
     RecordChanged,
+    /// Local edge for directory readers. Retained helpers carry the failure
+    /// in resident metadata, from which the host emits its own edge.
+    #[serde(skip)]
+    FailureChanged,
 }
 
 pub struct ConversationNaming {
@@ -401,6 +414,8 @@ struct Inner {
     /// What closing does with the work the provider already detached, once
     /// its owner decides. See [`DetachedDecision`].
     detached_work: Arc<DetachedDecision>,
+    #[cfg(target_os = "macos")]
+    completed_descendants: Arc<Mutex<Option<crate::daemon::descendants::Tracker>>>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
@@ -548,7 +563,7 @@ impl LocalHandle {
     /// when it published each update. A frame's confirmation is installed
     /// before the outcomes it settles are published.
     pub(super) fn start_retained(
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
@@ -564,6 +579,7 @@ impl LocalHandle {
             &spec.working_directory,
             |name| spec.environment.get(name).map(std::ffi::OsString::from),
         )?;
+        super::protocol::claude::apply_spawn_attribution(&mut spec, store.directory());
         let confirmed_session = Arc::new(Mutex::new(None));
         let followed = confirmed_session.clone();
         Self::start_with_scope(
@@ -693,6 +709,8 @@ impl LocalHandle {
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
         let detached_work = Arc::new(DetachedDecision::default());
+        #[cfg(target_os = "macos")]
+        let completed_descendants = Arc::new(Mutex::new(None));
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
@@ -721,6 +739,8 @@ impl LocalHandle {
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_work: detached_work.clone(),
+            #[cfg(target_os = "macos")]
+            completed_descendants: completed_descendants.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
@@ -788,6 +808,7 @@ impl LocalHandle {
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
                     waiting_fingerprint: None,
+                    published_error: None,
                     last_present: Instant::now(),
                     first_frame: false,
                     stdout_noise: spec.stdout_noise,
@@ -898,8 +919,28 @@ impl LocalHandle {
                         .ok()
                         .flatten()
                         .and_then(|s| s.code());
-                    child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    #[cfg(target_os = "linux")]
+                    {
+                        child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(disposition) = detached_work.get() {
+                            child.stop_detached = disposition == DetachedWork::Stop;
+                        }
+                    }
                     let result = child.terminate();
+                    #[cfg(target_os = "macos")]
+                    if child.terminated
+                        && let Some(mut tracker) = child.descendants.take()
+                    {
+                        if result.is_err() {
+                            tracker.mark_incomplete();
+                        }
+                        *completed_descendants
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(tracker);
+                    }
                     if child.force_stopped == Some(true) {
                         detached_work.force_stopped();
                     }
@@ -915,10 +956,9 @@ impl LocalHandle {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
-                    } else if let Err(error) = holder.close_inner(
-                        retain_cleanup_receipt.load(Ordering::Acquire),
-                        detached_work.holder(),
-                    ) {
+                    } else if let Err(error) = detached_work
+                        .close_holder(&mut holder, retain_cleanup_receipt.load(Ordering::Acquire))
+                    {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
                         false
@@ -1261,6 +1301,16 @@ impl LocalHandle {
         response
             .try_recv()
             .map_err(|error| format!("Provider update readiness was not acknowledged: {error}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn verify_update_release(&self) -> Result<(), String> {
+        self.ownership_command(ActorCommand::VerifyUpdateRelease)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn commit_update_release(&self) {
+        self.0.detached_work.commit_update_release();
     }
 
     pub(crate) fn interrupt_owned(
@@ -1746,6 +1796,12 @@ impl LocalHandle {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         accepts_prompt(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
     }
+    /// [`Self::is_idle`], and the provider holds nothing the person queued:
+    /// whether the courier may start a turn now.
+    pub(crate) fn takes_courier(&self) -> bool {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        accepts_courier(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
+    }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
         self.0
@@ -1790,7 +1846,7 @@ impl LocalHandle {
         state
             .subagents
             .iter()
-            .filter(|agent| agent.background && agent.status.is_live())
+            .filter(|agent| agent.background && agent.is_live())
             .map(|agent| agent.id.clone())
             .collect()
     }
@@ -1899,6 +1955,34 @@ impl LocalHandle {
         self.0.detached_work.was_force_stopped()
     }
 
+    fn detached_cleanup_proved(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return true;
+        #[cfg(target_os = "macos")]
+        return self
+            .0
+            .completed_descendants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .is_some_and(|tracker| tracker.prove_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stop_observed_detached(&self) -> Result<(), String> {
+        let mut completed = self
+            .0
+            .completed_descendants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match &mut *completed {
+            Some(tracker) => tracker
+                .stop_known(Duration::from_secs(2))
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
@@ -1932,9 +2016,9 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(holder) = retained.as_mut() {
-                holder.close_inner(
+                self.0.detached_work.close_holder(
+                    holder,
                     self.0.retain_cleanup_receipt.load(Ordering::Acquire),
-                    self.0.detached_work.holder(),
                 )?;
                 retained.take();
                 self.0.completed.store(true, Ordering::Release);
@@ -2113,6 +2197,10 @@ impl Drop for Inner {
 }
 impl super::protocol::LaunchCleanup for LocalHandle {
     fn cleanup(&self) -> Result<super::protocol::LaunchOutcome, String> {
+        #[cfg(target_os = "macos")]
+        if self.0.detached_work.get() == Some(DetachedWork::Spare) {
+            return Err("Launch cleanup requires an exact detached-work stop".into());
+        }
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         let deadline = Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE;
@@ -2132,6 +2220,10 @@ impl super::protocol::LaunchCleanup for LocalHandle {
             thread::sleep(Duration::from_millis(10));
         }
         self.close()?;
+        #[cfg(target_os = "macos")]
+        if crate::daemon::adopted_orphans::sweeping() && !self.detached_cleanup_proved() {
+            return Err("Retained launch did not prove detached provider cleanup".into());
+        }
         Ok(super::protocol::LaunchOutcome::TeardownProved)
     }
 }
@@ -2157,7 +2249,6 @@ fn spawn_provider(
     let mut process = Process::new(&spec.program);
     process
         .args(&spec.arguments)
-        .current_dir(&spec.working_directory)
         .env_clear()
         // Callers withhold these already; no path may hand a provider the
         // session its daemon or a saved recipe came from.
@@ -2170,6 +2261,8 @@ fn spawn_provider(
         .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
         .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
         .process_group(0);
+    #[cfg(target_os = "linux")]
+    process.current_dir(&spec.working_directory);
     crate::descriptor_limit::inherit(&mut process);
     let original = spec
         .execution
@@ -2192,7 +2285,7 @@ fn spawn_provider(
             Arc::new(
                 std::fs::OpenOptions::new()
                     .read(true)
-                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .custom_flags(crate::fs_safety::DIRECTORY_HANDLE | libc::O_CLOEXEC)
                     .open(&spec.working_directory)
                     .map_err(|error| error.to_string())?,
             )
@@ -2221,9 +2314,11 @@ fn spawn_provider(
         use crate::daemon::codex_temp::{PrivateDir, TEMP_ENV_KEYS};
 
         let inherited = spec.environment.get("TMPDIR").map(std::ffi::OsStr::new);
-        let cwd = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        let temporary = PrivateDir::create(inherited, Some(&cwd))
-            .map_err(|error| format!("Cannot create private Codex temporary directory: {error}"))?;
+        let temporary =
+            PrivateDir::create_for_launch(inherited, Some(&directory), &spec.working_directory)
+                .map_err(|error| {
+                    format!("Cannot create private Codex temporary directory: {error}")
+                })?;
         process.envs(TEMP_ENV_KEYS.map(|key| (key, temporary.path())));
         Some(temporary)
     } else {
@@ -2231,13 +2326,30 @@ fn spawn_provider(
     };
     // A retained actor sweeps its unregistered exited children; this
     // registration keeps the provider's status for its ChildGuard.
-    let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
-        .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+    let failure = |e| format!("Cannot start {}: {e}", spec.program);
+    #[cfg(target_os = "linux")]
+    let (child, registration) =
+        crate::daemon::adopted_orphans::spawn_owned(&mut process).map_err(failure)?;
+    #[cfg(target_os = "macos")]
+    let (child, registration, descendants) = if crate::daemon::adopted_orphans::sweeping() {
+        let (child, registration, tracker) =
+            crate::daemon::adopted_orphans::spawn_tracked(process).map_err(failure)?;
+        (child, registration, Some(tracker))
+    } else {
+        let (child, registration) =
+            crate::daemon::adopted_orphans::spawn_owned(&mut process).map_err(failure)?;
+        (child, registration, None)
+    };
     if let Some(temporary) = &mut temp {
         temporary.launched();
     }
     let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
+    #[cfg(target_os = "macos")]
+    {
+        child.stop_detached = descendants.is_some();
+        child.descendants = descendants;
+    }
     child.directory = Some(directory);
     child._temp = temp;
     // Scope enrollment happens before this child is handed to the actor and
@@ -2273,15 +2385,41 @@ impl DetachedDecision {
     }
     const STOP: u8 = 1;
     const SPARE: u8 = 2;
-    fn decide(&self, detached: DetachedWork) {
-        self.0.store(
-            match detached {
-                DetachedWork::Stop => Self::STOP,
-                DetachedWork::Spare => Self::SPARE,
-            },
-            Ordering::Release,
-        );
+    #[cfg(target_os = "macos")]
+    const UPDATE: u8 = 3;
+
+    #[cfg(target_os = "macos")]
+    fn commit_update_release(&self) {
+        self.0.store(Self::UPDATE, Ordering::Release);
     }
+
+    fn decide(&self, detached: DetachedWork) {
+        let value = match detached {
+            DetachedWork::Stop => Self::STOP,
+            DetachedWork::Spare => Self::SPARE,
+        };
+        #[cfg(target_os = "linux")]
+        self.0.store(value, Ordering::Release);
+        #[cfg(target_os = "macos")]
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != Self::UPDATE).then_some(value)
+            });
+    }
+
+    fn close_holder(
+        &self,
+        holder: &mut super::native_holder::Holder,
+        retain: bool,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if self.0.load(Ordering::Acquire) == Self::UPDATE {
+            return holder.close_for_update();
+        }
+        holder.close_inner(retain, self.holder())
+    }
+
     fn get(&self) -> Option<DetachedWork> {
         match self.0.load(Ordering::Acquire) {
             Self::STOP => Some(DetachedWork::Stop),
@@ -2295,7 +2433,7 @@ impl DetachedDecision {
 }
 struct ChildGuard {
     child: Child,
-    identity: OwnedFd,
+    identity: crate::pinned_process::PinnedChild,
     terminated: bool,
     directory: Option<Arc<std::fs::File>>,
     /// The provider's cgroup scope, when the OS user manager provided one.
@@ -2306,6 +2444,8 @@ struct ChildGuard {
     /// Whether teardown also ends the commands the provider detached, as
     /// when its owner decided to stop them.
     stop_detached: bool,
+    #[cfg(target_os = "macos")]
+    descendants: Option<crate::daemon::descendants::Tracker>,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
     _temp: Option<crate::daemon::codex_temp::PrivateDir>,
@@ -2318,6 +2458,7 @@ impl ChildGuard {
         grace: Duration,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
         let deadline = Instant::now() + grace;
+        let mut announced = false;
         loop {
             if let Some(status) = self.observed_exit_status()? {
                 return Ok(Some(status));
@@ -2326,27 +2467,22 @@ impl ChildGuard {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            let mut descriptor = libc::pollfd {
-                fd: self.identity.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout = remaining
-                .as_nanos()
-                .div_ceil(1_000_000)
-                .min(i32::MAX as u128) as i32;
-            // SAFETY: descriptor points to one initialized pollfd and the
-            // owned pidfd stays open throughout this non-reaping observation.
-            if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            } else if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
-                return Err(std::io::Error::other(
-                    "Provider exit capability became unavailable",
-                ));
+            if announced {
+                // Darwin announces an exit a moment before the child can be
+                // waited for, and the pin stays ready, so pause, not spin.
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                continue;
             }
+            // The pin stays open throughout this non-reaping observation.
+            announced = self
+                .identity
+                .process()
+                .wait_for_exit(remaining)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Provider exit capability became unavailable: {error}"
+                    ))
+                })?;
         }
     }
 
@@ -2355,46 +2491,50 @@ impl ChildGuard {
         mut child: Child,
         registration: crate::daemon::adopted_orphans::Registration,
     ) -> std::io::Result<Self> {
-        // SAFETY: pidfd_open obtains a capability for our freshly spawned,
-        // unreaped child. Its PID remains reserved even if it has exited.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-        if descriptor < 0 {
-            let error = std::io::Error::last_os_error();
-            // Startup has not handed the child to another owner. Keep the
-            // leader unreaped while cleaning its original process group.
-            let group_cleanup = if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
-                Ok(())
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
+        // Our freshly spawned, unreaped child: its PID remains reserved even
+        // if it has exited.
+        let identity = match crate::pinned_process::PinnedChild::of(&child) {
+            Ok(identity) => identity,
+            Err(error) => {
+                // Startup has not handed the child to another owner. Keep the
+                // leader unreaped while cleaning its original process group.
+                // SAFETY: kill takes scalar arguments. The unreaped leader
+                // keeps its pid, and so its group's, from being reused.
+                let group_cleanup =
+                    if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0 {
+                        Ok(())
+                    } else {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ESRCH) {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(
+                                error.kind(),
+                                format!("process group: {error}"),
+                            ))
+                        }
+                    };
+                let cleanup = child
+                    .kill()
+                    .and_then(|()| child.wait().map(|_| ()))
+                    .and(group_cleanup);
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => std::io::Error::new(
                         error.kind(),
-                        format!("process group: {error}"),
-                    ))
-                }
-            };
-            let cleanup = child
-                .kill()
-                .and_then(|()| child.wait().map(|_| ()))
-                .and(group_cleanup);
-            return Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => std::io::Error::new(
-                    error.kind(),
-                    format!("{error}; provider startup cleanup is unconfirmed: {cleanup}"),
-                ),
-            });
-        }
-        // SAFETY: successful pidfd_open returned a new descriptor owned here.
-        let identity = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+                        format!("{error}; provider startup cleanup is unconfirmed: {cleanup}"),
+                    ),
+                });
+            }
+        };
         Ok(Self {
             child,
             identity,
             terminated: false,
             force_stopped: None,
             stop_detached: false,
+            #[cfg(target_os = "macos")]
+            descendants: None,
             directory: None,
             scope: None,
             _registration: registration,
@@ -2410,49 +2550,10 @@ impl ChildGuard {
     }
 
     fn observed_exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        use std::os::unix::process::ExitStatusExt;
-        let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        loop {
-            // SAFETY: the pidfd identifies the original child despite numeric PID
-            // reuse and initializes the siginfo buffer. WNOWAIT leaves all
-            // reaping to terminate below.
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    self.identity.as_raw_fd() as libc::id_t,
-                    &mut information,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        // SAFETY: successful waitid initialized the child status fields.
-        let (pid, status) = unsafe { (information.si_pid(), information.si_status()) };
-        if pid == 0 {
-            return Ok(None);
-        }
-        if pid as u32 != self.child.id() {
-            return Err(std::io::Error::other(
-                "Provider exit observation returned another child",
-            ));
-        }
-        let raw = match information.si_code {
-            libc::CLD_EXITED => status << 8,
-            libc::CLD_KILLED => status,
-            libc::CLD_DUMPED => status | 0x80,
-            _ => {
-                return Err(std::io::Error::other(
-                    "Provider exit observation returned an unexpected status",
-                ));
-            }
-        };
-        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+        // The pin identifies the original child despite numeric PID reuse.
+        // WNOWAIT leaves all reaping to terminate below.
+        self.identity
+            .exit_status(libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
@@ -2471,6 +2572,9 @@ impl ChildGuard {
             })
         });
         let pid = self.child.id() as i32;
+        #[cfg(target_os = "macos")]
+        let signal_group = |signal| crate::process::identity::signal_unreaped_group(pid, signal);
+        #[cfg(target_os = "linux")]
         let signal_group = |signal| {
             // SAFETY: the sole-reaper guard keeps our leader unreaped until
             // after both signals, reserving its numeric group identity.
@@ -2495,6 +2599,23 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
+        #[cfg(target_os = "macos")]
+        let descendants = {
+            let timeout = Duration::from_secs(2);
+            // While the leader still reserves its ID, attempt cleanup of
+            // both the original group and exact known descendants. Failure in
+            // either path must not stop the other from ending known work.
+            self.identity.signal(libc::SIGKILL)?;
+            let group = crate::process::identity::finish_unreaped_group(pid, timeout);
+            let detached = if let Some(tracker) = &mut self.descendants
+                && (force_stopped || self.stop_detached)
+            {
+                tracker.stop_known(timeout)
+            } else {
+                Ok(())
+            };
+            group.and(detached)
+        };
         // Commands in process groups of their own outlive that signal. A
         // force-stopped provider's would hold memory the system needed, with
         // no agent left to use them, so they end with it, as do those of an
@@ -2508,6 +2629,8 @@ impl ChildGuard {
         }
         self.child.wait()?;
         self.terminated = true;
+        #[cfg(target_os = "macos")]
+        descendants?;
         Ok(())
     }
 }
@@ -2599,6 +2722,7 @@ struct Actor {
     execution: execution::Tracker,
     attention_baselined: bool,
     waiting_fingerprint: Option<String>,
+    published_error: Option<String>,
     last_present: Instant,
     first_frame: bool,
     stdout_noise: Option<fn(&[u8]) -> bool>,
@@ -2834,6 +2958,12 @@ fn idle_close_refusal(readiness: UpdateReadiness, state: &Snapshot) -> String {
 /// Parent admission deliberately excludes aggregate background-child activity.
 fn accepts_prompt(state: &Snapshot) -> bool {
     state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty()
+}
+
+/// Whether the courier may start a turn: the conversation takes a prompt,
+/// and the provider holds nothing the person queued, which goes first.
+fn accepts_courier(state: &Snapshot) -> bool {
+    accepts_prompt(state) && state.queued_messages.is_empty()
 }
 
 impl Actor {
@@ -3233,6 +3363,16 @@ impl Actor {
                     revents: 0,
                 },
                 watch,
+                #[cfg(target_os = "macos")]
+                libc::pollfd {
+                    fd: self
+                        .child
+                        .as_ref()
+                        .and_then(|child| child.descendants.as_ref())
+                        .map_or(-1, |tracker| tracker.fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             // The -1 branch proves the parser drained every complete frame
             // and no partial line remains. It also covers a conversation
@@ -3247,6 +3387,17 @@ impl Actor {
                 }
             }
             let mut buffer = [0u8; 8192];
+            #[cfg(target_os = "macos")]
+            if fds[5].revents != 0
+                && let Some(tracker) = self
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.descendants.as_mut())
+            {
+                // The tracker remembers incomplete observation. The provider
+                // transport can continue, with teardown proof unavailable.
+                let _ = tracker.observe();
+            }
             if fds[0].revents != 0 {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
@@ -3465,9 +3616,9 @@ impl Actor {
                     (run, command)
                 }
                 ActorCommand::IdlePrompt(text) => {
-                    if !accepts_prompt(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
+                    if !accepts_courier(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
                         let _ = refuse(
-                            "The conversation is no longer idle for courier delivery".into(),
+                            "The conversation is no longer idle for courier delivery, or the person's queued message goes first".into(),
                         );
                         continue;
                     }
@@ -3557,6 +3708,16 @@ impl Actor {
                     let _ = reply.send(Ok(()));
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                ActorCommand::VerifyUpdateRelease => {
+                    let result = self
+                        .native_holder
+                        .as_ref()
+                        .ok_or_else(|| "Missing native holder".to_owned())
+                        .and_then(super::native_holder::Holder::verify_update_release);
+                    let _ = reply.send(result.map_err(Rejection::Refused));
+                    continue;
+                }
                 ActorCommand::CheckUpdateReadiness(readiness) => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let _ = readiness.send(self.update_readiness(&state));
@@ -3620,10 +3781,16 @@ impl Actor {
             } else {
                 None
             };
-            let starts_turn = matches!(&command, Command::Prompt { .. });
-            if run.is_some() && starts_turn {
+            // A prompt made during a turn steers or queues into it; only one
+            // made between turns starts a turn, and only that one may say the
+            // conversation is waiting for it over what the provider last said.
+            let starts_turn = matches!(&command, Command::Prompt { .. })
+                && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+            if run.is_some() {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
+                if matches!(&command, Command::Prompt { .. })
+                    && (!state.ready || state.busy || state.waiting || !state.requests.is_empty())
+                {
                     let _ = refuse("The provider is no longer idle for the accepted run".into());
                     continue;
                 }
@@ -3791,6 +3958,18 @@ impl Actor {
             Event::Reset { .. } => Some(None),
             _ => None,
         });
+        #[cfg(target_os = "macos")]
+        if let Some(Some(_)) = &identity
+            && let Some(peer) = self.native_peer.as_ref()
+            && let Some(holder) = self.native_holder.as_mut()
+            && self.adapter.server_identity().is_some_and(|server| {
+                super::native_holder::verified_codex_version(&server.user_agent).is_none()
+            })
+            && !self.reconnect_only_reported
+            && let Err(error) = holder.observe_update_server(peer)
+        {
+            tracing::warn!(%error, "native app-server did not provide update release evidence");
+        }
         if let Some(Some(thread)) = &identity
             && self.native_holder.is_some()
             && let Some(identity) = self.adapter.server_identity()
@@ -4216,12 +4395,19 @@ impl Actor {
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
         }
+        let error_changed = self.published_error != state.error;
+        if error_changed {
+            self.published_error.clone_from(&state.error);
+        }
         self.retained = counter.0;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
         drop(state);
         if name_changed {
             (self.notify)(Update::ConversationNameChanged);
+        }
+        if error_changed {
+            (self.notify)(Update::FailureChanged);
         }
     }
     fn publish_activity(&mut self) {
@@ -4977,7 +5163,7 @@ fn apply_projected_event(
 fn stop_snapshot_steps(state: &mut Snapshot) {
     stop_running_steps(&mut state.items);
     for agent in &mut state.subagents {
-        if agent.status == ToolStatus::Running {
+        if agent.is_running() {
             agent.status = ToolStatus::Stopped;
             agent.waiting = false;
         }
@@ -5006,17 +5192,31 @@ fn stop_running_steps(items: &mut [Arc<Item>]) {
 /// available for status and selective Stop.
 fn trim_subagents(state: &mut Snapshot) {
     const RICH_HISTORY: usize = 32;
-    while state.subagents.len() > RICH_HISTORY {
+    // The provider bounds its unloaded listing separately. A catalog row
+    // does not buy history by evicting a followed child's transcript.
+    let mut followed = state
+        .subagents
+        .iter()
+        .filter(|agent| !agent.last_seen_running())
+        .count();
+    while followed > RICH_HISTORY {
         let Some(finished) = state
             .subagents
             .iter()
-            .position(|agent| !agent.status.is_live())
+            .position(|agent| !agent.last_seen_running() && !agent.is_live())
         else {
             break;
         };
         state.subagents.remove(finished);
+        followed -= 1;
     }
-    for agent in state.subagents.iter_mut().rev().skip(RICH_HISTORY) {
+    for agent in state
+        .subagents
+        .iter_mut()
+        .rev()
+        .filter(|agent| !agent.last_seen_running())
+        .skip(RICH_HISTORY)
+    {
         agent.items.clear();
     }
 }

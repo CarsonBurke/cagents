@@ -4,6 +4,10 @@ use super::*;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn pending_publication_failure_closed_agent_cold_cleanup() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -12,6 +16,10 @@ fn pending_publication_failure_closed_agent_cold_cleanup() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn installed_closed_agent_cold_explicit_cleanup() {
     if crate::retained_fixture::run_isolated() {
         return;
@@ -20,6 +28,10 @@ fn installed_closed_agent_cold_explicit_cleanup() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
 fn installed_helper_without_census_refuses_adoption_before_epoch_change() {
     if crate::retained_fixture::run_isolated() {
         return;

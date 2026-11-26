@@ -526,15 +526,22 @@ pub(super) fn start(host: &SharedHost, accepted: &Accepted) -> Result<Start, Str
 /// Starts each agent's next waiting prompt that its agent can now take.
 /// Called by the mailbox courier whenever a conversation or a run changes,
 /// outside any client request, so it takes the upgrade barrier itself, one
-/// prompt at a time. Returns whether one failed to start, so the courier
-/// tries again later rather than waiting for the next edge.
-pub(super) fn start_queued(host: &SharedHost) -> Result<bool, String> {
+/// prompt at a time, except one `defers` holds back for now. Returns whether
+/// one failed to start, so the courier tries again later rather than waiting
+/// for the next edge.
+pub(super) fn start_queued(
+    host: &SharedHost,
+    mut defers: impl FnMut(&Accepted) -> bool,
+) -> Result<bool, String> {
     let queued = registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .queued_agent_runs()?;
     let mut failed = false;
     for accepted in queued {
+        if defers(&accepted) {
+            continue;
+        }
         let Some(started) = mailbox::with_control(host, || start(host, &accepted)) else {
             break;
         };
@@ -1071,6 +1078,8 @@ fn dispatch(
             .recipe
             .arguments
             .extend(launch_options(&accepted.agent.spec));
+        #[cfg(target_os = "macos")]
+        super::chat::record_agent_login_path(&mut session.launch).map_err(|e| before(e.message))?;
         let (proof, listeners) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             (state.proof().clone(), state.codex_listeners.clone())
@@ -1360,7 +1369,7 @@ fn save_confirmed_identity(
     }
 }
 
-fn persist_confirmed_identity(
+pub(super) fn persist_confirmed_identity(
     store: &mut Registry,
     hosted: &chat::Session,
     confirmed: Option<String>,
@@ -1378,10 +1387,18 @@ fn persist_confirmed_identity(
     let Some(HostedSession::Chat(bound)) = agent.session.filter(|_| !agent.closed) else {
         return Ok(false);
     };
-    if bound.launch.session_id.is_some()
-        || !crate::agent_execution::same_chat_process(&bound, hosted)
-    {
+    if !crate::agent_execution::same_chat_process(&bound, hosted) {
         return Ok(false);
+    }
+    if let Some(saved) = bound.launch.session_id.as_deref() {
+        // The agent learned it first: before its pane existed, or before a
+        // window wrote the pane from an agent it read earlier. The pane is
+        // what recovery reads once this actor is gone. Only the thread this
+        // actor confirms is saved there.
+        if saved != confirmed {
+            return Ok(false);
+        }
+        return store.learn_saved_pane_identity(&bound);
     }
     let mut learned = bound.clone();
     learned.launch.session_id = Some(confirmed);
@@ -1798,6 +1815,14 @@ fn shared_gate<T: Default>(
     gate
 }
 
+fn retire_closed_agent_attention(host: &SharedHost, session: Option<&HostedSession>) {
+    if let Some(session) = session
+        && let Some(notifications) = &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+    {
+        notifications.retire(session.id());
+    }
+}
+
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
     let origin = origin(host, authority)?;
     let gate = agent_gate(host, id);
@@ -1811,12 +1836,13 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         // Older daemons closed the worker without retiring its shared pane.
         // Repeating close repairs only that retained presentation; it does not
         // start or contact a provider, and keeps the completed run history.
-        let agent = registry
+        let closed = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .close_agent(&origin, id)?;
+        retire_closed_agent_attention(host, agent.session.as_ref());
         announce(host, &registry);
-        return Ok(agent);
+        return Ok(closed);
     }
     let (pending, ended) = {
         let store = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -1924,6 +1950,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .unwrap_or_else(|p| p.into_inner())
         .execution_startups
         .remove(&id);
+    retire_closed_agent_attention(host, agent.session.as_ref().or(pending.as_ref()));
     announce(host, &registry);
     Ok(result)
 }
@@ -2080,6 +2107,37 @@ fn owned_provider(
     Ok((agent, run, handle))
 }
 
+/// Whether answering a request of `kind` can grant the agent something.
+/// Approving a tool request or consenting to what a tool asks does, and so
+/// does any question of a provider that asks its tool approvals as
+/// questions. An owner below nothing-asks may not give such an answer, so a
+/// person gives it in cagents on the owner's behalf, without taking the agent
+/// over.
+pub(super) fn answer_grants(provider: crate::agent::Provider, kind: chat::RequestKind) -> bool {
+    match kind {
+        chat::RequestKind::Approval | chat::RequestKind::Consent => true,
+        chat::RequestKind::Question => provider.approves_through_questions(),
+    }
+}
+
+/// Whether `command` answers one of the agent's pending requests that can
+/// grant it something: a person's answer the agent's owner may need, rather
+/// than a person taking the agent's controls.
+pub(super) fn answers_grant(
+    handle: &chat::runtime::Handle,
+    provider: crate::agent::Provider,
+    command: &Command,
+) -> bool {
+    let Command::Answer { request_id, .. } = command else {
+        return false;
+    };
+    refresh_retained_requests(handle);
+    handle
+        .requests()
+        .iter()
+        .any(|request| request.id == *request_id && answer_grants(provider, request.kind))
+}
+
 /// A retained provider reports its run Waiting through the durable outbox,
 /// which can overtake the proxy's cached metadata, so a caller reading a
 /// Waiting run's requests refreshes that metadata first. A failed refresh
@@ -2232,16 +2290,10 @@ fn control(
                     actions.join(", ")
                 ));
             }
-            // Approving a tool request, or consenting to what a tool asks,
-            // grants what the child asked for, so only an agent that runs with
-            // nothing asking may do it. Any agent may refuse one, as the
-            // provider's adapter reads the action. A provider that asks its
-            // tool approvals as questions has each of its questions treated so.
-            let grants = match request.kind {
-                chat::RequestKind::Approval | chat::RequestKind::Consent => true,
-                chat::RequestKind::Question => agent.spec.provider.approves_through_questions(),
-            };
-            let ceiling = if grants {
+            // Only an agent that runs with nothing asking may grant what its
+            // child asked for. Any agent may refuse it, as the provider's
+            // adapter reads the action.
+            let ceiling = if answer_grants(agent.spec.provider, request.kind) {
                 caller_ceiling(host, authority)?.filter(|ceiling| !ceiling.may_approve())
             } else {
                 None
@@ -2569,10 +2621,12 @@ fn console(
             }
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .claim_agent_interaction(id, None)?;
+            if !answers_grant(&handle, agent.spec.provider, &command) {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .claim_agent_interaction(id, None)?;
+            }
             handle.command(command)?;
             Ok(Reply::Console(None))
         }

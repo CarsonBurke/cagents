@@ -3,7 +3,7 @@
 use std::{
     io,
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::AsRawFd,
         unix::{ffi::OsStrExt, net::UnixStream},
     },
     path::Path,
@@ -40,21 +40,10 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
         }
         let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
             as libc::socklen_t;
+        let refusing_since = Instant::now();
         loop {
             remaining(deadline)?;
-            // SAFETY: a successful socket owns one new descriptor immediately
-            // transferred to OwnedFd. CLOEXEC is set atomically.
-            let descriptor = unsafe {
-                libc::socket(
-                    libc::AF_UNIX,
-                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                    0,
-                )
-            };
-            if descriptor < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            let descriptor = crate::descriptor::unix_socket(libc::SOCK_STREAM, true)?;
             let connected = unsafe {
                 libc::connect(descriptor.as_raw_fd(), (&raw const address).cast(), length)
             };
@@ -65,6 +54,15 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
                     // backlog is full without beginning a connection. Retry a
                     // fresh descriptor after a bounded pause, never blocking.
                     Some(libc::EAGAIN) => {
+                        drop(descriptor);
+                        std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(5)));
+                        continue;
+                    }
+                    // Darwin answers a full backlog with the refusal it
+                    // gives a socket nobody listens on; see `retry_refusal`.
+                    Some(libc::ECONNREFUSED)
+                        if crate::descriptor::retry_refusal(&error, refusing_since) =>
+                    {
                         drop(descriptor);
                         std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(5)));
                         continue;
@@ -123,20 +121,22 @@ pub(crate) fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
 
     #[test]
     fn full_holder_backlog_obeys_deadline_without_disturbing_original_connection() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("holder");
-        let listener = UnixListener::bind(&path).unwrap();
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let listener = crate::descriptor::bind(&path).unwrap();
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
         let original = UnixStream::connect(&path).unwrap();
         let start = Instant::now();
         let error = connect_until(&path, start + Duration::from_millis(80)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(2));
-        let (_accepted, _) = listener.accept().unwrap();
+        let (_accepted, _) = crate::descriptor::accept(&listener).unwrap();
         assert!(original.peer_addr().is_ok());
     }
 
@@ -144,9 +144,9 @@ mod tests {
     fn connected_stream_is_blocking_and_close_on_exec_and_expired_deadline_has_no_connection() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("holder");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         let connection = connect_until(&path, Instant::now() + Duration::from_secs(1)).unwrap();
-        let (_accepted, _) = listener.accept().unwrap();
+        let (_accepted, _) = crate::descriptor::accept(&listener).unwrap();
         assert_ne!(
             unsafe { libc::fcntl(connection.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
             0

@@ -213,7 +213,7 @@ impl Registry {
 pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
     use std::os::unix::fs::OpenOptionsExt;
 
-    assert!([3, 9, 10, 12, 15, 16, 20, 21].contains(&version));
+    assert!([2, 3, 9, 10, 12, 15, 16, 20, 21].contains(&version));
     assert_eq!(
         source
             .db
@@ -237,9 +237,10 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
     let converted = source
         .path
         .with_file_name(format!("published-schema-{version}-source.sqlite3"));
+    let sqlite_target = crate::secure_file::sqlite_path(&converted);
     source
         .db
-        .execute("VACUUM INTO ?1", [converted.to_str().unwrap()])
+        .execute("VACUUM INTO ?1", [sqlite_target.to_str().unwrap()])
         .unwrap();
     super::schema::downgrade(&converted, super::schema::OLDEST_DOWNGRADE).unwrap();
     let converted = Connection::open(&converted).unwrap();

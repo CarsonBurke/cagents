@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")] // The test writes invalid UTF-8 ref names, which APFS rejects.
     fn compares_non_utf8_revision_without_aliasing_lossy_name() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();

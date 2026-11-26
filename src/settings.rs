@@ -15,6 +15,7 @@ use crate::{
     layout_metrics::{
         NAVIGATION_MAX_WIDTH as EXPANDED_WIDTH_MAX, NAVIGATION_MIN_WIDTH as EXPANDED_WIDTH_MIN,
     },
+    secure_file::reject_symlink_components,
 };
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
@@ -389,48 +390,250 @@ pub struct KeyboardShortcuts {
 
 impl Default for KeyboardShortcuts {
     fn default() -> Self {
-        Self {
-            new_terminal: vec!["Ctrl+Shift+T".to_owned()],
-            new_channel: vec!["Ctrl+Shift+G".to_owned()],
-            clone_pane: vec!["Ctrl+Shift+D".to_owned()],
-            close_focused_column: vec!["Ctrl+W".to_owned()],
-            search_projects: vec!["Ctrl+Shift+F".to_owned()],
-            find_in_pane: vec!["Ctrl+F".to_owned()],
-            previous_column: vec!["Ctrl+PageUp".to_owned()],
-            next_column: vec!["Ctrl+PageDown".to_owned()],
-            cycle_pane_width: vec!["Alt+R".to_owned()],
-            previous_workspace: vec!["Alt+Shift+Tab".to_owned(), "Ctrl+Alt+PageUp".to_owned()],
-            next_workspace: vec!["Alt+Tab".to_owned(), "Ctrl+Alt+PageDown".to_owned()],
-            review_toggle_viewed: vec!["Alt+V".to_owned()],
-            review_next_file: vec!["Alt+Down".to_owned()],
-            review_previous_file: vec!["Alt+Up".to_owned()],
-            review_next_unviewed: vec!["Alt+Shift+Down".to_owned()],
-            review_next_change: vec!["Alt+J".to_owned()],
-            review_previous_change: vec!["Alt+K".to_owned()],
-            command_palette: vec!["Ctrl+Shift+P".to_owned()],
-            new_native_thread: vec!["Ctrl+T".to_owned(), "Ctrl+Shift+N".to_owned()],
-            chat_permissions: vec!["Ctrl+Shift+O".to_owned()],
-            chat_model: vec!["Ctrl+Shift+M".to_owned()],
-            chat_account: vec!["Ctrl+Shift+A".to_owned()],
-            toggle_inspector: vec!["Ctrl+Shift+I".to_owned()],
-            open_settings: vec!["Ctrl+Comma".to_owned()],
-            move_pane_left: vec!["Alt+Shift+Left".to_owned()],
-            move_pane_right: vec!["Alt+Shift+Right".to_owned()],
-            reopen_pane: vec!["Ctrl+Shift+Z".to_owned()],
-            focus_pane_1: vec!["Alt+1".to_owned()],
-            focus_pane_2: vec!["Alt+2".to_owned()],
-            focus_pane_3: vec!["Alt+3".to_owned()],
-            focus_pane_4: vec!["Alt+4".to_owned()],
-            focus_pane_5: vec!["Alt+5".to_owned()],
-            focus_pane_6: vec!["Alt+6".to_owned()],
-            focus_pane_7: vec!["Alt+7".to_owned()],
-            focus_pane_8: vec!["Alt+8".to_owned()],
-            focus_pane_9: vec!["Alt+9".to_owned()],
-            toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
-            rename_pane: vec!["F2".to_owned()],
-            open_worktrees: vec!["Ctrl+Shift+E".to_owned()],
-            dictate: vec!["Ctrl+Shift+Space".to_owned()],
+        Self::for_platform(ShortcutPlatform::CURRENT)
+    }
+}
+
+impl KeyboardShortcuts {
+    /// The built-in table for `platform`.
+    ///
+    /// On macOS, Command is the application's own modifier: no terminal
+    /// program receives it, and text fields use it only for well-known
+    /// chords. Option composes characters on many layouts (`@`, `[`, `{` on
+    /// German ones) and moves by word, and bare Control reaches a terminal as
+    /// a control character, so the macOS table binds neither alone where the
+    /// Linux one binds Alt. Tab is the exception: Option+Tab types nothing.
+    pub fn for_platform(platform: ShortcutPlatform) -> Self {
+        fn chords(chords: &[&str]) -> Vec<String> {
+            chords.iter().map(|chord| (*chord).to_owned()).collect()
         }
+        match platform {
+            ShortcutPlatform::Linux => Self {
+                new_terminal: chords(&["Ctrl+Shift+T"]),
+                new_channel: chords(&["Ctrl+Shift+G"]),
+                clone_pane: chords(&["Ctrl+Shift+D"]),
+                close_focused_column: chords(&["Ctrl+W"]),
+                search_projects: chords(&["Ctrl+Shift+F"]),
+                find_in_pane: chords(&["Ctrl+F"]),
+                previous_column: chords(&["Ctrl+PageUp"]),
+                next_column: chords(&["Ctrl+PageDown"]),
+                cycle_pane_width: chords(&["Alt+R"]),
+                previous_workspace: chords(&["Alt+Shift+Tab", "Ctrl+Alt+PageUp"]),
+                next_workspace: chords(&["Alt+Tab", "Ctrl+Alt+PageDown"]),
+                review_toggle_viewed: chords(&["Alt+V"]),
+                review_next_file: chords(&["Alt+Down"]),
+                review_previous_file: chords(&["Alt+Up"]),
+                review_next_unviewed: chords(&["Alt+Shift+Down"]),
+                review_next_change: chords(&["Alt+J"]),
+                review_previous_change: chords(&["Alt+K"]),
+                command_palette: chords(&["Ctrl+Shift+P"]),
+                new_native_thread: chords(&["Ctrl+T", "Ctrl+Shift+N"]),
+                chat_permissions: chords(&["Ctrl+O"]),
+                chat_model: chords(&["Ctrl+M"]),
+                chat_account: chords(&["Ctrl+Shift+A"]),
+                toggle_inspector: chords(&["Ctrl+Shift+I"]),
+                open_settings: chords(&["Ctrl+Comma"]),
+                move_pane_left: chords(&["Alt+Shift+Left"]),
+                move_pane_right: chords(&["Alt+Shift+Right"]),
+                reopen_pane: chords(&["Ctrl+Shift+Z"]),
+                focus_pane_1: chords(&["Alt+1"]),
+                focus_pane_2: chords(&["Alt+2"]),
+                focus_pane_3: chords(&["Alt+3"]),
+                focus_pane_4: chords(&["Alt+4"]),
+                focus_pane_5: chords(&["Alt+5"]),
+                focus_pane_6: chords(&["Alt+6"]),
+                focus_pane_7: chords(&["Alt+7"]),
+                focus_pane_8: chords(&["Alt+8"]),
+                focus_pane_9: chords(&["Alt+9"]),
+                toggle_projects: chords(&["Ctrl+Shift+B"]),
+                rename_pane: chords(&["F2"]),
+                open_worktrees: chords(&["Ctrl+Shift+E"]),
+                dictate: chords(&["Ctrl+Shift+Space"]),
+            },
+            ShortcutPlatform::MacOs => Self {
+                new_terminal: chords(&["Cmd+Shift+T"]),
+                new_channel: chords(&["Cmd+Shift+G"]),
+                clone_pane: chords(&["Cmd+Shift+D"]),
+                close_focused_column: chords(&["Cmd+W"]),
+                search_projects: chords(&["Cmd+Shift+F"]),
+                find_in_pane: chords(&["Cmd+F"]),
+                previous_column: chords(&["Cmd+Option+Left"]),
+                next_column: chords(&["Cmd+Option+Right"]),
+                cycle_pane_width: chords(&["Cmd+Option+R"]),
+                previous_workspace: chords(&["Option+Shift+Tab", "Cmd+Option+PageUp"]),
+                next_workspace: chords(&["Option+Tab", "Cmd+Option+PageDown"]),
+                review_toggle_viewed: chords(&["Cmd+Option+V"]),
+                review_next_file: chords(&["Cmd+Option+Down"]),
+                review_previous_file: chords(&["Cmd+Option+Up"]),
+                review_next_unviewed: chords(&["Cmd+Option+Shift+Down"]),
+                review_next_change: chords(&["Cmd+Option+J"]),
+                review_previous_change: chords(&["Cmd+Option+K"]),
+                command_palette: chords(&["Cmd+Shift+P"]),
+                new_native_thread: chords(&["Cmd+T", "Cmd+Shift+N"]),
+                // Command+M minimizes the window and Command+O opens; Shift
+                // keeps the pickers off both.
+                chat_permissions: chords(&["Cmd+Shift+O"]),
+                chat_model: chords(&["Cmd+Shift+M"]),
+                chat_account: chords(&["Cmd+Shift+A"]),
+                toggle_inspector: chords(&["Cmd+Option+I"]),
+                open_settings: chords(&["Cmd+Comma"]),
+                move_pane_left: chords(&["Cmd+Option+Shift+Left"]),
+                move_pane_right: chords(&["Cmd+Option+Shift+Right"]),
+                reopen_pane: chords(&["Cmd+Shift+Z"]),
+                focus_pane_1: chords(&["Cmd+1"]),
+                focus_pane_2: chords(&["Cmd+2"]),
+                focus_pane_3: chords(&["Cmd+3"]),
+                focus_pane_4: chords(&["Cmd+4"]),
+                focus_pane_5: chords(&["Cmd+5"]),
+                focus_pane_6: chords(&["Cmd+6"]),
+                focus_pane_7: chords(&["Cmd+7"]),
+                focus_pane_8: chords(&["Cmd+8"]),
+                focus_pane_9: chords(&["Cmd+9"]),
+                toggle_projects: chords(&["Cmd+Shift+B"]),
+                rename_pane: chords(&["F2"]),
+                open_worktrees: chords(&["Cmd+Shift+E"]),
+                dictate: chords(&["Cmd+Shift+Space"]),
+            },
+        }
+    }
+}
+
+/// The platform whose shortcut conventions a table follows. Both tables are
+/// available everywhere, so either can be checked on any build host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutPlatform {
+    Linux,
+    MacOs,
+}
+
+impl ShortcutPlatform {
+    /// The platform this build runs on.
+    pub const CURRENT: Self = if cfg!(target_os = "macos") {
+        Self::MacOs
+    } else {
+        Self::Linux
+    };
+
+    /// The chords native surfaces handle themselves on this platform.
+    pub const fn fixed_shortcuts(self) -> &'static [FixedShortcut] {
+        match self {
+            Self::Linux => LINUX_FIXED_SHORTCUTS,
+            Self::MacOs => MACOS_FIXED_SHORTCUTS,
+        }
+    }
+
+    /// Chords the system or the application menu takes before the window
+    /// sees them, with why a binding to one could never run.
+    const fn system_chords(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Linux => &[],
+            Self::MacOs => MACOS_SYSTEM_CHORDS,
+        }
+    }
+}
+
+/// The app menu's and Window menu's key equivalents, and the system-wide
+/// chords macOS sets by default. Each would be taken before the window saw it.
+const MACOS_SYSTEM_CHORDS: &[(&str, &str)] = &[
+    ("Cmd+Q", "Cmd+Q quits cagents"),
+    ("Cmd+H", "Cmd+H hides cagents"),
+    ("Cmd+Option+H", "Cmd+Option+H hides other applications"),
+    ("Cmd+M", "Cmd+M minimizes the window"),
+    ("Cmd+Ctrl+F", "Cmd+Ctrl+F enters full screen"),
+    ("Cmd+Tab", "Cmd+Tab switches applications"),
+    ("Cmd+Shift+Tab", "Cmd+Shift+Tab switches applications"),
+    ("Cmd+Space", "Cmd+Space opens Spotlight"),
+    ("Cmd+Option+Space", "Cmd+Option+Space opens a Finder search"),
+    (
+        "Cmd+Ctrl+Space",
+        "Cmd+Ctrl+Space opens the character viewer",
+    ),
+    ("Cmd+Ctrl+Q", "Cmd+Ctrl+Q locks the screen"),
+    ("Cmd+Shift+Q", "Cmd+Shift+Q logs out"),
+    ("Cmd+Option+Shift+Q", "Cmd+Option+Shift+Q logs out"),
+    ("Cmd+Option+D", "Cmd+Option+D shows and hides the Dock"),
+    ("Ctrl+Up", "Ctrl+Up opens Mission Control"),
+    ("Ctrl+Down", "Ctrl+Down shows the application's windows"),
+    ("Ctrl+Left", "Ctrl+Left moves to the previous space"),
+    ("Ctrl+Right", "Ctrl+Right moves to the next space"),
+    ("Ctrl+Space", "Ctrl+Space switches the input source"),
+    (
+        "Ctrl+Option+Space",
+        "Ctrl+Option+Space switches the input source",
+    ),
+    ("Cmd+Shift+3", "Cmd+Shift+3 takes a screenshot"),
+    ("Cmd+Shift+4", "Cmd+Shift+4 takes a screenshot"),
+    ("Cmd+Shift+5", "Cmd+Shift+5 takes a screenshot"),
+];
+
+/// Whether held modifiers are this platform's primary shortcut modifier,
+/// with or without Shift: Command on macOS and Control elsewhere, the key
+/// iced's `Modifiers::command()` names, held without Alt or the other of the
+/// two.
+pub const fn primary_alone(control: bool, alt: bool, logo: bool) -> bool {
+    !alt && match ShortcutPlatform::CURRENT {
+        ShortcutPlatform::Linux => control && !logo,
+        ShortcutPlatform::MacOs => logo && !control,
+    }
+}
+
+/// How a chord spells each modifier, in the order a chord writes them. The
+/// recorder writes these names and shortcut search reads them, so a recorded
+/// chord and a typed one compare equal. Every name parses on every platform.
+#[derive(Debug, Clone, Copy)]
+pub struct ModifierNames {
+    pub control: &'static str,
+    pub alt: &'static str,
+    pub logo: &'static str,
+    pub shift: &'static str,
+    /// The application's own modifier: Ctrl on Linux, Cmd on macOS.
+    pub primary: &'static str,
+    /// Whether the logo key leads, as Command does on macOS.
+    logo_first: bool,
+}
+
+impl ModifierNames {
+    pub const LINUX: Self = Self {
+        control: "Ctrl",
+        alt: "Alt",
+        logo: "Super",
+        shift: "Shift",
+        primary: "Ctrl",
+        logo_first: false,
+    };
+    pub const MACOS: Self = Self {
+        control: "Ctrl",
+        alt: "Option",
+        logo: "Cmd",
+        shift: "Shift",
+        primary: "Cmd",
+        logo_first: true,
+    };
+    pub const CURRENT: Self = match ShortcutPlatform::CURRENT {
+        ShortcutPlatform::Linux => Self::LINUX,
+        ShortcutPlatform::MacOs => Self::MACOS,
+    };
+
+    /// The names of the held modifiers, in chord order.
+    pub fn held(
+        self,
+        control: bool,
+        alt: bool,
+        logo: bool,
+        shift: bool,
+    ) -> impl Iterator<Item = &'static str> {
+        let logo = (logo, self.logo);
+        let (first, last) = if self.logo_first {
+            (Some(logo), None)
+        } else {
+            (None, Some(logo))
+        };
+        first
+            .into_iter()
+            .chain([(control, self.control), (alt, self.alt)])
+            .chain(last)
+            .chain([(shift, self.shift)])
+            .filter_map(|(held, name)| held.then_some(name))
     }
 }
 
@@ -565,6 +768,10 @@ impl KeyboardShortcuts {
     /// `actions()`, and for a conflict, the earlier action whose chord it
     /// repeats.
     pub fn fault(&self) -> Option<ShortcutFault> {
+        self.fault_on(ShortcutPlatform::CURRENT)
+    }
+
+    fn fault_on(&self, platform: ShortcutPlatform) -> Option<ShortcutFault> {
         let mut parsed: Vec<(ShortcutBinding, usize)> = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
             let fault = |error, conflicts_with| {
@@ -585,7 +792,7 @@ impl KeyboardShortcuts {
                     Ok(binding) => binding,
                     Err(error) => return fault(error, None),
                 };
-                if let Some(message) = shortcut_chord_refusal(binding) {
+                if let Some(message) = shortcut_chord_refusal_on(binding, platform) {
                     return fault(message, None);
                 }
                 if let Some(&(_, owner)) = parsed.iter().find(|(other, _)| *other == binding) {
@@ -662,7 +869,10 @@ pub struct FixedShortcut {
     pub font_zoom_delta: Option<i8>,
 }
 
-pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
+/// The chords native surfaces handle on this build's platform.
+pub const FIXED_SHORTCUTS: &[FixedShortcut] = ShortcutPlatform::CURRENT.fixed_shortcuts();
+
+const LINUX_FIXED_SHORTCUTS: &[FixedShortcut] = &[
     FixedShortcut {
         label: "Cycle recent panes",
         chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
@@ -721,12 +931,89 @@ pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
     },
 ];
 
+/// macOS keeps Control+Tab for recent panes, as its tabbed apps do, and moves
+/// the rest to Command. A terminal copies and pastes with Command+C and
+/// Command+V, leaving every Control chord to the program inside it.
+const MACOS_FIXED_SHORTCUTS: &[FixedShortcut] = &[
+    FixedShortcut {
+        label: "Cycle recent panes",
+        chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
+        scope: "Navigation",
+        refusal: "This chord is reserved for Cycle recent panes",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Increase font size",
+        chords: &["Cmd+=", "Cmd+Plus", "Cmd+Shift+=", "Cmd+Shift+Plus"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Increase font size",
+        font_zoom_delta: Some(1),
+    },
+    FixedShortcut {
+        label: "Decrease font size",
+        chords: &["Cmd+-"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Decrease font size",
+        font_zoom_delta: Some(-1),
+    },
+    FixedShortcut {
+        label: "Reset font size",
+        chords: &["Cmd+0"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Reset font size",
+        font_zoom_delta: Some(0),
+    },
+    FixedShortcut {
+        label: "Save file",
+        chords: &["Cmd+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Save file",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Stage / unstage selected lines",
+        chords: &["Cmd+Shift+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Stage / unstage selected lines",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Copy terminal selection",
+        chords: &["Cmd+C"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Copy terminal selection",
+        font_zoom_delta: None,
+    },
+    FixedShortcut {
+        label: "Paste into terminal",
+        chords: &["Cmd+V"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Paste into terminal",
+        font_zoom_delta: None,
+    },
+];
+
 /// The same refusal is used by the recorder, typed edits and file validation.
 pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> {
+    shortcut_chord_refusal_on(binding, ShortcutPlatform::CURRENT)
+}
+
+fn shortcut_chord_refusal_on(
+    binding: ShortcutBinding,
+    platform: ShortcutPlatform,
+) -> Option<&'static str> {
     if let Some(reason) = withheld_from_the_card(binding) {
         return Some(reason);
     }
-    FIXED_SHORTCUTS
+    if let Some((_, reason)) = platform
+        .system_chords()
+        .iter()
+        .find(|(chord, _)| parse_shortcut(chord).is_ok_and(|system| system == binding))
+    {
+        return Some(reason);
+    }
+    platform
+        .fixed_shortcuts()
         .iter()
         .find(|fixed| {
             fixed
@@ -830,7 +1117,10 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
             if std::mem::replace(&mut control, true) {
                 return Err("keyboard shortcut repeats a modifier");
             }
-        } else if token.eq_ignore_ascii_case("alt") {
+        } else if token.eq_ignore_ascii_case("alt")
+            || token.eq_ignore_ascii_case("option")
+            || token.eq_ignore_ascii_case("opt")
+        {
             if std::mem::replace(&mut alt, true) {
                 return Err("keyboard shortcut repeats a modifier");
             }
@@ -838,7 +1128,10 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
             if std::mem::replace(&mut shift, true) {
                 return Err("keyboard shortcut repeats a modifier");
             }
-        } else if token.eq_ignore_ascii_case("super") || token.eq_ignore_ascii_case("meta") {
+        } else if ["super", "meta", "cmd", "command"]
+            .iter()
+            .any(|name| token.eq_ignore_ascii_case(name))
+        {
             if std::mem::replace(&mut logo, true) {
                 return Err("keyboard shortcut repeats a modifier");
             }
@@ -891,7 +1184,11 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
         }
     }
     if !(control || alt || logo) && !matches!(key, Some(ShortcutKey::Function(_))) {
-        return Err("keyboard shortcut must include Ctrl, Alt, or Super");
+        return Err(if cfg!(target_os = "macos") {
+            "keyboard shortcut must include Cmd, Ctrl, or Option"
+        } else {
+            "keyboard shortcut must include Ctrl, Alt, or Super"
+        });
     }
     Ok(ShortcutBinding {
         control,
@@ -909,19 +1206,10 @@ pub fn shortcut_search_keywords(value: &str) -> String {
         .iter()
         .filter_map(|chord| parse_shortcut(chord).ok())
         .map(|binding| {
-            let mut parts = Vec::new();
-            if binding.control {
-                parts.push("Ctrl".to_owned());
-            }
-            if binding.alt {
-                parts.push("Alt".to_owned());
-            }
-            if binding.logo {
-                parts.push("Super".to_owned());
-            }
-            if binding.shift {
-                parts.push("Shift".to_owned());
-            }
+            let mut parts: Vec<String> = ModifierNames::CURRENT
+                .held(binding.control, binding.alt, binding.logo, binding.shift)
+                .map(str::to_owned)
+                .collect();
             parts.push(match binding.key {
                 ShortcutKey::Character(',') => "Comma".into(),
                 ShortcutKey::Character('+') => "Plus".into(),
@@ -1713,7 +2001,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 6;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1756,7 +2044,10 @@ struct RetiredShortcutDefault {
 /// Revision 3 adds the conventional new-tab chord to native threads.
 /// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
 /// Revision 5 separates project search from find in the focused pane.
-const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
+/// Revision 6 drops Shift from the chat model and permission pickers: their
+/// chords act only in a chat pane, so they never reach a shell, and neither
+/// `Ctrl+M` nor `Ctrl+O` edits the message.
+const LINUX_RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
         retired_in: 2,
@@ -1812,12 +2103,36 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         retired_in: 5,
         chords: &["Ctrl+F"],
     },
+    RetiredShortcutDefault {
+        action: "chat_permissions",
+        retired_in: 6,
+        chords: &["Ctrl+Shift+O"],
+    },
+    RetiredShortcutDefault {
+        action: "chat_model",
+        retired_in: 6,
+        chords: &["Ctrl+Shift+M"],
+    },
 ];
 
+/// macOS's table first shipped with revision 6, so no file holds an earlier
+/// macOS default to move off. A revision that changes it records the chords it
+/// replaces here, as Linux's history does.
+const MACOS_RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[];
+
+/// Every default a revision replaced on this platform, oldest revision first.
+const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = match ShortcutPlatform::CURRENT {
+    ShortcutPlatform::Linux => LINUX_RETIRED_SHORTCUT_DEFAULTS,
+    ShortcutPlatform::MacOs => MACOS_RETIRED_SHORTCUT_DEFAULTS,
+};
+
 /// Column navigation's defaults while each action took a single chord, before
-/// the arrow chords joined them. Only a version-2 file can hold these.
-const SINGLE_CHORD_DEFAULTS: [(&str, &[&str]); 2] =
-    [("previous_column", &["Alt+Q"]), ("next_column", &["Alt+W"])];
+/// the arrow chords joined them. Only a version-2 file can hold these, and
+/// only Linux ever wrote one.
+const SINGLE_CHORD_DEFAULTS: &[(&str, &[&str])] = match ShortcutPlatform::CURRENT {
+    ShortcutPlatform::Linux => &[("previous_column", &["Alt+Q"]), ("next_column", &["Alt+W"])],
+    ShortcutPlatform::MacOs => &[],
+};
 
 /// The default `action` had at `revision`, when a later revision replaced it.
 fn retired_default(action: &str, revision: u32) -> Option<&'static [&'static str]> {
@@ -2062,7 +2377,8 @@ where
         &mut shortcuts,
         FIRST_SHORTCUT_DEFAULTS_REVISION,
         &SINGLE_CHORD_DEFAULTS
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|(action, _)| scalar.iter().any(|name| name == action))
             .collect::<Vec<_>>(),
     );
@@ -3527,28 +3843,6 @@ fn open_private_directory(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
-fn reject_symlink_components(path: &Path) -> io::Result<()> {
-    let mut ancestors = path
-        .ancestors()
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .collect::<Vec<_>>();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(unsafe_path_error(
-                    ancestor,
-                    "symbolic links are not allowed",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
 fn reject_unsafe_destination(path: &Path) -> io::Result<()> {
     reject_symlink_components(path)?;
     match fs::symlink_metadata(path) {
@@ -4723,6 +5017,7 @@ mod tests {
     /// literal, so a key added to version 3 later cannot pass this test by
     /// simply not appearing in it: the writer has to strip the key here, which
     /// is where the migration decision gets stated.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn version_two_migration_preserves_custom_appearance() {
         let directory = tempfile::tempdir().unwrap();
@@ -4760,6 +5055,7 @@ cycle_pane_width = ["Alt+R"]
         );
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn version_two_scalar_shortcuts_migrate_without_losing_custom_bindings() {
         let directory = tempfile::tempdir().unwrap();
@@ -4793,6 +5089,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), migrated);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn separating_project_search_migrates_defaults_and_preserves_custom_chords() {
         for (search, occupied, expected_search, expected_find) in [
@@ -4829,6 +5126,53 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
+    #[test]
+    fn revision_6_moves_chat_pickers_still_on_their_default_off_shift() {
+        for (model, permissions, occupied, expected_model, expected_permissions) in [
+            (
+                vec!["Ctrl+Shift+M"],
+                vec!["Ctrl+Shift+O"],
+                "Alt+S",
+                vec!["Ctrl+M"],
+                vec!["Ctrl+O"],
+            ),
+            (
+                vec!["Alt+M"],
+                vec!["Ctrl+Shift+O", "Alt+O"],
+                "Alt+S",
+                vec!["Alt+M"],
+                vec!["Ctrl+Shift+O", "Alt+O"],
+            ),
+            (
+                vec!["Ctrl+Shift+M"],
+                vec!["Ctrl+Shift+O"],
+                "Ctrl+M",
+                vec!["Ctrl+Shift+M"],
+                vec!["Ctrl+O"],
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 5.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("chat_model".into(), model.into());
+            shortcuts.insert("chat_permissions".into(), permissions.into());
+            shortcuts.insert("new_terminal".into(), vec![occupied].into());
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.keyboard_shortcuts.chat_model, expected_model);
+            assert_eq!(
+                loaded.keyboard_shortcuts.chat_permissions,
+                expected_permissions
+            );
+            assert_eq!(loaded.keyboard_shortcuts.new_terminal, [occupied]);
+            save(&path, &loaded).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded);
+        }
+    }
+
     #[test]
     fn pane_find_can_be_explicitly_unbound_and_stays_unbound_on_reload() {
         let directory = tempfile::tempdir().unwrap();
@@ -4839,6 +5183,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), settings);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn introducing_pane_cycling_preserves_an_existing_binding_of_its_default() {
         let directory = tempfile::tempdir().unwrap();
@@ -4861,6 +5206,7 @@ next_column = ["Alt+W", "Alt+Right"]
     /// A current-schema document as a build before shortcut defaults
     /// revision 2 wrote it: every action on its default of the time, and no
     /// recorded revision.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     fn revision_one_document(path: &Path, extend: impl FnOnce(&mut toml::Table)) {
         let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
         document.remove("shortcut_defaults_revision");
@@ -4875,6 +5221,7 @@ next_column = ["Alt+W", "Alt+Right"]
         fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn shortcuts_on_retired_defaults_move_to_the_current_ones() {
         let directory = tempfile::tempdir().unwrap();
@@ -4901,6 +5248,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), desired);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn new_tab_default_upgrades_revision_two_without_overriding_user_bindings() {
         let directory = tempfile::tempdir().unwrap();
@@ -4933,6 +5281,7 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn pane_shortcuts_restore_revision_two_and_three_defaults_without_losing_choices() {
         let directory = tempfile::tempdir().unwrap();
@@ -4982,6 +5331,7 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn introduced_chat_shortcuts_preserve_existing_bindings_and_explicit_unbinding() {
         let directory = tempfile::tempdir().unwrap();
@@ -4996,12 +5346,13 @@ next_column = ["Alt+W", "Alt+Right"]
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+A"]);
         assert!(loaded.keyboard_shortcuts.chat_account.is_empty());
-        assert_eq!(loaded.keyboard_shortcuts.chat_model, ["Ctrl+Shift+M"]);
+        assert_eq!(loaded.keyboard_shortcuts.chat_model, ["Ctrl+M"]);
         assert!(loaded.keyboard_shortcuts.chat_permissions.is_empty());
         save(&path, &loaded).unwrap();
         assert_eq!(load(&path).unwrap(), loaded);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn restoring_pane_defaults_does_not_steal_another_actions_chords() {
         let directory = tempfile::tempdir().unwrap();
@@ -5027,6 +5378,7 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_shortcut_the_user_chose_survives_the_move_to_new_defaults() {
         let directory = tempfile::tempdir().unwrap();
@@ -5054,6 +5406,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), desired);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_new_default_another_action_already_binds_is_not_taken() {
         let directory = tempfile::tempdir().unwrap();
@@ -5074,6 +5427,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(load(&path).unwrap(), loaded);
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_version_two_file_on_old_defaults_moves_to_the_current_ones() {
         let directory = tempfile::tempdir().unwrap();
@@ -5111,6 +5465,7 @@ new_thread = "Alt+Shift+G"
 
     /// A table that leaves an action out had it on its old default, and a
     /// chord chosen around that default must not collide with the new one.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn an_action_an_old_table_leaves_out_takes_part_in_the_move() {
         let directory = tempfile::tempdir().unwrap();
@@ -5148,6 +5503,7 @@ new_thread = "Alt+Shift+G"
         );
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_newer_shortcut_defaults_revision_is_left_as_it_is() {
         let directory = tempfile::tempdir().unwrap();
@@ -5262,6 +5618,7 @@ new_thread = "Alt+Shift+G"
         }
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn new_channel_migration_preserves_a_custom_chord_but_rejects_explicit_conflicts() {
         let directory = tempfile::tempdir().unwrap();
@@ -5288,6 +5645,7 @@ new_thread = "Alt+Shift+G"
         ));
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn clone_pane_migration_preserves_owned_chords_and_existing_channel_bindings() {
         let directory = tempfile::tempdir().unwrap();
@@ -5442,7 +5800,7 @@ new_thread = "Alt+Shift+G"
         alternate_conflict
             .keyboard_shortcuts
             .new_terminal
-            .push("Ctrl+PageUp".to_owned());
+            .push(alternate_conflict.keyboard_shortcuts.previous_column[0].clone());
         assert!(matches!(
             alternate_conflict.validate(),
             Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
@@ -5459,6 +5817,7 @@ new_thread = "Alt+Shift+G"
         assert!(AppSettings::default().validate().is_ok());
     }
 
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn new_review_navigation_migration_preserves_existing_bindings() {
         let mut value = toml::Value::try_from(AppSettings::default()).unwrap();
@@ -5514,14 +5873,21 @@ new_thread = "Alt+Shift+G"
 
     #[test]
     fn native_fixed_chords_refuse_conflicting_actions_by_name() {
+        let (primary, copy) = match ShortcutPlatform::CURRENT {
+            ShortcutPlatform::Linux => ("Ctrl", "Ctrl+Shift+C"),
+            ShortcutPlatform::MacOs => ("Cmd", "Cmd+C"),
+        };
         for (chord, label) in [
-            ("Ctrl+Tab", "Cycle recent panes"),
-            ("Ctrl+=", "Increase font size"),
-            ("Ctrl+Shift+C", "Copy terminal selection"),
-            ("Ctrl+Shift+S", "Stage / unstage selected lines"),
+            ("Ctrl+Tab".to_owned(), "Cycle recent panes"),
+            (format!("{primary}+="), "Increase font size"),
+            (copy.to_owned(), "Copy terminal selection"),
+            (
+                format!("{primary}+Shift+S"),
+                "Stage / unstage selected lines",
+            ),
         ] {
             let mut settings = AppSettings::default();
-            settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
+            settings.keyboard_shortcuts.new_terminal = vec![chord.clone()];
             assert!(
                 matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)),
                 "{chord}"
@@ -6107,6 +6473,7 @@ new_thread = "Alt+Shift+G"
     /// A newer build that dropped an action may bind its chord elsewhere. This
     /// build binds the action it still has, and the file keeps the newer
     /// build's binding and never gains the dropped action.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_dropped_actions_chord_stays_where_the_newer_build_put_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -6137,6 +6504,7 @@ new_thread = "Alt+Shift+G"
     /// An action the file lacks whose default chord the file gave another is
     /// left unbound, and stays so once that chord is freed: the migration's
     /// choice is written, not the default it withheld.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn a_missing_action_left_unbound_stays_unbound() {
         let directory = tempfile::tempdir().unwrap();
@@ -6157,6 +6525,7 @@ new_thread = "Alt+Shift+G"
     /// A kept action that gives up its last chord is not kept, so the chords
     /// this build writes for it in turn cost the other kept actions; the file
     /// never binds a chord twice.
+    #[cfg(target_os = "linux")] // Linux's defaults history
     #[test]
     fn an_unkept_action_never_leaves_a_chord_bound_twice() {
         let directory = tempfile::tempdir().unwrap();
@@ -6571,5 +6940,110 @@ new_thread = "Alt+Shift+G"
         assert!(saved.asks(Confirmation::StopWorkingChat));
         assert!(!saved.asks(Confirmation::CloseActiveTerminal));
         assert_eq!(saved.confirmations.get("future_question"), Some(&false));
+    }
+
+    #[test]
+    fn each_platform_table_binds_every_action_without_conflict_or_refusal() {
+        for platform in [ShortcutPlatform::Linux, ShortcutPlatform::MacOs] {
+            let table = KeyboardShortcuts::for_platform(platform);
+            assert!(
+                table.fault_on(platform).is_none(),
+                "{platform:?}: {:?}",
+                table.fault_on(platform)
+            );
+            for fixed in platform.fixed_shortcuts() {
+                for chord in fixed.chords {
+                    parse_shortcut(chord).unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            KeyboardShortcuts::default(),
+            KeyboardShortcuts::for_platform(ShortcutPlatform::CURRENT)
+        );
+    }
+
+    /// Option alone composes characters and moves by word, and Control alone
+    /// reaches a terminal, so macOS binds Command except where neither costs
+    /// anything: Option+Tab and a bare function key.
+    #[test]
+    fn the_macos_table_binds_command_where_option_or_control_would_take_typing() {
+        let table = KeyboardShortcuts::for_platform(ShortcutPlatform::MacOs);
+        for chord in table.actions().into_iter().flatten() {
+            let binding = parse_shortcut(chord).unwrap();
+            assert!(
+                binding.logo || matches!(binding.key, ShortcutKey::Tab | ShortcutKey::Function(_)),
+                "{chord}"
+            );
+        }
+        let fixed = |label| {
+            ShortcutPlatform::MacOs
+                .fixed_shortcuts()
+                .iter()
+                .find(|fixed| fixed.label == label)
+                .unwrap()
+                .chords
+        };
+        assert_eq!(fixed("Copy terminal selection"), ["Cmd+C"]);
+        assert_eq!(fixed("Paste into terminal"), ["Cmd+V"]);
+        assert_eq!(fixed("Cycle recent panes"), ["Ctrl+Tab", "Ctrl+Shift+Tab"]);
+    }
+
+    /// A binding the system or the menu bar takes first would never run.
+    #[test]
+    fn macos_refuses_the_chords_its_system_and_menus_take() {
+        for (chord, reason) in ShortcutPlatform::MacOs.system_chords() {
+            let binding = parse_shortcut(chord).unwrap();
+            assert_eq!(
+                shortcut_chord_refusal_on(binding, ShortcutPlatform::MacOs),
+                Some(*reason)
+            );
+            assert_ne!(
+                shortcut_chord_refusal_on(binding, ShortcutPlatform::Linux),
+                Some(*reason)
+            );
+        }
+        let quit = parse_shortcut("Command+Q").unwrap();
+        assert_eq!(
+            shortcut_chord_refusal_on(quit, ShortcutPlatform::MacOs),
+            Some("Cmd+Q quits cagents")
+        );
+        let unrelated = parse_shortcut("Cmd+Shift+K").unwrap();
+        assert_eq!(
+            shortcut_chord_refusal_on(unrelated, ShortcutPlatform::MacOs),
+            None
+        );
+    }
+
+    #[test]
+    fn modifier_names_write_chords_that_parse_back_on_either_platform() {
+        for names in [ModifierNames::LINUX, ModifierNames::MACOS] {
+            let chord = names
+                .held(true, true, true, true)
+                .collect::<Vec<_>>()
+                .join("+")
+                + "+K";
+            let binding = parse_shortcut(&chord).unwrap();
+            assert!(
+                binding.control && binding.alt && binding.logo && binding.shift,
+                "{chord}"
+            );
+        }
+        assert_eq!(
+            ModifierNames::MACOS
+                .held(true, true, true, true)
+                .collect::<Vec<_>>(),
+            ["Cmd", "Ctrl", "Option", "Shift"]
+        );
+        assert_eq!(
+            ModifierNames::LINUX
+                .held(true, true, true, true)
+                .collect::<Vec<_>>(),
+            ["Ctrl", "Alt", "Super", "Shift"]
+        );
+        assert_eq!(
+            parse_shortcut("Command+Opt+Comma").unwrap(),
+            parse_shortcut("Super+Alt+Comma").unwrap()
+        );
     }
 }

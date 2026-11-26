@@ -13904,6 +13904,7 @@ mod app_tests {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         std::fs::create_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
         let link = |registry: &mut Registry, key| {
             registry.link(Provider::Codex, key, home.clone(), None, None, 1)
         };

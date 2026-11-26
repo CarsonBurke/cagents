@@ -2517,6 +2517,7 @@ mod tests {
     }
 
     #[cfg(feature = "host")]
+    #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
     #[test]
     fn a_live_query_keeps_the_original_flight_after_its_owner_is_killed() {
         use std::ffi::CString;

@@ -503,7 +503,8 @@ mod tests {
     fn a_project_opened_before_its_worktrees_load_opens_its_channel() {
         let mut app = super::super::super::tests::context_inspector_test_app(false);
         let main = tempfile::tempdir().unwrap();
-        let repository = main.path().join(".git");
+        let root = main.path().canonicalize().unwrap();
+        let repository = root.as_path().join(".git");
         std::fs::create_dir(&repository).unwrap();
         let project = ProjectId::new();
         app.sidebar_model.projects.push(SidebarProject::new(
@@ -525,7 +526,7 @@ mod tests {
         };
         assert_eq!(channel.checkout, None);
         assert_eq!(app.durable.active_channel, Some(channel.id));
-        assert_eq!(app.active_workspace.as_deref(), Some(main.path()));
+        assert_eq!(app.active_workspace.as_deref(), Some(root.as_path()));
     }
 
     #[test]
