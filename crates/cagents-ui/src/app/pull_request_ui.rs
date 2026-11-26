@@ -33,7 +33,7 @@ pub enum Action {
     /// Show this work's changes in `card`'s inspector, from its row's menu.
     ShowChanges { card: CardId, key: WorkKey },
     /// Put a row's link, branch or path on the clipboard.
-    Copy(String),
+    Copy { text: String, notice: String },
     /// Open a row's worktree in the file manager.
     OpenFolder(PathBuf),
 }
@@ -176,9 +176,9 @@ impl Cagents {
                 ));
                 Task::batch([show, changes])
             }
-            Action::Copy(text) => {
+            Action::Copy { text, notice } => {
                 chat_ui::invalidate_copy_intent();
-                self.status = Some(TransientNotice::success(format!("Copied {text}")));
+                self.status = Some(TransientNotice::success(notice));
                 iced::clipboard::write(text)
             }
             Action::OpenFolder(path) => {

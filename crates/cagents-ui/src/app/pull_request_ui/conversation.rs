@@ -1233,7 +1233,14 @@ fn menu_entries(card: CardId, work: Work<'_>, review: bool) -> Vec<MenuEntry> {
                 Icon::PopOut,
                 Action::OpenInBrowser(url.clone()),
             ));
-            entries.push(item("Copy link", Icon::Copy, Action::Copy(url.into())));
+            entries.push(item(
+                "Copy link",
+                Icon::Copy,
+                Action::Copy {
+                    text: url.into(),
+                    notice: format!("Copied the link to #{}", row.number),
+                },
+            ));
         }
     }
     if let Some(path) = work.worktree() {
@@ -1253,13 +1260,19 @@ fn menu_entries(card: CardId, work: Work<'_>, review: bool) -> Vec<MenuEntry> {
             entries.push(item(
                 "Copy branch",
                 Icon::Branch,
-                Action::Copy(branch.to_owned()),
+                Action::Copy {
+                    text: branch.to_owned(),
+                    notice: format!("Copied branch {branch}"),
+                },
             ));
         }
         entries.push(item(
             "Copy path",
             Icon::CopyPath,
-            Action::Copy(path.display().to_string()),
+            Action::Copy {
+                text: path.display().to_string(),
+                notice: "Copied the worktree's path".into(),
+            },
         ));
         entries.push(item(
             "Open folder",
@@ -2431,14 +2444,14 @@ mod tests {
         ));
         assert!(matches!(
             action("Copy link"),
-            Some(Action::Copy(link)) if link == "https://github.com/me/repo/pull/9"
+            Some(Action::Copy { text, .. }) if text == "https://github.com/me/repo/pull/9"
         ));
         assert!(
-            matches!(action("Copy branch"), Some(Action::Copy(branch)) if branch == "fix/cache")
+            matches!(action("Copy branch"), Some(Action::Copy { text, .. }) if text == "fix/cache")
         );
         assert!(matches!(
             action("Copy path"),
-            Some(Action::Copy(path)) if path == "/repo/fix-cache"
+            Some(Action::Copy { text, .. }) if text == "/repo/fix-cache"
         ));
         assert!(matches!(
             action("Open folder"),
