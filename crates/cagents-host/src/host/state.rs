@@ -235,6 +235,17 @@ impl Subscriptions {
             .is_some_and(|terminals| terminals.contains_key(&terminal_id))
     }
 
+    fn drives_presentation(&self, client_id: ClientId, terminal_id: TerminalId) -> bool {
+        self.by_client
+            .get(&client_id)
+            .and_then(|terminals| terminals.get(&terminal_id))
+            == Some(&TerminalVisibility::Visible)
+            && self
+                .viewports
+                .get(&(client_id, terminal_id))
+                .is_some_and(|view| view.focused || view.size.is_some())
+    }
+
     fn clients(&self, terminal_id: TerminalId) -> Vec<ClientId> {
         self.by_terminal
             .get(&terminal_id)
@@ -1254,24 +1265,33 @@ impl HostState {
             .map(|terminals| {
                 terminals
                     .keys()
-                    .map(|terminal_id| (*terminal_id, self.subscriptions.visibility(*terminal_id)))
+                    .map(|&terminal_id| {
+                        (
+                            terminal_id,
+                            self.subscriptions.visibility(terminal_id),
+                            self.subscriptions
+                                .drives_presentation(client_id, terminal_id),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let handles = terminals
             .iter()
-            .filter_map(|(terminal_id, _)| {
+            .filter_map(|(terminal_id, _, _)| {
                 self.terminals
                     .get(terminal_id)
                     .map(|record| record.handle.clone())
             })
             .collect::<Vec<_>>();
-        for (terminal_id, _) in &terminals {
+        for (terminal_id, _, _) in &terminals {
             self.retain_presentation_watermark(client_id, *terminal_id);
         }
         self.subscriptions.disconnect(client_id);
-        for (terminal_id, old_visibility) in terminals {
-            self.refresh_presentation_owner(terminal_id);
+        for (terminal_id, old_visibility, drove_presentation) in terminals {
+            if drove_presentation {
+                self.refresh_presentation_owner(terminal_id);
+            }
             let new_visibility = self.subscriptions.visibility(terminal_id);
             if old_visibility != new_visibility
                 && let Some(record) = self.terminals.get(&terminal_id)
@@ -1328,6 +1348,9 @@ impl HostState {
             return Ok(());
         }
         self.retain_presentation_watermark(client_id, terminal_id);
+        let drove_presentation = self
+            .subscriptions
+            .drives_presentation(client_id, terminal_id);
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
         let new_visibility = self.subscriptions.visibility(terminal_id);
@@ -1336,7 +1359,9 @@ impl HostState {
                 .handle
                 .set_host_visibility(new_visibility);
         }
-        self.refresh_presentation_owner(terminal_id);
+        if drove_presentation {
+            self.refresh_presentation_owner(terminal_id);
+        }
         self.disarm_output_if_observed(terminal_id);
         Ok(())
     }
@@ -1364,6 +1389,9 @@ impl HostState {
                 false,
             ));
         };
+        let drove_presentation = self
+            .subscriptions
+            .drives_presentation(client_id, terminal_id);
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions
             .set_visibility(client_id, terminal_id, requested);
@@ -1371,7 +1399,13 @@ impl HostState {
         if old_visibility != new_visibility {
             record.handle.set_host_visibility(new_visibility);
         }
-        self.refresh_presentation_owner(terminal_id);
+        if drove_presentation
+            || self
+                .subscriptions
+                .drives_presentation(client_id, terminal_id)
+        {
+            self.refresh_presentation_owner(terminal_id);
+        }
         if requested == TerminalVisibility::Visible {
             let generation = self.presentation_revision(client_id, terminal_id);
             if let Some(delivery) = self.clients.get(&client_id) {

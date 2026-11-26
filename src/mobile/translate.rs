@@ -56,6 +56,16 @@ pub fn session(member: &directory::Member) -> api::Session {
             run: delegation.run_state.map(run_state),
         }),
         watchable: entry.surface == directory::Surface::Chat && !member.exited,
+        terminal_watchable: terminal_provider(member).is_some(),
+    }
+}
+
+pub(super) fn terminal_provider(member: &directory::Member) -> Option<Provider> {
+    let entry = &member.session;
+    if entry.surface == directory::Surface::Terminal && !member.exited {
+        entry.provider
+    } else {
+        None
     }
 }
 

@@ -30,6 +30,7 @@ import kotlinx.serialization.json.long
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -111,10 +112,32 @@ class RecordedMessagesTest {
         assertEquals("Usage limit reached", session.failure)
         assertEquals(1700000000000, session.activeAt)
         assertTrue(session.watchable)
+        assertFalse(session.terminalWatchable)
         val agent = assertNotNull(session.agent)
         assertEquals(AgentOwner.Session, agent.owner)
         assertEquals(RunState.Running, agent.run)
         assertEquals(session.lineage, agent.ownerLineage)
+    }
+
+    @Test
+    fun terminalWatchesHaveTheirOwnCapabilityAndEvents() {
+        val terminal = event<Event.Sessions>("event terminal session").sessions.single()
+        assertEquals(Surface.Terminal, terminal.surface)
+        assertFalse(terminal.watchable)
+        assertTrue(terminal.terminalWatchable)
+
+        val screen = event<Event.TerminalScreenUpdated>("event terminal_screen").screen
+        assertEquals(terminal.id, screen.session)
+        assertEquals(Activity.Working, screen.activity)
+        assertEquals(1700000000000L, screen.lastOutputAt)
+        assertEquals(80, screen.columns)
+        assertEquals(2, screen.rows)
+        assertEquals(listOf("Running tests", "  3 passed"), screen.lines)
+        assertFalse(screen.clipped)
+
+        val ending = event<Event.TerminalWatchEnded>("event terminal_ended").ending
+        assertEquals(terminal.id, ending.session)
+        assertEquals("The terminal exited with status 0.", ending.message)
     }
 
     @Test
@@ -224,6 +247,8 @@ class RecordedMessagesTest {
             "notification.acknowledge" to Call.AcknowledgeNotification("0b0e7a52-6f6b-4f7c-8a35-5c9f3f0e2d11"),
             "conversation.watch" to Call.WatchConversation(session),
             "conversation.unwatch" to Call.UnwatchConversation(session),
+            "terminal.watch" to Call.WatchTerminal(session),
+            "terminal.unwatch" to Call.UnwatchTerminal(session),
             "conversation.load_earlier" to Call.LoadEarlier(session),
             "conversation.send" to Call.Send(session, "Run the tests", SendMode.Steer),
             "conversation.interrupt" to Call.Interrupt(session),

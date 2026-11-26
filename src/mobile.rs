@@ -20,6 +20,7 @@
 mod conversation;
 mod overview;
 pub mod pairing;
+mod terminal;
 mod translate;
 
 use std::{
@@ -199,8 +200,12 @@ fn read_line(input: &mut impl BufRead) -> Result<Option<Vec<u8>>, TooLong> {
     }
 }
 
+type PendingScreen = Arc<Mutex<Option<api::TerminalScreen>>>;
+
 enum Outgoing {
     Line(api::ServerLine),
+    /// The screen can be replaced while this slot waits for the phone.
+    TerminalScreen(PendingScreen),
     /// Flush what came before and end the process.
     Exit,
 }
@@ -215,8 +220,17 @@ struct Lines {
 /// away, or every sender being gone.
 fn write_lines(lines: Lines, mut output: impl Write) {
     for outgoing in lines.outgoing {
-        let Outgoing::Line(line) = outgoing else {
-            break;
+        let line = match outgoing {
+            Outgoing::Line(line) => line,
+            Outgoing::TerminalScreen(pending) => {
+                let screen = pending
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("queued terminal screen");
+                api::ServerLine::Event(api::Event::TerminalScreen(screen))
+            }
+            Outgoing::Exit => break,
         };
         let written = serde_json::to_vec(&line).map(|mut bytes| {
             bytes.push(b'\n');
@@ -267,11 +281,23 @@ impl Outbox {
     }
 
     fn send(&self, line: api::ServerLine) {
-        self.enqueue(&mut self.backlog.count.lock().unwrap(), line);
+        self.enqueue(
+            &mut self.backlog.count.lock().unwrap(),
+            Outgoing::Line(line),
+        );
     }
 
-    fn enqueue(&self, backlog: &mut usize, line: api::ServerLine) {
-        if self.outgoing.send(Outgoing::Line(line)).is_ok() {
+    fn terminal_screen(&self, pending: &PendingScreen, screen: api::TerminalScreen) {
+        if pending.lock().unwrap().replace(screen).is_none() {
+            self.enqueue(
+                &mut self.backlog.count.lock().unwrap(),
+                Outgoing::TerminalScreen(pending.clone()),
+            );
+        }
+    }
+
+    fn enqueue(&self, backlog: &mut usize, outgoing: Outgoing) {
+        if self.outgoing.send(outgoing).is_ok() {
             *backlog += 1;
         }
     }
@@ -296,7 +322,7 @@ impl Outbox {
     fn send_while_watched(&self, active: &AtomicBool, line: api::ServerLine) {
         let mut count = self.backlog.count.lock().unwrap();
         if active.load(Ordering::Relaxed) {
-            self.enqueue(&mut count, line);
+            self.enqueue(&mut count, Outgoing::Line(line));
         }
     }
 
@@ -305,7 +331,7 @@ impl Outbox {
         if active.load(Ordering::Relaxed) {
             self.enqueue(
                 &mut count,
-                api::ServerLine::Event(api::Event::Closing { message }),
+                Outgoing::Line(api::ServerLine::Event(api::Event::Closing { message })),
             );
             self.exit();
         }
@@ -388,6 +414,7 @@ struct Bridge {
     notifications: Option<overview::Watch>,
     conversations: Conversations,
     next_watch: u64,
+    terminal: Option<terminal::Watch>,
     outbox: Outbox,
 }
 
@@ -400,6 +427,7 @@ impl Bridge {
             notifications: None,
             conversations: Arc::default(),
             next_watch: 0,
+            terminal: None,
             outbox,
         }
     }
@@ -472,6 +500,21 @@ impl Bridge {
             api::Call::UnwatchConversation { session } => {
                 let session = parse_session(&session)?;
                 self.conversations.lock().unwrap().remove(&session);
+                Ok(Answered::Now)
+            }
+            api::Call::WatchTerminal { session } => {
+                self.watch_terminal(id, parse_session(&session)?)?;
+                Ok(Answered::Later)
+            }
+            api::Call::UnwatchTerminal { session } => {
+                let session = parse_session(&session)?;
+                if self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|watch| watch.session == session)
+                {
+                    drop(self.terminal.take());
+                }
                 Ok(Answered::Now)
             }
             api::Call::LoadEarlier { session } => {
@@ -576,6 +619,40 @@ impl Bridge {
             })
         })?;
         watching.insert(session, (generation, watch));
+        Ok(())
+    }
+
+    fn watch_terminal(&mut self, id: u64, session: TerminalId) -> Result<(), Failure> {
+        let provider = self
+            .control
+            .mobile_sessions()
+            .map_err(daemon_lost)?
+            .iter()
+            .find(|member| member.session.id == session)
+            .and_then(translate::terminal_provider)
+            .ok_or_else(|| {
+                Failure::Refused(api::Error {
+                    code: api::ErrorCode::NotWatchable,
+                    message: "Only a listed, running terminal agent can be followed.".into(),
+                })
+            })?;
+        drop(self.terminal.take());
+        self.terminal = Some(
+            terminal::Watch::start(
+                id,
+                session,
+                provider,
+                self.socket.clone(),
+                self.control.proof().clone(),
+                self.outbox.clone(),
+            )
+            .map_err(|error| {
+                Failure::Refused(api::Error {
+                    code: api::ErrorCode::Unavailable,
+                    message: format!("Could not follow the terminal: {error}"),
+                })
+            })?,
+        );
         Ok(())
     }
 

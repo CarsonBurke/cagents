@@ -370,6 +370,41 @@ fn a_stale_wake_with_a_newer_capture_numbers_it_afresh() {
 }
 
 #[test]
+fn a_sizeless_observer_does_not_own_an_unfocused_terminal() {
+    use crate::terminal::TerminalSize;
+
+    let fixture = Fixture::new();
+    let mut state = fixture.shared.lock().unwrap();
+    let id = fixture.id;
+    // The phone's ordinary terminal attachment becomes visible without
+    // sending Resize or Focus.
+    state
+        .set_visibility(1, id, TerminalVisibility::Visible)
+        .unwrap();
+    assert!(!state.subscriptions.size_owners.contains_key(&id));
+
+    state.register_client(2);
+    state.attach(2, id).unwrap();
+    state
+        .set_visibility(2, id, TerminalVisibility::Visible)
+        .unwrap();
+    state
+        .resize_client(
+            2,
+            id,
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(state.subscriptions.size_owners.get(&id), Some(&2));
+}
+
+#[test]
 fn a_frame_planned_before_a_resize_is_replaced_by_a_redraw() {
     let mut fixture = Fixture::new();
     let generation = fixture.change(0, "late");
