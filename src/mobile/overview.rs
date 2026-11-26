@@ -297,6 +297,7 @@ mod tests {
         let line = || match lines.outgoing.recv_timeout(deadline).unwrap() {
             Outgoing::Line(line) => line,
             Outgoing::Exit => panic!("the bridge exited"),
+            Outgoing::TerminalScreen(_) => panic!("unexpected terminal screen"),
         };
         assert_eq!(line(), api::ServerLine::Ok { id: 1, page: None });
         assert!(

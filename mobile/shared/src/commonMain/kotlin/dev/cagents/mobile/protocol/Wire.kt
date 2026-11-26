@@ -48,6 +48,8 @@ sealed interface ServerLine {
 sealed interface Event {
     data class Sessions(val sessions: List<Session>) : Event
     data class Notifications(val notices: List<Notice>) : Event
+    data class TerminalScreenUpdated(val screen: TerminalScreen) : Event
+    data class TerminalWatchEnded(val ending: TerminalEnded) : Event
     data class Conversation(val update: ConversationUpdate) : Event
     data class ConversationEnded(val session: String, val message: String) : Event
     data class Closing(val message: String) : Event
@@ -84,6 +86,8 @@ private fun decodeEvent(name: String?, data: JsonElement): Event = when (name) {
     "sessions" -> Event.Sessions(WireJson.decodeFromJsonElement<SessionList>(data).sessions)
     "notifications" -> Event.Notifications(WireJson.decodeFromJsonElement<NoticeList>(data).notices)
     "conversation" -> Event.Conversation(WireJson.decodeFromJsonElement(data))
+    "terminal_screen" -> Event.TerminalScreenUpdated(WireJson.decodeFromJsonElement(data))
+    "terminal_ended" -> Event.TerminalWatchEnded(WireJson.decodeFromJsonElement(data))
     "conversation_ended" -> data.jsonObject.let {
         Event.ConversationEnded(it.string("session").orEmpty(), it.string("message").orEmpty())
     }
@@ -170,6 +174,8 @@ sealed class Call(val op: String) {
 
     data class WatchConversation(override val session: String) : OnSession("conversation.watch")
     data class UnwatchConversation(override val session: String) : OnSession("conversation.unwatch")
+    data class WatchTerminal(override val session: String) : OnSession("terminal.watch")
+    data class UnwatchTerminal(override val session: String) : OnSession("terminal.unwatch")
     data class LoadEarlier(override val session: String) : OnSession("conversation.load_earlier")
     data class Interrupt(override val session: String) : OnSession("conversation.interrupt")
 

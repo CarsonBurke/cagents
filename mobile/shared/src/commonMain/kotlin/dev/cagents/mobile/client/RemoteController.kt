@@ -604,6 +604,7 @@ class RemoteController(
                 }
             }
             is Event.ConversationEnded -> markEnded(event.session, event.message)
+            is Event.TerminalScreenUpdated, is Event.TerminalWatchEnded,
             is Event.Closing, is Event.Unknown -> Unit
         }
     }

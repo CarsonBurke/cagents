@@ -12,12 +12,13 @@ API version 1 covers:
 - the computer's sessions and their activity, including delegated agents;
 - the person's unacknowledged notifications;
 - following a native chat as it streams, and loading its earlier history;
+- following the live screen of a terminal agent in read-only mode;
 - sending, steering or queueing a message, interrupting a turn, and answering
   approvals and questions.
 
-Terminal-surface sessions are listed. On computers that advertise
-`conversation_details`, a client can also read saved command and tool output,
-reported file diffs and stored images, and send an image with a message.
+On computers that advertise `conversation_details`, a client can also read
+saved command and tool output, reported file diffs and stored images, and send
+an image with a message.
 
 ## Connecting
 
@@ -172,7 +173,7 @@ The error `message` is written for the person and can be shown as is. The
 | `unknown_op` | This server doesn't know the op; it is older than the app. |
 | `not_found` | The session or request no longer exists. |
 | `not_watching` | The op needs `conversation.watch` first. |
-| `not_watchable` | The session can't be followed: it isn't a running native chat. |
+| `not_watchable` | This watch operation cannot follow the session. |
 | `not_allowed` | The daemon refused the action. |
 | `unavailable` | The daemon couldn't do it now; it may work later. |
 | `internal` | Something failed on the computer. |
@@ -192,6 +193,8 @@ Detail requests return one page in the request's `ok` reply.
 | `notification.acknowledge` | `id` | Dismisses a notification everywhere. |
 | `conversation.watch` | `session` | Sends a reset `conversation`, then its changes. Watching again restarts it. |
 | `conversation.unwatch` | `session` | Stops following it. |
+| `terminal.watch` | `session` | Follows a listed terminal agent's live screen. Starting a watch replaces the previous terminal watch on this connection. |
+| `terminal.unwatch` | `session` | Stops following that terminal if it is the current watch. |
 | `conversation.load_earlier` | `session` | Extends the window to older items. |
 | `conversation.send` | `session`, `text`, `mode` | Sends a message. `mode` is `send` (default), `steer` (into the running turn) or `queue` (after it). |
 | `conversation.output` | `session`, `item`, `cursor` | Reads saved command or tool output. |
@@ -226,7 +229,9 @@ approves only by choosing an action.
 | `sessions` | The whole session list. |
 | `notifications` | Every unacknowledged notice, newest first. |
 | `conversation` | A change to a watched conversation. |
-| `conversation_ended` | `session`, `message`: a watched conversation stopped being followable, such as when it was closed. Watch again to retry. |
+| `conversation_ended` | `session`, `message` describe why a watched conversation ended. Watch again to retry. |
+| `terminal_screen` | The current viewport and observed activity of a watched terminal agent. |
+| `terminal_ended` | `session`, `message` describe why a terminal watch ended. |
 | `closing` | `message`: the bridge is about to exit, such as when the daemon stops. |
 
 ### Sessions
@@ -238,7 +243,9 @@ Each session has an `id`, its `lineage` (the conversation it continues),
 `exited`, `failure`, `active_at` (Unix milliseconds) and `watchable`. A
 session started as an agent has `agent`, with its `owner` (`user`, `session`
 or `automation`), the owning session's `owner_lineage`, and `run`, its run
-state.
+state. On a listed terminal agent, `terminal_watchable: true` advertises
+`terminal.watch`. The existing `watchable` field describes
+`conversation.watch`.
 
 A watch sends a complete snapshot first. Changes on the computer trigger
 fresh snapshots, and several changes may be reflected in one event. The
@@ -324,6 +331,39 @@ The ordinary client line limit still applies. The image is stored on the
 conversation's computer and goes through the same send or queue as a desktop
 attachment. Use `conversation.send_image` so an older server refuses the
 whole request with `unknown_op`.
+
+### Terminal screens
+
+Clients can follow one terminal per connection. Use the listed session's
+exact `id` and check `terminal_watchable` before opening. Unwatch when
+leaving the view or moving the app to the background. A dropped connection
+detaches the watch. Following from a phone preserves the terminal's size
+and desktop scroll position.
+
+Each `terminal_screen` replaces the previous screen for its `session`.
+`columns` and `rows` are the host viewport dimensions. `lines` holds
+the visible rows in screen order as plain text, with internal spacing and
+blank rows preserved. Hidden terminal cells appear as spaces. Clients can
+show the rows in a fixed-width font with horizontal scrolling. `activity` is the provider state the host observed,
+and `last_output_at`, when present, is Unix milliseconds of observed
+terminal output. An absence of recent output alone does not imply that the
+agent is idle or needs input.
+
+A screen can contain up to 128 rows, 2 KiB of UTF-8 per row and 32 KiB of
+UTF-8 in total. Newest visible rows take priority. When the bridge drops any
+rows or clips a row, it sets `clipped`. A slow link gets the latest screen
+available when the writer catches up. The data is a viewport, so a new
+screen can overwrite text that was previously visible.
+
+The watch follows the selected terminal's current viewport. It ends when the
+daemon observes that the agent has left the terminal. The viewport can include
+shell text during that transition.
+
+`terminal_ended` means the terminal can no longer be followed. Show its
+`message` alongside the last received screen. If the provider leaves the
+terminal, the watch can end before the daemon observes an exit status.
+The API offers no terminal input, resizing or scrollback operations.
+Conversation commands still apply only to watched native chats.
 
 ## Compatibility
 

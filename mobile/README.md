@@ -22,7 +22,8 @@ What it does:
   watches again what it was showing. In the background it stops watching
   and closes the connection after 30 seconds.
 
-Terminal sessions are listed but can't be opened; the API follows native chats.
+The app lists terminal agents. The API supports a read-only terminal view
+that the app does not yet display.
 
 ## Connect a computer
 

@@ -64,6 +64,24 @@ data class Session(
     @SerialName("active_at") val activeAt: Long? = null,
     val agent: Agent? = null,
     val watchable: Boolean = false,
+    @SerialName("terminal_watchable") val terminalWatchable: Boolean = false,
+)
+
+@Serializable
+data class TerminalScreen(
+    val session: String,
+    val activity: Activity = Activity.Unknown,
+    @SerialName("last_output_at") val lastOutputAt: Long? = null,
+    val columns: Int,
+    val rows: Int,
+    val lines: List<String> = emptyList(),
+    val clipped: Boolean = false,
+)
+
+@Serializable
+data class TerminalEnded(
+    val session: String,
+    val message: String,
 )
 
 @Serializable(with = Surface.Serializer::class)

@@ -178,6 +178,14 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             request(8, Call::UnwatchConversation { session: session() }),
         ),
         (
+            "terminal.watch",
+            request(24, Call::WatchTerminal { session: session() }),
+        ),
+        (
+            "terminal.unwatch",
+            request(25, Call::UnwatchTerminal { session: session() }),
+        ),
+        (
             "conversation.load_earlier",
             request(9, Call::LoadEarlier { session: session() }),
         ),
@@ -360,6 +368,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                         run: Some(RunState::Running),
                     }),
                     watchable: true,
+                    terminal_watchable: false,
                 }],
             })),
         ),
@@ -544,6 +553,47 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                         provider: None,
                     },
                 ],
+            })),
+        ),
+        (
+            "event terminal session",
+            event(Event::Sessions(Sessions {
+                sessions: vec![Session {
+                    id: session(),
+                    lineage: session(),
+                    surface: Surface::Terminal,
+                    provider: Some("claude".into()),
+                    provider_label: Some("Claude Code".into()),
+                    title: None,
+                    project: None,
+                    directory: None,
+                    activity: Activity::Working,
+                    exited: false,
+                    failure: None,
+                    active_at: None,
+                    agent: None,
+                    watchable: false,
+                    terminal_watchable: true,
+                }],
+            })),
+        ),
+        (
+            "event terminal_screen",
+            event(Event::TerminalScreen(TerminalScreen {
+                session: session(),
+                activity: Activity::Working,
+                last_output_at: Some(1_700_000_000_000),
+                columns: 80,
+                rows: 2,
+                lines: vec!["Running tests".into(), "  3 passed".into()],
+                clipped: false,
+            })),
+        ),
+        (
+            "event terminal_ended",
+            event(Event::TerminalEnded(TerminalEnded {
+                session: session(),
+                message: "The terminal is no longer running this agent.".into(),
             })),
         ),
         (

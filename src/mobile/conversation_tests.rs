@@ -129,6 +129,7 @@ fn next_line(lines: &Lines) -> api::ServerLine {
     {
         Outgoing::Line(line) => line,
         Outgoing::Exit => panic!("the bridge exited"),
+        Outgoing::TerminalScreen(_) => panic!("unexpected terminal screen"),
     }
 }
 

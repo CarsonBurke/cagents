@@ -133,6 +133,11 @@ pub enum Call {
     WatchConversation { session: String },
     #[serde(rename = "conversation.unwatch")]
     UnwatchConversation { session: String },
+    /// Follow one listed terminal agent's read-only screen.
+    #[serde(rename = "terminal.watch")]
+    WatchTerminal { session: String },
+    #[serde(rename = "terminal.unwatch")]
+    UnwatchTerminal { session: String },
     /// Extend a watched conversation's window with older items, when its
     /// state says `has_earlier`.
     #[serde(rename = "conversation.load_earlier")]
@@ -210,6 +215,8 @@ impl Call {
         "notification.acknowledge",
         "conversation.watch",
         "conversation.unwatch",
+        "terminal.watch",
+        "terminal.unwatch",
         "conversation.load_earlier",
         "conversation.output",
         "conversation.diff",
@@ -352,6 +359,8 @@ pub enum Event {
         message: String,
     },
     Notifications(Notifications),
+    TerminalScreen(TerminalScreen),
+    TerminalEnded(TerminalEnded),
     /// The bridge is about to exit, such as when the daemon stops or is
     /// updated. Reconnecting starts a bridge of the new version.
     Closing {
@@ -404,6 +413,9 @@ pub struct Session {
     pub agent: Option<Agent>,
     /// Whether `conversation.watch` can follow it.
     pub watchable: bool,
+    /// Whether `terminal.watch` can follow this session's screen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_watchable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +475,33 @@ pub enum RunState {
     Interrupted,
     #[serde(other)]
     Unknown,
+}
+
+// ---------------------------------------------------------------------------
+// Terminals
+// ---------------------------------------------------------------------------
+
+/// One read-only terminal viewport. Each event replaces the previous screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalScreen {
+    pub session: String,
+    pub activity: Activity,
+    /// Unix milliseconds of the last observed output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
+    /// The host's terminal dimensions, even if the payload was clipped.
+    pub columns: u16,
+    pub rows: u16,
+    /// Visible text rows from top to bottom, retaining the newest rows when capped.
+    pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalEnded {
+    pub session: String,
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------
