@@ -140,6 +140,8 @@ struct ClaudeActivity {
     state: ActivityState,
     seen: Instant,
     order: ClaudeOrdering,
+    saw_exact_session: bool,
+    absent_transcript: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -227,6 +229,53 @@ pub enum ObserveError {
 impl Observer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn claude_attention(
+        &self,
+        process: &crate::model::agent_recovery::AgentProcess,
+        home: &Path,
+        session: &str,
+        state: ActivityState,
+    ) -> (attention::Edges, Option<PathBuf>) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let identity = (process.pid, process.start);
+        let (previously_absent, saw_exact_session) = self
+            .claude_activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&identity)
+            .map(|record| (record.absent_transcript.clone(), record.saw_exact_session))
+            .unwrap_or_default();
+        let cwd = &process.launch.working_directory;
+        let Ok(path) = crate::agent::claude_transcript(home, cwd, session) else {
+            // A new conversation can stay Idle without a history file until
+            // its first prompt. An exact absence can replace the EOF baseline
+            // only for that original scope, never for a resumed conversation.
+            let can_arm = state == ActivityState::Idle
+                && !saw_exact_session
+                && fresh_claude_launch(process, session);
+            let absent = (can_arm || previously_absent.is_some())
+                .then(|| super::claude::absent_transcript_path(home, cwd, session))
+                .flatten()
+                .filter(|path| can_arm || previously_absent.as_ref() == Some(path));
+            return (attention::Edges::default(), absent);
+        };
+        let edges = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .ok()
+            .and_then(|file| {
+                self.attention
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .read_claude(&file, identity, previously_absent.as_ref() == Some(&path))
+                    .ok()
+            })
+            .unwrap_or_default();
+        (edges, None)
     }
 
     pub fn try_observe(
@@ -330,36 +379,15 @@ impl Observer {
             }
             Inventory::Codex(_) => None,
         };
-        let edges = match census {
+        let session = match census {
             Inventory::Claude(census) => {
                 claude::session(census, process.pid, &recipe.working_directory)
-                    .and_then(|id| {
-                        crate::agent::claude_transcript(&key.home, &recipe.working_directory, id)
-                            .ok()
-                    })
-                    .and_then(|path| {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        std::fs::OpenOptions::new()
-                            .read(true)
-                            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-                            .open(path)
-                            .ok()
-                    })
-                    .and_then(|file| {
-                        self.attention
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .read_for_process(
-                                &file,
-                                attention::Format::Claude,
-                                (process.pid, process.start),
-                            )
-                            .ok()
-                    })
-                    .unwrap_or_default()
             }
-            Inventory::Codex(_) => attention::Edges::default(),
+            Inventory::Codex(_) => None,
         };
+        let (edges, absent_transcript) = session
+            .map(|session| self.claude_attention(process, &key.home, session, state))
+            .unwrap_or_default();
         let (previous, clear_attention, attention) = if provider == Provider::Claude {
             // Claude's PID-scoped inventory explicitly distinguishes waiting.
             // A first census is a baseline, including when already waiting.
@@ -382,9 +410,13 @@ impl Observer {
                 state,
                 seen: Instant::now(),
                 order: ClaudeOrdering::default(),
+                saw_exact_session: false,
+                absent_transcript: None,
             });
             record.state = state;
             record.seen = Instant::now();
+            record.saw_exact_session |= session.is_some();
+            record.absent_transcript = absent_transcript;
             let clear = observed_claude_progress(previous, state);
             (previous, clear, record.order.notice(state, clear, edges))
         } else {
@@ -402,6 +434,30 @@ impl Observer {
             clear_attention,
         })
     }
+}
+
+fn fresh_claude_launch(
+    process: &crate::model::agent_recovery::AgentProcess,
+    session: &str,
+) -> bool {
+    let recipe = &process.recovery;
+    crate::model::agent_recovery::fresh_recipe(recipe).is_some()
+        && recipe
+            .arguments
+            .iter()
+            .enumerate()
+            .all(|(index, argument)| {
+                let (flag, inline) = argument
+                    .split_once('=')
+                    .map_or((argument.as_str(), None), |(flag, value)| {
+                        (flag, Some(value))
+                    });
+                !matches!(flag, "--resume" | "-r")
+                    && !Provider::Claude.is_latest_selector(flag)
+                    && (flag != "--session-id"
+                        || inline.or_else(|| recipe.arguments.get(index + 1).map(String::as_str))
+                            == Some(session))
+            })
 }
 
 #[cfg(test)]
@@ -559,14 +615,7 @@ mod tests {
         entry
     }
 
-    #[test]
-    fn claude_terminal_fences_late_outcomes_across_polls() {
-        use std::io::Write;
-
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let process = process(&root, root.join("unused-census"));
-        let id = "00000000-0000-4000-8000-000000000001";
+    fn claude_fixture_transcript(root: &Path, id: &str) -> PathBuf {
         let project_key: String = root
             .to_str()
             .unwrap()
@@ -576,27 +625,48 @@ mod tests {
                 _ => '-',
             })
             .collect();
-        let project = root.join("projects").join(project_key);
-        std::fs::create_dir_all(&project).unwrap();
-        let mut transcript = std::fs::File::create(project.join(format!("{id}.jsonl"))).unwrap();
+        root.join("projects")
+            .join(project_key)
+            .join(format!("{id}.jsonl"))
+    }
+
+    fn observe_cached_claude(
+        observer: &Observer,
+        entry: &Mutex<Entry>,
+        process: &crate::model::agent_recovery::AgentProcess,
+        id: &str,
+        state: ActivityState,
+    ) -> Observation {
+        {
+            let mut entry = entry.lock().unwrap();
+            entry.checked = Some(Instant::now());
+            let Some(Inventory::Claude(census)) = &mut entry.census else {
+                panic!("missing process census");
+            };
+            let record = census.get_mut(&process.pid).unwrap();
+            record.1 = state;
+            record.3 = Some(id.into());
+        }
+        observer
+            .try_observe(process)
+            .unwrap_or_else(|_| panic!("fixture census failed"))
+    }
+
+    #[test]
+    fn claude_terminal_fences_late_outcomes_across_polls() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let process = process(&root, root.join("unused-census"));
+        let id = "00000000-0000-4000-8000-000000000001";
+        let path = claude_fixture_transcript(&root, id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut transcript = std::fs::File::create(path).unwrap();
 
         let observer = Observer::new();
         let entry = cached_account(&observer, &process, ActivityState::Idle, "Fixture");
-        let observe = |state| {
-            {
-                let mut entry = entry.lock().unwrap();
-                entry.checked = Some(Instant::now());
-                let Some(Inventory::Claude(census)) = &mut entry.census else {
-                    panic!("missing process census");
-                };
-                let record = census.get_mut(&process.pid).unwrap();
-                record.1 = state;
-                record.3 = Some(id.into());
-            }
-            observer
-                .try_observe(&process)
-                .unwrap_or_else(|_| panic!("fixture census failed"))
-        };
+        let observe = |state| observe_cached_claude(&observer, &entry, &process, id, state);
         let mut append = |frame: serde_json::Value| writeln!(transcript, "{frame}").unwrap();
         let result = |id| {
             serde_json::json!({
@@ -666,6 +736,13 @@ mod tests {
             "synthetic",
             serde_json::json!("<system-reminder>tool context</system-reminder>"),
         ));
+        append(input(
+            "only-context-blocks",
+            serde_json::json!([
+                {"type": "text", "text": "<system-reminder>Context</system-reminder>"},
+                {"type": "text", "text": "<fork-boilerplate>Worker</fork-boilerplate>"}
+            ]),
+        ));
         let mut replay = input("replay", serde_json::json!("<p>Replay</p>"));
         replay["isReplay"] = serde_json::json!(true);
         append(replay);
@@ -707,6 +784,71 @@ mod tests {
             observation.attention.unwrap().key,
             "claude:legacy-human-result"
         );
+    }
+
+    #[test]
+    fn claude_terminal_observes_only_a_proven_new_transcript_from_its_start() {
+        use std::io::Write;
+
+        for case in ["fresh", "resume", "continue", "symlink", "first-seen"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let mut process = process(&root, root.join("claude"));
+            let id = "00000000-0000-4000-8000-000000000002";
+            process.recovery.arguments = match case {
+                "resume" => vec!["--resume".into(), id.into()],
+                "continue" => vec!["--continue".into()],
+                _ => Vec::new(),
+            };
+            process.launch.arguments = process.recovery.arguments.clone();
+            let path = claude_fixture_transcript(&root, id);
+            if case == "symlink" {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink("not-created.jsonl", &path).unwrap();
+            }
+            let observer = Observer::new();
+            let entry = cached_account(&observer, &process, ActivityState::Idle, "Fixture");
+            let observe = |state| observe_cached_claude(&observer, &entry, &process, id, state);
+            if case != "first-seen" {
+                assert!(observe(ActivityState::Idle).attention.is_none(), "{case}");
+                let without_file = observe(ActivityState::Working);
+                assert_eq!(
+                    without_file.clear_attention,
+                    Some(AttentionClear::TurnStarted)
+                );
+                assert!(without_file.attention.is_none(), "{case}");
+            }
+
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if case == "symlink" {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let mut transcript = std::fs::File::create(path).unwrap();
+            let prompt = serde_json::json!({
+                "type": "user", "uuid": "desktop", "message": {
+                    "role": "user", "content": [
+                        {"type":"text","text":"<system-reminder>\nThe user started this session without choosing a project folder.\n</system-reminder>"},
+                        {"type":"text","text":"cagents update status?"}
+                    ]
+                }
+            });
+            let completion = serde_json::json!({
+                "type": "assistant", "uuid": "first", "message": {"stop_reason": "end_turn"}
+            });
+            writeln!(transcript, "{prompt}\n{completion}").unwrap();
+
+            let observation = observe(ActivityState::Working);
+            assert_eq!(observation.clear_attention, None, "{case}");
+            assert_eq!(
+                observation
+                    .attention
+                    .as_ref()
+                    .map(|notice| notice.key.as_str()),
+                (case == "fresh").then_some("claude:first"),
+                "{case}",
+            );
+            assert!(observe(ActivityState::Idle).attention.is_none(), "{case}");
+        }
     }
 
     #[test]

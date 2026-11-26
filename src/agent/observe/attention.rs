@@ -63,6 +63,25 @@ impl Tails {
         format: Format,
         process: (i32, u64),
     ) -> io::Result<Edges> {
+        self.read_tail(file, format, process, false)
+    }
+
+    pub fn read_claude(
+        &mut self,
+        file: &File,
+        process: (i32, u64),
+        previously_absent: bool,
+    ) -> io::Result<Edges> {
+        self.read_tail(file, Format::Claude, process, previously_absent)
+    }
+
+    fn read_tail(
+        &mut self,
+        file: &File,
+        format: Format,
+        process: (i32, u64),
+        previously_absent: bool,
+    ) -> io::Result<Edges> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Ok(Edges::default());
@@ -81,9 +100,11 @@ impl Tails {
             ..Edges::default()
         };
         if self.0.get(&key).is_none_or(|cursor| cursor.offset > size) {
-            // A partial historical line must also be skipped to its newline.
+            // Prior exact absence makes the new file's beginning observable.
+            // An existing history or a truncated cursor still gets a baseline.
+            let read_from_start = previously_absent && !self.0.contains_key(&key);
             let mut last = [b'\n'];
-            if size > 0 {
+            if !read_from_start && size > 0 {
                 file.read_exact_at(&mut last, size - 1)?;
             }
             let eligible = match format {
@@ -93,7 +114,7 @@ impl Tails {
             self.0.insert(
                 key,
                 Cursor {
-                    offset: size,
+                    offset: if read_from_start { 0 } else { size },
                     partial: Vec::new(),
                     skipping: last[0] != b'\n',
                     seen: Instant::now(),
@@ -101,7 +122,9 @@ impl Tails {
                 },
             );
             edges.claude_baseline = edges.claude_transcript.is_some();
-            return Ok(edges);
+            if !read_from_start {
+                return Ok(edges);
+            }
         }
         let cursor = self.0.get_mut(&key).expect("cursor was initialized");
         cursor.seen = Instant::now();
@@ -258,33 +281,51 @@ fn claude_root_input(value: &serde_json::Value) -> bool {
     {
         return false;
     }
-    let text = |value: &serde_json::Value| {
-        value.as_str().is_some_and(|text| {
-            let text = text.trim();
-            // Legacy Claude can store these synthetic envelopes as user
-            // text. Explicitly human prompts may quote the same markup.
-            const SYNTHETIC: &[&str] = &[
-                "<system-reminder>",
-                "<task-notification>",
-                "<fork-boilerplate>",
-                "<local-command-caveat>",
-                "<local-command-stdout>",
-                "<local-command-stderr>",
-            ];
-            !text.is_empty()
-                && (origin.is_some() || !SYNTHETIC.iter().any(|prefix| text.starts_with(prefix)))
-        })
+    let input_text = |text: &str| {
+        let text = text.trim();
+        !text.is_empty() && (origin.is_some() || !claude_context_only(text))
     };
     let content = &value["message"]["content"];
-    text(content)
-        || content.as_array().is_some_and(|blocks| {
-            !blocks.is_empty()
-                && blocks.iter().all(|block| match block["type"].as_str() {
-                    Some("text") => text(&block["text"]),
-                    Some("image" | "document") => block["source"].is_object(),
-                    _ => false,
-                })
-        })
+    if let Some(text) = content.as_str() {
+        return input_text(text);
+    }
+    let Some(blocks) = content.as_array() else {
+        return false;
+    };
+    let mut has_input = false;
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") if let Some(text) = block["text"].as_str() => {
+                has_input |= input_text(text);
+            }
+            Some("image" | "document") if block["source"].is_object() => has_input = true,
+            _ => return false,
+        }
+    }
+    has_input
+}
+
+fn claude_context_only(mut text: &str) -> bool {
+    // Only a whole context envelope is a note. Preserve human text after
+    // the envelope, including when Claude puts both in one text block.
+    const WRAPPERS: &[(&str, &str)] = &[
+        ("<system-reminder>", "</system-reminder>"),
+        ("<task-notification>", "</task-notification>"),
+        ("<fork-boilerplate>", "</fork-boilerplate>"),
+        ("<local-command-caveat>", "</local-command-caveat>"),
+        ("<local-command-stdout>", "</local-command-stdout>"),
+        ("<local-command-stderr>", "</local-command-stderr>"),
+    ];
+    while let Some((rest, close)) = WRAPPERS
+        .iter()
+        .find_map(|&(open, close)| text.strip_prefix(open).map(|rest| (rest, close)))
+    {
+        let Some((_, trailing)) = rest.split_once(close) else {
+            return false;
+        };
+        text = trailing.trim_start();
+    }
+    text.is_empty() || crate::chat::protocol::claude::model_only_note(text)
 }
 
 #[cfg(test)]

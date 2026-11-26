@@ -6106,7 +6106,7 @@ fn injected(content: &Value) -> Injected<'_> {
 
 /// Whether `text` is wholly one of the notes Claude Code writes for the
 /// model alone; see [`Injected::ModelOnly`].
-fn model_only_note(text: &str) -> bool {
+pub(crate) fn model_only_note(text: &str) -> bool {
     let text = text.trim();
     let wrapped = |tag: &str| {
         let mut rest = text;
