@@ -1277,6 +1277,7 @@ dependencies = [
  "libcosmic",
  "libghostty-vt",
  "notify 9.0.0-rc.8",
+ "png 0.18.1",
  "portable-pty",
  "postcard",
  "pulldown-cmark",

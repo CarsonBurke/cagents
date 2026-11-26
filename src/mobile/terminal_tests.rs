@@ -245,7 +245,7 @@ fn watches_a_terminal_with_daemon_push_and_releases_it_on_exit() {
                     snapshot: Some(snapshot),
                 },
             );
-            assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1 });
+            assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1, page: None });
         } else {
             daemon.send(
                 None,
@@ -327,7 +327,7 @@ fn a_slow_phone_gets_only_the_latest_queued_screen_before_the_end() {
         ));
     }
     publisher.finish(exited(0, None));
-    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1 });
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1, page: None });
     assert_eq!(next_screen(&lines).lines, ["c"]);
     assert!(matches!(
         next_line(&lines),

@@ -221,6 +221,45 @@ fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
     Ok(crate::instance::darwin_runtime_base()?.with_file_name("cagents.install-publication.lock"))
 }
 
+/// Serialize ordinary access to production state with offline publication.
+/// Installed processes also prove they are running the selected executable.
+/// The caller retains admission until it acquires its own state claim.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+pub fn admit_darwin_state_access() -> io::Result<Option<crate::instance::OwnedLock>> {
+    let executable = crate::process::current_executable()?;
+    let installed = installed_version_root(&executable).is_some()
+        || std::env::current_exe().is_ok_and(|path| installed_version_root(&path).is_some());
+    if !installed && crate::instance::IS_DEVELOPMENT {
+        return Ok(None);
+    }
+    let lock =
+        crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_SH | libc::LOCK_NB)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    io::Error::new(error.kind(), crate::instance::UpdateInProgress)
+                } else {
+                    error
+                }
+            })?;
+    if !installed {
+        return Ok(Some(lock));
+    }
+    let layout = crate::update::locate(&executable).map_err(io::Error::other)?;
+    let selected = std::fs::canonicalize(layout.prefix.join("current"))?;
+    let named = std::fs::metadata(&executable)?;
+    let mapped = crate::process::mapped_region_identity(
+        std::process::id(),
+        admit_darwin_state_access as *const () as usize as u64,
+    )?;
+    if selected != layout.version_root || (named.dev(), named.ino()) != mapped {
+        return Err(io::Error::other(
+            "The installed build changed before startup. Open cagents again to start the selected build.",
+        ));
+    }
+    Ok(Some(lock))
+}
+
 pub(crate) fn verify_publication() -> io::Result<()> {
     crate::instance::validate_install_guard()?;
     #[cfg(target_os = "macos")]
@@ -237,6 +276,7 @@ pub(crate) fn verify_publication() -> io::Result<()> {
         }
         let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
         crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
+        crate::instance::state_claim::require_idle_for_installation()?;
     }
     Ok(())
 }

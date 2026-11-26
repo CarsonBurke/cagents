@@ -106,6 +106,7 @@ fn start_scripted(
         id,
         session.id,
         outbox,
+        Arc::default(),
         move |stop| {
             stop.register(&stream)
                 .map_err(|error| Failure::DaemonLost(error.to_string()))?;
@@ -177,7 +178,7 @@ fn finish_watch(removed: bool) {
     ));
     daemon.respond(&visibility, ServerResponse::Accepted);
     daemon.approve_watch(chat_id);
-    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1 });
+    assert_eq!(next_line(&lines), api::ServerLine::Ok { id: 1, page: None });
     assert!(matches!(
         next_line(&lines),
         api::ServerLine::Event(api::Event::Conversation(update)) if update.reset
@@ -255,9 +256,16 @@ fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands(
     let (outbox, lines) = Outbox::new();
     let (ended, ending) = mpsc::channel();
     let chat_id = TerminalId::new();
-    let watch = Watch::connect(1, chat_id, path, proof(), outbox, move |chat, why| {
-        ended.send((chat, why)).unwrap()
-    })
+    let shared = Arc::<details::Shared>::default();
+    let watch = Watch::connect(
+        1,
+        chat_id,
+        path,
+        proof(),
+        outbox,
+        shared.clone(),
+        move |chat, why| ended.send((chat, why)).unwrap(),
+    )
     .unwrap();
     let (stream, _) = listener.accept().unwrap();
     stream.set_read_timeout(Some(WAIT)).unwrap();
@@ -278,6 +286,24 @@ fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands(
         id: 2,
         command: chat::Command::Interrupt
     }));
+    assert!(watch.send(Command::Detail {
+        id: 3,
+        request: details::Request::Output {
+            item: "command".into(),
+            cursor: None,
+        },
+        slot: shared.reserve().unwrap(),
+    }));
+    assert!(shared.reserve().is_none());
+    let upload_slot = Arc::new(());
+    assert!(watch.send(Command::ImagePrompt {
+        id: 4,
+        text: String::new(),
+        name: "photo.png".into(),
+        png_base64: String::new(),
+        mode: api::SendMode::Send,
+        slot: upload_slot.clone(),
+    }));
     drop(watch);
     assert!(
         read_frame::<ClientEnvelope>(&mut daemon.0)
@@ -289,10 +315,15 @@ fn a_stopped_conversation_lookup_closes_its_socket_and_answers_pending_commands(
         next_line(&lines),
         api::ServerLine::Error { id: Some(1), error } if error.code == api::ErrorCode::NotWatching
     ));
-    assert!(matches!(
-        next_line(&lines),
-        api::ServerLine::Error { id: Some(2), error } if error.code == api::ErrorCode::Unavailable
-    ));
+    for request in [2, 3, 4] {
+        assert!(matches!(
+            next_line(&lines),
+            api::ServerLine::Error { id: Some(id), error }
+                if id == request && error.code == api::ErrorCode::Unavailable
+        ));
+    }
+    assert_eq!(Arc::strong_count(&upload_slot), 1);
+    assert!(shared.reserve().is_some());
 }
 
 #[test]

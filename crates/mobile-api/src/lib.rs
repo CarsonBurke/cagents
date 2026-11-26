@@ -39,6 +39,9 @@ pub const API_VERSION: u32 = 1;
 pub const MIN_API_VERSION: u32 = 1;
 /// The longest line a client may send, newline excluded.
 pub const MAX_CLIENT_LINE_BYTES: usize = 1024 * 1024;
+/// A PNG and a prompt fit together in one client line, including base64.
+pub const MAX_UPLOAD_IMAGE_BYTES: usize = 512 * 1024;
+pub const MAX_DOWNLOAD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Client to server
@@ -139,6 +142,42 @@ pub enum Call {
     /// state says `has_earlier`.
     #[serde(rename = "conversation.load_earlier")]
     LoadEarlier { session: String },
+    /// Read the saved output of an item in the watched transcript.
+    #[serde(rename = "conversation.output")]
+    ReadOutput {
+        session: String,
+        item: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Read the reported patches for a file named by a watched edit item.
+    #[serde(rename = "conversation.diff")]
+    ReadDiff {
+        session: String,
+        item: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Read a stored image named by an item in the watched transcript.
+    #[serde(rename = "conversation.image")]
+    ReadImage {
+        session: String,
+        item: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Send a message with one PNG. A distinct op keeps old servers from
+    /// sending the message while discarding an unknown attachment field.
+    #[serde(rename = "conversation.send_image")]
+    SendImage {
+        session: String,
+        text: String,
+        name: String,
+        png_base64: String,
+        #[serde(default)]
+        mode: SendMode,
+    },
     /// Send the user's message to a watched conversation.
     #[serde(rename = "conversation.send")]
     Send {
@@ -179,6 +218,10 @@ impl Call {
         "terminal.watch",
         "terminal.unwatch",
         "conversation.load_earlier",
+        "conversation.output",
+        "conversation.diff",
+        "conversation.image",
+        "conversation.send_image",
         "conversation.send",
         "conversation.interrupt",
         "conversation.answer",
@@ -220,6 +263,8 @@ pub enum ServerLine {
     Welcome(Welcome),
     Ok {
         id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<DetailPage>,
     },
     /// `id` is absent for an error that answers no request, such as a line
     /// that isn't JSON or a refused `hello`.
@@ -240,6 +285,35 @@ pub struct Welcome {
     /// The computer's host name, for telling paired computers apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The server supports the transcript detail and image attachment ops.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conversation_details: bool,
+}
+
+/// One bounded detail page. Omit `cursor` for the first request and echo
+/// `next` on the next request for the same detail. When absent, the page
+/// completes the read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetailPage {
+    #[serde(flatten)]
+    pub body: DetailBody,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DetailBody {
+    Output { text: String },
+    Diff { patches: Vec<DiffPart> },
+    Image { base64: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffPart {
+    pub item: String,
+    pub text: String,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +551,8 @@ pub struct ConversationState {
     pub busy: bool,
     /// The provider takes messages now.
     pub ready: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_attach_image: bool,
     pub exited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -610,8 +686,8 @@ pub enum Role {
     Unknown,
 }
 
-/// What an item holds. Long tool output is clipped to its end, with
-/// `clipped` set; the full text stays on the computer.
+/// What an item previews. `clipped` marks shortened content, and
+/// `conversation.output` reads saved output on demand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ItemBody {
@@ -651,10 +727,15 @@ pub enum ItemBody {
         input: String,
         output: String,
         clipped: bool,
+        /// Whether the output preview is clipped independently of the input.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        output_clipped: bool,
         status: ToolStatus,
     },
     Image {
         description: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        available: bool,
     },
     /// Something delivered to the conversation that the person didn't write:
     /// an agent's report, another session's message, or a notice.

@@ -148,6 +148,8 @@ libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 notify = "=9.0.0-rc.8"
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
+# The mobile bridge validates PNG bytes before staging an attachment.
+png = "0.18"
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
 # binary payload; a self-describing text format costs ~24x more bytes and one
 # heap allocation per character cell on both sides. postcard is already in the
@@ -199,6 +201,20 @@ debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1
 
+# Parallelize LLVM for the workspace crates on the release build's critical
+# path while keeping the dependency profile and cross-crate LTO.
+[profile.release.package.cagents]
+codegen-units = 16
+
+[profile.release.package.cagents-host]
+codegen-units = 16
+
+[profile.release.package.cagents-ui]
+codegen-units = 16
+
+[profile.release.package.cagents-ui-kit]
+codegen-units = 16
+
 # Production builds for this workstation: release identity and optimization,
 # without the whole-crate code generation that makes each release take tens of
 # minutes. `scripts/install-local` uses it; published releases keep `release`.
@@ -207,6 +223,20 @@ inherits = "release"
 lto = false
 codegen-units = 256
 incremental = true
+
+# Package overrides are inherited from release and outrank the profile-wide
+# setting, so keep these crates incremental at the same partition size.
+[profile.local.package.cagents]
+codegen-units = 256
+
+[profile.local.package.cagents-host]
+codegen-units = 256
+
+[profile.local.package.cagents-ui]
+codegen-units = 256
+
+[profile.local.package.cagents-ui-kit]
+codegen-units = 256
 
 [profile.dev.package."*"]
 debug = 0

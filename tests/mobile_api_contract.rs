@@ -80,6 +80,7 @@ fn state() -> ConversationState {
         activity: Activity::Waiting,
         busy: true,
         ready: true,
+        can_attach_image: true,
         exited: false,
         error: Some("Usage limit reached".into()),
         read_only: Some("Saved history".into()),
@@ -200,6 +201,93 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
             ),
         ),
         (
+            "conversation.output",
+            request(
+                20,
+                Call::ReadOutput {
+                    session: session(),
+                    item: "c".into(),
+                    cursor: None,
+                },
+            ),
+        ),
+        (
+            "conversation.diff",
+            request(
+                21,
+                Call::ReadDiff {
+                    session: session(),
+                    item: "edit".into(),
+                    path: "src/lib.rs".into(),
+                    cursor: Some("next".into()),
+                },
+            ),
+        ),
+        (
+            "conversation.image",
+            request(
+                22,
+                Call::ReadImage {
+                    session: session(),
+                    item: "image".into(),
+                    cursor: None,
+                },
+            ),
+        ),
+        (
+            "conversation.send_image",
+            request(
+                23,
+                Call::SendImage {
+                    session: session(),
+                    text: "Look here".into(),
+                    name: "image.png".into(),
+                    png_base64: "aW1hZ2U=".into(),
+                    mode: SendMode::Send,
+                },
+            ),
+        ),
+        (
+            "ok output page",
+            server(ServerLine::Ok {
+                id: 20,
+                page: Some(DetailPage {
+                    body: DetailBody::Output {
+                        text: "Done\n".into(),
+                    },
+                    next: Some("next".into()),
+                }),
+            }),
+        ),
+        (
+            "ok diff page",
+            server(ServerLine::Ok {
+                id: 21,
+                page: Some(DetailPage {
+                    body: DetailBody::Diff {
+                        patches: vec![DiffPart {
+                            item: "edit".into(),
+                            text: "-old\n+new\n".into(),
+                            offset: 0,
+                        }],
+                    },
+                    next: None,
+                }),
+            }),
+        ),
+        (
+            "ok image page",
+            server(ServerLine::Ok {
+                id: 22,
+                page: Some(DetailPage {
+                    body: DetailBody::Image {
+                        base64: "aW1hZ2U=".into(),
+                    },
+                    next: None,
+                }),
+            }),
+        ),
+        (
             "conversation.interrupt",
             request(11, Call::Interrupt { session: session() }),
         ),
@@ -224,9 +312,19 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                 api: 1,
                 server_version: "0.1.3".into(),
                 host: Some("desktop".into()),
+                conversation_details: false,
             })),
         ),
-        ("ok", server(ServerLine::Ok { id: 7 })),
+        (
+            "welcome conversation details",
+            server(ServerLine::Welcome(Welcome {
+                api: 1,
+                server_version: "0.1.3".into(),
+                host: Some("desktop".into()),
+                conversation_details: true,
+            })),
+        ),
+        ("ok", server(ServerLine::Ok { id: 7, page: None })),
         (
             "error",
             server(ServerLine::Error {
@@ -355,6 +453,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                             input: "{}".into(),
                             output: "done".into(),
                             clipped: false,
+                            output_clipped: false,
                             status: ToolStatus::Waiting,
                         },
                     ),
@@ -363,6 +462,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                         Role::User,
                         ItemBody::Image {
                             description: "A screenshot".into(),
+                            available: true,
                         },
                     ),
                     item(

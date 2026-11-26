@@ -6,6 +6,8 @@ import dev.cagents.mobile.protocol.Call
 import dev.cagents.mobile.protocol.ChangeKind
 import dev.cagents.mobile.protocol.CommandAction
 import dev.cagents.mobile.protocol.DeliveryKind
+import dev.cagents.mobile.protocol.DetailKind
+import dev.cagents.mobile.protocol.ImageAttachment
 import dev.cagents.mobile.protocol.ErrorCode
 import dev.cagents.mobile.protocol.Event
 import dev.cagents.mobile.protocol.FieldAnswer
@@ -229,6 +231,22 @@ class RecordedMessagesTest {
     }
 
     @Test
+    fun detailPagesKeepTheRequestIdAndPayload() {
+        val old = assertIs<ServerLine.WelcomeLine>(server("welcome")).welcome
+        assertEquals(false, old.conversationDetails)
+        val current = assertIs<ServerLine.WelcomeLine>(server("welcome conversation details")).welcome
+        assertTrue(current.conversationDetails)
+        val output = assertIs<ServerLine.Ok>(server("ok output page"))
+        assertEquals(20L, output.id)
+        assertEquals("Done\n", output.page?.text)
+        assertEquals("next", output.page?.next)
+        val diff = assertIs<ServerLine.Ok>(server("ok diff page"))
+        assertEquals("-old\n+new\n", diff.page?.patches?.single()?.text)
+        val image = assertIs<ServerLine.Ok>(server("ok image page"))
+        assertEquals("aW1hZ2U=", image.page?.base64)
+    }
+
+    @Test
     fun endings() {
         val ended = event<Event.ConversationEnded>("event conversation_ended")
         assertEquals("The conversation closed.", ended.message)
@@ -251,6 +269,10 @@ class RecordedMessagesTest {
             "terminal.unwatch" to Call.UnwatchTerminal(session),
             "conversation.load_earlier" to Call.LoadEarlier(session),
             "conversation.send" to Call.Send(session, "Run the tests", SendMode.Steer),
+            "conversation.output" to Call.ReadDetail(session, "c", DetailKind.Output),
+            "conversation.diff" to Call.ReadDetail(session, "edit", DetailKind.Diff, "src/lib.rs", "next"),
+            "conversation.image" to Call.ReadDetail(session, "image", DetailKind.Image),
+            "conversation.send_image" to Call.SendImage(session, "Look here", SendMode.Send, ImageAttachment("image.png", "aW1hZ2U=")),
             "conversation.interrupt" to Call.Interrupt(session),
             "conversation.answer" to Call.Answer(session, "r1", "allow", listOf(FieldAnswer("reason", listOf("ci")))),
         )

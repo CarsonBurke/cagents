@@ -41,6 +41,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,6 +62,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import dev.cagents.mobile.client.isBlankThinking
 import dev.cagents.mobile.protocol.CommandAction
+import dev.cagents.mobile.protocol.DetailKind
 import dev.cagents.mobile.protocol.Item
 import dev.cagents.mobile.protocol.ItemBody
 import dev.cagents.mobile.protocol.Role
@@ -68,7 +70,7 @@ import dev.cagents.mobile.protocol.ToolStatus
 
 /** One transcript item. Prose reads in full; tool activity is one line until opened. */
 @Composable
-fun TranscriptItem(item: Item) {
+internal fun TranscriptItem(item: Item, onDetail: ((TranscriptDetail) -> Unit)? = null) {
     if (item.isBlankThinking) return
     when (val body = item.body) {
         is ItemBody.Text -> when {
@@ -94,7 +96,12 @@ fun TranscriptItem(item: Item) {
             ).joinToString(" · "),
         ) {
             if (body.label.isNotBlank()) Code(body.command)
-            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped)
+            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped && onDetail == null)
+            if (body.clipped && onDetail != null) {
+                TextButton(onClick = { onDetail(TranscriptDetail(item.id, DetailKind.Output, "Command output")) }) {
+                    Text("Read full output")
+                }
+            }
         }
         is ItemBody.Changes -> {
             val added = body.files.sumOf { it.addedLines }
@@ -107,7 +114,15 @@ fun TranscriptItem(item: Item) {
                 trailing = "+$added −$removed",
             ) {
                 body.files.forEach { file ->
-                    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .then(
+                                if (onDetail == null) Modifier else Modifier.clickable {
+                                    onDetail(TranscriptDetail(item.id, DetailKind.Diff, file.path, file.path))
+                                },
+                            )
+                            .padding(vertical = 8.dp),
+                    ) {
                         Text(
                             buildString {
                                 file.from?.let { append(it).append(" → ") }
@@ -148,15 +163,23 @@ fun TranscriptItem(item: Item) {
             trailing = "",
         ) {
             if (body.input.isNotBlank() && body.input != "{}") Code(body.input)
-            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped)
+            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped && onDetail == null)
+            if (body.outputClipped && onDetail != null) {
+                TextButton(onClick = { onDetail(TranscriptDetail(item.id, DetailKind.Output, "Tool output")) }) {
+                    Text("Read full output")
+                }
+            }
         }
         is ItemBody.Image -> ActivityRow(
             id = item.id,
             icon = Icons.Outlined.Image,
             title = body.description.ifBlank { "Image" },
             status = null,
-            trailing = "on the computer",
+            trailing = if (body.available && onDetail != null) "View" else "on the computer",
             expandable = false,
+            onClick = if (body.available && onDetail != null) {
+                { onDetail(TranscriptDetail(item.id, DetailKind.Image, body.description.ifBlank { "Image" })) }
+            } else null,
         ) {}
         is ItemBody.Delivery -> Delivery(item.id, body)
         is ItemBody.Unknown -> SystemLine("Something this app can't show yet (${body.kind.ifBlank { "unknown" }})")
@@ -249,13 +272,18 @@ private fun ActivityRow(
     trailing: String,
     monospaceTitle: Boolean = false,
     expandable: Boolean = true,
+    onClick: (() -> Unit)? = null,
     detail: @Composable () -> Unit,
 ) {
     var open by rememberSaveable(id) { mutableStateOf(false) }
     Column(
         Modifier
             .fillMaxWidth()
-            .then(if (expandable) Modifier.clickable { open = !open } else Modifier)
+            .then(when {
+                onClick != null -> Modifier.clickable(onClick = onClick)
+                expandable -> Modifier.clickable { open = !open }
+                else -> Modifier
+            })
             .padding(horizontal = 16.dp, vertical = 5.dp)
             .animateContentSize(),
     ) {
@@ -334,7 +362,7 @@ private fun Delivery(id: String, body: ItemBody.Delivery) {
 }
 
 @Composable
-fun Code(text: String, clipped: Boolean = false) {
+fun Code(text: String, clipped: Boolean = false, preserveTrailingWhitespace: Boolean = false) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         shape = RoundedCornerShape(8.dp),
@@ -356,7 +384,7 @@ fun Code(text: String, clipped: Boolean = false) {
                     .horizontalScroll(rememberScrollState()),
             ) {
                 Text(
-                    text.trimEnd(),
+                    if (preserveTrailingWhitespace) text else text.trimEnd(),
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                     softWrap = false,

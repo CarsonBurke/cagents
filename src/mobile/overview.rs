@@ -299,7 +299,7 @@ mod tests {
             Outgoing::Exit => panic!("the bridge exited"),
             Outgoing::TerminalScreen(_) => panic!("unexpected terminal screen"),
         };
-        assert_eq!(line(), api::ServerLine::Ok { id: 1 });
+        assert_eq!(line(), api::ServerLine::Ok { id: 1, page: None });
         assert!(
             matches!(line(), api::ServerLine::Event(api::Event::Notifications(event))
             if event.notices.is_empty())
