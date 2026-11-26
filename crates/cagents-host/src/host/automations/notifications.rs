@@ -82,6 +82,15 @@ impl Transfer {
         notifications: &Handle,
         event: impl FnOnce(&Registry, &Entry) -> Result<Event, String>,
     ) -> Result<Option<Duration>, String> {
+        let unread = notifications.unread_automation_notices();
+        if !unread.is_empty() {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            for (notice, automation, sequence) in unread {
+                if registry.automation_attention_resolved(automation, sequence)? {
+                    notifications.acknowledge(notice);
+                }
+            }
+        }
         if let Some(pending) = &mut self.pending {
             // No Registry/HostState/control guard is held while observing the
             // receiver. Empty retains this exact waiter, never another enqueue.
@@ -147,6 +156,57 @@ mod tests {
         model::ProjectKind,
         workspace_model::ModelEdit,
     };
+
+    #[test]
+    fn enabling_an_automation_retires_only_earlier_attention_and_its_outbox_row() {
+        let (_directory, registry, automation, entry) = fixture();
+        let mut registry = registry.lock().unwrap();
+        let id = automation.id;
+        let sequence = entry.event().sequence;
+        assert!(
+            !registry
+                .automation_attention_resolved(id, sequence)
+                .unwrap()
+        );
+
+        registry
+            .apply(&ModelEdit::ReopenProject {
+                repository: automation.definition.agent.target.repository.clone(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let current = registry.automation(id).unwrap();
+        registry
+            .set_automation_enabled(
+                id,
+                current.revision,
+                Some(Occurrence {
+                    due_ms: 20_000,
+                    local: "2026-11-26T08:00".into(),
+                }),
+                true,
+                3,
+            )
+            .unwrap();
+
+        assert!(
+            registry
+                .automation_attention_resolved(id, sequence)
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .automation_attention_resolved(id, u64::try_from(i64::MAX).unwrap())
+                .unwrap()
+        );
+        assert!(
+            registry
+                .pending_automation_notifications(1)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     // Uses the actual composed Registry migration and project-close hook. No
     // private table injection may bypass its published-layout validation.

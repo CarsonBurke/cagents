@@ -307,6 +307,22 @@ impl Handle {
         receiver
     }
 
+    pub(in crate::host) fn unread_automation_notices(&self) -> Vec<(Uuid, Uuid, u64)> {
+        self.0
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notices
+            .iter()
+            .filter_map(|notice| match notice.event.target {
+                Target::Automation { id, sequence } if !notice.acknowledged => {
+                    Some((notice.id, id, sequence))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.0
             .snapshot
@@ -403,12 +419,18 @@ fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
         if *current == snapshot {
             return;
         }
+        let automation_waiting = snapshot.notices.iter().any(|notice| {
+            !notice.acknowledged && matches!(notice.event.target, Target::Automation { .. })
+        });
         *current = snapshot;
         drop(current);
         if let Some(host) = host.upgrade() {
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .notifications_changed();
+            if automation_waiting {
+                super::automations::wake(&host);
+            }
         }
     }
 }

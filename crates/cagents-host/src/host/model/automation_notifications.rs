@@ -58,6 +58,29 @@ fn actionable(cause: LifecycleCause) -> bool {
     )
 }
 
+pub(super) fn resolves_retired_attention(cause: LifecycleCause) -> bool {
+    matches!(
+        cause,
+        LifecycleCause::Edited
+            | LifecycleCause::Enabled
+            | LifecycleCause::Removed
+            | LifecycleCause::ReleaseRecovered
+    )
+}
+
+pub(super) fn retire_before(
+    tx: &Transaction<'_>,
+    automation: Uuid,
+    sequence: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM automation_notifications WHERE automation=?1 AND sequence<?2",
+        params![automation.to_string(), sequence],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 fn validate(event: &LifecycleEvent) -> Result<(), String> {
     if event.automation.is_nil()
         || event.firing.is_some_and(|id| id.is_nil())
@@ -311,6 +334,24 @@ pub(super) fn suppress_precheck(
 }
 
 impl super::Registry {
+    /// A newer durable management receipt supersedes older actionable
+    /// attention. Check the sequence so a new block survives a late read.
+    pub(in crate::host) fn automation_attention_resolved(
+        &self,
+        automation: Uuid,
+        sequence: u64,
+    ) -> Result<bool, String> {
+        self.db.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM automation_lifecycle
+                WHERE automation=?1 AND sequence>?2
+                AND json_extract(record,'$.cause') IN ('edited','enabled','removed','release_recovered')
+            )",
+            params![automation.to_string(), sequence],
+            |row| row.get(0),
+        ).map_err(|error| error.to_string())
+    }
+
     pub(in crate::host) fn pending_automation_notifications(
         &self,
         limit: usize,

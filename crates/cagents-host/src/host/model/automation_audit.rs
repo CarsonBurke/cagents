@@ -50,6 +50,9 @@ pub(super) fn record(
         ],
     )
     .map_err(|error| error.to_string())?;
+    if super::automation_notifications::resolves_retired_attention(cause) {
+        super::automation_notifications::retire_before(tx, automation.id, tx.last_insert_rowid())?;
+    }
     tx.execute(
         "DELETE FROM automation_lifecycle WHERE automation=?1 AND sequence NOT IN
          (SELECT sequence FROM automation_lifecycle WHERE automation=?1 ORDER BY sequence DESC LIMIT ?2)",
