@@ -86,10 +86,12 @@ fn isolated(name: &str) -> Option<PathBuf> {
         }
         thread::sleep(Duration::from_millis(10));
     };
+    let output = fs::read_to_string(root.join("stdout")).unwrap();
     assert!(
-        status.is_some_and(|status| status.success()),
-        "isolated startup fixture failed or timed out:\n{}\n{}",
-        fs::read_to_string(root.join("stdout")).unwrap(),
+        status.is_some_and(|status| status.success())
+            && output.contains("test result: ok. 1 passed"),
+        "isolated startup fixture failed, selected no test, or timed out:\n{}\n{}",
+        output,
         fs::read_to_string(root.join("stderr")).unwrap(),
     );
     None
@@ -195,11 +197,8 @@ fn wait_for_ready(host: &SharedHost, source: &Session, client: &ClientHandle) {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn executable_permission_repair_retries_the_same_saved_conversation() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
@@ -820,11 +819,8 @@ fn invalid_resume_continuity_stays_blocked_through_prepare_handshake() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
-)]
 fn missing_claude_history_repair_restores_the_same_read_only_card_without_launching() {
+    #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
         return;
     }
