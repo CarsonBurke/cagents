@@ -927,8 +927,11 @@ fn reconcile_waiting(
 ) -> Result<bool, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let resolved = waiting_resolution(&state, target, through)? == RetainedWaiting::Resolved;
-    if resolved && let Some(notifications) = &state.notifications {
-        notifications.clear_session_waiting(target.source.id);
+    if resolved
+        && let Some(notifications) = &state.notifications
+        && !notifications.try_clear_session_waiting(target.source.id)
+    {
+        return Err("Waiting attention settlement has not been admitted".into());
     }
     Ok(resolved)
 }

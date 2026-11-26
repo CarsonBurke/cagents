@@ -113,7 +113,7 @@ impl Pending {
                 self.retired.insert(target);
             }
         }
-        for target in newer.cleared_waiting.iter().cloned() {
+        for target in newer.cleared_waiting {
             self.clear_waiting(target);
         }
         for (target, event) in newer.events {
@@ -127,7 +127,15 @@ impl Pending {
             }
         }
         self.read_predecessors(newer.predecessor_reads);
-        self.committed_events.extend(newer.committed_events);
+        for (event, receipt) in newer.committed_events {
+            if receipt.resolved && !self.cleared_waiting.contains(&event.target) {
+                receipt.finish(Err(
+                    "Waiting settlement queue is full; outcome remains unacknowledged".into(),
+                ));
+            } else {
+                self.committed_events.push_back((event, receipt));
+            }
+        }
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
         }
@@ -145,7 +153,10 @@ impl Pending {
         self
     }
 
-    fn clear_waiting(&mut self, target: Target) {
+    fn clear_waiting(&mut self, target: Target) -> bool {
+        if self.cleared_waiting.len() >= MAX_PENDING && !self.cleared_waiting.contains(&target) {
+            return false;
+        }
         if self
             .events
             .get(&target)
@@ -158,9 +169,8 @@ impl Pending {
                 receipt.resolved = true;
             }
         }
-        if self.cleared_waiting.len() < MAX_PENDING {
-            self.cleared_waiting.insert(target);
-        }
+        self.cleared_waiting.insert(target);
+        true
     }
 
     fn read_predecessors(&mut self, reads: BTreeMap<Uuid, TerminalId>) {
@@ -292,16 +302,8 @@ impl Handle {
         if pending.committed_events.len() >= MAX_PENDING {
             return Err("Notification commit queue is full; outcome remains unacknowledged".into());
         }
-        if resolved {
-            let target = event.target();
-            if pending.cleared_waiting.len() >= MAX_PENDING
-                && !pending.cleared_waiting.contains(&target)
-            {
-                return Err(
-                    "Waiting settlement queue is full; outcome remains unacknowledged".into(),
-                );
-            }
-            pending.clear_waiting(target);
+        if resolved && !pending.clear_waiting(event.target()) {
+            return Err("Waiting settlement queue is full; outcome remains unacknowledged".into());
         }
         let mut receipt = CommitReceipt::new(receipt);
         receipt.resolved = resolved;
@@ -333,7 +335,20 @@ impl Handle {
     }
 
     pub fn clear_session_waiting(&self, session: TerminalId) {
-        self.change(|pending| pending.clear_waiting(Target::Session(session)));
+        self.try_clear_session_waiting(session);
+    }
+
+    pub(super) fn try_clear_session_waiting(&self, session: TerminalId) -> bool {
+        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.stopped
+            || self.0.wake.is_closed()
+            || !pending.clear_waiting(Target::Session(session))
+        {
+            return false;
+        }
+        drop(pending);
+        let _ = self.0.wake.try_send(());
+        true
     }
 
     pub fn retire(&self, session: TerminalId) {
@@ -903,6 +918,18 @@ fn settle_attention_at_shutdown(
         tracing::warn!(%error, "accepted conversation reads could not settle during shutdown");
     }
     true
+}
+
+fn waiting_clear_admitted(shared: &Weak<Shared>, event: &Event) -> bool {
+    event.evidence.kind == Kind::Waiting
+        && shared.upgrade().is_some_and(|shared| {
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cleared_waiting
+                .contains(&event.target)
+        })
 }
 
 async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>) -> bool {
@@ -1759,8 +1786,12 @@ async fn run(
                 ) {
                     return;
                 }
-                // Portal connection and test delivery can each await. An
-                // automation may have been resolved after this batch started.
+                // Portal connection and test delivery can each await.
+                // Check for settlements accepted while this batch was paused.
+                if waiting_clear_admitted(&shared, &notice.event) {
+                    delivery.remove(&notice.event.target);
+                    continue;
+                }
                 if let Target::Automation { id, sequence } = notice.event.target {
                     let resolved = host
                         .upgrade()
@@ -2970,6 +3001,56 @@ mod tests {
         let notices = journal.list().unwrap();
         assert_eq!(notices.len(), 2);
         assert!(notices.iter().all(|notice| notice.acknowledged));
+    }
+
+    #[test]
+    fn a_deferred_waiting_batch_never_loses_a_clear_behind_a_successful_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, mut bridge) =
+            JournalTestBridge::new(&root.path().join("attention.sqlite")).unwrap();
+        let session = TerminalId::new();
+        let mut waiting = attention_event(session, "waiting");
+        waiting.evidence.kind = Kind::Waiting;
+        let existing = bridge
+            .journal
+            .record(waiting.clone(), false)
+            .unwrap()
+            .unwrap();
+        let receipt = handle.record_resolved_waiting(waiting.clone()).unwrap();
+        let deferred = Pending {
+            cleared_waiting: (0..MAX_PENDING)
+                .map(|_| Target::Session(TerminalId::new()))
+                .collect(),
+            ..Pending::default()
+        };
+        let merged = deferred.followed_by(take_pending(&handle.0));
+        assert_eq!(merged.cleared_waiting.len(), MAX_PENDING);
+        assert!(merged.committed_events.is_empty());
+        assert!(receipt.try_recv().unwrap().is_err());
+        assert!(bridge.list().unwrap().contains(&existing));
+
+        let receipt = handle.record_resolved_waiting(waiting).unwrap();
+        bridge.commit_next(&Preferences::default(), false).unwrap();
+        receipt.try_recv().unwrap().unwrap();
+        assert!(bridge.list().unwrap()[0].acknowledged);
+    }
+
+    #[test]
+    fn a_wait_settled_during_delivery_cannot_be_announced_after_the_portal_await() {
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let session = TerminalId::new();
+        let mut waiting = attention_event(session, "pending");
+        waiting.evidence.kind = Kind::Waiting;
+        let reference = Arc::downgrade(&shared);
+        assert!(!waiting_clear_admitted(&reference, &waiting));
+
+        assert!(handle.try_clear_session_waiting(session));
+        assert!(waiting_clear_admitted(&reference, &waiting));
+        assert!(!waiting_clear_admitted(
+            &reference,
+            &attention_event(session, "done")
+        ));
     }
 
     #[test]
