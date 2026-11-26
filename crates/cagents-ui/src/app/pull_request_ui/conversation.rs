@@ -11,7 +11,7 @@
 use super::*;
 use crate::design::list;
 use crate::work::{
-    Check, ConversationPullRequest, ConversationPullRequests, ConversationWorktree, Relation,
+    Check, ConversationPullRequest, ConversationPullRequests, ConversationWorktree,
     TranscriptCoverage,
 };
 use cosmic::iced::futures::SinkExt;
@@ -724,7 +724,7 @@ pub(super) fn height(
         .map_or(0.0, |row| {
             ROW_SPACING + detail_rows(row) as f32 * design::DENSE_ROW_HEIGHT
         });
-    let mut heights: Vec<f32> = vec![list::TWO_LINE_HEIGHT; work.len()];
+    let mut heights: Vec<f32> = work.iter().map(row_height).collect();
     let notes = if with_note {
         state.list.as_deref().map_or(0, note_lines)
     } else {
@@ -787,162 +787,49 @@ fn coverage_note(coverage: &TranscriptCoverage) -> Option<String> {
     }
 }
 
-/// A theme's style for one fact on a row's second line.
-type Tone = fn(&cosmic::Theme) -> iced::widget::text::Style;
-
-/// One fact on a row's second line: a few words, each part in its own tone
-/// when it has one, and whether the row's accessible name repeats it among
-/// its facts.
-struct Fact(Vec<(String, Option<Tone>)>, bool);
-
-impl Fact {
-    fn plain(text: impl Into<String>) -> Self {
-        Self(vec![(text.into(), None)], true)
-    }
-
-    fn toned(text: impl Into<String>, tone: Tone) -> Self {
-        Self(vec![(text.into(), Some(tone))], true)
-    }
-
-    /// Shown only: the accessible name says it already.
-    fn shown(text: impl Into<String>) -> Self {
-        Self(vec![(text.into(), None)], false)
-    }
-
-    /// Lines added and removed, each in its tone.
-    fn change_counts(additions: u64, deletions: u64) -> Option<Self> {
-        let counts = crate::repository::line_change_counts(Some(additions), Some(deletions));
-        let parts: Vec<(String, Option<Tone>)> = counts
-            .split(' ')
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let tone: Tone = if part.starts_with('+') {
-                    design::added_text
-                } else {
-                    design::removed_text
-                };
-                (part.to_owned(), Some(tone))
-            })
-            .collect();
-        (!parts.is_empty()).then_some(Self(parts, true))
-    }
-
-    fn text(&self) -> String {
-        self.0
-            .iter()
-            .map(|(text, _)| text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
+/// What a worktree's uncommitted changes are, for its mark's tooltip and its
+/// row's accessible name: `4 uncommitted changes, +8 −17`. `None` while it
+/// has none or its status is not read yet. The daemon's count includes
+/// untracked files, which a worktree row in Projects may leave out.
+fn uncommitted(worktree: &ConversationWorktree) -> Option<String> {
+    let count = worktree.changed_paths.filter(|count| *count > 0)?;
+    let lines = worktree.diff.map_or_else(String::new, |diff| {
+        crate::repository::line_change_counts(Some(diff.additions), Some(diff.deletions))
+    });
+    Some(crate::ui_controls::uncommitted_label(
+        u64::from(count),
+        &lines,
+    ))
 }
 
-/// A row's facts on its second line with a dot between each, fading where
-/// the row is too narrow, so the facts that matter most go first.
-fn facts_line<'a>(facts: &[Fact]) -> Element<'a, Action> {
-    let mut line = String::new();
-    let mut tints = Vec::new();
-    for (index, fact) in facts.iter().enumerate() {
-        if index > 0 {
-            line.push_str(" · ");
-        }
-        for (part, (text, tone)) in fact.0.iter().enumerate() {
-            if part > 0 {
-                line.push(' ');
-            }
-            let start = line.len();
-            line.push_str(text);
-            if let Some(tone) = tone {
-                tints.push((start..line.len(), *tone));
-            }
-        }
-    }
-    tints
-        .into_iter()
-        .fold(
-            crate::ui_controls::FadeText::caption(line),
-            |line, (range, tone)| line.tint(range, cosmic::theme::Text::Custom(tone)),
-        )
-        .size(design::TEXT_DESCRIPTION)
-        .line_height(iced::widget::text::LineHeight::Absolute(
-            list::CAPTION_LINE.into(),
-        ))
-        .width(Length::Fill)
-        .into()
-}
-
-/// What a worktree's row says about it: its uncommitted changes and the
-/// lines they change.
-fn worktree_facts(worktree: &ConversationWorktree, facts: &mut Vec<Fact>) {
-    // The daemon's count includes untracked files, which a worktree row in
-    // Projects may leave out.
-    match worktree.changed_paths {
-        Some(0) => facts.push(Fact::plain("No uncommitted changes")),
-        Some(count) => facts.push(Fact::toned(
-            format!("{count} uncommitted"),
-            design::warning_text,
-        )),
-        None => {}
-    }
-    if let Some(diff) = worktree.diff {
-        facts.extend(Fact::change_counts(diff.additions, diff.deletions));
-    }
-}
-
-/// What a pull request's row says about it, the facts most in need of
-/// attention first: whose it is when not this repository's, how current
-/// it is, what its worktree has not committed yet, whether it has merged or
-/// closed, its size, and why it is listed. Its checks and review are
-/// [`pull_request_marks`].
-fn pull_request_facts(
+/// What a pull request's number says on hover: its size, and how old its
+/// state is while GitHub cannot be reached to refresh it.
+fn pull_request_detail(
     list: Option<&ConversationPullRequests>,
     row: &ConversationPullRequest,
-    worktree: Option<&ConversationWorktree>,
-) -> Vec<Fact> {
-    let mut facts = Vec::with_capacity(6);
-    // Another repository's number would crowd the title, so it goes
-    // beneath it. Not yet known, the row is named by that number already.
-    if !own_repository(list, row) && row.pull_request.is_some() {
-        facts.push(Fact::plain(repository_label(&row.repository)));
-    }
-    if row.pull_request.is_none() {
-        facts.push(Fact::plain("State unknown"));
-        facts.push(Fact::plain(reason(row)));
-        return facts;
+) -> Vec<String> {
+    let mut detail = Vec::with_capacity(2);
+    if let Some(diff) = row.diff {
+        let lines =
+            crate::repository::line_change_counts(Some(diff.additions), Some(diff.deletions));
+        if !lines.is_empty() {
+            detail.push(format!("{lines} in the pull request"));
+        }
     }
     if let Some(list) = list
         && list.forge_error.is_some()
         && let Some(at) = row.observed_at_unix_ms
         && list.generated_at_unix_ms.saturating_sub(at) > STALE_AFTER_MS
     {
-        facts.push(Fact::plain(format!(
-            "as of {}",
+        detail.push(format!(
+            "State as of {}",
             crate::work_ui::age(list.generated_at_unix_ms, at, true)
-        )));
-    }
-    // Work not pushed yet is not in the pull request's size beside it.
-    if let Some(count) = worktree
-        .and_then(|worktree| worktree.changed_paths)
-        .filter(|count| *count > 0)
-    {
-        facts.push(Fact::toned(
-            format!("{count} uncommitted"),
-            design::warning_text,
         ));
     }
-    // Why it is listed, such as "Pushed", is no state: a finished pull
-    // request says it is finished in words, not only by its glyph. Its
-    // accessible name says so first.
-    if let Some(finished) = finished_state(row) {
-        facts.push(Fact::shown(finished.label()));
-    }
-    if let Some(diff) = row.diff {
-        facts.extend(Fact::change_counts(diff.additions, diff.deletions));
-    }
-    facts.push(Fact::plain(reason(row)));
-    facts
+    detail
 }
 
-/// A merged or closed pull request's state, which its facts name.
+/// A merged or closed pull request's state, which its second line names.
 fn finished_state(
     row: &ConversationPullRequest,
 ) -> Option<crate::sidebar::WorktreePullRequestState> {
@@ -981,20 +868,41 @@ fn pull_request_marks<'a>(row: &ConversationPullRequest) -> Vec<(Element<'a, Act
 }
 
 /// What a row of the Work list draws and says.
+///
+/// A row names its work and marks what may need the user: an open pull
+/// request's checks and review, and a worktree's uncommitted changes. It
+/// does not say how the conversation came to list it. Counts, sizes and
+/// folders are on hover.
 struct RowParts<'a> {
     glyph: Element<'a, Action>,
     name: String,
     /// The name read out: a pull request's adds its state and number, which
-    /// its glyph and trailing number draw.
+    /// its glyph and second line draw.
     spoken: String,
-    trailing: Option<String>,
+    /// A pull request's number on the second line, after its repository
+    /// when that is not the conversation's. A row without one is one line.
+    number: Option<String>,
+    /// What the row's name says of the pull request beyond its marks: its
+    /// size, and how old its state is.
+    number_detail: Vec<String>,
+    /// What the number says on hover: the worktree's folder, then the
+    /// details.
+    number_tip: Option<String>,
+    /// What the label says on hover: the worktree's folder.
+    label_tip: Option<String>,
+    /// Glyphs that give way to opening the pull request on hover.
     marks: Vec<(Element<'a, Action>, String)>,
-    facts: Vec<Fact>,
+    /// The worktree's uncommitted changes. Their mark stays while the
+    /// pointer is on the row, so its tooltip can be read.
+    uncommitted: Option<String>,
+    /// Said when the worktree is not in Projects, which its folder's
+    /// tooltip explains.
+    unlisted: Option<&'static str>,
 }
 
 impl RowParts<'_> {
-    /// The row's accessible name. The facts line may be cut short, so it
-    /// says them all. Pressing a shown pull request again folds or unfolds
+    /// The row's accessible name, which says what the row draws and what it
+    /// shows on hover. Pressing a shown pull request again folds or unfolds
     /// its details, which nothing on the row draws, so it says which.
     fn described(&self, work: Work<'_>, marked: bool, details: bool) -> String {
         let spoken = &self.spoken;
@@ -1013,9 +921,20 @@ impl RowParts<'_> {
         };
         std::iter::once(shown)
             .chain(self.marks.iter().map(|(_, said)| said.clone()))
-            .chain(self.facts.iter().filter(|fact| fact.1).map(Fact::text))
+            .chain(self.uncommitted.clone())
+            .chain(self.unlisted.map(str::to_owned))
+            .chain(self.number_detail.iter().cloned())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// How tall [`work_row`] draws `work`: two lines for a pull request whose
+/// number goes beneath its title, one for anything else.
+fn row_height(work: &Work<'_>) -> f32 {
+    match work {
+        Work::PullRequest { row, .. } if row.pull_request.is_some() => list::TWO_LINE_HEIGHT,
+        _ => design::ROW_HEIGHT,
     }
 }
 
@@ -1024,75 +943,108 @@ fn row_parts<'a>(
     work: Work<'_>,
     openable: &dyn Fn(&Path) -> bool,
 ) -> RowParts<'a> {
-    let mut facts: Vec<Fact> = Vec::with_capacity(6);
-    // Work this window cannot show says so before anything else, since it
-    // is why choosing it shows no changes.
-    if let Some(path) = work.worktree()
-        && !openable(path)
-    {
-        facts.push(Fact::plain("Not in Projects"));
-    }
-    let mut marks: Vec<(Element<'a, Action>, String)> = Vec::new();
-    let mut spoken = None;
-    let (glyph, name, trailing): (Element<'a, Action>, String, Option<String>) = match work {
+    // Choosing work in a worktree Projects doesn't list shows none of its
+    // changes; its folder's tooltip says why.
+    let folder = |path: &Path| {
+        let shown = crate::ui_controls::display_path(path);
+        if openable(path) {
+            shown.into_owned()
+        } else {
+            format!("{shown}\nNot in Projects, so its changes are not shown here")
+        }
+    };
+    let unlisted = |path: &Path| (!openable(path)).then_some("not in Projects");
+    match work {
         Work::PullRequest { row, worktree } => {
-            marks = pull_request_marks(row);
             let state = row
                 .pull_request
                 .as_ref()
                 .map(crate::sidebar::WorktreePullRequestState::from_work);
-            facts.extend(pull_request_facts(list, row, worktree));
             let number = number_label(list, row);
-            let name = row
-                .pull_request
-                .as_ref()
-                .map_or_else(|| number.clone(), |pull_request| pull_request.title.clone());
-            // Not yet known, a pull request is named by its number already.
-            // Another repository's name is one of the facts, so the number
-            // read out leaves it off.
-            spoken = state
-                .map(|state| format!("{name}, {}, #{}", state.label().to_lowercase(), row.number));
-            (
-                crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
+            // Not yet known, a pull request is named by its number, which a
+            // second line would only repeat. A finished one says so in words
+            // after its number, not only by its glyph.
+            let (name, second) = match &row.pull_request {
+                Some(pull_request) => (
+                    pull_request.title.clone(),
+                    Some(match finished_state(row) {
+                        Some(finished) => format!("{number} · {}", finished.label()),
+                        None => number.clone(),
+                    }),
+                ),
+                None => (number.clone(), None),
+            };
+            let spoken = match state {
+                Some(state) => format!("{name}, {}, {number}", state.label().to_lowercase()),
+                None => format!("{name}, state unknown"),
+            };
+            // The folder is said on hover of the number, beneath the title,
+            // so the tooltip doesn't open over that number; a row without
+            // one says it on its name.
+            let folder = worktree.map(|worktree| folder(&worktree.path));
+            let number_detail = pull_request_detail(list, row);
+            let (label_tip, number_tip) = match second {
+                Some(_) => {
+                    let tip = folder
+                        .into_iter()
+                        .chain(number_detail.iter().cloned())
+                        .collect::<Vec<_>>();
+                    (None, (!tip.is_empty()).then(|| tip.join("\n")))
+                }
+                None => (folder, None),
+            };
+            RowParts {
+                glyph: crate::ui_controls::pull_request_state_glyph(state, design::ROW_ICON_SIZE),
                 name,
-                Some(format!("#{}", row.number)),
-            )
+                spoken,
+                number: second,
+                number_detail,
+                number_tip,
+                label_tip,
+                marks: pull_request_marks(row),
+                uncommitted: worktree.and_then(uncommitted),
+                unlisted: worktree.and_then(|worktree| unlisted(&worktree.path)),
+            }
         }
         Work::Worktree(worktree) => {
-            worktree_facts(worktree, &mut facts);
-            facts.push(Fact::plain(if worktree.by_subagent {
-                "Edited by a subagent"
-            } else {
-                "Edited"
-            }));
-            (
-                crate::ui_controls::passive_icon(
+            let name = worktree_branch(worktree);
+            RowParts {
+                glyph: crate::ui_controls::passive_icon(
                     crate::sidebar::worktree_icon(),
                     design::ROW_ICON_SIZE,
                 ),
-                worktree_branch(worktree),
-                None,
-            )
+                spoken: name.clone(),
+                name,
+                number: None,
+                number_detail: Vec::new(),
+                number_tip: None,
+                label_tip: Some(folder(&worktree.path)),
+                marks: Vec::new(),
+                uncommitted: uncommitted(worktree),
+                unlisted: unlisted(&worktree.path),
+            }
         }
-        Work::Here(_) => {
-            facts.push(Fact::plain("Where this conversation runs"));
-            (
-                crate::ui_controls::passive_icon(
+        Work::Here(path) => {
+            let name = work.scope_label();
+            RowParts {
+                glyph: crate::ui_controls::passive_icon(
                     crate::sidebar::worktree_icon(),
                     design::ROW_ICON_SIZE,
                 ),
-                work.scope_label(),
-                None,
-            )
+                spoken: format!("{name}, where this conversation runs"),
+                name,
+                number: None,
+                number_detail: Vec::new(),
+                number_tip: None,
+                label_tip: Some(format!(
+                    "{}\nWhere this conversation runs",
+                    crate::ui_controls::display_path(path)
+                )),
+                marks: Vec::new(),
+                uncommitted: None,
+                unlisted: None,
+            }
         }
-    };
-    RowParts {
-        glyph,
-        spoken: spoken.unwrap_or_else(|| name.clone()),
-        name,
-        trailing,
-        marks,
-        facts,
     }
 }
 
@@ -1109,31 +1061,41 @@ fn work_row<'a>(
     let RowParts {
         glyph,
         name,
-        trailing,
+        number,
+        number_tip,
+        label_tip,
         marks,
-        facts,
+        uncommitted,
         ..
     } = parts;
-    let mut row = crate::ui_controls::list_row(None, name)
+    // The tooltips sit on the label and the number rather than the whole
+    // row, so none of them covers another's, or the marks'.
+    let label = crate::ui_controls::row_label(name);
+    let mut row = crate::ui_controls::list_row(None, "")
+        .label(match label_tip {
+            Some(tip) => crate::interaction::tooltip(label, tip),
+            None => label,
+        })
         .icon_element(glyph)
-        .caption_element(facts_line(&facts))
         .name(described)
         .selected(marked)
         .on_press(Action::Choose {
             card,
             key: work.key(),
         });
-    let mut idle: Vec<Element<'a, Action>> = marks.into_iter().map(|(mark, _)| mark).collect();
-    if let Some(trailing) = trailing {
-        idle.push(
-            design::caption(trailing)
-                .size(design::TEXT_DESCRIPTION)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        );
+    if let Some(number) = number {
+        let line: Element<'a, Action> = crate::ui_controls::FadeText::caption(number)
+            .line_height(iced::widget::text::LineHeight::Absolute(
+                list::CAPTION_LINE.into(),
+            ))
+            .into();
+        row = row.caption_element(match number_tip {
+            Some(tip) => crate::interaction::tooltip(line, tip),
+            None => line,
+        });
     }
-    let idle = (!idle.is_empty()).then(|| -> Element<'a, Action> {
-        widget::row::with_children(idle)
+    let idle = (!marks.is_empty()).then(|| -> Element<'a, Action> {
+        widget::row::with_children(marks.into_iter().map(|(mark, _)| mark).collect::<Vec<_>>())
             .spacing(space::XS)
             .align_y(Alignment::Center)
             .into()
@@ -1159,15 +1121,20 @@ fn work_row<'a>(
         (None, Some(idle)) => row = row.trailing(idle),
         (None, None) => {}
     }
+    // The changes mark comes last on every row, so it lines up down the
+    // list, and stays while the pointer is on the row so its tooltip can be
+    // read.
+    if let Some(said) = uncommitted {
+        row = row.trailing(crate::ui_controls::uncommitted_glyph(
+            said,
+            design::COMPACT_ICON_SIZE,
+        ));
+    }
     let row: Element<'a, Action> = row.into();
-    // A worktree's row names its folder; a pull request's would cover the
-    // checks beneath it.
-    match work {
-        Work::Worktree(worktree) => {
-            crate::interaction::tooltip(row, worktree.path.display().to_string())
-        }
-        Work::Here(path) => crate::interaction::tooltip(row, path.display().to_string()),
-        Work::PullRequest { .. } => crate::ui_controls::hover_reveal::region(row, &region),
+    if work.pull_request().is_some() {
+        crate::ui_controls::hover_reveal::region(row, &region)
+    } else {
+        row
     }
 }
 
@@ -1272,24 +1239,6 @@ fn repository_label(repository: &GitHubRepoKey) -> String {
     }
 }
 
-/// What the conversation did to the row's pull request.
-fn reason(row: &ConversationPullRequest) -> String {
-    let mut reason = if row.current_branch && row.relation == Relation::CheckedOut {
-        // The branch the conversation is on, which it did nothing else to.
-        "Current branch".to_owned()
-    } else {
-        let mut reason = row.relation.label().to_owned();
-        if row.current_branch {
-            reason.push_str(" · current branch");
-        }
-        reason
-    };
-    if row.by_subagent {
-        reason.push_str(" by a subagent");
-    }
-    reason
-}
-
 /// Opening the row's pull request, where Projects would open it.
 fn open(row: &ConversationPullRequest) -> Option<Action> {
     Url::parse(&row.url()).ok().map(|url| Action::Open {
@@ -1314,7 +1263,7 @@ fn tinted_icon<'a>((icon, tone): (Icon, fn(&cosmic::Theme) -> iced::Color)) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work::{CheckState, PullRequest, PullRequestState};
+    use crate::work::{CheckState, PullRequest, PullRequestState, Relation};
 
     fn repo(owner: &str) -> GitHubRepoKey {
         GitHubRepoKey::new("github.com", None, owner, "repo").unwrap()
@@ -1796,16 +1745,20 @@ mod tests {
             .map(|index| check(&format!("check {index}"), CheckState::Passed))
             .chain([check("lint", CheckState::Failed)])
             .collect();
-        state.update(listed(
+        // A lone worktree's row is one line, beside the pull requests' two.
+        let mut unread = row(5, Relation::Pushed);
+        unread.pull_request = None;
+        state.update(with_worktrees(
             conversation,
             1,
             vec![
                 created,
                 row(2, Relation::Pushed),
+                unread,
                 row(3, Relation::Mentioned),
                 row(4, Relation::Mentioned),
             ],
-            true,
+            vec![worktree("/repo/notes", None)],
         ));
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let keys: Vec<WorkKey> = state.work(None, &|_| true).iter().map(Work::key).collect();
@@ -2113,10 +2066,11 @@ mod tests {
         assert!(pull_request_marks(&open).is_empty());
     }
 
-    /// A row's accessible name says what its glyphs and number draw, and
-    /// what pressing it will do.
+    /// A row's accessible name says what its glyphs and number draw, what
+    /// its tooltips hold, and what pressing it will do. How the
+    /// conversation came to list it is not said anywhere.
     #[test]
-    fn a_rows_name_says_its_state_number_marks_and_facts() {
+    fn a_rows_name_says_its_state_number_marks_and_changes() {
         let list = ConversationPullRequests {
             generated_at_unix_ms: 0,
             repository: Some(repo("me")),
@@ -2130,26 +2084,43 @@ mod tests {
         draft.pull_request.as_mut().unwrap().draft = true;
         draft.pull_request.as_mut().unwrap().review = Some(crate::work::Review::Required);
         draft.checks = vec![check("test", CheckState::Pending)];
+        draft.diff = Some(crate::work::DiffStat {
+            additions: 120,
+            deletions: 30,
+        });
         let mut checked_out = worktree("/repo/fix-cache", Some(9));
         checked_out.changed_paths = Some(2);
+        checked_out.diff = Some(crate::work::DiffStat {
+            additions: 8,
+            deletions: 17,
+        });
         let work = Work::PullRequest {
             row: &draft,
             worktree: Some(&checked_out),
         };
         let parts = row_parts(list, work, &|_| true);
+        assert_eq!(parts.number.as_deref(), Some("#9"), "under the title");
+        // The folder is on the number's hover, not the title's, whose
+        // tooltip would open over the number.
+        assert_eq!(parts.label_tip, None);
+        assert_eq!(
+            parts.number_tip.as_deref(),
+            Some("/repo/fix-cache\n+120 −30 in the pull request")
+        );
         assert_eq!(
             parts.described(work, false, false),
-            "Show Change 9, draft, #9, Checks: 1 running, Review required, 2 uncommitted, Edited"
+            "Show Change 9, draft, #9, Checks: 1 running, Review required, \
+             2 uncommitted changes, +8 −17, +120 −30 in the pull request"
         );
         assert_eq!(
             parts.described(work, true, false),
             "Change 9, draft, #9, shown below, press to list its checks, \
-             Checks: 1 running, Review required, 2 uncommitted, Edited"
+             Checks: 1 running, Review required, 2 uncommitted changes, +8 −17, +120 −30 in the pull request"
         );
         assert_eq!(
             parts.described(work, true, true),
             "Change 9, draft, #9, shown below, press to hide its checks, \
-             Checks: 1 running, Review required, 2 uncommitted, Edited"
+             Checks: 1 running, Review required, 2 uncommitted changes, +8 −17, +120 −30 in the pull request"
         );
 
         // A merged one lists no checks, so pressing it shows only its link.
@@ -2162,72 +2133,88 @@ mod tests {
         };
         assert_eq!(
             row_parts(list, work, &|_| true).described(work, true, true),
-            "Change 3, merged, #3, shown below, press to hide its details, Created"
+            "Change 3, merged, #3, shown below, press to hide its details"
         );
-        // Why it is listed is no state: it says it merged in words too,
-        // which its name already read out.
+        // A finished one says so in words after its number too, which its
+        // name already read out; why it is listed is not said.
         merged.relation = Relation::Pushed;
         let work = Work::PullRequest {
             row: &merged,
             worktree: None,
         };
         assert_eq!(
-            row_parts(list, work, &|_| true)
-                .facts
-                .iter()
-                .map(Fact::text)
-                .collect::<Vec<_>>(),
-            ["Merged", "Pushed"]
+            row_parts(list, work, &|_| true).number.as_deref(),
+            Some("#3 · Merged")
         );
         merged.pull_request.as_mut().unwrap().state = PullRequestState::Closed;
         let work = Work::PullRequest {
             row: &merged,
             worktree: None,
         };
+        let parts = row_parts(list, work, &|_| true);
+        assert_eq!(parts.number.as_deref(), Some("#3 · Closed"));
         assert_eq!(
-            row_parts(list, work, &|_| true).described(work, false, false),
-            "Show Change 3, closed, #3, Pushed"
+            parts.described(work, false, false),
+            "Show Change 3, closed, #3"
         );
 
-        // Another repository is named once, among the facts.
+        // Another repository is named with its number, beneath the title.
         let mut upstream = row(4, Relation::Reviewed);
         upstream.repository = repo("upstream");
         let work = Work::PullRequest {
             row: &upstream,
             worktree: None,
         };
+        let parts = row_parts(list, work, &|_| true);
+        assert_eq!(parts.number.as_deref(), Some("upstream/repo#4"));
         assert_eq!(
-            row_parts(list, work, &|_| true).described(work, false, false),
-            "Show Change 4, open, #4, upstream/repo, Reviewed"
+            parts.described(work, false, false),
+            "Show Change 4, open, upstream/repo#4"
         );
+        // Not yet read, it is named by its number, with no second line.
         upstream.pull_request = None;
         let work = Work::PullRequest {
             row: &upstream,
             worktree: None,
         };
+        let parts = row_parts(list, work, &|_| true);
+        assert_eq!(parts.number, None);
         assert_eq!(
-            row_parts(list, work, &|_| true).described(work, false, false),
-            "Show upstream/repo#4, State unknown, Reviewed"
+            parts.described(work, false, false),
+            "Show upstream/repo#4, state unknown"
         );
 
+        // A worktree Projects doesn't list draws no mark for it: its
+        // folder's tooltip says why, and its name says so aloud.
         let edited = worktree("/repo/notes", None);
         let work = Work::Worktree(&edited);
+        let parts = row_parts(list, work, &|_| false);
         assert_eq!(
-            row_parts(list, work, &|_| false).described(work, true, false),
-            "repo/notes, shown below, Not in Projects, 1 uncommitted, Edited"
+            parts.described(work, true, false),
+            "repo/notes, shown below, 1 uncommitted change, not in Projects"
         );
+        let listed = row_parts(list, work, &|_| true);
+        assert_eq!(
+            listed.described(work, true, false),
+            "repo/notes, shown below, 1 uncommitted change"
+        );
+        assert!(
+            parts.label_tip.as_deref().is_some_and(
+                |tip| tip.ends_with("Not in Projects, so its changes are not shown here")
+            ),
+            "{:?}",
+            parts.label_tip
+        );
+        // A clean one has no mark at all.
+        let mut clean = edited.clone();
+        clean.changed_paths = Some(0);
+        assert_eq!(uncommitted(&clean), None);
     }
 
     #[test]
-    fn a_row_says_why_it_is_listed_and_opens_its_pull_request() {
-        let mut current = row(1, Relation::CheckedOut);
-        current.current_branch = true;
-        assert_eq!(reason(&current), "Current branch");
-        current.relation = Relation::Pushed;
-        assert_eq!(reason(&current), "Pushed · current branch");
+    fn a_rows_number_and_link_name_its_pull_request() {
         let mut delegated = row(2, Relation::Created);
         delegated.by_subagent = true;
-        assert_eq!(reason(&delegated), "Created by a subagent");
         let list = ConversationPullRequests {
             generated_at_unix_ms: 0,
             repository: Some(repo("me")),
