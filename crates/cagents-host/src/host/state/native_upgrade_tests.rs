@@ -1691,6 +1691,12 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         proof.clone(),
     )));
     let native_directory = registry::directory(Kind::Native).unwrap();
+    #[cfg(target_os = "linux")]
+    let processes = {
+        let processes = root.join("processes");
+        fs::create_dir(&processes).unwrap();
+        processes
+    };
     // Every holder and server this isolated fixture started, by exact
     // identity, so a failed assertion leaves none running.
     #[derive(Default)]
@@ -1709,6 +1715,16 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         cleanup
             .0
             .extend([record.holder.clone(), record.root.clone()]);
+        #[cfg(target_os = "linux")]
+        for process in [&record.holder, &record.root] {
+            // The recovery census reads real kernel state for every provider
+            // and holder this test starts, without unrelated login sessions.
+            let entry = processes.join(process.pid.to_string());
+            if let Err(error) = std::os::unix::fs::symlink(format!("/proc/{}", process.pid), entry)
+            {
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+        }
         record
     };
 
@@ -1810,6 +1826,10 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
             .ok()
             .and_then(|pid| registry::Process::read(pid.trim().parse().ok()?).ok())
     };
+    #[cfg(target_os = "linux")]
+    super::super::update_recovery::restore_ordinary_with_process_fixture(&updated, &processes)
+        .unwrap();
+    #[cfg(not(target_os = "linux"))]
     super::super::update_recovery::restore_ordinary(&updated).unwrap();
     let unattached = store().unattached().unwrap();
     // Only the two stopped restarts are left unattached, so startup's orphan
@@ -1820,6 +1840,7 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
             .map(|entry| entry.id)
             .collect::<std::collections::BTreeSet<_>>(),
         [ids[stalled], ids[refused]].into_iter().collect(),
+        "{unattached:?}"
     );
 
     // The update finished: no checkpoint and no daemon-wide recovery hold,
