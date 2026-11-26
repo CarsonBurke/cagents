@@ -1,22 +1,25 @@
 //! Launch an installed window through its stable LaunchServices identity.
 
-use super::{Command, Duration, Path, Stdio, io, read_ui_launch_handshake};
+use super::{
+    BorrowedFd, Command, Duration, Instant, Path, Stdio, io, read_ui_launch_handshake_with,
+};
 use crate::pinned_process::PinnedProcess;
 use std::{
     ffi::CString,
     fs::OpenOptions,
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt},
+    },
 };
-
-const OPEN_DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) fn launch(
     command: &Command,
     bundle: &Path,
     timeout: Duration,
 ) -> io::Result<Option<String>> {
-    // LaunchServices opens the named stdout when it dispatches the app. The
-    // read-only descriptor sees EOF if that app exits before acknowledging.
+    // Keep the pipe open until dispatch connects. LaunchServices can itself
+    // retain a writer after the app exits, so use open -W for the exit event.
     let directory = tempfile::tempdir()?;
     let readiness = directory.path().join("startup");
     let name = CString::new(readiness.as_os_str().as_bytes())?;
@@ -26,10 +29,11 @@ pub(super) fn launch(
     }
     let mut response = OpenOptions::new()
         .read(true)
+        .write(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&readiness)?;
     let mut open = Command::new("/usr/bin/open");
-    open.args(["-n", "-a"])
+    open.args(["-W", "-n", "-a"])
         .arg(bundle)
         .arg("--stdout")
         .arg(&readiness)
@@ -51,31 +55,38 @@ pub(super) fn launch(
     unsafe {
         open.pre_exec(crate::daemon::seal_inherited_descriptors);
     }
-    dispatch(&mut open)?;
-    read_ui_launch_handshake(&mut response, timeout)
+    let mut helper = open.spawn()?;
+    let result = PinnedProcess::open_unreaped(helper.id()).and_then(|helper| {
+        read_ui_launch_handshake_with(&mut response, timeout, |output, deadline| {
+            wait_for_app(output, helper.exit_readiness(), deadline)
+        })
+    });
+    // Reap the system wait helper. The application was launched separately by
+    // LaunchServices and continues to own its own window and claims.
+    let _ = helper.kill();
+    let _ = helper.wait();
+    result
 }
 
-fn dispatch(open: &mut Command) -> io::Result<()> {
-    let mut child = open.spawn()?;
-    let exited = match PinnedProcess::open(child.id()) {
-        Ok(process) => process.wait_for_exit(OPEN_DISPATCH_TIMEOUT),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(error),
-    };
-    if !matches!(exited, Ok(true)) {
-        let _ = child.kill();
-        let _ = child.wait();
-        exited?;
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "macOS did not open Cagents.app in time",
-        ));
+fn wait_for_app(
+    output: BorrowedFd<'_>,
+    exited: BorrowedFd<'_>,
+    deadline: Instant,
+) -> io::Result<bool> {
+    let mut watched = [output, exited].map(|descriptor| libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    if !crate::descriptor::wait_for_events(&mut watched, Some(deadline))? {
+        return Ok(false);
     }
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "macOS could not open Cagents.app ({status})"
-        )));
+    // Consume buffered startup bytes before acting on a simultaneous exit.
+    if watched[0].revents != 0 {
+        return Ok(true);
     }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "cagents-ui exited before acknowledging startup",
+    ))
 }
