@@ -85,8 +85,9 @@ struct Pending {
     committed_events: VecDeque<(Event, CommitReceipt)>,
     inboxes: Option<InboxAttention>,
     retired: BTreeSet<Target>,
+    // Provider lifecycle settlements coalesce by exact target. Keep them
+    // through a journal outage even after the process that sent one has ended.
     cleared_waiting: BTreeSet<Target>,
-    waiting_clear_receipts: Vec<(Target, CommitReceipt)>,
     acknowledged: BTreeSet<Uuid>,
     predecessor_reads: BTreeMap<Uuid, TerminalId>,
     presence_changed: bool,
@@ -128,21 +129,7 @@ impl Pending {
             }
         }
         self.read_predecessors(newer.predecessor_reads);
-        for (event, receipt) in newer.committed_events {
-            if receipt.resolved && !self.cleared_waiting.contains(&event.target) {
-                receipt.finish(Err(
-                    "Waiting settlement queue is full; outcome remains unacknowledged".into(),
-                ));
-            } else {
-                self.committed_events.push_back((event, receipt));
-            }
-        }
-        self.waiting_clear_receipts.extend(
-            newer
-                .waiting_clear_receipts
-                .into_iter()
-                .filter(|(target, _)| self.cleared_waiting.contains(target)),
-        );
+        self.committed_events.extend(newer.committed_events);
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
         }
@@ -160,10 +147,7 @@ impl Pending {
         self
     }
 
-    fn clear_waiting(&mut self, target: Target) -> bool {
-        if self.cleared_waiting.len() >= MAX_PENDING && !self.cleared_waiting.contains(&target) {
-            return false;
-        }
+    fn clear_waiting(&mut self, target: Target) {
         if self
             .events
             .get(&target)
@@ -177,14 +161,6 @@ impl Pending {
             }
         }
         self.cleared_waiting.insert(target);
-        true
-    }
-
-    fn finish_waiting_clears(&mut self) {
-        self.cleared_waiting.clear();
-        for (_, receipt) in self.waiting_clear_receipts.drain(..) {
-            receipt.finish(Ok(()));
-        }
     }
 
     fn read_predecessors(&mut self, reads: BTreeMap<Uuid, TerminalId>) {
@@ -316,8 +292,8 @@ impl Handle {
         if pending.committed_events.len() >= MAX_PENDING {
             return Err("Notification commit queue is full; outcome remains unacknowledged".into());
         }
-        if resolved && !pending.clear_waiting(event.target()) {
-            return Err("Waiting settlement queue is full; outcome remains unacknowledged".into());
+        if resolved {
+            pending.clear_waiting(event.target());
         }
         let mut receipt = CommitReceipt::new(receipt);
         receipt.resolved = resolved;
@@ -349,37 +325,7 @@ impl Handle {
     }
 
     pub fn clear_session_waiting(&self, session: TerminalId) {
-        self.admit_waiting_clear(session, None);
-    }
-
-    pub(super) fn commit_waiting_clear(
-        &self,
-        session: TerminalId,
-    ) -> Result<CommitAcknowledgement, String> {
-        let (reply, result) = std::sync::mpsc::channel();
-        if self.admit_waiting_clear(session, Some(CommitReceipt::new(reply))) {
-            Ok(result)
-        } else {
-            Err("Waiting attention settlement has not been admitted".into())
-        }
-    }
-
-    fn admit_waiting_clear(&self, session: TerminalId, receipt: Option<CommitReceipt>) -> bool {
-        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
-        let target = Target::Session(session);
-        if pending.stopped
-            || self.0.wake.is_closed()
-            || (receipt.is_some() && pending.waiting_clear_receipts.len() >= MAX_PENDING)
-            || !pending.clear_waiting(target.clone())
-        {
-            return false;
-        }
-        if let Some(receipt) = receipt {
-            pending.waiting_clear_receipts.push((target, receipt));
-        }
-        drop(pending);
-        let _ = self.0.wake.try_send(());
-        true
+        self.change(|pending| pending.clear_waiting(Target::Session(session)));
     }
 
     pub fn retire(&self, session: TerminalId) {
@@ -1238,7 +1184,7 @@ impl JournalTestBridge {
     pub(in crate::host) fn flush_waiting_clears(&mut self) -> Result<(), String> {
         let mut pending = self.handle.0.pending.lock().unwrap();
         commit_waiting_clears(&mut self.journal, &pending.cleared_waiting, |_, _| {})?;
-        pending.finish_waiting_clears();
+        pending.cleared_waiting.clear();
         Ok(())
     }
 
@@ -1481,7 +1427,7 @@ async fn run(
             deferred = pending.deferred();
             continue;
         }
-        pending.finish_waiting_clears();
+        pending.cleared_waiting.clear();
         if let Some(current) = current_presence {
             for (client, update) in &current {
                 if settle_attention_at_shutdown(
@@ -3035,38 +2981,55 @@ mod tests {
     }
 
     #[test]
-    fn a_deferred_waiting_batch_never_loses_a_clear_behind_a_successful_receipt() {
+    fn journal_retry_preserves_direct_and_retained_waiting_settlements_across_batches() {
         let root = tempfile::tempdir().unwrap();
         let (handle, mut bridge) =
             JournalTestBridge::new(&root.path().join("attention.sqlite")).unwrap();
-        let session = TerminalId::new();
-        let mut waiting = attention_event(session, "waiting");
-        waiting.evidence.kind = Kind::Waiting;
-        let existing = bridge
+        let waiting = |session, key| {
+            let mut event = attention_event(session, key);
+            event.evidence.kind = Kind::Waiting;
+            event
+        };
+        let direct = TerminalId::new();
+        let retained = waiting(TerminalId::new(), "retained");
+        let before_direct = bridge
             .journal
-            .record(waiting.clone(), false)
+            .record(waiting(direct, "direct"), false)
             .unwrap()
             .unwrap();
-        let receipt = handle.record_resolved_waiting(waiting.clone()).unwrap();
-        let standalone = handle.commit_waiting_clear(session).unwrap();
+        let before_retained = bridge
+            .journal
+            .record(retained.clone(), false)
+            .unwrap()
+            .unwrap();
+
         let deferred = Pending {
             cleared_waiting: (0..MAX_PENDING)
                 .map(|_| Target::Session(TerminalId::new()))
                 .collect(),
             ..Pending::default()
         };
+        handle.clear_session_waiting(direct);
+        let receipt = handle.record_resolved_waiting(retained).unwrap();
         let merged = deferred.followed_by(take_pending(&handle.0));
-        assert_eq!(merged.cleared_waiting.len(), MAX_PENDING);
-        assert!(merged.committed_events.is_empty());
-        assert!(merged.waiting_clear_receipts.is_empty());
-        assert!(receipt.try_recv().unwrap().is_err());
-        assert!(standalone.try_recv().unwrap().is_err());
-        assert!(bridge.list().unwrap().contains(&existing));
+        assert_eq!(merged.cleared_waiting.len(), MAX_PENDING + 2);
+        assert_eq!(
+            receipt.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        *handle.0.pending.lock().unwrap() = merged;
 
-        let receipt = handle.record_resolved_waiting(waiting).unwrap();
         bridge.commit_next(&Preferences::default(), false).unwrap();
         receipt.try_recv().unwrap().unwrap();
-        assert!(bridge.list().unwrap()[0].acknowledged);
+        for prior in [before_direct, before_retained] {
+            assert!(
+                bridge
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .any(|notice| notice.id == prior.id && notice.acknowledged)
+            );
+        }
     }
 
     #[test]

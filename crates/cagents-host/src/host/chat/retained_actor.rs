@@ -856,12 +856,8 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         // An outcome that followed a conversation since reset republished it.
         persist_confirmed_identity(host, &target, &registry)?;
     }
-    // Drain every available execution page before requiring a standalone
-    // acknowledgement from the independently fallible attention store.
-    if !more && let Some(receipt) = admit_waiting_resolution(host, &target, None)? {
-        receipt
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "The notification journal did not confirm the waiting settlement")??;
+    if !more {
+        reconcile_waiting(host, &target, None)?;
     }
     // One bounded page per actor per pass. A detached actor can have many
     // pages without another latest-sequence edge; explicitly revisit it until
@@ -926,20 +922,17 @@ pub(in crate::host) mod drain_fence {
 /// Read the actor's latest activity under the same ownership lock that
 /// queues its resolution. A delayed retained outbox entry cannot bring
 /// back a waiting notice after that resolution.
-fn admit_waiting_resolution(
+fn reconcile_waiting(
     host: &SharedHost,
     target: &SemanticTarget,
     through: Option<u64>,
-) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
+) -> Result<bool, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if waiting_resolution(&state, target, through)? == RetainedWaiting::Resolved
-        && let Some(notifications) = &state.notifications
-    {
-        return notifications
-            .commit_waiting_clear(target.source.id)
-            .map(Some);
+    let resolved = waiting_resolution(&state, target, through)? == RetainedWaiting::Resolved;
+    if resolved && let Some(notifications) = &state.notifications {
+        notifications.clear_session_waiting(target.source.id);
     }
-    Ok(None)
+    Ok(resolved)
 }
 
 fn waiting_resolution(
@@ -1584,12 +1577,10 @@ mod startup_retryability_tests {
             );
             assert!(queue_attention(&host, &target, waiting.clone(), 5).is_err());
             assert!(!journal.waiting_clear_pending(source.id));
-            let resolution = admit_waiting_resolution(&host, &target, None).unwrap();
-            assert_eq!(resolution.is_some(), proved);
+            assert_eq!(reconcile_waiting(&host, &target, None).unwrap(), proved);
             assert_eq!(journal.waiting_clear_pending(source.id), proved);
-            if let Some(resolution) = resolution {
+            if proved {
                 journal.flush_waiting_clears().unwrap();
-                resolution.try_recv().unwrap().unwrap();
                 let existing = target
                     .notifications
                     .as_ref()
