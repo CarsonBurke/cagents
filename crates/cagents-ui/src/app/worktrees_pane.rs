@@ -379,6 +379,45 @@ mod tests {
 
         work_in(&mut app, "/elsewhere");
         assert!(app.worktrees_ui.agents().is_empty());
+
+        // A folder opened inside a repository holds its own directories.
+        let work = ProjectId::new();
+        let work_main = WorktreeId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            work,
+            RepositoryId::new(),
+            "work".into(),
+            "/work".into(),
+            vec![SidebarWorktree::from_durable(
+                work_main,
+                "/work".into(),
+                Some("main".into()),
+            )],
+            vec![],
+        ));
+        let inner = SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "scratch".into(),
+            "/work/scratch".into(),
+            vec![],
+            vec![],
+        )
+        .with_kind(crate::model::ProjectKind::Folder);
+        let inner_key = inner.folder_key().unwrap();
+        app.sidebar_model.projects.push(inner);
+        work_in(&mut app, "/work/scratch/a");
+        let agents = app.worktrees_ui.agents();
+        assert_eq!(
+            agents
+                .get(&(inner_key.project_id, inner_key.worktree_id))
+                .map(|listed| listed[0].card),
+            Some(shell),
+            "{agents:?}"
+        );
+        assert!(!agents.contains_key(&(work, work_main)));
+        work_in(&mut app, "/work/src");
+        assert_eq!(app.worktrees_ui.agents()[&(work, work_main)][0].card, shell);
     }
 
     #[test]
