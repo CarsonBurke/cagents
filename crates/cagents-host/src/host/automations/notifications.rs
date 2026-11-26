@@ -159,25 +159,33 @@ mod tests {
 
     #[test]
     fn enabling_an_automation_retires_only_earlier_attention_and_its_outbox_row() {
-        let (_directory, registry, automation, entry) = fixture();
-        let mut registry = registry.lock().unwrap();
+        let (directory, registry, automation, entry) = fixture();
+        let path = directory.path().join("attention.sqlite3");
+        let (notifications, mut journal) =
+            crate::host::notifications::JournalTestBridge::new(&path).unwrap();
+        let mut transfer = Transfer::default();
+        transfer
+            .advance(
+                &registry,
+                &notifications,
+                super::super::notification_event::build,
+            )
+            .unwrap();
+        assert_eq!(journal.pending_events().len(), 1);
+        let mut model = registry.lock().unwrap();
         let id = automation.id;
         let sequence = entry.event().sequence;
-        assert!(
-            !registry
-                .automation_attention_resolved(id, sequence)
-                .unwrap()
-        );
+        assert!(!model.automation_attention_resolved(id, sequence).unwrap());
 
-        registry
+        model
             .apply(&ModelEdit::ReopenProject {
                 repository: automation.definition.agent.target.repository.clone(),
                 name: "Fixture".into(),
                 kind: ProjectKind::Folder,
             })
             .unwrap();
-        let current = registry.automation(id).unwrap();
-        registry
+        let current = model.automation(id).unwrap();
+        model
             .set_automation_enabled(
                 id,
                 current.revision,
@@ -190,22 +198,23 @@ mod tests {
             )
             .unwrap();
 
+        assert!(model.automation_attention_resolved(id, sequence).unwrap());
         assert!(
-            registry
-                .automation_attention_resolved(id, sequence)
-                .unwrap()
-        );
-        assert!(
-            !registry
+            !model
                 .automation_attention_resolved(id, u64::try_from(i64::MAX).unwrap())
                 .unwrap()
         );
         assert!(
-            registry
+            model
                 .pending_automation_notifications(1)
                 .unwrap()
                 .is_empty()
         );
+        drop(model);
+        assert!(journal.commit_next_automation(&registry).unwrap().is_none());
+        drop(journal);
+        let (_, mut reopened) = crate::host::notifications::JournalTestBridge::new(&path).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
     }
 
     // Uses the actual composed Registry migration and project-close hook. No

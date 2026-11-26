@@ -26,6 +26,25 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())
 }
 
+pub(super) fn migrate_attention_resolution(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE automation_attention_resolution (
+             automation TEXT PRIMARY KEY REFERENCES automations(id),
+             sequence INTEGER NOT NULL CHECK(sequence > 0)
+         ) STRICT;
+         INSERT INTO automation_attention_resolution(automation,sequence)
+         SELECT automation,MAX(sequence) FROM automation_lifecycle
+         WHERE CASE WHEN json_valid(record)
+             THEN json_extract(record,'$.cause') IN ('edited','enabled','removed')
+             ELSE FALSE END
+         GROUP BY automation;
+         DELETE FROM automation_notifications
+         WHERE sequence < (SELECT sequence FROM automation_attention_resolution
+                           WHERE automation=automation_notifications.automation);",
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Immutable delivery identity and fixed metadata only. An Entry is a pending
 /// observation, never proof that the notification journal or desktop committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,10 +80,7 @@ fn actionable(cause: LifecycleCause) -> bool {
 pub(super) fn resolves_retired_attention(cause: LifecycleCause) -> bool {
     matches!(
         cause,
-        LifecycleCause::Edited
-            | LifecycleCause::Enabled
-            | LifecycleCause::Removed
-            | LifecycleCause::ReleaseRecovered
+        LifecycleCause::Edited | LifecycleCause::Enabled | LifecycleCause::Removed
     )
 }
 
@@ -73,6 +89,13 @@ pub(super) fn retire_before(
     automation: Uuid,
     sequence: i64,
 ) -> Result<(), String> {
+    // This owner watermark must outlive the bounded audit history.
+    tx.execute(
+        "INSERT INTO automation_attention_resolution(automation,sequence) VALUES(?1,?2)
+         ON CONFLICT(automation) DO UPDATE SET sequence=MAX(sequence,excluded.sequence)",
+        params![automation.to_string(), sequence],
+    )
+    .map_err(|error| error.to_string())?;
     tx.execute(
         "DELETE FROM automation_notifications WHERE automation=?1 AND sequence<?2",
         params![automation.to_string(), sequence],
@@ -341,15 +364,16 @@ impl super::Registry {
         automation: Uuid,
         sequence: u64,
     ) -> Result<bool, String> {
-        self.db.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM automation_lifecycle
+        self.db
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM automation_attention_resolution
                 WHERE automation=?1 AND sequence>?2
-                AND json_extract(record,'$.cause') IN ('edited','enabled','removed','release_recovered')
             )",
-            params![automation.to_string(), sequence],
-            |row| row.get(0),
-        ).map_err(|error| error.to_string())
+                params![automation.to_string(), sequence],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub(in crate::host) fn pending_automation_notifications(
@@ -436,6 +460,40 @@ mod tests {
             )
             .unwrap();
         (registry, directory, automation)
+    }
+
+    #[test]
+    fn attention_resolution_survives_audit_eviction_and_registry_reopen() {
+        let (mut registry, directory, automation) = fixture();
+        let tx = registry.db.transaction().unwrap();
+        automation_audit::record(&tx, &automation, LifecycleCause::Edited, None).unwrap();
+        let resolution: i64 = tx
+            .query_row(
+                "SELECT MAX(sequence) FROM automation_lifecycle WHERE automation=?1",
+                [automation.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The bounded history may eventually evict the resolution receipt.
+        tx.execute(
+            "DELETE FROM automation_lifecycle WHERE sequence=?1",
+            [resolution],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let resolution = u64::try_from(resolution).unwrap();
+        assert!(
+            registry
+                .automation_attention_resolved(automation.id, resolution - 1)
+                .unwrap()
+        );
+        assert!(
+            !registry
+                .automation_attention_resolved(automation.id, resolution)
+                .unwrap()
+        );
     }
 
     // Test-only state preparation uses the real Registry schema and real audit

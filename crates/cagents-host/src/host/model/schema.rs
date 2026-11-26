@@ -238,6 +238,10 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            32 => {
+                tx.execute_batch("DROP TABLE automation_attention_resolution;")
+                    .map_err(|error| error.to_string())?;
+            }
             31 => {
                 tx.execute_batch(
                     "DROP INDEX agent_runs_unfinished_by_agent; DROP INDEX agent_runs_by_message;",
@@ -409,6 +413,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_NINE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -430,6 +435,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         29 => &TWENTY_NINE,
         30 => &THIRTY,
         31 => &THIRTY_ONE,
+        32 => &THIRTY_TWO,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published

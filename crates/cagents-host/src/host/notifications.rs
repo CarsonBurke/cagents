@@ -630,6 +630,66 @@ fn record_attention_committed_policy(
     record_attention_committed(journal, event, suppressed, receipt)
 }
 
+fn record_broker_event(
+    journal: &mut Journal,
+    event: Event,
+    suppressed: bool,
+    receipt: Option<CommitReceipt>,
+    policy: &Preferences,
+    registry: impl FnOnce() -> Result<super::agent_execution::SharedRegistry, String>,
+) -> Result<Option<Notice>, String> {
+    if let Target::Automation { id, sequence } = event.target {
+        let current = registry().and_then(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_attention_resolved(id, sequence)
+        });
+        if !matches!(current, Ok(false)) {
+            // The management transaction may have removed the outbox row
+            // after its transfer already queued this event. Its resolution
+            // is authoritative before the journal publishes any unread edge.
+            if let Some(receipt) = receipt {
+                receipt.finish(current.clone().map(|_| ()));
+            }
+            return current.map(|_| None);
+        }
+    }
+    record_attention_committed_policy(journal, event, suppressed, receipt, policy)
+}
+
+fn restore_automation_attention(
+    journal: &mut Journal,
+    host: &Weak<HostLock>,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+) {
+    let Some(host) = host.upgrade() else {
+        return;
+    };
+    let Ok(registry) = super::agent_execution::registry(&host) else {
+        return;
+    };
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    for notice in &mut snapshot.notices {
+        if let Target::Automation { id, sequence } = notice.event.target
+            && !notice.acknowledged
+        {
+            match registry.automation_attention_resolved(id, sequence) {
+                Ok(true) => match journal.acknowledge(notice.id) {
+                    Ok(_) => {
+                        notice.acknowledged = true;
+                        withdraw_notice(withdrawals, notice);
+                    }
+                    Err(error) => snapshot.diagnostic = Some(error),
+                },
+                Ok(false) => {}
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
+    }
+}
+
 fn record_attention_committed(
     journal: &mut Journal,
     event: Event,
@@ -678,6 +738,31 @@ impl JournalTestBridge {
         policy: &Preferences,
         suppressed: bool,
     ) -> Result<Option<Notice>, String> {
+        self.commit_next_with(|journal, event, receipt| {
+            record_attention_committed_policy(journal, event, suppressed, Some(receipt), policy)
+        })
+    }
+
+    pub(in crate::host) fn commit_next_automation(
+        &mut self,
+        registry: &super::agent_execution::SharedRegistry,
+    ) -> Result<Option<Notice>, String> {
+        self.commit_next_with(|journal, event, receipt| {
+            record_broker_event(
+                journal,
+                event,
+                false,
+                Some(receipt),
+                &Preferences::default(),
+                || Ok(registry.clone()),
+            )
+        })
+    }
+
+    fn commit_next_with(
+        &mut self,
+        commit: impl FnOnce(&mut Journal, Event, CommitReceipt) -> Result<Option<Notice>, String>,
+    ) -> Result<Option<Notice>, String> {
         let next = self
             .handle
             .0
@@ -689,13 +774,7 @@ impl JournalTestBridge {
         let Some((event, receipt)) = next else {
             return Ok(None);
         };
-        record_attention_committed_policy(
-            &mut self.journal,
-            event,
-            suppressed,
-            Some(receipt),
-            policy,
-        )
+        commit(&mut self.journal, event, receipt)
     }
 
     pub(in crate::host) fn pending_events(&self) -> Vec<Event> {
@@ -765,7 +844,10 @@ async fn run(
         ..Default::default()
     };
     match store.journal() {
-        Ok(journal) => restore(journal, &policy, &mut snapshot, &mut withdrawals),
+        Ok(journal) => {
+            restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals);
+        }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
     publish(&shared, &host, snapshot.clone());
@@ -820,6 +902,7 @@ async fn run(
                 snapshot.diagnostic.clone_from(&settings_error);
             }
             restore(journal, &policy, &mut snapshot, &mut withdrawals);
+            restore_automation_attention(journal, &host, &mut snapshot, &mut withdrawals);
         }
         let journal = match store.journal() {
             Ok(journal) => journal,
@@ -981,7 +1064,10 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
-            match record_attention_committed_policy(journal, event, suppressed, receipt, &policy) {
+            match record_broker_event(journal, event, suppressed, receipt, &policy, || {
+                let host = host.upgrade().ok_or("The daemon has stopped")?;
+                super::agent_execution::registry(&host)
+            }) {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot.notices.iter().find(|old| {
