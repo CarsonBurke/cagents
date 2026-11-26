@@ -612,14 +612,27 @@ impl Shared {
     }
 }
 
-fn stopped(shared: &Weak<Shared>) -> bool {
-    shared.upgrade().is_none_or(|shared| {
-        shared
+fn settle_predecessor_reads_at_shutdown(
+    shared: &Weak<Shared>,
+    journal: &mut Journal,
+    reads: &mut BTreeMap<Uuid, TerminalId>,
+) -> bool {
+    if let Some(shared) = shared.upgrade() {
+        let mut queue = shared
             .pending
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .stopped
-    })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !queue.stopped {
+            return false;
+        }
+        reads.append(&mut queue.predecessor_reads);
+    }
+    if !reads.is_empty()
+        && let Err(error) = apply_predecessor_reads(journal, reads, &mut BTreeMap::new(), |_, _| {})
+    {
+        tracing::warn!(%error, "accepted conversation reads could not settle during shutdown");
+    }
+    true
 }
 
 fn queue_withdrawal(queue: &mut Withdrawals, id: Uuid) {
@@ -1180,6 +1193,20 @@ async fn run(
         });
         drop(core);
         if pending.stopped {
+            if !pending.predecessor_reads.is_empty() {
+                match store.journal_for_shutdown() {
+                    Ok(journal) => {
+                        settle_predecessor_reads_at_shutdown(
+                            &shared,
+                            journal,
+                            &mut pending.predecessor_reads,
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not reopen attention journal at shutdown")
+                    }
+                }
+            }
             break;
         }
         if let Some(owner) = pending.portal_owner.take()
@@ -1245,7 +1272,11 @@ async fn run(
         };
         if let Some(current) = current_presence {
             for (client, update) in &current {
-                if stopped(&shared) {
+                if settle_predecessor_reads_at_shutdown(
+                    &shared,
+                    journal,
+                    &mut pending.predecessor_reads,
+                ) {
                     return;
                 }
                 if presence.is_empty() {
@@ -1324,7 +1355,11 @@ async fn run(
             pending.events.extend(inboxes.events);
         }
         for session in pending.retired {
-            if stopped(&shared) {
+            if settle_predecessor_reads_at_shutdown(
+                &shared,
+                journal,
+                &mut pending.predecessor_reads,
+            ) {
                 return;
             }
             delivery.remove(&session);
@@ -1355,7 +1390,7 @@ async fn run(
                 }
             }
             Err(error) => {
-                deferred.read_predecessors(pending.predecessor_reads);
+                deferred.read_predecessors(pending.predecessor_reads.clone());
                 let now = Instant::now();
                 let due = predecessor_retry
                     .as_ref()
@@ -1367,7 +1402,11 @@ async fn run(
             }
         }
         for id in pending.acknowledged {
-            if stopped(&shared) {
+            if settle_predecessor_reads_at_shutdown(
+                &shared,
+                journal,
+                &mut pending.predecessor_reads,
+            ) {
                 return;
             }
             delivery.retain(|_, notice| notice.id != id);
@@ -1389,7 +1428,11 @@ async fn run(
                     .map(|(event, receipt)| (event, Some(receipt))),
             );
         for (event, receipt) in events {
-            if stopped(&shared) {
+            if settle_predecessor_reads_at_shutdown(
+                &shared,
+                journal,
+                &mut pending.predecessor_reads,
+            ) {
                 return;
             }
             let focused = presence.values().any(|window| {
@@ -1549,7 +1592,11 @@ async fn run(
                 delivery_batch(&delivery, &delivery_schedule, &withdrawals, Instant::now())
             };
             for notice in batch {
-                if stopped(&shared) {
+                if settle_predecessor_reads_at_shutdown(
+                    &shared,
+                    journal,
+                    &mut pending.predecessor_reads,
+                ) {
                     return;
                 }
                 // Portal connection and test delivery can each await. An
@@ -1604,7 +1651,11 @@ async fn run(
             // Cleanup is bounded like delivery. A desktop that stops answering
             // cannot hold daemon shutdown behind thousands of remove calls.
             for _ in 0..8 {
-                if stopped(&shared) {
+                if settle_predecessor_reads_at_shutdown(
+                    &shared,
+                    journal,
+                    &mut pending.predecessor_reads,
+                ) {
                     return;
                 }
                 if failed {
@@ -1834,6 +1885,55 @@ mod tests {
         .unwrap();
         assert!(reads.is_empty());
         assert_eq!(journal.list().unwrap(), [replacement, unrelated]);
+    }
+
+    #[test]
+    fn shutdown_settles_only_the_exact_predecessor_reads_already_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let first = TerminalId::new();
+        let second = TerminalId::new();
+        let replaced = TerminalId::new();
+        let before_first = journal
+            .record(attention_event(first, "old:first"), false)
+            .unwrap()
+            .unwrap();
+        let before_second = journal
+            .record(attention_event(second, "old:second"), false)
+            .unwrap()
+            .unwrap();
+        let old = journal
+            .record(attention_event(replaced, "old:replaced"), false)
+            .unwrap()
+            .unwrap();
+        let later = journal
+            .record(attention_event(replaced, "new:replaced"), false)
+            .unwrap()
+            .unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        handle.change(|pending| {
+            pending.read_predecessors([(before_first.id, first), (old.id, replaced)].into())
+        });
+        let mut in_flight = take_pending(&shared);
+        handle.change(|pending| pending.read_predecessors([(before_second.id, second)].into()));
+        shared.pending.lock().unwrap().stopped = true;
+        assert!(settle_predecessor_reads_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &mut in_flight.predecessor_reads
+        ));
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        let notices = journal.list().unwrap();
+        assert!(notices.contains(&later));
+        assert!(
+            notices
+                .iter()
+                .filter(|notice| notice.id == before_first.id || notice.id == before_second.id)
+                .all(|notice| notice.acknowledged)
+        );
     }
 
     #[test]
