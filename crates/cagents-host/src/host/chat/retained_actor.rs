@@ -1593,7 +1593,10 @@ mod startup_retryability_tests {
                 let receipt = queue_attention(&host, &target, waiting, 1)
                     .unwrap()
                     .unwrap();
-                assert_eq!(receipt.try_recv(), Err(mpsc::TryRecvError::Empty));
+                assert_eq!(
+                    receipt.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                );
                 assert!(!journal.list().unwrap()[0].acknowledged);
                 journal
                     .commit_next(&crate::notifications::Preferences::default(), false)
