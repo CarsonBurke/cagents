@@ -1981,7 +1981,7 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
                 current,
             } = wake
             {
-                let _ = send.send((source, messages, current));
+                let _ = send.send((*source, messages, current));
             }
         },
     )

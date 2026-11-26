@@ -396,7 +396,7 @@ mod tests {
                 current,
             } = wake
             {
-                let _ = send.try_send((source, messages, current));
+                let _ = send.try_send((*source, messages, current));
             }
         })
         .unwrap();

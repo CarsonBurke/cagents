@@ -278,7 +278,7 @@ pub enum Wake {
     /// The authenticated source and whole queue of an attached or archived
     /// ended provider, independent of the current presentation descriptor.
     CompletedQueue {
-        source: Session,
+        source: Box<Session>,
         messages: Vec<super::QueuedMessage>,
         current: bool,
     },
@@ -386,7 +386,7 @@ impl CompletedQueueRead {
             .finish()
             .map_err(|_| "Invalid completed chat queue payload")?;
         wake(Wake::CompletedQueue {
-            source: self.notice.source,
+            source: Box::new(self.notice.source),
             messages: queue.messages,
             current: self.notice.current,
         });
