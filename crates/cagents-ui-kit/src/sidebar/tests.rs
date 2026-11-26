@@ -13165,11 +13165,21 @@ fn a_clean_worktree_opens_on_its_branch_once() {
     // A view saved before the choice was recorded kept a tab other than
     // Changes only because it was chosen.
     let mut saved = state.saved_view();
-    saved.changes_tab_settled = false;
+    saved.changes_tab_chosen = false;
     let mut upgraded = panel_state(&model);
     upgraded.restore_view(saved);
     upgraded.settle_changes_tab(&clean);
     assert_eq!(upgraded.changes_tab(), ChangesTab::History);
+
+    // A tab picked from a read is not kept: a worktree opened with changes
+    // and committed since opens on Branch next time.
+    let mut picked = panel_state(&model);
+    picked.settle_changes_tab(&dirty);
+    assert_eq!(picked.changes_tab(), ChangesTab::Changes);
+    let mut next = panel_state(&model);
+    next.restore_view(picked.saved_view());
+    next.settle_changes_tab(&clean);
+    assert_eq!(next.changes_tab(), ChangesTab::Branch);
 }
 
 /// With nothing to commit there is no commit box, and no tree/flat switch
@@ -13216,6 +13226,21 @@ fn a_clean_worktree_draws_no_commit_box() {
         names.iter().any(|name| name == "Commit subject"),
         "{names:?}"
     );
+    assert!(
+        !names.iter().any(|name| name == "Amend last commit"),
+        "{names:?}"
+    );
+    // Once the last commit is pushed, amending it would split the branch
+    // from its upstream, so it isn't offered.
+    let mut pushed = clean.clone();
+    pushed.status.tracking = TrackingState::Compared {
+        upstream: "refs/remotes/origin/main".into(),
+        ahead: 0,
+        behind: 0,
+    };
+    let mut pushed_model = panel_model();
+    pushed_model.source_control = Some(SourceControlModel::ready(main_key(), &pushed));
+    let names = accessible_names(&renderer, git_panel(&pushed_model, &state, 380.0, false));
     assert!(
         !names.iter().any(|name| name == "Amend last commit"),
         "{names:?}"

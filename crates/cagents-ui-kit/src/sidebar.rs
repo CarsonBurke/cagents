@@ -3132,11 +3132,12 @@ pub struct SidebarView {
     change_list_mode: FileListMode,
     #[serde(default, deserialize_with = "known_or_default")]
     changes_tab: ChangesTab,
-    /// Whether `changes_tab` was settled for the worktree it was saved on,
-    /// by the user or by its first read; see
+    /// Whether the user chose `changes_tab` for the worktree it was saved
+    /// on. A tab picked from a read is not saved, so the next start picks
+    /// again from what the worktree holds then; see
     /// [`SidebarState::settle_changes_tab`].
     #[serde(default)]
-    changes_tab_settled: bool,
+    changes_tab_chosen: bool,
 }
 
 impl SidebarView {
@@ -3150,7 +3151,7 @@ impl SidebarView {
             collapsed_change_directories: Vec::new(),
             toggled_sections: BTreeSet::new(),
             changes_tab: ChangesTab::default(),
-            changes_tab_settled: false,
+            changes_tab_chosen: false,
             ..self
         }
     }
@@ -3302,6 +3303,9 @@ pub struct SidebarState {
     /// the user, or picked once from its first read. Until then the first
     /// read picks it; see [`Self::settle_changes_tab`].
     changes_tab_settled: bool,
+    /// Whether the user chose `changes_tab`, which is the only pick a saved
+    /// view keeps.
+    changes_tab_chosen: bool,
     worktree_sort: crate::settings::WorktreeSort,
     hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -3568,8 +3572,12 @@ impl SidebarState {
             files_query: self.files_query.clone(),
             files_filter_open: self.files_filter_open,
             change_list_mode: self.change_list_mode,
-            changes_tab: self.changes_tab,
-            changes_tab_settled: self.changes_tab_settled,
+            changes_tab: if self.changes_tab_chosen {
+                self.changes_tab
+            } else {
+                ChangesTab::default()
+            },
+            changes_tab_chosen: self.changes_tab_chosen,
         }
     }
 
@@ -3590,8 +3598,9 @@ impl SidebarState {
         self.changes_tab = view.changes_tab;
         // A view saved before this was recorded kept any tab but Changes
         // only because someone chose it.
-        self.changes_tab_settled =
-            view.changes_tab_settled || view.changes_tab != ChangesTab::default();
+        self.changes_tab_chosen =
+            view.changes_tab_chosen || view.changes_tab != ChangesTab::default();
+        self.changes_tab_settled = self.changes_tab_chosen;
         self.collapsed_projects = view.collapsed_projects;
         self.expanded_worktree_groups = view.expanded_worktree_groups;
         self.selection = view.selection;
@@ -4754,6 +4763,7 @@ impl SidebarState {
         self.toggled_sections.clear();
         self.changes_tab = ChangesTab::default();
         self.changes_tab_settled = false;
+        self.changes_tab_chosen = false;
         self.publish = None;
         self.discard = None;
         self.panel_selection = None;
@@ -4877,6 +4887,7 @@ impl SidebarState {
             SidebarAction::SetChangesTab { tab, .. } => {
                 self.changes_tab = *tab;
                 self.changes_tab_settled = true;
+                self.changes_tab_chosen = true;
             }
             SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
@@ -11285,8 +11296,12 @@ fn changes_section<'a>(
             },
         ));
         // With nothing to commit the commit box is gone, but the last commit
-        // can still be reworded: amending brings the box back for it.
-        if source.head_oid.is_some() && !offers_commit(state, source) {
+        // can still be reworded: amending brings the box back for it. Not
+        // once it is pushed, where amending would split the branch from its
+        // upstream so that a plain push could no longer send it.
+        let pushed = source.upstream.is_some()
+            && matches!(source.tracking, TrackingState::Compared { ahead: 0, .. });
+        if source.head_oid.is_some() && !pushed && !offers_commit(state, source) {
             column = column.push(
                 crate::ui_controls::button::secondary("Amend last commit")
                     .icon(Icon::Commit.handle())
