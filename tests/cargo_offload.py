@@ -2690,8 +2690,10 @@ class RemoteRun(unittest.TestCase):
         with self.slots() as base:
             self.hold(base, 0, None)
             lease, lines = self.lease(base)
-            self.assertEqual(json.loads(lines.next(HANG_GUARD).removeprefix("slot ")),
-                             {"index": 1, "path": os.path.realpath(Path(base, "slot-1"))})
+            leased = json.loads(lines.next(HANG_GUARD).removeprefix("slot "))
+            self.assertEqual(leased["index"], 1)
+            self.assertEqual(leased["path"], os.path.realpath(Path(base, "slot-1")))
+            self.assertRegex(leased["generation"], r"^[0-9a-f]{32}$")
 
     def test_no_further_slot_is_made_without_disk_for_one_or_beyond_the_most(self):
         for slots, slot_disk in ((2, 2**62), (1, 0)):
