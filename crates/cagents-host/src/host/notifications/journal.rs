@@ -242,18 +242,21 @@ impl Journal {
             .collect()
     }
 
-    pub fn automation_notice_sequence(&mut self, automation: Uuid) -> Result<Option<u64>, String> {
+    pub fn automation_notice(&mut self, automation: Uuid) -> Result<Option<(Uuid, u64)>, String> {
         let serialized = notices::table
             .find(format!("automation:{automation}"))
-            .select(notices::event)
-            .first::<String>(&mut self.0)
+            .select((notices::id, notices::event))
+            .first::<(String, String)>(&mut self.0)
             .optional()
             .map_err(|error| error.to_string())?;
         serialized
-            .map(|serialized| {
+            .map(|(notice, serialized)| {
                 let event = Event::from_journal(&serialized).map_err(|error| error.to_string())?;
                 match event.target {
-                    Target::Automation { id, sequence } if id == automation => Ok(sequence),
+                    Target::Automation { id, sequence } if id == automation => {
+                        let notice = notice.parse::<Uuid>().map_err(|error| error.to_string())?;
+                        Ok((notice, sequence))
+                    }
                     _ => Err("Notification journal contains the wrong automation identity".into()),
                 }
             })

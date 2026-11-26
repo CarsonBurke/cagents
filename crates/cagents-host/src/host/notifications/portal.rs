@@ -26,8 +26,8 @@ const PORTAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// it exited.
 pub(super) type PortalOwner = Option<zbus::names::OwnedUniqueName>;
 /// The application action a notification's default action invokes, with the
-/// stable conversation-group identity as its target. The broker resolves it to
-/// the current journal notice. Notification backends deliver `app.` actions
+/// target used by the broker to open the notice. Automation actions identify
+/// their exact lifecycle receipt. Notification backends deliver `app.` actions
 /// to the application's `org.freedesktop.Application` object together with the
 /// activation token the notification server minted for the click; without that
 /// token a Wayland compositor refuses to raise the window.
@@ -104,11 +104,15 @@ fn platform_activation_token(
 }
 
 /// The notice an `ActivateAction` call opens. Its first parameter is the
-/// target the notification declared: its stable conversation-group identity.
+/// target the notification declared.
 fn activated_notice(action: &str, parameter: &[OwnedValue]) -> Option<Uuid> {
     if action != OPEN_ACTION {
         return None;
     }
+    notice_parameter(parameter)
+}
+
+fn notice_parameter(parameter: &[OwnedValue]) -> Option<Uuid> {
     let target = match &**parameter.first()? {
         // The target is a variant inside `av`; tolerate one extra boxing.
         ashpd::zvariant::Value::Value(boxed) => &**boxed,
@@ -378,7 +382,9 @@ pub(super) async fn connect(
                 if !signal_opens_notice(action.name()) {
                     continue;
                 }
-                let Ok(id) = Uuid::parse_str(action.id()) else {
+                let Some(id) = notice_parameter(action.parameter())
+                    .or_else(|| Uuid::parse_str(action.id()).ok())
+                else {
                     continue;
                 };
                 // Portal v2 backends append platform data after the target.
@@ -406,6 +412,15 @@ pub(super) async fn send(
     // Content reaching this point has already passed broker privacy policy.
     let message = crate::notifications::presentation::message(&notice.event, true);
     let id = batching::desktop_id(&notice.event.target).to_string();
+    let exact = notice.id.to_string();
+    let target = if matches!(
+        notice.event.target,
+        crate::notifications::Target::Automation { .. }
+    ) {
+        &exact
+    } else {
+        &id
+    };
     let action = if application_action {
         format!("app.{OPEN_ACTION}")
     } else {
@@ -418,9 +433,9 @@ pub(super) async fn send(
         } else {
             Priority::Normal
         })
-        .button(Button::new(message.action, action.as_str()).target(id.as_str()))
+        .button(Button::new(message.action, action.as_str()).target(target.as_str()))
         .default_action(action.as_str())
-        .default_action_target(id.as_str());
+        .default_action_target(target.as_str());
     tokio::time::timeout(
         PORTAL_TIMEOUT,
         portal.proxy.add_notification(&id, notification),

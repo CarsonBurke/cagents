@@ -584,10 +584,11 @@ fn revoke_previews(snapshot: &mut Snapshot, withdrawals: &mut Withdrawals) {
 }
 
 fn action_notice(snapshot: &Snapshot, id: Uuid) -> Option<&Notice> {
-    snapshot
-        .notices
-        .iter()
-        .find(|notice| notice.id == id || batching::desktop_id(&notice.event.target) == id)
+    snapshot.notices.iter().find(|notice| {
+        notice.id == id
+            || (!matches!(notice.event.target, Target::Automation { .. })
+                && batching::desktop_id(&notice.event.target) == id)
+    })
 }
 
 fn delivery_batch(
@@ -673,12 +674,13 @@ fn protect_automation_toast(
     target: &Target,
     resolved: impl FnOnce(u64) -> Result<bool, String>,
 ) -> Result<(), String> {
-    if let Some(previous) = journal.automation_notice_sequence(id)?
-        && resolved(previous)?
+    if let Some((previous, sequence)) = journal.automation_notice(id)?
+        && resolved(sequence)?
     {
         // Commit the stable desktop cleanup before the new event can overwrite
         // the only journal row containing the old notice's sequence.
         journal.remember_group_withdrawal(batching::desktop_id(target))?;
+        journal.remember_group_withdrawal(previous)?;
     }
     Ok(())
 }
@@ -1612,8 +1614,14 @@ mod tests {
             &mut withdrawals,
         );
         assert_eq!(snapshot.notices, [replacement]);
-        assert_eq!(withdrawals.pop_first().unwrap().id(), group);
-        journal.finish_group_withdrawal(group).unwrap();
+        assert!(action_notice(&snapshot, group).is_none());
+        assert!(action_notice(&snapshot, previous.id).is_none());
+        let mut removed = BTreeSet::new();
+        while let Some(entry) = withdrawals.pop_first() {
+            removed.insert(entry.id());
+            journal.finish_group_withdrawal(entry.id()).unwrap();
+        }
+        assert_eq!(removed, [group, previous.id].into());
         assert!(journal.group_withdrawals().unwrap().is_empty());
     }
 
@@ -2324,12 +2332,9 @@ mod tests {
             let serialized = serde_json::to_string(&snapshot).unwrap();
             assert_eq!(serialized.contains("PRIVATE_AUTOMATION_TITLE"), previews);
             assert_eq!(serialized.contains("PRIVATE_AUTOMATION_REASON"), previews);
-            assert_eq!(
-                action_notice(&snapshot, batching::desktop_id(&old.event.target))
-                    .unwrap()
-                    .event
-                    .target,
-                current.event.target
+            assert!(
+                action_notice(&snapshot, batching::desktop_id(&old.event.target)).is_none(),
+                "a group-only click cannot select an automation lifecycle receipt"
             );
             assert!(
                 action_notice(&snapshot, old.id).is_none(),
