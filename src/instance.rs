@@ -2309,6 +2309,7 @@ impl UiUpdateGuard {
 
     #[cfg(all(target_os = "macos", feature = "host"))]
     pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
+        let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
         let windows = self.verified_windows()?;
         for slot in slots {
             let lease = self.runtime.join(slot_lock_name(slot));
@@ -2316,8 +2317,7 @@ impl UiUpdateGuard {
                 .iter()
                 .find(|window| window.lease_path == lease && window.executable == image)
                 .ok_or_else(|| io::Error::other("A saved window has no matching restored owner"))?;
-            let mut stream =
-                crate::descriptor::connect_settled(self.runtime.join(slot_socket_name(slot)))?;
+            let mut stream = connect_cutover_window(&self.runtime, slot, deadline)?;
             let peer = crate::pinned_process::peer_credentials(&stream)?;
             if peer.uid != current_uid() || peer.pid != owner.pid {
                 return Err(io::Error::other(
@@ -2325,7 +2325,11 @@ impl UiUpdateGuard {
                 ));
             }
             stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-            stream.set_read_timeout(Some(CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT))?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| io::Error::other("Saved windows are still reopening"))?;
+            stream.set_read_timeout(Some(remaining))?;
             writeln!(&mut stream, "update-ready")?;
             if read_capped_line(&stream)? != "ready" || !owner.still_owns_lease()? {
                 return Err(io::Error::other("A saved window is still reopening"));
@@ -2371,6 +2375,39 @@ impl UiUpdateGuard {
         }
         self.lock.take();
         Ok(())
+    }
+}
+
+/// A naturally opened window can take its lease before binding activation.
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::Result<UnixStream> {
+    use std::os::fd::AsFd;
+
+    let path = runtime.join(slot_socket_name(slot));
+    if let Ok(stream) = crate::descriptor::connect_settled(&path) {
+        return Ok(stream);
+    }
+    let directory = File::open(runtime)?;
+    let watches = crate::fs_watch::FileWatches::shared()
+        .ok_or_else(|| io::Error::other("Cannot follow saved window startup"))?;
+    loop {
+        let watch = watches
+            .watch(&directory)
+            .ok_or_else(|| io::Error::other("Cannot follow saved window startup"))?;
+        match crate::descriptor::connect_settled(&path) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if !crate::descriptor::wait_for_activity(watch.as_fd(), libc::POLLIN, Some(deadline))? {
+            return Err(io::Error::other(
+                "A saved window is still opening its activation socket",
+            ));
+        }
     }
 }
 
@@ -3196,18 +3233,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
         match read_activation_request(&stream) {
             Ok(ActivationRequest::Shutdown) => break,
             #[cfg(target_os = "macos")]
-            Ok(ActivationRequest::UpdateReady) => {
-                let (ready, changed) = &UI_RESTORATION_READY;
-                let readiness = ready
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let (readiness, _) = changed
-                    .wait_timeout_while(readiness, CUTOVER_READY_TIMEOUT, |ready| !*ready)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let response = if *readiness { "ready" } else { "pending" };
-                drop(readiness);
-                let _ = writeln!(&stream, "{response}");
-            }
+            Ok(ActivationRequest::UpdateReady) => report_cutover_ready(stream),
             Ok(ActivationRequest::Activate(token)) => {
                 // The acknowledgement is the launcher's proof that a window
                 // will be raised: `cagents ui` reports "already running" and
@@ -3262,6 +3288,42 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 let _ = writeln!(&stream, "error");
             }
         }
+    }
+}
+
+#[cfg(all(feature = "ui", target_os = "macos"))]
+fn report_cutover_ready(mut stream: UnixStream) {
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    let (ready, changed) = &UI_RESTORATION_READY;
+    if *ready
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        let _ = writeln!(stream, "ready");
+        return;
+    }
+    if WAITING.swap(true, Ordering::AcqRel) {
+        let _ = writeln!(stream, "pending");
+        return;
+    }
+    // Leave activation, close, and focus requests responsive during startup.
+    if std::thread::Builder::new()
+        .name("cutover-window-ready".into())
+        .spawn(move || {
+            let readiness = ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (readiness, _) = changed
+                .wait_timeout_while(readiness, CUTOVER_READY_TIMEOUT, |ready| !*ready)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let response = if *readiness { "ready" } else { "pending" };
+            drop(readiness);
+            let _ = writeln!(stream, "{response}");
+            WAITING.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        WAITING.store(false, Ordering::Release);
     }
 }
 

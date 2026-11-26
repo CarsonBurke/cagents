@@ -286,9 +286,15 @@ fn finish_windows(
     if !intent.windows.is_empty() {
         let mut guard = crate::instance::UiUpdateGuard::acquire_for_cutover()?;
         guard.set_recovery_restore_only();
-        guard.relaunch_missing_windows(&intent.windows, &ui)?;
-        crate::instance::UiUpdateGuard::acquire_for_cutover()?
-            .verify_cutover_windows(&intent.windows, &ui)?;
+        let launched = guard.relaunch_missing_windows(&intent.windows, &ui);
+        // A natural launch can legitimately win a slot after we release the
+        // fence. An authenticated Ready owner settles that slot either way.
+        let verified = crate::instance::UiUpdateGuard::acquire_for_cutover()
+            .and_then(|guard| guard.verify_cutover_windows(&intent.windows, &ui));
+        if verified.is_err() {
+            launched?;
+            verified?;
+        }
     }
     intent.verify_serving(layout)
 }
