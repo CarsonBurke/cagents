@@ -15805,6 +15805,46 @@ fn large_managed_attribution_uses_private_settings_and_explicit_files_stay_in_pl
 }
 
 #[test]
+fn attribution_launch_scans_exact_native_option_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let launch = Launch {
+        provider: Provider::Claude,
+        session_id: None,
+        draft_model: None,
+        recipe: crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: [
+                "--system-prompt=--settings",
+                "--append-system-prompt=--setting-sources",
+                "--tools=--settings",
+                "--add-dir",
+                "/first",
+                "/second",
+                "--setting-sources=project",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            working_directory: directory.path().to_path_buf(),
+            environment: Default::default(),
+            unset_environment: ["CLAUDE_CODE_PERMISSION_MODE".to_owned()].into(),
+        },
+    };
+    let mut argv = arguments(&launch).unwrap();
+    let mut expected = argv.clone();
+    expected.extend(["--settings".into(), r#"{"attribution":false}"#.into()]);
+    apply_spawn_attribution_with(
+        &mut argv,
+        &launch.recipe,
+        || Ok(directory.path().to_path_buf()),
+        |_, sources| {
+            assert_eq!(sources, "project");
+            Some(json!(false))
+        },
+    );
+    assert_eq!(argv, expected);
+}
+
+#[test]
 fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
     let directory = tempfile::tempdir().unwrap();
     let homes = account::home::Homes::at(directory.path().join("accounts"));

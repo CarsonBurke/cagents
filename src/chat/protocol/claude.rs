@@ -507,17 +507,27 @@ fn apply_spawn_attribution_with(
     directory: impl FnOnce() -> std::io::Result<PathBuf>,
     attribution: impl FnOnce(&crate::model::LaunchRecipe, &str) -> Option<Value>,
 ) {
+    use crate::chat::fresh::{ArgumentArity, claude_arity};
+
     let mut settings = None;
     let mut sources = "user,project,local";
-    let mut args = arguments.iter().enumerate();
-    while let Some((index, flag)) = args.next() {
-        if crate::agent::Provider::Claude.is_value_option(flag) {
-            let Some((_, value)) = args.next() else { break };
-            match flag.as_str() {
-                "--settings" => settings = Some(index + 1),
-                "--setting-sources" => sources = value,
-                _ => {}
+    let mut args = arguments.iter().enumerate().peekable();
+    while let Some((_, flag)) = args.next() {
+        match claude_arity(flag) {
+            Some(ArgumentArity::Value) => {
+                let Some((index, value)) = args.next() else {
+                    break;
+                };
+                match flag.as_str() {
+                    "--settings" => settings = Some(index),
+                    "--setting-sources" => sources = value,
+                    _ => {}
+                }
             }
+            Some(ArgumentArity::Values) => {
+                while args.next_if(|(_, value)| !value.starts_with('-')).is_some() {}
+            }
+            _ => {}
         }
     }
     if let Some(value) = launch_attribution_argument(
@@ -611,10 +621,11 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
         } else if crate::chat::fresh::claude_arity(flag)
             == Some(crate::chat::fresh::ArgumentArity::Values)
         {
-            result.push(flag.into());
-            if let Some(value) = inline {
-                result.push(value.into());
+            if inline.is_some() {
+                // Keep variadic inline values distinct from subsequent options.
+                result.push(arg.clone());
             } else {
+                result.push(flag.into());
                 let start = result.len();
                 while args.peek().is_some_and(|value| !value.starts_with('-')) {
                     result.push(args.next().unwrap().clone());
@@ -10830,11 +10841,7 @@ mod fresh_recipe_constructor_tests {
                         .windows(2)
                         .any(|pair| pair == ["--system-prompt", system])
                 );
-                assert!(
-                    spec.arguments
-                        .windows(2)
-                        .any(|pair| pair == ["--tools", tool])
-                );
+                assert!(spec.arguments.contains(&format!("--tools={tool}")));
                 let generated: Vec<_> = spec
                     .arguments
                     .iter()
