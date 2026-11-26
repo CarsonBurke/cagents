@@ -26898,44 +26898,136 @@ fn refused_direct_queue_recovery_is_committed_before_an_immediate_close() {
 }
 
 #[test]
-fn an_exact_completed_queue_waits_for_ready_and_replaces_its_display_preview() {
+fn early_completed_queues_recover_in_delivery_order() {
+    for refused in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+        let source = chat_runtime(&app, card).session.clone();
+        let mut anonymous_source = source.clone();
+        anonymous_source.launch.session_id = None;
+        app.cards.remove(&card);
+        app.chat_ui
+            .drafts
+            .insert(card, "independently typed".into());
+
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            &directory.path().join("early-receipts.sqlite3"),
+            crate::model::BootId::new("early-completed-queue-fixture"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        drop(app.start_chat(card, source.clone(), chat::Intent::Restore, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        let archived = provider_message("archived-1", "The previous actor's queued message");
+        let current = provider_message("current-1", "The current actor's queued message");
+        let previous_key = completed_queue_key(source.id, std::slice::from_ref(&archived)).unwrap();
+        let current_key = completed_queue_key(source.id, std::slice::from_ref(&current)).unwrap();
+        let mut preview = current.clone();
+        preview.text = "The current actor…".into();
+        preview.editable = false;
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.queued_messages = vec![preview.clone()];
+        handle.publish_snapshot_for_test(snapshot.clone());
+
+        // A duplicated old notice and an incomplete preview do not take the
+        // second slot from the later exact completion of the replacement.
+        for (source, message, current) in [
+            (anonymous_source.clone(), archived.clone(), false),
+            (anonymous_source, archived, false),
+            (source.clone(), preview, true),
+            (source.clone(), current, true),
+        ] {
+            drop(app.handle_chat_ui(Action::Wake(
+                target,
+                Wake::CompletedQueue {
+                    source: Box::new(source),
+                    messages: vec![message],
+                    current,
+                },
+            )));
+        }
+        assert_eq!(app.chat_ui.completed_queues[&card].receipts.len(), 2);
+        assert!(
+            app.chat_ui.completed_queues[&card].receipts[0]
+                .source
+                .launch
+                .session_id
+                .is_none()
+        );
+        assert!(!app.returned_chat_queue(card, previous_key));
+        assert!(!app.returned_chat_queue(card, current_key));
+        if refused {
+            answer_start(
+                &mut app,
+                target,
+                Err(chat::StartFailure::retry("The attachment was refused")),
+            );
+        } else {
+            answer_start(&mut app, target, Ok(handle.clone()));
+            snapshot.generation += 1;
+            snapshot.exited = true;
+            handle.publish_snapshot_for_test(snapshot);
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            assert!(chat_runtime(&app, card).complete_exit_queue);
+        }
+        assert!(!app.chat_ui.completed_queues.contains_key(&card));
+
+        let saved = app.persistent_workspace();
+        assert_eq!(
+            saved.chat_drafts[&card].trim(),
+            "The previous actor's queued message\nThe current actor's queued message\nindependently typed",
+        );
+        assert!(saved.chat_waiting_messages[&card].messages.is_empty());
+        assert_eq!(saved.returned_chat_queues[&card][&previous_key], Some(card));
+        assert_eq!(saved.returned_chat_queues[&card][&current_key], Some(card));
+        let writer = app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let store = writer.operation_store();
+        assert!(store.has_returned_chat_queue(card, previous_key).unwrap());
+        assert!(store.has_returned_chat_queue(card, current_key).unwrap());
+    }
+}
+
+#[test]
+fn recovering_a_prior_archive_leaves_the_live_replacements_queue_waiting() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
     let source = chat_runtime(&app, card).session.clone();
-    app.cards.remove(&card);
-    app.chat_ui
-        .drafts
-        .insert(card, "independently typed".into());
-
-    drop(app.start_chat(card, source.clone(), chat::Intent::Restore, None, false));
-    let target = chat_runtime_attempt(&app, card);
-    let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
-    let message = provider_message("queued-1", "Then summarize the complete result");
-    let key = completed_queue_key(source.id, std::slice::from_ref(&message)).unwrap();
-    let mut preview = message.clone();
-    preview.text = "Then summarize…".into();
-    preview.editable = false;
+    let handle = chat_runtime(&app, card).handle().unwrap().clone();
+    let held = provider_message("replacement-1", "The live actor is still holding this");
     let mut snapshot = (*handle.snapshot()).clone();
-    snapshot.queued_messages = vec![preview];
-    handle.publish_snapshot_for_test(snapshot.clone());
+    snapshot.generation += 1;
+    snapshot.queued_messages = vec![held.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+
+    let previous = provider_message("archived-1", "The old queue");
+    let key = completed_queue_key(source.id, std::slice::from_ref(&previous)).unwrap();
+    let mut foreign = source.clone();
+    foreign.proof.as_mut().unwrap().host_incarnation = "different-daemon".into();
     drop(app.handle_chat_ui(Action::Wake(
         target,
-        Wake::CompletedQueue(source.id, vec![message]),
+        Wake::CompletedQueue {
+            source: Box::new(foreign),
+            messages: vec![previous.clone()],
+            current: true,
+        },
     )));
     assert!(!app.returned_chat_queue(card, key));
-    answer_start(&mut app, target, Ok(handle.clone()));
 
-    snapshot.generation += 1;
-    snapshot.exited = true;
-    handle.publish_snapshot_for_test(snapshot);
-    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
-    let saved = app.persistent_workspace();
-    assert_eq!(
-        saved.chat_drafts[&card].trim(),
-        "Then summarize the complete result\nindependently typed",
-    );
-    assert!(saved.chat_waiting_messages[&card].messages.is_empty());
-    assert_eq!(saved.returned_chat_queues[&card][&key], Some(card));
+    drop(app.handle_chat_ui(Action::Wake(
+        target,
+        Wake::CompletedQueue {
+            source: Box::new(source),
+            messages: vec![previous],
+            current: false,
+        },
+    )));
+    assert!(app.returned_chat_queue(card, key));
+    assert!(!chat_runtime(&app, card).complete_exit_queue);
+    assert_eq!(app.chat_waiting_to_save(card).messages, [held]);
 }
 
 #[test]
