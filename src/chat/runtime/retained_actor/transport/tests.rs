@@ -1901,6 +1901,35 @@ fn resident_naming_and_notification_projections_do_not_need_a_helper_socket() {
     assert!(!actor.0.socket.exists());
 }
 #[test]
+fn a_wait_appended_after_active_metadata_was_sampled_is_still_open() {
+    use super::super::journal::WaitingAttention;
+
+    let fixture = resident_fixture();
+    let open = Update::Attention(crate::notifications::Evidence {
+        key: "wait-after-copy".into(),
+        kind: crate::notifications::Kind::Waiting,
+    });
+    let first = fixture
+        .server
+        .resident_after_copy(|| {
+            let mut journal = fixture.server.journal.lock().unwrap();
+            journal.append(&open, None).unwrap();
+        })
+        .unwrap();
+    assert!(!first.activity.waits_on_user());
+    assert_eq!(
+        first.waiting_attention,
+        Some(WaitingAttention::Open(first.outbox_latest))
+    );
+    let sequence = first.outbox_latest;
+    let proxy = RemoteActor::fixture();
+    *proxy.0.state.lock().unwrap() = Arc::new(first);
+    assert_eq!(
+        proxy.waiting_resolution(Some(sequence)),
+        Some(crate::chat::runtime::RetainedWaiting::Current)
+    );
+}
+#[test]
 fn concurrent_ready_publication_cannot_be_hidden_by_a_new_revision_on_old_metadata() {
     let mut fixture = resident_fixture();
     fixture.server.actor.0.state.lock().unwrap().ready = false;

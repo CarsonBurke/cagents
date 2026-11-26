@@ -36,6 +36,12 @@ const MAX_FINISHED_ENTRY_BYTES: usize = 6
     + 4096;
 const OVERFLOW_REASON: &str = "Claude holder outcome journal overflowed before the daemon committed its updates; the in-flight run outcome is unconfirmed";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum WaitingAttention {
+    Open(u64),
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {
     pub sequence: u64,
@@ -105,7 +111,7 @@ pub(super) struct Journal {
     unknown_inputs: std::collections::BTreeSet<u64>,
     outcome_ack: u64,
     outcome_latest: u64,
-    pub latest_waiting: Option<u64>,
+    pub(super) waiting_attention: Option<WaitingAttention>,
     published_sources: Vec<crate::chat::Session>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
@@ -170,7 +176,7 @@ impl Journal {
             unknown_inputs: Default::default(),
             outcome_ack: 0,
             outcome_latest: 0,
-            latest_waiting: None,
+            waiting_attention: None,
             published_sources: Vec::new(),
         })
     }
@@ -283,6 +289,15 @@ impl Journal {
         update: &Update,
         confirmed_session: Option<&str>,
     ) -> Result<(), String> {
+        if matches!(
+            update,
+            Update::Activity {
+                state: crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle,
+                ..
+            }
+        ) {
+            self.waiting_attention = Some(WaitingAttention::Resolved);
+        }
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
@@ -373,7 +388,7 @@ impl Journal {
             Update::Attention(evidence) | Update::AttentionContext { evidence, .. }
                 if evidence.kind == crate::notifications::Kind::Waiting
         ) {
-            self.latest_waiting = Some(sequence);
+            self.waiting_attention = Some(WaitingAttention::Open(sequence));
         }
         if let Update::Execution {
             run,

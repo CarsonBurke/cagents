@@ -234,7 +234,7 @@ pub struct Resident {
     pub outbox_ack: u64,
     pub outbox_latest: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    latest_waiting: Option<u64>,
+    waiting_attention: Option<super::journal::WaitingAttention>,
     changed: u64,
 }
 impl Resident {
@@ -581,7 +581,7 @@ impl RemoteActor {
             retained_runs: Vec::new(),
             outbox_ack: 0,
             outbox_latest: 0,
-            latest_waiting: None,
+            waiting_attention: None,
             changed: 1,
         };
         Self(Arc::new(Remote {
@@ -740,7 +740,7 @@ impl RemoteActor {
             state.waiting = true;
             state.idle = false;
             state.outbox_latest = 4;
-            state.latest_waiting = Some(3);
+            state.waiting_attention = Some(super::journal::WaitingAttention::Open(3));
         }
         actor
     }
@@ -762,22 +762,18 @@ impl RemoteActor {
                 RetainedWaiting::Resolved
             });
         }
-        if matches!(
-            state.activity,
-            crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle
-        ) {
-            return Some(RetainedWaiting::Resolved);
-        }
-        Some(
-            if through
-                .zip(state.latest_waiting)
-                .is_some_and(|(sequence, current)| sequence < current)
+        use super::journal::WaitingAttention;
+        // Both this disposition and the outbox clock came from the same
+        // journal lock. The earlier activity projection may predate them.
+        Some(match state.waiting_attention {
+            Some(WaitingAttention::Resolved) => RetainedWaiting::Resolved,
+            Some(WaitingAttention::Open(current))
+                if through.is_some_and(|sequence| sequence < current) =>
             {
                 RetainedWaiting::Superseded
-            } else {
-                RetainedWaiting::Current
-            },
-        )
+            }
+            _ => RetainedWaiting::Current,
+        })
     }
     pub fn close_proved(
         identity: &ActorIdentity,
@@ -844,7 +840,8 @@ impl RemoteActor {
     }
     pub fn wake_outcomes(&self) {
         let state = self.state();
-        if state.outbox_latest > state.outbox_ack
+        if state.waiting_attention == Some(super::journal::WaitingAttention::Resolved)
+            || state.outbox_latest > state.outbox_ack
             || state
                 .continuity_loss
                 .as_ref()
@@ -1666,6 +1663,7 @@ impl RemoteActor {
             if identity_changed
                 || (resident.outbox_latest > resident.outbox_ack
                     && resident.outbox_latest != state.outbox_latest)
+                || resident.waiting_attention != state.waiting_attention
                 || (resident.continuity_loss != state.continuity_loss
                     && resident
                         .continuity_loss
@@ -3269,7 +3267,7 @@ impl Server {
             retained_runs: journal.retained_runs()?,
             outbox_ack: journal.acknowledged()?,
             outbox_latest: journal.latest()?,
-            latest_waiting: journal.latest_waiting,
+            waiting_attention: journal.waiting_attention,
             changed,
         })
     }

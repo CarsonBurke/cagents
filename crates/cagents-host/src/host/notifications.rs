@@ -14,7 +14,7 @@ use journal::Journal;
 use osascript::{Activation, PortalOwner, connect, remove, send, send_test};
 #[cfg(target_os = "linux")]
 use portal::{Activation, PortalOwner, connect, remove, send, send_test};
-use withdrawals::Withdrawals;
+use withdrawals::{Withdrawal, Withdrawals};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -573,6 +573,14 @@ fn restore(
     if !policy.message_previews {
         revoke_previews(snapshot, withdrawals);
     }
+    match journal.group_withdrawals() {
+        Ok(groups) => {
+            for group in groups {
+                withdrawals.group(group);
+            }
+        }
+        Err(error) => snapshot.diagnostic = Some(error),
+    }
     withdrawals.protect(
         snapshot
             .notices
@@ -1075,6 +1083,21 @@ async fn run(
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
         }
+        let persisted_withdrawals = match journal.group_withdrawals() {
+            Ok(groups) => {
+                for group in &groups {
+                    withdrawals.group(*group);
+                }
+                groups
+            }
+            Err(error) => {
+                snapshot.diagnostic = Some(error);
+                Vec::new()
+            }
+        };
+        pending
+            .actions
+            .retain(|(id, _)| !persisted_withdrawals.contains(id));
         if !policy.message_previews {
             for notice in &mut snapshot.notices {
                 notice.event.content = None;
@@ -1188,7 +1211,15 @@ async fn run(
                 let Some(entry) = withdrawals.pop_first() else {
                     break;
                 };
-                if let Err(error) = remove(backend, entry.id()).await {
+                let result = remove(backend, entry.id()).await.and_then(|()| {
+                    if let Withdrawal::Group(id) = entry
+                        && persisted_withdrawals.contains(&id)
+                    {
+                        journal.finish_group_withdrawal(id)?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
                     withdrawals.requeue(entry);
                     snapshot.diagnostic = Some(error);
                     failed = true;
@@ -1838,6 +1869,43 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].event.evidence.key, "new");
         assert!(!retained[0].acknowledged);
+    }
+
+    #[test]
+    fn a_resolved_waiting_toast_is_withdrawn_after_a_new_request_overwrites_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let request = |key: &str| {
+            let mut event = attention_event(session, key);
+            event.evidence.kind = Kind::Waiting;
+            event
+        };
+        let prior = journal.record(request("old"), false).unwrap().unwrap();
+        journal.delivered(prior.id).unwrap();
+        let target = Target::Session(session);
+        assert_eq!(
+            journal.acknowledge_waiting(&target).unwrap(),
+            Some(prior.id)
+        );
+        let newer = journal.record(request("new"), false).unwrap().unwrap();
+        drop(journal);
+
+        let mut journal = Journal::open(&path).unwrap();
+        let mut snapshot = Snapshot::default();
+        let mut withdrawals = Withdrawals::default();
+        restore(
+            &mut journal,
+            &Preferences::default(),
+            &mut snapshot,
+            &mut withdrawals,
+        );
+        assert_eq!(snapshot.notices, [newer]);
+        let group = batching::desktop_id(&target);
+        assert_eq!(withdrawals.pop_first().unwrap().id(), group);
+        journal.finish_group_withdrawal(group).unwrap();
+        assert!(journal.group_withdrawals().unwrap().is_empty());
     }
 
     #[test]

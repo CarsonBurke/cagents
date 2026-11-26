@@ -611,6 +611,7 @@ fn changed_for_instance(
     // completed actor without retained work before clearing on exit.
     if let Some(record) = state.chats.get(&id)
         && let Some(notifications) = &state.notifications
+        && record.handle.actor_identity().is_none()
         && (matches!(
             &update,
             Update::Activity {
