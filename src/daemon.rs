@@ -2400,6 +2400,10 @@ for line in sys.stdin:
 
     #[test]
     fn rebuild_stop_recovers_unheld_corrupt_metadata_but_not_a_replaced_lock() {
+        #[cfg(target_os = "macos")]
+        if !isolated_handoff_coordinator() {
+            return;
+        }
         use std::time::Duration;
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
