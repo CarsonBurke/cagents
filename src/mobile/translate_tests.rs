@@ -207,7 +207,7 @@ fn a_pending_approval_reaches_the_phone_with_its_choices() {
 }
 
 #[test]
-fn a_delegated_agent_names_its_owner() {
+fn delegated_sessions_show_their_owners_and_own_task_titles() {
     let id = TerminalId::new();
     let owner = Lineage(TerminalId::new());
     let agent = AgentId::new();
@@ -242,19 +242,43 @@ fn a_delegated_agent_names_its_owner() {
         account: None,
         cache: None,
     };
-    let session = session(&member);
-    assert_eq!(session.id, id.to_string());
-    assert_eq!(session.provider.as_deref(), Some("codex"));
-    assert_eq!(session.activity, api::Activity::Working);
-    assert!(session.watchable);
+    let translated = session(&member, &HashMap::new());
+    assert_eq!(translated.id, id.to_string());
+    assert_eq!(translated.provider.as_deref(), Some("codex"));
+    assert_eq!(translated.activity, api::Activity::Working);
+    assert!(translated.watchable);
     assert_eq!(
-        session.agent,
+        translated.agent,
         Some(api::Agent {
             id: agent.to_string(),
             owner: api::AgentOwner::Session,
             owner_lineage: Some(owner.to_string()),
             run: Some(api::RunState::Running),
         })
+    );
+
+    // The phone sees the agent's own accepted task even when the directory
+    // title was inherited from its parent or supplied by a provider.
+    let mut other = member.clone();
+    let other_agent = AgentId::new();
+    other.session.delegation.as_mut().unwrap().agent = other_agent;
+    let mut parent = member.clone();
+    parent.session.delegation = None;
+    let labels = HashMap::from([
+        (agent, "rust · check the host lane".into()),
+        (other_agent, "android · review the fake bridge".into()),
+    ]);
+    assert_eq!(
+        session(&member, &labels).title.as_deref(),
+        Some("rust · check the host lane")
+    );
+    assert_eq!(
+        session(&other, &labels).title.as_deref(),
+        Some("android · review the fake bridge")
+    );
+    assert_eq!(
+        session(&parent, &labels).title.as_deref(),
+        Some("Fix the build")
     );
 }
 

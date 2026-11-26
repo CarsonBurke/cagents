@@ -237,7 +237,8 @@ approves only by choosing an action.
 ### Sessions
 
 Each session has an `id`, its `lineage` (the conversation it continues),
-`surface` (`chat` or `terminal`), `provider` and `provider_label`, `title`,
+`surface` (`chat` or `terminal`), `provider` and `provider_label`, `title`
+(the label from an agent's first accepted task, when available),
 `project`, `directory`, `activity` (`idle`, `working`, `waiting`, or
 `unknown`, as for one that has exited),
 `exited`, `failure`, `active_at` (Unix milliseconds) and `watchable`. A

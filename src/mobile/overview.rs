@@ -1,6 +1,7 @@
 //! One read-only, connection-scoped subscription for a phone's overview.
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{
         Arc,
@@ -111,10 +112,18 @@ impl Drop for Watch {
 fn snapshot(control: &mut ControlClient, topic: MobileWatch) -> Result<api::Event, ControlError> {
     match topic {
         MobileWatch::Sessions => {
-            let sessions = control
-                .mobile_sessions()?
+            let members = control.mobile_sessions()?;
+            let labels: HashMap<_, _> = if members
                 .iter()
-                .map(translate::session)
+                .any(|member| member.session.delegation.is_some())
+            {
+                control.read_agent_labels()?.1.into_iter().collect()
+            } else {
+                HashMap::new()
+            };
+            let sessions = members
+                .iter()
+                .map(|member| translate::session(member, &labels))
                 .collect();
             Ok(api::Event::Sessions(api::Sessions { sessions }))
         }
