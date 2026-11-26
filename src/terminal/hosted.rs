@@ -2625,19 +2625,14 @@ fn serve_connection(
             {
                 return ConnectionEnd::Retry;
             }
-            let epoch = published
-                .output_observation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .epoch;
-            if epoch != 0
+            if let Some(request) = restored_output_observation(published, terminal_id)
                 && send_request(
                     connection.writer(),
                     &proof,
                     &mut next_request_id,
                     &mut pending,
                     PendingRequest::Command("restore terminal output observation"),
-                    ClientRequest::TerminalAcknowledge { terminal_id, epoch },
+                    request,
                 )
                 .is_err()
             {
@@ -3375,6 +3370,18 @@ impl RetainedPresentationFixture {
     }
 }
 
+fn restored_output_observation(
+    published: &HostedPublishedState,
+    terminal_id: TerminalId,
+) -> Option<ClientRequest> {
+    let epoch = published
+        .output_observation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .epoch;
+    (epoch != 0).then_some(ClientRequest::TerminalAcknowledge { terminal_id, epoch })
+}
+
 #[cfg(test)]
 mod tests {
     mod explicit_authority_tests;
@@ -3410,6 +3417,28 @@ mod tests {
                 assert_eq!(published.frame().generation, generation);
                 assert!(!published.needs_snapshot(generation, false));
             }
+        }
+
+        #[test]
+        fn a_hidden_reconnect_only_rearms_output_until_an_explicit_conversation_read() {
+            let published = HostedPublishedState::new(None, true, Arc::new(|_| {}));
+            published.set_visibility(TerminalVisibility::Hidden);
+            published.output_observation.lock().unwrap().epoch = 8;
+            let id = TerminalId::new();
+            assert_eq!(
+                restored_output_observation(&published, id),
+                Some(ClientRequest::TerminalAcknowledge {
+                    terminal_id: id,
+                    epoch: 8
+                }),
+            );
+            assert_eq!(
+                ClientCommand::AcknowledgeConversation.into_request(id),
+                ClientRequest::ChatAcknowledge {
+                    chat_id: id,
+                    epoch: 1
+                },
+            );
         }
 
         #[test]
