@@ -15772,7 +15772,7 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
     std::fs::write(&system_settings, r#"{"attribution":false,"theme":"dark"}"#).unwrap();
     assert_eq!(settings(&launch), Some(json!({"attribution": false})));
     let terminal_overlay = |recipe: &crate::model::LaunchRecipe| {
-        crate::agent_recovery::claude_attribution_overlay_with(recipe, |recipe, sources| {
+        crate::model::agent_recovery::claude_attribution_overlay_with(recipe, |recipe, sources| {
             chat::managed_claude_attribution(recipe, &homes, &system, sources)
         })
     };

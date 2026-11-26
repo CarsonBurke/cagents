@@ -1339,23 +1339,7 @@ fn read_process_launch(
         .split(|byte| *byte == 0)
         .map(|arg| std::str::from_utf8(arg).map(str::to_owned));
     let program = argv.next()?.ok()?;
-    let mut arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
-    if Provider::from_program(&program) == Some(Provider::Claude)
-        && let Some(first) = arguments.first()
-        && let Some(value) = first.strip_prefix("--settings=")
-        && environ.as_ref().is_some_and(|bytes| {
-            bytes.split(|byte| *byte == 0).any(|entry| {
-                entry
-                    .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())
-                    .and_then(|entry| entry.strip_prefix(b"="))
-                    == Some(first.as_bytes())
-            })
-        })
-        && serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
-            .is_ok_and(|settings| settings.len() == 1 && settings.contains_key("attribution"))
-    {
-        arguments.remove(0);
-    }
+    let arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
     // A recipe saved before parent sessions were withheld may still name one.
     let mut inherited = request.hint.map(|base| {
         let mut environment = base.environment.clone();
@@ -1409,13 +1393,31 @@ fn read_process_launch(
         .hint
         .map(|base| base.unset_environment.clone())
         .unwrap_or_default();
-    let raw = LaunchRecipe {
+    let mut raw = LaunchRecipe {
         unset_environment,
         program,
         arguments,
         working_directory,
         environment: Default::default(),
     };
+    if let Some(environ) = &environ
+        && let Some((Provider::Claude, arguments)) = Provider::launched(&raw)
+        && let Some(first) = arguments.first()
+        && let Some(value) = first.strip_prefix("--settings=")
+        && environ.split(|byte| *byte == 0).any(|entry| {
+            entry
+                .strip_prefix(CLAUDE_ATTRIBUTION_OVERLAY.as_bytes())
+                .and_then(|entry| entry.strip_prefix(b"="))
+                == Some(first.as_bytes())
+        })
+        && serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+            .is_ok_and(|settings| settings.len() == 1 && settings.contains_key("attribution"))
+    {
+        // The interpreter, when there is one, owns argv[1]. The overlay
+        // follows the provider executable or script's name.
+        let index = raw.arguments.len() - arguments.len();
+        raw.arguments.remove(index);
+    }
     let recognized = Provider::recognize_launch(&raw);
     let native_agent = Provider::from_program(&raw.program).is_some();
     let forwarding_launcher = Provider::is_interpreter(&raw.program)

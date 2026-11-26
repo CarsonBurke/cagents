@@ -3217,7 +3217,7 @@ impl Worker {
         for name in crate::account::launch_credential_overrides(&execution) {
             command.env_remove(name);
         }
-        command.env_remove(crate::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY);
+        command.env_remove(crate::model::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY);
         if crate::agent::Provider::from_program(&execution.program)
             == Some(crate::agent::Provider::Claude)
         {
@@ -3230,9 +3230,13 @@ impl Worker {
                     launch.unset_environment.insert(name.into());
                 }
             }
-            if let Some(overlay) = crate::agent_recovery::claude_attribution_overlay(&launch) {
+            if let Some(overlay) = crate::model::agent_recovery::claude_attribution_overlay(&launch)
+            {
                 command.get_argv_mut().insert(1, overlay.as_str().into());
-                command.env(crate::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY, overlay);
+                command.env(
+                    crate::model::agent_recovery::CLAUDE_ATTRIBUTION_OVERLAY,
+                    overlay,
+                );
             }
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
