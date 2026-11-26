@@ -2258,7 +2258,7 @@ fn adapter() -> Codex {
         waiting_child_resumes: BTreeMap::new(),
         listing_generation: 0,
         parent_child: None,
-        listed_unloaded: std::collections::BTreeSet::new(),
+        listed_unloaded: BTreeMap::new(),
         spawn_calls: std::collections::BTreeSet::new(),
         turn_diffs: BTreeMap::new(),
         repo_root: None,
@@ -4025,6 +4025,73 @@ fn a_subagent_listing_pages_past_32_children_and_keeps_the_newest_live() {
             "data":(0..32).map(child).collect::<Vec<_>>(),"nextCursor":"more"}}))
         .unwrap();
     assert!(listing(&last).is_none());
+}
+
+#[test]
+fn sparse_child_discovery_keeps_the_last_observation_until_codex_confirms_state() {
+    for confirmed in [false, true] {
+        let mut parent = adapter();
+        let id = "older-child";
+        parent.listed_unloaded.insert(id.into(), true);
+        let mut listed = Step::default();
+        parent
+            .discover_child_as(
+                id,
+                &json!({"status":{"type":"active"},"parentThreadId":"thread-exact"}),
+                ChildName::Listed,
+                false,
+                false,
+                &mut listed,
+            )
+            .unwrap();
+        let mut state = chat::Snapshot::default();
+        crate::chat::runtime::project_events_for_test(&mut state, listed.events);
+        let mut sparse = Step::default();
+        parent
+            .discover_activity_child(
+                &json!({"agentThreadId":id,"kind":"started"}),
+                "thread-exact",
+                ChildName::Recorded,
+                false,
+                &mut sparse,
+            )
+            .unwrap();
+        let request = sparse
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap()["id"]
+            .clone();
+        crate::chat::runtime::project_events_for_test(&mut state, sparse.events);
+        assert!(state.subagents[0].last_seen_running());
+        assert!(!state.holds_work());
+        assert!(
+            parent
+                .command(Command::StopSubagent { id: id.into() })
+                .is_err()
+        );
+
+        let response = if confirmed {
+            json!({"id":request,"result":{
+                "thread":{"id":id,"status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}}})
+        } else {
+            json!({"id":request,"error":{"code":-1,"message":"read temporarily unavailable"}})
+        };
+        let reply = parent.receive(response).unwrap();
+        crate::chat::runtime::project_events_for_test(&mut state, reply.events);
+        if confirmed {
+            assert_eq!(state.subagents[0].status, ToolStatus::Succeeded);
+            assert!(!state.subagents[0].last_seen_running());
+        } else {
+            assert!(state.subagents[0].last_seen_running());
+            assert!(
+                parent
+                    .command(Command::StopSubagent { id: id.into() })
+                    .is_err()
+            );
+        }
+    }
 }
 
 #[test]
