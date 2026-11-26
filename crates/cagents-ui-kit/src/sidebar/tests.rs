@@ -12939,8 +12939,8 @@ fn a_plain_folder_draws_no_panel_tabs() {
 }
 
 /// The tree/flat choice arranges changed files, so History, a list of
-/// commits, does not offer it; and the one control names the arrangement
-/// it switches to.
+/// commits, does not offer it, nor does a branch not yet compared with its
+/// base; and the one control names the arrangement it switches to.
 #[test]
 fn the_list_mode_toggle_follows_the_view_it_arranges() {
     let renderer = headless_renderer();
@@ -12956,10 +12956,10 @@ fn the_list_mode_toggle_follows_the_view_it_arranges() {
                     _ => None,
                 })
                 .collect();
-        let expected = if tab == ChangesTab::History {
-            Vec::new()
-        } else {
+        let expected = if tab == ChangesTab::Changes {
             vec![FileListMode::Flat]
+        } else {
+            Vec::new()
         };
         assert_eq!(modes, expected, "{tab:?}");
     }
@@ -13039,52 +13039,282 @@ fn the_changes_count_is_distinct_paths() {
     );
 }
 
+/// Pushing is the branch's, in the header beside its name, so committed
+/// work can be pushed from any view and without a commit subject.
 #[test]
 fn uploads_do_not_require_a_commit_subject_and_keep_their_guards() {
     let renderer = headless_renderer();
-    let state = SidebarState::default();
+    let model = panel_model();
+    let mut state = panel_state(&model);
+    let pushes = |actions: &[SidebarAction]| {
+        actions
+            .iter()
+            .any(|action| matches!(action, SidebarAction::Push { .. }))
+    };
+    for tab in ChangesTab::ALL {
+        state.changes_tab = tab;
+        for width in [240.0, 380.0] {
+            let actions = frame_enter_presses_at_width(
+                &renderer,
+                git_panel(&model, &state, width, false),
+                width,
+            );
+            assert!(pushes(&actions), "{tab:?} at {width} offered no push");
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Commit { .. }))
+            );
+        }
+    }
     for width in [240.0, 380.0] {
+        let control = |source: &SourceControlModel, modal_open| {
+            frame_enter_presses_at_width(
+                &renderer,
+                upload_control(source, modal_open).expect("a push or publish control"),
+                width,
+            )
+        };
         let mut source = source_control();
         assert!(source.can_push());
-        let actions =
-            frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, false), width);
-        assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Push { .. }))
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Commit { .. }))
-        );
-        assert!(
-            !frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, true), width)
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Push { .. }))
-        );
+        assert!(pushes(&control(&source, false)));
+        assert!(!pushes(&control(&source, true)));
         source.set_mutation(Some(MutationKind::Stage));
-        assert!(
-            !frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, false), width)
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Push { .. }))
-        );
+        assert!(!pushes(&control(&source, false)));
         source.set_mutation(None);
         source.upstream = None;
         source.tracking = TrackingState::NoUpstream;
         assert!(source.can_publish());
-        let actions =
-            frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, false), width);
+        let actions = control(&source, false);
         assert!(
             actions
                 .iter()
                 .any(|action| matches!(action, SidebarAction::OpenPublish { .. }))
         );
-        assert!(!actions.iter().any(|action| matches!(
-            action,
-            SidebarAction::Push { .. } | SidebarAction::Commit { .. }
-        )));
+        assert!(!pushes(&actions));
     }
+}
+
+/// A branch with nothing to send draws no push control at all, rather than
+/// one that can never be pressed.
+#[test]
+fn an_up_to_date_branch_offers_no_push() {
+    let mut snapshot = snapshot();
+    snapshot.status.tracking = TrackingState::Compared {
+        upstream: "refs/remotes/origin/main".into(),
+        ahead: 0,
+        behind: 3,
+    };
+    let source = SourceControlModel::ready(main_key(), &snapshot);
+    assert!(source.upstream.is_some());
+    assert!(upload_control(&source, false).is_none());
+}
+
+/// A worktree opens on Branch when it has nothing uncommitted, since an
+/// empty Changes view has nothing to show; it opens on Changes otherwise.
+/// The pick is made once, from the worktree's first read, and never over
+/// a view the user chose.
+#[test]
+fn a_clean_worktree_opens_on_its_branch_once() {
+    let model = panel_model();
+    let mut clean = snapshot();
+    clean.status.entries.clear();
+    let clean = SourceControlModel::ready(main_key(), &clean);
+    let dirty = source_control();
+    assert!(!clean.has_uncommitted_changes());
+    assert!(dirty.has_uncommitted_changes());
+
+    let mut state = panel_state(&model);
+    // Nothing is picked before the read.
+    state.settle_changes_tab(&SourceControlModel::loading(main_key()));
+    assert_eq!(state.changes_tab(), ChangesTab::Changes);
+    state.settle_changes_tab(&clean);
+    assert_eq!(state.changes_tab(), ChangesTab::Branch);
+    // A change arriving later does not move the view under the reader.
+    state.settle_changes_tab(&dirty);
+    assert_eq!(state.changes_tab(), ChangesTab::Branch);
+
+    // Another worktree picks again; a read of a worktree not bound picks
+    // nothing.
+    assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+    assert_eq!(state.changes_tab(), ChangesTab::Changes);
+    state.settle_changes_tab(&clean);
+    assert_eq!(state.changes_tab(), ChangesTab::Changes);
+    let mut fix_clean = snapshot();
+    fix_clean.status.entries.clear();
+    state.settle_changes_tab(&SourceControlModel::ready(fix_key(), &fix_clean));
+    assert_eq!(state.changes_tab(), ChangesTab::Branch);
+
+    // The user's choice stands, and survives the window being restored.
+    let mut state = panel_state(&model);
+    state.apply(&SidebarAction::SetChangesTab {
+        key: main_key(),
+        tab: ChangesTab::History,
+    });
+    state.settle_changes_tab(&clean);
+    assert_eq!(state.changes_tab(), ChangesTab::History);
+    let mut restored = panel_state(&model);
+    restored.restore_view(state.saved_view());
+    restored.settle_changes_tab(&clean);
+    assert_eq!(restored.changes_tab(), ChangesTab::History);
+    // A view restored for another worktree keeps nothing of this one's.
+    let mut elsewhere = panel_state(&model);
+    elsewhere.restore_view(state.saved_view().without_worktree_panel());
+    elsewhere.settle_changes_tab(&clean);
+    assert_eq!(elsewhere.changes_tab(), ChangesTab::Branch);
+    // A view saved before the choice was recorded kept a tab other than
+    // Changes only because it was chosen.
+    let mut saved = state.saved_view();
+    saved.changes_tab_chosen = false;
+    let mut upgraded = panel_state(&model);
+    upgraded.restore_view(saved);
+    upgraded.settle_changes_tab(&clean);
+    assert_eq!(upgraded.changes_tab(), ChangesTab::History);
+
+    // A tab picked from a read is not kept: a worktree opened with changes
+    // and committed since opens on Branch next time.
+    let mut picked = panel_state(&model);
+    picked.settle_changes_tab(&dirty);
+    assert_eq!(picked.changes_tab(), ChangesTab::Changes);
+    let mut next = panel_state(&model);
+    next.restore_view(picked.saved_view());
+    next.settle_changes_tab(&clean);
+    assert_eq!(next.changes_tab(), ChangesTab::Branch);
+}
+
+/// With nothing to commit there is no commit box, and no tree/flat switch
+/// over an empty list. A draft under way keeps its box.
+#[test]
+fn a_clean_worktree_draws_no_commit_box() {
+    let renderer = headless_renderer();
+    let mut model = panel_model();
+    let mut clean = snapshot();
+    clean.status.entries.clear();
+    model.source_control = Some(SourceControlModel::ready(main_key(), &clean));
+    let mut state = panel_state(&model);
+    state.changes_tab = ChangesTab::Changes;
+    let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
+    for absent in ["Commit subject", "Commit (Ctrl+Enter)", "Amend"] {
+        assert!(
+            !names.iter().any(|name| name == absent),
+            "{absent} drawn over a clean worktree: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|name| name.starts_with("View as ")),
+        "{names:?}"
+    );
+    // Committed work is still pushed from here.
+    assert!(
+        names.iter().any(|name| name.starts_with("Push main")),
+        "{names:?}"
+    );
+
+    // The last commit can still be amended, which brings the box back.
+    let actions =
+        frame_enter_presses_at_width(&renderer, git_panel(&model, &state, 380.0, false), 380.0);
+    let amend = SidebarAction::AmendChanged {
+        key: main_key(),
+        amend: true,
+    };
+    assert!(actions.contains(&amend), "{actions:?}");
+    let mut amending = panel_state(&model);
+    amending.changes_tab = ChangesTab::Changes;
+    amending.apply(&amend);
+    let names = accessible_names(&renderer, git_panel(&model, &amending, 380.0, false));
+    assert!(
+        names.iter().any(|name| name == "Commit subject"),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "Amend last commit"),
+        "{names:?}"
+    );
+    // Once the last commit is pushed, amending it would split the branch
+    // from its upstream, so it isn't offered.
+    let mut pushed = clean.clone();
+    pushed.status.tracking = TrackingState::Compared {
+        upstream: "refs/remotes/origin/main".into(),
+        ahead: 0,
+        behind: 0,
+    };
+    let mut pushed_model = panel_model();
+    pushed_model.source_control = Some(SourceControlModel::ready(main_key(), &pushed));
+    let names = accessible_names(&renderer, git_panel(&pushed_model, &state, 380.0, false));
+    assert!(
+        !names.iter().any(|name| name == "Amend last commit"),
+        "{names:?}"
+    );
+
+    state.apply(&SidebarAction::CommitMessageChanged {
+        key: main_key(),
+        message: "a draft".into(),
+    });
+    let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
+    assert!(
+        names.iter().any(|name| name == "Commit subject"),
+        "{names:?}"
+    );
+}
+
+/// Push and publish are the Git views' header controls; Files has no place
+/// for the publish form, so its header draws neither.
+#[test]
+fn the_files_view_draws_no_push() {
+    let renderer = headless_renderer();
+    let model = panel_model();
+    let state = panel_state(&model);
+    let names = accessible_names(
+        &renderer,
+        worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Files, true),
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("Push ") || name.starts_with("Publish ")),
+        "{names:?}"
+    );
+}
+
+/// A branch that cannot be pushed for a reason the panel would not
+/// otherwise show says why, in place of a control that can't be pressed.
+#[test]
+fn an_unpushable_branch_says_why() {
+    let mut source = source_control();
+    assert_eq!(source.unpushable_reason(), None);
+    source.branch = None;
+    assert!(
+        source
+            .unpushable_reason()
+            .is_some_and(|reason| reason.contains("name"))
+    );
+    source.head_oid = None;
+    assert!(
+        source
+            .unpushable_reason()
+            .is_some_and(|reason| reason.starts_with("HEAD"))
+    );
+    source.detached = true;
+    assert_eq!(source.unpushable_reason(), None);
+    assert!(upload_control(&source, false).is_none());
+
+    let mut unnamed = source_control();
+    unnamed.upstream = None;
+    assert!(unnamed.upstream_reported());
+    assert!(
+        unnamed
+            .unpushable_reason()
+            .is_some_and(|reason| reason.contains("upstream"))
+    );
+    assert!(upload_control(&unnamed, false).is_none());
+
+    // With no remote there is nowhere to publish, and nothing to explain.
+    let mut local = source_control();
+    local.upstream = None;
+    local.tracking = TrackingState::NoUpstream;
+    local.remotes.clear();
+    assert!(upload_control(&local, false).is_none());
+    assert_eq!(local.unpushable_reason(), None);
 }
 
 /// Committing belongs to the working tree, and the working tree is one of

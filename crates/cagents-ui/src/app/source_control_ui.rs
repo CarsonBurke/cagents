@@ -43,6 +43,10 @@ impl Cagents {
         self.replace_source_control(
             SourceControlModel::ready(key, &snapshot).built_from(Arc::clone(&snapshot)),
         );
+        // A worktree's first read decides which Git view it opens on.
+        if let Some(source) = self.sidebar_model.source_control.as_ref() {
+            self.sidebar_state.settle_changes_tab(source);
+        }
         ControlFlow::Continue(self.refresh_branch_changes(&snapshot))
     }
 
