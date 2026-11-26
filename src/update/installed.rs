@@ -121,15 +121,24 @@ pub(super) fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
     Ok(Stamp(entries))
 }
 
-fn digest(root: &Path) -> Result<String, UpdateError> {
+pub(super) fn digest(root: &Path, binaries: &[&str]) -> Result<String, UpdateError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
-    for binary in BINARIES {
+    for binary in binaries {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(root.join("bin").join(binary))?;
-        let size = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(invalid("installed binary is not an owned regular file"));
+        }
+        let size = metadata.len();
         if size > ARCHIVE_LIMIT {
             return Err(invalid("installed binary exceeds update size limit"));
         }
@@ -156,15 +165,40 @@ fn digest(root: &Path) -> Result<String, UpdateError> {
         .collect())
 }
 
+pub(super) enum Candidate<'a> {
+    Local(&'a Path),
+    #[cfg(target_os = "macos")]
+    Release(&'a super::release_stage::VerifiedCandidate),
+}
+
+impl Candidate<'_> {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Local(root) => root,
+            #[cfg(target_os = "macos")]
+            Self::Release(release) => &release.root,
+        }
+    }
+
+    fn digest(&self) -> Result<String, UpdateError> {
+        match self {
+            Self::Local(root) => digest(root, &BINARIES),
+            #[cfg(target_os = "macos")]
+            Self::Release(release) => release.digest(),
+        }
+    }
+}
+
 pub(super) fn perform(
     installation: &Installation,
     state: &Path,
     job: &mut UpdateJob,
-    root: &Path,
+    candidate: Candidate<'_>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
     terminal: bool,
 ) -> Result<Completion, UpdateError> {
+    let root = candidate.root();
     let layout = locate(&crate::process::current_executable()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
@@ -182,7 +216,7 @@ pub(super) fn perform(
         "Verifying the installed application set",
     )?;
     let before = stamp(root)?;
-    let identity = digest(root)?;
+    let identity = candidate.digest()?;
     let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged = candidate::Staged::from_installed(
         root.join("bin/cagents"),
@@ -251,7 +285,7 @@ pub(super) fn perform(
         .map_err(io::Error::other)?
         .with_inspection(&inspected);
         if !confirmed.preserves_consent(&context.apply(latest))
-            || digest(root).map_err(io::Error::other)? != staged.identity.digest
+            || candidate.digest().map_err(io::Error::other)? != staged.identity.digest
         {
             return Err(invalid(
                 "The installed build or session ownership changed during pane inspection; existing windows were kept open",
@@ -1844,12 +1878,12 @@ exit 1"#,
             fs::write(root.join("bin").join(binary), b"first build").unwrap();
         }
         let original_stamp = stamp(&root).unwrap();
-        let original_identity = digest(&root).unwrap();
+        let original_identity = digest(&root, &BINARIES).unwrap();
         let replacement = root.join("bin/replacement");
         fs::write(&replacement, b"other build").unwrap();
         fs::rename(replacement, root.join("bin/cagentsd")).unwrap();
         assert!(stamp(&root).unwrap() != original_stamp);
-        assert_ne!(digest(&root).unwrap(), original_identity);
+        assert_ne!(digest(&root, &BINARIES).unwrap(), original_identity);
         // A different target behind an unchanged version name cannot borrow
         // the previous confirmation through a symlink either.
         fs::remove_file(root.join("bin/cagentsd")).unwrap();
