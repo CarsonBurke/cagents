@@ -317,13 +317,22 @@ impl Cagents {
         runtime.connection = Connection::AwaitingAdmission;
         // A view that still lists the card with the same conversation, as
         // when only the daemon's proof changed again, keeps the draft there.
+        // A snapshot can still list a pane another client has closed, so a
+        // closed or retired pane doesn't count.
         let source = runtime.session.clone();
-        if let Some(listed) = self.workspace_model.views.iter().find_map(|view| {
-            view.panes.iter().find(|listed| {
-                listed.id == card
-                    && matches!(&listed.kind, CardKind::Chat(session) if same_conversation(session, &source))
+        if !self.shared_views.closed.contains(&card)
+            && let Some(listed) = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| !view.retired.contains(&card))
+            .find_map(|view| {
+                view.panes.iter().find(|listed| {
+                    listed.id == card
+                        && matches!(&listed.kind, CardKind::Chat(session) if same_conversation(session, &source))
+                })
             })
-        }) {
+        {
             let listed = listed.clone();
             return self.admit_shared_chat_inner(&listed, false, true);
         }
