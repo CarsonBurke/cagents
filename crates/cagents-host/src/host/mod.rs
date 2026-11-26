@@ -293,10 +293,9 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
             InstalledRestoration::Ready { admission, .. } => {
                 let chats = chat::chat_list_inventory(&state);
                 if chats.iter().any(|session| {
-                    state
-                        .chats
-                        .get(&session.id)
-                        .is_none_or(|record| !record.handle.owns_work())
+                    state.chats.get(&session.id).is_none_or(|record| {
+                        record.handle.is_completed() || !record.handle.owns_work()
+                    })
                 }) {
                     return Err("An original conversation has not finished resuming".into());
                 }
