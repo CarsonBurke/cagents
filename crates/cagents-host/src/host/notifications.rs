@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use super::state::{ClientId, HostLock, SharedHost};
 use crate::{
-    model::TerminalId,
+    model::{BootId, TerminalId, agent_recovery::AgentProcessIdentity},
     notifications::{Event, Kind, Notice, Preferences, Presence, Snapshot, Target, TestOutcome},
 };
 
@@ -115,6 +115,39 @@ struct QueuedReviewUpdate {
     _slot: OwnedSemaphorePermit,
 }
 
+const TERMINAL_WAIT_PREFIX: &str = "terminal-wait:";
+
+fn terminal_wait_prefix(boot: &BootId, process: AgentProcessIdentity) -> String {
+    format!(
+        "{TERMINAL_WAIT_PREFIX}{boot}:{}:{}:",
+        process.pid, process.start
+    )
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct WaitingClear {
+    target: Target,
+    source_prefix: Option<String>,
+}
+
+impl WaitingClear {
+    fn native(target: Target) -> Self {
+        Self {
+            target,
+            source_prefix: None,
+        }
+    }
+
+    fn matches(&self, event: &Event) -> bool {
+        event.evidence.kind == Kind::Waiting
+            && event.target == self.target
+            && self
+                .source_prefix
+                .as_ref()
+                .is_none_or(|prefix| event.evidence.key.starts_with(prefix))
+    }
+}
+
 #[derive(Default)]
 struct Pending {
     events: BTreeMap<Target, Event>,
@@ -123,7 +156,7 @@ struct Pending {
     retired: BTreeSet<Target>,
     // Provider lifecycle settlements coalesce by exact target. Keep them
     // through a journal outage even after the process that sent one has ended.
-    cleared_waiting: BTreeSet<Target>,
+    cleared_waiting: BTreeSet<WaitingClear>,
     acknowledged: BTreeSet<Uuid>,
     predecessor_reads: BTreeMap<Uuid, TerminalId>,
     review_updates: VecDeque<QueuedReviewUpdate>,
@@ -234,8 +267,8 @@ impl Pending {
                 self.retired.insert(target);
             }
         }
-        for target in newer.cleared_waiting {
-            self.clear_waiting(target);
+        for clear in newer.cleared_waiting {
+            self.clear_waiting(clear);
         }
         self.start_turns(newer.started_turns);
         for event in newer.events.into_values() {
@@ -280,20 +313,20 @@ impl Pending {
         }
     }
 
-    fn clear_waiting(&mut self, target: Target) {
+    fn clear_waiting(&mut self, clear: WaitingClear) {
         if self
             .events
-            .get(&target)
-            .is_some_and(|event| event.evidence.kind == Kind::Waiting)
+            .get(&clear.target)
+            .is_some_and(|event| clear.matches(event))
         {
-            self.events.remove(&target);
+            self.events.remove(&clear.target);
         }
         for (event, receipt) in &mut self.committed_events {
-            if event.target == target && event.evidence.kind == Kind::Waiting {
+            if clear.matches(event) {
                 receipt.resolved = true;
             }
         }
-        self.cleared_waiting.insert(target);
+        self.cleared_waiting.insert(clear);
     }
 
     fn read_predecessors(&mut self, reads: BTreeMap<Uuid, TerminalId>) {
@@ -533,7 +566,7 @@ impl Handle {
             return Err("Notification commit queue is full; outcome remains unacknowledged".into());
         }
         if resolved {
-            pending.clear_waiting(event.target());
+            pending.clear_waiting(WaitingClear::native(event.target()));
         }
         let mut receipt = CommitReceipt::admitted(receipt, admission);
         receipt.resolved = resolved;
@@ -565,7 +598,62 @@ impl Handle {
     }
 
     pub fn clear_session_waiting(&self, session: TerminalId) {
-        self.change(|pending| pending.clear_waiting(Target::Session(session)));
+        self.change(|pending| {
+            pending.clear_waiting(WaitingClear::native(Target::Session(session)))
+        });
+    }
+
+    pub(super) fn record_terminal_wait(
+        &self,
+        mut event: Event,
+        boot: &BootId,
+        process: AgentProcessIdentity,
+    ) {
+        event.evidence.key = terminal_wait_prefix(boot, process) + &event.evidence.key;
+        self.record(event);
+    }
+
+    pub(super) fn clear_terminal_waiting(
+        &self,
+        session: TerminalId,
+        boot: &BootId,
+        process: AgentProcessIdentity,
+    ) {
+        self.change(|pending| {
+            pending.clear_waiting(WaitingClear {
+                target: Target::Session(session),
+                source_prefix: Some(terminal_wait_prefix(boot, process)),
+            });
+        });
+    }
+
+    pub(super) fn terminal_waits(&self, boot: &BootId) -> Vec<(TerminalId, AgentProcessIdentity)> {
+        let boot_prefix = format!("{TERMINAL_WAIT_PREFIX}{boot}:");
+        self.0
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notices
+            .iter()
+            .filter_map(|notice| {
+                if notice.acknowledged || notice.event.evidence.kind != Kind::Waiting {
+                    return None;
+                }
+                let Target::Session(session) = notice.event.target else {
+                    return None;
+                };
+                let key = notice.event.evidence.key.strip_prefix(&boot_prefix)?;
+                let (pid, key) = key.split_once(':')?;
+                let (start, _) = key.split_once(':')?;
+                Some((
+                    session,
+                    AgentProcessIdentity {
+                        pid: pid.parse().ok()?,
+                        start: start.parse().ok()?,
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub fn retire(&self, session: TerminalId) {
@@ -840,12 +928,25 @@ fn publish(shared: &Weak<Shared>, host: &Weak<HostLock>, snapshot: Snapshot) {
         let automation_waiting = snapshot.notices.iter().any(|notice| {
             !notice.acknowledged && matches!(notice.event.target, Target::Automation { .. })
         });
+        let terminal_waiting = snapshot
+            .notices
+            .iter()
+            .chain(&current.notices)
+            .any(|notice| {
+                !notice.acknowledged
+                    && notice.event.evidence.kind == Kind::Waiting
+                    && notice.event.evidence.key.starts_with(TERMINAL_WAIT_PREFIX)
+            });
         *current = snapshot;
         drop(current);
         if let Some(host) = host.upgrade() {
-            host.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notifications_changed();
+            {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.notifications_changed();
+                if terminal_waiting {
+                    state.agent_activity_wake.notify();
+                }
+            }
             if automation_waiting {
                 super::automations::wake(&host);
             }
@@ -1282,12 +1383,14 @@ fn answer_tests(requesters: &[std::sync::mpsc::Sender<TestOutcome>], outcome: &T
 
 fn commit_waiting_clears(
     journal: &mut Journal,
-    cleared: &BTreeSet<Target>,
+    cleared: &BTreeSet<WaitingClear>,
     mut committed: impl FnMut(&Target, Uuid),
 ) -> Result<(), String> {
-    for target in cleared {
-        if let Some(id) = journal.acknowledge_waiting(target)? {
-            committed(target, id);
+    for clear in cleared {
+        if let Some(id) =
+            journal.acknowledge_waiting(&clear.target, |event| clear.matches(event))?
+        {
+            committed(&clear.target, id);
         }
     }
     Ok(())
@@ -1404,8 +1507,10 @@ fn session_settlement_admitted(shared: &Weak<Shared>, event: &Event) -> bool {
     shared.upgrade().is_some_and(|shared| {
         let pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending.started_turns.contains(&session)
-            || (event.evidence.kind == Kind::Waiting
-                && pending.cleared_waiting.contains(&event.target))
+            || pending
+                .cleared_waiting
+                .iter()
+                .any(|clear| clear.matches(event))
     })
 }
 
@@ -1661,7 +1766,8 @@ impl JournalTestBridge {
             .lock()
             .unwrap()
             .cleared_waiting
-            .contains(&Target::Session(session))
+            .iter()
+            .any(|clear| clear.target == Target::Session(session) && clear.source_prefix.is_none())
     }
     pub(in crate::host) fn new(path: &std::path::Path) -> Result<(Handle, Self), String> {
         let journal = Journal::open(path)?;
@@ -3972,13 +4078,17 @@ mod tests {
         };
 
         let mut settled = Pending::default();
-        settled.clear_waiting(target.clone());
+        let clear = WaitingClear {
+            target: target.clone(),
+            source_prefix: None,
+        };
+        settled.clear_waiting(clear.clone());
         let combined = pending(request("old")).followed_by(settled);
         assert!(combined.events.is_empty());
-        assert!(combined.cleared_waiting.contains(&target));
+        assert!(combined.cleared_waiting.contains(&clear));
 
         let combined = combined.followed_by(pending(request("new")));
-        assert!(combined.cleared_waiting.contains(&target));
+        assert!(combined.cleared_waiting.contains(&clear));
         assert_eq!(combined.events.get(&target), Some(&request("new")));
 
         let (shared, _receiver) = shared();
@@ -4014,6 +4124,124 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].event.evidence.key, "new");
         assert!(!retained[0].acknowledged);
+    }
+
+    #[test]
+    fn terminal_wait_settlement_matches_the_same_boot_and_provider_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let session = TerminalId::new();
+        let boot = BootId::new("fixture-boot");
+        let other_boot = BootId::new("new-boot");
+        let original = AgentProcessIdentity {
+            pid: 37,
+            start: 240,
+        };
+        let replacement = AgentProcessIdentity {
+            pid: 37,
+            start: 245,
+        };
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let mut event = attention_event(session, "waiting:fixture");
+        event.evidence.kind = Kind::Waiting;
+        handle.record_terminal_wait(event, &boot, original);
+        let mut pending = take_pending(&shared);
+        let mut journal = Journal::open(&path).unwrap();
+        let notice = journal
+            .record(pending.events.pop_first().unwrap().1, false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+
+        let mut journal = Journal::open(&path).unwrap();
+        handle.clear_terminal_waiting(session, &boot, replacement);
+        handle.clear_terminal_waiting(session, &other_boot, original);
+        let pending = take_pending(&shared);
+        commit_waiting_clears(
+            &mut journal,
+            &pending.cleared_waiting,
+            |_, _| unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(
+            journal.list().unwrap().as_slice(),
+            std::slice::from_ref(&notice)
+        );
+
+        shared.snapshot.lock().unwrap().notices = vec![notice.clone()];
+        assert_eq!(handle.terminal_waits(&boot), [(session, original)]);
+        assert!(handle.terminal_waits(&other_boot).is_empty());
+        handle.clear_terminal_waiting(session, &boot, original);
+        let pending = take_pending(&shared);
+        let mut cleared = Vec::new();
+        commit_waiting_clears(&mut journal, &pending.cleared_waiting, |_, id| {
+            cleared.push(id)
+        })
+        .unwrap();
+        assert_eq!(cleared, [notice.id]);
+        assert!(journal.list().unwrap()[0].acknowledged);
+        assert!(
+            journal
+                .group_withdrawals_for(&[])
+                .unwrap()
+                .contains(&notice.id)
+        );
+    }
+
+    #[test]
+    fn terminal_wait_settlement_preserves_newer_pending_and_replacement_requests() {
+        let session = TerminalId::new();
+        let target = Target::Session(session);
+        let boot = BootId::new("fixture-boot");
+        let original = AgentProcessIdentity {
+            pid: 37,
+            start: 240,
+        };
+        let replacement = AgentProcessIdentity {
+            pid: 38,
+            start: 246,
+        };
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        let record = |process, key| {
+            let mut event = attention_event(session, key);
+            event.evidence.kind = Kind::Waiting;
+            handle.record_terminal_wait(event, &boot, process);
+        };
+
+        record(original, "first");
+        let deferred = take_pending(&shared);
+        handle.clear_terminal_waiting(session, &boot, replacement);
+        let deferred = deferred.followed_by(take_pending(&shared));
+        assert_eq!(
+            deferred.events[&target].evidence.key,
+            terminal_wait_prefix(&boot, original) + "first"
+        );
+
+        handle.clear_terminal_waiting(session, &boot, original);
+        let deferred = deferred.followed_by(take_pending(&shared));
+        assert!(deferred.events.is_empty());
+
+        record(original, "later request");
+        let deferred = deferred.followed_by(take_pending(&shared));
+        assert_eq!(
+            deferred.events[&target].evidence.key,
+            terminal_wait_prefix(&boot, original) + "later request"
+        );
+
+        let previous = deferred.events[&target].clone();
+        record(replacement, "replacement");
+        let next = shared.pending.lock().unwrap().events[&target].clone();
+        handle.clear_terminal_waiting(session, &boot, original);
+        let broker = Arc::downgrade(&shared);
+        assert!(session_settlement_admitted(&broker, &previous));
+        assert!(!session_settlement_admitted(&broker, &next));
+        let pending = deferred.followed_by(take_pending(&shared));
+        assert_eq!(
+            pending.events[&target].evidence.key,
+            terminal_wait_prefix(&boot, replacement) + "replacement"
+        );
     }
 
     #[test]
@@ -4076,7 +4304,7 @@ mod tests {
 
         let deferred = Pending {
             cleared_waiting: (0..MAX_PENDING)
-                .map(|_| Target::Session(TerminalId::new()))
+                .map(|_| WaitingClear::native(Target::Session(TerminalId::new())))
                 .collect(),
             ..Pending::default()
         };
@@ -4144,7 +4372,10 @@ mod tests {
         )
         .unwrap();
         let mut pending = Pending::default();
-        pending.clear_waiting(target.clone());
+        pending.clear_waiting(WaitingClear {
+            target: target.clone(),
+            source_prefix: None,
+        });
         let failure =
             commit_waiting_clears(journal, &pending.cleared_waiting, |_, _| {}).unwrap_err();
         let next = store.retry_failed_write(failure, Instant::now());
@@ -4224,7 +4455,11 @@ mod tests {
         store.retry_failed_write("temporary fixture failure".into(), failed);
         assert!(store.reopen_if_due(failed).is_none());
         let journal = store.journal_for_shutdown().unwrap();
-        commit_waiting_clears(journal, &[Target::Session(session)].into(), |_, _| {}).unwrap();
+        let clear = WaitingClear {
+            target: Target::Session(session),
+            source_prefix: None,
+        };
+        commit_waiting_clears(journal, &[clear].into(), |_, _| {}).unwrap();
         assert!(journal.list().unwrap()[0].acknowledged);
     }
 
@@ -4243,7 +4478,7 @@ mod tests {
         journal.delivered(prior.id).unwrap();
         let target = Target::Session(session);
         assert_eq!(
-            journal.acknowledge_waiting(&target).unwrap(),
+            journal.acknowledge_waiting(&target, |_| true).unwrap(),
             Some(prior.id)
         );
         let newer = journal.record(request("new"), false).unwrap().unwrap();
