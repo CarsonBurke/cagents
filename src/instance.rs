@@ -462,6 +462,8 @@ impl WindowLease {
         requested: Option<&str>,
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let _publication = crate::install_guard::admit_darwin_installed_build()?;
         // A window here would need a daemon here, which would refuse to serve
         // data a daemon in another runtime directory serves. Say so first:
         // that daemon's session, not this window, is what is in the way.

@@ -224,6 +224,53 @@ pub fn daemon_served_elsewhere(lock: &Path) -> io::Result<Option<StateInUse>> {
     served_elsewhere(&claims_directory()?.join(DAEMON_CLAIM), lock)
 }
 
+/// Called under the Darwin publication and application launch fences. A daemon
+/// or window already admitted in another runtime still holds its state claim.
+#[cfg(target_os = "macos")]
+pub(crate) fn require_idle_for_installation() -> io::Result<()> {
+    let entries = match fs::read_dir(claims_directory()?) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or_default();
+        let daemon = name == DAEMON_CLAIM;
+        if !daemon && !(name.starts_with("window.") && name.ends_with(".lock")) {
+            continue;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(entry.path())?;
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.uid() != current_uid()
+            || meta.mode() & 0o077 != 0
+            || meta.nlink() != 1
+        {
+            return Err(io::Error::other(
+                "could not verify ownership of saved cagents data",
+            ));
+        }
+        match owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(_) => (),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let message = if daemon {
+                    "the cagents daemon is running and using saved work; stop it before installing or removing cagents"
+                } else {
+                    "a cagents window is using saved work; close it before installing or removing cagents"
+                };
+                return Err(io::Error::other(message));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn served_elsewhere(claim: &Path, lock: &Path) -> io::Result<Option<StateInUse>> {
     let Some(recorded) = read_path(claim)? else {
         return Ok(None);

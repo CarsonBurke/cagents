@@ -530,6 +530,8 @@ pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result
 pub struct DaemonAdmissionGuard {
     _launch: DaemonLaunch,
     _legacy: OwnedLock,
+    #[cfg(target_os = "macos")]
+    _publication: Option<OwnedLock>,
 }
 
 #[cfg(any(feature = "host", test))]
@@ -546,7 +548,14 @@ enum DaemonLaunch {
 impl DaemonAdmissionGuard {
     pub fn acquire() -> io::Result<Self> {
         let runtime = runtime_directory()?;
-        let launch = if let Some((file, descriptor)) = inherited_fence()? {
+        let inherited = inherited_fence()?;
+        #[cfg(target_os = "macos")]
+        let publication = if inherited.is_none() {
+            crate::install_guard::admit_darwin_installed_build()?
+        } else {
+            None
+        };
+        let launch = if let Some((file, descriptor)) = inherited {
             upgrade_fence(&file)?;
             // The clone keeps the description alive. Close this process's raw
             // reserved FD too, so daemon lifetime cannot extend the fence.
@@ -565,6 +574,8 @@ impl DaemonAdmissionGuard {
         Ok(Self {
             _launch: launch,
             _legacy: legacy,
+            #[cfg(target_os = "macos")]
+            _publication: publication,
         })
     }
 }
