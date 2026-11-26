@@ -1549,7 +1549,12 @@ impl Preparation {
                 "The original update request changed before acknowledged checkpoint binding".into(),
             );
         }
-        self.authority.checkpoint_hash = digest(&bytes);
+        self.bind_acknowledged_checkpoint(&bytes)?;
+        Ok(CapturedPreparation(self))
+    }
+
+    fn bind_acknowledged_checkpoint(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.authority.checkpoint_hash = digest(bytes);
         persist_bound_capture(
             &self.authority.checkpoint_path,
             &CapturedCensus {
@@ -1562,8 +1567,7 @@ impl Preparation {
                 census: self.authority.census.clone(),
                 windows: self.authority.windows.clone(),
             },
-        )?;
-        Ok(CapturedPreparation(self))
+        )
     }
 
     fn validate_continuity(&self) -> Result<(), String> {
@@ -1625,19 +1629,7 @@ impl CapturedPreparation {
             // this worker continuously owns its fences. Retain the full
             // original scope for the exact final bytes consumed by normal
             // restoration, including panes ended before that checkpoint.
-            persist_bound_capture(
-                &preparation.authority.checkpoint_path,
-                &CapturedCensus {
-                    producer: Some(CaptureProducer::Acknowledged {
-                        job: preparation.authority.job.clone(),
-                        request_hash: preparation.authority.job_request_hash.clone(),
-                    }),
-                    source: preparation.authority.source.clone(),
-                    checkpoint_hash: Some(digest(&bytes)),
-                    census: preparation.authority.census.clone(),
-                    windows: preparation.authority.windows.clone(),
-                },
-            )?;
+            preparation.bind_acknowledged_checkpoint(&bytes)?;
             return Ok(None);
         }
         if digest(&bytes) != preparation.authority.checkpoint_hash {
