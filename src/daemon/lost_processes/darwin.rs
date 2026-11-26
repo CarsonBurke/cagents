@@ -1,6 +1,6 @@
 use super::{PinnedProcess, Process, Survivor, command_for_display};
 use crate::process::table::{self, Record};
-use std::{io, os::unix::ffi::OsStrExt, path::Path, time::Duration};
+use std::{io, os::unix::ffi::OsStrExt, path::Path};
 
 /// A reused leader PID excludes its new group or session. An absent leader
 /// leaves the numeric boundary visible, but only the original leader can
@@ -140,45 +140,14 @@ fn scan(
 
 fn scan_records(
     pids: impl IntoIterator<Item = i32>,
-    mut read: impl FnMut(i32) -> io::Result<Option<Record>>,
+    read: impl FnMut(i32) -> io::Result<Option<Record>>,
     mut member: impl FnMut(&Record) -> Result<Option<Survivor>, String>,
 ) -> Result<Vec<Survivor>, String> {
+    let records =
+        table::settled_rows(pids, None, read).map_err(|(pid, error)| read_error(pid, error))?;
     let mut found = Vec::new();
-    let mut pending = Vec::new();
-    let mut visit = |pid| match read(pid) {
-        Ok(Some(record)) => {
-            found.extend(member(&record)?);
-            Ok(false)
-        }
-        Ok(None) => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
-        Err(error) => Err(read_error(pid, error)),
-    };
-    for pid in pids {
-        if visit(pid)? {
-            pending.push(pid);
-        }
-    }
-    // XNU can change a row between BSD, session, and Mach reads. Revisit
-    // only those rows, after a brief settle, instead of restarting the table
-    // among unrelated process churn. A row that remains uncertain refuses.
-    for delay in [5, 10, 20, 40] {
-        if pending.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(delay));
-        let mut still_pending = Vec::new();
-        for pid in pending {
-            if visit(pid)? {
-                still_pending.push(pid);
-            }
-        }
-        pending = still_pending;
-    }
-    if let Some(pid) = pending.first() {
-        return Err(format!(
-            "Cannot read process {pid}: process changed during census"
-        ));
+    for record in records {
+        found.extend(member(&record)?);
     }
     found.sort_by_key(|survivor| survivor.pid);
     Ok(found)

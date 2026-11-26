@@ -102,6 +102,68 @@ pub(crate) fn record(pid: libc::pid_t) -> io::Result<Record> {
     Err(process_changed())
 }
 
+/// Read a fixed list of candidate PIDs, retrying only rows whose BSD,
+/// session, and start observations disagreed. Pending rows receive fresh
+/// evidence. Unresolved rows and all other errors still refuse the census.
+#[cfg(feature = "host")]
+pub(crate) fn settled_rows<T>(
+    pids: impl IntoIterator<Item = libc::pid_t>,
+    deadline: Option<std::time::Instant>,
+    mut read: impl FnMut(libc::pid_t) -> io::Result<Option<T>>,
+) -> Result<Vec<T>, (libc::pid_t, io::Error)> {
+    use std::time::{Duration, Instant};
+
+    let mut found = Vec::new();
+    let mut pending = Vec::new();
+    let timed_out = |pid| (pid, io::Error::from(io::ErrorKind::TimedOut));
+    let mut visit = |pid| {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(timed_out(pid));
+        }
+        let result = read(pid);
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(timed_out(pid));
+        }
+        match result {
+            Ok(record) => {
+                found.extend(record);
+                Ok(false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err((pid, error)),
+        }
+    };
+    for pid in pids {
+        if visit(pid)? {
+            pending.push(pid);
+        }
+    }
+    for millis in [5, 10, 20, 40] {
+        let Some(&first) = pending.first() else {
+            break;
+        };
+        let pause = Duration::from_millis(millis);
+        let pause = deadline.map_or(pause, |deadline| {
+            pause.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        if pause.is_zero() {
+            return Err(timed_out(first));
+        }
+        std::thread::sleep(pause);
+        let mut still_pending = Vec::new();
+        for pid in pending {
+            if visit(pid)? {
+                still_pending.push(pid);
+            }
+        }
+        pending = still_pending;
+    }
+    match pending.first() {
+        Some(&pid) => Err((pid, process_changed())),
+        None => Ok(found),
+    }
+}
+
 #[cfg(any(feature = "host", feature = "ui"))]
 fn process_changed() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "process changed during census")

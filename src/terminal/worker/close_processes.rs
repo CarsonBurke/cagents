@@ -192,6 +192,19 @@ impl FrozenFamily {
                 {
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                if process.session != root.process.session
+                    && !family.targets.iter().any(|parent| {
+                        parent.identity.pid == process.parent
+                            && parent.identity.start <= process.start
+                            && matches!(parent.pidfd.reaped(), Ok(false))
+                    })
+                {
+                    // A deferred census row may name a descendant sampled
+                    // after a numeric parent PID was reused. An unreaped
+                    // stopped parent keeps its original PID across the read.
+                    return Err("Terminal job ancestry changed during close inspection".into());
+                }
                 let pidfd = match open_target(&process) {
                     Ok(pidfd) => pidfd,
                     Err(error)
@@ -473,9 +486,11 @@ fn threads_quiescent(process: &CloseProcess, deadline: Instant) -> Result<bool, 
     Ok(quiescent(after.state))
 }
 
+const CLOSE_INSPECTION_EXPIRED: &str = "Close inspection expired; stopped processes were released";
+
 fn check_deadline(deadline: Instant) -> Result<(), String> {
     if Instant::now() >= deadline {
-        Err("Close inspection expired; stopped processes were released".into())
+        Err(CLOSE_INSPECTION_EXPIRED.into())
     } else {
         Ok(())
     }
@@ -699,20 +714,25 @@ fn census_with(
     deadline: Instant,
     mut read_process: impl FnMut(libc::pid_t) -> io::Result<CloseProcess>,
 ) -> Result<Vec<CloseProcess>, String> {
-    let pids = crate::process::table::list_all().map_err(|error| error.to_string())?;
+    use crate::process::table;
+    let pids = table::list_all().map_err(|error| error.to_string())?;
     if pids.len() >= MAX_PROCESSES {
         return Err("Process census exceeded its safety bound".into());
     }
-    let mut processes = Vec::with_capacity(pids.len());
-    for pid in pids {
-        check_deadline(deadline)?;
-        match read_process(pid as libc::pid_t) {
-            Ok(process) => processes.push(process),
-            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {}
-            Err(error) => return Err(format!("Cannot inspect terminal jobs: {error}")),
-        }
-    }
-    Ok(processes)
+    let read = |pid| match read_process(pid) {
+        Ok(process) => Ok(Some(process)),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
+        Err(error) => Err(error),
+    };
+    table::settled_rows(pids.into_iter().map(|pid| pid as i32), Some(deadline), read).map_err(
+        |(_, error)| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                CLOSE_INSPECTION_EXPIRED.into()
+            } else {
+                format!("Cannot inspect terminal jobs: {error}")
+            }
+        },
+    )
 }
 
 fn process_family(
