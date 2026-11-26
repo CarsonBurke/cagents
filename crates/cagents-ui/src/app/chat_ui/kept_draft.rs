@@ -11,7 +11,14 @@
 //! [`KeptChatDraft::RETENTION_MS`]. Only what the reader confirmed a close
 //! discards is not kept.
 use super::*;
-use crate::model::{KeptChatDraft, SentAfter};
+use crate::model::{ConfirmedQueueSource, KeptChatDraft, SentAfter};
+
+fn same_queue_conversation(proof: &ConfirmedQueueSource, recipient: &chat::Session) -> bool {
+    proof.source.launch.provider == recipient.launch.provider
+        && proof.confirmed_session.is_some()
+        && proof.confirmed_session == recipient.launch.session_id
+        && proof.source.launch.recipe.working_directory == recipient.launch.recipe.working_directory
+}
 
 /// What the reader confirmed a close discards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,13 +51,34 @@ impl Cagents {
         card: CardId,
         loss: Option<ConfirmedLoss>,
     ) -> KeptChatDraft {
-        if loss == Some(ConfirmedLoss::Draft)
-            || !matches!(
-                self.card_state(card).map(|state| &state.kind),
-                Some(CardKind::Chat(_))
-            )
-        {
+        if !matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Chat(_))
+        ) {
             return KeptChatDraft::default();
+        }
+        let mut queue = self.chat_waiting_to_save(card);
+        // A shared view may still mark the physically retired origin open.
+        // Its checked final queue remains separate from an observed queue.
+        let confirmed = self.durable.kept_chat_drafts.get(&card).and_then(|draft| {
+            if queue.restored.is_none() {
+                queue.restored.clone_from(&draft.restored_queue);
+            }
+            let proof = draft.confirmed_waiting.as_ref()?;
+            queue.messages.clone_from(&draft.waiting);
+            Some(proof.clone())
+        });
+        if loss == Some(ConfirmedLoss::Draft) {
+            return KeptChatDraft {
+                waiting: if confirmed.is_some() {
+                    queue.messages
+                } else {
+                    Vec::new()
+                },
+                confirmed_waiting: confirmed,
+                restored_queue: queue.restored,
+                ..KeptChatDraft::default()
+            };
         }
         let runtime = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
@@ -72,7 +100,9 @@ impl Cagents {
         KeptChatDraft {
             text,
             attachments,
-            waiting: self.chat_waiting_to_save(card).messages,
+            waiting: queue.messages,
+            confirmed_waiting: confirmed,
+            restored_queue: queue.restored,
             sending: sending.is_some(),
             sent_after: sending.unwrap_or_default(),
             closed_at_unix_ms: 0,
@@ -102,7 +132,7 @@ impl Cagents {
             closed_at_unix_ms: unix_millis(),
             ..self.draft_to_keep(card, loss)
         };
-        if draft.is_empty() {
+        if !draft.has_saved_data() {
             if self.durable.kept_chat_drafts.contains_key(&card) {
                 Arc::make_mut(&mut self.durable)
                     .kept_chat_drafts
@@ -116,14 +146,255 @@ impl Cagents {
         KeptChatDraft::retain_recent(drafts, now);
     }
 
+    /// Replace the original pane's last observed queue with the exact
+    /// stopped actor's final queue. Keep it with the closed draft while
+    /// its replacement is still being prepared or after a refusal.
+    pub(in crate::app) fn keep_reopened_queue(
+        &mut self,
+        closed: CardId,
+        source: &chat::Session,
+        queue: &chat::ExitedQueue,
+    ) -> bool {
+        let key = completed_queue_key(source.id, &queue.messages);
+        if key.is_some_and(|key| self.returned_chat_queue(closed, key)) {
+            return false;
+        }
+        let open_origin = if let Some(card) = self.card_state(closed) {
+            if !matches!(&card.kind, CardKind::Chat(current) if current == source) {
+                return false;
+            }
+            card.existence.is_open()
+        } else {
+            false
+        };
+        let saved = self.durable.kept_chat_drafts.get(&closed);
+        let live_receipt = open_origin
+            .then(|| self.chat_waiting_to_save(closed).restored)
+            .flatten();
+        let receipt = saved
+            .and_then(|draft| draft.restored_queue.as_ref())
+            .or(live_receipt.as_ref())
+            .filter(|receipt| receipt.source == source.id);
+        let waiting = queue
+            .messages
+            .iter()
+            .filter(|message| !receipt.is_some_and(|receipt| receipt.contains(&message.id)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_waiting = !waiting.is_empty();
+        if saved.is_none() && !has_waiting {
+            return false;
+        }
+        let confirmed = has_waiting.then(|| {
+            Box::new(ConfirmedQueueSource {
+                source: source.clone(),
+                account_scope: queue.account_scope,
+                confirmed_session: queue.confirmed_session.clone(),
+                fingerprint: key.map(|key| key.1),
+            })
+        });
+        let now = unix_millis();
+        let drafts = &mut Arc::make_mut(&mut self.durable).kept_chat_drafts;
+        let draft = drafts.entry(closed).or_default();
+        draft.confirmed_waiting = confirmed;
+        draft.waiting = waiting;
+        draft.closed_at_unix_ms = now;
+        KeptChatDraft::retain_recent(drafts, now);
+        has_waiting
+    }
+
+    /// Only an independently captured account of the current running
+    /// recipient can claim an exact closed provider's final queue.
+    pub(in crate::app) fn restore_attested_reopened_queues(
+        &mut self,
+        winner: CardId,
+        recipient: &chat::Session,
+        account: [u8; 32],
+    ) -> bool {
+        if self.reopen_pending(winner)
+            || !self.card_state(winner).is_some_and(|card| {
+                card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Chat(current) if current == recipient)
+            })
+        {
+            return false;
+        }
+        let mut waiting: Vec<_> = self
+            .durable
+            .kept_chat_drafts
+            .iter()
+            .filter_map(|(closed, draft)| {
+                let proof = draft.confirmed_waiting.as_ref()?;
+                if *closed == winner
+                    || draft.waiting.is_empty()
+                    || proof
+                        .receipt_key()
+                        .is_some_and(|key| self.returned_chat_queue(*closed, key))
+                    || proof.account_scope != Some(account)
+                    || !same_queue_conversation(proof, recipient)
+                    || self
+                        .card_state(*closed)
+                        .is_some_and(|card| card.existence.is_open())
+                {
+                    return None;
+                }
+                Some((
+                    draft.closed_at_unix_ms,
+                    *closed,
+                    proof.source.id,
+                    proof.receipt_key(),
+                    draft.waiting.clone(),
+                ))
+            })
+            .collect();
+        // Each recovered queue is prepended to the composer. Process the
+        // newer queues first so the older ones are still read first.
+        waiting.sort_unstable_by_key(|(time, card, ..)| std::cmp::Reverse((*time, *card)));
+        let mut changed = false;
+        for (_, closed, source, key, queue) in waiting {
+            changed |=
+                self.return_closed_exit_queue(closed, source, key, winner, recipient.id, &queue);
+        }
+        changed
+    }
+
+    pub(in crate::app) fn has_attested_queue_candidate(&self, recipient: &chat::Session) -> bool {
+        self.durable.kept_chat_drafts.iter().any(|(closed, draft)| {
+            !draft.waiting.is_empty()
+                && draft.confirmed_waiting.as_ref().is_some_and(|proof| {
+                    !proof
+                        .receipt_key()
+                        .is_some_and(|key| self.returned_chat_queue(*closed, key))
+                        && proof.account_scope.is_some()
+                        && same_queue_conversation(proof, recipient)
+                })
+        })
+    }
+
+    pub(in crate::app) fn returned_chat_queue(&self, origin: CardId, key: ExitedQueueKey) -> bool {
+        self.durable
+            .returned_chat_queues
+            .get(&origin)
+            .is_some_and(|queues| queues.contains_key(&key))
+    }
+
+    pub(super) fn checkpoint_returned_chat_queue(
+        &mut self,
+        origin: CardId,
+        key: ExitedQueueKey,
+        recipient: CardId,
+    ) {
+        let queues = Arc::make_mut(&mut self.durable)
+            .returned_chat_queues
+            .entry(origin)
+            .or_default();
+        if let std::collections::btree_map::Entry::Vacant(entry) = queues.entry(key) {
+            entry.insert(Some(recipient));
+            self.chat_ui.pending_queue_checkpoints.insert((origin, key));
+        }
+    }
+
+    pub(in crate::app) fn acknowledge_returned_chat_queue(
+        &mut self,
+        origin: CardId,
+        key: ExitedQueueKey,
+    ) {
+        self.chat_ui
+            .pending_queue_checkpoints
+            .remove(&(origin, key));
+        Arc::make_mut(&mut self.durable)
+            .returned_chat_queues
+            .entry(origin)
+            .or_default()
+            .insert(key, None);
+    }
+
+    fn return_closed_exit_queue(
+        &mut self,
+        closed: CardId,
+        source: TerminalId,
+        key: Option<ExitedQueueKey>,
+        winner: CardId,
+        destination: TerminalId,
+        queue: &[chat::QueuedMessage],
+    ) -> bool {
+        if key.is_some_and(|key| self.returned_chat_queue(closed, key)) {
+            return false;
+        }
+        let kept_receipt = self
+            .durable
+            .kept_chat_drafts
+            .get(&closed)
+            .and_then(|draft| draft.restored_queue.as_ref())
+            .filter(|receipt| receipt.source == source);
+        let waiting = self.chat_waiting_to_save(winner);
+        let messages = queue
+            .iter()
+            .filter(|message| {
+                !kept_receipt.is_some_and(|receipt| receipt.contains(&message.id))
+                    && !waiting.messages.iter().any(|held| held.id == message.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let runtime = match self.cards.get_mut(&winner) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime),
+            _ => self.chat_ui.parked.get_mut(&winner),
+        };
+        if let Some(runtime) = runtime {
+            if runtime.session.id != destination {
+                return false;
+            }
+            let snapshot = runtime.latest_snapshot();
+            runtime.restore_confirmed_queue(&snapshot, &messages);
+        } else {
+            self.restore_saved_exit_queue(winner, destination, &messages);
+        }
+
+        if let Some(key) = key {
+            self.checkpoint_returned_chat_queue(closed, key, winner);
+        }
+        let now = unix_millis();
+        let drafts = &mut Arc::make_mut(&mut self.durable).kept_chat_drafts;
+        if !queue.is_empty() || drafts.contains_key(&closed) {
+            let draft = drafts.entry(closed).or_default();
+            draft.waiting.clear();
+            draft.confirmed_waiting = None;
+            let mut receipt = draft
+                .restored_queue
+                .take()
+                .filter(|receipt| receipt.source == source)
+                .unwrap_or_else(|| RestoredQueue {
+                    source,
+                    ids: Vec::new(),
+                });
+            for message in queue.iter().filter(|message| message.editable) {
+                receipt.remember(&message.id);
+            }
+            draft.restored_queue = (!receipt.ids.is_empty()).then_some(receipt);
+            if draft.closed_at_unix_ms == 0 {
+                draft.closed_at_unix_ms = now;
+            }
+            KeptChatDraft::retain_recent(drafts, now);
+        }
+        true
+    }
+
     /// Takes back the draft kept when `closed` closed, to be moved with
     /// [`Self::move_chat_draft`] into the card reopening its conversation.
     /// Whether there was one.
     pub(in crate::app) fn reclaim_kept_draft(&mut self, closed: CardId) -> bool {
+        self.reclaim_kept_draft_mode(closed, false)
+    }
+
+    pub(in crate::app) fn reclaim_kept_draft_for_actor(&mut self, closed: CardId) -> bool {
+        self.reclaim_kept_draft_mode(closed, true)
+    }
+
+    fn reclaim_kept_draft_mode(&mut self, closed: CardId, await_recipient: bool) -> bool {
         if !self.durable.kept_chat_drafts.contains_key(&closed) {
             return self.reclaim_returned_unsent(closed);
         }
-        let Some(draft) = Arc::make_mut(&mut self.durable)
+        let Some(mut draft) = Arc::make_mut(&mut self.durable)
             .kept_chat_drafts
             .remove(&closed)
         else {
@@ -131,6 +402,28 @@ impl Cagents {
         };
         if unix_millis().saturating_sub(draft.closed_at_unix_ms) > KeptChatDraft::RETENTION_MS {
             return false;
+        }
+        if draft
+            .confirmed_waiting
+            .as_ref()
+            .and_then(|proof| proof.receipt_key())
+            .is_some_and(|key| self.returned_chat_queue(closed, key))
+        {
+            draft.confirmed_waiting = None;
+            draft.waiting.clear();
+        }
+        let mut checkpoint = KeptChatDraft {
+            restored_queue: draft.restored_queue.clone(),
+            closed_at_unix_ms: draft.closed_at_unix_ms,
+            ..KeptChatDraft::default()
+        };
+        let mut final_queue = draft.confirmed_waiting.take();
+        if await_recipient && final_queue.is_some() {
+            // Preparation alone does not attest the account this successor
+            // will open. Keep the final queue reachable from its origin.
+            checkpoint.waiting = std::mem::take(&mut draft.waiting);
+            checkpoint.confirmed_waiting = final_queue.take();
+            draft.restored_queue = None;
         }
         if !draft.text.is_empty() {
             self.chat_ui.drafts.insert(closed, draft.text);
@@ -145,17 +438,35 @@ impl Cagents {
                 .draft_attachments
                 .insert(closed, draft.attachments);
         }
-        if !draft.waiting.is_empty() {
-            // Saved with the reopened card like any queue, until it connects
-            // and can tell what the conversation already has.
+        if let Some(receipt) = draft.restored_queue {
+            self.chat_ui.restored_queues.insert(closed, receipt);
+        }
+        if !await_recipient && let Some(proof) = final_queue {
+            // Fold the checked queue into the inert draft before inserting
+            // the new card saves it. The same save records the old IDs at
+            // their origin, even though the inert draft has no session yet.
+            self.restore_saved_exit_queue(closed, proof.source.id, &draft.waiting);
+            checkpoint.restored_queue = self.chat_ui.restored_queues.remove(&closed);
+            if let Some(key) = proof.receipt_key() {
+                self.checkpoint_returned_chat_queue(closed, key, closed);
+            }
+            checkpoint.closed_at_unix_ms = unix_millis();
+        } else if !draft.waiting.is_empty() {
+            // An observed queue still needs the attached conversation to
+            // tell which messages it already has.
             self.chat_ui.waiting.insert(
                 closed,
                 SavedQueue {
-                    host: None,
                     messages: draft.waiting,
                     stopped: true,
+                    ..SavedQueue::default()
                 },
             );
+        }
+        if checkpoint.has_saved_data() {
+            Arc::make_mut(&mut self.durable)
+                .kept_chat_drafts
+                .insert(closed, checkpoint);
         }
         true
     }
@@ -178,11 +489,24 @@ impl Cagents {
         self.chat_ui.drafts.contains_key(&closed)
             || self.chat_ui.draft_attachments.contains_key(&closed)
             || self.chat_ui.waiting.contains_key(&closed)
+            || self.chat_ui.restored_queues.contains_key(&closed)
             || self.chat_ui.sending_on_close.contains_key(&closed)
     }
 
     /// Gives `card` the unsent draft `source` holds without a runtime.
     pub(in crate::app) fn move_chat_draft(&mut self, source: CardId, card: CardId) {
+        if self.durable.returned_chat_queues.contains_key(&source) {
+            let queues = Arc::make_mut(&mut self.durable)
+                .returned_chat_queues
+                .get_mut(&source)
+                .expect("the draft's exact history checkpoint");
+            for recipient in queues
+                .values_mut()
+                .filter(|target| **target == Some(source))
+            {
+                *recipient = Some(card);
+            }
+        }
         if let Some(attachments) = self.chat_ui.draft_attachments.remove(&source) {
             self.chat_ui.draft_attachments.insert(card, attachments);
         }
@@ -191,6 +515,12 @@ impl Cagents {
         }
         if let Some(after) = self.chat_ui.sending_on_close.remove(&source) {
             self.chat_ui.sending_on_close.insert(card, after);
+        }
+        if let Some(receipt) = self.chat_ui.restored_queues.remove(&source) {
+            self.chat_ui.restored_queues.insert(card, receipt);
+        }
+        if let Some(notice) = self.chat_ui.restored_draft_queues.remove(&source) {
+            self.chat_ui.restored_draft_queues.insert(card, notice);
         }
         // Only messages no provider holds go with the draft; another
         // card's queue stays its own.

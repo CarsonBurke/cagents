@@ -582,6 +582,84 @@ fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_pro
 }
 
 #[test]
+fn verified_provider_exit_keeps_complete_queue_outside_the_snapshot() {
+    struct QueueFixture(crate::chat::QueuedMessage);
+    impl Adapter for QueueFixture {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::Ready(true),
+                    Event::QueueChanged(vec![crate::chat::QueuedMessage::new(
+                        self.0.id.clone(),
+                        self.0.text.clone(),
+                    )]),
+                ],
+                ..Default::default()
+            })
+        }
+
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Ok(Step {
+                writes: vec![serde_json::json!({"exit": true})],
+                ..Default::default()
+            })
+        }
+
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+
+        fn recovery_queue(&self) -> Option<Vec<crate::chat::QueuedMessage>> {
+            Some(vec![self.0.clone()])
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let exact = crate::chat::QueuedMessage {
+        id: "held-input".into(),
+        text: "Keep this longer λ follow-up verbatim.\n".repeat(700),
+        editable: true,
+        delivery: crate::chat::QueueDelivery::NextStep,
+        attachments: Vec::new(),
+    };
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), "IFS= read -r input".into()],
+        working_directory: directory.path().into(),
+        environment: BTreeMap::new(),
+    };
+    let mut adapter = QueueFixture(exact.clone());
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+    assert!(handle.exited_recovery_queue().is_none());
+    handle.command(Command::Interrupt).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !handle.is_completed() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(
+        handle.is_completed(),
+        "the fixture provider must exit on its own"
+    );
+    assert_eq!(
+        handle.exited_recovery_queue().as_deref(),
+        Some(&[exact][..])
+    );
+    let final_snapshot = handle.snapshot(None).unwrap();
+    assert!(final_snapshot.exited);
+    assert_eq!(final_snapshot.queued_messages.len(), 1);
+    assert!(!final_snapshot.queued_messages[0].editable);
+}
+
+#[test]
 fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure() {
     struct FinalFrame {
         run: Option<crate::model::RunId>,

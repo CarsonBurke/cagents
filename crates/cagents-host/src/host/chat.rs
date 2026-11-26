@@ -25,6 +25,7 @@ pub(super) use owned_listener::{
 };
 mod paired_close;
 pub(in crate::host) mod pane_start;
+pub(super) mod queue_transfer;
 pub(super) mod retained_actor;
 #[cfg(test)]
 mod retained_actor_tests;
@@ -683,7 +684,23 @@ fn changed_for_instance(
     let completed = matches!(update, Update::Observed { .. }) && record.handle.is_completed();
     let released = completed && !record.handle.owns_work();
     let mobile_ended = released && !record.returning_terminal;
+    let queue_ended =
+        (completed && !record.returning_terminal && !record.handle.is_read_only_history())
+            .then(|| record.current_session());
     for (&client, &visible) in &record.subscribers {
+        if let Some(source) = &queue_ended
+            && let Some(delivery) = clients.get(&client)
+        {
+            let _ = delivery.push(ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: proof.clone(),
+                message: ServerMessage::ChatQueueEnded {
+                    source: source.clone(),
+                    execution: record.execution_instance,
+                },
+            });
+        }
         let message = match &update {
             &Update::Activity { state, generation } => ServerMessage::ChatActivity {
                 chat_id: id,
@@ -2710,7 +2727,7 @@ fn start_publishing(
     if terminate_source && source.is_none() {
         return Err(error("Source termination requires an exact host proof"));
     }
-    let source_handle = {
+    let (source_handle, replacing) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_unreserved_terminals(&state, &session)?;
         if state.shutting_down {
@@ -2722,6 +2739,7 @@ fn start_publishing(
                 "This chat already returned to terminal; reattach and complete that handoff instead of starting another writer",
             ));
         }
+        let mut replacing = None;
         let recovering = if let Some(record) = state.chats.get(&session.id) {
             if record.returning_terminal {
                 if record.session.launch.provider != session.launch.provider
@@ -2757,6 +2775,12 @@ fn start_publishing(
                 return Err(error(
                     "Explicit recovery must retain the exact closed chat identity",
                 ));
+            }
+            if record.handle.is_completed()
+                && record.handle.actor_identity().is_none()
+                && !record.handle.is_read_only_history()
+            {
+                replacing = Some((CloseTarget::from_record(record), record.current_session()));
             }
             true
         } else {
@@ -2847,9 +2871,19 @@ fn start_publishing(
         session.proof = Some(state.proof().clone());
         capacity::Reservation::install(&mut admission, host, &mut state, &session)?;
         state.inventory_changed();
-        source_handle
+        (source_handle, replacing)
     };
     let result = (|| {
+        if let Some((previous, current)) = &replacing {
+            previous.require_current(host)?;
+            archive_completed_queue(
+                host,
+                &previous.source,
+                current.clone(),
+                previous.instance,
+                &previous.handle,
+            )?;
+        }
         let mut pending_fresh = None;
         if let Some(handle) = source_handle {
             let (current_process, current_recipe, _, _, current_fresh, current_execution) =
@@ -3204,8 +3238,25 @@ fn start_publishing(
             let _ = record.handle.close();
             return Err(refusal);
         }
+        if let Some((previous, _)) = &replacing
+            && state
+                .chats
+                .get(&id)
+                .is_none_or(|record| !previous.matches(record))
+        {
+            drop(state);
+            let _ = record.handle.close();
+            return Err(retryable_unavailable(
+                "The completed chat changed before its exact replacement was installed",
+            ));
+        }
         let installed_handle = record.handle.clone();
         let retired = state.chats.insert(id, record);
+        if let Some(previous) = &retired {
+            state
+                .exited_queue_archive
+                .forget_resident(previous.execution_instance);
+        }
         state.chat_added(id);
         if let Some(context) = &execution {
             context.installed();
@@ -4114,6 +4165,370 @@ fn chat_command(
     Ok(ServerResponse::Accepted)
 }
 
+fn prepare_resume(
+    host: &SharedHost,
+    source: Session,
+    queue: Option<&mut Option<chat::ExitedQueue>>,
+) -> Result<Session, ProtocolError> {
+    if let Some(session) = floor_history::prepare_resume(host, &source).map_err(unavailable)? {
+        return Ok(session);
+    }
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    let unnamed = source.has_unnamed_retained_claude_actor();
+    if !source.has_valid_native_continuity() || (source.launch.session_id.is_none() && !unnamed) {
+        return Err(error("Saved conversation has invalid continuity evidence"));
+    }
+    if let Some(session) =
+        retained_actor::prepare_failed_start_for_start(host, &source).map_err(setup_error)?
+    {
+        return Ok(session);
+    }
+    if let Some(session) = capacity::prepare_saved_history(host, &source)? {
+        return Ok(session);
+    }
+    // A card still attached to an actor whose provider exited under
+    // this daemon resumes the same way as one a daemon stop ended:
+    // the exited actor is retired as a stop first, so the checks
+    // below find its verified retirement rather than a present owner.
+    retained_actor::finish_exited_attachment_for_start(host, &source).map_err(setup_error)?;
+    // An unnamed pane resumes the conversation its ended actors
+    // confirmed, through the same checks as a named one; when they
+    // confirmed none, every actor's end is already proved and the
+    // pane starts a conversation in place.
+    let ended = source.clone();
+    let mut source = source;
+    let mut unconfirmed = false;
+    if unnamed {
+        match retained_resume::unnamed_conversation_for_start(host, &source).map_err(setup_error)? {
+            Some(conversation) => source.launch.session_id = Some(conversation),
+            None => unconfirmed = true,
+        }
+    }
+    // Classify retained Claude execution before generic discovery:
+    // an exited helper may still await its original parent's wait.
+    // Errors/unproved exit never fall back to treating it as live.
+    let retirement = if unconfirmed {
+        retained_resume::ResumeRetirement::Abandoned
+    } else if source.launch.provider == Provider::Claude {
+        retained_resume::inspect_resume_retirement_for_start(host, &source).map_err(setup_error)?
+    } else {
+        retained_resume::ResumeRetirement::Unclassified
+    };
+    // A helper whose daemon exited between closing its provider and
+    // retiring it finishes that exit here, then classifies as retired.
+    let retirement = if !retirement.is_classified()
+        && retained_actor::finish_interrupted_exit_of_for_start(host, &ended)
+            .map_err(setup_error)?
+    {
+        retained_resume::inspect_resume_retirement_for_start(host, &source).map_err(setup_error)?
+    } else {
+        retirement
+    };
+    if let Some(queue) = queue {
+        *queue = if unconfirmed
+            && ended
+                .proof
+                .as_ref()
+                .is_some_and(|saved| saved.boot_id == proof.boot_id)
+        {
+            // Failure to read optional input must not block the independently
+            // proved start of a conversation that Claude never confirmed.
+            retained_actor::unconfirmed_exited_queue(host, &ended, &proof)
+                .unwrap_or_else(|error| {
+                    tracing::debug!(session = %ended.id, %error, "could not replay the final queued messages");
+                    None
+                })
+        } else {
+            retirement.final_queue(&ended)
+        };
+    }
+    // A present owner must be restored, not replaced. Missing evidence
+    // is never proof of a completed close; a runtime record left by a
+    // proved retired or abandoned actor is not a present owner.
+    if !retirement.is_classified() && has_native_owner(&ended)? {
+        return Ok(ended);
+    }
+    if prepare_shared_codex_join(host, &source)? {
+        return Ok(source);
+    }
+    // A kernel boot change proves every process from the saved boot
+    // is gone. Unlike missing runtime files within the same boot, it
+    // authorizes an exact disk resume without its ephemeral receipt.
+    let previous_boot = source.launch.provider != Provider::Codex
+        && source
+            .proof
+            .as_ref()
+            .is_some_and(|previous| previous.is_complete() && previous.boot_id != proof.boot_id);
+    let unstarted = if previous_boot || unconfirmed {
+        None
+    } else {
+        retained_resume::unstarted_for_start(host, &source).map_err(setup_error)?
+    };
+    // A successor no lineage records here resumes on its own, as any
+    // conversation reopened without an owner to take over.
+    if unstarted == Some(retained_resume::Unstarted::Unrecorded) {
+        let mut session = source;
+        session.id = TerminalId::new();
+        return Ok(session);
+    }
+    let closed =
+        if previous_boot || unconfirmed || unstarted == Some(retained_resume::Unstarted::InLineage)
+        {
+            true
+        } else if source.launch.provider == Provider::Claude {
+            retained_resume::prepare_resume_verified_for_start(host, &source, retirement.verified())
+                .map_err(setup_error)?
+        } else {
+            // An owner lost without its receipt was closed all the same,
+            // proved while no start or close can take its allocation.
+            chat::native_holder::closed_source(&source, &proof)
+                .map_err(retryable_unavailable)?
+                .is_some_and(|(_, paired_closed)| paired_closed)
+                || match reserve_unhosted_allocation(host, &source, None) {
+                    Ok(_fence) => {
+                        require_ended_codex_execution(host, &source, &proof.boot_id).map_err(
+                            |failure| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::TerminalUnavailable,
+                                    failure.to_string(),
+                                    source.launch.provider == Provider::Codex,
+                                )
+                            },
+                        )?;
+                        true
+                    }
+                    Err(()) => false,
+                }
+        };
+    if !closed {
+        return Err(retryable_unavailable(
+            "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
+        ));
+    }
+    // A changed boot proves the old owner is gone, not that the
+    // recorded launch still selects the account home it ran under.
+    if previous_boot && source.launch.provider == Provider::Claude {
+        retained_resume::ensure_prior_boot_account_for_start(host, &source).map_err(setup_error)?;
+    }
+    // The old process is proved ended, as after a daemon stop: its
+    // authority and unfinished runs end and its agent stays open, so
+    // the successor's start can take the agent over.
+    super::agent_execution::stopped(host, &ended).map_err(retryable_unavailable)?;
+    let predecessor = source.id;
+    let root = source
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.recovery_origin);
+    let mut session = source;
+    session.reset_owned_codex_listener();
+    session.id = TerminalId::new();
+    session.proof = None;
+    session.terminal = None;
+    // The old owner's close is proved, so the reopened conversation
+    // takes over its lineage, unless another of its sessions runs.
+    if let Ok(registry) = super::agent_execution::registry(host) {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .succeed(session.id, predecessor, root, |members| {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .any_other_live(members, predecessor)
+            })
+            .map_err(retryable_unavailable)?;
+    }
+    Ok(session)
+}
+
+fn queue_recipient_scope(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<Option<[u8; 32]>, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(session.proof.as_ref(), state.proof())?;
+    let Some(record) = state.chats.get(&session.id) else {
+        return Ok(None);
+    };
+    if session.launch.provider != Provider::Claude
+        || record.current_session() != *session
+        || record.returning_terminal
+        || !record.handle.is_ready()
+        || record.handle.is_completed()
+        || session.launch.session_id.is_none()
+        || record.handle.confirmed_session_id() != session.launch.session_id
+    {
+        return Ok(None);
+    }
+    Ok(record
+        .handle
+        .launch_account_scope()
+        .ok()
+        .map(crate::account::scope::LaunchAccountScope::queue_fingerprint))
+}
+
+fn capture_exited_queue(handle: &Handle) -> Option<chat::ExitedQueue> {
+    let messages = handle.exited_recovery_queue()?;
+    Some(chat::ExitedQueue {
+        messages,
+        confirmed_session: handle.confirmed_session_id(),
+        account_scope: handle
+            .launch_account_scope()
+            .ok()
+            .map(crate::account::scope::LaunchAccountScope::queue_fingerprint),
+    })
+}
+
+fn archive_completed_queue(
+    host: &SharedHost,
+    original: &Session,
+    current: Session,
+    execution: uuid::Uuid,
+    handle: &Handle,
+) -> Result<(), ProtocolError> {
+    if handle.actor_identity().is_some() || handle.is_read_only_history() {
+        return Ok(());
+    }
+    let archive = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(&state.exited_queue_archive)
+    };
+    if archive.returned(execution) {
+        return Ok(());
+    }
+    let Some(queue) = capture_exited_queue(handle).filter(|queue| !queue.messages.is_empty())
+    else {
+        return Ok(());
+    };
+    let bytes = queue_transfer::encode(&queue)?;
+    let identity =
+        chat::exited_queue_fingerprint(queue.messages.iter().map(|message| message.id.as_str()));
+    archive.retain(original.clone(), current, execution, identity, &bytes)
+}
+
+fn completed_queue_owner(record: &Record, source: &Session, execution: Option<uuid::Uuid>) -> bool {
+    execution.is_none_or(|instance| instance == record.execution_instance)
+        && (&record.session == source || &record.current_session() == source)
+        && record.handle.is_completed()
+        && !record.handle.is_read_only_history()
+        && !record.returning_terminal
+        && !record.handle.is_close_only()
+}
+
+fn commit_completed_queue(
+    host: &SharedHost,
+    source: &Session,
+    queue_ids: Vec<String>,
+) -> Result<(), ProtocolError> {
+    if queue_ids.is_empty() || queue_ids.len() > chat::QueuedMessage::LIMIT {
+        return Err(error("The exact returned queue IDs are required"));
+    }
+    let identity = chat::exited_queue_fingerprint(queue_ids.iter().map(String::as_str));
+    let (verified, archive) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(source.proof.as_ref(), state.proof())?;
+        let verified = state
+            .chats
+            .get(&source.id)
+            .filter(|record| completed_queue_owner(record, source, None))
+            .map(|record| (record.execution_instance, record.handle.clone()));
+        (verified, Arc::clone(&state.exited_queue_archive))
+    };
+    let resident = verified.filter(|(instance, handle)| {
+        !archive.returned(*instance)
+            && handle.exited_recovery_queue().is_some_and(|queue| {
+                chat::exited_queue_fingerprint(queue.iter().map(|message| message.id.as_str()))
+                    == identity
+            })
+    });
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(source.proof.as_ref(), state.proof())?;
+    let execution = resident.and_then(|(instance, handle)| {
+        state
+            .chats
+            .get(&source.id)
+            .filter(|record| {
+                completed_queue_owner(record, source, Some(instance))
+                    && record.handle.same_attachment(&handle)
+            })
+            .map(|_| instance)
+    });
+    // Keep this exact active-owner mark ordered with remove_chat. Archive
+    // writes are off this lock and check the mark before publication.
+    archive.commit(source, identity, execution);
+    Ok(())
+}
+
+fn completed_queue_page(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    execution: Option<uuid::Uuid>,
+) -> Result<Option<crate::terminal_ipc::ExitedQueuePage>, ProtocolError> {
+    // Capture the finished worker while holding the host's exact ownership
+    // and descriptor. A helper receipt may require I/O, so read it outside
+    // HostState, then require the same owner before binding its bytes to us.
+    let current = |record: &&Record| completed_queue_owner(record, source, execution);
+    let (owner, archive) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(source.proof.as_ref(), state.proof())?;
+        let owner = state.chats.get(&source.id);
+        let resident = owner.filter(current);
+        if owner.is_some()
+            && resident.is_none()
+            && execution.is_none_or(|execution| {
+                owner.is_some_and(|record| record.execution_instance == execution)
+            })
+        {
+            return Ok(None);
+        }
+        (
+            resident.map(|record| (record.execution_instance, record.handle.clone())),
+            Arc::clone(&state.exited_queue_archive),
+        )
+    };
+    let bytes = match &owner {
+        Some((instance, handle)) if !archive.returned(*instance) => capture_exited_queue(handle)
+            .map(|queue| queue_transfer::encode(&queue))
+            .transpose()?,
+        Some(_) => None,
+        None => archive.read(source, execution)?,
+    };
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(source.proof.as_ref(), state.proof())?;
+    let same_source = match &owner {
+        Some((instance, handle)) => {
+            state
+                .chats
+                .get(&source.id)
+                .filter(current)
+                .is_some_and(|record| {
+                    record.execution_instance == *instance
+                        && record.handle.same_attachment(handle)
+                        && !archive.returned(*instance)
+                })
+        }
+        None => state.chats.get(&source.id).is_none_or(|record| {
+            execution.is_some_and(|execution| record.execution_instance != execution)
+        }),
+    };
+    if state.shutting_down || !same_source {
+        return Err(retryable_unavailable(
+            "Native ownership changed while its exact queued input was loading",
+        ));
+    }
+    state
+        .exited_queue_transfers
+        .begin(client, source.id, bytes, Instant::now())
+        .map(Some)
+}
+
 fn process_inner(
     host: &SharedHost,
     client: ClientId,
@@ -4144,174 +4559,54 @@ fn process_inner(
             dry_run,
         }),
         ClientRequest::ChatPrepareResume { source } => {
-            if let Some(session) =
-                floor_history::prepare_resume(host, &source).map_err(unavailable)?
-            {
-                return Ok(ServerResponse::ChatResumePrepared { session });
-            }
-            let proof = host
+            let session = prepare_resume(host, source, None)?;
+            Ok(ServerResponse::ChatResumePrepared { session })
+        }
+        ClientRequest::ChatPrepareResumeWithQueue { source } => {
+            let id = source.id;
+            let mut queued = None;
+            let prepared = prepare_resume(host, source, Some(&mut queued));
+            let bytes = queued.as_ref().map(queue_transfer::encode).transpose()?;
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let transfers = &mut state.exited_queue_transfers;
+            transfers.remove(client);
+            let queued = bytes
+                .map(|bytes| transfers.begin(client, id, bytes, Instant::now()))
+                .transpose()?;
+            Ok(ServerResponse::ChatResumePreparedWithQueue {
+                source: id,
+                queued,
+                prepared,
+            })
+        }
+        ClientRequest::ChatCommitExitedQueue { source, queue_ids } => {
+            commit_completed_queue(host, &source, queue_ids)?;
+            Ok(ServerResponse::Accepted)
+        }
+        ClientRequest::ChatReadExitedQueue { source, execution } => {
+            let queued = completed_queue_page(host, client, &source, execution)?;
+            Ok(ServerResponse::ChatExitedQueue {
+                source: source.id,
+                queued,
+            })
+        }
+        ClientRequest::ChatReadExitedQueuePage {
+            source,
+            receipt,
+            offset,
+        } => {
+            let page = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .proof()
-                .clone();
-            let unnamed = source.has_unnamed_retained_claude_actor();
-            if !source.has_valid_native_continuity()
-                || (source.launch.session_id.is_none() && !unnamed)
-            {
-                return Err(error("Saved conversation has invalid continuity evidence"));
-            }
-            if let Some(session) = retained_actor::prepare_failed_start_for_start(host, &source)
-                .map_err(setup_error)?
-            {
-                return Ok(ServerResponse::ChatResumePrepared { session });
-            }
-            if let Some(session) = capacity::prepare_saved_history(host, &source)? {
-                return Ok(ServerResponse::ChatResumePrepared { session });
-            }
-            // A card still attached to an actor whose provider exited under
-            // this daemon resumes the same way as one a daemon stop ended:
-            // the exited actor is retired as a stop first, so the checks
-            // below find its verified retirement rather than a present owner.
-            retained_actor::finish_exited_attachment_for_start(host, &source)
-                .map_err(setup_error)?;
-            // An unnamed pane resumes the conversation its ended actors
-            // confirmed, through the same checks as a named one; when they
-            // confirmed none, every actor's end is already proved and the
-            // pane starts a conversation in place.
-            let ended = source.clone();
-            let mut source = source;
-            let mut unconfirmed = false;
-            if unnamed {
-                match retained_resume::unnamed_conversation_for_start(host, &source)
-                    .map_err(setup_error)?
-                {
-                    Some(conversation) => source.launch.session_id = Some(conversation),
-                    None => unconfirmed = true,
-                }
-            }
-            // Classify retained Claude execution before generic discovery:
-            // an exited helper may still await its original parent's wait.
-            // Errors/unproved exit never fall back to treating it as live.
-            let retirement = if unconfirmed {
-                retained_resume::ResumeRetirement::Abandoned
-            } else if source.launch.provider == Provider::Claude {
-                retained_resume::inspect_resume_retirement_for_start(host, &source)
-                    .map_err(setup_error)?
-            } else {
-                retained_resume::ResumeRetirement::Unclassified
-            };
-            // A helper whose daemon exited between closing its provider and
-            // retiring it finishes that exit here, then classifies as retired.
-            let retirement = if !retirement.is_classified()
-                && retained_actor::finish_interrupted_exit_of_for_start(host, &ended)
-                    .map_err(setup_error)?
-            {
-                retained_resume::inspect_resume_retirement_for_start(host, &source)
-                    .map_err(setup_error)?
-            } else {
-                retirement
-            };
-            // A present owner must be restored, not replaced. Missing evidence
-            // is never proof of a completed close; a runtime record left by a
-            // proved retired or abandoned actor is not a present owner.
-            if !retirement.is_classified() && has_native_owner(&ended)? {
-                return Ok(ServerResponse::ChatResumePrepared { session: ended });
-            }
-            if prepare_shared_codex_join(host, &source)? {
-                return Ok(ServerResponse::ChatResumePrepared { session: source });
-            }
-            // A kernel boot change proves every process from the saved boot
-            // is gone. Unlike missing runtime files within the same boot, it
-            // authorizes an exact disk resume without its ephemeral receipt.
-            let previous_boot = source.launch.provider != Provider::Codex
-                && source.proof.as_ref().is_some_and(|previous| {
-                    previous.is_complete() && previous.boot_id != proof.boot_id
-                });
-            let unstarted = if previous_boot || unconfirmed {
-                None
-            } else {
-                retained_resume::unstarted_for_start(host, &source).map_err(setup_error)?
-            };
-            // A successor no lineage records here resumes on its own, as any
-            // conversation reopened without an owner to take over.
-            if unstarted == Some(retained_resume::Unstarted::Unrecorded) {
-                let mut session = source;
-                session.id = TerminalId::new();
-                return Ok(ServerResponse::ChatResumePrepared { session });
-            }
-            let closed = if previous_boot
-                || unconfirmed
-                || unstarted == Some(retained_resume::Unstarted::InLineage)
-            {
-                true
-            } else if source.launch.provider == Provider::Claude {
-                retained_resume::prepare_resume_verified_for_start(
-                    host,
-                    &source,
-                    retirement.verified(),
-                )
-                .map_err(setup_error)?
-            } else {
-                // An owner lost without its receipt was closed all the same,
-                // proved while no start or close can take its allocation.
-                chat::native_holder::closed_source(&source, &proof)
-                    .map_err(retryable_unavailable)?
-                    .is_some_and(|(_, paired_closed)| paired_closed)
-                    || match reserve_unhosted_allocation(host, &source, None) {
-                        Ok(_fence) => {
-                            require_ended_codex_execution(host, &source, &proof.boot_id).map_err(
-                                |failure| {
-                                    ProtocolError::new(
-                                        ProtocolErrorCode::TerminalUnavailable,
-                                        failure.to_string(),
-                                        source.launch.provider == Provider::Codex,
-                                    )
-                                },
-                            )?;
-                            true
-                        }
-                        Err(()) => false,
-                    }
-            };
-            if !closed {
-                return Err(retryable_unavailable(
-                    "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
-                ));
-            }
-            // A changed boot proves the old owner is gone, not that the
-            // recorded launch still selects the account home it ran under.
-            if previous_boot && source.launch.provider == Provider::Claude {
-                retained_resume::ensure_prior_boot_account_for_start(host, &source)
-                    .map_err(setup_error)?;
-            }
-            // The old process is proved ended, as after a daemon stop: its
-            // authority and unfinished runs end and its agent stays open, so
-            // the successor's start can take the agent over.
-            super::agent_execution::stopped(host, &ended).map_err(retryable_unavailable)?;
-            let predecessor = source.id;
-            let root = source
-                .terminal
-                .as_ref()
-                .and_then(|terminal| terminal.recovery_origin);
-            let mut session = source;
-            session.reset_owned_codex_listener();
-            session.id = TerminalId::new();
-            session.proof = None;
-            session.terminal = None;
-            // The old owner's close is proved, so the reopened conversation
-            // takes over its lineage, unless another of its sessions runs.
-            if let Ok(registry) = super::agent_execution::registry(host) {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .succeed(session.id, predecessor, root, |members| {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .any_other_live(members, predecessor)
-                    })
-                    .map_err(retryable_unavailable)?;
-            }
-            Ok(ServerResponse::ChatResumePrepared { session })
+                .exited_queue_transfers
+                .read(client, source, receipt, offset, Instant::now())?;
+            Ok(ServerResponse::ChatExitedQueuePage { source, page })
+        }
+        ClientRequest::ChatQueueRecipientScope { session } => {
+            Ok(ServerResponse::ChatQueueRecipientScope {
+                source: session.id,
+                account_scope: queue_recipient_scope(host, &session)?,
+            })
         }
         ClientRequest::ChatRecoverAccount {
             source,
@@ -5031,19 +5326,23 @@ pub(super) fn close_captured(
     let chat_id = target.source.id;
     let handle = target.handle.clone();
     let source = target.source.clone();
-    let closing = {
+    let (closing, completed_source) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(current) = state
+        let Some(record) = state
             .chats
             .get(&chat_id)
             .filter(|record| target.matches(record))
-            .map(Record::current_session)
         else {
             return Err(unavailable(
                 "The exact native attachment changed before close",
             ));
         };
-        capacity::Reservation::removing(host, &mut state, &source, current)?
+        let current = record.current_session();
+        let completed_source = handle.is_completed().then(|| current.clone());
+        (
+            capacity::Reservation::removing(host, &mut state, &source, current)?,
+            completed_source,
+        )
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
@@ -5064,6 +5363,9 @@ pub(super) fn close_captured(
         unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")
     })?;
     target.require_current(host)?;
+    if let Some(current) = completed_source {
+        archive_completed_queue(host, &source, current, target.instance, &handle)?;
+    }
     let (retained, pending_cleanup, registered_codex_pair) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state

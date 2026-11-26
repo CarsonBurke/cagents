@@ -180,6 +180,15 @@ fn bulk_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
                 | ServerResponse::ChatTextCopy { .. }
+                | ServerResponse::ChatResumePreparedWithQueue {
+                    queued: Some(_),
+                    ..
+                }
+                | ServerResponse::ChatExitedQueuePage { .. }
+                | ServerResponse::ChatExitedQueue {
+                    queued: Some(_),
+                    ..
+                }
                 | ServerResponse::Work(
                     crate::work::Response::Board(_) | crate::work::Response::Watching { .. }
                 )

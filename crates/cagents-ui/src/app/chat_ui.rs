@@ -6,7 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
-use crate::model::{ChatDraftModel, SavedQueue, SentAfter};
+use crate::model::{ChatDraftModel, ExitedQueueKey, RestoredQueue, SavedQueue, SentAfter};
 use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
@@ -369,6 +369,7 @@ pub enum Action {
     RetryRefusedView(Target),
     Switch(CardId),
     Ready(Target, Ready),
+    ReadyAfterExitedQueue(Target, TerminalId, Arc<Vec<chat::QueuedMessage>>, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
     ResumeCommitted(Target, Ready, Result<(), String>),
@@ -962,6 +963,7 @@ impl Action {
             Self::RetryRefusedView(..) => "RetryRefusedView",
             Self::Switch(..) => "Switch",
             Self::Ready(..) => "Ready",
+            Self::ReadyAfterExitedQueue(..) => "ReadyAfterExitedQueue",
             Self::AccountCommitted(..) => "AccountCommitted",
             Self::UpgradeCommitted(..) => "UpgradeCommitted",
             Self::ResumeCommitted(..) => "ResumeCommitted",
@@ -1145,6 +1147,7 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::ReadyAfterExitedQueue(..)
                 | Self::DraftStartCheckpointed(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
@@ -1508,6 +1511,7 @@ pub(super) struct State {
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
     draft_attachments: HashMap<CardId, Vec<Attachment>>,
+    restored_draft_queues: HashMap<CardId, RestoredWaiting>,
     /// The model and effort of drafts whose runtime has been dropped, and what
     /// the saved window held, until their draft opens again.
     draft_models: HashMap<CardId, ChatDraftModel>,
@@ -1518,6 +1522,12 @@ pub(super) struct State {
     /// The provider queue each card last saved, until a connection to its
     /// conversation shows whether the provider that held it is still there.
     waiting: HashMap<CardId, SavedQueue>,
+    /// Exit receipts whose draft is currently between runtimes.
+    restored_queues: HashMap<CardId, RestoredQueue>,
+    /// Complete queue recoveries awaiting their first ordered workspace offer.
+    pub(super) pending_queue_checkpoints: HashSet<(CardId, ExitedQueueKey)>,
+    /// An authenticated exit can be delivered before its start installs the runtime.
+    completed_queues: HashMap<CardId, (Target, TerminalId, Vec<chat::QueuedMessage>)>,
     /// What the reader confirmed a card's close discards, for the
     /// conversation the question was about, so that close keeps no more
     /// than the rest to bring back.
@@ -1598,9 +1608,13 @@ impl Default for State {
             hidden_returns: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
+            restored_draft_queues: HashMap::new(),
             draft_models: HashMap::new(),
             peer_started: HashMap::new(),
             waiting: HashMap::new(),
+            restored_queues: HashMap::new(),
+            pending_queue_checkpoints: HashSet::new(),
+            completed_queues: HashMap::new(),
             confirmed_losses: HashMap::new(),
             sending_on_close: HashMap::new(),
             started_elsewhere: HashSet::new(),
@@ -1649,7 +1663,14 @@ impl State {
         }
     }
     pub(super) fn with_waiting_messages(mut self, waiting: HashMap<CardId, SavedQueue>) -> Self {
-        self.waiting = waiting;
+        for (card, mut queue) in waiting {
+            if let Some(restored) = queue.restored.take() {
+                self.restored_queues.insert(card, restored);
+            }
+            if !queue.is_empty() {
+                self.waiting.insert(card, queue);
+            }
+        }
         self
     }
     pub(super) fn with_draft_models(mut self, models: HashMap<CardId, ChatDraftModel>) -> Self {
@@ -3383,16 +3404,18 @@ fn unaccounted(
             false
         });
     }
-    remaining.retain(|message| {
-        !snapshot.items.iter().any(|item| {
-            item.role == chat::Role::User
-                && item
-                    .id
-                    .strip_prefix(message.id.as_str())
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-        })
-    });
+    remaining.retain(|message| !queue_message_in_history(snapshot, message));
     remaining
+}
+
+fn queue_message_in_history(snapshot: &Snapshot, message: &chat::QueuedMessage) -> bool {
+    snapshot.items.iter().any(|item| {
+        item.role == chat::Role::User
+            && item
+                .id
+                .strip_prefix(message.id.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    })
 }
 
 /// The reader's messages `snapshot` shows, oldest first, with their item ids.
@@ -3469,6 +3492,47 @@ struct RestoredWaiting {
 }
 
 impl RestoredWaiting {
+    fn collect<'a>(
+        messages: impl IntoIterator<Item = &'a chat::QueuedMessage>,
+    ) -> Option<(String, Vec<Attachment>, Self)> {
+        let mut text = String::new();
+        let mut attachments = Vec::new();
+        let mut notice = Self {
+            count: 0,
+            whole: true,
+        };
+        for message in messages {
+            notice.count += 1;
+            notice.whole &= message.editable;
+            if !message.editable {
+                continue;
+            }
+            let body = message.text.trim_end();
+            if !body.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(body);
+            }
+            // A path the provider could not vouch for names no file here.
+            for attachment in &message.attachments {
+                if attachment.reference.is_none() && attachment.path.as_os_str().is_empty() {
+                    notice.whole = false;
+                } else if !attachments.contains(attachment) {
+                    attachments.push(attachment.clone());
+                }
+            }
+        }
+        (notice.count != 0).then_some((text, attachments, notice))
+    }
+
+    fn including(self, previous: Option<Self>) -> Self {
+        Self {
+            count: self.count + previous.map_or(0, |notice| notice.count),
+            whole: self.whole && previous.is_none_or(|notice| notice.whole),
+        }
+    }
+
     /// What the notice beside the draft says: what came back, that it was
     /// not sent again, and that the agent may have it anyway.
     fn caption(self) -> String {
@@ -3557,6 +3621,8 @@ pub(super) struct Runtime {
     /// Provider queue entries already back in the composer, hidden until the
     /// provider's own listing drops them.
     taken_back: Vec<String>,
+    restored_queue: Option<RestoredQueue>,
+    complete_exit_queue: bool,
     /// How the draft was queued before it was taken back, which is how
     /// sending it again queues it unless the reader chooses otherwise.
     resend: Option<PromptMode>,
@@ -4673,49 +4739,94 @@ impl Runtime {
     /// it holds, less what has already come back to the composer. A parked
     /// runtime does not refresh its snapshot, so the connection is asked.
     fn waiting_messages(&self) -> Vec<chat::QueuedMessage> {
-        let snapshot = self
-            .handle()
-            .map_or_else(|| Arc::clone(&self.snapshot), |handle| handle.snapshot());
+        self.waiting_messages_in(&self.latest_snapshot())
+    }
+
+    fn latest_snapshot(&self) -> Arc<Snapshot> {
+        self.handle()
+            .map_or_else(|| Arc::clone(&self.snapshot), |handle| handle.snapshot())
+    }
+
+    fn waiting_messages_in(&self, snapshot: &Snapshot) -> Vec<chat::QueuedMessage> {
+        if self.complete_exit_queue {
+            return Vec::new();
+        }
         snapshot
             .queued_messages
             .iter()
-            .filter(|message| !self.taken_back.contains(&message.id))
+            .filter(|message| !self.queue_taken_back(&message.id))
             .cloned()
             .collect()
+    }
+
+    fn queue_taken_back(&self, id: &str) -> bool {
+        self.taken_back.iter().any(|taken| taken == id)
+            || self
+                .restored_queue
+                .as_ref()
+                .is_some_and(|receipt| receipt.source == self.session.id && receipt.contains(id))
+    }
+
+    /// Only a provider-confirmed exit ends the queue. A disconnected owner
+    /// can still be running, even while the pane offers to reconnect.
+    fn restore_exited_queue(&mut self) -> bool {
+        let snapshot = self.latest_snapshot();
+        if self.complete_exit_queue
+            || !snapshot.exited
+            || self.session.closes_without_hosted_actor()
+        {
+            return false;
+        }
+
+        self.restore_confirmed_queue(&snapshot, &snapshot.queued_messages)
+    }
+
+    /// Reconcile the exact exit queue against the draft and transcript, then
+    /// keep its IDs with the draft so replay after restart is idempotent.
+    fn restore_confirmed_queue(
+        &mut self,
+        snapshot: &Snapshot,
+        queue: &[chat::QueuedMessage],
+    ) -> bool {
+        if queue.is_empty() {
+            return false;
+        }
+        let source = self.session.id;
+        let mut restored = Vec::new();
+        let mut receipt_changed = false;
+        if self
+            .restored_queue
+            .as_ref()
+            .is_some_and(|receipt| receipt.source != source)
+        {
+            self.restored_queue = None;
+        }
+        for message in queue {
+            if !self.queue_taken_back(&message.id) && !queue_message_in_history(snapshot, message) {
+                restored.push(message.clone());
+            }
+            if !message.editable {
+                continue;
+            }
+            let receipt = self.restored_queue.get_or_insert_with(|| RestoredQueue {
+                source,
+                ids: Vec::new(),
+            });
+            receipt_changed |= receipt.remember(&message.id);
+        }
+        let changed = receipt_changed || !restored.is_empty();
+        self.restore_waiting(restored);
+        changed
     }
 
     /// Returns to the composer the messages a provider that did not come back
     /// was holding. They are never sent from here: the provider may have
     /// started on any of them before it went, so the reader decides.
     fn restore_waiting(&mut self, messages: Vec<chat::QueuedMessage>) {
-        if messages.is_empty() {
-            return;
+        if let Some((text, attachments, notice)) = RestoredWaiting::collect(&messages) {
+            self.prepend_to_draft(&text, attachments);
+            self.restored_waiting = Some(notice.including(self.restored_waiting));
         }
-        let mut text = String::new();
-        let mut attachments: Vec<Attachment> = Vec::new();
-        let mut whole = messages.iter().all(|message| message.editable);
-        for message in &messages {
-            let body = message.text.trim_end();
-            if !body.is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(body);
-            }
-            // A path the provider could not vouch for names no file here.
-            for attachment in &message.attachments {
-                if attachment.reference.is_none() && attachment.path.as_os_str().is_empty() {
-                    whole = false;
-                } else if !attachments.contains(attachment) {
-                    attachments.push(attachment.clone());
-                }
-            }
-        }
-        self.prepend_to_draft(&text, attachments);
-        self.restored_waiting = Some(RestoredWaiting {
-            count: messages.len(),
-            whole,
-        });
     }
 
     /// Holds `text` for the turn after the running one, as a message written
@@ -5215,6 +5326,8 @@ impl Runtime {
             next_written: 0,
             recalling: Vec::new(),
             taken_back: Vec::new(),
+            restored_queue: None,
+            complete_exit_queue: false,
             resend: None,
             restored_waiting: None,
             parked_queue: Vec::new(),
@@ -8284,6 +8397,18 @@ const RESUME_RECOVERIES: u8 = 2;
 /// What a chat's pull request labels were built from: the generations of
 /// the window's pull request and worktree indexes, the conversation, and
 /// whether the inspector held a current list of it.
+pub(super) fn completed_queue_key(
+    source: TerminalId,
+    messages: &[chat::QueuedMessage],
+) -> Option<ExitedQueueKey> {
+    (!messages.is_empty() && messages.iter().all(|message| message.editable)).then(|| {
+        (
+            source,
+            chat::exited_queue_fingerprint(messages.iter().map(|message| message.id.as_str())),
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LabelSources {
     board: u64,
@@ -9942,7 +10067,7 @@ impl Cagents {
             })
             .filter_map(|state| {
                 let waiting = self.chat_waiting_to_save(state.id);
-                (!waiting.messages.is_empty()).then_some((state.id, waiting))
+                (!waiting.is_empty()).then_some((state.id, waiting))
             })
             .collect::<HashMap<_, _>>();
         let editors = self
@@ -10609,7 +10734,99 @@ impl Cagents {
             }
         }
         saved.messages.truncate(chat::QueuedMessage::LIMIT);
+        let source = self.card_state(card).and_then(|card| match &card.kind {
+            CardKind::Chat(session) => Some(session.id),
+            _ => None,
+        });
+        saved.restored = runtime
+            .and_then(|runtime| runtime.restored_queue.as_ref())
+            .into_iter()
+            .chain(self.chat_ui.restored_queues.get(&card))
+            .find(|receipt| Some(receipt.source) == source)
+            .cloned();
         saved
+    }
+
+    /// The provider may have left while the pane held only its saved draft.
+    /// Preserve that draft and its exact queue receipt even if resume fails.
+    fn restore_saved_exit_queue(
+        &mut self,
+        card: CardId,
+        source: TerminalId,
+        messages: &[chat::QueuedMessage],
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+        let receipt = self
+            .chat_ui
+            .restored_queues
+            .entry(card)
+            .or_insert_with(|| RestoredQueue {
+                source,
+                ids: Vec::new(),
+            });
+        if receipt.source != source {
+            *receipt = RestoredQueue {
+                source,
+                ids: Vec::new(),
+            };
+        }
+        let restored = messages.iter().filter(|message| {
+            if receipt.contains(&message.id) {
+                return false;
+            }
+            if message.editable {
+                receipt.remember(&message.id);
+            }
+            true
+        });
+        let Some((text, mut attachments, notice)) = RestoredWaiting::collect(restored) else {
+            return;
+        };
+        if !text.is_empty() {
+            let draft = self.chat_ui.drafts.entry(card).or_default();
+            *draft = if draft.trim().is_empty() {
+                text
+            } else {
+                format!("{text}\n{draft}")
+            };
+        }
+        if !attachments.is_empty() {
+            let draft = self.chat_ui.draft_attachments.entry(card).or_default();
+            for attachment in std::mem::take(draft) {
+                if !attachments.contains(&attachment) {
+                    attachments.push(attachment);
+                }
+            }
+            *draft = attachments;
+        }
+        let previous = self.chat_ui.restored_draft_queues.get(&card).copied();
+        self.chat_ui
+            .restored_draft_queues
+            .insert(card, notice.including(previous));
+    }
+
+    /// An unnamed actor can leave an unstarted successor. Its draft opens
+    /// without waiting for a provider, so there is no transcript to compare.
+    pub(super) fn restore_reopened_queue_to_unstarted_draft(
+        &mut self,
+        card: CardId,
+        source: TerminalId,
+    ) {
+        if self
+            .chat_ui
+            .waiting
+            .get(&card)
+            .is_some_and(|queue| queue.stopped)
+            && let Some(queue) = self.chat_ui.waiting.remove(&card)
+        {
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+                runtime.restore_waiting(queue.messages);
+            } else {
+                self.restore_saved_exit_queue(card, source, &queue.messages);
+            }
+        }
     }
 
     /// Gives a new runtime for `card` the draft saved when its last one
@@ -10624,6 +10841,14 @@ impl Cagents {
         }
         if let Some(attachments) = self.chat_ui.draft_attachments.remove(&card) {
             runtime.replace_attachments(attachments);
+        }
+        runtime.restored_queue = self
+            .chat_ui
+            .restored_queues
+            .remove(&card)
+            .filter(|receipt| receipt.source == runtime.session.id);
+        if let Some(notice) = self.chat_ui.restored_draft_queues.remove(&card) {
+            runtime.restored_waiting = Some(notice);
         }
         if self.chat_ui.started_elsewhere.remove(&card) {
             runtime.await_draft_echo(DraftEcho::First);
@@ -10779,6 +11004,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.chat_ui.completed_queues.remove(&card);
         self.dictation_forget(card);
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
@@ -10805,7 +11031,16 @@ impl Cagents {
     /// about to be dropped while the card lives on, so whatever runtime the
     /// card builds next opens with them rather than losing them.
     pub(super) fn stash_unsent_chat(&mut self, card: CardId) {
-        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.restore_exited_queue();
+            if let Some(receipt) = &runtime.restored_queue {
+                self.chat_ui.restored_queues.insert(card, receipt.clone());
+            }
+            if let Some(notice) = runtime.restored_waiting {
+                self.chat_ui.restored_draft_queues.insert(card, notice);
+            } else {
+                self.chat_ui.restored_draft_queues.remove(&card);
+            }
             if let Some(model) = runtime.draft_model() {
                 self.chat_ui.draft_models.insert(card, model);
             } else if !runtime.session.is_unstarted() {
@@ -10895,6 +11130,8 @@ impl Cagents {
         self.chat_ui.resuming_on_attach.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.waiting.remove(&card);
+        self.chat_ui.restored_queues.remove(&card);
+        self.chat_ui.restored_draft_queues.remove(&card);
         self.chat_ui.confirmed_losses.remove(&card);
         self.chat_ui.sending_on_close.remove(&card);
         self.chat_ui.started_elsewhere.remove(&card);
@@ -11855,6 +12092,7 @@ impl Cagents {
         }
         let selection = None;
         let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
+        self.chat_ui.completed_queues.remove(&card);
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
             card,
@@ -11870,14 +12108,22 @@ impl Cagents {
         );
         let sender = self.chat_ui.sender.clone();
         cosmic::task::future(async move {
+            let retired = Arc::new(Mutex::new(None));
+            let collected = Arc::clone(&retired);
             let result = tokio::task::spawn_blocking(move || {
                 // A panic in the provider handshake has to come back as a
                 // failed start. Unwinding here fails the blocking task; the
                 // UI thread then only sees a join error and can still draw.
                 Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || {
-                        let wake = move |wake| {
-                            let _ = sender.try_send((target, wake));
+                        let wake = move |wake| match wake {
+                            Wake::ExitedQueue(source, messages) => {
+                                *collected.lock().unwrap_or_else(|p| p.into_inner()) =
+                                    Some((source, messages));
+                            }
+                            wake => {
+                                let _ = sender.try_send((target, wake));
+                            }
                         };
                         match upgrade_admission {
                             Some(canonical) => ClientHandle::connect_upgrade_with_intent(
@@ -11910,10 +12156,14 @@ impl Cagents {
             .await
             .map_err(|error| chat::StartFailure::retry(error.to_string()))
             .and_then(|result| result);
-            Message::ChatUi(Action::Ready(
-                target,
-                Ready(Arc::new(Mutex::new(Some(result)))),
-            ))
+            let ready = Ready(Arc::new(Mutex::new(Some(result))));
+            let retired = retired.lock().unwrap_or_else(|p| p.into_inner()).take();
+            Message::ChatUi(match retired {
+                Some((source, messages)) => {
+                    Action::ReadyAfterExitedQueue(target, source, Arc::new(messages), ready)
+                }
+                None => Action::Ready(target, ready),
+            })
         })
     }
     pub(super) fn acknowledge_chat_updates(&mut self, card: CardId) -> Task<Message> {
@@ -13346,9 +13596,116 @@ impl Cagents {
         (task, Some(projection))
     }
 
+    fn apply_completed_chat_queue(
+        &mut self,
+        target: Target,
+        source: TerminalId,
+        messages: &[chat::QueuedMessage],
+    ) -> Option<Task<Message>> {
+        let card = self.card_state(target.card)?;
+        if !card.existence.is_open()
+            || !match &card.kind {
+                CardKind::Chat(current) => current.id == source,
+                CardKind::Terminal(_) => self.chat_ui.parked.contains_key(&target.card),
+                _ => false,
+            }
+        {
+            return None;
+        }
+        let runtime = match self.cards.get(&target.card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime),
+            _ => self.chat_ui.parked.get(&target.card),
+        }?;
+        if runtime.target != target || runtime.session.id != source {
+            return None;
+        }
+        let session = runtime.session.clone();
+        self.restore_authenticated_chat_exit_queue(target.card, source, messages);
+        Some(
+            completed_queue_key(source, messages).map_or_else(Task::none, |receipt| {
+                self.release_completed_queue_after_save(target.card, session, receipt, messages)
+            }),
+        )
+    }
+
+    fn release_completed_queue_after_save(
+        &self,
+        card: CardId,
+        source: chat::Session,
+        key: ExitedQueueKey,
+        messages: &[chat::QueuedMessage],
+    ) -> Task<Message> {
+        let Some(writer) = self.session.as_ref() else {
+            return Task::none();
+        };
+        let Ok(receipt) = writer.request_pane_flush(card) else {
+            return Task::none();
+        };
+        let store = writer.operation_store();
+        let ids = messages.iter().map(|message| message.id.clone()).collect();
+        iced::Task::future(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                if !matches!(receipt.recv(), Ok(Ok(())))
+                    || !matches!(store.has_returned_chat_queue(card, key), Ok(true))
+                {
+                    return;
+                }
+                let release = crate::terminal::ipc::daemon_socket_path()
+                    .ok()
+                    .and_then(|socket| crate::control::ControlClient::connect(&socket).ok())
+                    .map(|mut client| client.commit_exited_chat_queue(source, ids));
+                if let Some(Err(error)) = release {
+                    tracing::debug!(%error, "Could not release the saved completed chat queue");
+                }
+            })
+            .await;
+        })
+        .discard()
+    }
+
+    /// A fully decoded receipt comes from the daemon's completed actor. The
+    /// presentation snapshot can still show an older queue when it arrives.
+    fn restore_authenticated_chat_exit_queue(
+        &mut self,
+        card: CardId,
+        source: TerminalId,
+        messages: &[chat::QueuedMessage],
+    ) {
+        let key = completed_queue_key(source, messages);
+        let returned = key.is_some_and(|key| self.returned_chat_queue(card, key));
+        let complete = messages.iter().all(|message| message.editable);
+        let runtime = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime),
+            _ => self.chat_ui.parked.get_mut(&card),
+        };
+        if let Some(runtime) = runtime {
+            if runtime.session.id != source {
+                return;
+            }
+            if !returned {
+                let snapshot = runtime.latest_snapshot();
+                runtime.restore_confirmed_queue(&snapshot, messages);
+            }
+            runtime.complete_exit_queue |= complete || returned;
+        } else if !returned {
+            self.restore_saved_exit_queue(card, source, messages);
+        }
+        if complete || returned {
+            self.chat_ui.waiting.remove(&card);
+        }
+        if !returned && let Some(key) = key {
+            self.checkpoint_returned_chat_queue(card, key, card);
+        }
+        // Save the recovered composer before Ready or a later close can
+        // change the original descriptor.
+        self.persist();
+    }
+
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
         let closed_refresh = match &action {
-            Action::Ready(target, _) => Some(target.card),
+            Action::Ready(target, _) | Action::ReadyAfterExitedQueue(target, ..) => {
+                Some(target.card)
+            }
             _ => None,
         };
         let restore = match &action {
@@ -13966,6 +14323,44 @@ impl Cagents {
             Action::DraftStartCheckpointed(target, attempt, result) => {
                 return self.draft_start_checkpointed(target, attempt, result);
             }
+            Action::ReadyAfterExitedQueue(target, source, messages, ready) => {
+                if matches!(self.chat_ui.phases.get(&target.card),
+                    Some(Phase::Starting(attempt)) if attempt.target == target)
+                {
+                    self.materialize_replica_snapshot();
+                }
+                let cleanup = match (
+                    self.chat_ui.phases.get(&target.card),
+                    self.card_state(target.card),
+                ) {
+                    (Some(Phase::Starting(attempt)), Some(card))
+                        if attempt.target == target
+                            && attempt.session.id == source
+                            && card.existence.is_open()
+                            && matches!(&card.kind, CardKind::Chat(session) if *session == attempt.session) =>
+                    {
+                        // A standalone Start reads a completed direct actor
+                        // before replacing it. Retained-helper retirement has
+                        // its own lifetime and never releases that archive here.
+                        let archive_source = (attempt.intent == chat::Intent::Start
+                            && !attempt.session.native_continuity.retains_provider())
+                        .then(|| attempt.session.clone());
+                        self.restore_authenticated_chat_exit_queue(target.card, source, &messages);
+                        archive_source
+                            .zip(completed_queue_key(source, &messages))
+                            .map_or_else(Task::none, |(session, key)| {
+                                self.release_completed_queue_after_save(
+                                    target.card,
+                                    session,
+                                    key,
+                                    &messages,
+                                )
+                            })
+                    }
+                    _ => Task::none(),
+                };
+                return Task::batch([cleanup, self.handle_chat_ui(Action::Ready(target, ready))]);
+            }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
                 let Some(result) = result else {
@@ -13992,6 +14387,18 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                if result.is_err()
+                    && let Some((completed, source, messages)) =
+                        self.chat_ui.completed_queues.remove(&target.card)
+                    && completed == target
+                    && source == attempt.session.id
+                    && self.card_state(target.card).is_some_and(|card| {
+                        card.existence.is_open()
+                            && matches!(&card.kind, CardKind::Chat(current) if *current == attempt.session)
+                    })
+                {
+                    self.restore_authenticated_chat_exit_queue(target.card, source, &messages);
+                }
                 let recovery = attempt.recovery.take();
                 let automatic_submit = recovery.as_ref().and_then(|recovery| recovery.submit);
                 let account_committed =
@@ -14244,6 +14651,12 @@ impl Cagents {
                         self.chat_ui.restorable_accounts.remove(&target.card);
                         let mut session = handle.session();
                         session.proof = handle.proof();
+                        let completed = self.chat_ui.completed_queues.remove(&target.card).filter(
+                            |(completed, source, _)| *completed == target && *source == session.id,
+                        );
+                        let completed_here = completed.as_ref().is_some_and(|(_, _, messages)| {
+                            messages.iter().all(|message| message.editable)
+                        });
                         let snapshot = handle.snapshot();
                         // A saved proof names the daemon that hosted the
                         // conversation. Another daemon started its provider
@@ -14262,6 +14675,7 @@ impl Cagents {
                         // What a close stopped while its provider still held it
                         // is held nowhere now, and comes back with the reopened
                         // conversation unless the conversation shows it arrived.
+                        let stopped_in_place = saved.stopped && attempt.session.id == session.id;
                         let (mut waiting, stopped) = if saved.stopped {
                             (Vec::new(), saved.messages)
                         } else if saved.host.is_some() && saved.host == attempt.session.proof {
@@ -14281,9 +14695,9 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             // A provider that ended took its queue with it,
                             // whichever daemon starts the next one.
-                            let ended = runtime.snapshot.exited;
-                            if ended || other_daemon {
-                                for message in runtime.waiting_messages() {
+                            let previous = runtime.latest_snapshot();
+                            if previous.exited || other_daemon || resumed_source.is_some() {
+                                for message in runtime.waiting_messages_in(&previous) {
                                     if !waiting.iter().any(|saved| saved.id == message.id) {
                                         waiting.push(message);
                                     }
@@ -14303,6 +14717,10 @@ impl Cagents {
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
                             runtime.account_picker = false;
+                            if runtime.session.id != session.id {
+                                runtime.restored_queue = None;
+                            }
+                            runtime.complete_exit_queue = false;
                             runtime.session = session.clone();
                             runtime.disconnected = false;
                             // Whatever the old handle was still sending may
@@ -14354,7 +14772,7 @@ impl Cagents {
                             }
                             // The same daemon still hosts the provider that
                             // held the saved queue, and lists what it holds.
-                            if !other_daemon {
+                            if !other_daemon && resumed_source.is_none() {
                                 waiting.clear();
                             }
                         }
@@ -14368,10 +14786,22 @@ impl Cagents {
                                 waiting.push(message);
                             }
                         }
-                        let waiting = unaccounted(&snapshot, waiting);
-                        let restored_waiting = !waiting.is_empty();
+                        let waiting = if completed_here && attempt.session.id == session.id {
+                            Vec::new()
+                        } else {
+                            unaccounted(&snapshot, waiting)
+                        };
+                        let mut restored_waiting = !waiting.is_empty();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.restore_waiting(waiting);
+                            if stopped_in_place {
+                                restored_waiting |=
+                                    runtime.restore_confirmed_queue(&snapshot, &waiting);
+                            } else {
+                                runtime.restore_waiting(waiting);
+                            }
+                            if !completed_here {
+                                restored_waiting |= runtime.restore_exited_queue();
+                            }
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
@@ -14390,6 +14820,11 @@ impl Cagents {
                         } else {
                             self.commit_chat_session(target.card, session);
                         }
+                        let queue_cleanup = completed
+                            .and_then(|(_, source, messages)| {
+                                self.apply_completed_chat_queue(target, source, &messages)
+                            })
+                            .unwrap_or_else(Task::none);
                         // The draft that now holds them and the queue saved
                         // without them are written together.
                         if title.is_some_and(|title| self.apply_reported_title(target.card, title))
@@ -14453,11 +14888,14 @@ impl Cagents {
                         if self.workspace.focused() == Some(target.card) {
                             self.keyboard_owed = Some(target.card);
                         }
+                        let restored_queue = self.check_saved_reopened_queue_scope(target.card);
                         return Task::batch([
                             submitted,
                             usage,
                             limits,
                             opening_name,
+                            restored_queue,
+                            queue_cleanup,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                             self.show_refusal_on_reopen(target.card),
@@ -14847,6 +15285,23 @@ impl Cagents {
                 }
             }
             Action::Wake(target, wake) => {
+                let wake = match wake {
+                    Wake::CompletedQueue(source, messages) => {
+                        if let Some(task) =
+                            self.apply_completed_chat_queue(target, source, &messages)
+                        {
+                            return task;
+                        } else if matches!(self.chat_ui.phases.get(&target.card),
+                            Some(Phase::Starting(attempt)) if attempt.target == target)
+                        {
+                            self.chat_ui
+                                .completed_queues
+                                .insert(target.card, (target, source, messages));
+                        }
+                        return Task::none();
+                    }
+                    wake => wake,
+                };
                 // Ready refreshes the new handle.
                 if self.chat_start_pending(target.card) {
                     // The account reports go unread, as the recipe may already
@@ -14909,6 +15364,7 @@ impl Cagents {
                 };
                 runtime.refresh_session();
                 match wake {
+                    Wake::ExitedQueue(..) | Wake::CompletedQueue(..) => return Task::none(),
                     Wake::Changed => {
                         let before = Arc::clone(&runtime.snapshot);
                         let previous_limit = runtime.failure_ui.limit_occurrence;
@@ -14950,6 +15406,7 @@ impl Cagents {
                             );
                         // What the provider holds is saved as it changes, so a
                         // queue outlives a provider that goes with the computer.
+                        let restored_waiting = runtime.restore_exited_queue();
                         let queue_changed =
                             before.queued_messages != runtime.snapshot.queued_messages;
                         let fork = if runtime.fork_requested
@@ -14993,6 +15450,7 @@ impl Cagents {
                         self.trim_warm_chats();
                         if title.is_some_and(|title| self.apply_reported_title(target.card, title))
                             || queue_changed
+                            || restored_waiting
                         {
                             self.persist();
                         }

@@ -344,7 +344,9 @@ use crate::{
 /// Version 208 appends connection-scoped mobile watch invalidations.
 ///
 /// Version 209 adds review monitor reports and complete review censuses.
-pub const PROTOCOL_VERSION: u16 = 209;
+///
+/// Version 210 adds exact exited queue reads, resume receipts and acknowledgements.
+pub const PROTOCOL_VERSION: u16 = 210;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -384,6 +386,11 @@ pub use older_clients::{OlderClient, is_cli_peer, older_client};
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Retired input can be much larger than an interactive frame. The retained
+/// helper and direct providers each bound their receipts. Reserve headroom
+/// above the largest admitted direct provider queue (64 MiB).
+pub const MAX_EXITED_QUEUE_BYTES: usize = 72 * 1024 * 1024;
+pub const EXITED_QUEUE_PAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Client requests carry at most a one-MiB byte vector plus small scalars.
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -896,6 +903,30 @@ pub enum ClientRequest {
     ObserveReviewMonitor {
         update: crate::notifications::review::MonitorUpdate,
     },
+    /// Prepare this exact resume and return the exited provider's final queue.
+    ChatPrepareResumeWithQueue {
+        source: crate::chat::Session,
+    },
+    /// Observe the launch scope of this exact active provider descriptor.
+    ChatQueueRecipientScope {
+        session: crate::chat::Session,
+    },
+    /// Read the next part of an authenticated receipt on the same connection.
+    ChatReadExitedQueuePage {
+        source: TerminalId,
+        receipt: uuid::Uuid,
+        offset: u32,
+    },
+    /// Read a completed native actor's exact queue without reopening it.
+    ChatReadExitedQueue {
+        source: crate::chat::Session,
+        execution: Option<uuid::Uuid>,
+    },
+    /// Release an exact queue after its recipient durably saved the input.
+    ChatCommitExitedQueue {
+        source: crate::chat::Session,
+        queue_ids: Vec<String>,
+    },
 }
 
 /// Read-only invalidations for the SSH bridge. They do not confer window
@@ -1225,6 +1256,12 @@ pub enum ServerMessage {
     MobileChanged {
         topic: MobileWatch,
     },
+    /// A completed native owner may have recoverable input. This edge is
+    /// independent of transcript visibility, and contains no queued messages.
+    ChatQueueEnded {
+        source: crate::chat::Session,
+        execution: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1400,6 +1437,112 @@ pub enum ServerResponse {
         proof: [u8; crate::device_trust::SECRET_BYTES],
     },
     ProviderStatus(Vec<crate::account::provider_install::ProviderStatus>),
+    ChatResumePreparedWithQueue {
+        source: TerminalId,
+        queued: Option<ExitedQueuePage>,
+        prepared: Result<crate::chat::Session, ProtocolError>,
+    },
+    ChatQueueRecipientScope {
+        source: TerminalId,
+        account_scope: Option<[u8; 32]>,
+    },
+    ChatExitedQueuePage {
+        source: TerminalId,
+        page: ExitedQueuePage,
+    },
+    ChatExitedQueue {
+        source: TerminalId,
+        queued: Option<ExitedQueuePage>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitedQueuePage {
+    pub receipt: uuid::Uuid,
+    pub total: u32,
+    pub offset: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// One exact transfer, validated before its payload can reach a surface.
+pub(crate) struct ExitedQueueCollector {
+    source: TerminalId,
+    receipt: uuid::Uuid,
+    total: usize,
+    bytes: Vec<u8>,
+}
+
+impl ExitedQueueCollector {
+    pub(crate) fn start(source: TerminalId, first: ExitedQueuePage) -> Result<Self, ()> {
+        let total = first.total as usize;
+        if first.receipt.is_nil() || total == 0 || total > MAX_EXITED_QUEUE_BYTES {
+            return Err(());
+        }
+        let mut collector = Self {
+            source,
+            receipt: first.receipt,
+            total,
+            bytes: Vec::new(),
+        };
+        collector.append(source, first)?;
+        Ok(collector)
+    }
+
+    pub(crate) fn append(&mut self, source: TerminalId, page: ExitedQueuePage) -> Result<(), ()> {
+        if source != self.source
+            || page.receipt != self.receipt
+            || page.total as usize != self.total
+            || page.offset as usize != self.bytes.len()
+            || self.bytes.len() == self.total
+            || page.bytes.len() != (self.total - self.bytes.len()).min(EXITED_QUEUE_PAGE_BYTES)
+        {
+            return Err(());
+        }
+        if self.bytes.is_empty() {
+            self.bytes.try_reserve_exact(self.total).map_err(|_| ())?;
+        }
+        self.bytes.extend(page.bytes);
+        Ok(())
+    }
+
+    pub(crate) fn next_request(&self) -> Option<ClientRequest> {
+        (self.bytes.len() < self.total).then_some(ClientRequest::ChatReadExitedQueuePage {
+            source: self.source,
+            receipt: self.receipt,
+            offset: self.bytes.len() as u32,
+        })
+    }
+
+    pub(crate) fn finish(self) -> Result<crate::chat::ExitedQueue, ()> {
+        if self.bytes.len() != self.total {
+            return Err(());
+        }
+        let (queue, trailing): (crate::chat::ExitedQueue, _) =
+            postcard::take_from_bytes(&self.bytes).map_err(|_| ())?;
+        if trailing.is_empty() && queue.messages.len() <= crate::chat::QueuedMessage::LIMIT {
+            return Ok(queue);
+        }
+        Err(())
+    }
+}
+
+/// Assemble one immutable queue before handing it to a caller.
+pub(crate) fn collect_exited_queue<E>(
+    source: TerminalId,
+    first: ExitedQueuePage,
+    mut read: impl FnMut(ClientRequest) -> Result<ServerResponse, E>,
+    invalid: impl Fn() -> E,
+) -> Result<crate::chat::ExitedQueue, E> {
+    let mut collector = ExitedQueueCollector::start(source, first).map_err(|()| invalid())?;
+    while let Some(request) = collector.next_request() {
+        match read(request)? {
+            ServerResponse::ChatExitedQueuePage { source, page } => {
+                collector.append(source, page).map_err(|()| invalid())?;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    collector.finish().map_err(|()| invalid())
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

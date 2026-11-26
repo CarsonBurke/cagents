@@ -2753,9 +2753,7 @@ impl Runtime {
         self.snapshot
             .queued_messages
             .iter()
-            .filter(|queued| {
-                !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
-            })
+            .filter(|queued| !self.queue_taken_back(&queued.id) && !self.is_recalling(&queued.id))
             .count()
     }
 
@@ -7070,7 +7068,7 @@ impl Runtime {
         let mut rows = Vec::new();
         let held = self.queue_held();
         for queued in &self.snapshot.queued_messages {
-            if self.taken_back.contains(&queued.id) {
+            if self.queue_taken_back(&queued.id) {
                 continue;
             }
             let entry = QueueEntry::Provider(queued.id.clone());

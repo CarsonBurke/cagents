@@ -2027,6 +2027,22 @@ pub(in crate::host) fn finish_exited_attachment_for_start(
     Ok(true)
 }
 
+/// An unnamed pane whose actor never confirmed a conversation does not use
+/// the standard resume retirement. Its exact cleanup receipt is still valid
+/// evidence of which messages were left queued.
+pub(super) fn unconfirmed_exited_queue(
+    host: &SharedHost,
+    source: &Session,
+    proof: &HostSessionProof,
+) -> Result<Option<chat::ExitedQueue>, String> {
+    match cleanup_retirement(host, source, proof, None)? {
+        CleanupRetirement::Verified(receipt) if receipt.receipt().confirmed_session.is_none() => {
+            Ok(receipt.queue_for(source))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Resume may finish an interrupted daemon shutdown. Reuse its normal
 /// per-conversation disposition so a completed interactive Spare can settle.
 fn restart_close_scope(host: &SharedHost, id: TerminalId) -> DetachedWork {

@@ -325,6 +325,13 @@ impl ResumeRetirement {
     pub(super) fn is_classified(&self) -> bool {
         !matches!(self, Self::Unclassified)
     }
+    pub(super) fn final_queue(&self, source: &Session) -> Option<crate::chat::ExitedQueue> {
+        match self {
+            Self::Verified(retirement) => retirement.queue_for(source),
+            Self::Unclassified | Self::Abandoned => None,
+        }
+    }
+
     pub(super) fn verified(self) -> Option<crate::chat::runtime::VerifiedRetirement> {
         match self {
             Self::Verified(verified) => Some(verified),

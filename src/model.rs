@@ -458,6 +458,12 @@ pub struct KeptChatDraft {
     pub attachments: Vec<crate::chat::Attachment>,
     #[serde(default)]
     pub waiting: Vec<crate::chat::QueuedMessage>,
+    /// Scope proved when recording an actor's final `waiting` queue. An
+    /// ordinary saved queue can only follow its original closed pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_waiting: Option<Box<ConfirmedQueueSource>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_queue: Option<RestoredQueue>,
     /// Whether `text` is the message the chat was still sending as it
     /// closed, which the conversation may have received.
     #[serde(default)]
@@ -468,6 +474,25 @@ pub struct KeptChatDraft {
     #[serde(default)]
     pub sent_after: SentAfter,
     pub closed_at_unix_ms: i64,
+}
+
+pub type ExitedQueueKey = (TerminalId, [u8; 32]);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmedQueueSource {
+    pub source: crate::chat::Session,
+    pub account_scope: Option<[u8; 32]>,
+    pub confirmed_session: Option<String>,
+    /// Identity of the full receipt, even after removing already returned entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<[u8; 32]>,
+}
+
+impl ConfirmedQueueSource {
+    pub fn receipt_key(&self) -> Option<ExitedQueueKey> {
+        self.fingerprint
+            .map(|fingerprint| (self.source.id, fingerprint))
+    }
 }
 
 /// The reader's latest message in a conversation as it was sent another,
@@ -497,11 +522,22 @@ impl KeptChatDraft {
         self.text.is_empty() && self.attachments.is_empty() && self.waiting.is_empty()
     }
 
-    /// Keeps the newest [`Self::LIMIT`] drafts that hold anything and closed
-    /// within [`Self::RETENTION_MS`] of `now_unix_ms`.
+    pub fn has_saved_data(&self) -> bool {
+        !self.is_empty() || self.restored_queue.is_some()
+    }
+
+    /// A shared view may still list an origin pane while its exact retired
+    /// queue or the record of returning it belongs to the saved workspace.
+    pub fn keeps_queue_at_origin(&self) -> bool {
+        self.confirmed_waiting.is_some() || (self.is_empty() && self.restored_queue.is_some())
+    }
+
+    /// Keeps the newest [`Self::LIMIT`] entries closed within
+    /// [`Self::RETENTION_MS`] of `now_unix_ms`. Drafts take priority over
+    /// entries that only remember a returned queue.
     pub fn retain_recent(drafts: &mut HashMap<CardId, Self>, now_unix_ms: i64) {
         drafts.retain(|_, draft| {
-            !draft.is_empty()
+            draft.has_saved_data()
                 && now_unix_ms.saturating_sub(draft.closed_at_unix_ms) <= Self::RETENTION_MS
         });
         if drafts.len() <= Self::LIMIT {
@@ -509,10 +545,10 @@ impl KeptChatDraft {
         }
         let mut order = drafts
             .iter()
-            .map(|(card, draft)| (draft.closed_at_unix_ms, *card))
+            .map(|(card, draft)| (!draft.is_empty(), draft.closed_at_unix_ms, *card))
             .collect::<Vec<_>>();
         order.sort_unstable_by(|a, b| b.cmp(a));
-        for (_, card) in order.into_iter().skip(Self::LIMIT) {
+        for (_, _, card) in order.into_iter().skip(Self::LIMIT) {
             drafts.remove(&card);
         }
     }
@@ -531,6 +567,40 @@ pub struct SavedQueue {
     /// reopened card connects through.
     #[serde(default)]
     pub stopped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<RestoredQueue>,
+}
+
+impl SavedQueue {
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.restored.is_none()
+    }
+}
+
+/// Message IDs already reconciled with a stopped provider's draft. The
+/// exit publication and resume reply can contain overlapping queues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredQueue {
+    pub source: TerminalId,
+    pub ids: Vec<String>,
+}
+
+impl RestoredQueue {
+    pub fn remember(&mut self, id: &str) -> bool {
+        // At most one bounded exit snapshot and one final queue reply.
+        if self.ids.len() < 2 * crate::chat::QueuedMessage::LIMIT
+            && !self.ids.iter().any(|seen| seen == id)
+        {
+            self.ids.push(id.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.iter().any(|seen| seen == id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1724,6 +1794,10 @@ pub struct WorkspaceState {
     /// card, so reopening the conversation brings it back to the composer.
     #[serde(default)]
     pub kept_chat_drafts: HashMap<CardId, KeptChatDraft>,
+    /// Complete final queues recovered from exact historical panes. A new
+    /// checkpoint names its recipient until the writer has saved its draft.
+    #[serde(skip)]
+    pub returned_chat_queues: BTreeMap<CardId, BTreeMap<ExitedQueueKey, Option<CardId>>>,
     /// Chats closed in this window that the daemon has not yet said were
     /// stopped, or refused to stop, oldest first.
     #[serde(default)]
@@ -1778,6 +1852,7 @@ impl Default for WorkspaceState {
             chat_draft_models: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
             kept_chat_drafts: HashMap::new(),
+            returned_chat_queues: BTreeMap::new(),
             stopping_chats: Vec::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),

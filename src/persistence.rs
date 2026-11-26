@@ -48,7 +48,7 @@ pub use update_resume::{Taken, UpdateResumeStore};
 // decode safely. Admission must reject them before partial workspace loading
 // can omit a card and a later snapshot can tombstone it. This supplements the
 // normal local IPC startup gate; it also fences permitted old-set/remote opens.
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -2137,6 +2137,23 @@ impl StateStore {
         load_card_connection(&inner.connection, id, &self.boot_id, proof)
     }
 
+    pub fn has_returned_chat_queue(
+        &self,
+        origin: CardId,
+        receipt: crate::model::ExitedQueueKey,
+    ) -> Result<bool> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        Ok(inner.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM returned_chat_queues WHERE origin_card_id = ?1 AND source_terminal_id = ?2
+                    AND queue_fingerprint = ?3
+            )",
+            params![origin.to_string(), receipt.0.to_string(), receipt.1.as_slice()],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn saved_conversations(&self) -> Result<Vec<SavedConversation>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -2271,6 +2288,30 @@ impl StateStore {
                 }
             }
         }
+        // Resume lists history from every workspace. Load the compact
+        // checkpoints along with that window's local draft state.
+        let mut returned_chat_queues =
+            BTreeMap::<CardId, BTreeMap<crate::model::ExitedQueueKey, _>>::new();
+        {
+            let mut statement = transaction
+                .prepare("SELECT origin_card_id, source_terminal_id, queue_fingerprint FROM returned_chat_queues")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let origin = parse_id("retired queue origin", &row.get::<_, String>(0)?);
+                let source = parse_id("retired queue source", &row.get::<_, String>(1)?);
+                match (origin, source) {
+                    (Ok(origin), Ok(source)) => {
+                        returned_chat_queues
+                            .entry(origin)
+                            .or_default()
+                            .insert((source, row.get::<_, [u8; 32]>(2)?), None);
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        tracing::warn!(%error, "Skipping unreadable retired queue checkpoint");
+                    }
+                }
+            }
+        }
         transaction.commit()?;
         let offered = &mut inner.offered_cards.unrestored;
         offered.retain(|_, unrestored| unrestored.workspace != id);
@@ -2302,6 +2343,7 @@ impl StateStore {
             chat_draft_models: manifest.chat_draft_models,
             chat_waiting_messages: manifest.chat_waiting_messages,
             kept_chat_drafts: manifest.kept_chat_drafts,
+            returned_chat_queues,
             stopping_chats: manifest.stopping_chats,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
@@ -2315,9 +2357,16 @@ impl StateStore {
         state
             .pending_chat_admissions
             .retain(|id, source| open_chats.get(id).is_some_and(|open| **open == *source));
-        state
-            .chat_waiting_messages
-            .retain(|id, _| open_chats.contains_key(id));
+        state.chat_waiting_messages.retain(|id, queue| {
+            let Some(source) = open_chats.get(id) else {
+                return false;
+            };
+            queue.restored = queue
+                .restored
+                .take()
+                .filter(|receipt| receipt.source == source.id);
+            !queue.is_empty()
+        });
         // A choice applies only to the draft it was made in. A replacement
         // committed before the snapshot that would have dropped the choice
         // does not inherit it.
@@ -2326,10 +2375,26 @@ impl StateStore {
                 .get(id)
                 .is_some_and(|session| model.applies_to(session))
         });
+        for (origin, draft) in &mut state.kept_chat_drafts {
+            if draft
+                .confirmed_waiting
+                .as_ref()
+                .and_then(|proof| proof.receipt_key())
+                .is_some_and(|receipt| {
+                    state
+                        .returned_chat_queues
+                        .get(origin)
+                        .is_some_and(|queues| queues.contains_key(&receipt))
+                })
+            {
+                draft.confirmed_waiting = None;
+                draft.waiting.clear();
+            }
+        }
         // A closed chat's draft waits for that chat to reopen as another card.
         state
             .kept_chat_drafts
-            .retain(|id, _| !open_chats.contains_key(id));
+            .retain(|id, draft| !open_chats.contains_key(id) || draft.keeps_queue_at_origin());
         crate::model::KeptChatDraft::retain_recent(&mut state.kept_chat_drafts, now_unix_ms());
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
@@ -4045,6 +4110,16 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                  CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
             )?;
         }
+        if current < 14 {
+            transaction.execute_batch(
+                "CREATE TABLE returned_chat_queues (
+                    origin_card_id TEXT NOT NULL REFERENCES cards(card_id) ON DELETE CASCADE,
+                    source_terminal_id TEXT NOT NULL,
+                    queue_fingerprint BLOB NOT NULL CHECK(length(queue_fingerprint) = 32),
+                    PRIMARY KEY(origin_card_id, source_terminal_id, queue_fingerprint)
+                 ) STRICT;",
+            )?;
+        }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -4609,11 +4684,12 @@ fn save_workspace_transaction(
     let waiting = state
         .chat_waiting_messages
         .iter()
-        .filter(|(id, queue)| !queue.messages.is_empty() && open_chats.contains_key(id))
-        .map(|(id, queue)| {
+        .filter_map(|(id, queue)| {
+            let source = open_chats.get(id)?;
             let mut queue = queue.clone();
             queue.messages.truncate(crate::chat::QueuedMessage::LIMIT);
-            (*id, queue)
+            queue.restored = queue.restored.filter(|receipt| receipt.source == source.id);
+            (!queue.is_empty()).then_some((*id, queue))
         })
         .collect::<HashMap<_, _>>();
     set_metadata(
@@ -4624,7 +4700,7 @@ fn save_workspace_transaction(
     let mut kept_drafts = state
         .kept_chat_drafts
         .iter()
-        .filter(|(id, _)| !open_chats.contains_key(id))
+        .filter(|(id, draft)| !open_chats.contains_key(id) || draft.keeps_queue_at_origin())
         .map(|(id, draft)| (*id, draft.clone()))
         .collect::<HashMap<_, _>>();
     crate::model::KeptChatDraft::retain_recent(&mut kept_drafts, now_unix_ms());
@@ -4764,6 +4840,42 @@ fn save_workspace_transaction(
         };
         let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
         card_generations.insert(*card_id, generation);
+    }
+    // A final receipt can be suppressed only after its destination can be
+    // recovered from this same commit. In particular, a separately refused
+    // card or a not-yet-saved reopen placeholder cannot consume the queue.
+    if !state.returned_chat_queues.is_empty() {
+        let mut checkpoint = transaction.prepare_cached(
+            "INSERT INTO returned_chat_queues (origin_card_id, source_terminal_id, queue_fingerprint)
+             SELECT card_id, ?2, ?3 FROM cards
+             WHERE card_id = ?1 AND kind_tag = 'chat'
+                AND CASE WHEN json_valid(content_json) THEN json_extract(content_json, '$.id')
+                    END = ?2
+             ON CONFLICT(origin_card_id, source_terminal_id, queue_fingerprint) DO NOTHING",
+        )?;
+        for (origin, sources) in &state.returned_chat_queues {
+            for ((source, fingerprint), recipient) in sources {
+                let Some(recipient) = recipient else {
+                    continue;
+                };
+                if open_chats.contains_key(recipient)
+                    && !refused.iter().any(
+                        |error| matches!(error, StoreError::Card { card, .. } if card == recipient),
+                    )
+                    && (state.chat_drafts.contains_key(recipient)
+                        || state.chat_draft_attachments.contains_key(recipient)
+                        || waiting
+                            .get(recipient)
+                            .is_some_and(|queue| !queue.messages.is_empty()))
+                {
+                    checkpoint.execute(params![
+                        origin.to_string(),
+                        source.to_string(),
+                        fingerprint.as_slice()
+                    ])?;
+                }
+            }
+        }
     }
     // A card this workspace no longer offers has nothing left to skip,
     // whether its row was tombstoned above, never stored or has moved on.
@@ -7128,6 +7240,7 @@ mod tests {
             chat_draft_models: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
             kept_chat_drafts: HashMap::new(),
+            returned_chat_queues: Default::default(),
             stopping_chats: Vec::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
@@ -7381,9 +7494,13 @@ mod tests {
         configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
         // Synthetic layout test only. Exported before/after compatibility
         // fixtures above always use actual normal-writer schema admission.
+        connection
+            .execute_batch("DROP TABLE returned_chat_queues")
+            .unwrap();
         connection.pragma_update(None, "user_version", 11).unwrap();
-        let before = logical_ui_rows(&connection);
-        let schema = connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap();
+        let mut before = logical_ui_rows(&connection);
+        before.insert("returned_chat_queues".into(), Vec::new());
+        let schema = connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name != 'returned_chat_queues' ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap();
         migrate(&mut connection).unwrap();
         assert_eq!(
             connection
@@ -7392,7 +7509,7 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
         assert_eq!(logical_ui_rows(&connection), before);
-        assert_eq!(connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap(), schema);
+        assert_eq!(connection.query_row("SELECT group_concat(sql, char(10)) FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name != 'returned_chat_queues' ORDER BY type,name)", [], |row| row.get::<_, String>(0)).unwrap(), schema);
     }
 
     #[test]
@@ -8617,6 +8734,8 @@ mod tests {
                 delivery: Default::default(),
                 attachments: Vec::new(),
             }],
+            confirmed_waiting: None,
+            restored_queue: None,
             sending: true,
             sent_after: SentAfter::Same("user-1".into()),
             closed_at_unix_ms: at,
@@ -8850,6 +8969,7 @@ mod tests {
             }),
             messages: vec![message],
             stopped: false,
+            restored: None,
         };
         workspace.chat_waiting_messages.insert(chat, queue.clone());
         // A card this workspace no longer holds keeps nothing.
@@ -8883,6 +9003,37 @@ mod tests {
                 .chat_waiting_messages
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn an_exit_queue_receipt_is_saved_with_only_its_source_draft() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("restored-queue.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+        let chat = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        workspace.chat_drafts.insert(chat, "returned prompt".into());
+        let queue = crate::model::SavedQueue {
+            restored: Some(crate::model::RestoredQueue {
+                source: source.id,
+                ids: vec!["prompt-1".into()],
+            }),
+            ..Default::default()
+        };
+        workspace.chat_waiting_messages.insert(chat, queue.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(saved.chat_drafts[&chat], "returned prompt");
+        assert_eq!(saved.chat_waiting_messages[&chat], queue);
+
+        source.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(source);
+        lane.save(&store, &workspace).unwrap();
+        let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(saved.chat_drafts[&chat], "returned prompt");
+        assert!(!saved.chat_waiting_messages.contains_key(&chat));
     }
 
     #[test]
@@ -10016,6 +10167,98 @@ mod tests {
             store.stored_generations(workspace.id).unwrap().workspace,
             before
         );
+    }
+
+    #[test]
+    fn returned_chat_queue_checkpoint_requires_saved_composer_and_exact_history() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("queue-checkpoint.sqlite3");
+        let (mut workspace, session) = agent_workspace(crate::agent::Provider::Claude);
+        let origin = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(session.clone());
+        workspace.cards[0].existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: None,
+            },
+        };
+        workspace.focused = None;
+        let mut recipient_card = workspace.cards[0].clone();
+        let recipient = CardId::new();
+        recipient_card.id = recipient;
+        recipient_card.existence = Existence::Open;
+        recipient_card.kind = CardKind::Chat(crate::chat::Session {
+            id: TerminalId::new(),
+            terminal: None,
+            ..session.clone()
+        });
+        workspace.cards.push(recipient_card);
+        let fingerprint = crate::chat::exited_queue_fingerprint(["one"]);
+        let key = (session.id, fingerprint);
+        let wrong_source = (TerminalId::new(), fingerprint);
+        let next_key = (session.id, crate::chat::exited_queue_fingerprint(["two"]));
+        workspace.returned_chat_queues.insert(
+            origin,
+            BTreeMap::from([(key, Some(recipient)), (wrong_source, Some(recipient))]),
+        );
+
+        let store = StateStore::open(&path, boot("queue-checkpoint")).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let workspace_id = workspace.id;
+        let read = || store.load_workspace(workspace_id, None).unwrap().unwrap();
+        assert!(read().returned_chat_queues.is_empty());
+        assert!(!store.has_returned_chat_queue(origin, key).unwrap());
+        workspace
+            .chat_drafts
+            .insert(recipient, "recovered queue".into());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            read().returned_chat_queues,
+            BTreeMap::from([(origin, BTreeMap::from([(key, None)]))])
+        );
+        assert!(store.has_returned_chat_queue(origin, key).unwrap());
+        assert!(!store.has_returned_chat_queue(origin, wrong_source).unwrap());
+        assert!(!store.has_returned_chat_queue(origin, next_key).unwrap());
+        let file = crate::chat::Attachment::file("/project/notes.txt");
+        workspace.kept_chat_drafts.insert(
+            origin,
+            crate::model::KeptChatDraft {
+                text: "independently typed".into(),
+                attachments: vec![file.clone()],
+                waiting: vec![crate::chat::QueuedMessage::new(
+                    "one".into(),
+                    "already returned".into(),
+                )],
+                confirmed_waiting: Some(Box::new(crate::model::ConfirmedQueueSource {
+                    source: session.clone(),
+                    account_scope: None,
+                    confirmed_session: session.launch.session_id.clone(),
+                    fingerprint: Some(fingerprint),
+                })),
+                closed_at_unix_ms: now_unix_ms(),
+                ..Default::default()
+            },
+        );
+        workspace.returned_chat_queues.clear();
+        lane.save(&store, &workspace).unwrap();
+        let restored = read();
+        let draft = &restored.kept_chat_drafts[&origin];
+        assert_eq!(draft.text, "independently typed");
+        assert_eq!(draft.attachments, [file]);
+        assert!(draft.waiting.is_empty());
+        assert!(draft.confirmed_waiting.is_none());
+        assert!(read().returned_chat_queues[&origin].contains_key(&key));
+
+        let inner = store.lock_inner().unwrap();
+        inner
+            .connection
+            .execute("DELETE FROM cards WHERE card_id = ?1", [origin.to_string()])
+            .unwrap();
+        drop(inner);
+        assert!(read().returned_chat_queues.is_empty());
+        assert!(!store.has_returned_chat_queue(origin, key).unwrap());
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::account::{
 };
 use crate::agent::Provider;
 use crate::chat;
+use crate::model::{ConfirmedQueueSource, ExitedQueueKey};
 use crate::persistence::SavedConversation;
 use cosmic::iced::futures::StreamExt;
 use std::collections::HashSet;
@@ -79,10 +80,12 @@ pub(super) struct State {
     /// Whether a chosen conversation waits for its retiring channel to
     /// settle before it can reopen there.
     pub(super) loading: bool,
+    queued_draft_check: Option<u64>,
     /// Panes put in place for conversations still being prepared to resume.
     pub(super) reopening: HashMap<CardId, Reopening>,
     /// Numbers each preparation, so only the latest answer is applied.
     attempts: u64,
+    queue_queries: HashMap<CardId, u64>,
     pub(super) error: Option<String>,
     limit: usize,
     selected: usize,
@@ -412,7 +415,20 @@ pub enum Action {
     /// for its numbered attempt. `Ok(None)` means it could not be reached to
     /// prepare an unstarted successor, which then resumes as a conversation of
     /// its own, as it would without one.
-    Prepared(CardId, u64, Result<Option<Box<chat::Session>>, String>),
+    Prepared(
+        CardId,
+        u64,
+        Result<Option<Box<chat::Session>>, String>,
+        Option<Arc<chat::ExitedQueue>>,
+    ),
+    QueuedDraftChecked(u64, Box<SavedConversation>, Option<ExitedQueueKey>),
+    QueueRecipientScope(
+        CardId,
+        u64,
+        Box<chat::Session>,
+        Option<[u8; 32]>,
+        Vec<(CardId, ExitedQueueKey)>,
+    ),
 }
 
 /// What indexing has found so far, in the order it is found.
@@ -547,6 +563,7 @@ fn missing_directories<'a>(
 /// `cancel` is set. What was read is saved to `store` for the next run.
 fn index(
     saved: Result<Vec<SavedConversation>, String>,
+    recoverable: &HashSet<CardId>,
     seeds: Vec<(chat::Session, Account)>,
     cache: &catalog::Cache,
     store: Option<&Path>,
@@ -557,7 +574,15 @@ fn index(
         cache.restore(store);
     }
     let mut candidates = Vec::new();
-    let complete = list(saved, seeds, cache, cancel, &mut candidates, &mut send);
+    let complete = list(
+        saved,
+        recoverable,
+        seeds,
+        cache,
+        cancel,
+        &mut candidates,
+        &mut send,
+    );
     if let Some(store) = store {
         // Only a reading of every transcript knows which are gone.
         let live = complete.then(|| {
@@ -575,6 +600,7 @@ fn index(
 /// [`index`]'s listing, which answers whether it read every transcript.
 fn list(
     saved: Result<Vec<SavedConversation>, String>,
+    recoverable: &HashSet<CardId>,
     seeds: Vec<(chat::Session, Account)>,
     cache: &catalog::Cache,
     cancel: &AtomicBool,
@@ -604,9 +630,11 @@ fn list(
                 &launch.recipe,
             );
             let untitled = entry.title == launch.provider.chat_title();
-            seen.insert(key.clone(), Some((entry.card, untitled)))
-                .is_none()
-                .then_some((entry, key))
+            let first = !seen.contains_key(&key);
+            if first {
+                seen.insert(key.clone(), Some((entry.card, untitled)));
+            }
+            (first || recoverable.contains(&entry.card)).then_some((entry, key))
         })
         .collect::<Vec<_>>();
     let mut checked = HashSet::new();
@@ -1034,6 +1062,7 @@ impl Cagents {
         state.asked_from = None;
         state.error = None;
         state.loading = false;
+        state.queued_draft_check = None;
         state.indexing = Some((0, 0));
         state.limit = PAGE;
         state.selected = 0;
@@ -1043,6 +1072,33 @@ impl Cagents {
         let cancel = state.cancel.clone();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let current = self.durable.cards.clone();
+        let recovery_rows: Vec<_> = self
+            .durable
+            .kept_chat_drafts
+            .iter()
+            .filter_map(|(id, draft)| {
+                let proof = draft.confirmed_waiting.as_ref()?;
+                let key = proof.receipt_key();
+                if draft.waiting.is_empty()
+                    || key.is_some_and(|key| self.returned_chat_queue(*id, key))
+                {
+                    return None;
+                }
+                Some((
+                    SavedConversation {
+                        card: *id,
+                        title: current.iter().find(|card| card.id == *id).map_or_else(
+                            || "Recovered queued messages".into(),
+                            |card| format!("Queued draft · {}", card.title),
+                        ),
+                        session: proof.source.clone(),
+                        open: false,
+                        updated_at_unix_ms: draft.closed_at_unix_ms,
+                    },
+                    key,
+                ))
+            })
+            .collect();
         let accounts = self.resume_catalog_accounts();
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         // Tests never read or write the reader's own catalog.
@@ -1054,7 +1110,16 @@ impl Cagents {
         let spawned = std::thread::Builder::new()
             .name("resume-index".into())
             .spawn(move || {
+                let mut recovery_rows = recovery_rows;
+                if let Some(store) = &store {
+                    recovery_rows.retain(|(row, key)| {
+                        !key.is_some_and(|key| {
+                            matches!(store.has_returned_chat_queue(row.card, key), Ok(true))
+                        })
+                    });
+                }
                 let mut saved = store
+                    .as_ref()
                     .map_or(Ok(Vec::new()), |store| store.saved_conversations())
                     .map_err(|error| error.to_string());
                 if let Ok(entries) = &mut saved {
@@ -1080,6 +1145,16 @@ impl Cagents {
                         }
                     }
                 }
+                let recovery_ids: HashSet<_> =
+                    recovery_rows.iter().map(|(row, _)| row.card).collect();
+                if !recovery_rows.is_empty() {
+                    if saved.is_err() {
+                        saved = Ok(Vec::new());
+                    }
+                    let entries = saved.as_mut().expect("recovery rows provide a catalog");
+                    entries.retain(|entry| !recovery_ids.contains(&entry.card));
+                    entries.extend(recovery_rows.into_iter().map(|(row, _)| row));
+                }
                 let seeds = accounts
                     .into_iter()
                     .filter_map(|account| {
@@ -1095,6 +1170,7 @@ impl Cagents {
                     .collect();
                 index(
                     saved,
+                    &recovery_ids,
                     seeds,
                     &cache,
                     catalog_store.as_deref(),
@@ -1233,8 +1309,23 @@ impl Cagents {
                     .map(|&index| self.resume_ui.rows[index].card);
                 card.map_or_else(Task::none, |card| self.update_resume(Action::Resume(card)))
             }
-            Action::Prepared(card, attempt, result) => {
-                self.reopening_prepared(card, attempt, result)
+            Action::QueuedDraftChecked(attempt, entry, returned) => {
+                if self.resume_ui.queued_draft_check != Some(attempt) {
+                    return Task::none();
+                }
+                self.resume_ui.queued_draft_check = None;
+                self.resume_ui.loading = false;
+                if let Some(key) = returned {
+                    self.acknowledge_returned_chat_queue(entry.card, key);
+                }
+                self.resume_saved_conversation_checked(*entry)
+            }
+            Action::Prepared(card, attempt, result, queue) => {
+                self.reopening_prepared(card, attempt, result, queue.as_deref())
+            }
+            Action::QueueRecipientScope(card, attempt, recipient, account, returned) => {
+                self.apply_queue_recipient_scope(card, attempt, &recipient, account, returned);
+                Task::none()
             }
         }
     }
@@ -1637,11 +1728,69 @@ impl Cagents {
             .map(|card| card.id)
     }
 
+    fn recoverable_queued_draft(&self, entry: &SavedConversation) -> Option<&ConfirmedQueueSource> {
+        let draft = self.durable.kept_chat_drafts.get(&entry.card)?;
+        let proof = draft.confirmed_waiting.as_ref()?;
+        (!draft.waiting.is_empty()
+            && proof.source == entry.session
+            && !proof
+                .receipt_key()
+                .is_some_and(|key| self.returned_chat_queue(entry.card, key)))
+        .then_some(proof)
+    }
+
     pub(super) fn resume_saved_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
         if self.resume_ui.loading {
             return Task::none();
         }
+        if let Some(key) = self
+            .recoverable_queued_draft(&entry)
+            .and_then(ConfirmedQueueSource::receipt_key)
+            && let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store)
+        {
+            self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
+            let attempt = self.resume_ui.attempts;
+            self.resume_ui.queued_draft_check = Some(attempt);
+            self.resume_ui.loading = true;
+            let origin = entry.card;
+            return cosmic::task::future(async move {
+                let returned =
+                    tokio::task::spawn_blocking(move || store.has_returned_chat_queue(origin, key))
+                        .await
+                        .is_ok_and(|result| matches!(result, Ok(true)));
+                Message::ResumeConversation(Action::QueuedDraftChecked(
+                    attempt,
+                    Box::new(entry),
+                    returned.then_some(key),
+                ))
+            });
+        }
+        self.resume_saved_conversation_checked(entry)
+    }
+
+    fn resume_saved_conversation_checked(&mut self, entry: SavedConversation) -> Task<Message> {
         self.resume_ui.error = None;
+        if self.recoverable_queued_draft(&entry).is_some() {
+            // Explicitly choosing the closed queue can recover its text even
+            // while a different physical account holds that conversation ID.
+            let mut draft = entry.session.clone();
+            let Some(recipe) = crate::model::agent_recovery::fresh_recipe(&draft.launch.recipe)
+            else {
+                self.resume_error(
+                    "The recovered queue's original launch options could not be kept safely.",
+                );
+                return Task::none();
+            };
+            draft.reset_owned_codex_listener();
+            draft.id = TerminalId::new();
+            draft.launch.recipe = recipe;
+            draft.launch.session_id = None;
+            draft.launch.draft_model = None;
+            draft.proof = None;
+            draft.terminal = None;
+            draft.native_continuity = chat::NativeContinuity::ReconnectOnly;
+            return self.place_resumed_conversation(entry, draft, None).1;
+        }
         // A conversation whose stop was refused is still running: it comes
         // back attached to that provider, never as a second one beside it,
         // and its notice goes, however it was reopened.
@@ -1689,6 +1838,7 @@ impl Cagents {
 
     /// Selects where the open `card` is and focuses it.
     fn reveal_conversation_card(&mut self, card: CardId, session: &chat::Session) -> Task<Message> {
+        let queues = self.check_saved_reopened_queue_scope(card);
         // The conversation is already open: going to it is navigation.
         let scope = if let Some(channel) = self
             .durable
@@ -1706,7 +1856,99 @@ impl Cagents {
                 .unwrap_or_else(|| session.launch.recipe.working_directory.clone());
             self.navigate_to_worktree(owner, false)
         };
-        Task::batch([scope, cosmic::task::message(Message::FocusCard(card))])
+        Task::batch([
+            scope,
+            queues,
+            cosmic::task::message(Message::FocusCard(card)),
+        ])
+    }
+
+    /// Request attestation off the window thread. A changed pane or later
+    /// attempt cannot consume a reply that was in flight for its predecessor.
+    pub(super) fn check_saved_reopened_queue_scope(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardState {
+            kind: CardKind::Chat(session),
+            ..
+        }) = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())
+        else {
+            return Task::none();
+        };
+        if self.reopen_pending(card)
+            || session.proof.is_none()
+            || !self.has_attested_queue_candidate(session)
+        {
+            return Task::none();
+        }
+        let store = self.session.as_ref().map(SessionRuntime::operation_store);
+        let candidates = self
+            .durable
+            .kept_chat_drafts
+            .iter()
+            .filter_map(|(origin, draft)| {
+                let key = draft.confirmed_waiting.as_ref()?.receipt_key()?;
+                Some((*origin, key))
+            })
+            .collect::<Vec<_>>();
+        let session = session.clone();
+        self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
+        let attempt = self.resume_ui.attempts;
+        self.resume_ui.queue_queries.insert(card, attempt);
+        cosmic::task::future(async move {
+            let requested = session.clone();
+            let (account, returned) = tokio::task::spawn_blocking(move || {
+                let account = crate::terminal::ipc::daemon_socket_path()
+                    .ok()
+                    .and_then(|socket| {
+                        let mut client = crate::control::ControlClient::connect(&socket).ok()?;
+                        client.chat_queue_recipient_scope(requested).ok().flatten()
+                    });
+                let returned = store
+                    .filter(|_| account.is_some())
+                    .map_or_else(Vec::new, |store| {
+                        candidates
+                            .into_iter()
+                            .filter(|(origin, key)| {
+                                matches!(store.has_returned_chat_queue(*origin, *key), Ok(true))
+                            })
+                            .collect()
+                    });
+                (account, returned)
+            })
+            .await
+            .unwrap_or_default();
+            Message::ResumeConversation(Action::QueueRecipientScope(
+                card,
+                attempt,
+                Box::new(session),
+                account,
+                returned,
+            ))
+        })
+    }
+
+    fn apply_queue_recipient_scope(
+        &mut self,
+        card: CardId,
+        attempt: u64,
+        recipient: &chat::Session,
+        account: Option<[u8; 32]>,
+        returned: Vec<(CardId, ExitedQueueKey)>,
+    ) {
+        if self.resume_ui.queue_queries.get(&card) != Some(&attempt) {
+            return;
+        }
+        self.resume_ui.queue_queries.remove(&card);
+        for (origin, key) in returned {
+            self.acknowledge_returned_chat_queue(origin, key);
+        }
+        self.materialize_replica_snapshot();
+        if let Some(account) = account
+            && self.restore_attested_reopened_queues(card, recipient, account)
+        {
+            self.persist();
+        }
     }
 
     /// Puts the pane of a conversation the service must prepare in place at
@@ -1728,28 +1970,67 @@ impl Cagents {
             return Task::none();
         };
         let attempt = reopening.attempt;
+        let origin = reopening.entry.card;
+        let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let source = reopening.entry.session.clone();
         let unstarted = unstarted_successor(&source);
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
+            let response = tokio::task::spawn_blocking(move || {
                 let socket = crate::terminal::ipc::daemon_socket_path()
                     .map_err(|error| error.to_string())?;
                 let mut client = match crate::control::ControlClient::connect(&socket) {
                     Ok(client) => client,
                     // Nothing runs to vouch for it, or to refuse it.
                     Err(crate::control::ControlError::Connect(_)) if unstarted => {
-                        return Ok(None);
+                        return Ok((None, Ok(None)));
                     }
                     Err(error) => return Err(error.to_string()),
                 };
-                client
-                    .prepare_chat_resume(source)
-                    .map(|session| Some(Box::new(session)))
-                    .map_err(|error| error.to_string())
+                let source_id = source.id;
+                let completed = if !source.native_continuity.retains_provider()
+                    && source.proof.as_ref() == Some(client.proof())
+                {
+                    // A failed read from the owner is not evidence of an
+                    // empty queue. Leave this history row available to Retry.
+                    client
+                        .read_exited_chat_queue(source.clone())
+                        .map_err(|error| error.to_string())?
+                } else {
+                    None
+                };
+                let (queued, prepared) = match client.prepare_chat_resume_with_queue(source) {
+                    Ok((queued, prepared)) => (
+                        queued,
+                        prepared.map(|session| Some(Box::new(session))).map_err(|error| {
+                            crate::control::ControlError::Remote {
+                                code: error.code,
+                                message: error.message,
+                                retryable: error.retryable,
+                            }
+                            .to_string()
+                        }),
+                    ),
+                    Err(error) => (None, Err(error.to_string())),
+                };
+                let queued = queued.or(completed);
+                let returned = queued.as_ref()
+                    .and_then(|queue| chat_ui::completed_queue_key(source_id, &queue.messages))
+                    .is_some_and(|key| {
+                        store.is_some_and(|store| match store.has_returned_chat_queue(origin, key) {
+                            Ok(returned) => returned,
+                            Err(error) => {
+                                tracing::warn!(%error, "Could not check the exact retired queue history");
+                                false
+                            }
+                        })
+                    });
+                let queued = queued.filter(|_| !returned);
+                Ok((queued.map(Arc::new), prepared))
             })
             .await
             .unwrap_or_else(|error| Err(error.to_string()));
-            Message::ResumeConversation(Action::Prepared(card, attempt, result))
+            let (queue, result) = response.unwrap_or_else(|error| (None, Err(error)));
+            Message::ResumeConversation(Action::Prepared(card, attempt, result, queue))
         })
     }
 
@@ -1846,12 +2127,15 @@ impl Cagents {
         card: CardId,
         attempt: u64,
         result: Result<Option<Box<chat::Session>>, String>,
+        queue: Option<&chat::ExitedQueue>,
     ) -> Task<Message> {
+        self.materialize_replica_snapshot();
         let Some(reopening) = self.resume_ui.reopening.get(&card).filter(|reopening| {
             reopening.attempt == attempt && reopening.stage == ReopenStage::Preparing
         }) else {
             return Task::none();
         };
+        let saved_card = reopening.entry.card;
         let source = reopening.entry.session.clone();
         if !self.card_state(card).is_some_and(|state| {
             state.existence.is_open()
@@ -1861,7 +2145,7 @@ impl Cagents {
             return Task::none();
         }
         let session = match result {
-            Ok(Some(session)) if prepared_resume_matches(&source, &session) => *session,
+            Ok(Some(session)) if prepared_resume_matches(&source, &session) => Ok(*session),
             Ok(Some(_)) => {
                 return self.fail_reopening(
                     card,
@@ -1869,21 +2153,42 @@ impl Cagents {
                 );
             }
             Ok(None) => {
-                let mut session = source;
+                let mut session = source.clone();
                 session.reset_owned_codex_listener();
                 session.id = TerminalId::new();
                 session.proof = None;
                 session.terminal = None;
-                session
+                Ok(session)
             }
+            Err(error) => Err(error),
+        };
+        let waiting = queue.is_some_and(|queue| {
+            let waiting = self.keep_reopened_queue(saved_card, &source, queue);
+            self.persist();
+            waiting
+        });
+        // The final queue first belongs to the saved source. When a native
+        // pane already opened, its daemon can independently attest a match.
+        if let Ok(opened) = &session
+            && let Some(existing) = self.existing_conversation_card(opened, Some(card))
+            && (opened.launch.session_id.is_some() || !waiting)
+        {
+            if waiting
+                && self
+                    .card_state(existing)
+                    .is_some_and(|state| matches!(state.kind, CardKind::Terminal(_)))
+            {
+                return self.fail_reopening(
+                    card,
+                    "Close the terminal or switch it to native chat, then retry to recover the queued messages.",
+                );
+            }
+            return self.supersede_reopening(card, existing, opened);
+        }
+        let session = match session {
+            Ok(session) => session,
             Err(error) => return self.fail_reopening(card, &error),
         };
-        // Opened in another pane meanwhile, which is then where it is. The
-        // placeholder still records its reopen while it closes, so its close
-        // asks nothing of the conversation the other pane holds.
-        if let Some(existing) = self.existing_conversation_card(&session, Some(card)) {
-            return self.supersede_reopening(card, existing, &session);
-        }
         // What may have changed while the service answered.
         if let Some(reason) = self.deleting_card_reason(card) {
             return self.fail_reopening(card, reason);
@@ -1929,8 +2234,16 @@ impl Cagents {
             state.kind = CardKind::Chat(session.clone());
         }
         // What it had not sent when its card closed comes back with it.
-        if self.reclaim_kept_draft(reopening.entry.card) {
+        let reclaimed = if session.is_unstarted() {
+            self.reclaim_kept_draft(reopening.entry.card)
+        } else {
+            self.reclaim_kept_draft_for_actor(reopening.entry.card)
+        };
+        if reclaimed {
             self.move_chat_draft(reopening.entry.card, card);
+        }
+        if session.is_unstarted() {
+            self.restore_reopened_queue_to_unstarted_draft(card, reopening.entry.session.id);
         }
         self.persist();
         self.open_placed_chat(card, session)
@@ -1978,14 +2291,23 @@ impl Cagents {
             return;
         };
         let source = reopening.entry.card;
-        if !self.durable.kept_chat_drafts.contains_key(&card)
-            && let Some(draft) = Arc::make_mut(&mut self.durable)
-                .kept_chat_drafts
-                .remove(&source)
+        let drafts = &mut Arc::make_mut(&mut self.durable).kept_chat_drafts;
+        if !drafts.contains_key(&card)
+            && let Some(draft) = drafts.remove(&source)
         {
-            Arc::make_mut(&mut self.durable)
-                .kept_chat_drafts
-                .insert(card, draft);
+            if let Some(receipt) = draft.restored_queue.clone() {
+                drafts.insert(
+                    source,
+                    crate::model::KeptChatDraft {
+                        restored_queue: Some(receipt),
+                        closed_at_unix_ms: draft.closed_at_unix_ms,
+                        ..Default::default()
+                    },
+                );
+            }
+            if !draft.is_empty() {
+                drafts.insert(card, draft);
+            }
         }
     }
 
@@ -1998,7 +2320,7 @@ impl Cagents {
         result: Result<Option<Box<chat::Session>>, String>,
     ) -> Task<Message> {
         let attempt = self.resume_ui.reopening[&card].attempt;
-        self.update_resume(Action::Prepared(card, attempt, result))
+        self.update_resume(Action::Prepared(card, attempt, result, None))
     }
 
     /// Puts a pane in place beside `beside` for `session`, as a reopen does
@@ -2051,6 +2373,8 @@ impl Cagents {
         let draft_from =
             (attempt.is_none() && self.reclaim_kept_draft(entry.card)).then_some(entry.card);
         let title = entry.title.clone();
+        let unstarted = session.is_unstarted();
+        let source = entry.session.id;
         let reopening = attempt.map(|attempt| Reopening {
             attempt,
             entry,
@@ -2058,6 +2382,10 @@ impl Cagents {
         });
         let (card, insert) =
             self.insert_resumed_chat_card(session, replace, user_title, draft_from, reopening);
+        if attempt.is_none() && unstarted {
+            self.restore_reopened_queue_to_unstarted_draft(card, source);
+            self.persist();
+        }
         // Manual names were installed before insertion. Otherwise publish
         // the saved automatic title instead of the provider's generic name.
         if self.apply_reported_title(card, title) {
@@ -2150,6 +2478,9 @@ impl Cagents {
             self.core.set_keyboard_nav(restore);
         }
         let state = &mut self.resume_ui;
+        if state.queued_draft_check.take().is_some() {
+            state.loading = false;
+        }
         state.open = false;
         state.indexing = None;
         state.replace = None;
@@ -2869,6 +3200,36 @@ mod tests {
         prepared
     }
 
+    fn exited_queue(messages: impl Into<Vec<chat::QueuedMessage>>) -> Arc<chat::ExitedQueue> {
+        Arc::new(chat::ExitedQueue {
+            messages: messages.into(),
+            account_scope: Some([7; 32]),
+            confirmed_session: Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into()),
+        })
+    }
+
+    fn answer_queue_scope(app: &mut Cagents, card: CardId, account: Option<[u8; 32]>) {
+        let CardKind::Chat(session) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("the receiver is a native chat");
+        };
+        let attempt = app.resume_ui.queue_queries[&card];
+        drop(app.update_resume(Action::QueueRecipientScope(
+            card,
+            attempt,
+            Box::new(session),
+            account,
+            Vec::new(),
+        )));
+    }
+
+    fn prepared_answer(
+        card: CardId,
+        attempt: u64,
+        result: Result<Option<Box<chat::Session>>, String>,
+    ) -> Action {
+        Action::Prepared(card, attempt, result, None)
+    }
+
     /// The pane put in place for a reopen, and the attempt it waits on.
     fn reopening(app: &Cagents) -> (CardId, u64) {
         let card = app.workspace.focused().expect("the reopened pane");
@@ -2905,7 +3266,7 @@ mod tests {
         assert_ne!(saved.focused, Some(card));
 
         let prepared = successor(&source);
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             attempt,
             Ok(Some(Box::new(prepared.clone()))),
@@ -2937,7 +3298,7 @@ mod tests {
         let entry = retained(directory.path());
         drop(app.resume_saved_conversation(entry.clone()));
         let (card, attempt) = reopening(&app);
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             attempt,
             Ok(Some(Box::new(successor(&entry.session)))),
@@ -3022,7 +3383,7 @@ mod tests {
         let (card, attempt) = reopening(&app);
         // The pane carries its manual name while it waits.
         assert_eq!(app.card_state(card).unwrap().title, "Parser recovery");
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             attempt,
             Ok(Some(Box::new(prepared.clone()))),
@@ -3089,7 +3450,7 @@ mod tests {
         assert!(app.chat_start_pending(card), "the daemon keeps its lineage");
         let mut prepared = source.clone();
         prepared.id = TerminalId::new();
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             attempt,
             Ok(Some(Box::new(prepared.clone()))),
@@ -3100,7 +3461,7 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.resume_saved_conversation(entry));
         let (card, attempt) = reopening(&app);
-        drop(app.update_resume(Action::Prepared(card, attempt, Ok(None))));
+        drop(app.update_resume(prepared_answer(card, attempt, Ok(None))));
         let CardKind::Chat(session) = &app.card_state(card).unwrap().kind else {
             panic!("the conversation resumes as a chat");
         };
@@ -3120,7 +3481,7 @@ mod tests {
         // A refusal, such as the daemon not answering in time, is shown where
         // the pane is, as a sentence, and starts nothing.
         let refusal = "the daemon did not answer within 5 s";
-        drop(app.update_resume(Action::Prepared(card, attempt, Err(refusal.into()))));
+        drop(app.update_resume(prepared_answer(card, attempt, Err(refusal.into()))));
         assert!(matches!(app.cards.get(&card),
             Some(CardRuntime::Failed(failure))
                 if failure.message() == "The daemon did not answer within 5 s."));
@@ -3140,7 +3501,7 @@ mod tests {
                 .all(|saved| saved.id != card)
         );
         // The same answer arriving twice changes nothing more.
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             attempt,
             Ok(Some(Box::new(successor(&source)))),
@@ -3153,14 +3514,14 @@ mod tests {
         assert!(app.chat_start_pending(card));
         let retried = app.resume_ui.reopening[&card].attempt;
         assert_ne!(retried, attempt);
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             attempt,
             Ok(Some(Box::new(successor(&source)))),
         )));
         assert!(app.reopen_preparing(card), "a stale answer is ignored");
         let prepared = successor(&source);
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             retried,
             Ok(Some(Box::new(prepared.clone()))),
@@ -3175,7 +3536,7 @@ mod tests {
         let (card, attempt) = reopening(&app);
         let mut altered = successor(&entry.session);
         altered.launch.session_id = Some("another-thread".into());
-        drop(app.update_resume(Action::Prepared(card, attempt, Ok(Some(Box::new(altered))))));
+        drop(app.update_resume(prepared_answer(card, attempt, Ok(Some(Box::new(altered))))));
         assert!(app.reopen_failed(card));
         assert_eq!(
             app.card_state(card).unwrap().kind,
@@ -3348,6 +3709,86 @@ mod tests {
     }
 
     #[test]
+    fn resume_picker_preserves_the_exact_final_queue_across_a_refusal_and_retry() {
+        use super::super::chat_ui::tests::{answer_start, chat_runtime_attempt, fixture_handle};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        let old_card = entry.card;
+        let source = entry.session.clone();
+        let already_returned = chat::QueuedMessage::new("seen".into(), "Review the changes".into());
+        let mut unseen = chat::QueuedMessage::new("unseen".into(), "Run the tests".into());
+        unseen.attachments = vec![chat::Attachment::file(directory.path().join("notes.txt"))];
+        let stale = chat::QueuedMessage::new("stale".into(), "Already processed".into());
+        let kept = crate::model::KeptChatDraft {
+            text: "Review the changes\nTyped afterwards".into(),
+            waiting: vec![stale.clone()],
+            restored_queue: Some(crate::model::RestoredQueue {
+                source: source.id,
+                ids: vec![already_returned.id.clone()],
+            }),
+            closed_at_unix_ms: unix_millis(),
+            ..Default::default()
+        };
+        Arc::make_mut(&mut app.durable)
+            .kept_chat_drafts
+            .insert(old_card, kept);
+        drop(app.resume_saved_conversation(entry));
+        let (card, attempt) = reopening(&app);
+
+        // The old actor's receipt is independent of the failed preparation.
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Err("Could not prepare the successor".into()),
+            Some(exited_queue([already_returned, unseen.clone()])),
+        )));
+        assert!(app.reopen_failed(card));
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.kept_chat_drafts[&old_card].waiting, [unseen.clone()]);
+        assert_eq!(
+            saved.kept_chat_drafts[&old_card].text,
+            "Review the changes\nTyped afterwards"
+        );
+
+        drop(app.retry_reopening(card));
+        let retry = app.resume_ui.reopening[&card].attempt;
+        let prepared = successor(&source);
+        // A late result from the old attempt cannot overwrite the queue
+        // or consume the closed draft.
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(prepared.clone()))),
+            Some(exited_queue([stale])),
+        )));
+        assert_eq!(
+            app.durable.kept_chat_drafts[&old_card].waiting,
+            [unseen.clone()]
+        );
+        // The retry can still use the saved evidence if no receipt arrives.
+        drop(app.update_resume(prepared_answer(card, retry, Ok(Some(Box::new(prepared))))));
+        assert_eq!(
+            app.durable.kept_chat_drafts[&old_card].waiting,
+            [unseen.clone()]
+        );
+        assert!(app.chat_waiting_to_save(card).messages.is_empty());
+
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, source.launch.session_id.as_deref());
+        answer_start(&mut app, target, Ok(handle));
+        answer_queue_scope(&mut app, card, Some([7; 32]));
+        assert_eq!(
+            app.chat_composer_text(card).unwrap().trim(),
+            "Run the tests\nReview the changes\nTyped afterwards"
+        );
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_draft_attachments[&card], unseen.attachments);
+        assert!(saved.chat_waiting_messages[&card].messages.is_empty());
+    }
+
+    #[test]
     fn a_pane_closed_while_reopening_takes_nothing_from_a_late_answer() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -3370,10 +3811,15 @@ mod tests {
         // start is left to give up.
         assert!(!app.chat_ui.transition_pending());
 
+        let late_queue = Some(exited_queue([chat::QueuedMessage::new(
+            "late".into(),
+            "Held text".into(),
+        )]));
         drop(app.update_resume(Action::Prepared(
             card,
             attempt,
             Ok(Some(Box::new(successor(&entry.session)))),
+            late_queue,
         )));
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert!(!app.chat_start_began(card));
@@ -3394,10 +3840,11 @@ mod tests {
                 .any(|(closed, _)| closed.id == card)
         );
         assert_eq!(app.durable.kept_chat_drafts[&card].text, "Unsent question");
+        assert!(app.durable.kept_chat_drafts[&card].waiting.is_empty());
         drop(app.reopen_closed_pane(card));
         let (reopened, attempt) = reopening(&app);
         assert_ne!(reopened, card);
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             reopened,
             attempt,
             Ok(Some(Box::new(successor(&entry.session)))),
@@ -3414,7 +3861,7 @@ mod tests {
         let (card, attempt) = reopening(&app);
         let other = saved(directory.path()).session;
         app.card_state_mut(card).unwrap().kind = CardKind::Chat(other.clone());
-        drop(app.update_resume(Action::Prepared(
+        drop(app.update_resume(prepared_answer(
             card,
             attempt,
             Ok(Some(Box::new(successor(&entry.session)))),
@@ -3426,14 +3873,26 @@ mod tests {
 
     #[test]
     fn preparation_rechecks_a_conversation_opened_while_waiting() {
+        use super::super::chat_ui::tests::{
+            answer_start, chat_runtime_attempt, fixture_handle, write,
+        };
+
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         // The conversation the daemon will answer with is opened in another
         // pane while the reopen waits.
         let entry = retained(directory.path());
         let source = entry.card;
+        let seen = chat::QueuedMessage::new("seen".into(), "Unsent question".into());
+        let mut unseen = chat::QueuedMessage::new("unseen".into(), "Held text".into());
+        unseen.attachments = vec![chat::Attachment::file(directory.path().join("notes.txt"))];
+        let still_held = chat::QueuedMessage::new("current-provider".into(), "Held text".into());
         let kept = crate::model::KeptChatDraft {
             text: "Unsent question".into(),
+            restored_queue: Some(crate::model::RestoredQueue {
+                source: entry.session.id,
+                ids: vec![seen.id.clone()],
+            }),
             closed_at_unix_ms: unix_millis(),
             ..Default::default()
         };
@@ -3441,15 +3900,28 @@ mod tests {
             .kept_chat_drafts
             .insert(source, kept);
         let prepared = successor(&entry.session);
-        drop(app.resume_saved_conversation(entry));
+        drop(app.resume_saved_conversation(entry.clone()));
         let (card, attempt) = reopening(&app);
         let (existing, _) = app.insert_resumed_chat_card(prepared.clone(), None, None, None, None);
         assert_ne!(card, existing);
-        drop(app.update_resume(Action::Prepared(
+        let target = chat_runtime_attempt(&app, existing);
+        let handle = fixture_handle(&app, existing, prepared.launch.session_id.as_deref());
+        answer_start(&mut app, target, Ok(handle.clone()));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.queued_messages = vec![still_held.clone()];
+        handle.publish_snapshot_for_test(snapshot);
+        write(&mut app, existing, "Already working here");
+        let queue = exited_queue([seen, unseen.clone()]);
+        let receipt = Action::Prepared(
             card,
             attempt,
-            Ok(Some(Box::new(prepared))),
-        )));
+            Ok(Some(Box::new(prepared.clone()))),
+            Some(queue.clone()),
+        );
+        drop(app.update_resume(receipt.clone()));
+        drop(app.update_resume(receipt));
+        answer_queue_scope(&mut app, existing, Some([7; 32]));
         // The placeholder gives way to the pane already holding it, and its
         // close stops nothing that pane holds.
         assert!(!app.chat_start_began(card));
@@ -3467,10 +3939,477 @@ mod tests {
                 .all(|(closed, _)| closed.id != card)
         );
         assert!(!app.durable.kept_chat_drafts.contains_key(&card));
+        let saved = app.persistent_workspace();
+        assert!(saved.kept_chat_drafts[&source].waiting.is_empty());
+        assert_eq!(
+            saved.kept_chat_drafts[&source]
+                .restored_queue
+                .as_ref()
+                .unwrap()
+                .ids,
+            ["seen", "unseen"]
+        );
+
+        // A second independently admitted preparation can replay the same
+        // exact receipt after the first placeholder has already gone.
+        drop(app.reopen_before_preparation(entry));
+        let (repeated, attempt) = reopening(&app);
+        drop(app.update_resume(Action::Prepared(
+            repeated,
+            attempt,
+            Ok(Some(Box::new(prepared))),
+            Some(queue),
+        )));
+        drop(app.update(Message::CommitClose(repeated)));
+        assert_eq!(app.chat_waiting_to_save(existing).messages, [still_held]);
+        assert_eq!(
+            app.chat_composer_text(existing).unwrap().trim(),
+            "Held text\nAlready working here"
+        );
+        assert_eq!(
+            app.persistent_workspace().chat_draft_attachments[&existing],
+            unseen.attachments
+        );
         assert_eq!(
             app.durable.kept_chat_drafts[&source].text,
             "Unsent question"
         );
+    }
+
+    #[test]
+    fn a_terminal_winner_keeps_the_queue_reachable_after_close() {
+        use super::super::chat_ui::tests::{answer_start, chat_runtime_attempt, fixture_handle};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let template = app.workspace.focused().unwrap();
+        let CardKind::Terminal(mut opened) = app.card_state(template).unwrap().kind.clone() else {
+            panic!("the fixture started with a terminal");
+        };
+        let entry = retained(directory.path());
+        let old_card = entry.card;
+        let source = entry.session.clone();
+        drop(app.resume_saved_conversation(entry));
+        let (card, attempt) = reopening(&app);
+
+        // This terminal acquired the exact conversation while preparation
+        // was in flight. The replay must never become part of its input.
+        let recipe = source.launch.terminal_recipe().unwrap();
+        opened.id = TerminalId::new();
+        opened.launch = recipe.clone();
+        opened.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: Some(crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            }),
+        };
+        drop(app.insert_terminal_card(opened.clone(), None));
+        let terminal = app.workspace.focused().unwrap();
+        app.cards.insert(terminal, CardRuntime::Completed);
+        let queued = chat::QueuedMessage::new("late".into(), "Return to the queue".into());
+        let prepared = successor(&source);
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(prepared.clone()))),
+            Some(exited_queue([queued.clone()])),
+        )));
+        assert!(app.reopen_failed(card));
+        assert!(app.held_chat_draft(terminal).is_none());
+        assert_eq!(
+            app.persistent_workspace().kept_chat_drafts[&old_card].waiting,
+            [queued]
+        );
+
+        drop(app.update(Message::CloseCard(terminal)));
+        drop(app.update(Message::CompletedTerminalClosed {
+            card: terminal,
+            session: opened,
+            result: Ok(super::super::terminal_close::CompletedCloseOutcome::Closed),
+        }));
+        drop(app.update(Message::CommitClose(terminal)));
+        assert!(!app.card_state(terminal).unwrap().existence.is_open());
+        drop(app.retry_reopening(card));
+        let retry = app.resume_ui.reopening[&card].attempt;
+        drop(app.update_resume(prepared_answer(card, retry, Ok(Some(Box::new(prepared))))));
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, source.launch.session_id.as_deref());
+        answer_start(&mut app, target, Ok(handle));
+        answer_queue_scope(&mut app, card, Some([7; 32]));
+        assert_eq!(
+            app.chat_composer_text(card).unwrap().trim(),
+            "Return to the queue"
+        );
+        assert!(app.durable.kept_chat_drafts[&old_card].waiting.is_empty());
+    }
+
+    #[test]
+    fn ordinary_resume_recovers_the_confirmed_queue_of_a_previous_pane_after_restart() {
+        use super::super::chat_ui::tests::{
+            answer_start, chat_runtime_attempt, fixture_handle, write,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = retained(directory.path());
+        let final_thread = source.session.launch.session_id.clone();
+        source.session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        // A remote provider path need not exist on this desktop. Only the
+        // capture received on the daemon connection can identify the account.
+        let remote_home = directory.path().join("remote-only-account");
+        source
+            .session
+            .launch
+            .recipe
+            .unset_environment
+            .remove("CLAUDE_CONFIG_DIR");
+        source.session.launch.recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            remote_home.to_string_lossy().into_owned(),
+        );
+        assert!(!remote_home.exists());
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let kept = crate::model::KeptChatDraft {
+            text: "The old draft stays separate".into(),
+            closed_at_unix_ms: unix_millis(),
+            ..Default::default()
+        };
+        Arc::make_mut(&mut app.durable)
+            .kept_chat_drafts
+            .insert(source.card, kept);
+        let mut queued =
+            chat::QueuedMessage::new("exact".into(), "Recover the queued prompt".into());
+        queued.attachments = vec![chat::Attachment::file(directory.path().join("notes.txt"))];
+        assert!(app.keep_reopened_queue(
+            source.card,
+            &source.session,
+            &exited_queue([queued.clone()]),
+        ));
+
+        assert!(!app.has_attested_queue_candidate(&source.session));
+        let mut current = successor(&source.session);
+        current.launch.session_id = final_thread;
+        let (winner, _) = app.insert_resumed_chat_card(current.clone(), None, None, None, None);
+        let target = chat_runtime_attempt(&app, winner);
+        let handle = fixture_handle(&app, winner, current.launch.session_id.as_deref());
+        answer_start(&mut app, target, Ok(handle));
+        write(&mut app, winner, "The winning draft");
+
+        let durable = app.persistent_workspace();
+        let boot = crate::model::BootId::new("fixture-boot");
+        let path = directory.path().join("state.sqlite3");
+        let store = crate::persistence::StateStore::open(&path, boot.clone()).unwrap();
+        store
+            .save_workspace(
+                &durable,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        drop(app);
+
+        let store = crate::persistence::StateStore::open(&path, boot).unwrap();
+        let read = store.load_workspace(durable.id, None).unwrap().unwrap();
+        let latest = |card| {
+            store
+                .saved_conversations()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.card == card)
+                .unwrap()
+        };
+        let current = latest(winner);
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace = Cagents::rebuild_workspace(&read);
+        app.chat_ui = chat_ui::State::for_workspace(&read);
+        app.durable = Arc::new(read);
+        assert!(app.resume_ui.reopening.is_empty());
+
+        drop(app.open_placed_chat(winner, current.session.clone()));
+        let target = chat_runtime_attempt(&app, winner);
+        let handle = fixture_handle(&app, winner, current.session.launch.session_id.as_deref());
+        answer_start(&mut app, target, Ok(handle));
+        // The live recipient captured a different account inode even though
+        // its saved recipe still spells the same account path.
+        drop(app.resume_saved_conversation(current.clone()));
+        answer_queue_scope(&mut app, winner, Some([9; 32]));
+        assert_eq!(
+            app.chat_composer_text(winner).unwrap().trim(),
+            "The winning draft"
+        );
+        assert_eq!(
+            app.durable.kept_chat_drafts[&source.card].waiting,
+            [queued.clone()]
+        );
+        // A reply for an earlier attempt cannot apply while the next checks.
+        drop(app.resume_saved_conversation(current.clone()));
+        let stale = app.resume_ui.queue_queries[&winner];
+        let CardKind::Chat(expected) = app.card_state(winner).unwrap().kind.clone() else {
+            panic!("the winner is a native chat");
+        };
+        drop(app.resume_saved_conversation(current.clone()));
+        drop(app.update_resume(Action::QueueRecipientScope(
+            winner,
+            stale,
+            Box::new(expected),
+            Some([7; 32]),
+            Vec::new(),
+        )));
+        assert_eq!(
+            app.chat_composer_text(winner).unwrap().trim(),
+            "The winning draft"
+        );
+        answer_queue_scope(&mut app, winner, Some([7; 32]));
+        drop(app.resume_saved_conversation(current));
+        assert_eq!(
+            app.chat_composer_text(winner).unwrap().trim(),
+            "Recover the queued prompt\nThe winning draft"
+        );
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_draft_attachments[&winner], queued.attachments);
+        let kept = &saved.kept_chat_drafts[&source.card];
+        assert_eq!(kept.text, "The old draft stays separate");
+        assert!(kept.waiting.is_empty());
+        assert!(kept.confirmed_waiting.is_none());
+        assert_eq!(kept.restored_queue.as_ref().unwrap().ids, ["exact"]);
+    }
+
+    #[test]
+    fn an_unattested_queue_has_its_own_recovery_entry_even_with_an_open_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        let queued = chat::QueuedMessage::new("archived".into(), "Review the saved change".into());
+        assert!(app.keep_reopened_queue(
+            entry.card,
+            &entry.session,
+            &chat::ExitedQueue {
+                messages: vec![queued],
+                account_scope: None,
+                confirmed_session: entry.session.launch.session_id.clone(),
+            },
+        ));
+        let current = successor(&entry.session);
+        let (winner, _) = app.insert_resumed_chat_card(current.clone(), None, None, None, None);
+        let mut visible_history = None;
+        let mut winner_row = entry.clone();
+        winner_row.card = winner;
+        winner_row.session = current;
+        winner_row.open = true;
+        index(
+            Ok(vec![winner_row, entry.clone()]),
+            &HashSet::from([entry.card]),
+            Vec::new(),
+            &catalog::Cache::default(),
+            None,
+            &AtomicBool::new(false),
+            |progress| {
+                if let Progress::Saved { entries, .. } = progress {
+                    visible_history = Some(entries);
+                }
+                false
+            },
+        );
+        let entry = visible_history
+            .unwrap()
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .find(|candidate| candidate.card == entry.card)
+            .expect("the original recovery entry is listed separately");
+        drop(app.resume_saved_conversation(entry.clone()));
+        let recovered = app.workspace.focused().unwrap();
+        assert_ne!(recovered, winner);
+        assert_eq!(
+            app.chat_composer_text(recovered).unwrap().trim(),
+            "Review the saved change"
+        );
+        assert!(
+            matches!(&app.card_state(recovered).unwrap().kind, CardKind::Chat(session) if session.is_unstarted())
+        );
+        assert!(!app.chat_start_began(recovered));
+        let origin = &app.durable.kept_chat_drafts[&entry.card];
+        assert!(origin.is_empty());
+        assert_eq!(origin.restored_queue.as_ref().unwrap().ids, ["archived"]);
+    }
+
+    #[test]
+    fn recovering_an_inert_queue_checkpoints_the_exact_origin_across_reload() {
+        use super::super::chat_ui::tests::{
+            answer_start, chat_runtime_attempt, dismiss_restored_queue_notice, fixture_handle,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        let cards = &mut Arc::make_mut(&mut app.durable).cards;
+        cards.push(CardState {
+            id: entry.card,
+            generation: 0,
+            title: entry.title.clone(),
+            width_fraction: 0.5,
+            existence: Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: unix_millis(),
+                    reason: None,
+                },
+            },
+            kind: CardKind::Chat(entry.session.clone()),
+        });
+        let mut first = chat::QueuedMessage::new("held-1".into(), "Review the saved change".into());
+        first.attachments = vec![chat::Attachment::file(directory.path().join("old.txt"))];
+        let second = chat::QueuedMessage::new("held-2".into(), "Keep this follow-up".into());
+        let receipt = Arc::new(chat::ExitedQueue {
+            messages: vec![first.clone(), second],
+            account_scope: None,
+            confirmed_session: entry.session.launch.session_id.clone(),
+        });
+        let key = chat_ui::completed_queue_key(entry.session.id, &receipt.messages).unwrap();
+        assert!(app.keep_reopened_queue(entry.card, &entry.session, &receipt));
+        drop(app.resume_saved_conversation(entry.clone()));
+        let inert = app.workspace.focused().unwrap();
+        dismiss_restored_queue_notice(&mut app, inert);
+
+        assert_eq!(
+            app.durable.returned_chat_queues[&entry.card][&key],
+            Some(inert)
+        );
+        let now = unix_millis();
+        let drafts = &mut Arc::make_mut(&mut app.durable).kept_chat_drafts;
+        for index in 0..=crate::model::KeptChatDraft::LIMIT {
+            drafts.insert(
+                CardId::new(),
+                crate::model::KeptChatDraft {
+                    text: format!("independent draft {index}"),
+                    closed_at_unix_ms: now + index as i64,
+                    ..Default::default()
+                },
+            );
+        }
+        let snapshot = app.persistent_workspace();
+        let boot = crate::model::BootId::new("fixture-boot");
+        let path = directory.path().join("state.sqlite3");
+        let store = crate::persistence::StateStore::open(&path, boot.clone()).unwrap();
+        store
+            .save_workspace(
+                &snapshot,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        drop(app);
+
+        let store = crate::persistence::StateStore::open(&path, boot).unwrap();
+        let read = store.load_workspace(snapshot.id, None).unwrap().unwrap();
+        assert_eq!(
+            read.kept_chat_drafts.len(),
+            crate::model::KeptChatDraft::LIMIT
+        );
+        assert!(!read.kept_chat_drafts.contains_key(&entry.card));
+        assert_eq!(read.returned_chat_queues[&entry.card][&key], None);
+        let original = store
+            .saved_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.card == entry.card)
+            .expect("the original named history remains available");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace = Cagents::rebuild_workspace(&read);
+        app.chat_ui = chat_ui::State::for_workspace(&read);
+        app.durable = Arc::new(read);
+        let CardKind::Chat(inert_session) = app.card_state(inert).unwrap().kind.clone() else {
+            panic!("the saved recovery is an inert chat");
+        };
+        assert!(inert_session.is_unstarted());
+        drop(app.open_placed_chat(inert, inert_session));
+        assert_eq!(
+            app.chat_composer_text(inert).unwrap().trim(),
+            "Review the saved change\nKeep this follow-up"
+        );
+
+        let prepared = successor(&original.session);
+        let named = original.session.launch.session_id.clone();
+        drop(app.resume_saved_conversation(original));
+        let (current, attempt) = reopening(&app);
+        drop(app.update_resume(Action::Prepared(
+            current,
+            attempt,
+            Ok(Some(Box::new(prepared))),
+            Some(receipt),
+        )));
+        let target = chat_runtime_attempt(&app, current);
+        let handle = fixture_handle(&app, current, named.as_deref());
+        answer_start(&mut app, target, Ok(handle));
+        assert!(app.chat_composer_text(current).unwrap().trim().is_empty());
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_draft_attachments[&inert], first.attachments);
+        assert!(!saved.chat_draft_attachments.contains_key(&current));
+        assert_eq!(saved.chat_drafts[&inert].lines().count(), 2);
+        assert!(!saved.kept_chat_drafts.contains_key(&entry.card));
+        assert_eq!(saved.returned_chat_queues[&entry.card].len(), 1);
+    }
+
+    #[test]
+    fn resume_preserves_an_independent_draft_beside_an_already_returned_queue() {
+        use super::super::chat_ui::tests::{answer_start, chat_runtime_attempt, fixture_handle};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        let fingerprint = chat::exited_queue_fingerprint(["one"]);
+        let file = chat::Attachment::file(directory.path().join("typed.txt"));
+        Arc::make_mut(&mut app.durable).kept_chat_drafts.insert(
+            entry.card,
+            crate::model::KeptChatDraft {
+                text: "independently typed".into(),
+                attachments: vec![file.clone()],
+                waiting: vec![chat::QueuedMessage::new(
+                    "one".into(),
+                    "already returned".into(),
+                )],
+                confirmed_waiting: Some(Box::new(crate::model::ConfirmedQueueSource {
+                    source: entry.session.clone(),
+                    account_scope: None,
+                    confirmed_session: entry.session.launch.session_id.clone(),
+                    fingerprint: Some(fingerprint),
+                })),
+                closed_at_unix_ms: unix_millis(),
+                ..Default::default()
+            },
+        );
+
+        // An older window still holds the escrow. The selected row's
+        // asynchronous store check has just confirmed it was returned.
+        let attempt = 1;
+        app.resume_ui.queued_draft_check = Some(attempt);
+        app.resume_ui.loading = true;
+        drop(app.update_resume(Action::QueuedDraftChecked(
+            attempt,
+            Box::new(entry.clone()),
+            Some((entry.session.id, fingerprint)),
+        )));
+        let (card, attempt) = reopening(&app);
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(successor(&entry.session)))),
+            None,
+        )));
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, entry.session.launch.session_id.as_deref());
+        answer_start(&mut app, target, Ok(handle));
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts[&card].trim(), "independently typed");
+        assert_eq!(saved.chat_draft_attachments[&card], [file]);
+        assert!(!saved.kept_chat_drafts.contains_key(&entry.card));
     }
 
     #[test]
@@ -3519,11 +4458,7 @@ mod tests {
         });
         app.refresh_sidebar_channels();
 
-        drop(app.update_resume(Action::Prepared(
-            card,
-            attempt,
-            Ok(Some(Box::new(prepared))),
-        )));
+        drop(app.update_resume(prepared_answer(card, attempt, Ok(Some(Box::new(prepared))))));
         // The channel holding it is shown, and the placeholder is gone with
         // the strip it was on, rather than left waiting off screen.
         assert_eq!(app.durable.active_channel, Some(channel));
@@ -3554,7 +4489,7 @@ mod tests {
         let path = directory.path().to_path_buf();
         drop(directory);
         // With no daemon to vouch for it, it would resume on its own.
-        drop(app.update_resume(Action::Prepared(card, attempt, Ok(None))));
+        drop(app.update_resume(prepared_answer(card, attempt, Ok(None))));
         assert!(app.reopen_failed(card));
         assert!(!app.chat_start_began(card));
         assert!(matches!(app.cards.get(&card),
@@ -3958,6 +4893,7 @@ mod tests {
         let mut progress = Vec::new();
         index(
             Ok(vec![entry.clone(), named]),
+            &HashSet::new(),
             vec![(seed, account)],
             &catalog::Cache::default(),
             None,
@@ -3996,6 +4932,7 @@ mod tests {
         let mut steps = 0;
         index(
             Ok(Vec::new()),
+            &HashSet::new(),
             Vec::new(),
             &catalog::Cache::default(),
             None,

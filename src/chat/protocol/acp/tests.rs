@@ -1049,6 +1049,80 @@ fn a_message_queued_during_a_turn_waits_in_the_adapter() {
 }
 
 #[test]
+fn recovery_keeps_full_held_input_until_the_adapter_delivers_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let attachment = chat::Attachment::file(directory.path().join("notes.txt"));
+    std::fs::write(&attachment.path, "attachment content").unwrap();
+    let text = format!("held {} tail", "雪".repeat(7 * 1024));
+    for (profile, initialized, opened) in [
+        (&antigravity::PROFILE, agy_initialize(), agy_new()),
+        (&muse::PROFILE, muse_initialize(), muse_new()),
+    ] {
+        let mut acp = Acp {
+            cwd: "/work/project".into(),
+            ..Acp::new(profile)
+        };
+        let initialize = acp.initialize().unwrap();
+        let open = acp
+            .receive(reply(only_write(&initialize), initialized))
+            .unwrap();
+        let mut step = acp
+            .receive(reply(only_write(&open), opened.clone()))
+            .unwrap();
+        while let Some(setting) = step.writes.first().cloned() {
+            step = acp
+                .receive(reply(
+                    &setting,
+                    json!({"configOptions": opened["configOptions"]}),
+                ))
+                .unwrap();
+        }
+        let current = prompt(&mut acp, "working");
+        let step = acp
+            .command(Command::Prompt {
+                text: text.clone(),
+                attachments: vec![attachment.clone()],
+                mode: PromptMode::Queue,
+            })
+            .unwrap();
+        let preview = queue_listing(&step).unwrap();
+        assert_eq!(preview.len(), 1);
+        assert!(preview[0].1.ends_with("[Queue preview truncated]"));
+        let queued = acp.recovery_queue().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, preview[0].0);
+        assert_eq!(queued[0].text, text);
+        assert_eq!(queued[0].attachments, [attachment.clone()]);
+        assert_eq!(queued[0].delivery, chat::QueueDelivery::NextTurn);
+        assert!(queued[0].editable);
+
+        // Delivery transfers the input out of the held queue. A removal
+        // racing behind it cannot make that same input recoverable again.
+        let delivered = acp
+            .receive(reply(&current, json!({"stopReason": "end_turn"})))
+            .unwrap();
+        let next = delivered
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "session/prompt")
+            .unwrap();
+        assert_eq!(prompt_texts(next), [text.as_str()]);
+        let removal = acp
+            .command(Command::RemoveQueued {
+                id: queued[0].id.clone(),
+            })
+            .unwrap();
+        assert!(
+            removal
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::QueueRemoval(reply) if !reply.removed))
+        );
+        assert_eq!(acp.recovery_queue(), Some(Vec::new()));
+    }
+}
+
+#[test]
 fn the_prompt_reply_starts_everything_queued_in_the_same_step() {
     let mut acp = adapter(&[], None);
     let session = ready(&mut acp);

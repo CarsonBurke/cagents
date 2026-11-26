@@ -473,6 +473,11 @@ pub trait Adapter: Send {
     fn outcome_pending(&self) -> bool {
         false
     }
+    /// Exact inputs still known to be held, in the order they would run.
+    /// `None` means this adapter has no verified recovery queue to report.
+    fn recovery_queue(&self) -> Option<Vec<super::QueuedMessage>> {
+        None
+    }
     fn command(&mut self, command: Command) -> Result<Step, String>;
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.
@@ -506,6 +511,50 @@ pub trait Adapter: Send {
         None
     }
 }
+
+/// Keeps the submitted input alongside the projection shown while it waits.
+/// Most messages fit in the projection, so they need no separate text.
+struct QueuedInput {
+    preview: super::QueuedMessage,
+    full_text: Option<String>,
+}
+
+impl QueuedInput {
+    fn new(
+        id: String,
+        text: String,
+        attachments: Vec<super::Attachment>,
+        delivery: super::QueueDelivery,
+    ) -> Self {
+        let (preview_text, full_text) = if text.len() > super::QueuedMessage::PREVIEW_BYTES {
+            // Let the ordinary preview formatter mark the text as truncated
+            // without cloning the entire input for it.
+            let end = text.ceil_char_boundary(super::QueuedMessage::PREVIEW_BYTES + 1);
+            (text[..end].to_owned(), Some(text))
+        } else {
+            (text, None)
+        };
+        let mut preview = super::QueuedMessage::new(id, preview_text);
+        preview.attachments = attachments;
+        preview.delivery = delivery;
+        Self { preview, full_text }
+    }
+
+    fn recovery(&self) -> super::QueuedMessage {
+        super::QueuedMessage {
+            id: self.preview.id.clone(),
+            text: self
+                .full_text
+                .as_ref()
+                .unwrap_or(&self.preview.text)
+                .clone(),
+            editable: true,
+            delivery: self.preview.delivery,
+            attachments: self.preview.attachments.clone(),
+        }
+    }
+}
+
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)
 }

@@ -106,7 +106,7 @@ fn unrun_input_outcome(refusal: QueueRefusal) -> &'static str {
 /// A helper's answer to a request it does not implement, such as an older
 /// helper asked to settle an input.
 const UNKNOWN_METHOD: &str = "Unknown retained actor method/version";
-fn payload_digest(bytes: &[u8]) -> [u8; 32] {
+pub(super) fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
 }
@@ -943,6 +943,27 @@ impl RemoteActor {
     pub fn owns_work(&self) -> bool {
         !self.0.preserved.load(Ordering::Acquire) && self.state().owns_work
     }
+    pub fn exited_recovery_queue(&self) -> Option<Vec<chat::QueuedMessage>> {
+        if !self.state().completed {
+            return None;
+        }
+        // The helper serializes a reference under this attachment's proof.
+        // The body may be much larger than a presentation RPC can carry.
+        match self.call::<Option<[u8; 32]>>("exit_recovery_queue", Value::Null) {
+            Ok(Some(digest)) => {
+                final_snapshot::read_recovery_queue(&self.0.identity.record, digest).ok()
+            }
+            Ok(None) | Err(_) => final_snapshot::read_exited_recovery_queue(
+                &self.0.identity,
+                &self.0.proof,
+                &self.0.source,
+            )
+            .ok()
+            .flatten()
+            .filter(|messages| messages.iter().all(|message| message.editable)),
+        }
+    }
+
     pub fn state(&self) -> Arc<Resident> {
         self.0
             .state
@@ -2841,6 +2862,7 @@ fn close_only_method(method: &str) -> bool {
         "state"
             | "watch"
             | "execution_environment"
+            | "exit_recovery_queue"
             | "recognize_sources"
             | "snapshot"
             | "presentation"
@@ -2957,6 +2979,7 @@ struct Server {
     socket_identity: (u64, u64),
     _directory: Option<Arc<File>>,
     closed_snapshot: Option<Arc<Snapshot>>,
+    published_exit_queue: Option<[u8; 32]>,
     session_stopping: bool,
     // A successful ownership handoff fences authorizing commands from the old
     // attachment. A newly authenticated attach may own the still-live actor.
@@ -3149,6 +3172,7 @@ impl Server {
                 socket_identity,
                 _directory: directory,
                 closed_snapshot: None,
+                published_exit_queue: None,
                 session_stopping: false,
                 attachment_preserved: false,
                 close_only: false,
@@ -3623,6 +3647,17 @@ impl Server {
         }
         match request.method.as_str() {
             "watch" => Ok(Value::Null),
+            "exit_recovery_queue" => {
+                if !self.installed || !self.actor.is_completed() {
+                    return Err("The retained provider's exit has not been proved".into());
+                }
+                let queue = self.actor.exited_recovery_queue();
+                let digest = queue
+                    .as_deref()
+                    .map(|queue| self.publish_exit_queue(queue))
+                    .transpose()?;
+                value!(digest)
+            }
             "presentation_codec" => {
                 let (version,) = decode!((u16,));
                 value!(version == crate::terminal_ipc::PROTOCOL_VERSION)
@@ -4284,6 +4319,15 @@ impl Server {
         reap_orphans(self.detached, self.actor.detached_cleanup_proved())
     }
 
+    fn publish_exit_queue(&mut self, queue: &[chat::QueuedMessage]) -> Result<[u8; 32], String> {
+        if let Some(digest) = self.published_exit_queue {
+            return Ok(digest);
+        }
+        let digest = final_snapshot::save_recovery_queue(&self.identity.record, queue)?;
+        self.published_exit_queue = Some(digest);
+        Ok(digest)
+    }
+
     fn publish_close(&mut self) -> Result<ClosePublication, String> {
         let snapshot = if let Some(snapshot) = &self.closed_snapshot {
             snapshot.as_ref().clone()
@@ -4307,6 +4351,11 @@ impl Server {
         // its last semantic ACK. Refresh receipt authority without changing
         // the exact immutable final publication.
         let previous_sources = self.retained_sources_for_publication()?;
+        if let Some(recovery) = self.actor.exited_recovery_queue()
+            && recovery.as_ref() != snapshot.queued_messages.as_slice()
+        {
+            self.publish_exit_queue(&recovery)?;
+        }
         final_snapshot::save(
             self.installed,
             &self.identity,
@@ -4317,6 +4366,7 @@ impl Server {
             self.actor.launch_account_scope(),
             self.actor.confirmed_session_id().as_deref(),
             &snapshot,
+            self.published_exit_queue,
             #[cfg(target_os = "macos")]
             self.actor.detached_cleanup_proved(),
         )?;

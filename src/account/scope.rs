@@ -48,6 +48,22 @@ pub struct LaunchAccountScope {
 }
 
 impl LaunchAccountScope {
+    /// Compare this captured home across related actors without returning
+    /// the home pathname, inode, or registry associations to the window.
+    pub fn queue_fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut digest = Sha256::new();
+        digest.update(b"cagents:retired-queue-account:v1");
+        digest.update(self.provider.executable().as_bytes());
+        digest.update([0]);
+        digest.update(self.device.to_be_bytes());
+        digest.update(self.inode.to_be_bytes());
+        digest.update(self.canonical_home.as_os_str().as_bytes());
+        digest.finalize().into()
+    }
+
     /// `environment` must describe the actual child environment after explicit
     /// removals and captured inheritance. Do not consult a later UI selection.
     pub fn resolve(
