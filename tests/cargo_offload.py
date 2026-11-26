@@ -518,8 +518,7 @@ class Transport(unittest.TestCase):
     def test_rsync_holds_the_remote_slot_and_refuses_a_superseded_lease(self):
         with FixtureDirectory() as scope:
             slot = Path(scope.name)
-            claim = slot / "claim"
-            claim.write_text(json.dumps({"generation": "first"}))
+            proof = slot / "lease-live"
             rsync = slot / "rsync"
             rsync.write_text("#!/bin/sh\nprintf 'ready\\n'\nread -r line\n")
             rsync.chmod(0o700)
@@ -527,24 +526,38 @@ class Transport(unittest.TestCase):
             build.slot_generation = "first"
             command = shlex.split(build.rsync_path(str(slot)).removeprefix("--rsync-path="))
             environment = os.environ | {"PATH": f"{slot}:{os.environ['PATH']}"}
-            with subprocess.Popen(command, env=environment, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE) as transfer:
-                try:
-                    self.assertTrue(select.select([transfer.stdout], [], [], HANG_GUARD)[0])
-                    self.assertEqual(transfer.stdout.readline(), b"ready\n")
-                    claim.write_text(json.dumps({"generation": "second"}))
-                    with open(slot / "running") as running:
-                        with self.assertRaises(BlockingIOError):
-                            fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    transfer.stdin.write(b"done\n")
-                    transfer.stdin.flush()
-                    self.assertEqual(transfer.wait(timeout=HANG_GUARD), 0)
-                finally:
-                    transfer.stdin.close()
+            with proof.open("w") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX)
+                lease.write("first")
+                lease.flush()
+                with subprocess.Popen(command, env=environment, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE) as transfer:
+                    try:
+                        self.assertTrue(select.select([transfer.stdout], [], [], HANG_GUARD)[0])
+                        self.assertEqual(transfer.stdout.readline(), b"ready\n")
+                        lease.close()
+                        with open(slot / "running") as running:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        transfer.stdin.write(b"done\n")
+                        transfer.stdin.flush()
+                        self.assertEqual(transfer.wait(timeout=HANG_GUARD), 0)
+                    finally:
+                        transfer.stdin.close()
+            # Even before its successor starts, a finished lease cannot
+            # admit another rsync through a delayed channel.
             result = subprocess.run(command, env=environment, capture_output=True,
                                     stdin=subprocess.DEVNULL, timeout=HANG_GUARD)
             self.assertEqual(result.returncode, 255)
             self.assertEqual(result.stdout, b"")
+            with proof.open("w") as successor:
+                fcntl.flock(successor, fcntl.LOCK_EX)
+                successor.write("second")
+                successor.flush()
+                result = subprocess.run(command, env=environment, capture_output=True,
+                                        stdin=subprocess.DEVNULL, timeout=HANG_GUARD)
+                self.assertEqual(result.returncode, 255)
+                self.assertEqual(result.stdout, b"")
 
     def test_a_run_channel_retries_before_sending_a_cargo_request(self):
         with FixtureDirectory() as scope:

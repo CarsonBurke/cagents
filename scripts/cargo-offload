@@ -635,6 +635,22 @@ TOOLS = ("build-host", "memory-capped", "cargo-gate-rustc-guard", "cargo-increme
 OPTIONAL_TOOLS = ("cargo-host-test-helper.py", "cargo_artifacts.py")
 
 
+LEASE_PROOF = r'''
+def require_generation(slot, generation=None):
+    if generation is None:
+        return
+    try:
+        with open(os.path.join(slot, "lease-live")) as proof:
+            if proof.read() == generation:
+                fcntl.flock(proof, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+    except OSError:
+        pass
+    sys.exit(255)
+'''
+
+
 # The lease checks Git ancestry before the remote slot receives any files.
 REMOTE_AGENT = Path(__file__).resolve().with_name("git_ancestry.py").read_text(encoding="utf-8") + r'''
 import base64, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
@@ -1264,12 +1280,7 @@ def read_claim(slot):
     except (OSError, ValueError):
         return {}
 
-
-def require_generation(slot, generation=None):
-    if generation is not None and read_claim(slot).get("generation") != generation:
-        sys.exit(255)
-
-
+''' + LEASE_PROOF + r'''
 def slot_indices(base):
     """The slots made so far, in order."""
     try:
@@ -1363,7 +1374,14 @@ if command == "lease":
     os.makedirs(base, exist_ok=True)
     leases = []
     waiting_for = None
+    proof_gate = threading.Lock()
+    lease_proof = None
     def release():
+        # Revoke new admission before waiting for already-admitted work.
+        # Keep proof_gate through exit so startup cannot publish afterwards.
+        proof_gate.acquire()
+        if lease_proof is not None:
+            lease_proof.close()
         # The next build in this slot starts only once this one's command
         # has ended, however this host's side of it was stopped.
         if leases:
@@ -1500,9 +1518,8 @@ if command == "lease":
         pass
     # What this build is, at once, so that a request for the same build
     # waits for it rather than build it again elsewhere.
-    generation = os.urandom(16).hex()
     with open(os.path.join(slot, "claim.new"), "w") as file:
-        json.dump({"build": build, "key": key, "generation": generation}, file)
+        json.dump({"build": build, "key": key}, file)
     os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
     queue.close()
     # A previous build's command or transfer may outlive its lease's
@@ -1596,6 +1613,16 @@ if command == "lease":
         with open(config + ".new", "w") as file:
             file.write(profiles)
         os.replace(config + ".new", config)
+    # A fresh inode ties this identity to the lease process. A forced exit
+    # drops its flock, even if it leaves the file behind.
+    with proof_gate:
+        generation = os.urandom(16).hex()
+        proof_path = os.path.join(slot, "lease-live")
+        lease_proof = open(proof_path + ".new", "w")
+        fcntl.flock(lease_proof, fcntl.LOCK_EX)
+        lease_proof.write(generation)
+        lease_proof.flush()
+        os.replace(proof_path + ".new", proof_path)
     say("slot", json.dumps({"index": index, "path": os.path.realpath(slot), "generation": generation}))
     while True:
         time.sleep(3600)
@@ -1941,14 +1968,8 @@ def install(staged, path, expected):
             os.unlink(temporary)
 
 
-RSYNC_SERVER = """import json, os, sys
-try:
-    with open(sys.argv[1]) as file:
-        current = json.load(file)
-        if not isinstance(current, dict) or current.get("generation") != sys.argv[2]:
-            sys.exit(255)
-except (OSError, ValueError):
-    sys.exit(255)
+RSYNC_SERVER = "import fcntl, os, sys\n" + LEASE_PROOF + """
+require_generation(sys.argv[1], sys.argv[2])
 os.execvp("rsync", ["rsync", *sys.argv[3:]])
 """
 
@@ -2248,6 +2269,8 @@ class Offload:
             if held is None:
                 return None
             slot, marker, _, control, generation = held
+            if generation is None:
+                return self.refuse("this build hold predates lease fencing; finish it and start a new hold")
             if marker and self.tests_there():
                 return self.refuse_marker(marker)
             self.control = control
@@ -2783,8 +2806,7 @@ class Offload:
         if self.slot_generation is None:
             command.append("rsync")
         else:
-            command += ["/usr/bin/python3", "-c", RSYNC_SERVER,
-                        os.path.join(slot, "claim"), self.slot_generation]
+            command += ["/usr/bin/python3", "-c", RSYNC_SERVER, slot, self.slot_generation]
         return "--rsync-path=" + shlex.join(command)
 
     def fetch(self, slot, remote, local, shell, *, files=None, delete=False, missing_ok=False):
@@ -2969,8 +2991,11 @@ class Hold(Offload):
             top, _, _, _, base = self.locate()
         except Refusal as refusal:
             return self.refuse(str(refusal))
-        if self.held(base, top) is not None:
+        held = self.held(base, top)
+        if held is not None:
             # Already inside a hold of this checkout's: its slot serves.
+            if held[4] is None:
+                return self.refuse("this build hold predates lease fencing; finish it and start a new hold")
             return self.execute(dict(self.environment))
         if self.cancelled:
             return 128 + self.cancelled

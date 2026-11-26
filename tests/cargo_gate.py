@@ -1781,7 +1781,7 @@ class PreflightCancellation(unittest.TestCase):
 
     def install_offload(self):
         # The real router, with the helper it reads beside itself.
-        for name in ("cargo-offload", "git_ancestry.py"):
+        for name in ("cargo-offload", "git_ancestry.py", "offload_client.py", "native_slots.py"):
             shutil.copy2(ROOT / "scripts" / name, self.root / name)
 
     def test_read_only_cargo_queries_skip_build_preflight_and_admission(self):

@@ -1199,6 +1199,10 @@ probes. The transfer deadline also covers a stuck local SSH proxy, including
 invoking process exits. Once a remote command begins, a lost connection
 fails the command so its effects cannot be replayed. Waiting for the build
 host to accept a lease keeps its separate admission budget and retry interval.
+Source and artifact transfers hold the slot on the build host until they exit.
+A delayed channel must still prove its exact lease before it starts. If a
+gate update refuses a command inside an older hold, finish that hold and
+start a new one.
 
 The host has build slots under
 `~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
