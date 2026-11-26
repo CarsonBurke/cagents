@@ -759,7 +759,7 @@ impl ExecutionEvidence {
         let check = || self.deadline.map_or(Ok(()), check_deadline).ok();
         let live_pid = |expected: &crate::daemon::holder_registry::Process| {
             let pid = u32::try_from(expected.pid).ok()?;
-            let pin = crate::pinned_process::PinnedProcess::open(pid).ok()?;
+            let pin = crate::daemon::PinnedProcess::open(pid).ok()?;
             (expected.is_current() && matches!(pin.exited(), Ok(false))).then_some(expected.pid)
         };
         let discovered = self.native_holders.as_ref().ok().and_then(|directory| {
