@@ -653,7 +653,7 @@ def require_generation(slot, generation=None):
 
 # The lease checks Git ancestry before the remote slot receives any files.
 REMOTE_AGENT = Path(__file__).resolve().with_name("git_ancestry.py").read_text(encoding="utf-8") + r'''
-import base64, fcntl, glob, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
+import base64, fcntl, glob, hashlib, json, os, re, resource, select, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
@@ -1702,6 +1702,45 @@ elif command in ("run", "run-client"):
     if not incoming.endswith(b"\n"):
         sys.exit(255)
     request = json.loads(incoming)
+    launch_gate = threading.Lock()
+    cancelling = threading.Event()
+    child = None
+    input_closed = select.poll()
+    input_closed.register(sys.stdin, select.POLLHUP)
+
+    def end(process, sent_first):
+        """Exit the command's group, including children that ignore an interrupt."""
+        for sent in (sent_first, signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, sent)
+            except ProcessLookupError:
+                return
+            for _ in range(50):
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    return
+                time.sleep(0.1)
+
+    def cancel():
+        cancelling.set()
+        with launch_gate:
+            if child is not None:
+                end(child, signal.SIGINT)
+            os._exit(130)
+
+    def start(arguments, **options):
+        global child
+        with launch_gate:
+            if command == "run-client" and (cancelling.is_set() or input_closed.poll(0)):
+                os._exit(130)
+            child = subprocess.Popen(arguments, start_new_session=True, **options)
+            return child
+
+    if command == "run-client":
+        # A complete request can still lose its SSH channel while waiting for
+        # the slot or preparing Cargo. Revoke it before that work can start.
+        until_closed(cancel)
     environment = request["environment"]
     # The command may open as many files as the host allows. An ssh
     # session's soft limit is the conventional 1024, which fails
@@ -1756,13 +1795,16 @@ elif command in ("run", "run-client"):
         metadata_environment = dict(environment)
         if request.get("target_dir"):
             metadata_environment["CARGO_TARGET_DIR"] = request["target_dir"]
-        found = subprocess.run(
+        metadata_child = start(
             [arguments[0], *cargo_options, "metadata", "--format-version", "1", "--no-deps",
              "--offline", *metadata_options],
             env=metadata_environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL)
+        metadata_output, _ = metadata_child.communicate()
+        with launch_gate:
+            child = None
         try:
-            described = json.loads(found.stdout)
+            described = json.loads(metadata_output)
             directories = {"target": described["target_directory"],
                            "build": described.get("build_directory") or described["target_directory"]}
         except (ValueError, KeyError, TypeError):
@@ -1811,36 +1853,16 @@ elif command in ("run", "run-client"):
     # could alias a later same-size source update within one timestamp tick.
     arguments = [sys.executable, "-I", "-B", os.path.join(tools, "build-host"), "cargo",
                  *admission, "--", *arguments]
-    child = subprocess.Popen(arguments, env=environment, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
-    def end(sent_first):
-        """Signals the command's process group until it is gone: children
-        that ignore an interrupt, as a shell's background jobs do, get a
-        termination and then a kill."""
-        for sent in (sent_first, signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(child.pid, sent)
-            except ProcessLookupError:
-                return
-            for _ in range(50):
-                try:
-                    os.killpg(child.pid, 0)
-                except ProcessLookupError:
-                    return
-                time.sleep(0.1)
-    cancelling = threading.Event()
-    def cancel():
-        cancelling.set()
-        end(signal.SIGINT)
-        os._exit(130)
-    until_closed(cancel)
+    child = start(arguments, env=environment, stdin=subprocess.DEVNULL)
+    if command != "run-client":
+        until_closed(cancel)
     status = child.wait()
     if cancelling.is_set():
         # Ending the group exits.
         while True:
             time.sleep(3600)
     # What the command left running would keep the connection open.
-    end(signal.SIGTERM)
+    end(child, signal.SIGTERM)
     remove_evicted([base])
     os._exit(status if status >= 0 else 128 - status)
 '''
@@ -2017,6 +2039,7 @@ class Offload:
         self.lease = None
         self.slot_generation = None
         self.local_sync_fd = None
+        self.held_builds_fd = None
         self.cancelled = 0
         # A Git marker above the slot's checkout, as its lease reported.
         self.marker = None
@@ -2049,11 +2072,13 @@ class Offload:
                    "--parent", str(os.getpid()), "--timeout", str(timeout)]
         if not (self.loopback and remote_long):
             wrapper.append("--drain-on-exit")
-        if local_sync_fd is not None:
+        descriptors = tuple(fd for fd in (local_sync_fd, self.held_builds_fd) if fd is not None)
+        if descriptors:
             # The supervisor keeps admission until it has reaped the
             # transfer, including if this client is killed.
-            wrapper += ["--hold-fd", str(local_sync_fd)]
-            options["pass_fds"] = (local_sync_fd,)
+            for descriptor in descriptors:
+                wrapper += ["--hold-fd", str(descriptor)]
+            options["pass_fds"] = descriptors
         if remote_long and not self.loopback:
             lower = Path(__file__).resolve().with_name("offload_client.py")
             command = [sys.executable, "-I", str(lower), "low", *command]
@@ -2193,8 +2218,8 @@ class Offload:
 
         if self.cancelled:
             return 128 + self.cancelled
-        if self.held(base, top) is not None:
-            status = self.build_held(base, top, workspace, cwd, metadata)
+        if (held := self.held(base, top)) is not None:
+            status = self.build_held(held, base, top, workspace, cwd, metadata)
             if status is not None:
                 return status
         self.share_connection()
@@ -2254,10 +2279,9 @@ class Offload:
         finally:
             os.close(descriptor)
 
-    def build_held(self, base, top, workspace, cwd, metadata):
+    def build_held(self, held, base, top, workspace, cwd, metadata):
         """Builds in the slot an enclosing `--hold` holds, or returns None
         when that hold ended while this waited its turn."""
-        held = self.held(base, top)
         try:
             builds = open(held[2] + ".builds", "a")
         except OSError:
@@ -2275,6 +2299,7 @@ class Offload:
                 return self.refuse_marker(marker)
             self.control = control
             self.slot_generation = generation
+            self.held_builds_fd = builds.fileno()
             try:
                 return self.build(slot, top, workspace, cwd, metadata)
             except Refusal as refusal:
@@ -2284,6 +2309,7 @@ class Offload:
             finally:
                 self.control = None
                 self.slot_generation = None
+                self.held_builds_fd = None
 
     def tests_there(self):
         """Whether the command runs tests on the build host."""

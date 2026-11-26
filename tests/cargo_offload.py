@@ -2384,6 +2384,27 @@ class RemoteRun(unittest.TestCase):
                     agent.stdin.close()
                     self.assertFalse(crate.exists())
 
+    def test_a_run_channel_closed_while_waiting_cannot_start_cargo(self):
+        with FixtureDirectory() as scope:
+            slot = Path(scope.name, "slot-0")
+            (slot / "src").mkdir(parents=True)
+            marker = slot / "launched"
+            host = f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+            with (slot / "lease-live").open("w") as lease, (slot / "running").open("a") as running:
+                fcntl.flock(lease, fcntl.LOCK_EX)
+                lease.write("still-held")
+                lease.flush()
+                fcntl.flock(running, fcntl.LOCK_EX)
+                agent = self.agent(scope, "run-client", str(slot), ".", "cargo", "check",
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                self.assertTrue(select.select([agent.stdout], [], [], HANG_GUARD)[0])
+                self.assertEqual(agent.stdout.readline(), offload.RUN_READY)
+                request = {"environment": {}, "generation": "still-held", "tools": {"build-host": host}}
+                agent.stdin.write(json.dumps(request).encode() + b"\n")
+                agent.stdin.close()
+                self.assertEqual(agent.wait(timeout=HANG_GUARD), 130)
+            self.assertFalse(marker.exists())
+
     def test_the_build_host_uses_the_fixtures_private_gate(self):
         for override in (False, True):
             with self.subTest(override=override), FixtureDirectory() as scope:
