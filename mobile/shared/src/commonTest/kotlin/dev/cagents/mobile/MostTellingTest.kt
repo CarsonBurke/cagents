@@ -34,6 +34,16 @@ class MostTellingTest {
     }
 
     @Test
+    fun aComputerThatRefusesThePortSaysSoRatherThanUnreachable() {
+        val refused = ConnectFailure.Network("100.101.102.103 refused the connection on port 2244.", answered = true)
+        val reported = mostTelling(listOf(unreachable, refused, unreachable), "workstation", hosts, paired = true)
+        assertSame(refused, reported)
+        // With nothing refusing, it stays the summary of every address.
+        val none = mostTelling(listOf(unreachable, unreachable), "workstation", hosts, paired = true)
+        assertTrue("any of its 3 addresses" in none.message!!)
+    }
+
+    @Test
     fun aPairedComputerWithAWrongKeyEverywhereRaisesTheAlarm() {
         val failures = hosts.map(::changed)
         assertSame(failures.first(), mostTelling(failures, "workstation", hosts, paired = true))

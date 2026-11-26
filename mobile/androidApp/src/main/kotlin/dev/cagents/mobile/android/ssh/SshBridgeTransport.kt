@@ -221,10 +221,10 @@ private suspend fun connect(target: SshTarget, host: String): SSHClient {
         throw e
     } catch (e: TransportException) {
         client.disconnectQuietly()
-        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e)
+        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, isRefusal(e))
     } catch (e: Exception) {
         client.disconnectQuietly()
-        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e)
+        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, isRefusal(e))
     }
     return client
 }
@@ -254,6 +254,23 @@ internal fun describeConnectFailure(e: Throwable, host: String, port: Int): Stri
     val known = generateSequence(e) { it.cause }.firstOrNull {
         it is UnknownHostException || it is ConnectException || it is NoRouteToHostException || it is SocketTimeoutException
     }
+    return when {
+        isRefusal(e) ->
+            "$host refused the connection on port $port. Is its SSH server running on that port? " +
+                "Check the port in Settings, or pair again."
+        else -> describeKnown(known, e, host, address)
+    }
+}
+
+/**
+ * Whether the computer answered and turned the connection down, as it does
+ * when nothing listens on the port, rather than not answering at all.
+ */
+internal fun isRefusal(e: Throwable): Boolean = generateSequence(e) { it.cause }.any { cause ->
+    cause is ConnectException && cause.message.orEmpty().let { "ECONNREFUSED" in it || "Connection refused" in it }
+}
+
+private fun describeKnown(known: Throwable?, e: Throwable, host: String, address: String): String {
     return when (known) {
         is UnknownHostException -> "Couldn't find $host. Check the address."
         is ConnectException, is NoRouteToHostException ->

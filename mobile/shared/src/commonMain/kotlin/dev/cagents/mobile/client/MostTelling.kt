@@ -30,6 +30,8 @@ fun mostTelling(failures: List<Throwable>, name: String, hosts: List<String>, pa
     return failures.firstOrNull { it is ConnectFailure.UnknownHostKey }
         ?: failures.firstOrNull { it is ConnectFailure && it !is ConnectFailure.Network }
         ?: failures.singleOrNull()
+        // The computer is there but nothing takes SSH on that port: a wrong port, not a sleeping computer.
+        ?: failures.firstOrNull { it is ConnectFailure.Network && it.answered }
         ?: ConnectFailure.Network(
             "Couldn't reach $name at any of its ${hosts.size} addresses. " +
                 "Is it awake, and is this phone on its network or on Tailscale?",

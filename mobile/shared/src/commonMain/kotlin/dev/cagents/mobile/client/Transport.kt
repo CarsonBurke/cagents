@@ -28,8 +28,13 @@ interface LineChannel {
 sealed class ConnectFailure(message: String, cause: Throwable? = null) : Exception(message, cause) {
     abstract val retry: Boolean
 
-    /** The computer couldn't be reached or dropped the connection. */
-    class Network(message: String, cause: Throwable? = null) : ConnectFailure(message, cause) {
+    /**
+     * The computer couldn't be reached or dropped the connection. [answered]
+     * when it was reached but refused the connection on that port, which
+     * says more about what's wrong than an address that never answered.
+     */
+    class Network(message: String, cause: Throwable? = null, val answered: Boolean = false) :
+        ConnectFailure(message, cause) {
         override val retry get() = true
     }
 
