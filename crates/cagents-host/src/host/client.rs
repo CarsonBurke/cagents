@@ -185,6 +185,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadTerminalRemovalBasis { .. }
             | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
+            | ClientRequest::WatchMobile { .. }
             | ClientRequest::ProviderStatus
     )
 }
@@ -1677,6 +1678,17 @@ fn process_admitted_request(
             authority,
             operation,
         } => {
+            if matches!(
+                &operation,
+                crate::agent_execution::Operation::Context {
+                    scope: crate::agent_execution::directory::Scope::All,
+                    standing: false,
+                }
+            ) {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .mobile_snapshot_started(client_id, crate::terminal_ipc::MobileWatch::Sessions);
+            }
             let reply = super::agent_execution::process_request(host, authority, operation)
                 .map_err(|error| match error {
                     crate::agent_execution::AcceptanceError::Invalid(message) => {
@@ -1793,6 +1805,10 @@ fn process_admitted_request(
         }
         ClientRequest::ReadNotifications => {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.mobile_snapshot_started(
+                client_id,
+                crate::terminal_ipc::MobileWatch::Notifications,
+            );
             Ok((
                 ServerResponse::Notifications {
                     snapshot: state.notification_snapshot(),
@@ -2026,6 +2042,12 @@ fn process_admitted_request(
                 Vec::new(),
                 false,
             ))
+        }
+        ClientRequest::WatchMobile { topic } => {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .watch_mobile(client_id, topic)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchTerminals => {
             host.lock()

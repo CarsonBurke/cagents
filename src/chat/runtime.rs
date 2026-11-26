@@ -265,6 +265,10 @@ pub enum Update {
         model: Option<super::ActiveModel>,
     },
     ConversationNameChanged,
+    /// Local edge for directory readers. Retained helpers carry the failure
+    /// in resident metadata, from which the host emits its own edge.
+    #[serde(skip)]
+    FailureChanged,
 }
 
 pub struct ConversationNaming {
@@ -786,6 +790,7 @@ impl LocalHandle {
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
                     waiting_fingerprint: None,
+                    published_error: None,
                     last_present: Instant::now(),
                     first_frame: false,
                     stdout_noise: spec.stdout_noise,
@@ -2658,6 +2663,7 @@ struct Actor {
     execution: execution::Tracker,
     attention_baselined: bool,
     waiting_fingerprint: Option<String>,
+    published_error: Option<String>,
     last_present: Instant,
     first_frame: bool,
     stdout_noise: Option<fn(&[u8]) -> bool>,
@@ -4308,12 +4314,19 @@ impl Actor {
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
         }
+        let error_changed = self.published_error != state.error;
+        if error_changed {
+            self.published_error.clone_from(&state.error);
+        }
         self.retained = counter.0;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
         drop(state);
         if name_changed {
             (self.notify)(Update::ConversationNameChanged);
+        }
+        if error_changed {
+            (self.notify)(Update::FailureChanged);
         }
     }
     fn publish_activity(&mut self) {

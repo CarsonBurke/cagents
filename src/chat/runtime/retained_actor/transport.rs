@@ -1582,6 +1582,9 @@ impl RemoteActor {
                     generation,
                 });
             }
+            if resident.failure != state.failure {
+                updates.push(Update::FailureChanged);
+            }
             if resident.ready && !state.ready {
                 updates.push(Update::Ready);
             }

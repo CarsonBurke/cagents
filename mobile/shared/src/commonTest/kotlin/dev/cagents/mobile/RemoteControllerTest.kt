@@ -78,6 +78,67 @@ class RemoteControllerTest {
     }
 
     @Test
+    fun suspendsOverviewWatchesWhileTheAppIsInTheBackground() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.send(sessionsEvent("working"))
+        controller.await { it.sessions?.single()?.activity == Activity.Working }
+
+        controller.setForeground(false)
+        connection.ok(connection.expect("sessions.unwatch"))
+        connection.ok(connection.expect("notifications.unwatch"))
+        runCurrent()
+        assertTrue(connection.isQuiet())
+
+        controller.setForeground(true)
+        connection.ok(connection.expect("sessions.watch"))
+        connection.ok(connection.expect("notifications.watch"))
+        connection.send(sessionsEvent("idle"))
+        controller.await { it.sessions?.single()?.activity == Activity.Idle }
+        assertEquals(1, bridge.opens)
+    }
+
+    @Test
+    fun backgroundUnwatchesBothTopicsBeforeDelayedWatchReplies() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        val sessions = connection.expect("sessions.watch")
+        val notifications = connection.expect("notifications.watch")
+
+        controller.setForeground(false)
+        val stopSessions = connection.expect("sessions.unwatch")
+        val stopNotifications = connection.expect("notifications.unwatch")
+        // Both detaches were sent before any earlier acknowledgement arrived.
+        connection.ok(sessions)
+        connection.ok(notifications)
+        connection.ok(stopSessions)
+        connection.ok(stopNotifications)
+        runCurrent()
+        assertTrue(connection.isQuiet())
+    }
+
+    @Test
+    fun backgroundUnwatchesAConversationBeforeItsDelayedWatchReply() = runTest {
+        val controller = controller()
+        controller.start()
+        val connection = bridge.acceptWelcomed()
+        controller.open(S)
+        val watch = connection.expect("conversation.watch")
+
+        controller.setForeground(false)
+        val stop = connection.expect("conversation.unwatch")
+        assertEquals(S, stop.params["session"]!!.jsonPrimitive.content)
+        connection.error(watch, "not_watching", "The watch stopped before it opened.")
+        connection.ok(stop)
+        runCurrent()
+        assertNull(controller.state.value.conversations[S]?.ended)
+    }
+
+    @Test
     fun followsAStreamingConversation() = runTest {
         val controller = controller()
         controller.start()
@@ -569,7 +630,7 @@ class RemoteControllerTest {
         connection.loadHello(controller)
 
         controller.setForeground(false)
-        val unwatch = connection.nextRequest()
+        val unwatch = connection.expect("conversation.unwatch")
         assertEquals("conversation.unwatch", unwatch.op)
         assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
         connection.ok(unwatch)
@@ -608,18 +669,19 @@ class RemoteControllerTest {
 
         controller.setForeground(false)
         controller.open(S)
+        connection.ok(connection.expect("sessions.unwatch"))
+        connection.ok(connection.expect("notifications.unwatch"))
         runCurrent()
         assertTrue(connection.isQuiet(), "opened in the background, it isn't watched")
         // Reconnecting in the background watches nothing either.
         connection.hangUp()
         val again = bridge.acceptWelcomed()
-        again.ok(again.expect("notifications.watch"))
         controller.await { it.connection == ConnectionState.Connected }
         runCurrent()
         assertTrue(again.isQuiet(), "reconnected in the background, it isn't watched")
 
         controller.setForeground(true)
-        val watch = again.nextRequest()
+        val watch = again.expect("conversation.watch")
         assertEquals("conversation.watch", watch.op)
         assertEquals(S, watch.params["session"]!!.jsonPrimitive.content)
     }
@@ -635,12 +697,14 @@ class RemoteControllerTest {
 
         // Sent, then straight to the home screen: unwatching now would fail the send.
         controller.setForeground(false)
+        connection.ok(connection.expect("sessions.unwatch"))
+        connection.ok(connection.expect("notifications.unwatch"))
         runCurrent()
         assertTrue(connection.isQuiet())
 
         connection.ok(send)
         sent.await()
-        val unwatch = connection.nextRequest()
+        val unwatch = connection.expect("conversation.unwatch")
         assertEquals("conversation.unwatch", unwatch.op)
         assertEquals(S, unwatch.params["session"]!!.jsonPrimitive.content)
     }
@@ -654,9 +718,12 @@ class RemoteControllerTest {
         connection.error(connection.expect("conversation.watch"), "unavailable", "The conversation couldn't be loaded.")
         controller.await { it.conversations[S]?.ended != null }
 
-        // Try again, tapped as the app went to the background.
+        // Try again, tapped as the app went to the background. Detach the
+        // earlier requested watch, even though the bridge refused it.
         controller.setForeground(false)
         controller.rewatch(S)
+        val stops = List(3) { connection.nextRequest().also(connection::ok).op }
+        assertEquals(setOf("sessions.unwatch", "notifications.unwatch", "conversation.unwatch"), stops.toSet())
         runCurrent()
         assertTrue(connection.isQuiet())
 

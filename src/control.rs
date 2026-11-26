@@ -1011,6 +1011,8 @@ pub struct ControlClient {
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<ModelEdge>,
     observed_notifications: VecDeque<crate::notifications::Update>,
+    mobile_watch: Option<crate::terminal::ipc::MobileWatch>,
+    mobile_changed: bool,
     /// The newest Work board pushed while a correlated response was pending.
     /// Each carries the whole board, so only the newest matters.
     observed_work: Option<(u64, Box<crate::work::Board>)>,
@@ -1132,6 +1134,14 @@ pub struct ResidentTerminals {
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
+        Self::connect_observing_socket(socket_path, |_| Ok(()))
+    }
+
+    /// Make the socket available for cancellation before the handshake.
+    pub(crate) fn connect_observing_socket(
+        socket_path: &Path,
+        connected: impl FnOnce(&UnixStream) -> io::Result<()>,
+    ) -> Result<Self, ControlError> {
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
         let deadline = Instant::now() + Self::handshake_timeout();
@@ -1141,6 +1151,7 @@ impl ControlClient {
                 io_timeout().min(deadline.saturating_duration_since(Instant::now())),
             )
             .map_err(ControlError::Connect)?;
+            connected(&stream).map_err(ControlError::Configure)?;
             Self::from_stream_inner(
                 stream,
                 deadline,
@@ -1273,6 +1284,8 @@ impl ControlClient {
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
+            mobile_watch: None,
+            mobile_changed: false,
             observed_work: None,
             observed_conversation: None,
             attached_chats: BTreeSet::new(),
@@ -1292,19 +1305,30 @@ impl ControlClient {
     /// Panics if anything was asked on it: a reply or notification it read
     /// would be lost to the new owner.
     pub fn into_handshaken_stream(self) -> (UnixStream, HostSessionProof) {
+        assert_eq!(
+            self.next_request_id, 2,
+            "the connection has already sent a request"
+        );
+        let (stream, proof, _) = self.into_unsubscribed_stream();
+        (stream, proof)
+    }
+
+    /// Hand over a current-protocol connection after ordinary round trips.
+    /// The new owner keeps the request sequence, and must subscribe itself.
+    pub(crate) fn into_unsubscribed_stream(self) -> (UnixStream, HostSessionProof, u64) {
         assert!(
             self.protocol == PROTOCOL_VERSION
-                && self.next_request_id == 2
                 && self.observed.is_empty()
                 && self.observed_model.is_empty()
                 && self.observed_notifications.is_empty()
+                && self.mobile_watch.is_none()
                 && self.observed_work.is_none()
                 && self.observed_conversation.is_none()
                 && self.attached_chats.is_empty()
                 && self.terminal_streams.is_empty(),
-            "only a connection that has asked nothing since its handshake can be handed over"
+            "only an unsubscribed current-protocol connection can be handed over"
         );
-        (self.stream, self.proof)
+        (self.stream, self.proof, self.next_request_id)
     }
 
     /// Whether nothing has arrived on this connection since its last reply,
@@ -1555,6 +1579,61 @@ impl ControlClient {
         match self.request_strict(ClientRequest::ApplyWorkspaceEdit { edit })? {
             ServerResponse::WorkspaceEdit(receipt) => Ok(receipt),
             response => Err(unexpected_response("a workspace edit receipt", &response)),
+        }
+    }
+
+    pub(crate) fn watch_mobile(
+        &mut self,
+        topic: crate::terminal::ipc::MobileWatch,
+    ) -> Result<(), ControlError> {
+        self.mobile_watch = Some(topic);
+        self.accepted(ClientRequest::WatchMobile { topic })
+    }
+
+    /// Await the next invalidation. A read can be interrupted by a newer
+    /// invalidation; keep that edge for the next pass.
+    pub(crate) fn next_mobile_change(&mut self) -> Result<(), ControlError> {
+        if std::mem::take(&mut self.mobile_changed) {
+            return Ok(());
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        let envelope = self.read_envelope()?;
+        self.validate_pinned_envelope(&envelope)?;
+        match envelope.message {
+            ServerMessage::MobileChanged { topic }
+                if envelope.request_id.is_none() && Some(topic) == self.mobile_watch =>
+            {
+                Ok(())
+            }
+            ServerMessage::HostShuttingDown => Err(ControlError::ConnectionClosed),
+            message => Err(ControlError::UnexpectedMessage {
+                expected: "a mobile watch update",
+                actual: message_name(&message),
+            }),
+        }
+    }
+
+    pub(crate) fn mobile_sessions(
+        &mut self,
+    ) -> Result<Vec<crate::agent_execution::directory::Member>, ControlError> {
+        self.stream
+            .set_read_timeout(Some(io_timeout()))
+            .map_err(ControlError::Configure)?;
+        let reply = self.agent(
+            Authority::default(),
+            crate::agent_execution::Operation::Context {
+                scope: crate::agent_execution::directory::Scope::All,
+                standing: false,
+            },
+        )?;
+        match reply {
+            crate::agent_execution::Reply::Context(context) => Ok(context.sessions.sessions),
+            _ => Err(ControlError::UnexpectedResponse {
+                expected: "mobile sessions",
+                actual: "agent reply",
+            }),
         }
     }
 
@@ -3041,6 +3120,9 @@ impl ControlClient {
     fn absorb(&mut self, message: ServerMessage) -> Option<ServerMessage> {
         match message {
             ServerMessage::TerminalWorker { .. } => {}
+            ServerMessage::MobileChanged { topic } if Some(topic) == self.mobile_watch => {
+                self.mobile_changed = true;
+            }
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited {
                 sequence,
@@ -3381,6 +3463,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
+        | ServerMessage::MobileChanged { .. }
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
         | ServerMessage::ConversationPullRequests { .. }
@@ -3413,6 +3496,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
         ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
+        ServerMessage::MobileChanged { .. } => "mobile_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",

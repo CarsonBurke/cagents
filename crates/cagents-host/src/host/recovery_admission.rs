@@ -75,6 +75,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::SearchTerminal { .. }
         | R::CopyTerminalSelection { .. }
         | R::WatchTerminals
+        | R::WatchMobile { .. }
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
         | R::ReadWorkspaceView { .. }

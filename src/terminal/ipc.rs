@@ -341,7 +341,8 @@ use crate::{
 ///
 /// Version 207 appends `queue_holds` to chat capabilities. Earlier clients
 /// receive the capabilities they know, and earlier update sources omit it.
-pub const PROTOCOL_VERSION: u16 = 207;
+/// Version 208 appends connection-scoped mobile watch invalidations.
+pub const PROTOCOL_VERSION: u16 = 208;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -883,6 +884,19 @@ pub enum ClientRequest {
         chat_id: TerminalId,
         held: bool,
     },
+    /// Watch one mobile projection until this connection disconnects.
+    WatchMobile {
+        topic: MobileWatch,
+    },
+}
+
+/// Read-only invalidations for the SSH bridge. They do not confer window
+/// presence, assign notification destinations or make a surface visible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum MobileWatch {
+    Sessions,
+    Notifications,
+    Conversation(TerminalId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1198,6 +1212,10 @@ pub enum ServerMessage {
     TerminalWorker {
         terminal_id: TerminalId,
         instance: uuid::Uuid,
+    },
+    /// Reread the projection, or end a conversation watch on removal.
+    MobileChanged {
+        topic: MobileWatch,
     },
 }
 

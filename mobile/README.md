@@ -17,8 +17,8 @@ What it does:
 - **Messages.** Send a message. While a turn runs, steer it now or queue the
   message for after it, or stop the turn.
 - **Reconnection.** A dropped connection comes back with backoff, and the app
-  watches again what it was showing. In the background the connection closes
-  after 30 seconds.
+  watches again what it was showing. In the background it stops watching
+  and closes the connection after 30 seconds.
 
 Terminal sessions are listed but can't be opened; the API follows native chats.
 

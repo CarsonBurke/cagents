@@ -48,6 +48,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ListPage { .. }
         | R::ListResidentTerminals
         | R::WatchTerminals
+        | R::WatchMobile { .. }
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
         | R::ReadWorkspaceView { .. }

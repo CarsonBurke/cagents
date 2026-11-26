@@ -7,6 +7,7 @@ pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     path::PathBuf,
@@ -27,10 +28,10 @@ use crate::{
     },
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
-        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
-        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight, StartupState,
-        TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
-        WireTerminalEvent,
+        MobileWatch, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+        ServerMessage, ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+        StartupState, TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions,
+        TerminalVisibility, WireTerminalEvent,
     },
     workspace_model::ModelEdit,
 };
@@ -279,6 +280,13 @@ struct PendingPublication {
     reservation: Option<super::workspace::PendingTerminal>,
 }
 
+struct MobileSubscription {
+    topic: MobileWatch,
+    /// At most one edge outstanding until this watcher begins another read.
+    /// HostState serializes access to the credit with both reads and writes.
+    pending: Cell<bool>,
+}
+
 pub(crate) struct HostState {
     recover_holders: bool,
     /// Shared, never mutated: a redraw broadcast hands the same proof to every
@@ -389,6 +397,7 @@ pub(crate) struct HostState {
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
+    mobile_watchers: BTreeMap<ClientId, MobileSubscription>,
     notification_activation:
         BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
     subscriptions: Subscriptions,
@@ -564,6 +573,7 @@ impl HostState {
             notifications: None,
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
+            mobile_watchers: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
             shutting_down: false,
@@ -642,6 +652,7 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        self.mobile_watchers.remove(&client_id);
         self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
@@ -723,6 +734,7 @@ impl HostState {
     pub(super) fn inventory_changed(&mut self) {
         self.inventory_generation += 1;
         self.tally_updates.notify_one();
+        self.mobile_sessions_changed();
     }
 
     pub(super) fn notification_snapshot(&self) -> crate::notifications::Snapshot {
@@ -801,7 +813,74 @@ impl HostState {
         }
     }
 
+    pub(super) fn watch_mobile(
+        &mut self,
+        client: ClientId,
+        topic: MobileWatch,
+    ) -> Result<(), ProtocolError> {
+        if let MobileWatch::Conversation(chat) = topic
+            && self.chats.get(&chat).is_none_or(|record| {
+                !record.subscribers.contains_key(&client)
+                    || (record.handle.is_completed()
+                        && !record.handle.owns_work()
+                        && !record.returning_terminal)
+            })
+        {
+            return Err(not_found(chat));
+        }
+        self.mobile_watchers.insert(
+            client,
+            MobileSubscription {
+                topic,
+                pending: Cell::new(false),
+            },
+        );
+        Ok(())
+    }
+
+    /// Rearm before taking the snapshot. A change racing that read is either
+    /// visible in its result or advances the next snapshot.
+    pub(super) fn mobile_snapshot_started(&self, client: ClientId, topic: MobileWatch) {
+        if let Some(watch) = self.mobile_watchers.get(&client)
+            && watch.topic == topic
+        {
+            watch.pending.set(false);
+        }
+    }
+
+    fn mobile_changed(&self, topic: MobileWatch) {
+        for (&client, watch) in &self.mobile_watchers {
+            if watch.topic == topic
+                && !watch.pending.replace(true)
+                && let Some(delivery) = self.clients.get(&client)
+            {
+                let _ = delivery.push(Outbound::broadcast(
+                    &self.proof,
+                    ServerMessage::MobileChanged { topic },
+                ));
+            }
+        }
+    }
+
+    pub(super) fn mobile_sessions_changed(&self) {
+        self.mobile_changed(MobileWatch::Sessions);
+    }
+
+    pub(super) fn mobile_chat_ended(&mut self, id: TerminalId) {
+        self.mobile_sessions_changed();
+        let topic = MobileWatch::Conversation(id);
+        self.mobile_changed(topic);
+        self.mobile_watchers.retain(|_, watch| watch.topic != topic);
+    }
+
+    pub(super) fn remove_chat(&mut self, id: TerminalId) -> Option<super::chat::Record> {
+        let record = self.chats.remove(&id)?;
+        self.mobile_chat_ended(id);
+        Some(record)
+    }
+
     pub(super) fn notifications_changed(&self) {
+        self.mobile_changed(MobileWatch::Notifications);
         for client in self.notification_watchers.keys() {
             if let Some(delivery) = self.clients.get(client) {
                 let _ = delivery.push(ServerEnvelope {
@@ -1083,6 +1162,7 @@ impl HostState {
         edit: &ModelEdit,
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
+        self.mobile_sessions_changed();
         let edit = edit.committed();
         for client_id in &self.model_watchers {
             if *client_id == origin {
@@ -1143,6 +1223,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.mobile_watchers.remove(&client_id);
         self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
@@ -6267,6 +6348,16 @@ fn record_event_from(
         }
         while record.events.len() > EVENT_REPLAY_CAPACITY {
             record.events.pop_front();
+        }
+        if matches!(
+            wire_event,
+            WireTerminalEvent::ConversationTitleChanged { .. }
+                | WireTerminalEvent::WorkingDirectoryChanged { .. }
+                | WireTerminalEvent::AgentActivityChanged { .. }
+                | WireTerminalEvent::Completed { .. }
+                | WireTerminalEvent::Exited { .. }
+        ) {
+            state.mobile_sessions_changed();
         }
         let deliveries = client_ids
             .into_iter()
