@@ -781,6 +781,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
     let registry = super::super::agent_execution::registry(host)?;
     let mut execution_owner = None;
     target.handle.refresh_retained_state()?;
+    reconcile_waiting(host, &target, None)?;
     persist_confirmed_identity(host, &target, &registry)?;
     #[cfg(test)]
     drain_fence::pass(id);
@@ -917,25 +918,52 @@ pub(in crate::host) mod drain_fence {
 /// Read the actor's latest activity under the same ownership lock that
 /// queues its resolution. A delayed retained outbox entry cannot bring
 /// back a waiting notice after that resolution.
-fn queue_attention(
+fn reconcile_waiting(
     host: &SharedHost,
     target: &SemanticTarget,
-    event: crate::notifications::Event,
-) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
+    through: Option<u64>,
+) -> Result<bool, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    waiting_resolution(&state, target, through)
+}
+
+fn waiting_resolution(
+    state: &super::HostState,
+    target: &SemanticTarget,
+    through: Option<u64>,
+) -> Result<bool, String> {
     if state.chats.get(&target.source.id).is_none_or(|record| {
         record.execution_instance != target.identity.instance
             || !record.handle.same_attachment(&target.handle)
     }) {
         return Err("Retained actor ownership changed before notification admission".into());
     }
-    if event.evidence.kind == crate::notifications::Kind::Waiting
-        && matches!(
-            target.handle.activity(),
-            crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle
-        )
-    {
-        return Ok(None);
+    let resolved = target
+        .handle
+        .retained_waiting_resolved(through)
+        .ok_or("The latest retained outcome is awaiting its actor publication")?;
+    if resolved && let Some(notifications) = &state.notifications {
+        notifications.clear_session_waiting(target.source.id);
+    }
+    Ok(resolved)
+}
+
+fn queue_attention(
+    host: &SharedHost,
+    target: &SemanticTarget,
+    event: crate::notifications::Event,
+    sequence: u64,
+) -> Result<Option<super::super::notifications::CommitAcknowledgement>, String> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if event.evidence.kind == crate::notifications::Kind::Waiting {
+        if waiting_resolution(&state, target, Some(sequence))? {
+            return Ok(None);
+        }
+    } else if state.chats.get(&target.source.id).is_none_or(|record| {
+        record.execution_instance != target.identity.instance
+            || !record.handle.same_attachment(&target.handle)
+    }) {
+        return Err("Retained actor ownership changed before notification admission".into());
     }
     target
         .notifications
@@ -1028,7 +1056,7 @@ fn commit_semantic_entry(
             evidence,
         );
         event.content = content;
-        if let Some(receipt) = queue_attention(host, target, event)? {
+        if let Some(receipt) = queue_attention(host, target, event, sequence)? {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or("Retained semantic acknowledgement deadline expired")?;
@@ -1481,6 +1509,71 @@ mod startup_retryability_tests {
         assert!(state.chats[&source.id].handle.same_attachment(&handle));
         assert_eq!(state.chats[&source.id].session, source);
         assert!(state.chat_spawning.is_empty());
+    }
+
+    #[test]
+    fn a_retained_wait_needs_current_publication_and_a_proven_end_clears_its_notice() {
+        for proved in [false, true] {
+            let root = crate::fixture_tempdir().unwrap();
+            let (host, mut source, _) = pending(root.path());
+            let handle = if proved {
+                Handle::fixture_ended_remote()
+            } else {
+                Handle::fixture_failed_remote()
+            };
+            let identity = handle.actor_identity().unwrap();
+            source.id = identity.record.terminal;
+            let (notifications, journal) =
+                super::super::super::notifications::JournalTestBridge::new(
+                    &root.path().join("notifications.sqlite3"),
+                )
+                .unwrap();
+            {
+                let mut state = host.lock().unwrap();
+                state.notifications = Some(notifications.clone());
+                state.chats.insert(
+                    source.id,
+                    super::super::Record {
+                        session: source.clone(),
+                        handle: handle.clone(),
+                        execution_instance: identity.instance,
+                        console_recipe: None,
+                        paired_terminal: None,
+                        source_process: None,
+                        subscribers: Default::default(),
+                        observations: Default::default(),
+                        completion_observed: false,
+                        returning_terminal: false,
+                    },
+                );
+            }
+            let target = SemanticTarget {
+                handle,
+                source: source.clone(),
+                identity,
+                notifications: Some(notifications),
+            };
+            let waiting = crate::notifications::Event::session(
+                source.id,
+                source.launch.provider,
+                source.launch.recipe.working_directory.clone(),
+                crate::notifications::Evidence {
+                    key: "waiting".into(),
+                    kind: crate::notifications::Kind::Waiting,
+                },
+            );
+            assert!(queue_attention(&host, &target, waiting.clone(), 2).is_err());
+            assert!(!journal.waiting_clear_pending(source.id));
+            assert_eq!(reconcile_waiting(&host, &target, None).unwrap(), proved);
+            assert_eq!(journal.waiting_clear_pending(source.id), proved);
+            if proved {
+                assert!(
+                    queue_attention(&host, &target, waiting, 1)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
     }
 }
 
@@ -2921,10 +3014,11 @@ fn remove_closed_resident(
             state.native_actor_startups.remove(&source.id);
         }
         state.native_adoption_failures.clear(source.id);
-        if ending == Ending::Closed
-            && let Some(notifications) = &state.notifications
-        {
-            notifications.retire(source.id);
+        if let Some(notifications) = &state.notifications {
+            match ending {
+                Ending::Closed => notifications.retire(source.id),
+                Ending::Stopped => notifications.clear_session_waiting(source.id),
+            }
         }
         state.inventory_generation += 1;
         removed
@@ -3137,10 +3231,11 @@ fn close_verified_unattached(
             state.retire_terminal(requested.id);
         }
         state.native_adoption_failures.clear(requested.id);
-        if ending == Ending::Closed
-            && let Some(notifications) = &state.notifications
-        {
-            notifications.retire(requested.id);
+        if let Some(notifications) = &state.notifications {
+            match ending {
+                Ending::Closed => notifications.retire(requested.id),
+                Ending::Stopped => notifications.clear_session_waiting(requested.id),
+            }
         }
         state.inventory_generation += 1;
     }
@@ -3831,7 +3926,8 @@ pub(in crate::host) fn finish_close(
                     evidence,
                 );
                 notification.content = content;
-                if let Some(receipt) = queue_attention(host, &target, notification)? {
+                if let Some(receipt) = queue_attention(host, &target, notification, entry.sequence)?
+                {
                     receipt
                         .recv_timeout(Duration::from_secs(10))
                         .map_err(|_| "Final attention has not committed; helper is retained")??;

@@ -712,6 +712,33 @@ impl RemoteActor {
         }
         actor
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn completed_waiting_fixture() -> Self {
+        let actor = Self::fixture();
+        {
+            let mut state = actor.0.state.lock().unwrap();
+            let state = Arc::make_mut(&mut state);
+            state.completed = true;
+            state.owns_work = false;
+            state.activity = crate::agent::ActivityState::Unknown;
+            state.outbox_latest = 1;
+        }
+        actor
+    }
+
+    pub fn waiting_resolved(&self, through: Option<u64>) -> Option<bool> {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if through.is_some_and(|sequence| sequence > state.outbox_latest) {
+            return None;
+        }
+        Some(
+            matches!(
+                state.activity,
+                crate::agent::ActivityState::Working | crate::agent::ActivityState::Idle
+            ) || (state.completed && !state.owns_work),
+        )
+    }
     pub fn close_proved(
         identity: &ActorIdentity,
         proof: &HostSessionProof,

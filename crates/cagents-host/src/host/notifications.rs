@@ -688,6 +688,15 @@ pub(in crate::host) struct JournalTestBridge {
 
 #[cfg(test)]
 impl JournalTestBridge {
+    pub(in crate::host) fn waiting_clear_pending(&self, session: TerminalId) -> bool {
+        self.handle
+            .0
+            .pending
+            .lock()
+            .unwrap()
+            .cleared_waiting
+            .contains(&Target::Session(session))
+    }
     pub(in crate::host) fn new(path: &std::path::Path) -> Result<(Handle, Self), String> {
         let journal = Journal::open(path)?;
         let (wake, receiver) = mpsc::channel(1);

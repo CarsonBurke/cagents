@@ -74,6 +74,11 @@ impl Handle {
     pub fn fixture_failed_remote() -> Self {
         Self(Owner::Remote(RemoteActor::completed_failure_fixture()))
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fixture_ended_remote() -> Self {
+        Self(Owner::Remote(RemoteActor::completed_waiting_fixture()))
+    }
     /// Model the provider naming its conversation after it started, as a new
     /// one does.
     #[cfg(any(test, feature = "test-support"))]
@@ -671,6 +676,15 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.activity(),
             Owner::Remote(remote) => remote.state().activity,
+        }
+    }
+
+    /// The authenticated retained publication covering this outcome. A
+    /// journal sequence can become readable before that publication.
+    pub fn retained_waiting_resolved(&self, through: Option<u64>) -> Option<bool> {
+        match &self.0 {
+            Owner::Remote(remote) => remote.waiting_resolved(through),
+            Owner::Local(_) => None,
         }
     }
     /// Whether the conversation's own turn is under way or awaiting the user,
