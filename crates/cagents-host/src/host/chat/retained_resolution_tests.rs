@@ -468,6 +468,73 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn ordinary_shutdown_settles_a_wait_with_an_already_acknowledged_helper_outbox() {
+    #[cfg(target_os = "linux")]
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated() else { return };
+    let mut fixture = Fixture::with_provider(
+        root,
+        Some((
+            "        for index in range(40):",
+            r#"        send({'type':'control_request','request_id':'shutdown-question','request':{'subtype':'can_use_tool','tool_name':'AskUserQuestion','tool_use_id':'shutdown-use','input':{'questions':[{'question':'Continue this fixture?','header':'Continue','multiSelect':False,'options':[{'label':'Yes','description':'Continue'},{'label':'No','description':'Stop'}]}]}}})
+        continue
+        for index in range(40):"#,
+        )),
+    );
+    let handle = fixture.handle();
+    handle
+        .command(chat::Command::Prompt {
+            text: "Wait for a response".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    let waiting = || {
+        fixture
+            .broker
+            .as_ref()
+            .unwrap()
+            .handle()
+            .snapshot()
+            .notices
+            .into_iter()
+            .find(|notice| {
+                notice.event.source_session() == Some(fixture.original.id)
+                    && notice.event.evidence.kind == crate::notifications::Kind::Waiting
+                    && !notice.acknowledged
+            })
+    };
+    wait(
+        || {
+            waiting().is_some()
+                && handle
+                    .uncommitted_outcomes()
+                    .is_ok_and(|entries| entries.is_empty())
+        },
+        "the exact waiting notice did not commit and leave the helper outbox",
+    );
+    let notice = waiting().unwrap();
+    fixture.host.lock().unwrap().graceful_shutdown();
+    super::super::finish_chat_shutdown(&fixture.host).unwrap();
+    drop(fixture.broker.take());
+
+    let path = crate::instance::project_dirs()
+        .unwrap()
+        .data_dir()
+        .join("agent-attention.sqlite3");
+    let (_, mut reopened) = super::super::notifications::JournalTestBridge::new(&path).unwrap();
+    assert!(
+        reopened
+            .list()
+            .unwrap()
+            .into_iter()
+            .any(|stored| stored.id == notice.id && stored.acknowledged)
+    );
+}
+
+#[test]
 fn real_helper_resolution_adopts_an_unregistered_retained_owner_without_launching() {
     #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {
