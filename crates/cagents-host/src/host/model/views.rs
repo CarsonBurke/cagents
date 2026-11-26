@@ -6,6 +6,7 @@ use crate::workspace_model::{
 
 pub(in crate::host::model) mod bindings;
 mod compaction;
+mod foreign_proof;
 pub(in crate::host::model) mod store;
 pub(super) use store::{all, occupied, occupied_for_start, operation_seen, read};
 
