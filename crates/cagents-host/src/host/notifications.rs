@@ -87,6 +87,7 @@ struct Pending {
     retired: BTreeSet<Target>,
     cleared_waiting: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
+    predecessor_reads: BTreeMap<Uuid, TerminalId>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
     /// The portal service's latest owner, when it changed; `Some(None)` means
@@ -125,6 +126,7 @@ impl Pending {
                 self.acknowledged.insert(id);
             }
         }
+        self.read_predecessors(newer.predecessor_reads);
         self.committed_events.extend(newer.committed_events);
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
@@ -161,6 +163,15 @@ impl Pending {
         }
     }
 
+    fn read_predecessors(&mut self, reads: BTreeMap<Uuid, TerminalId>) {
+        for (id, session) in reads {
+            if self.predecessor_reads.len() >= MAX_PENDING {
+                break;
+            }
+            self.predecessor_reads.insert(id, session);
+        }
+    }
+
     /// The work that waits for an unavailable journal rather than being lost:
     /// attention, retirements, acknowledgements and the settings and windows
     /// they are judged by. Receipts and tests are answered at once, and a
@@ -172,6 +183,7 @@ impl Pending {
             retired: self.retired,
             cleared_waiting: self.cleared_waiting,
             acknowledged: self.acknowledged,
+            predecessor_reads: self.predecessor_reads,
             presence_changed: self.presence_changed,
             reload: self.reload,
             preferences: self.preferences,
@@ -374,6 +386,70 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+}
+
+/// Capture the exact committed predecessor notices at authenticated read
+/// acceptance. The broker remains the only writer, and a replacement committed
+/// before it handles this batch must remain unread.
+pub(super) fn acknowledge_predecessors(host: &SharedHost, session: TerminalId) {
+    let (notifications, registry) = {
+        let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            state.notifications.clone(),
+            state.execution_registry.clone(),
+        )
+    };
+    let (Some(notifications), Some(registry), Some(path)) =
+        (notifications, registry, journal_path())
+    else {
+        return;
+    };
+    let predecessors = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .notice_predecessors(session);
+    let reads = predecessors.and_then(|predecessors| {
+        if predecessors.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        Journal::open_reader(&path)?.unread_session_ids(&predecessors)
+    });
+    match reads {
+        Ok(reads) if !reads.is_empty() => notifications.change(|pending| {
+            pending.read_predecessors(reads);
+        }),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(%session, %error, "could not capture committed predecessor attention")
+        }
+    }
+}
+
+fn apply_predecessor_reads(
+    journal: &mut Journal,
+    reads: &mut BTreeMap<Uuid, TerminalId>,
+    delivery: &mut BTreeMap<Target, Notice>,
+    mut cleared: impl FnMut(Uuid, TerminalId),
+) -> Result<(), String> {
+    // The person already read these exact notices. A failed disk write
+    // must not allow a waiting desktop delivery to announce them again.
+    delivery.retain(|_, notice| !reads.contains_key(&notice.id));
+    let mut failure = None;
+    reads.retain(
+        |&id, &mut session| match journal.acknowledge_with_withdrawal(id) {
+            Ok(acknowledged) => {
+                if acknowledged.is_some() {
+                    cleared(id, session);
+                }
+                false
+            }
+            Err(error) => {
+                failure = Some(error);
+                true
+            }
+        },
+    );
+    failure.map_or(Ok(()), Err)
 }
 
 pub(super) struct Broker {
@@ -770,26 +846,35 @@ fn commit_waiting_clears(
     Ok(())
 }
 
-fn settle_waiting_at_shutdown(
+/// Flush only settlement the broker accepted before ordinary shutdown.
+fn settle_attention_at_shutdown(
     shared: &Weak<Shared>,
     journal: &mut Journal,
-    local: &BTreeSet<Target>,
+    local_waiting: &BTreeSet<Target>,
+    predecessor_reads: &mut BTreeMap<Uuid, TerminalId>,
 ) -> bool {
-    let queued = shared.upgrade().map_or_else(
-        || Some(BTreeSet::new()),
-        |shared| {
-            let mut pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
-            pending
-                .stopped
-                .then(|| std::mem::take(&mut pending.cleared_waiting))
-        },
-    );
-    let Some(queued) = queued else {
-        return false;
+    let queued_waiting = if let Some(shared) = shared.upgrade() {
+        let mut pending = shared
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.stopped {
+            return false;
+        }
+        predecessor_reads.append(&mut pending.predecessor_reads);
+        std::mem::take(&mut pending.cleared_waiting)
+    } else {
+        BTreeSet::new()
     };
-    let cleared = local.union(&queued).cloned().collect();
-    if let Err(error) = commit_waiting_clears(journal, &cleared, |_, _| {}) {
+    let waiting = local_waiting.union(&queued_waiting).cloned().collect();
+    if let Err(error) = commit_waiting_clears(journal, &waiting, |_, _| {}) {
         tracing::warn!(%error, "could not record waiting attention settlement at shutdown");
+    }
+    if !predecessor_reads.is_empty()
+        && let Err(error) =
+            apply_predecessor_reads(journal, predecessor_reads, &mut BTreeMap::new(), |_, _| {})
+    {
+        tracing::warn!(%error, "accepted conversation reads could not settle during shutdown");
     }
     true
 }
@@ -1119,17 +1204,20 @@ impl JournalTestBridge {
     }
 }
 
+fn journal_path() -> Option<std::path::PathBuf> {
+    crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"))
+}
+
 async fn run(
     shared: Weak<Shared>,
     host: Weak<HostLock>,
     mut receiver: mpsc::Receiver<()>,
     application: crate::notifications::Application,
 ) {
-    let path =
-        crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"));
-    let mut store = journal::Reopening::open(path, Instant::now());
+    let mut store = journal::Reopening::open(journal_path(), Instant::now());
     // Work held while the journal is unavailable, applied before the next batch.
     let mut deferred = Pending::default();
+    let mut predecessor_retry = None;
     let settings = preferences();
     let settings_error = settings.as_ref().err().cloned();
     let mut policy = settings.unwrap_or_else(|_| Preferences {
@@ -1186,6 +1274,7 @@ async fn run(
         }
         .into_iter()
         .chain(store.retry_at())
+        .chain(predecessor_retry.as_ref().map(|(due, _)| *due))
         .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
         .chain(automation_retry.deadline())
         .min(),
@@ -1204,13 +1293,15 @@ async fn run(
         });
         drop(core);
         if pending.stopped {
-            // Retained shutdown can enqueue its final settlement immediately
-            // before the broker's drop. Finish those durable clears without
-            // calling the portal or accepting any new work.
-            if !pending.cleared_waiting.is_empty() {
+            if !pending.cleared_waiting.is_empty() || !pending.predecessor_reads.is_empty() {
                 match store.journal_for_shutdown() {
                     Ok(journal) => {
-                        settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting);
+                        settle_attention_at_shutdown(
+                            &shared,
+                            journal,
+                            &pending.cleared_waiting,
+                            &mut pending.predecessor_reads,
+                        );
                     }
                     Err(error) => {
                         tracing::warn!(%error, "could not reopen attention journal at shutdown")
@@ -1251,6 +1342,7 @@ async fn run(
         let journal = match store.journal() {
             Ok(journal) => journal,
             Err(error) => {
+                predecessor_retry = None;
                 let error = error.clone();
                 for (_, receipt) in pending.committed_events.drain(..) {
                     receipt.finish(Err(error.clone()));
@@ -1299,7 +1391,12 @@ async fn run(
         pending.cleared_waiting.clear();
         if let Some(current) = current_presence {
             for (client, update) in &current {
-                if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
+                if settle_attention_at_shutdown(
+                    &shared,
+                    journal,
+                    &pending.cleared_waiting,
+                    &mut pending.predecessor_reads,
+                ) {
                     return;
                 }
                 if presence.is_empty() {
@@ -1378,7 +1475,12 @@ async fn run(
             pending.events.extend(inboxes.events);
         }
         for session in pending.retired {
-            if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
+            if settle_attention_at_shutdown(
+                &shared,
+                journal,
+                &pending.cleared_waiting,
+                &mut pending.predecessor_reads,
+            ) {
                 return;
             }
             delivery.remove(&session);
@@ -1393,8 +1495,40 @@ async fn run(
                 snapshot.diagnostic = Some(error);
             }
         }
+        match apply_predecessor_reads(
+            journal,
+            &mut pending.predecessor_reads,
+            &mut delivery,
+            |id, session| {
+                withdraw_target(&mut withdrawals, id, &Target::Session(session));
+            },
+        ) {
+            Ok(()) => {
+                if let Some((_, error)) = predecessor_retry.take()
+                    && snapshot.diagnostic.as_ref() == Some(&error)
+                {
+                    snapshot.diagnostic.clone_from(&settings_error);
+                }
+            }
+            Err(error) => {
+                deferred.read_predecessors(pending.predecessor_reads.clone());
+                let now = Instant::now();
+                let due = predecessor_retry
+                    .as_ref()
+                    .map(|(due, _)| *due)
+                    .filter(|due| *due > now)
+                    .unwrap_or(now + RETRY_DELAY);
+                snapshot.diagnostic = Some(error.clone());
+                predecessor_retry = Some((due, error));
+            }
+        }
         for id in pending.acknowledged {
-            if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
+            if settle_attention_at_shutdown(
+                &shared,
+                journal,
+                &pending.cleared_waiting,
+                &mut pending.predecessor_reads,
+            ) {
                 return;
             }
             delivery.retain(|_, notice| notice.id != id);
@@ -1416,7 +1550,12 @@ async fn run(
                     .map(|(event, receipt)| (event, Some(receipt))),
             );
         for (event, receipt) in events {
-            if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
+            if settle_attention_at_shutdown(
+                &shared,
+                journal,
+                &pending.cleared_waiting,
+                &mut pending.predecessor_reads,
+            ) {
                 return;
             }
             let focused = presence.values().any(|window| {
@@ -1577,7 +1716,12 @@ async fn run(
                 delivery_batch(&delivery, &delivery_schedule, &withdrawals, Instant::now())
             };
             for notice in batch {
-                if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
+                if settle_attention_at_shutdown(
+                    &shared,
+                    journal,
+                    &pending.cleared_waiting,
+                    &mut pending.predecessor_reads,
+                ) {
                     return;
                 }
                 // Portal connection and test delivery can each await. An
@@ -1632,7 +1776,12 @@ async fn run(
             // Cleanup is bounded like delivery. A desktop that stops answering
             // cannot hold daemon shutdown behind thousands of remove calls.
             for _ in 0..8 {
-                if settle_waiting_at_shutdown(&shared, journal, &pending.cleared_waiting) {
+                if settle_attention_at_shutdown(
+                    &shared,
+                    journal,
+                    &pending.cleared_waiting,
+                    &mut pending.predecessor_reads,
+                ) {
                     return;
                 }
                 if failed {
@@ -1745,6 +1894,197 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         )
+    }
+
+    #[test]
+    fn predecessor_read_uses_committed_ids_and_preserves_a_later_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let (handle, mut bridge) = JournalTestBridge::new(&path).unwrap();
+        let predecessor = TerminalId::new();
+        let replaced_predecessor = TerminalId::new();
+        let unrelated = TerminalId::new();
+        let receipt = handle
+            .record_committed(attention_event(predecessor, "first"))
+            .unwrap();
+        let previous = bridge
+            .commit_next(&Preferences::default(), false)
+            .unwrap()
+            .unwrap();
+        receipt.recv().unwrap().unwrap();
+        assert!(handle.snapshot().notices.is_empty());
+        let replaced = bridge
+            .journal
+            .record(attention_event(replaced_predecessor, "earlier"), false)
+            .unwrap()
+            .unwrap();
+        let unrelated = bridge
+            .journal
+            .record(attention_event(unrelated, "outside"), false)
+            .unwrap()
+            .unwrap();
+        let mut reads = Journal::open_reader(&path)
+            .unwrap()
+            .unread_session_ids(&[predecessor, replaced_predecessor].into())
+            .unwrap();
+        assert_eq!(
+            reads,
+            [
+                (previous.id, predecessor),
+                (replaced.id, replaced_predecessor)
+            ]
+            .into()
+        );
+        let later = bridge
+            .journal
+            .record(attention_event(replaced_predecessor, "later"), false)
+            .unwrap()
+            .unwrap();
+        let mut retired = Vec::new();
+        apply_predecessor_reads(
+            &mut bridge.journal,
+            &mut reads,
+            &mut BTreeMap::new(),
+            |id, _| retired.push(id),
+        )
+        .unwrap();
+        assert_eq!(retired, [previous.id]);
+        let visible = bridge.list().unwrap();
+        assert!(
+            visible
+                .iter()
+                .find(|notice| notice.id == previous.id)
+                .unwrap()
+                .acknowledged
+        );
+        assert!(visible.contains(&unrelated));
+        assert!(visible.contains(&later));
+    }
+
+    #[test]
+    fn retry_after_a_failed_predecessor_write_keeps_its_original_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let predecessor = TerminalId::new();
+        let previous = journal
+            .record(attention_event(predecessor, "before"), false)
+            .unwrap()
+            .unwrap();
+        let mut reads = [(previous.id, predecessor)].into();
+        let unrelated = journal
+            .record(attention_event(TerminalId::new(), "unrelated"), false)
+            .unwrap()
+            .unwrap();
+        let mut delivery = [
+            (previous.event.target(), previous.clone()),
+            (unrelated.event.target(), unrelated.clone()),
+        ]
+        .into();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER refuse_ack BEFORE UPDATE OF acknowledged ON notices BEGIN SELECT raise(ABORT, 'temporarily cannot write'); END;").unwrap();
+        assert!(
+            apply_predecessor_reads(
+                &mut journal,
+                &mut reads,
+                &mut delivery,
+                |_, _| unreachable!()
+            )
+            .is_err()
+        );
+        assert_eq!(reads, [(previous.id, predecessor)].into());
+        assert_eq!(
+            delivery,
+            [(unrelated.event.target(), unrelated.clone())].into()
+        );
+        db.execute_batch("DROP TRIGGER refuse_ack").unwrap();
+        let replacement = journal
+            .record(attention_event(predecessor, "after"), false)
+            .unwrap()
+            .unwrap();
+        apply_predecessor_reads(
+            &mut journal,
+            &mut reads,
+            &mut delivery,
+            |_, _| unreachable!(),
+        )
+        .unwrap();
+        assert!(reads.is_empty());
+        assert_eq!(journal.list().unwrap(), [replacement, unrelated]);
+    }
+
+    #[test]
+    fn shutdown_settles_only_the_exact_predecessor_reads_already_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let first = TerminalId::new();
+        let second = TerminalId::new();
+        let replaced = TerminalId::new();
+        let before_first = journal
+            .record(attention_event(first, "old:first"), false)
+            .unwrap()
+            .unwrap();
+        let before_second = journal
+            .record(attention_event(second, "old:second"), false)
+            .unwrap()
+            .unwrap();
+        let old = journal
+            .record(attention_event(replaced, "old:replaced"), false)
+            .unwrap()
+            .unwrap();
+        let later = journal
+            .record(attention_event(replaced, "new:replaced"), false)
+            .unwrap()
+            .unwrap();
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        handle.change(|pending| {
+            pending.read_predecessors([(before_first.id, first), (old.id, replaced)].into())
+        });
+        let mut in_flight = take_pending(&shared);
+        handle.change(|pending| pending.read_predecessors([(before_second.id, second)].into()));
+        shared.pending.lock().unwrap().stopped = true;
+        assert!(settle_attention_at_shutdown(
+            &Arc::downgrade(&shared),
+            &mut journal,
+            &in_flight.cleared_waiting,
+            &mut in_flight.predecessor_reads,
+        ));
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        let notices = journal.list().unwrap();
+        assert!(notices.contains(&later));
+        assert!(
+            notices
+                .iter()
+                .filter(|notice| notice.id == before_first.id || notice.id == before_second.id)
+                .all(|notice| notice.acknowledged)
+        );
+    }
+
+    #[test]
+    fn predecessor_read_keeps_withdrawals_when_new_attention_replaces_the_row() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let earlier_owner = TerminalId::new();
+        let before = journal
+            .record(attention_event(earlier_owner, "before"), false)
+            .unwrap()
+            .unwrap();
+        let mut reads = [(before.id, earlier_owner)].into();
+        apply_predecessor_reads(&mut journal, &mut reads, &mut BTreeMap::new(), |_, _| {}).unwrap();
+        let replacement = journal
+            .record(attention_event(earlier_owner, "later"), false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.list().unwrap().contains(&replacement));
+        let withdrawals = journal.group_withdrawals_for(&[]).unwrap();
+        assert!(withdrawals.contains(&before.id));
+        assert!(withdrawals.contains(&batching::desktop_id(&before.event.target())));
     }
 
     #[test]
@@ -2582,14 +2922,15 @@ mod tests {
         });
         let handle = Handle(shared.clone());
         handle.clear_session_waiting(first);
-        let batch = take_pending(&shared);
+        let mut batch = take_pending(&shared);
         handle.clear_session_waiting(second);
         handle.change(|pending| pending.stopped = true);
 
-        assert!(settle_waiting_at_shutdown(
+        assert!(settle_attention_at_shutdown(
             &Arc::downgrade(&shared),
             &mut journal,
             &batch.cleared_waiting,
+            &mut batch.predecessor_reads,
         ));
         let notices = journal.list().unwrap();
         assert_eq!(notices.len(), 2);

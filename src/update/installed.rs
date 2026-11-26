@@ -84,7 +84,7 @@ pub(super) fn complete_selection(
 #[derive(PartialEq, Eq)]
 pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Stamp {
     fn daemon_inode(&self) -> (u64, u64) {
         let index = BINARIES
@@ -262,14 +262,20 @@ pub(super) fn perform(
     #[cfg(target_os = "linux")]
     let parks_successor = confirmed.replaces_daemon
         || (selection.previous_link.is_some() && confirmed.daemon.is_none());
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let parks_successor = confirmed.replaces_daemon && selection.previous_link.is_some();
+    #[cfg(target_os = "macos")]
+    if parks_successor {
+        survivors.require_acknowledged_preparation();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let parks_successor = false;
     let switch = if parks_successor {
         None
     } else {
         selection.prepare(&layout)?
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut standby = parks_successor
         .then(|| {
             crate::daemon::standby::Parked::launch(
@@ -283,7 +289,7 @@ pub(super) fn perform(
         .map_err(|error| {
             invalid(format!("The replacement terminal service could not start. Your current workspace is still open. {error}"))
         })?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if standby.is_some() && stamp(root)? != before {
         return Err(invalid(
             "The installed application changed before the replacement could start",
@@ -313,7 +319,7 @@ pub(super) fn perform(
             }
             previous = (owner.version_root != root).then_some(owner.version_root);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(standby) = standby.as_mut() {
             standby.check_running()?;
             if Selection::capture(&layout)? != selection {
@@ -332,11 +338,20 @@ pub(super) fn perform(
             &mut guard,
         )?;
         if previous.is_some()
+            && (!cfg!(target_os = "macos") || !parks_successor)
             && let Some(lease) = handoff.as_ref()
         {
             original_schema = Some(stopped_store_schema(root, &guard, lease)?);
         }
-        survivors.authorize_successor(&root.join("bin/cagentsd"), None, handoff.as_ref())?;
+        let daemon = root.join("bin/cagentsd");
+        #[cfg(target_os = "macos")]
+        if standby.is_some() {
+            survivors.authorize_standby_successor(&daemon, handoff.as_ref())?;
+        } else {
+            survivors.authorize_successor(&daemon, None, handoff.as_ref())?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        survivors.authorize_successor(&daemon, None, handoff.as_ref())?;
         confirmation::prepared(state, job)?;
         guard.close_remaining_prepared_windows(Duration::from_secs(45))?;
         set_phase(
@@ -346,7 +361,7 @@ pub(super) fn perform(
             "Starting the installed application",
         )?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(standby) = standby.as_mut() {
             let pid = standby.pid();
             let daemon = root.join("bin").join(DAEMON_BINARY);
@@ -408,7 +423,7 @@ pub(super) fn perform(
         // Ready, then prove this job's recovery inventory against it.
         confirm_daemon_ready(&root.join("bin/cagentsd"), None, timeout)
     })();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if result.is_err()
         && let Some(candidate) = standby.as_mut()
         && candidate.may_own_runtime()
@@ -420,6 +435,9 @@ pub(super) fn perform(
         if confirm_daemon_ready(&daemon, Some(candidate.pid()), timeout).is_ok() {
             result = Ok(());
         } else if candidate.may_own_runtime() {
+            #[cfg(target_os = "macos")]
+            guard.defer_reopening_to_recovery();
+            #[cfg(target_os = "linux")]
             guard.set_fallback_executable(root.join("bin/cagents-ui"));
             guard.set_recovery_restore_only();
             if selection.previous_link.is_some() {
@@ -430,7 +448,7 @@ pub(super) fn perform(
     }
     // No parked process should retain a launch-fence copy while closing an
     // unsuccessful transaction and reopening the old application.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     drop(standby);
     if result.is_ok() && parks_successor && selection.previous_link.is_some() {
         result = selected_candidate(&layout.prefix, root);
@@ -438,6 +456,19 @@ pub(super) fn perform(
         result = complete_selection(switch, &layout);
     }
     announce_primary_failure(&result);
+    #[cfg(target_os = "macos")]
+    if parks_successor && let Err(failure) = result {
+        let previous = previous.as_ref().unwrap_or(&selection.current);
+        if selected_candidate(&layout.prefix, previous).is_ok()
+            && crate::daemon::running_executable()
+                .is_ok_and(|exe| exe == Some(previous.join("bin/cagentsd")))
+        {
+            guard.set_fallback_executable(previous.join("bin/cagents-ui"));
+        } else {
+            guard.defer_reopening_to_recovery();
+        }
+        return Err(failure);
+    }
     let mut restored_previous = false;
     if result.is_err()
         && recovery.shutdown_requested

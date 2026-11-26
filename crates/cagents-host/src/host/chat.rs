@@ -4344,40 +4344,9 @@ fn process_inner(
         }
         ClientRequest::ChatList => {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let mut sessions = state
-                .chats
-                .values()
-                .filter(|record| {
-                    record.handle.owns_work()
-                        || record.returning_terminal
-                        || state
-                            .native_actor_startups
-                            .get(&record.session.id)
-                            .is_some_and(|pending| {
-                                pending
-                                    .failed_close
-                                    .as_ref()
-                                    .is_some_and(|target| target.matches(record))
-                            })
-                })
-                .map(Record::current_session)
-                .collect::<Vec<_>>();
-            sessions.extend(
-                state
-                    .chat_spawning
-                    .values()
-                    .filter(|pending| {
-                        state.historical_chat_retirements.get(&pending.id) != Some(*pending)
-                    })
-                    .map(|pending| {
-                        let mut session = pending.clone();
-                        // Inventory describes this daemon's pending attachment. Keep
-                        // the reservation's exact caller token unchanged for its CAS.
-                        session.proof = Some(state.proof().clone());
-                        session
-                    }),
-            );
-            Ok(ServerResponse::ChatListed { sessions })
+            Ok(ServerResponse::ChatListed {
+                sessions: chat_list_inventory(&state),
+            })
         }
         ClientRequest::ChatStartInPane {
             pane,
@@ -4579,15 +4548,25 @@ fn process_inner(
         } => chat_command(host, client, chat_id, command, Some(delivery)),
         ClientRequest::ChatAcknowledge { chat_id, epoch } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            // An attached terminal can explicitly acknowledge its conversation.
+            // Output rearm during reconnect uses a separate request.
+            if state.attached_terminal_conversation(client, chat_id) {
+                drop(state);
+                super::notifications::acknowledge_predecessors(host, chat_id);
+                return Ok(ServerResponse::Accepted);
+            }
             if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
                 receipt.require_attached(client)?;
                 return Ok(ServerResponse::Accepted);
             }
             let record = attached_mut(&mut state, client, chat_id)?;
             let observation = record.observations.entry(client).or_default();
-            if epoch > observation.epoch {
-                observation.acknowledge(epoch, record.handle.observe_next_update());
+            if epoch <= observation.epoch {
+                return Ok(ServerResponse::Accepted);
             }
+            observation.acknowledge(epoch, record.handle.observe_next_update());
+            drop(state);
+            super::notifications::acknowledge_predecessors(host, chat_id);
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatVisibility { chat_id, visible } => {
@@ -5908,3 +5887,38 @@ pub(super) fn close_terminal_actor(
 
 #[cfg(test)]
 pub(in crate::host) mod tests;
+
+pub(super) fn chat_list_inventory(state: &HostState) -> Vec<Session> {
+    let mut sessions = state
+        .chats
+        .values()
+        .filter(|record| {
+            record.handle.owns_work()
+                || record.returning_terminal
+                || state
+                    .native_actor_startups
+                    .get(&record.session.id)
+                    .is_some_and(|pending| {
+                        pending
+                            .failed_close
+                            .as_ref()
+                            .is_some_and(|target| target.matches(record))
+                    })
+        })
+        .map(Record::current_session)
+        .collect::<Vec<_>>();
+    sessions.extend(
+        state
+            .chat_spawning
+            .values()
+            .filter(|pending| state.historical_chat_retirements.get(&pending.id) != Some(*pending))
+            .map(|pending| {
+                let mut session = pending.clone();
+                // Inventory describes this daemon's pending attachment. Keep
+                // the reservation's exact caller token unchanged for its CAS.
+                session.proof = Some(state.proof().clone());
+                session
+            }),
+    );
+    sessions
+}

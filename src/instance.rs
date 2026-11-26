@@ -396,7 +396,6 @@ fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 's
 
 /// Observe an existing private lock without creating, repairing, or retaining
 /// it. This is a point-in-time status observation, never launch admission.
-#[cfg(feature = "ui")]
 pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
     let named = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -559,6 +558,9 @@ impl WindowLease {
         if let Some(slot) = requested {
             validate_window_slot(slot)?;
         }
+        if let Some(claims) = claims {
+            state_claim::prepare_claim_directory(claims, state_claim::Claimant::Window)?;
+        }
         for index in 1..=1024 {
             let slot = requested.map(str::to_owned).unwrap_or_else(|| {
                 if !new_window {
@@ -581,13 +583,20 @@ impl WindowLease {
                             Ok(claim) => Some(claim),
                             // Another session has this saved window open; a
                             // new window takes the next free one instead.
-                            Err(error) if state_claim::state_in_use(&error).is_some() => {
-                                if new_window && requested.is_none() {
-                                    continue;
-                                }
+                            Err(error)
+                                if new_window
+                                    && requested.is_none()
+                                    && state_claim::state_in_use(&error).is_some_and(
+                                        state_claim::StateInUse::can_try_another_slot,
+                                    ) =>
+                            {
+                                continue;
+                            }
+                            Err(error)
+                                if require_state || state_claim::state_in_use(&error).is_some() =>
+                            {
                                 return Err(error);
                             }
-                            Err(error) if require_state => return Err(error),
                             // A claim that can't be taken for another reason,
                             // such as a read-only data directory, leaves the
                             // window as it was before claims.
@@ -5746,6 +5755,59 @@ mod startup_update_tests {
                 String::from_utf8_lossy(&output.stderr),
             );
         }
+    }
+
+    #[test]
+    fn automatic_new_window_skips_an_individually_unreadable_layout_claim() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let damaged = claims.path().join("window.window-2.lock");
+        fs::write(&damaged, b"unrecognized claim").unwrap();
+        fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600)).unwrap();
+        let open = |requested| {
+            WindowLease::acquire_waiting_in(
+                runtime.path(),
+                Some(claims.path()),
+                false,
+                true,
+                requested,
+                Duration::ZERO,
+                &mut |_| {},
+            )
+        };
+        let error = open(Some("window-2"))
+            .err()
+            .expect("exact damaged slot must refuse");
+        assert!(state_claim::state_in_use(&error).is_some());
+        let (_lease, chosen) = open(None).unwrap();
+        assert_eq!(chosen, "window-3");
+        assert_eq!(fs::read(&damaged).unwrap(), b"unrecognized claim");
+    }
+
+    #[test]
+    fn new_window_reports_an_unreadable_claim_directory_before_allocating_a_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let claims = root.path().join("claims");
+        fs::write(&claims, "directory has been replaced by a file").unwrap();
+        let error = WindowLease::acquire_waiting_in(
+            &runtime,
+            Some(&claims),
+            false,
+            true,
+            None,
+            Duration::ZERO,
+            &mut |_| {},
+        )
+        .err()
+        .expect("a broken claims directory must refuse window startup");
+        let reason = state_claim::state_in_use(&error).unwrap();
+        assert!(!reason.can_try_another_slot());
+        assert!(reason.to_string().contains("unreadable"));
+        assert!(!runtime.join(slot_lock_name("window-2")).exists());
     }
 
     #[test]

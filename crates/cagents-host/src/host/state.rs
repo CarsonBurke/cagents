@@ -1483,6 +1483,10 @@ impl HostState {
         Ok(())
     }
 
+    pub(super) fn attached_terminal_conversation(&self, client: ClientId, id: TerminalId) -> bool {
+        self.attached_terminal(client, id).is_ok()
+    }
+
     pub(crate) fn list(&self, client_id: ClientId) -> Vec<TerminalDescriptor> {
         self.terminals
             .keys()
@@ -4035,6 +4039,10 @@ struct RestoreFinalization {
 
 impl RestoredUpgrade {
     pub(super) fn finish(&mut self, host: &SharedHost) -> Result<(), String> {
+        self.finish_locked(&mut host.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub(super) fn finish_locked(&mut self, state: &mut HostState) -> Result<(), String> {
         let Some(finalization) = self.finalization.take() else {
             return Ok(());
         };
@@ -4051,15 +4059,10 @@ impl RestoredUpgrade {
             let message = format!(
                 "Upgrade restore finalization failed while retaining its original owners: {error}"
             );
-            host.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .retain_startup_recovery(message.clone());
+            state.retain_startup_recovery(message.clone());
             return Err(message);
         }
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retained_startup_checkpoint
-            .take();
+        state.retained_startup_checkpoint.take();
         Ok(())
     }
 }

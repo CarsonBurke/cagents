@@ -166,6 +166,7 @@ pub(super) struct Preview {
 struct VisiblePane {
     card: CardId,
     session: Option<TerminalId>,
+    can_acknowledge: bool,
 }
 
 pub(super) struct State {
@@ -614,6 +615,15 @@ impl Cagents {
             .map(|card| VisiblePane {
                 card,
                 session: self.card_state(card).and_then(card_session),
+                can_acknowledge: match self.cards.get(&card) {
+                    Some(CardRuntime::Chat(runtime)) => {
+                        runtime.handle().is_some_and(|handle| handle.is_connected())
+                    }
+                    Some(CardRuntime::Terminal(handle)) => {
+                        handle.current_attachment().ok().flatten().is_some()
+                    }
+                    _ => false,
+                },
             })
     }
 
@@ -677,6 +687,22 @@ impl Cagents {
         let ids = std::mem::take(&mut self.notification_ui.visible_notices);
         for id in ids {
             self.notification_ui.acknowledge(id);
+        }
+        if let Some(pane) = visible
+            && pane.can_acknowledge
+            && let Some(CardRuntime::Terminal(handle)) = self.cards.get(&pane.card)
+        {
+            let _ = handle.acknowledge_conversation_attention();
+        }
+        if let Some(pane) = visible
+            && !self.sidebar_state.has_card_update(pane.card)
+            && pane.session.is_some()
+            && pane.can_acknowledge
+        {
+            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&pane.card) {
+                let _ = handle.acknowledge_updates();
+            }
+            return self.acknowledge_visible_chat_lineage(pane.card);
         }
         self.acknowledge_active_pane_with_notices(false)
     }
