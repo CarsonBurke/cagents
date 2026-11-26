@@ -90,11 +90,12 @@ pub struct StateInUse {
     runtime: Option<PathBuf>,
     foreign_host: Option<String>,
     unreadable: bool,
+    storage_unavailable: bool,
 }
 
 impl StateInUse {
-    pub(crate) fn unreadable(&self) -> bool {
-        self.unreadable
+    pub(super) fn can_try_another_slot(&self) -> bool {
+        !self.storage_unavailable
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -343,7 +344,7 @@ pub(crate) fn claim_window_state_in(
 pub(super) fn prepare_claim_directory(path: &Path, claimant: Claimant) -> io::Result<()> {
     crate::secure_file::prepare_private_directory(path).map_err(|error| {
         tracing::debug!(directory = %path.display(), %error, "could not verify the saved-data claim directory");
-        io::Error::other(unreadable(claimant))
+        storage_unavailable(claimant)
     })
 }
 
@@ -369,6 +370,12 @@ fn unreadable(claimant: Claimant) -> StateInUse {
     let mut reason = refusal(claimant, None, false);
     reason.unreadable = true;
     reason
+}
+
+fn storage_unavailable(claimant: Claimant) -> io::Error {
+    let mut reason = unreadable(claimant);
+    reason.storage_unavailable = true;
+    io::Error::other(reason)
 }
 
 fn open_claim(path: &Path, write: bool) -> io::Result<File> {
@@ -481,7 +488,7 @@ fn acquire(
                     }
                     Err(error) => {
                         tracing::debug!(claim = %path.display(), %error, "could not publish the saved-data claim");
-                        return Err(unreadable());
+                        return Err(storage_unavailable(claimant));
                     }
                 }
             }
@@ -504,7 +511,7 @@ fn acquire(
                     let foreign = other_boot(&last, ours.boot.as_deref());
                     return Err(io::Error::other(refusal(claimant, Some(&last), foreign)));
                 }
-                write(lock.file_mut(), &ours).map_err(|_| unreadable())?;
+                write(lock.file_mut(), &ours).map_err(|_| storage_unavailable(claimant))?;
                 return Ok(StateClaim { _lock: lock });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => match read_path(path) {
@@ -550,6 +557,7 @@ fn refusal(claimant: Claimant, record: Option<&Record>, foreign: bool) -> StateI
                 .unwrap_or_else(|| "another machine".to_owned())
         }),
         unreadable: false,
+        storage_unavailable: false,
     }
 }
 
@@ -603,11 +611,9 @@ fn guard_held(path: &Path) -> bool {
         Listed::Free => return false,
         Listed::Unknown => {}
     }
-    // Only by trying it. Dropping the probe releases it at once.
-    matches!(
-        owned_file_lock(lock, libc::LOCK_EX | libc::LOCK_NB),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock
-    )
+    // Owners take an exclusive lease. Probe it with a shared read lock:
+    // a read-only descriptor cannot request an exclusive lock on NFS.
+    private_lock_is_held(path).unwrap_or(true)
 }
 
 #[cfg(target_os = "linux")]

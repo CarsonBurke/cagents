@@ -582,8 +582,9 @@ impl WindowLease {
                             Err(error)
                                 if new_window
                                     && requested.is_none()
-                                    && state_claim::state_in_use(&error)
-                                        .is_some_and(|reason| !reason.unreadable()) =>
+                                    && state_claim::state_in_use(&error).is_some_and(
+                                        state_claim::StateInUse::can_try_another_slot,
+                                    ) =>
                             {
                                 continue;
                             }
@@ -5718,6 +5719,34 @@ mod startup_update_tests {
     }
 
     #[test]
+    fn automatic_new_window_skips_an_individually_unreadable_layout_claim() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let damaged = claims.path().join("window.window-2.lock");
+        fs::write(&damaged, b"unrecognized claim").unwrap();
+        fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600)).unwrap();
+        let open = |requested| {
+            WindowLease::acquire_waiting_in(
+                runtime.path(),
+                Some(claims.path()),
+                false,
+                true,
+                requested,
+                Duration::ZERO,
+                &mut |_| {},
+            )
+        };
+        let error = open(Some("window-2"))
+            .err()
+            .expect("exact damaged slot must refuse");
+        assert!(state_claim::state_in_use(&error).is_some());
+        let (_lease, chosen) = open(None).unwrap();
+        assert_eq!(chosen, "window-3");
+        assert_eq!(fs::read(&damaged).unwrap(), b"unrecognized claim");
+    }
+
+    #[test]
     fn new_window_reports_an_unreadable_claim_directory_before_allocating_a_slot() {
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
@@ -5736,7 +5765,9 @@ mod startup_update_tests {
         )
         .err()
         .expect("a broken claims directory must refuse window startup");
-        assert!(state_claim::state_in_use(&error).unwrap().unreadable());
+        let reason = state_claim::state_in_use(&error).unwrap();
+        assert!(!reason.can_try_another_slot());
+        assert!(reason.to_string().contains("unreadable"));
         assert!(!runtime.join(slot_lock_name("window-2")).exists());
     }
 
