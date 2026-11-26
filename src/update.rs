@@ -360,6 +360,45 @@ pub(crate) fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
     })
 }
 
+/// The stable launch bundle can resolve only the currently selected build.
+#[cfg(target_os = "macos")]
+pub(crate) fn stable_ui_bundle(executable: &Path) -> Result<Option<PathBuf>, UpdateError> {
+    if executable
+        .file_name()
+        .is_none_or(|name| name != "cagents-ui")
+    {
+        return Ok(None);
+    }
+    let layout = match locate(executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if served_version_root(&layout)? != layout.version_root {
+        return Ok(None);
+    }
+    let bundle = layout.prefix.join("Cagents.app");
+    if !fs::symlink_metadata(&bundle).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == crate::daemon::current_uid()
+            && metadata.mode() & 0o022 == 0
+    }) {
+        // Older or incomplete installs can still open the physical UI.
+        return Ok(None);
+    }
+    let entry = bundle.join("Contents/MacOS/Cagents");
+    if !fs::symlink_metadata(&entry).is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.uid() == crate::daemon::current_uid()
+            && metadata.mode() & 0o022 == 0
+            && metadata.mode() & 0o111 != 0
+    }) || !entry.canonicalize().is_ok_and(|physical| physical == entry)
+    {
+        return Ok(None);
+    }
+    Ok(Some(bundle))
+}
+
 /// The three executables are released, installed and spoken as one set: a
 /// version directory holding only some of them cannot host a window.
 fn matched_set(bin: &Path) -> bool {
@@ -4082,6 +4121,45 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_the_selected_owned_install_uses_the_stable_launch_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().canonicalize().unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for version in ["1.2.3", "1.2.4"] {
+            let bin = prefix.join("versions").join(version).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for binary in ["cagents", "cagentsd", "cagents-ui"] {
+                fs::write(bin.join(binary), "fixture").unwrap();
+            }
+        }
+        std::os::unix::fs::symlink("versions/1.2.3", prefix.join("current")).unwrap();
+        let selected = prefix.join("versions/1.2.3/bin/cagents-ui");
+        let staged = prefix.join("versions/1.2.4/bin/cagents-ui");
+        assert!(stable_ui_bundle(&selected).unwrap().is_none());
+
+        let bundle = prefix.join("Cagents.app");
+        let launcher = bundle.join("Contents/MacOS/Cagents");
+        fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&launcher)
+            .unwrap();
+        assert_eq!(stable_ui_bundle(&selected).unwrap(), Some(bundle));
+        assert!(stable_ui_bundle(&staged).unwrap().is_none());
+
+        fs::remove_file(&launcher).unwrap();
+        std::os::unix::fs::symlink(&selected, launcher).unwrap();
+        assert!(stable_ui_bundle(&selected).unwrap().is_none());
+    }
+
     #[test]
     fn only_macos_sends_updates_to_its_installer() {
         assert_eq!(
