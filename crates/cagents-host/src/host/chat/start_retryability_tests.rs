@@ -86,10 +86,12 @@ fn isolated(name: &str) -> Option<PathBuf> {
         }
         thread::sleep(Duration::from_millis(10));
     };
+    let output = fs::read_to_string(root.join("stdout")).unwrap();
     assert!(
-        status.is_some_and(|status| status.success()),
-        "isolated startup fixture failed or timed out:\n{}\n{}",
-        fs::read_to_string(root.join("stdout")).unwrap(),
+        status.is_some_and(|status| status.success())
+            && output.contains("test result: ok. 1 passed"),
+        "isolated startup fixture failed, selected no test, or timed out:\n{}\n{}",
+        output,
         fs::read_to_string(root.join("stderr")).unwrap(),
     );
     None
