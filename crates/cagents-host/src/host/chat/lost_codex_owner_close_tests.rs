@@ -1265,15 +1265,14 @@ static OFFLINE_CODEX_SERVER: extern "C" fn() = {
         {
             return;
         }
-        // Only a private fixture with exact app-server argv enters this
-        // test-only path. It records its real exec args and waits for EOF.
+        // Only a private fixture with the exact app-server argv enters.
+        // The holder gives it null stdin and owns the shutdown signal.
         let notes = arguments.join("\n") + "\n";
-        let finished = std::fs::write(marker, notes)
-            .and_then(|()| std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()));
-        if let Err(error) = finished {
+        if let Err(error) = std::fs::write(marker, notes) {
             eprintln!("offline Codex fixture: {error}");
             std::process::exit(1);
         }
+        std::thread::sleep(Duration::from_secs(60));
         std::process::exit(0);
     }
     serve_fixture
