@@ -74,6 +74,14 @@ pub(super) fn write_reply(message: &str, final_response: bool) -> Option<io::Res
     let mut reply = REPLY.lock().unwrap_or_else(|error| error.into_inner());
     let stream = reply.as_mut()?;
     let result = writeln!(stream, "{message}").and_then(|()| stream.flush());
+    // Admission already transferred window ownership. If the launcher exits
+    // during restore, the window can still finish opening its saved work.
+    let result = result.or_else(|error| match error.kind() {
+        io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::NotConnected => Ok(()),
+        _ => Err(error),
+    });
     if final_response {
         reply.take();
     }
