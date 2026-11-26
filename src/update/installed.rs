@@ -1853,12 +1853,12 @@ exit 1"#,
             fs::write(root.join("bin").join(binary), b"first build").unwrap();
         }
         let original_stamp = stamp(&root).unwrap();
-        let original_identity = digest(&root).unwrap();
+        let original_identity = digest(&root, &BINARIES).unwrap();
         let replacement = root.join("bin/replacement");
         fs::write(&replacement, b"other build").unwrap();
         fs::rename(replacement, root.join("bin/cagentsd")).unwrap();
         assert!(stamp(&root).unwrap() != original_stamp);
-        assert_ne!(digest(&root).unwrap(), original_identity);
+        assert_ne!(digest(&root, &BINARIES).unwrap(), original_identity);
         // A different target behind an unchanged version name cannot borrow
         // the previous confirmation through a symlink either.
         fs::remove_file(root.join("bin/cagentsd")).unwrap();
