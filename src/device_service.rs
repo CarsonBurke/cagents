@@ -614,14 +614,14 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
             // HEAD is the only thing holding its commits.
             let service = crate::repository::RepositoryService::system("git");
             let cancellation = CancellationToken::new();
-            if let Some(record) = service
+            let records = service
                 .list_worktrees(root, &cancellation)
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            let record = records
                 .iter()
                 .find(|record| record.path == destination)
-            {
-                service.refuse_losing_detached_commits(root, record, &cancellation)?;
-            }
+                .ok_or("worktree is not registered with Git")?;
+            service.refuse_losing_detached_commits(root, record, &cancellation)?;
             command.args(["worktree", "remove", "--"]).arg(destination)
         }
         GitOperation::Diff { staged } => {

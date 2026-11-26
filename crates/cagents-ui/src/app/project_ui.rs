@@ -2746,6 +2746,16 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
         })
         .ok();
     close_worktree_sessions(target)?;
+    // An agent in the worktree may have committed between the first check
+    // and its session closing; nothing can commit there now.
+    if let Some(record) = service
+        .list_worktrees(&target.repository, &cancellation)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .find(|record| record.id == id)
+    {
+        service.refuse_losing_detached_commits(&target.repository, record, &cancellation)?;
+    }
     // Confirmation authorizes discarding this worktree's changes. Git owns
     // directory removal and still refuses locked worktrees with one --force.
     let command = worktree_removal_command(target);
@@ -5255,6 +5265,22 @@ pub(in crate::app) mod tests {
         };
         let head = record(&detached).head_oid.clone().unwrap();
         let short = &head[..12];
+
+        // A commit Git cannot read is not counted as kept.
+        let unreadable = WorktreeRecord {
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            ..record(&detached).clone()
+        };
+        let failure = service
+            .refuse_losing_detached_commits(&repository, &unreadable, &cancellation)
+            .unwrap_err();
+        assert!(
+            failure.starts_with(
+                "Could not check whether detached HEAD 0123456789ab has commits on no branch, \
+                 tag or remote, so the worktree was kept:"
+            ),
+            "{failure}"
+        );
 
         let refusal = delete_worktree(&target(&detached)).unwrap_err();
         assert_eq!(

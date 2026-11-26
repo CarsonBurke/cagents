@@ -3846,8 +3846,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &WorktreeRecord,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
-        let (true, Some(head)) = (worktree.detached, worktree.head_oid.as_deref()) else {
+        if !worktree.detached {
             return Ok(());
+        }
+        let Some(head) = worktree.head_oid.as_deref() else {
+            return Err(
+                "Git listed this worktree's HEAD as detached without a commit, \
+                 so the worktree was kept."
+                    .into(),
+            );
         };
         let short = head.get(..12).unwrap_or(head);
         let command = self
@@ -3880,7 +3887,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|error| {
                 format!(
                     "Could not check whether detached HEAD {short} has commits on no branch, \
-                     so the worktree was kept: {error}"
+                     tag or remote, so the worktree was kept: {error}"
                 )
             })?;
         match count {
