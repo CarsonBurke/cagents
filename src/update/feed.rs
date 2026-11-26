@@ -353,16 +353,9 @@ impl Feed {
         let Err(UpdateError::Exited { status, .. }) = outcome else {
             return outcome;
         };
-        let mut response = String::new();
-        let http_status = if status.code() == Some(22)
-            && read_status.take(4).read_to_string(&mut response).is_ok()
-            && response.len() == 3
-            && response.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            response.parse::<u16>().ok()
-        } else {
-            None
-        };
+        let http_status = (status.code() == Some(22))
+            .then(|| read_http_status(read_status))
+            .flatten();
         if (self.local && status.code() == Some(37)) || http_status == Some(404) {
             return Err(UpdateError::ReleaseAssetMissing(path.to_owned()));
         }
@@ -373,6 +366,21 @@ impl Feed {
             .unwrap_or_else(|| "the release server".into());
         Err(curl_failure(operation, status, http_status, &host))
     }
+}
+
+fn read_http_status(status: UnixStream) -> Option<u16> {
+    let mut response = Vec::new();
+    match status.take(4).read_to_end(&mut response) {
+        Ok(_) => {}
+        // The curl process has exited. A concurrent fork could still hold
+        // a close-on-exec copy of its descriptor without writing to it.
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(_) => return None,
+    }
+    if response.len() != 3 || !response.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(&response).ok()?.parse().ok()
 }
 
 /// curl's failures, in words for the person checking for an update.
@@ -881,7 +889,7 @@ mod tests {
                         error
                             .to_string()
                             .contains(&format!("updates.example.test returned HTTP {status}")),
-                        "{error}"
+                        "HTTP {status}: {error}"
                     );
                 } else {
                     assert!(matches!(error, UpdateError::Exited { .. }), "{error}");
