@@ -15,6 +15,8 @@
 #       order. An optional fixtureReviewRequests counts the times the viewer
 #       was asked to review it.
 #   home/.config/fixture-forge-delay  Seconds every answer waits first.
+#   home/.config/fixture-forge-graphql-reset  A Unix timestamp. GraphQL
+#       fails with exhausted primary quota until then; REST still answers.
 #   avatars/OWNER.image  Copied into the app's avatar cache, with a fresh
 #       modification time, whenever the app resolves a repository. Any PNG,
 #       JPEG, GIF or WebP up to 1 MiB and 1024x1024 pixels.
@@ -86,18 +88,41 @@ unsupported() {
 
 # gh --include prints the status line, then headers ending in CRLF.
 headers() {
-    status=$1 resource=$2
+    status=$1 resource=$2 remaining=${3:-4999} reset=${4:-$(($(date +%s) + 3600))}
     printf 'HTTP/2.0 %s\n' "$status"
     printf '%s\r\n' \
         "Date: $(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
         'Content-Type: application/json; charset=utf-8' \
         'X-Github-Media-Type: github.v3; format=json' \
         'X-Ratelimit-Limit: 5000' \
-        'X-Ratelimit-Remaining: 4999' \
-        "X-Ratelimit-Reset: $(($(date +%s) + 3600))" \
+        "X-Ratelimit-Remaining: $remaining" \
+        "X-Ratelimit-Reset: $reset" \
         "X-Ratelimit-Resource: $resource" \
-        'X-Ratelimit-Used: 1' \
+        "X-Ratelimit-Used: $((5000 - remaining))" \
         ''
+}
+
+# gh api --include returns HTTP headers on stdout. For GraphQL reads made
+# through porcelain, the fixture exposes the response headers on stderr.
+require_graphql_quota() {
+    reset_file=$config/fixture-forge-graphql-reset
+    [ -f "$reset_file" ] || return 0
+    reset=$(cat -- "$reset_file")
+    case $reset in
+        '' | *[!0-9]*)
+            printf 'gh: %s must hold a Unix reset timestamp\n' "$reset_file" >&2
+            exit 1
+            ;;
+    esac
+    [ "$reset" -gt "$(date +%s)" ] || return 0
+    if "${1:-false}"; then
+        headers '200 OK' graphql 0 "$reset"
+        printf '%s\n' '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit already exceeded"}]}'
+    else
+        headers '200 OK' graphql 0 "$reset" >&2
+    fi
+    printf '%s\n' 'GraphQL: API rate limit already exceeded' >&2
+    exit 1
 }
 
 # OWNER/NAME of a github.com remote URL, or nothing for any other host.
@@ -290,6 +315,7 @@ pr() {
     case $subcommand in
         list)
             trace "pr list author=$author repository=$slug"
+            require_graphql_quota
             case $state in
                 open | closed | merged | all) ;;
                 *)
@@ -315,6 +341,7 @@ pr() {
             ;;
         view | checks)
             trace "pr $subcommand repository=$slug"
+            require_graphql_quota
             case $number in
                 '' | *[!0-9]*) unsupported pr "$subcommand" "$number" ;;
             esac
@@ -378,6 +405,7 @@ api() {
         # repository as repo:OWNER/NAME and the viewer as @me.
         slug=$(printf '%s\n' "$search_all" | sed -nE 's#.*repo:([^ ]+).*#\1#p')
         trace "api graphql CagentsAuthoredPullRequests repository=$slug"
+        require_graphql_quota "$include"
         check_seed
         ! "$include" || headers '200 OK' graphql
         seeded "$slug" | jq -c --arg login "$login" --argjson open "$open_limit" --argjson all "$all_limit" "$checks_jq"'
@@ -396,6 +424,7 @@ api() {
     if [ "$endpoint" = graphql ]; then
         operation=$(printf '%s\n' "$query" | sed -nE '1s/^[[:space:]]*(query|mutation)[[:space:]]+([A-Za-z0-9_]+).*/\2/p')
         trace "api graphql ${operation:-anonymous} repository=$owner/$name"
+        require_graphql_quota "$include"
         case $query in
             'query SidebarPullRequests('* | 'query SidebarHistory('*)
                 check_seed
@@ -556,6 +585,7 @@ case ${1:-} in
         [ "${1:-}" = view ] || unsupported repo "$@"
         shift
         trace "repo view"
+        require_graphql_quota
         repo_view "$@"
         ;;
     pr) shift; pr "$@" ;;

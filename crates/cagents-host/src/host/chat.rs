@@ -616,6 +616,12 @@ fn changed_for_instance(
     }) {
         return;
     }
+    if matches!(update, Update::RecordChanged) {
+        if let Some(work) = &state.work {
+            work.input_changed(id);
+        }
+        return;
+    }
     if matches!(update, Update::TurnStarted { .. }) {
         if state.chats.contains_key(&id)
             && let Some(notifications) = &state.notifications
@@ -627,6 +633,9 @@ fn changed_for_instance(
     let proof = state.proof().clone();
     if matches!(update, Update::Activity { .. }) {
         state.tally_updates.notify_one();
+        if let Some(work) = &state.work {
+            work.activity_changed(id);
+        }
     }
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind.
@@ -677,6 +686,9 @@ fn changed_for_instance(
         state.mobile_sessions_changed();
     }
     if matches!(update, Update::ConversationNameChanged) {
+        if let Some(work) = &state.work {
+            work.conversation_identity_changed(id);
+        }
         if let Some(titles) = &state.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
         }

@@ -126,13 +126,24 @@ impl Signal {
     }
 
     fn wait(&self, observed: u64, timeout: Duration) {
+        self.wait_for_change(observed, Some(timeout));
+    }
+
+    fn wait_for_change(&self, observed: u64, timeout: Option<Duration>) {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = self
-            .changed
-            .wait_timeout_while(state, timeout, |state| {
-                !state.stopped && state.generation == observed
-            })
-            .unwrap_or_else(|p| p.into_inner());
+        let unchanged = |state: &mut SignalState| !state.stopped && state.generation == observed;
+        if let Some(timeout) = timeout {
+            let _ = self
+                .changed
+                .wait_timeout_while(state, timeout, unchanged)
+                .unwrap_or_else(|p| p.into_inner());
+        } else {
+            drop(
+                self.changed
+                    .wait_while(state, unchanged)
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+        }
     }
 }
 
@@ -247,6 +258,7 @@ struct Tracked {
     /// When a CLI board or a watched conversation last read this project.
     /// Only the projects someone reads poll at the watched cadence.
     read_at: Option<Instant>,
+    conversation_watched: bool,
 }
 
 impl Tracked {
@@ -281,6 +293,7 @@ impl Tracked {
             paused_until: None,
             memory: forge::Memory::with_listings(listings),
             read_at: None,
+            conversation_watched: false,
         }
     }
 
@@ -288,6 +301,7 @@ impl Tracked {
     /// the whole board, or a request or conversation read it lately.
     fn being_read(&self, watching: bool) -> bool {
         watching
+            || self.conversation_watched
             || self
                 .read_at
                 .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
@@ -1321,8 +1335,10 @@ impl Handle {
 
     pub(super) fn unwatch(&self, client: ClientId) {
         let mut publication = self.publication();
-        publication.watchers.remove(&client);
-        self.shared().set_watching(!publication.watchers.is_empty());
+        if publication.watchers.remove(&client).is_none() || !publication.watchers.is_empty() {
+            return;
+        }
+        self.shared().set_watching(false);
         drop(publication);
         self.0.forge.notify();
     }
@@ -1538,13 +1554,16 @@ impl Handle {
         tracked.scanning = false;
         tracked.scans = job.sequence;
         tracked.last_scan = Some(Instant::now());
-        match result {
+        let projection_changed = match result {
             Ok(local) => {
+                let changed =
+                    conversations::checkout_facts_changed(tracked.local.as_deref(), &local);
                 tracked.scan_error = None;
                 tracked.local = Some(Arc::new(local));
                 if job.full {
                     tracked.last_full_scan = tracked.last_scan;
                 }
+                changed
             }
             Err(error) => {
                 tracing::debug!(%error, project = %tracked.name, "Work board scan failed");
@@ -1554,8 +1573,9 @@ impl Handle {
                     .get_or_insert_with(Default::default)
                     .merge(job.change);
                 tracked.full |= job.full;
+                false
             }
-        }
+        };
         let settled = tracked.scan_error.is_none()
             && matches!(
                 tracked.forge,
@@ -1580,6 +1600,9 @@ impl Handle {
             self.store(|store| store.retain_pins(&job.repository, |item| !stale.contains(item)));
         }
         self.changed();
+        if projection_changed {
+            self.projection_changed();
+        }
         if first {
             // The forge needs a checkout to resolve the repository from.
             self.0.forge.notify();
@@ -1721,15 +1744,18 @@ impl Handle {
             let synced_at = now_unix_ms();
             // A listing is written when it changes, not every poll; until the
             // first poll after a restart its age reads as when it last did.
-            let changed = |snapshot: &forge::Snapshot| {
-                self.shared()
-                    .projects
-                    .get(&target.repository)
-                    .and_then(|tracked| tracked.snapshot.as_deref())
-                    != Some(snapshot)
+            let listing_changed = match &outcome {
+                forge::Outcome::Synced(snapshot) => {
+                    self.shared()
+                        .projects
+                        .get(&target.repository)
+                        .and_then(|tracked| tracked.snapshot.as_deref())
+                        != Some(snapshot)
+                }
+                _ => false,
             };
             if let forge::Outcome::Synced(snapshot) = &outcome
-                && changed(snapshot)
+                && listing_changed
                 && let Ok(serialized) = serde_json::to_string(snapshot)
             {
                 self.store(|store| {
@@ -1752,13 +1778,36 @@ impl Handle {
             if freshness == forge::Freshness::Fresh {
                 tracked.last_fresh_poll = tracked.last_poll;
             }
+            let previous_forge = tracked.forge.clone();
             let hints = Arc::clone(&tracked.hints);
             tracked.polled(outcome, synced_at, watching);
             if !Arc::ptr_eq(&hints, &tracked.hints) {
                 self.0.scanner.notify();
             }
+            // An inspector dates the pull requests it takes from the listing
+            // by its sync; other projects' syncs leave conversation facts be.
+            let projection_changed = listing_changed
+                || match (&previous_forge, &tracked.forge) {
+                    (
+                        Forge::Synced {
+                            at_unix_ms: synced_before,
+                            error: before,
+                        },
+                        Forge::Synced {
+                            at_unix_ms: synced_after,
+                            error: after,
+                        },
+                    ) => {
+                        before != after
+                            || (tracked.conversation_watched && synced_before != synced_after)
+                    }
+                    _ => previous_forge != tracked.forge,
+                };
             drop(shared);
             self.changed();
+            if projection_changed {
+                self.projection_changed();
+            }
         }
 
         // Tickets are resolved only while someone reads the board, so the
@@ -1898,6 +1947,7 @@ impl Scanner {
         drop(shared);
         if !unchanged {
             handle.0.publisher.notify();
+            handle.projection_changed();
         }
     }
 
@@ -2546,6 +2596,14 @@ mod tests {
     #[test]
     fn non_utf8_branch_preserves_refreshed_work_cards() {
         non_utf8_branch_work_cards(true);
+    }
+
+    #[test]
+    fn disconnecting_an_unrelated_client_does_not_wake_the_forge() {
+        let handle = polling_handle();
+        let generation = handle.0.forge.observe();
+        handle.unwatch(1);
+        assert_eq!(handle.0.forge.observe(), generation);
     }
 
     #[test]
