@@ -177,6 +177,30 @@ pub(crate) fn transcript_exists(config: &Path, cwd: &Path, id: &str) -> bool {
         })
 }
 
+/// Confirm absence only at a single exact, unsymlinked path below a
+/// canonical configuration root. A missing parent is also absence. An
+/// opaque path, directory error or dangling leaf is not an empty history.
+#[cfg(feature = "host")]
+pub(super) fn absent_transcript_path(config: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    let lookup = TranscriptLookup::new(cwd, id).ok()?;
+    if lookup.hashed() {
+        return None;
+    }
+    let projects = config.join("projects");
+    let project = projects.join(lookup.project);
+    let expected = project.join(lookup.filename);
+    for directory in [&projects, &project] {
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(expected),
+            _ => return None,
+        }
+    }
+    std::fs::symlink_metadata(&expected)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        .then_some(expected)
+}
+
 /// The transcript of conversation `id` that Claude Code keeps under `config`
 /// for a session started in `cwd`, which must already be canonical.
 ///
@@ -195,7 +219,7 @@ pub fn transcript(config: &Path, cwd: &Path, id: &str) -> Result<PathBuf, String
 /// changing the selected conversation.
 #[cfg(any(feature = "ui", feature = "host"))]
 #[derive(Debug)]
-pub(crate) enum TranscriptError {
+pub enum TranscriptError {
     Invalid(String),
     Unavailable(String),
 }
@@ -210,7 +234,7 @@ impl std::fmt::Display for TranscriptError {
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn transcript_for_start(
+pub fn transcript_for_start(
     config: &Path,
     cwd: &Path,
     id: &str,

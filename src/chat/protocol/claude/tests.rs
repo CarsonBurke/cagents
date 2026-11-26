@@ -2691,6 +2691,88 @@ fn stream(event: Value) -> Value {
 }
 
 #[test]
+fn claude_turn_confirmation_requires_correlated_lifecycle_or_a_new_root_stream() {
+    let mut adapter = Claude {
+        ready: true,
+        async_input: true,
+        ..Claude::default()
+    };
+    let sent = adapter
+        .send_prompt("start".into(), vec![], PromptMode::Send)
+        .unwrap();
+    assert!(sent.events.contains(&Event::TurnStarted));
+    assert!(!sent.events.contains(&Event::TurnStartConfirmed));
+    let lifecycle =
+        |id: &Value, state| json!({"type":"command_lifecycle","command_uuid":id,"state":state});
+    let id = &sent.writes[0]["uuid"];
+    let queued = adapter.receive(lifecycle(id, "queued")).unwrap();
+    assert!(!queued.events.contains(&Event::TurnStartConfirmed));
+    let wrong = adapter
+        .receive(lifecycle(&json!("unknown"), "started"))
+        .unwrap();
+    assert!(!wrong.events.contains(&Event::TurnStartConfirmed));
+    let first = adapter.receive(lifecycle(id, "started")).unwrap();
+    assert!(first.events.contains(&Event::TurnStartConfirmed));
+    assert!(!first.events.contains(&Event::TurnStarted));
+    let root = |id| stream(json!({"type":"message_start","message":{"id":id}}));
+    let same_turn = adapter.receive(root("first-root")).unwrap();
+    assert!(!same_turn.events.contains(&Event::TurnStartConfirmed));
+    adapter
+        .receive(json!({"type":"result","is_error":false}))
+        .unwrap();
+
+    let repeated = adapter.receive(root("first-root")).unwrap();
+    assert!(!repeated.events.contains(&Event::TurnStartConfirmed));
+    let mut history = root("history");
+    history["isReplay"] = json!(true);
+    assert!(
+        !adapter
+            .receive(history)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let mut child = root("child");
+    child["parent_tool_use_id"] = json!("background");
+    assert!(
+        !adapter
+            .receive(child)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let live = adapter.receive(root("second-root")).unwrap();
+    assert!(live.events.contains(&Event::TurnStartConfirmed));
+    let another_model_call = adapter.receive(root("third-root")).unwrap();
+    assert!(
+        !another_model_call
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    adapter
+        .receive(json!({"type":"result","is_error":false}))
+        .unwrap();
+    let reply = |id, replay| {
+        json!({"type":"assistant","uuid":id,"isReplay":replay,"message":{
+            "id":id,"content":[{"type":"text","text":"Done"}],"role":"assistant"
+        }})
+    };
+    let replayed_reply = adapter.receive(reply("older-reply", true)).unwrap();
+    assert!(!replayed_reply.events.contains(&Event::TurnStartConfirmed));
+    let mut refusal = reply("refused-reply", false);
+    refusal["error"] = json!("rate_limit");
+    assert!(
+        !adapter
+            .receive(refusal)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let actual_reply = adapter.receive(reply("fresh-reply", false)).unwrap();
+    assert!(actual_reply.events.contains(&Event::TurnStartConfirmed));
+}
+
+#[test]
 fn autonomous_parent_turns_publish_one_start_even_with_pending_decisions() {
     for pending in [false, true] {
         let mut adapter = Claude {
@@ -11119,6 +11201,90 @@ fn rejected_model_change_does_not_apply_or_report_effort() {
     );
     assert_eq!(adapter.selected.as_deref(), Some("old"));
     assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+}
+
+#[test]
+fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
+    let mut adapter = Claude::default();
+    adapter.receive(json!({"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+    let answers = |query: Vec<String>, limit: Vec<String>| {
+        vec![
+            Answer {
+                field: "query".into(),
+                values: query,
+            },
+            Answer {
+                field: "limit".into(),
+                values: limit,
+            },
+        ]
+    };
+    // A blank required field is missing, and the request stays pending.
+    for blank in [vec![], vec![String::new()]] {
+        let error = adapter
+            .answer("e1".into(), "accept".into(), answers(blank, vec![]))
+            .unwrap_err();
+        assert!(error.contains("Missing required Claude field"), "{error}");
+    }
+    // Skipping a blank answer must not hide a duplicate or unknown field.
+    for field in ["limit", "unknown"] {
+        let mut duplicate = answers(vec!["search".into()], vec![]);
+        duplicate.push(Answer {
+            field: field.into(),
+            values: if field == "limit" {
+                vec!["5".into()]
+            } else {
+                vec![]
+            },
+        });
+        let error = adapter
+            .answer("e1".into(), "accept".into(), duplicate)
+            .unwrap_err();
+        assert!(error.contains("unknown or duplicate field"), "{error}");
+    }
+    // An untouched optional field arrives with no value; a cleared one may
+    // arrive as one empty string. Either way it is left out of the reply.
+    for (id, blank) in [("e2", vec![]), ("e3", vec![String::new()])] {
+        adapter.receive(json!({"type":"control_request","request_id":id,"request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+        let step = adapter
+            .answer(
+                id.into(),
+                "accept".into(),
+                answers(vec!["search".into()], blank),
+            )
+            .unwrap();
+        assert_eq!(
+            step.writes[0]["response"]["response"],
+            json!({"action":"accept","content":{"query":"search"}})
+        );
+    }
+    let step = adapter
+        .answer(
+            "e1".into(),
+            "accept".into(),
+            answers(vec!["search".into()], vec!["5".into()]),
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"query":"search","limit":5}})
+    );
+    // An empty multi-select is a selection of nothing, not a blank field.
+    adapter.receive(json!({"type":"control_request","request_id":"e4","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string","enum":["a","b"]}}},"required":["tags"]}}})).unwrap();
+    let step = adapter
+        .answer(
+            "e4".into(),
+            "accept".into(),
+            vec![Answer {
+                field: "tags".into(),
+                values: vec![],
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"tags":[]}})
+    );
 }
 
 #[test]

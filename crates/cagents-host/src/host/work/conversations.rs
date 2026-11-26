@@ -21,9 +21,9 @@ use super::{
 };
 use crate::{
     agent::Provider,
-    github::{GitHubError, GitHubService},
+    github::{GitHubError, GitHubService, polling},
     github_identity::{GitHubRepoKey, PullRequestKey},
-    model::TerminalId,
+    model::{ProjectId, TerminalId},
     pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
     terminal_ipc::ServerMessage,
     work::{
@@ -37,16 +37,22 @@ use std::{
     io,
     os::unix::fs::{FileExt as _, MetadataExt as _},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
+
+mod files;
 
 #[cfg(test)]
 mod tests;
 
-/// How often a watched conversation's transcript is read again.
+/// Coalesce bursts of active output and continue bounded reads.
 const TICK: Duration = Duration::from_secs(2);
-const UNWATCHED: Duration = Duration::from_secs(60 * 60);
+/// Retry file coverage while the directory or watch backend is unavailable.
+const UNWATCHED_TRANSCRIPT: Duration = Duration::from_secs(10);
 /// How long what was read of an unwatched conversation is kept, so coming
 /// back to it, or showing the inspector again, does not read it all again.
 const KEPT_UNWATCHED: Duration = Duration::from_secs(10 * 60);
@@ -79,13 +85,21 @@ const OPEN_FOR: Duration = Duration::from_secs(60);
 const MENTIONED_OPEN_FOR: Duration = Duration::from_secs(10 * 60);
 const FINISHED_FOR: Duration = Duration::from_secs(30 * 60);
 const NOT_A_PULL_REQUEST_FOR: Duration = Duration::from_secs(24 * 60 * 60);
-const BRANCH_FOUND_FOR: Duration = Duration::from_secs(15 * 60);
 const BRANCH_MISSING_FOR: Duration = Duration::from_secs(10 * 60);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(super) struct Conversations {
     state: Mutex<State>,
+    /// Only conversations with input queued need their transcript read.
+    inputs_changed: Mutex<BTreeSet<TerminalId>>,
+    /// Inspected conversations whose transcript was looked for and not
+    /// found. Their provider writes it once a turn starts, which no file
+    /// watch sees, so their activity is input. Nothing is locked while
+    /// this is held.
+    unlocated: Mutex<BTreeSet<TerminalId>>,
+    watching: AtomicBool,
+    projection: AtomicU64,
     pub(super) signal: Signal,
 }
 
@@ -104,51 +118,26 @@ struct State {
     /// cannot be reached, lookups back off rather than retry every pass.
     failures: u32,
     failed: Option<Instant>,
-    /// The Unix second GitHub's rate limit admits lookups again. They resume
-    /// then rather than after a doubling backoff.
-    paused_until: Option<u64>,
 }
 
 impl State {
-    fn lookups_due(&self) -> bool {
-        match self.paused_until {
-            Some(until) => super::pause_over(until),
-            None => self
-                .failed
-                .is_none_or(|failed| failed.elapsed() >= backoff(self.failures)),
-        }
+    fn lookup_retry(&self) -> Option<Instant> {
+        self.failed
+            .map(|failed| failed + backoff(self.failures))
+            .filter(|&due| due > Instant::now())
     }
 
     fn succeeded(&mut self) {
         self.forge_error = None;
         self.failures = 0;
         self.failed = None;
-        self.paused_until = None;
     }
 
     fn failed(&mut self, error: &GitHubError) {
         self.forge_error = Some(error.to_string());
+        self.failures = self.failures.saturating_add(1);
         self.failed = Some(Instant::now());
-        match pause(error) {
-            // GitHub answered, so earlier outages are over.
-            Some(until) => {
-                self.paused_until = Some(until);
-                self.failures = 0;
-            }
-            None => {
-                self.failures = self.failures.saturating_add(1);
-                self.paused_until = None;
-            }
-        }
     }
-}
-
-/// Until when a rate limit that refused a lookup pauses the rest, as the
-/// board's polls pause.
-fn pause(error: &GitHubError) -> Option<u64> {
-    error
-        .rate_limit()
-        .and_then(|limit| super::rate_limit_pause(limit.retry_at))
 }
 
 /// As the board backs off: 30 s doubling, at most 30 min.
@@ -172,19 +161,8 @@ struct Observed {
 }
 
 impl Observed {
-    /// Counts a failed lookup of this pull request toward its backoff. A
-    /// rate limit is no fault of the pull request: lookups resume together
-    /// when it resets.
-    fn lookup_failed(&mut self, error: &GitHubError) {
-        if pause(error).is_none() {
-            self.failures = self.failures.saturating_add(1);
-        }
-    }
-
-    fn due(&self, worked_on: bool) -> bool {
-        let Some(checked) = self.checked else {
-            return true;
-        };
+    fn refresh_at(&self, worked_on: bool) -> Option<Instant> {
+        let checked = self.checked?;
         let wait =
             if self.missing {
                 NOT_A_PULL_REQUEST_FOR
@@ -199,7 +177,7 @@ impl Observed {
             } else {
                 MENTIONED_OPEN_FOR
             };
-        checked.elapsed() >= wait
+        Some(checked + wait)
     }
 }
 
@@ -212,6 +190,7 @@ struct BranchLookup {
 struct Watched {
     watchers: BTreeMap<ClientId, Weak<DeliveryQueue>>,
     source: Source,
+    facts: Option<(u64, Option<Arc<Facts>>)>,
     files: BTreeMap<PathBuf, Cursor>,
     /// How far cagents' own record of the conversation has been read, for a
     /// conversation whose transcript files are not.
@@ -229,9 +208,58 @@ struct Watched {
     /// the transcript, a search for Codex, happens once per conversation ID.
     located_id: Option<String>,
     /// Searching for a Codex rollout walks its dated directories, so a
-    /// search that found nothing is not repeated before this.
+    /// search that found nothing is not repeated before this, unless the
+    /// conversation's input or activity changes first.
     search_after: Option<Instant>,
     searches_missed: u32,
+    input: InputRead,
+}
+
+#[derive(Default)]
+struct InputRead {
+    read: Option<Instant>,
+    due: Option<Instant>,
+}
+
+impl InputRead {
+    fn changed(&mut self, now: Instant) {
+        sooner(&mut self.due, self.read.map_or(now, |read| read + TICK));
+    }
+
+    fn complete(&mut self, again: Option<Duration>) {
+        let now = Instant::now();
+        self.read = Some(now);
+        self.due = again.map(|delay| now + delay);
+    }
+}
+
+fn sooner(next: &mut Option<Instant>, at: Instant) {
+    *next = Some(next.map_or(at, |pending| pending.min(at)));
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NextPass {
+    deadline: Option<Instant>,
+    reset: Option<u64>,
+}
+
+impl NextPass {
+    fn due(&self) -> bool {
+        self.deadline.is_some_and(|at| Instant::now() >= at)
+            || self.reset.is_some_and(super::pause_over)
+    }
+
+    fn wait_for(&self) -> Option<Duration> {
+        self.deadline
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .into_iter()
+            .chain(self.reset.map(|until| {
+                super::pause_ends(until)
+                    .saturating_duration_since(Instant::now())
+                    .min(super::PAUSED_WAKE)
+            }))
+            .min()
+    }
 }
 
 /// Where a pass found the conversation's transcript.
@@ -293,6 +321,7 @@ impl Watched {
         Self {
             watchers: BTreeMap::new(),
             source: Source::Pending,
+            facts: None,
             files: BTreeMap::new(),
             items: Items::default(),
             references: BTreeMap::new(),
@@ -305,6 +334,7 @@ impl Watched {
             located_id: None,
             search_after: None,
             searches_missed: 0,
+            input: InputRead::default(),
         }
     }
 
@@ -450,6 +480,7 @@ struct Facts {
 
 #[derive(Clone)]
 struct ProjectFacts {
+    id: ProjectId,
     snapshot: Option<Arc<forge::Snapshot>>,
     local: Option<Arc<super::scan::Local>>,
     forge_error: Option<String>,
@@ -460,6 +491,7 @@ struct ProjectFacts {
 impl ProjectFacts {
     fn of(tracked: &super::Tracked) -> Self {
         Self {
+            id: tracked.id,
             snapshot: tracked.snapshot.clone(),
             local: tracked.local.clone(),
             forge_error: match &tracked.forge {
@@ -584,6 +616,30 @@ impl ProjectFacts {
     }
 }
 
+pub(super) fn checkout_facts_changed(
+    before: Option<&super::scan::Local>,
+    after: &super::scan::Local,
+) -> bool {
+    before.is_none_or(|before| {
+        before.worktrees.len() != after.worktrees.len()
+            || before
+                .worktrees
+                .iter()
+                .zip(&after.worktrees)
+                .any(|(before, after)| {
+                    before.path != after.path
+                        || before.branch != after.branch
+                        || before.head != after.head
+                        || before.dirty != after.dirty
+                        // Whether a merged pull request's branch was left
+                        // behind reads these.
+                        || before.comparison.as_ref().map(|c| c.ahead)
+                            != after.comparison.as_ref().map(|c| c.ahead)
+                })
+            || before.ancestry != after.ancestry
+    })
+}
+
 /// A reference turned into a pull request, or what must be asked to do so.
 enum Resolved {
     Key(PullRequestKeyOrd),
@@ -593,6 +649,7 @@ enum Resolved {
         head: GitHubRepoKey,
         branch: String,
     },
+    Deferred(Instant),
     Nothing,
 }
 
@@ -600,8 +657,58 @@ impl Handle {
     /// Tells the conversation loop about a chat the daemon now hosts. One
     /// whose record is read is followed from the next pass rather than after
     /// the loop's idle wait.
-    pub(in crate::host) fn chat_added(&self, provider: Provider) {
+    pub(in crate::host) fn chat_added(&self, conversation: TerminalId, provider: Provider) {
+        self.0
+            .conversations
+            .projection
+            .fetch_add(1, Ordering::Release);
         if recorded_provider(provider) {
+            self.input_changed(conversation);
+        } else {
+            self.conversation_identity_changed(conversation);
+        }
+    }
+
+    pub(in crate::host) fn conversation_identity_changed(&self, conversation: TerminalId) {
+        if self.0.conversations.watching.load(Ordering::Acquire) {
+            self.input_changed(conversation);
+        }
+    }
+
+    /// A conversation started or settled a turn. One whose inspector is
+    /// still looking for its transcript looks again: Claude writes it with
+    /// the first prompt, and Codex after a resume.
+    pub(in crate::host) fn activity_changed(&self, conversation: TerminalId) {
+        let unlocated = self
+            .0
+            .conversations
+            .unlocated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&conversation);
+        if unlocated {
+            self.input_changed(conversation);
+        }
+    }
+
+    pub(in crate::host) fn input_changed(&self, conversation: TerminalId) {
+        let conversations = &self.0.conversations;
+        if conversations
+            .inputs_changed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(conversation)
+        {
+            conversations.signal.notify();
+        }
+    }
+
+    pub(super) fn projection_changed(&self) {
+        self.0
+            .conversations
+            .projection
+            .fetch_add(1, Ordering::Release);
+        if self.0.conversations.watching.load(Ordering::Acquire) {
             self.0.conversations.signal.notify();
         }
     }
@@ -631,25 +738,33 @@ impl Handle {
         {
             return Err("No such conversation".into());
         }
-        let facts = self.facts(host, conversation, true);
+        let projection = self.0.conversations.projection.load(Ordering::Acquire);
+        let facts = self.facts(host, conversation, true).map(Arc::new);
         let mut state = self.conversations();
         // A connection watches one conversation at a time.
         for watched in state.watched.values_mut() {
             watched.watchers.remove(&client);
         }
-        let forge_error = state.forge_error.clone();
-        let observed = state.observed.clone();
-        let branches = state.branches.clone();
-        let measured = state.measured.clone();
-        let watched = state
-            .watched
-            .entry(conversation)
-            .or_insert_with(Watched::new);
+        let State {
+            watched,
+            observed,
+            branches,
+            measured,
+            forge_error,
+            ..
+        } = &mut *state;
+        let watched = watched.entry(conversation).or_insert_with(Watched::new);
         watched.watchers.insert(client, delivery);
         watched.unwatched_since = None;
-        watched.pin_edits(facts.as_ref(), &observed, &branches);
-        let mut list = assemble(watched, facts.as_ref(), &observed, &branches, forge_error);
-        with_measured(&mut list, &measured);
+        watched.pin_edits(facts.as_deref(), observed, branches);
+        let mut list = assemble(
+            watched,
+            facts.as_deref(),
+            observed,
+            branches,
+            forge_error.clone(),
+        );
+        with_measured(&mut list, measured);
         let mut comparable = list.clone();
         comparable.generated_at_unix_ms = 0;
         if watched.sent.as_ref() != Some(&comparable) {
@@ -657,47 +772,68 @@ impl Handle {
             watched.revision += 1;
         }
         let revision = watched.revision;
+        watched.facts = Some((projection, facts));
+        self.0.conversations.watching.store(true, Ordering::Release);
         drop(state);
-        self.0.conversations.signal.notify();
+        self.input_changed(conversation);
         Ok((revision, list))
     }
 
     pub(in crate::host) fn unwatch_conversation(&self, client: ClientId) {
         let mut state = self.conversations();
         for watched in state.watched.values_mut() {
-            watched.watchers.remove(&client);
+            if watched.watchers.remove(&client).is_some() {
+                self.0.conversations.signal.notify();
+                break;
+            }
         }
     }
 
     pub(super) fn conversation_loop(&self) {
-        while let Some(observed) = self.0.conversations.signal.observe() {
+        let owner = Arc::downgrade(&self.0);
+        let mut files = files::Watches::new(move |id| {
+            if let Some(inner) = owner.upgrade() {
+                Handle(inner).input_changed(id);
+            }
+        });
+        let signal = &self.0.conversations.signal;
+        while let Some(observed) = signal.observe() {
             let Some(host) = self.0.host.upgrade() else {
                 break;
             };
-            let read = super::super::service::attempt("Conversation pull requests", || {
-                Ok(self.conversation_pass(&host))
+            let next = super::super::service::attempt("Conversation pull requests", || {
+                Ok(self.conversation_pass(&host, &mut files))
             })
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, "conversation pull requests are temporarily unavailable");
-                true
+                NextPass {
+                    deadline: Some(Instant::now() + TICK),
+                    reset: None,
+                }
             });
             drop(host);
-            self.0
-                .conversations
-                .signal
-                .wait(observed, if read { TICK } else { UNWATCHED });
+            // A monotonic wait sleeps through suspend. Check the wall clock
+            // during a quota pause without running another conversation pass.
+            while signal.observe() == Some(observed) && !next.due() {
+                signal.wait_for_change(observed, next.wait_for());
+            }
         }
     }
 
-    /// Reads every watched conversation and every followed one once,
-    /// resolves and publishes the watched ones, and reports whether it read
-    /// any, so that the loop comes back after a tick rather than its idle
-    /// wait.
-    fn conversation_pass(&self, host: &SharedHost) -> bool {
-        // A conversation whose record is read is followed whether or not
-        // anything shows it: the record serves only what changed since the
-        // last read, so an idle one costs nothing, and what a busy one did
-        // early is read before it is long past.
+    /// Reads changed records and watched transcripts, then publishes any
+    /// changed lists. Only watches, retention and incomplete record reads
+    /// can need another pass without input.
+    fn conversation_pass(&self, host: &SharedHost, files: &mut files::Watches) -> NextPass {
+        let dirty = std::mem::take(
+            &mut *self
+                .0
+                .conversations
+                .inputs_changed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        // A recorded conversation is followed from startup even when no
+        // window shows it, but its SQLite store is read only after a change.
         let followed = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -706,7 +842,7 @@ impl Handle {
             .filter(|(_, record)| recorded_provider(record.session.launch.provider))
             .map(|(conversation, _)| *conversation)
             .collect::<BTreeSet<_>>();
-        let (conversations, read) = {
+        let (conversations, read, was_watching) = {
             let mut state = self.conversations();
             state.watched.retain(|conversation, watched| {
                 watched
@@ -732,14 +868,54 @@ impl Handle {
                 .filter(|(_, watched)| !watched.watchers.is_empty())
                 .map(|(conversation, _)| *conversation)
                 .collect::<Vec<_>>();
-            let mut read = conversations.iter().copied().collect::<BTreeSet<_>>();
-            read.extend(&followed);
-            (conversations, read)
+            let was_watching = self
+                .0
+                .conversations
+                .watching
+                .swap(!conversations.is_empty(), Ordering::AcqRel);
+            let now = Instant::now();
+            let read = state
+                .watched
+                .iter_mut()
+                .filter_map(|(id, watched)| {
+                    let followed = followed.contains(id);
+                    if !followed && watched.watchers.is_empty() {
+                        return None;
+                    }
+                    if dirty.contains(id) {
+                        watched.input.changed(now);
+                        // What changed may be what a missed search lacked,
+                        // and may still be on its way: Claude writes the
+                        // transcript after taking the turn's prompt. Look
+                        // now, and soon after.
+                        watched.search_after = None;
+                        watched.searches_missed = 0;
+                    }
+                    let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
+                    (due(watched.input.due)
+                        || due(watched.search_after)
+                        || (followed && watched.source == Source::Pending))
+                        .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            (conversations, read, was_watching)
         };
-        if read.is_empty() {
-            return false;
+        files.retain(|id| conversations.contains(&id) && !followed.contains(&id));
+        let mut facts = conversations
+            .iter()
+            .map(|id| (*id, self.watched_facts(host, *id)))
+            .collect::<BTreeMap<_, _>>();
+        if was_watching || !conversations.is_empty() {
+            // A live inspector keeps only its own project at the watched
+            // forge cadence, even when its cached facts do not need reading.
+            let projects = facts
+                .values()
+                .filter_map(|facts| Some(facts.as_ref()?.project.as_ref()?.id))
+                .collect::<BTreeSet<_>>();
+            for tracked in self.shared().projects.values_mut() {
+                tracked.conversation_watched = projects.contains(&tracked.id);
+            }
         }
-        let mut facts = BTreeMap::new();
         for conversation in &read {
             let watched = conversations.contains(conversation);
             let (known, search_due) = self
@@ -756,18 +932,27 @@ impl Handle {
                 })
                 .unwrap_or_default();
             let located = locate(host, *conversation, known.as_deref(), search_due);
-            if watched {
-                facts.insert(*conversation, self.facts(host, *conversation, true));
-            }
             let (source, mut cursors, mut items) = {
                 let mut state = self.conversations();
                 let Some(watched) = state.watched.get_mut(conversation) else {
                     continue;
                 };
+                if search_due {
+                    watched.search_after = None;
+                }
                 if matches!(located, Location::Missed) {
                     watched.searches_missed = watched.searches_missed.saturating_add(1);
                     watched.search_after =
                         Some(Instant::now() + search_backoff(watched.searches_missed));
+                    // So activity during the rest of this pass is not lost.
+                    if !watched.watchers.is_empty() {
+                        self.0
+                            .conversations
+                            .unlocated
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(*conversation);
+                    }
                 }
                 if let Location::Found(id, source) = located {
                     watched.searches_missed = 0;
@@ -792,9 +977,29 @@ impl Handle {
             // Watching and unwatching take the same lock, so the files and
             // the record are read without it. Only this thread moves the
             // cursors.
-            let scanned = match &source {
-                Source::Recorded => recorded(host, *conversation, &mut items),
-                _ => scan(&source, &mut cursors),
+            let (scanned, again) = match &source {
+                Source::Recorded => {
+                    let (scanned, read) = recorded(host, *conversation, &mut items);
+                    let retry = match read {
+                        RecordRead::Complete => None,
+                        RecordRead::More => Some(TICK),
+                        // Followed conversations no one shows wait for their
+                        // next write rather than retrying unattended.
+                        RecordRead::Failed => watched.then_some(UNWATCHED_TRANSCRIPT),
+                    };
+                    (scanned, retry)
+                }
+                Source::Located(located) => {
+                    let covered = files.cover(*conversation, located);
+                    let scanned = scan(&source, &mut cursors);
+                    let retry = match &scanned.coverage {
+                        TranscriptCoverage::Pending => Some(TICK),
+                        _ if !covered => Some(UNWATCHED_TRANSCRIPT),
+                        _ => None,
+                    };
+                    (scanned, retry)
+                }
+                Source::Pending => (scan(&source, &mut cursors), None),
             };
             // Work on "the current branch" is pinned to the branch checked
             // out as it is read.
@@ -804,7 +1009,10 @@ impl Handle {
                     .iter()
                     .any(|found| matches!(found.signal.reference, Reference::CurrentBranch { .. }))
             {
-                facts.insert(*conversation, self.facts(host, *conversation, false));
+                facts.insert(
+                    *conversation,
+                    self.facts(host, *conversation, false).map(Arc::new),
+                );
             }
             let mut state = self.conversations();
             if let Some(watched) = state.watched.get_mut(conversation)
@@ -812,30 +1020,55 @@ impl Handle {
             {
                 watched.files = cursors;
                 watched.items = items;
-                watched.apply(scanned, facts.get(conversation).and_then(Option::as_ref));
+                watched.input.complete(again);
+                watched.apply(scanned, facts.get(conversation).and_then(Option::as_deref));
             }
         }
-        self.look_up(&conversations, &facts);
-        self.measure(&conversations, &facts);
-        let mut state = self.conversations();
-        let observed = state.observed.clone();
-        let branches = state.branches.clone();
-        let measured = state.measured.clone();
-        let forge_error = state.forge_error.clone();
+        let unlocated = self
+            .conversations()
+            .watched
+            .iter()
+            .filter(|(_, watched)| !watched.watchers.is_empty() && watched.searches_missed > 0)
+            .map(|(conversation, _)| *conversation)
+            .collect();
+        *self
+            .0
+            .conversations
+            .unlocated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = unlocated;
+        let deadline = self.conversation_deadline(&followed);
+        if conversations.is_empty() {
+            return NextPass {
+                deadline,
+                reset: None,
+            };
+        }
+        let mut next = self.look_up(&conversations, &facts);
+        let more_diffs = self.measure(&conversations, &facts);
         let proof = Arc::new(
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .proof()
                 .clone(),
         );
+        let mut state = self.conversations();
+        let State {
+            watched,
+            observed,
+            branches,
+            measured,
+            forge_error,
+            ..
+        } = &mut *state;
         for conversation in conversations {
-            let Some(watched) = state.watched.get_mut(&conversation) else {
+            let Some(watched) = watched.get_mut(&conversation) else {
                 continue;
             };
-            let facts = facts.get(&conversation).and_then(Option::as_ref);
-            watched.pin_edits(facts, &observed, &branches);
-            let mut list = assemble(watched, facts, &observed, &branches, forge_error.clone());
-            with_measured(&mut list, &measured);
+            let facts = facts.get(&conversation).and_then(Option::as_deref);
+            watched.pin_edits(facts, observed, branches);
+            let mut list = assemble(watched, facts, observed, branches, forge_error.clone());
+            with_measured(&mut list, measured);
             let mut comparable = list.clone();
             comparable.generated_at_unix_ms = 0;
             if watched.sent.as_ref() == Some(&comparable) {
@@ -859,8 +1092,55 @@ impl Handle {
                     ))
                     .is_ok()
             });
+            if watched.watchers.is_empty() {
+                self.0.conversations.signal.notify();
+            }
         }
-        true
+        if let Some(deadline) = deadline {
+            sooner(&mut next.deadline, deadline);
+        }
+        if more_diffs {
+            sooner(&mut next.deadline, Instant::now() + TICK);
+        }
+        next
+    }
+
+    fn conversation_deadline(&self, followed: &BTreeSet<TerminalId>) -> Option<Instant> {
+        self.conversations()
+            .watched
+            .iter()
+            .filter_map(|(id, watched)| {
+                if !followed.contains(id) && watched.watchers.is_empty() {
+                    watched.unwatched_since.map(|since| since + KEPT_UNWATCHED)
+                } else {
+                    watched
+                        .search_after
+                        .into_iter()
+                        .chain(watched.input.due)
+                        .min()
+                }
+            })
+            .min()
+    }
+
+    /// Project placement reads the workspace registry and Git metadata.
+    /// A transcript tick can reuse that answer until Work publishes facts.
+    fn watched_facts(&self, host: &SharedHost, conversation: TerminalId) -> Option<Arc<Facts>> {
+        let projection = self.0.conversations.projection.load(Ordering::Acquire);
+        if let Some((seen, facts)) = self
+            .conversations()
+            .watched
+            .get(&conversation)
+            .and_then(|watched| watched.facts.as_ref())
+            && *seen == projection
+        {
+            return facts.clone();
+        }
+        let facts = self.facts(host, conversation, true).map(Arc::new);
+        if let Some(watched) = self.conversations().watched.get_mut(&conversation) {
+            watched.facts = Some((projection, facts.clone()));
+        }
+        facts
     }
 
     /// The board's facts for a conversation's directory. Watching a
@@ -909,7 +1189,11 @@ impl Handle {
     /// conversation edited whose status changed since it was last measured.
     /// The board's scan, which its file watcher drives, says when one did, so
     /// an unchanged worktree is never diffed again.
-    fn measure(&self, conversations: &[TerminalId], facts: &BTreeMap<TerminalId, Option<Facts>>) {
+    fn measure(
+        &self,
+        conversations: &[TerminalId],
+        facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
+    ) -> bool {
         let due = {
             let mut state = self.conversations();
             let mut wanted = BTreeMap::new();
@@ -937,6 +1221,7 @@ impl Handle {
                 })
                 .collect::<Vec<_>>()
         };
+        let more = due.len() > MEASURES_PER_PASS;
         let git = crate::repository::RepositoryService::system("git");
         for (path, fingerprint) in due.into_iter().take(MEASURES_PER_PASS) {
             let diff = match &fingerprint.dirty {
@@ -955,17 +1240,27 @@ impl Handle {
                 .measured
                 .insert(path, Measured { fingerprint, diff });
         }
+        more
     }
 
     /// Asks GitHub about the few pull requests and branches most worth it.
-    fn look_up(&self, conversations: &[TerminalId], facts: &BTreeMap<TerminalId, Option<Facts>>) {
+    fn look_up(
+        &self,
+        conversations: &[TerminalId],
+        facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
+    ) -> NextPass {
+        let mut cached_deadline = None;
         // In rank order across conversations, so the budget goes to what
         // they worked on before what they mentioned.
         let lookups = {
             let state = self.conversations();
-            if !state.lookups_due() {
-                return;
+            if let Some(due) = state.lookup_retry() {
+                return NextPass {
+                    deadline: Some(due),
+                    reset: None,
+                };
             }
+            let now = Instant::now();
             let mut lookups: Vec<(Relation, Lookup)> = Vec::new();
             for conversation in conversations {
                 let (Some(watched), Some(Some(facts))) =
@@ -988,12 +1283,16 @@ impl Handle {
                                 .project
                                 .as_ref()
                                 .is_some_and(|project| project.listed(&key).is_some());
-                            if listed
-                                || !state
-                                    .observed
-                                    .get(&key)
-                                    .is_none_or(|observed| observed.due(worked_on))
+                            if listed {
+                                continue;
+                            }
+                            if let Some(due) = state
+                                .observed
+                                .get(&key)
+                                .and_then(|read| read.refresh_at(worked_on))
+                                .filter(|&due| due > now)
                             {
+                                sooner(&mut cached_deadline, due);
                                 continue;
                             }
                             Lookup::PullRequest(key)
@@ -1016,6 +1315,10 @@ impl Handle {
                             head: RepoKeyOrd::from(&head),
                             branch,
                         },
+                        Resolved::Deferred(due) => {
+                            sooner(&mut cached_deadline, due);
+                            continue;
+                        }
                         Resolved::Nothing => continue,
                     };
                     match lookups.iter_mut().find(|(_, known)| *known == lookup) {
@@ -1027,78 +1330,128 @@ impl Handle {
             lookups.sort_by_key(|(relation, _)| *relation);
             lookups
         };
-        let gh = GitHubService::system("gh");
+        let mut next = self.run_lookups(&GitHubService::system("gh"), lookups);
+        if let Some(due) = cached_deadline {
+            sooner(&mut next.deadline, due);
+        }
+        next
+    }
+
+    fn run_lookups<E: crate::repository::ProcessExecutor>(
+        &self,
+        gh: &GitHubService<E>,
+        lookups: impl IntoIterator<Item = (Relation, Lookup)>,
+    ) -> NextPass {
         let cancellation = &self.0.cancellation;
-        for (_, lookup) in lookups.into_iter().take(LOOKUPS_PER_PASS) {
-            match lookup {
-                Lookup::Branch {
-                    base: base_key,
-                    head,
-                    branch,
-                } => {
-                    let base = GitHubRepoKey::from(&base_key);
-                    let head = GitHubRepoKey::from(&head);
-                    let result = gh.resolve_branch(&base, &head, &branch, None, cancellation);
-                    let mut state = self.conversations();
-                    match result {
-                        Ok(found) => {
-                            if let Some(found) = &found
-                                && let Ok(key) = PullRequestKey::new(base.clone(), found.number)
-                            {
-                                state.observed.insert((&key).into(), observed_now(found));
-                            }
-                            state.branches.insert(
-                                (base_key, branch),
-                                BranchLookup {
-                                    number: found.map(|found| found.number),
-                                    checked: Instant::now(),
-                                },
-                            );
-                            state.succeeded();
-                        }
-                        // GitHub answered, about this branch only: it has no
-                        // single pull request here. That is not GitHub being
-                        // unreachable.
-                        Err(error) if answered(&error) => {
-                            state.branches.insert(
-                                (base_key, branch),
-                                BranchLookup {
-                                    number: None,
-                                    checked: Instant::now(),
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            state.failed(&error);
-                            return;
-                        }
-                    }
+        let mut checked_hosts = BTreeSet::new();
+        let mut limited = BTreeMap::new();
+        let mut reads = 0;
+        let mut next = NextPass::default();
+        for (relation, lookup) in lookups {
+            let repository = lookup.repository();
+            let authority = repository.authority();
+            // A transport worker binds the credential context. Use its
+            // published budget here without reading the credentials for a
+            // request that cannot run.
+            if checked_hosts.insert(authority.clone())
+                && let Some(limit) = polling::rate_limit(&authority)
+            {
+                limited.insert(authority.clone(), limit);
+            }
+            if limited.contains_key(&authority) {
+                continue;
+            }
+            if reads == LOOKUPS_PER_PASS {
+                sooner(&mut next.deadline, Instant::now() + TICK);
+                continue;
+            }
+
+            let result = match &lookup {
+                Lookup::Branch { head, branch, .. } => {
+                    gh.resolve_branch(&repository, &head.into(), branch, None, cancellation)
                 }
-                Lookup::PullRequest(key) => {
-                    let pull_request_key = PullRequestKey::from(&key);
-                    let result =
-                        gh.view_with_timeout(&pull_request_key, cancellation, LOOKUP_TIMEOUT);
-                    let mut state = self.conversations();
-                    let entry = state.observed.entry(key).or_default();
-                    entry.checked = Some(Instant::now());
-                    match result {
-                        Ok(found) => {
-                            *entry = observed_now(&found);
-                            state.succeeded();
+                Lookup::PullRequest(key) => gh
+                    .view_with_timeout(&key.into(), cancellation, LOOKUP_TIMEOUT)
+                    .map(Some),
+            };
+            reads += 1;
+            // A fresh rate limit answers the lookup without invalidating
+            // existing observations or holding up other hosts. A reset too
+            // close to trust uses the same outage backoff as the board.
+            if let Err(error) = &result
+                && let Some(limit) = error.rate_limit()
+                && super::rate_limit_pause(limit.retry_at).is_some()
+            {
+                self.conversations().succeeded();
+                limited.insert(authority, limit);
+            } else {
+                let mut state = self.conversations();
+                let found = match result {
+                    Ok(found) => {
+                        state.succeeded();
+                        found
+                    }
+                    Err(error) if answered(&error) => None,
+                    Err(error) => {
+                        if let Lookup::PullRequest(key) = lookup {
+                            let entry = state.observed.entry(key).or_default();
+                            entry.checked = Some(Instant::now());
+                            entry.failures = entry.failures.saturating_add(1);
                         }
-                        Err(error) if answered(&error) => {
+                        state.failed(&error);
+                        next.deadline = state.lookup_retry();
+                        return next;
+                    }
+                };
+                match lookup {
+                    Lookup::Branch { base, branch, .. } => {
+                        if let Some(found) = &found
+                            && let Ok(key) = PullRequestKey::new(repository, found.number)
+                        {
+                            let read = observed_now(found);
+                            if let Some(due) = read.refresh_at(relation.worked_on()) {
+                                sooner(&mut next.deadline, due);
+                            }
+                            state.observed.insert((&key).into(), read);
+                        }
+                        let checked = Instant::now();
+                        if found.is_none() {
+                            sooner(&mut next.deadline, checked + BRANCH_MISSING_FOR);
+                        }
+                        state.branches.insert(
+                            (base, branch),
+                            BranchLookup {
+                                number: found.map(|found| found.number),
+                                checked,
+                            },
+                        );
+                    }
+                    Lookup::PullRequest(key) => {
+                        let entry = state.observed.entry(key).or_default();
+                        if let Some(found) = found {
+                            *entry = observed_now(&found);
+                        } else {
+                            entry.checked = Some(Instant::now());
                             entry.missing = true;
                             entry.failures = 0;
                         }
-                        Err(error) => {
-                            entry.lookup_failed(&error);
-                            state.failed(&error);
-                            return;
+                        if let Some(due) = entry.refresh_at(relation.worked_on()) {
+                            sooner(&mut next.deadline, due);
                         }
                     }
                 }
             }
         }
+        let limit = limited.values().min_by_key(|limit| limit.retry_at);
+        next.reset = limit.map(|limit| {
+            // The shared budget can already be ending. Wait for it when it
+            // reports a near reset before admission; only a new refusal at
+            // that time demonstrates clock skew.
+            super::rate_limit_pause(limit.retry_at)
+                .unwrap_or_else(|| limit.retry_at.saturating_add(1))
+        });
+        self.conversations().forge_error = limit.map(ToString::to_string);
+        next
     }
 }
 
@@ -1112,6 +1465,15 @@ enum Lookup {
         head: RepoKeyOrd,
         branch: String,
     },
+}
+
+impl Lookup {
+    fn repository(&self) -> GitHubRepoKey {
+        match self {
+            Self::PullRequest(key) => (&key.repository).into(),
+            Self::Branch { base, .. } => base.into(),
+        }
+    }
 }
 
 /// What a pull request's row shows beyond its state: the lines it changes
@@ -1236,27 +1598,17 @@ fn resolve(
             });
         }
         match branches.get(&(base.into(), name.to_owned())) {
-            Some(lookup) => {
-                let fresh = lookup.checked.elapsed()
-                    < if lookup.number.is_some() {
-                        BRANCH_FOUND_FOR
-                    } else {
-                        BRANCH_MISSING_FOR
-                    };
-                match lookup.number {
-                    Some(number) => Resolved::Key(PullRequestKeyOrd {
-                        repository: base.into(),
-                        number,
-                    }),
-                    None if fresh => Resolved::Nothing,
-                    None => Resolved::Branch {
-                        base: base.clone(),
-                        head: head.unwrap_or(base).clone(),
-                        branch: name.to_owned(),
-                    },
-                }
+            Some(BranchLookup {
+                number: Some(number),
+                ..
+            }) => Resolved::Key(PullRequestKeyOrd {
+                repository: base.into(),
+                number: *number,
+            }),
+            Some(BranchLookup { checked, .. }) if checked.elapsed() < BRANCH_MISSING_FOR => {
+                Resolved::Deferred(*checked + BRANCH_MISSING_FOR)
             }
-            None => Resolved::Branch {
+            _ => Resolved::Branch {
                 base: base.clone(),
                 head: head.unwrap_or(base).clone(),
                 branch: name.to_owned(),
@@ -1633,6 +1985,9 @@ fn locate(
     let Some(id) = session_id.filter(|id| known != Some(id.as_str())) else {
         return Location::Unchanged;
     };
+    if !search_due {
+        return Location::Unchanged;
+    }
     let Some(root) = provider.session_root(&recipe) else {
         return Location::Unchanged;
     };
@@ -1640,8 +1995,13 @@ fn locate(
         .unwrap_or_else(|_| recipe.working_directory.clone());
     match provider {
         Provider::Claude => {
-            let Ok(transcript) = crate::agent::claude_transcript(&root, &directory, &id) else {
-                return Location::Unchanged;
+            let transcript = match crate::agent::claude_transcript_for_start(&root, &directory, &id)
+            {
+                Ok(transcript) => transcript,
+                Err(crate::agent::ClaudeTranscriptError::Unavailable(_)) => {
+                    return Location::Missed;
+                }
+                Err(crate::agent::ClaudeTranscriptError::Invalid(_)) => return Location::Unchanged,
             };
             Location::Found(
                 id,
@@ -1653,7 +2013,6 @@ fn locate(
                 }),
             )
         }
-        Provider::Codex if !search_due => Location::Unchanged,
         Provider::Codex => match codex_rollout(&root.join("sessions"), &id) {
             Some(transcript) => Location::Found(
                 id,
@@ -1718,7 +2077,11 @@ fn read(watched: &mut Watched) {
 /// Reads what cagents' own record of the conversation gained since the last
 /// pass. Only the conversation's handle is taken under the host's lock; the
 /// record is read without it.
-fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> Scanned {
+fn recorded(
+    host: &SharedHost,
+    conversation: TerminalId,
+    items: &mut Items,
+) -> (Scanned, RecordRead) {
     let handle = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1726,16 +2089,38 @@ fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> S
         .get(&conversation)
         .map(|record| record.handle.clone());
     let mut found = Vec::new();
-    match handle.map(|handle| handle.unread(&items.again())) {
-        Some(Ok((unread, busy))) => items.read(unread, busy, &mut found),
-        Some(Err(error)) => items.failed(error),
+    let read = match handle.map(|handle| handle.unread(&items.again())) {
+        Some(Ok((unread, busy))) => {
+            let more = unread.more;
+            items.read(unread, busy, &mut found);
+            if more {
+                RecordRead::More
+            } else {
+                RecordRead::Complete
+            }
+        }
+        Some(Err(error)) => {
+            items.failed(error);
+            RecordRead::Failed
+        }
         // Gone: what was read stays as it was.
-        None => {}
-    }
-    Scanned {
-        found,
-        coverage: items.coverage(),
-    }
+        None => RecordRead::Complete,
+    };
+    (
+        Scanned {
+            found,
+            coverage: items.coverage(),
+        },
+        read,
+    )
+}
+
+/// How far one read of a conversation's record got.
+enum RecordRead {
+    Complete,
+    /// It stopped at its batch limit with more unread.
+    More,
+    Failed,
 }
 
 /// Whether cagents' own record of `provider`'s conversations is read for

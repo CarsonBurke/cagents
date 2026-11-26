@@ -464,9 +464,13 @@ pub struct State {
     /// reclaim it until it reports a name of its own, which one that fails
     /// to reconnect never does.
     names: HashMap<ChannelId, (String, crate::model::ChannelTitleSource)>,
-    /// Channels the person renamed in this window. A name is never taken back
-    /// automatically, so this stays true once the registry has the rename.
-    named: HashSet<ChannelId>,
+    /// Renames made in this window that the registry has not echoed yet,
+    /// with the name each sent. Until the echo, a model the registry sent
+    /// before the rename still shows the old title, so the channel counts as
+    /// named regardless. The echo ends that: from then the registry's title
+    /// alone says whether it is named, so a name another window clears is
+    /// cleared here too (#3403).
+    named: HashMap<ChannelId, String>,
     reopening: HashMap<ChannelId, PendingReopen>,
     /// Emptied channels waiting for their view publication to settle, by the
     /// incarnation the close saw, with what made each a candidate. The
@@ -1574,10 +1578,10 @@ impl Cagents {
     /// Whether `id` carries a name given to it rather than one suggested by
     /// its conversation: by a rename, or when it was made with a title.
     ///
-    /// A rename made here counts before the registry confirms it. Until
-    /// then, a model the registry sent before the rename shows the old title.
+    /// A rename made here counts before the registry echoes it. Until then,
+    /// a model the registry sent before the rename shows the old title.
     pub(super) fn channel_is_named(&self, id: ChannelId) -> bool {
-        self.channel_ui.named.contains(&id)
+        self.channel_ui.named.contains_key(&id)
             || self.durable.channels.iter().any(|channel| {
                 channel.id == id
                     && channel.title_source == crate::model::ChannelTitleSource::Manual
@@ -1585,9 +1589,27 @@ impl Cagents {
             })
     }
 
-    /// Records that the person named channel `id` in this window.
-    pub(super) fn note_channel_named(&mut self, id: ChannelId) {
-        self.channel_ui.named.insert(id);
+    /// Records that the person named channel `id` `title` in this window,
+    /// until the registry holds the name (see
+    /// [`Self::note_channel_rename_held`]).
+    pub(super) fn note_channel_named(&mut self, id: ChannelId, title: String) {
+        self.channel_ui.named.insert(id, title);
+    }
+
+    /// Ends the wait of this window's rename of `id` to `title`, the latest
+    /// it made, once the registry holds it: the registry's title then says
+    /// whether the channel is named, so a later clear leaves it unnamed.
+    /// Called for the rename's receipt, and for any model showing the name,
+    /// which may arrive first.
+    pub(super) fn note_channel_rename_held(&mut self, id: ChannelId, title: &str) {
+        if self
+            .channel_ui
+            .named
+            .get(&id)
+            .is_some_and(|pending| pending == title)
+        {
+            self.channel_ui.named.remove(&id);
+        }
     }
 
     /// Records that channel `id` went back to its automatic name.

@@ -47,12 +47,10 @@ impl Schedule {
         );
     }
     pub fn ready(&self, target: &Target, now: Instant) -> bool {
-        self.0
-            .get(&desktop_id(target))
-            .is_none_or(|(_, due)| *due <= now)
+        self.due(target).is_none_or(|due| due <= now)
     }
-    pub fn deadline(&self) -> Option<Instant> {
-        self.0.values().map(|(_, due)| *due).min()
+    pub fn due(&self, target: &Target) -> Option<Instant> {
+        self.0.get(&desktop_id(target)).map(|(_, due)| *due)
     }
     pub fn retain(&mut self, mut keep: impl FnMut(&uuid::Uuid) -> bool) {
         self.0.retain(|target, _| keep(target));

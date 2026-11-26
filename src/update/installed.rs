@@ -397,8 +397,6 @@ pub(super) fn perform(
         let timeout = crate::install_guard::daemon_start_timeout()?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(standby) = standby.as_mut() {
-            let pid = standby.pid();
-            let daemon = root.join("bin").join(DAEMON_BINARY);
             if confirmed.daemon.is_some() && handoff.is_none() {
                 return Err(invalid(
                     "The replacement did not receive the terminal service lease",
@@ -406,22 +404,41 @@ pub(super) fn perform(
             }
             startup_attempted = true;
             startup_owned = true;
-            standby
-                .activate(
-                    &daemon,
-                    handoff.as_ref(),
-                    survivors.recovery_receipt(),
-                    timeout,
-                    || {
-                        let _ = report_overdue_startup(state, job);
-                    },
-                )
-                .map_err(|error| {
-                    invalid(format!(
-                        "The replacement terminal service did not confirm startup: {error}"
-                    ))
-                })?;
-            return confirm_daemon_ready(&daemon, Some(pid), timeout);
+            let receipt = survivors.recovery_receipt();
+            let activate = |standby: &mut crate::daemon::standby::Parked, job: &mut UpdateJob| {
+                standby.activate(&daemon, handoff.as_ref(), receipt, timeout, || {
+                    let _ = report_overdue_startup(state, job);
+                })
+            };
+            let started = activate(standby, job);
+            #[cfg(target_os = "macos")]
+            let started = match started {
+                Err(error)
+                    if standby.exited_during_start(&error)
+                        && receipt
+                            .is_some_and(|receipt| receipt.ready_before_restore() == Ok(true))
+                        && Selection::capture(&layout)
+                            .is_ok_and(|current| current == selection)
+                        && stamp(root).is_ok_and(|current| current == before) =>
+                {
+                    tracing::warn!(%error, "retrying the exact installed successor before restoration began");
+                    standby
+                        .retry_exited(
+                            &daemon,
+                            before.daemon_inode(),
+                            &guard,
+                            selection.previous_link.as_deref(),
+                        )
+                        .and_then(|()| activate(standby, job))
+                }
+                outcome => outcome,
+            };
+            started.map_err(|error| {
+                invalid(format!(
+                    "The replacement terminal service did not confirm startup: {error}"
+                ))
+            })?;
+            return confirm_daemon_ready(&daemon, Some(standby.pid()), timeout);
         }
         let mut command = Command::new(
             root.join("bin")

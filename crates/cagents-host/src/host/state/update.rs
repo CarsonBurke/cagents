@@ -57,11 +57,17 @@ pub(in crate::host) fn inspect(
     // conversation. Runs still queued unsent are carried and hold nothing.
     let mut queued = BTreeMap::new();
     let mut agent_runs = BTreeMap::new();
+    let mut queue_ready = BTreeSet::new();
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         agent_runs = registry
             .agent_runs_at_risk_on_restart()
             .map_err(upgrade_error)?;
+        if policy == Policy::WhenIdle {
+            queue_ready = registry
+                .agent_queues_ready_for_update()
+                .map_err(upgrade_error)?;
+        }
         for hold in registry.agent_update_holds().map_err(upgrade_error)? {
             match hold.session {
                 Some(session) => {
@@ -109,6 +115,11 @@ pub(in crate::host) fn inspect(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .upgrade_impact_with_agent_work(policy, &queued.keys().copied().collect(), &agent_runs)?;
+    for item in &mut impact.sessions {
+        if queue_ready.contains(&item.id) {
+            mark_ready_queue(item);
+        }
+    }
     // Queued work no listed conversation will deliver still fences the update.
     for (session, blocker) in queued {
         if !impact.sessions.iter().any(|item| {
@@ -121,6 +132,16 @@ pub(in crate::host) fn inspect(
     }
     impact.blockers.extend(blockers);
     Ok(impact)
+}
+
+fn mark_ready_queue(item: &mut SessionImpact) {
+    if item.kind == SessionKind::NativeChat
+        && item.disposition == Disposition::Resumes
+        && item.checkpointed()
+        && !item.reason.unconfirmed_agent_run()
+    {
+        item.reason = SessionCause::QueuedPromptsReady;
+    }
 }
 
 impl HostState {
@@ -455,7 +476,7 @@ fn identity(value: &impl serde::Serialize) -> Result<String, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{interrupted_reason, waits_for_idle_reason};
+    use super::*;
     use crate::chat::{HeldSubagent, WorkHold};
 
     fn hold(turn: bool, agents: &[(&str, bool)]) -> WorkHold {
@@ -469,6 +490,26 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_ready_queue_does_not_change_the_checkpoint_scope_of_an_ended_provider() {
+        let mut item = SessionImpact {
+            id: TerminalId::new(),
+            kind: SessionKind::NativeChat,
+            title: String::new(),
+            identity: String::new(),
+            disposition: Disposition::Resumes,
+            reason: SessionCause::ProviderEnded,
+            interrupted_subagents: Vec::new(),
+        };
+        mark_ready_queue(&mut item);
+        assert_eq!(item.reason, SessionCause::ProviderEnded);
+        assert!(!item.checkpointed());
+        item.reason = "The conversation will resume".into();
+        mark_ready_queue(&mut item);
+        assert_eq!(item.reason, SessionCause::QueuedPromptsReady);
+        assert!(item.checkpointed());
     }
 
     #[test]

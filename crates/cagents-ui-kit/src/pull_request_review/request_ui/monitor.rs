@@ -65,16 +65,17 @@ pub struct Monitor {
     generation: u64,
     // Keep the global slot until even a cancelled worker acknowledges completion.
     busy: Option<(GitHubRepoKey, u64)>,
-    observed: Vec<crate::notifications::review::ReviewRequest>,
+    observed: Vec<crate::notifications::review::ObservedRequest>,
     // Followers can catch up several pages at once, but each report RPC accepts
     // one page. Drain the remaining observations through local messages.
-    pending_observed: VecDeque<(u64, crate::notifications::review::ReviewRequest)>,
+    pending_observed: VecDeque<crate::notifications::review::ObservedRequest>,
     /// When the next read would be on schedule were reads started at exactly
     /// one per [`PACE`]; a read may start while this is less than a burst
     /// ahead of now (the generic cell rate algorithm).
     paced: Option<Instant>,
     /// Advances whenever [`Monitor::snapshots`] would yield something else.
     revision: u64,
+    watched: HashMap<GitHubRepoKey, Instant>,
 }
 
 impl Monitor {
@@ -90,7 +91,7 @@ impl Monitor {
 
     /// A bounded batch of newly consumed shared observations. Displayed rows
     /// alone never grant an alert, and ordinary ticks never replay a page.
-    pub fn take_observed(&mut self) -> Vec<crate::notifications::review::ReviewRequest> {
+    pub fn take_observed(&mut self) -> Vec<crate::notifications::review::ObservedRequest> {
         std::mem::take(&mut self.observed)
     }
 
@@ -149,6 +150,58 @@ impl Monitor {
         &mut self,
         action: Action,
         repositories: impl IntoIterator<Item = GitHubRepoKey>,
+    ) -> iced::Task<Action> {
+        self.update_inner(action, repositories, None)
+    }
+
+    pub fn update_observing(
+        &mut self,
+        action: Action,
+        repositories: impl IntoIterator<Item = GitHubRepoKey>,
+        application: crate::notifications::Application,
+    ) -> iced::Task<Action> {
+        use crate::notifications::review::{MonitorUpdate, report_monitor};
+        let repositories: Vec<_> = repositories.into_iter().collect();
+        let now = Instant::now();
+        self.watched
+            .retain(|repository, _| repositories.contains(repository));
+        let mut due = Vec::new();
+        for repository in &repositories {
+            if self.watched.get(repository).is_none_or(|next| now >= *next) {
+                self.watched
+                    .insert(repository.clone(), now + Duration::from_secs(60 * 60));
+                due.push(repository.clone());
+            }
+        }
+        let heartbeat = if due.is_empty() {
+            iced::Task::none()
+        } else {
+            iced::Task::future(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for batch in due.chunks(256) {
+                        if let Err(error) =
+                            report_monitor(application, MonitorUpdate::Watching(batch.to_vec()))
+                        {
+                            tracing::debug!(%error, "review watch was not reported");
+                            break;
+                        }
+                    }
+                })
+                .await;
+            })
+            .discard()
+        };
+        iced::Task::batch([
+            self.update_inner(action, repositories, Some(application)),
+            heartbeat,
+        ])
+    }
+
+    fn update_inner(
+        &mut self,
+        action: Action,
+        repositories: impl IntoIterator<Item = GitHubRepoKey>,
+        application: Option<crate::notifications::Application>,
     ) -> iced::Task<Action> {
         let repositories = repositories
             .into_iter()
@@ -226,7 +279,7 @@ impl Monitor {
                                         .pending_observed
                                         .iter()
                                         .enumerate()
-                                        .map(|(index, (_, request))| (request.clone(), index))
+                                        .map(|(index, entry)| (entry.request.clone(), index))
                                         .collect::<HashMap<_, _>>();
                                     for page in result.observed {
                                         if page.revision <= since || page.viewer != viewer.id {
@@ -246,19 +299,30 @@ impl Monitor {
                                                         viewer: viewer.id.clone(),
                                                         request: request_id,
                                                     };
+                                                let point =
+                                                    crate::notifications::review::ScanPoint {
+                                                        incarnation: entry
+                                                            .last_shared_observation
+                                                            .as_ref()
+                                                            .unwrap()
+                                                            .0
+                                                            .clone(),
+                                                        revision: page.revision,
+                                                        at: page.at,
+                                                    };
+                                                let observation =
+                                                    crate::notifications::review::ObservedRequest {
+                                                        request: request.clone(),
+                                                        point,
+                                                    };
                                                 if let Some(&index) = queued.get(&request) {
-                                                    state.pending_observed[index].0 = state
-                                                        .pending_observed[index]
-                                                        .0
-                                                        .max(page.at);
+                                                    state.pending_observed[index] = observation;
                                                 } else {
                                                     queued.insert(
                                                         request.clone(),
                                                         state.pending_observed.len(),
                                                     );
-                                                    state
-                                                        .pending_observed
-                                                        .push_back((page.at, request));
+                                                    state.pending_observed.push_back(observation);
                                                 }
                                             }
                                         }
@@ -290,8 +354,9 @@ impl Monitor {
         // A new viewer, closed request or removed repository revokes queued
         // authority before delivery. Unchanged cached pages are never replayed.
         let observed_at = crate::github::polling::now();
-        state.pending_observed.retain(|(at, request)| {
-            observed_at.saturating_sub(*at) < 5 * 60
+        state.pending_observed.retain(|entry| {
+            let request = &entry.request;
+            observed_at.saturating_sub(entry.point.at) < 5 * 60
                 && state.entries.iter().any(|(repository, entry)| {
                     repository.host == request.host
                         && repository.port == request.port
@@ -312,11 +377,11 @@ impl Monitor {
         });
         let mut numbers = std::collections::HashSet::new();
         while state.observed.len() < 50 {
-            let Some((_, request)) = state.pending_observed.pop_front() else {
+            let Some(observation) = state.pending_observed.pop_front() else {
                 break;
             };
-            if numbers.insert(request.clone()) {
-                state.observed.push(request);
+            if numbers.insert(observation.request.clone()) {
+                state.observed.push(observation);
             }
         }
         if !state.pending_observed.is_empty() {
@@ -348,11 +413,16 @@ impl Monitor {
         iced::Task::perform(
             async move {
                 let target = repository.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || shared::poll(&target, &cancellation))
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result);
+                let result = tokio::task::spawn_blocking(move || {
+                    shared::poll_observing(&target, &cancellation, |update| {
+                        application.map_or(Ok(()), |application| {
+                            crate::notifications::review::report_monitor(application, update)
+                        })
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
                 Action::SharedLoaded {
                     repository,
                     generation,
@@ -407,7 +477,8 @@ mod tests {
             scan,
             error: None,
             due: crate::github::polling::now() + 60,
-            observation: ("incarnation".into(), revision),
+            observation: ("a28fe031-f782-4ea4-850f-016d4207b69c".into(), revision),
+            census: None,
             observed: vec![shared::Observation {
                 revision,
                 at: crate::github::polling::now(),
@@ -478,7 +549,7 @@ mod tests {
         drop(monitor.update(Action::Tick, [repository(), equivalent]));
         assert_eq!(monitor.entries.len(), 1);
         load(&mut monitor, Ok(result("first", &[51], 1)));
-        assert_eq!(monitor.take_observed()[0].viewer, "first");
+        assert_eq!(monitor.take_observed()[0].request.viewer, "first");
         load(&mut monitor, Ok(result("second", &[], 1)));
         assert!(monitor.take_observed().is_empty());
         assert!(monitor.entries[&repository()].snapshot.requested.is_empty());
@@ -525,7 +596,9 @@ mod tests {
         load(&mut monitor, Ok(result("viewer", &[1], 1)));
         assert!(monitor.take_observed().is_empty());
         load(&mut monitor, Ok(result("viewer", &[1], 2)));
-        assert_eq!(monitor.take_observed(), observed);
+        let offered = monitor.take_observed();
+        assert_eq!(offered[0].request, observed[0].request);
+        assert_eq!(offered[0].point.revision, 2);
     }
 
     #[test]
@@ -592,7 +665,7 @@ mod tests {
         assert_eq!(
             delivered
                 .iter()
-                .map(|request| request.number)
+                .map(|request| request.request.number)
                 .collect::<std::collections::BTreeSet<_>>(),
             (1..=200).collect()
         );

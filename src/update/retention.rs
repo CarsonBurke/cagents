@@ -85,6 +85,7 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "recovery.json"
             | "settled.json"
             | "cutover.json"
+            | "cutover-inventory.json"
             | "release-stage.json"
             | "cancel-nonce"
             | "decisions.lock"

@@ -2133,6 +2133,20 @@ mod process_tests {
             ));
             panic!("{content}");
         }
+        if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("debug_panic")) {
+            local_debug_panic_fixture();
+        }
+        if std::env::var_os(TEST_MODE).as_deref()
+            == Some(std::ffi::OsStr::new("debug_thread_panic"))
+        {
+            let worker = std::thread::Builder::new()
+                .name("panicking-worker".into())
+                .spawn(local_debug_panic_fixture)
+                .unwrap();
+            assert!(worker.join().is_err());
+            record(Event::Exit { success: true });
+            return;
+        }
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("recovered")) {
             let content =
                 std::hint::black_box(String::from("RECOVERED_SECRET prompt https://private.test"));
@@ -2199,6 +2213,12 @@ mod process_tests {
         assert!(!take_failure_notice());
         assert_eq!(std::fs::read(file).unwrap(), before);
     }
+    /// A named frame for the backtrace tests to find.
+    #[inline(never)]
+    fn local_debug_panic_fixture() {
+        panic!("local debug panic fixture");
+    }
+
     #[cfg(all(feature = "ui", target_os = "linux"))]
     fn missing_accessibility_bus_fixture(root: PathBuf) {
         use iced_accessibility::accesskit::{
@@ -2497,5 +2517,71 @@ mod process_tests {
             assert!(!evidence.contains(forbidden));
             assert!(!String::from_utf8_lossy(&output.stderr).contains(forbidden));
         }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("stack backtrace"));
+    }
+
+    /// A local debug capture prints a backtrace for a panic on the thread
+    /// the test harness runs the fixture on and on one it spawns, without
+    /// RUST_BACKTRACE set, and leaves the choice to RUST_BACKTRACE when it is
+    /// set.
+    #[test]
+    fn local_debug_panics_print_a_backtrace_without_rust_backtrace() {
+        let run = |mode: &str, rust_backtrace: Option<&str>| {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "diagnostics::process_tests::subprocess_fixture",
+                    "--nocapture",
+                ])
+                .env(TEST_STATE, root.path())
+                .env(TEST_MODE, mode)
+                .env("XDG_STATE_HOME", root.path())
+                .env("CAGENTS_LOCAL_DEBUG", "1")
+                .env_remove("RUST_BACKTRACE");
+            if let Some(value) = rust_backtrace {
+                command.env("RUST_BACKTRACE", value);
+            }
+            let output = command.output().unwrap();
+            (
+                output.status.success(),
+                String::from_utf8(output.stderr).unwrap(),
+            )
+        };
+        for (mode, succeeds, thread) in [
+            ("debug_panic", false, None),
+            ("debug_thread_panic", true, Some("panicking-worker")),
+        ] {
+            let (success, stderr) = run(mode, None);
+            assert_eq!(success, succeeds, "{mode}: {stderr}");
+            assert!(
+                stderr.contains("local debug panic fixture"),
+                "{mode}: {stderr}"
+            );
+            if let Some(thread) = thread {
+                assert!(
+                    stderr.contains(&format!("thread '{thread}'")),
+                    "{mode}: {stderr}"
+                );
+            }
+            let backtrace = stderr
+                .split_once("stack backtrace:")
+                .unwrap_or_else(|| panic!("{mode}: no backtrace: {stderr}"))
+                .1;
+            assert!(
+                backtrace.contains("local_debug_panic_fixture"),
+                "{mode}: {stderr}"
+            );
+            assert_eq!(
+                stderr.matches("stack backtrace:").count(),
+                1,
+                "{mode}: {stderr}"
+            );
+        }
+        // An explicit RUST_BACKTRACE=0 is respected.
+        let (_, stderr) = run("debug_panic", Some("0"));
+        assert!(stderr.contains("local debug panic fixture"), "{stderr}");
+        assert!(!stderr.contains("stack backtrace:"), "{stderr}");
     }
 }

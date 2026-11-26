@@ -880,7 +880,7 @@ pub fn history_command(press: &KeyPress) -> Option<HistoryCommand> {
     {
         return None;
     }
-    match press.key.to_latin(press.physical_key)?.to_ascii_lowercase() {
+    match crate::interaction::latin_key(&press.key, press.physical_key)? {
         'z' if press.modifiers.shift() => Some(HistoryCommand::Redo),
         'z' => Some(HistoryCommand::Undo),
         'y' if !press.modifiers.shift() => Some(HistoryCommand::Redo),

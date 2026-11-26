@@ -36,6 +36,7 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex, Weak},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -88,13 +89,15 @@ pub(in crate::host) fn post(
 /// which must see every prompt its readiness check admitted. `None`, without
 /// running it, once the daemon no longer takes work.
 pub(super) fn with_control<T>(host: &SharedHost, work: impl FnOnce() -> T) -> Option<T> {
-    let gate = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .control_gate
-        .clone();
+    let (gate, courier) = {
+        let host = host.lock().unwrap_or_else(|p| p.into_inner());
+        (host.control_gate.clone(), host.mailbox.clone())
+    };
     let _control = gate.shared();
     crate::host::client::ensure_control_open(host).ok()?;
+    if courier.is_some_and(|courier| courier.defers_for_update()) {
+        return None;
+    }
     Some(work())
 }
 
@@ -789,9 +792,19 @@ pub(in crate::host) fn wake(host: &SharedHost) {
 struct WakeState {
     generation: u64,
     stopped: bool,
+    update: UpdateWait,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum UpdateWait {
+    #[default]
+    Open,
+    Held,
+    Retry,
 }
 
 struct Inner {
+    update_runtime: Option<PathBuf>,
     host: Weak<crate::host::state::HostLock>,
     registry: SharedRegistry,
     seal: Arc<Seal>,
@@ -824,6 +837,52 @@ impl Handle {
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         state.generation = state.generation.wrapping_add(1);
         self.0.changed.notify_one();
+    }
+
+    /// Keep unclaimed inputs durable during approved interruption. Follow the
+    /// fence without holding daemon control or joining its waiter at shutdown.
+    fn defers_for_update(&self) -> bool {
+        let Some(runtime) = &self.0.update_runtime else {
+            return false;
+        };
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.update != UpdateWait::Open {
+            return true;
+        }
+        let release = match crate::instance::UpdateFenceRelease::observe(runtime) {
+            Ok(None) => return false,
+            Ok(Some(release)) => release,
+            Err(error) => {
+                tracing::warn!(%error, "cannot check the update fence before message delivery");
+                state.update = UpdateWait::Retry;
+                return true;
+            }
+        };
+        let owner = Arc::downgrade(&self.0);
+        match std::thread::Builder::new()
+            .name("courier-update-fence".into())
+            .spawn(move || {
+                let released = release.wait();
+                if let Some(owner) = owner.upgrade() {
+                    let mut state = owner.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.update = match released {
+                        Ok(()) => UpdateWait::Open,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not follow the update fence release");
+                            UpdateWait::Retry
+                        }
+                    };
+                    state.generation = state.generation.wrapping_add(1);
+                    owner.changed.notify_one();
+                }
+            }) {
+            Ok(_) => state.update = UpdateWait::Held,
+            Err(error) => {
+                tracing::warn!(%error, "could not observe the update fence release");
+                state.update = UpdateWait::Retry;
+            }
+        }
+        true
     }
 }
 
@@ -870,7 +929,17 @@ impl Courier {
         self.wait_for_scan(generation);
     }
 
+    #[cfg(test)]
     pub(in crate::host) fn start(host: &SharedHost) -> Result<Self, String> {
+        Self::start_in(host, None)
+    }
+
+    pub(in crate::host) fn start_with_update_fence(host: &SharedHost) -> Result<Self, String> {
+        let runtime = crate::instance::runtime_directory().map_err(|error| error.to_string())?;
+        Self::start_in(host, Some(runtime))
+    }
+
+    fn start_in(host: &SharedHost, update_runtime: Option<PathBuf>) -> Result<Self, String> {
         let registry = registry(host)?;
         let seal = host
             .lock()
@@ -879,6 +948,7 @@ impl Courier {
             .clone()
             .ok_or("The mailbox key is unavailable")?;
         let handle = Handle(Arc::new(Inner {
+            update_runtime,
             host: Arc::downgrade(host),
             registry,
             seal,
@@ -892,11 +962,13 @@ impl Courier {
             scanned: Condvar::new(),
         }));
         let owner = handle.clone();
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let thread = std::thread::Builder::new()
             .name("message-courier".into())
             .spawn(move || owner.run())
             .map_err(|error| error.to_string())?;
-        host.lock().unwrap_or_else(|p| p.into_inner()).mailbox = Some(handle.clone());
+        // The first delivery pass must see its fence before it can claim work.
+        state.mailbox = Some(handle.clone());
         Ok(Self {
             handle,
             thread: Some(thread),
@@ -1105,8 +1177,19 @@ impl Handle {
         self.forget_yields(host);
         let (queued_failed, deferred) = self.start_queued(host);
         let (released, pending) = self.deliver_messages(host, &limits)?;
-        let outstanding = (queued_failed || pending || !limits.is_empty())
-            .then(|| super::now().saturating_add(FALLBACK.as_millis() as u64));
+        let update = {
+            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            let update = state.update;
+            if update == UpdateWait::Retry {
+                state.update = UpdateWait::Open;
+            }
+            update
+        };
+        let outstanding = (queued_failed
+            || (pending && update != UpdateWait::Held)
+            || update == UpdateWait::Retry
+            || !limits.is_empty())
+        .then(|| super::now().saturating_add(FALLBACK.as_millis() as u64));
         Ok([released, reset, outstanding, deferred]
             .into_iter()
             .flatten()
@@ -1484,6 +1567,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn courier_defers_new_dispatch_and_wakes_when_the_update_releases_its_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path();
+        let filename = if crate::instance::IS_DEVELOPMENT {
+            "cagents-development-ui.lock.update"
+        } else {
+            "cagents-ui.lock.update"
+        };
+        let fence = crate::instance::owned_file_lock(
+            std::fs::File::create(runtime.join(filename)).unwrap(),
+            libc::LOCK_EX,
+        )
+        .unwrap();
+        let host = crate::host::service::test_host();
+        {
+            let mut state = host.lock().unwrap();
+            state.execution_registry = Some(Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&runtime.join("model.sqlite3")).unwrap(),
+            )));
+            state.mailbox_seal = Some(Arc::new(Seal::new([7; 32])));
+        }
+        let courier = Courier::start_in(&host, Some(runtime.into())).unwrap();
+        for _ in 0..2 {
+            assert!(with_control(&host, || panic!("started during the update")).is_none());
+        }
+        let generation = {
+            let state = courier.handle.0.state.lock().unwrap();
+            assert!(state.update == UpdateWait::Held);
+            state.generation
+        };
+        drop(fence);
+        courier.wait_for_scan(generation + 1);
+        assert!(courier.handle.0.state.lock().unwrap().update == UpdateWait::Open);
+        assert_eq!(with_control(&host, || "delivered"), Some("delivered"));
+    }
+
+    #[test]
     fn courier_requeues_a_claim_if_a_request_arrives_after_its_idle_scan() {
         use crate::{
             agent_execution::mailbox::Party, chat::runtime::courier_tests::RequestRaceFixture,
@@ -1510,6 +1630,7 @@ mod tests {
         };
         registry.lock().unwrap().post_message(&message).unwrap();
         let courier = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Weak::new(),
             registry: registry.clone(),
             seal: Arc::new(Seal::new([7; 32])),
@@ -1637,6 +1758,7 @@ mod tests {
         };
         registry.lock().unwrap().post_message(&message).unwrap();
         let courier = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Weak::new(),
             registry: registry.clone(),
             seal: Arc::new(Seal::new([8; 32])),
@@ -1706,6 +1828,7 @@ mod tests {
             };
             registry.lock().unwrap().post_message(&message).unwrap();
             let courier = Handle(Arc::new(Inner {
+                update_runtime: None,
                 host: Weak::new(),
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([9; 32])),
@@ -1828,6 +1951,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let host = crate::host::service::test_host();
         let handle = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Arc::downgrade(&host),
             registry: Arc::new(Mutex::new(
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
@@ -1897,6 +2021,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let host = crate::host::service::test_host();
         let handle = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Arc::downgrade(&host),
             registry: Arc::new(Mutex::new(
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
@@ -2011,6 +2136,7 @@ mod tests {
                 registry.lock().unwrap().post_message(message).unwrap();
             }
             let courier = Handle(Arc::new(Inner {
+                update_runtime: None,
                 host: Arc::downgrade(&host),
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([7; 32])),

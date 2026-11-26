@@ -274,10 +274,19 @@ pub enum Update {
         model: Option<super::ActiveModel>,
     },
     ConversationNameChanged,
+    /// A local conversation's record changed for its Work reader.
+    #[serde(skip)]
+    RecordChanged,
     /// Local edge for directory readers. Retained helpers carry the failure
     /// in resident metadata, from which the host emits its own edge.
     #[serde(skip)]
     FailureChanged,
+    /// The provider has begun a real turn, even if the public activity state
+    /// was already Working or the frame also recorded its completion.
+    #[serde(skip)]
+    TurnStarted {
+        generation: u64,
+    },
 }
 
 pub struct ConversationNaming {
@@ -395,6 +404,7 @@ struct Inner {
     prompt_cache: PromptCache,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
+    record_observer: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
@@ -693,6 +703,7 @@ impl LocalHandle {
         }));
         let visible = Arc::new(AtomicBool::new(false));
         let observe_next = Arc::new(AtomicBool::new(true));
+        let record_observer = spec.followed.then(|| Arc::new(AtomicBool::new(false)));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
@@ -718,6 +729,7 @@ impl LocalHandle {
             prompt_cache: prompt_cache.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
+            record_observer: record_observer.clone(),
             stop: stop.clone(),
             completed: completed.clone(),
             draining: draining.clone(),
@@ -775,6 +787,7 @@ impl LocalHandle {
                     store,
                     visible,
                     observe_next,
+                    record_observer,
                     stop,
                     detached_work: detached_work.clone(),
                     incoming,
@@ -782,6 +795,7 @@ impl LocalHandle {
                     notify,
                     resident_changed,
                     resident_dirty: false,
+                    followed_generation: spec.followed.then_some(0),
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
@@ -1470,6 +1484,10 @@ impl LocalHandle {
     /// follows the conversation without presenting it; `again` names items
     /// to serve once more. See [`store::Unread`].
     pub fn unread(&self, again: &[String]) -> Result<(store::Unread, bool), String> {
+        // Arm before reading, so a write racing this read still signals.
+        if let Some(observer) = &self.0.record_observer {
+            observer.store(true, Ordering::Release);
+        }
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let unread = store.unread(again)?;
         let busy = self.0.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
@@ -2676,6 +2694,7 @@ struct Actor {
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
+    record_observer: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     /// What teardown leaves running; see [`ActorCommand::CloseIfIdle`].
     detached_work: Arc<DetachedDecision>,
@@ -2686,6 +2705,7 @@ struct Actor {
     /// presentation and the once-per-unread-epoch output observation.
     resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
     resident_dirty: bool,
+    followed_generation: Option<u64>,
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
@@ -4077,6 +4097,18 @@ impl Actor {
         // this bounded frame's semantic proof has been published.
         let mut frame_error = None;
         for event in step.events {
+            if matches!(event, Event::TurnStartConfirmed) {
+                if !suppress_current_notification {
+                    self.resident_dirty = true;
+                    let generation = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .turn_generation;
+                    (self.notify)(Update::TurnStarted { generation });
+                }
+                continue;
+            }
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
                     let update = self.execution.start(run, key)?;
@@ -4452,6 +4484,13 @@ impl Actor {
             self.reclaim_idle_frame_buffer();
             (self.notify)(Update::PromptAvailable);
         }
+        if let Some(previous) = &mut self.followed_generation
+            && std::mem::replace(previous, generation) != generation
+            && let Some(observer) = &self.record_observer
+            && observer.swap(false, Ordering::AcqRel)
+        {
+            (self.notify)(Update::RecordChanged);
+        }
         // apply_step has installed confirmed_session before reaching here.
         self.publish_resident_metadata();
     }
@@ -4668,7 +4707,10 @@ fn apply_projected_event(
             state.turn_generation = state.turn_generation.wrapping_add(1);
             state.finished_at = None;
         }
-        Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
+        Event::TurnStartConfirmed
+        | Event::TurnSettled
+        | Event::TurnFinished { .. }
+        | Event::Execution { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));

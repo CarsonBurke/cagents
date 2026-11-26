@@ -337,6 +337,10 @@ impl Drop for OwnedLock {
 }
 
 pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
+    owned_file_lock(open_owned_lock(path)?, operation)
+}
+
+fn open_owned_lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -353,7 +357,7 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
         ));
     }
     lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    owned_file_lock(lock, operation)
+    Ok(lock)
 }
 
 /// Acquire the existing drop-safe advisory lock on a file a confined storage
@@ -799,6 +803,11 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         crate::diagnostics::initialize(product, version);
     }
     crate::diagnostics::record(crate::diagnostics::Event::Startup);
+    // The default hook prints a backtrace only when RUST_BACKTRACE asks for
+    // one. A local debug capture is the record of a crash that may not
+    // happen again, so it gets one unless RUST_BACKTRACE was set either way.
+    // Read once, as the standard library reads it.
+    let force_backtrace = env::var_os("RUST_BACKTRACE").is_none();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         let Some(recovered) = crate::runtime_state::begin_panic_report() else {
@@ -808,7 +817,22 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         // Payloads/backtraces can contain secrets. Only a user-requested local
         // debug capture invokes the raw default hook.
         if crate::diagnostics::local_debug() {
-            previous(panic);
+            if force_backtrace {
+                // Written whole, in place of the default hook's report, so a
+                // panic on another thread cannot land between this message
+                // and its backtrace, and no "run with RUST_BACKTRACE" note
+                // contradicts it. Symbolized before stderr is locked, so
+                // tracing on other threads does not wait for it.
+                let thread = std::thread::current();
+                let report = format!(
+                    "\nthread '{}' {panic}\nstack backtrace:\n{}\n",
+                    thread.name().unwrap_or("<unnamed>"),
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                let _ = io::stderr().lock().write_all(report.as_bytes());
+            } else {
+                previous(panic);
+            }
         }
         crate::runtime_state::finish_panic_report();
     }));
@@ -1586,6 +1610,35 @@ fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+/// An open observation of the exact launch fence an update already holds.
+#[cfg(feature = "host")]
+#[doc(hidden)]
+pub struct UpdateFenceRelease(File);
+
+#[cfg(feature = "host")]
+impl UpdateFenceRelease {
+    pub fn observe(runtime: &Path) -> io::Result<Option<Self>> {
+        let path = daemon_admission::fence_path_in(runtime);
+        let file = open_owned_lock(&path)?;
+        match file.try_lock_shared() {
+            Ok(()) => file.unlock().map(|()| None),
+            Err(fs::TryLockError::WouldBlock) => {
+                let opened = file.metadata()?;
+                let named = fs::symlink_metadata(&path)?;
+                if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+                    return Err(io::Error::other("the observed update fence changed"));
+                }
+                Ok(Some(Self(file)))
+            }
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    pub fn wait(self) -> io::Result<()> {
+        owned_file_lock(self.0, libc::LOCK_SH).map(drop)
     }
 }
 

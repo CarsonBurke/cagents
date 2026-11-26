@@ -1,6 +1,6 @@
 //! Finish an installed Ready update after its coordinator releases custody.
-//! This record can admit saved windows to the same successor. It cannot start
-//! a daemon or authorize another checkpoint restore.
+//! This record can admit saved windows after exact live work is verified. It
+//! carries no authority to start a daemon or restore a checkpoint.
 use super::*;
 use crate::model::HostSessionProof;
 #[cfg(feature = "host")]
@@ -27,6 +27,128 @@ struct Intent {
 enum Stage {
     Pending,
     Deferred,
+}
+
+#[cfg(feature = "host")]
+pub(crate) struct Original<'a> {
+    pub(crate) source: &'a HostSessionProof,
+    pub(crate) inventory: &'a crate::upgrade::recovery::Census,
+}
+
+#[cfg(feature = "host")]
+pub enum StartupCheckpoint {
+    Absent,
+    AdoptionOnly {
+        source: HostSessionProof,
+        restoring_digest: String,
+        ready_digest: String,
+    },
+    Unsettled,
+}
+
+#[cfg(feature = "host")]
+impl StartupCheckpoint {
+    pub fn restoring_digest(&self) -> Option<&str> {
+        match self {
+            Self::AdoptionOnly {
+                restoring_digest, ..
+            } => Some(restoring_digest),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+pub fn startup_checkpoint() -> StartupCheckpoint {
+    use crate::upgrade::handoff::Store;
+    let checkpoint = Store::existing()
+        .and_then(|store| store.map_or(Ok(None), |store| store.load_with_digest()));
+    match checkpoint {
+        Ok(None) => StartupCheckpoint::Absent,
+        Ok(Some((checkpoint, restoring_digest))) => {
+            let source = checkpoint.proof.clone();
+            match checkpoint.adoption_ready_digest() {
+                Ok(Some(ready_digest)) => StartupCheckpoint::AdoptionOnly {
+                    source,
+                    restoring_digest,
+                    ready_digest,
+                },
+                _ => StartupCheckpoint::Unsettled,
+            }
+        }
+        Err(_) => StartupCheckpoint::Unsettled,
+    }
+}
+
+/// A single snapshot of actual running owners under the serving host's lock.
+#[cfg(feature = "host")]
+pub struct LiveInventory {
+    pub terminals: Vec<crate::terminal_ipc::TerminalDescriptor>,
+    pub chats: Vec<crate::chat::Session>,
+    pub adopted_sources: std::collections::BTreeMap<
+        crate::model::TerminalId,
+        Vec<crate::upgrade::handoff::ChatSource>,
+    >,
+}
+
+#[cfg(feature = "host")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginalInventory {
+    terminals: Vec<crate::model::TerminalSession>,
+    chats: Vec<crate::chat::Session>,
+}
+
+#[cfg(feature = "host")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Witness {
+    version: u16,
+    intent_digest: String,
+    inventory_digest: String,
+    inventory: OriginalInventory,
+}
+
+#[cfg(feature = "host")]
+const INVENTORY_LIMIT: u64 = crate::upgrade::recovery::STANDBY_RECEIPT_LIMIT as u64;
+
+fn inventory_path(state: &Path, job: &str) -> PathBuf {
+    state.join(format!("{job}.cutover-inventory.json"))
+}
+
+#[cfg(feature = "host")]
+fn persist(state: &Path, target: &Path, bytes: &[u8], exclusive: bool) -> Result<(), UpdateError> {
+    let temporary = state.join(format!(".cutover-{}", uuid::Uuid::new_v4()));
+    let saved = (|| {
+        let mut file = private_create(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if exclusive {
+            let root = crate::fs_safety::Root::open(state)?;
+            crate::fs_safety::rename_new_within(
+                &root,
+                temporary.file_name().expect("cutover temporary name"),
+                target.file_name().expect("cutover file name"),
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+        } else {
+            fs::rename(&temporary, target)?;
+        }
+        File::open(state)?.sync_all()?;
+        Ok(())
+    })();
+    if saved.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    saved
+}
+
+fn has_witness(state: &Path, job: &str) -> Result<bool, UpdateError> {
+    match fs::symlink_metadata(inventory_path(state, job)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn path(state: &Path, job: &str) -> PathBuf {
@@ -115,14 +237,24 @@ impl Intent {
     }
 
     #[cfg(feature = "host")]
-    fn verify_serving(&self, layout: &InstallLayout) -> Result<(), UpdateError> {
-        if !self.names_selected(layout)? {
+    fn verify_serving(
+        &self,
+        layout: &InstallLayout,
+        serving: &HostSessionProof,
+    ) -> Result<source::Client, UpdateError> {
+        if !self.names_selected(layout)?
+            || crate::process::mapped_region_identity(
+                std::process::id(),
+                crate::process::own_code_address(),
+            )? != self.target_image
+        {
             return Err(invalid("The restored build is no longer selected"));
         }
         let mut client =
             source::Client::connect_matched(&crate::terminal_ipc::daemon_socket_path()?)
                 .map_err(|error| invalid(error.to_string()))?;
-        if client.proof() != &self.successor
+        if client.proof() != serving
+            || client.peer_pid() != std::process::id()
             || client.serving_executable()? != self.target
             || client.startup_state()? != StartupState::Ready
         {
@@ -130,25 +262,96 @@ impl Intent {
                 "The selected service no longer owns the restored work",
             ));
         }
-        Ok(())
+        Ok(client)
+    }
+
+    fn original_alive(&self) -> Result<bool, UpdateError> {
+        // A missing process or a recycled PID can settle only within the
+        // recorded boot. Any observation error keeps the original reserved.
+        match crate::daemon::holder_registry::Process::read(self.process.pid) {
+            Ok(current) => Ok(current == self.process),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(feature = "host")]
+    fn original_exited(&self) -> Result<bool, UpdateError> {
+        Ok(crate::pinned_process::exited_since(
+            self.process.pid as u32,
+            self.process.start,
+        )?)
+    }
+
+    #[cfg(feature = "host")]
+    fn verify_resumed_inventory(
+        &self,
+        state: &Path,
+        serving: &HostSessionProof,
+        mut inventory: LiveInventory,
+    ) -> Result<(), UpdateError> {
+        let bytes = read_private(&inventory_path(state, &self.job), INVENTORY_LIMIT)?;
+        let witness: Witness = serde_json::from_slice(&bytes)?;
+        if witness.version != 1
+            || witness.intent_digest != self.digest()?
+            || witness.inventory_digest != hashed_json(&witness.inventory)?
+        {
+            return Err(invalid("The original cutover inventory changed"));
+        }
+        let saved = witness.inventory;
+        let store = crate::upgrade::handoff::Store::discover().map_err(invalid)?;
+        let mut lineage = store.recovered_chats().map_err(invalid)?;
+        let mut terminals = inventory.terminals;
+        terminals.retain(|terminal| {
+            saved
+                .terminals
+                .iter()
+                .any(|source| source.id == terminal.session.id)
+        });
+        let mut chats = inventory.chats;
+        chats.retain(|chat| saved.chats.iter().any(|source| source.id == chat.id));
+        for chat in &chats {
+            if chat.native_continuity.retains_provider()
+                && let Some(sources) = inventory.adopted_sources.remove(&chat.id)
+            {
+                lineage.observe_live_adoption(chat, sources);
+            }
+        }
+        recovery::verify_ready_inventory(
+            &self.job,
+            &self.source,
+            &crate::upgrade::recovery::Census {
+                terminals: saved.terminals,
+                chats: saved.chats,
+                ..Default::default()
+            },
+            serving,
+            &terminals,
+            &chats,
+            &lineage,
+        )
+        .map_err(invalid)
     }
 
     #[cfg(feature = "host")]
     fn persist(&self, state: &Path) -> Result<(), UpdateError> {
-        let temporary = state.join(format!(".cutover-{}", uuid::Uuid::new_v4()));
-        let saved = (|| {
-            let mut file = private_create(&temporary)?;
-            serde_json::to_writer(&mut file, self)?;
-            file.sync_all()?;
-            fs::rename(&temporary, path(state, &self.job))?;
-            File::open(state)?.sync_all()?;
-            Ok(())
-        })();
-        if saved.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        saved
+        persist(
+            state,
+            &path(state, &self.job),
+            &serde_json::to_vec(self)?,
+            false,
+        )
     }
+
+    #[cfg(feature = "host")]
+    fn digest(&self) -> Result<String, UpdateError> {
+        hashed_json(self)
+    }
+}
+
+#[cfg(feature = "host")]
+fn hashed_json(value: &impl Serialize) -> Result<String, UpdateError> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
 /// Written with the transferred worker lease and launch fence held, after
@@ -159,7 +362,7 @@ pub(crate) fn record(
     request_digest: &str,
     checkpoint_digest: &str,
     target: &Path,
-    source: &HostSessionProof,
+    original: Original<'_>,
     successor: &HostSessionProof,
     windows: &[String],
 ) -> Result<(), UpdateError> {
@@ -186,7 +389,7 @@ pub(crate) fn record(
         target: target.into(),
         target_image,
         window_image: (ui.dev(), ui.ino()),
-        source: source.clone(),
+        source: original.source.clone(),
         successor: successor.clone(),
         process: crate::daemon::holder_registry::Process::read(std::process::id() as i32)?,
         windows: windows.to_vec(),
@@ -194,6 +397,29 @@ pub(crate) fn record(
     };
     intent.validate()?;
     intent.verify_request(&state)?;
+    let inventory = OriginalInventory {
+        terminals: original.inventory.terminals.clone(),
+        chats: original.inventory.chats.clone(),
+    };
+    let witness = serde_json::to_vec(&Witness {
+        version: 1,
+        intent_digest: intent.digest()?,
+        inventory_digest: hashed_json(&inventory)?,
+        inventory,
+    })?;
+    if witness.len() as u64 > INVENTORY_LIMIT {
+        return Err(invalid(
+            "The original cutover inventory exceeds the evidence limit",
+        ));
+    }
+    let witness_path = inventory_path(&state, job);
+    if has_witness(&state, job)? {
+        if read_private(&witness_path, INVENTORY_LIMIT)? != witness {
+            return Err(invalid("An exact cutover inventory is already recorded"));
+        }
+    } else {
+        persist(&state, &witness_path, &witness, true)?;
+    }
     intent.persist(&state)
 }
 
@@ -218,14 +444,12 @@ pub(super) fn pending_selected(
     {
         return Ok(false);
     }
-    // Kernel identity is available during socket contention and before the
-    // listener starts accepting. A transient query error cannot authorize an
-    // unrelated job to replace this job's saved-window scope.
-    match crate::daemon::holder_registry::Process::read(intent.process.pid) {
-        Ok(current) => Ok(current == intent.process),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
+    // Keep a recoverable job reserved until another exact selected daemon
+    // can finish it, even if the first successor no longer exists.
+    if has_witness(state, &job.id)? {
+        return Ok(true);
     }
+    intent.original_alive()
 }
 
 #[cfg(feature = "host")]
@@ -234,6 +458,8 @@ pub(super) fn finish(
     state: &Path,
     successor: &HostSessionProof,
     mut job: UpdateJob,
+    entry_checkpoint: StartupCheckpoint,
+    observe_live: impl FnOnce() -> LiveInventory,
 ) -> Result<Option<String>, UpdateError> {
     if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
         || layout.version != job.version
@@ -244,13 +470,46 @@ pub(super) fn finish(
         return Ok(None);
     };
     if intent.stage != Stage::Pending
-        || &intent.successor != successor
-        || intent.process.pid != std::process::id() as i32
+        || successor.boot_id != intent.successor.boot_id
         || !intent.names_selected(layout)?
     {
         return Ok(None);
     }
-    let finished = finish_windows(&intent, layout, state);
+    let reentered = &intent.successor != successor;
+    if reentered && (!has_witness(state, &job.id)? || !intent.original_exited()?) {
+        return Ok(None);
+    }
+    if !reentered && intent.process.pid != std::process::id() as i32 {
+        return Ok(None);
+    }
+    let finished = (|| {
+        intent.verify_request(state)?;
+        let mut client = intent.verify_serving(layout, successor)?;
+        if reentered {
+            let adoption_only = match entry_checkpoint {
+                StartupCheckpoint::Absent => true,
+                StartupCheckpoint::AdoptionOnly {
+                    source,
+                    ready_digest,
+                    ..
+                } => source == intent.source && ready_digest == intent.checkpoint_digest,
+                StartupCheckpoint::Unsettled => false,
+            };
+            if !adoption_only || recovery::checkpoint_status()?.is_some() {
+                return Err(invalid(
+                    "Saved work had not finished reopening before the daemon restarted",
+                ));
+            }
+            let generation = client.inventory_generation()?;
+            intent.verify_resumed_inventory(state, successor, observe_live())?;
+            if client.inventory_generation()? != generation {
+                return Err(invalid(
+                    "The running work changed during update verification",
+                ));
+            }
+        }
+        finish_windows(&intent, layout, successor)
+    })();
     job.confirmation = None;
     job.refusal = None;
     match finished {
@@ -278,10 +537,8 @@ pub(super) fn finish(
 fn finish_windows(
     intent: &Intent,
     layout: &InstallLayout,
-    state: &Path,
+    serving: &HostSessionProof,
 ) -> Result<(), UpdateError> {
-    intent.verify_request(state)?;
-    intent.verify_serving(layout)?;
     let ui = layout.version_root.join("bin/cagents-ui");
     if !intent.windows.is_empty() {
         let mut guard = crate::instance::UiUpdateGuard::acquire_for_cutover()?;
@@ -296,7 +553,7 @@ fn finish_windows(
             verified?;
         }
     }
-    intent.verify_serving(layout)
+    intent.verify_serving(layout, serving).map(|_| ())
 }
 
 #[cfg(test)]
@@ -396,5 +653,7 @@ mod tests {
         intent.process.start += 1;
         save(&intent);
         assert!(!pending_selected(&layout, &state, &job).unwrap());
+        private_create(&inventory_path(&state, &job.id)).unwrap();
+        assert!(pending_selected(&layout, &state, &job).unwrap());
     }
 }

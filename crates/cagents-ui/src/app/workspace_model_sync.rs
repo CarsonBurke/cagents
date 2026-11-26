@@ -1746,6 +1746,12 @@ impl Cagents {
                 if receipt.identity != self.workspace_model.identity {
                     return Task::none();
                 }
+                // The registry holds this window's rename from here, and its
+                // row clock keeps any older model from showing the old title,
+                // even when a later edit already replaced this one's row.
+                if let ModelEdit::RetitleChannel { id, title } = &edit {
+                    self.note_channel_rename_held(*id, title);
+                }
                 let operation = match &edit {
                     ModelEdit::ChangeView { operation, .. } => Some(*operation),
                     _ => None,
@@ -3243,6 +3249,11 @@ impl Cagents {
 
     /// Takes the shared half of a channel this window already has.
     fn absorb_shared_channel(&mut self, index: usize, shared: &ModelChannel) -> bool {
+        // A model showing this window's rename, which may come before the
+        // rename's receipt. One with any other title may predate it.
+        if shared.title_source == crate::model::ChannelTitleSource::Manual {
+            self.note_channel_rename_held(shared.id, &shared.title);
+        }
         let local = &self.durable.channels[index];
         // The shared title wins even where this window's own derivation would
         // differ: one window deferring is better than two windows showing one
@@ -3263,9 +3274,11 @@ impl Cagents {
         }
         // A name cleared in another window asks for the automatic one, which
         // this window offers if it runs the channel's conversation. A model
-        // older than this window's own rename looks the same, so it does not
-        // forget that rename (see `channel_is_named`): the registry refuses
-        // the offer once it holds the new name, whose echo then restores it.
+        // older than this window's own rename looks the same, so a rename
+        // still waiting for its echo is not forgotten (see
+        // `channel_is_named`): the registry refuses the offer once it holds
+        // the new name, whose echo then restores it. A clear after the echo
+        // leaves the channel unnamed.
         let cleared = retitle && !local.title.is_empty() && shared.title.is_empty();
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
         if retitle {

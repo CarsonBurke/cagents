@@ -12272,6 +12272,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
             .unwrap_or_default(),
         card_chrome: HashMap::new(),
         card_indices: HashMap::new(),
+        closed_cards_by_terminal: HashMap::new(),
         card_indices_source: std::sync::Weak::new(),
         terminal_ordinals_source: std::sync::Weak::new(),
         navigation_cache: sidebar::NavigationCache::default(),
@@ -14976,6 +14977,36 @@ fn control_tab_uses_history_and_respects_blocking_surfaces() {
     app.settings_reset_confirm = true;
     drop(app.update(next()));
     assert_eq!(app.workspace.focused(), Some(ids[2]));
+}
+
+#[test]
+fn staging_shortcut_works_on_a_non_latin_layout() {
+    let mut app = context_inspector_test_app(true);
+    app.sidebar_model = sidebar::test_support::panel_model();
+    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    let worktree = app.sidebar_state.active_worktree().unwrap().clone();
+    let card = app.workspace.focused().unwrap();
+    let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    runtime.descriptor.worktree = worktree.canonical_path.clone();
+    app.cards
+        .insert(card, CardRuntime::Repository(Box::new(runtime)));
+    // Ctrl+Shift+S on a Russian layout, where the S key types "ы".
+    drop(app.update(Message::KeyEvent {
+        event: keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("ы".into()),
+            modified_key: keyboard::Key::Character("Ы".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            text: None,
+            repeat: false,
+        },
+        captured: false,
+    }));
+    assert_eq!(
+        app.source_control_mutations[&worktree.canonical_path].kind,
+        MutationKind::Stage
+    );
 }
 
 #[test]

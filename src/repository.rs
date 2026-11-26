@@ -3831,6 +3831,77 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parsed, output)
     }
 
+    /// Refuses removing `worktree` while its detached HEAD holds commits that
+    /// no branch, remote-tracking branch or tag contains. Removing the
+    /// worktree drops its HEAD, the one thing that points at them, so they
+    /// would be lost without a word. A worktree on a branch keeps its commits
+    /// on that branch and is never refused.
+    ///
+    /// The count runs from `repository` against the commit Git listed, so it
+    /// works for a worktree whose directory is already gone. A count that
+    /// fails or times out refuses too: removal is never authorized blind.
+    pub fn refuse_losing_detached_commits(
+        &self,
+        repository: &Path,
+        worktree: &WorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        if !worktree.detached {
+            return Ok(());
+        }
+        let Some(head) = worktree.head_oid.as_deref() else {
+            return Err(
+                "Git listed this worktree's HEAD as detached without a commit, \
+                 so the worktree was kept."
+                    .into(),
+            );
+        };
+        let short = head.get(..12).unwrap_or(head);
+        let command = self
+            .git_read(
+                repository,
+                [
+                    "rev-list",
+                    "--count",
+                    head,
+                    "--not",
+                    "--branches",
+                    "--remotes",
+                    "--tags",
+                ],
+            )
+            .timeout(Duration::from_secs(30))
+            .output_limits(64, 64 * 1024);
+        let count = self
+            .run_checked(&command, cancellation)
+            .map_err(RepositoryError::from)
+            .and_then(|output| {
+                let parsed = parse_utf8_line(&output.stdout, "rev-list count")?;
+                parsed
+                    .parse::<u64>()
+                    .map_err(|_| RepositoryError::InvalidOutput {
+                        field: "rev-list count",
+                        reason: "count is not a number".into(),
+                    })
+            })
+            .map_err(|error| {
+                format!(
+                    "Could not check whether detached HEAD {short} has commits on no branch, \
+                     tag or remote, so the worktree was kept: {error}"
+                )
+            })?;
+        match count {
+            0 => Ok(()),
+            count => Err(format!(
+                "Detached HEAD {short} has {count} commit{} on no branch, tag or remote, \
+                 which deleting the worktree would lose. Keep {} on a branch first, \
+                 for example with `git branch NAME {short}`.",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "it" } else { "them" },
+            )),
+        }
+    }
+
     /// Line counts for one uncommitted area. The staged form compares HEAD to
     /// the index and also works on an unborn branch, where Git compares against
     /// the empty tree.
