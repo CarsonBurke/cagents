@@ -1304,8 +1304,10 @@ async fn run(
     let mut withdrawal_retry = None;
     let mut automation_retry = AutomationRetry::default();
     // Inbox reconciliation that could not read the journal. The courier
-    // publishes again only when its mail changes, so retry on a timer.
+    // publishes again only when its mail changes, so retry on a timer, backing
+    // off while a notice stays unreadable.
     let mut inbox_retry = None;
+    let mut inbox_retry_delay = RETRY_DELAY;
     let mut snapshot = Snapshot {
         diagnostic: settings_error.clone(),
         ..Default::default()
@@ -1531,11 +1533,17 @@ async fn run(
             next_attempt = Instant::now();
             retry_delay = RETRY_DELAY;
         }
-        if let Err(error) = pending.reconcile_inboxes(journal) {
-            // A newer courier publication replaces this one first.
-            snapshot.diagnostic = Some(error);
-            deferred.inboxes = pending.inboxes.take();
-            inbox_retry = Some(Instant::now() + RETRY_DELAY);
+        let reconciling = pending.inboxes.is_some();
+        match pending.reconcile_inboxes(journal) {
+            Ok(()) if reconciling => inbox_retry_delay = RETRY_DELAY,
+            Ok(()) => {}
+            Err(error) => {
+                // A newer courier publication replaces this one first.
+                snapshot.diagnostic = Some(error);
+                deferred.inboxes = pending.inboxes.take();
+                inbox_retry = Some(Instant::now() + inbox_retry_delay);
+                inbox_retry_delay = (inbox_retry_delay * 2).min(Duration::from_secs(300));
+            }
         }
         for session in pending.retired {
             if settle_attention_at_shutdown(
