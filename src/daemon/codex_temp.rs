@@ -530,7 +530,7 @@ pub(crate) mod cleanup_fixture {
         process::Command,
     };
 
-    const PROC_ROOT: &str = "CAGENTS_TEST_CODEX_TEMP_PROC";
+    pub(crate) const PROC_ROOT: &str = "CAGENTS_TEST_CODEX_TEMP_PROC";
 
     fn proc_root() -> Option<PathBuf> {
         std::env::var_os(PROC_ROOT).map(PathBuf::from)
