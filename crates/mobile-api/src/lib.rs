@@ -688,6 +688,9 @@ pub enum ItemBody {
         input: String,
         output: String,
         clipped: bool,
+        /// Whether the output preview is clipped independently of the input.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        output_clipped: bool,
         status: ToolStatus,
     },
     Image {

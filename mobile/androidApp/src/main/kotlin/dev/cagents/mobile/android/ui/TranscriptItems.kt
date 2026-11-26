@@ -164,7 +164,7 @@ internal fun TranscriptItem(item: Item, onDetail: ((TranscriptDetail) -> Unit)? 
         ) {
             if (body.input.isNotBlank() && body.input != "{}") Code(body.input)
             if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped && onDetail == null)
-            if (body.clipped && onDetail != null) {
+            if (body.outputClipped && onDetail != null) {
                 TextButton(onClick = { onDetail(TranscriptDetail(item.id, DetailKind.Output, "Tool output")) }) {
                     Text("Read full output")
                 }

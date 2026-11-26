@@ -312,6 +312,7 @@ sealed interface ItemBody {
         val input: String = "",
         val output: String = "",
         val clipped: Boolean = false,
+        @SerialName("output_clipped") val outputClipped: Boolean = false,
         val status: ToolStatus = ToolStatus.Unknown,
     ) : ItemBody
 

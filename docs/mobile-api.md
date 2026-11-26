@@ -274,7 +274,8 @@ An item has a `role` (`user`, `assistant` or `system`), `started_at` and `at`
 times, and a `kind` with its own fields: `text`, `command`, `changes`,
 `web_search`, `tool`, `image` or `delivery`. Command and tool output is
 clipped to its last 4 KiB and tool input to its first 2 KiB, with `clipped`
-set. File changes carry the paths and line counts, not the diff.
+set. A tool can additionally set `output_clipped` when its output preview
+was clipped. File changes carry paths and line counts.
 
 On a slow connection, updates are combined: the bridge holds back while
 the phone is behind and then sends everything that changed since the last

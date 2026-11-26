@@ -444,6 +444,7 @@ fn examples() -> BTreeMap<&'static str, (Direction, Value)> {
                             input: "{}".into(),
                             output: "done".into(),
                             clipped: false,
+                            output_clipped: false,
                             status: ToolStatus::Waiting,
                         },
                     ),

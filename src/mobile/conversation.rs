@@ -265,7 +265,9 @@ enum Input {
 
 /// What a daemon request in flight was for.
 enum Pending {
-    Read { final_read: bool },
+    Read {
+        final_read: bool,
+    },
     Chat {
         id: u64,
         _upload_slot: Option<Arc<()>>,

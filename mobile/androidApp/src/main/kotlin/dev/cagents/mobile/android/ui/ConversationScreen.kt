@@ -174,7 +174,9 @@ fun ConversationScreen(
             when {
                 conversation == null || (!conversation.loaded && conversation.ended == null) ->
                     Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
-                else -> Transcript(vm, session, conversation, view.details, follow) { follow = it }
+                else -> Transcript(
+                    vm, session, conversation, view.details && conversation.ended == null && !state.exited, follow,
+                ) { follow = it }
             }
         }
     }
@@ -228,9 +230,10 @@ private fun Transcript(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var detail by remember(session) { mutableStateOf<TranscriptDetail?>(null) }
-    detail?.let { selected ->
+    detail?.takeIf { details }?.let { selected ->
         key(selected) { TranscriptDetailDialog(vm, session, selected) { detail = null } }
     }
+    LaunchedEffect(details) { if (!details) detail = null }
     val reversed = remember(conversation.items) { conversation.items.asReversed() }
     val atEnd by remember {
         derivedStateOf { listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= END_SLOP_PX }

@@ -262,6 +262,7 @@ pub fn item(item: &chat::Item) -> api::Item {
                 input: input.into(),
                 output: output.into(),
                 clipped: input_clipped || output_clipped,
+                output_clipped,
                 status: tool_status(*status),
             }
         }
