@@ -1079,6 +1079,11 @@ struct EditorDocument {
     /// exactly while the reader is asked whether to reload, compare or keep
     /// their edits.
     disk_version: Option<DiskVersion>,
+    /// The history revision a reload from disk replaced, and the disk
+    /// version it took, while that is still the file's version. Undoing back
+    /// to it reverts a change made outside the editor, which autosave must
+    /// not write without the reader choosing to.
+    reload_undo: Option<(u64, blake3::Hash)>,
     error: Option<String>,
     error_from_document_watch: bool,
     durability_warning: Option<String>,
@@ -1090,10 +1095,16 @@ struct EditorDocument {
     history_time: Option<Instant>,
 }
 
+/// Why a save was refused: the file changed after the buffer read it.
+const SAVE_CONFLICT: &str = "The file changed on disk after it was opened.";
+
 /// A file's contents on disk, newer than the ones its buffer was loaded from.
 struct DiskVersion {
     text: String,
     disk_hash: blake3::Hash,
+    /// The reader undid a reload, rather than the file changing under
+    /// their edits.
+    undone: bool,
 }
 
 /// What one editor action did to the buffer's text.
@@ -1177,6 +1188,7 @@ impl EditorDocument {
             active_save: None,
             conflict: false,
             disk_version: None,
+            reload_undo: None,
             error: None,
             error_from_document_watch: false,
             durability_warning: None,
@@ -1204,8 +1216,16 @@ impl EditorDocument {
             self.error = None;
             self.error_from_document_watch = false;
         }
-        // The file is back to the bytes the buffer was loaded from.
-        self.disk_version = None;
+        // The file is back to the bytes the buffer was loaded from. An
+        // undone reload left those bytes on disk on purpose, and its choice
+        // stays open.
+        if !self
+            .disk_version
+            .as_ref()
+            .is_some_and(|version| version.undone)
+        {
+            self.disk_version = None;
+        }
     }
 
     /// A document that is its own file, which is every fixture that is not
@@ -1323,6 +1343,28 @@ impl EditorDocument {
         if !edits.is_empty() {
             self.text_changed();
         }
+        if !redo
+            && !self.conflict
+            && self.reload_undo == Some((self.history.revision(), self.disk_hash))
+        {
+            // The file still holds what the reload took; the buffer is back
+            // to what it replaced. Ask, as for a change under unsaved edits.
+            self.reload_undo = None;
+            self.conflict = true;
+            self.disk_version = Some(DiskVersion {
+                text: self.saved_text.clone(),
+                disk_hash: self.disk_hash,
+                undone: true,
+            });
+        } else if !self.dirty
+            && self
+                .disk_version
+                .as_ref()
+                .is_some_and(|version| version.undone && version.disk_hash == self.disk_hash)
+        {
+            // Redone: the buffer holds the file's text again.
+            self.resolve_disk_state();
+        }
         Some(edits)
     }
 
@@ -1355,12 +1397,14 @@ impl EditorDocument {
     ) -> Vec<Option<LspTextEdit>> {
         self.saved_text = text;
         self.disk_hash = disk_hash;
+        let replaced = self.history.revision();
         let edits = self.replace_with_saved_text();
         self.saved_snapshot = self.content.text_snapshot();
         self.saved_history_revision = self.history.revision();
         self.dirty = false;
         self.durability_warning = None;
         self.resolve_disk_state();
+        self.reload_undo = Some((replaced, disk_hash));
         edits
     }
 
@@ -1373,7 +1417,7 @@ impl EditorDocument {
     /// choice.
     fn observe_disk(&mut self, text: String, disk_hash: blake3::Hash) {
         if self.durability_warning.is_none()
-            && (self.error.is_none() || self.error_from_document_watch)
+            && (self.error.is_none() || self.error_from_document_watch || self.conflict)
             && content_matches(&self.content, &text)
         {
             self.saved_text = text;
@@ -1388,7 +1432,11 @@ impl EditorDocument {
             "The file changed on disk. Your unsaved edits are kept, and autosave is paused until you choose."
                 .into(),
         );
-        self.disk_version = Some(DiskVersion { text, disk_hash });
+        self.disk_version = Some(DiskVersion {
+            text,
+            disk_hash,
+            undone: false,
+        });
     }
 
     /// Keeps the buffer as it is and lets it replace the newer file: the
@@ -1399,7 +1447,10 @@ impl EditorDocument {
     /// Answers `false` when the newer file has not been read, and so cannot
     /// be the baseline.
     fn keep_buffer(&mut self) -> bool {
-        let Some(DiskVersion { text, disk_hash }) = self.disk_version.take() else {
+        let Some(DiskVersion {
+            text, disk_hash, ..
+        }) = self.disk_version.take()
+        else {
             return false;
         };
         // Measured once, on the reader's choice, rather than for every disk
@@ -1424,6 +1475,7 @@ impl EditorDocument {
         self.error = None;
         self.error_from_document_watch = false;
         self.disk_version = None;
+        self.reload_undo = None;
     }
 
     /// Replaces the buffer with [`EditorDocument::saved_text`] as one undo
@@ -6739,14 +6791,19 @@ impl RepositoryRuntime {
         let identity = self.current_identity(card, document.path.clone());
         let (revision, disk_hash) = (document.revision, version.disk_hash);
         let cancellation = CancellationToken::new();
+        // A comparison rebuilt for a newer file keeps the reader's place.
+        let (viewport, horizontal, scroll_id) = self.disk_comparison.take().map_or_else(
+            || (ListViewport::default(), 0.0, widget::Id::unique()),
+            |previous| (previous.viewport, previous.horizontal, previous.scroll_id),
+        );
         let comparison = |state| DiskComparison {
             identity: identity.clone(),
             revision,
             disk_hash,
             state,
-            viewport: ListViewport::default(),
-            horizontal: 0.0,
-            scroll_id: widget::Id::unique(),
+            viewport,
+            horizontal,
+            scroll_id: scroll_id.clone(),
         };
         let after = document.content.text();
         if after.len() as u64 > MAX_DIFF_SIDE_BYTES
@@ -7021,6 +7078,7 @@ impl RepositoryRuntime {
                 // retained buffer merely because its read succeeded.
                 let attested = result.is_ok() && !self.rejects_reload_replacement(&result);
                 if background {
+                    let comparing = self.current_disk_comparison().is_some();
                     if let DocumentState::Editable(document) = &mut self.document {
                         let unchanged = matches!(&result, Ok(LoadedFile { source, content: FileContent::Editable { content_hash, .. } }) if *content_hash == document.disk_hash && *source == document.source);
                         if unchanged {
@@ -7066,6 +7124,20 @@ impl RepositoryRuntime {
                             return self.reload_in_place(identity.card, text, content_hash);
                         }
                         if unavailable || held {
+                            if let Ok(LoadedFile {
+                                content: FileContent::Editable { content_hash, .. },
+                                ..
+                            }) = &result
+                                && in_place
+                                && document
+                                    .disk_version
+                                    .as_ref()
+                                    .is_some_and(|version| version.disk_hash == *content_hash)
+                            {
+                                // Already the version the reader is deciding
+                                // about.
+                                return Task::none();
+                            }
                             match result {
                                 Ok(LoadedFile {
                                     content:
@@ -7076,14 +7148,15 @@ impl RepositoryRuntime {
                                 }) if in_place => document.observe_disk(text, content_hash),
                                 Err(error) => document.note_document_watch_error(format!("File unavailable on disk: {error}. Your text is preserved. Reload to retry.")),
                                 Ok(LoadedFile { source, content: FileContent::ReadOnly(reason @ ReadOnlyReason::Symlink { .. }) }) => document.note_document_watch_error(format!("File unavailable on disk: {} Your text is preserved. Reload to retry.", read_only_detail(&source, &reason))),
+                                Ok(LoadedFile { content: FileContent::Editable { .. }, .. }) => document.note_document_watch_error("The link now points to a different file. Your edits are kept. Reload to open the file it points to now.".into()),
                                 Ok(_) => document.note_document_watch_error("The file changed on disk and no longer opens as editable text. Your edits are kept. Reload to open it as it is now.".into()),
                             }
                             // An open comparison follows the file it compares
                             // against, or closes once there is none.
-                            if self.disk_comparison.is_some() {
-                                self.disk_comparison = None;
+                            if comparing {
                                 return self.compare_with_disk(identity.card);
                             }
+                            self.disk_comparison = None;
                             return Task::none();
                         }
                     }
@@ -7700,8 +7773,10 @@ impl RepositoryRuntime {
                             document.saved_history_revision = ticket.history_revision;
                             document.saved_snapshot = ticket.snapshot_source;
                             document.refresh_dirty();
-                            document.conflict = false;
-                            document.error = None;
+                            // The buffer now is the file, whichever version
+                            // was waiting to be chosen.
+                            document.resolve_disk_state();
+                            self.disk_comparison = None;
                             document.durability_warning = match durability {
                                 SaveDurability::Durable => None,
                                 SaveDurability::Unconfirmed { error } => Some(format!(
@@ -7712,8 +7787,7 @@ impl RepositoryRuntime {
                         }
                         Ok(SaveOutcome::Conflict { .. }) => {
                             document.conflict = true;
-                            document.error =
-                                Some("The file changed on disk after it was opened.".into());
+                            document.error = Some(SAVE_CONFLICT.into());
                             // Read the newer file, so the reader can compare
                             // it or keep their edits over it.
                             self.document_reload_pending = self.document_watch.is_some();
@@ -7783,13 +7857,18 @@ impl RepositoryRuntime {
                 }
                 // The newer file is already read: taking it is an edit the
                 // reader can undo to get their own text back.
-                if let DocumentState::Editable(document) = &mut self.document
-                    && let Some(DiskVersion { text, disk_hash }) = document.disk_version.take()
+                if !self.has_editor_recovery()
+                    && let DocumentState::Editable(document) = &mut self.document
+                    && let Some(DiskVersion {
+                        text, disk_hash, ..
+                    }) = document.disk_version.take()
                 {
-                    return Task::batch([
-                        self.reload_in_place(card, text, disk_hash),
-                        self.focus_editor(card),
-                    ]);
+                    let reload = self.reload_in_place(card, text, disk_hash);
+                    // Find keeps the keyboard while it is open.
+                    if self.search_mode {
+                        return reload;
+                    }
+                    return Task::batch([reload, self.focus_editor(card)]);
                 }
                 let Some(path) = self.selected.as_ref().map(|file| file.path.clone()) else {
                     return Task::none();
@@ -7797,7 +7876,7 @@ impl RepositoryRuntime {
                 self.open_file(card, path)
             }
             RepositoryAction::KeepBufferVersion { card } => {
-                if self.is_saving() {
+                if self.is_saving() || self.has_editor_recovery() {
                     return Task::none();
                 }
                 let DocumentState::Editable(document) = &mut self.document else {
@@ -7809,11 +7888,17 @@ impl RepositoryRuntime {
                 self.disk_comparison = None;
                 // Autosave, when on, writes the buffer from here; the shell
                 // asks for it after every action.
+                if self.search_mode {
+                    return Task::none();
+                }
                 self.focus_editor(card)
             }
             RepositoryAction::CompareWithDisk { card } => {
                 if self.current_disk_comparison().is_some() {
                     self.disk_comparison = None;
+                    if self.search_mode {
+                        return Task::none();
+                    }
                     return self.focus_editor(card);
                 }
                 self.compare_with_disk(card)
@@ -11160,13 +11245,32 @@ fn disk_notice<'a>(
     document: &'a EditorDocument,
 ) -> Option<Element<'a, RepositoryAction>> {
     use crate::ui_controls::button;
+    let choosable = !runtime.is_saving() && !runtime.has_editor_recovery();
     let reload = (!runtime.is_saving()).then_some(RepositoryAction::Reload { card });
     let (heading, detail, actions): (Option<&str>, &str, Vec<Element<'a, RepositoryAction>>) =
-        if document.disk_version.is_some() {
+        if let Some(version) = &document.disk_version {
             let comparing = runtime.current_disk_comparison().is_some();
+            let reload = choosable.then_some(RepositoryAction::Reload { card });
+            // A save that failed for its own reason, not because of this
+            // newer file, still needs saying.
+            let save_error = document
+                .error
+                .as_deref()
+                .filter(|error| !document.error_from_document_watch && *error != SAVE_CONFLICT);
+            let (heading, detail) = if version.undone {
+                (
+                    "Undid a change from disk",
+                    "Your text no longer matches the file on disk, and autosave is paused until you choose. Reload takes the file on disk; Keep mine saves this text over it.",
+                )
+            } else {
+                (
+                    "Changed on disk",
+                    "Your unsaved edits are kept, and autosave is paused until you choose. Reload takes the new version; Undo brings your edits back.",
+                )
+            };
             (
-                Some("Changed on disk"),
-                "Your unsaved edits are kept, and autosave is paused until you choose. Reload takes the new version; Undo brings your edits back.",
+                Some(heading),
+                save_error.unwrap_or(detail),
                 vec![
                     button::primary("Reload")
                         .description("Replace your edits with the file on disk")
@@ -11180,8 +11284,7 @@ fn disk_notice<'a>(
                     button::secondary("Keep mine")
                         .description("Keep your edits; the next save replaces the file on disk")
                         .on_press_maybe(
-                            (!runtime.is_saving())
-                                .then_some(RepositoryAction::KeepBufferVersion { card }),
+                            choosable.then_some(RepositoryAction::KeepBufferVersion { card }),
                         )
                         .into(),
                 ],
@@ -11190,18 +11293,17 @@ fn disk_notice<'a>(
             let mut actions: Vec<Element<'a, RepositoryAction>> = Vec::new();
             if document.conflict {
                 actions.push(button::primary("Reload").on_press_maybe(reload).into());
-                // A file that is gone or unreadable has nothing to overwrite.
-                if !document.error_from_document_watch {
-                    actions.push(
-                        button::secondary("Overwrite")
-                            .description("Save your edits over the file on disk")
-                            .on_press_maybe(runtime.can_save().then_some(RepositoryAction::Save {
-                                card,
-                                overwrite: true,
-                            }))
-                            .into(),
-                    );
-                }
+                // Saving over a missing or unreadable file recreates it, which
+                // is the reader's call.
+                actions.push(
+                    button::secondary("Overwrite")
+                        .description("Save your edits over the file on disk")
+                        .on_press_maybe(runtime.can_save().then_some(RepositoryAction::Save {
+                            card,
+                            overwrite: true,
+                        }))
+                        .into(),
+                );
             }
             (None, error, actions)
         } else {

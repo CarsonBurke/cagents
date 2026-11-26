@@ -1054,6 +1054,14 @@ async fn changed_underneath(card: CardId, runtime: &mut RepositoryRuntime) {
     .expect("the newer file was never offered");
 }
 
+/// Writes the file the way editors and agents do, so a watcher never reads
+/// it half written.
+fn write_atomically(path: &Path, text: &str) {
+    let staged = path.with_extension("staged");
+    std::fs::write(&staged, text).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
 fn caret(runtime: &RepositoryRuntime) -> text_editor::Cursor {
     let DocumentState::Editable(document) = &runtime.document else {
         panic!("text document lost");
@@ -1073,10 +1081,12 @@ async fn clean_reload_is_one_undo_step_of_the_same_document() {
             selection: Some(text_editor::Position { line: 2, column: 0 }),
         });
     }
+    runtime.set_auto_save(true);
+    runtime.set_lsp_document(Some(LspDocumentId(0)));
     let identity = runtime.current_identity(card, "live.rs".into());
     let _ = runtime.take_lsp_intents();
 
-    std::fs::write(&path, "zero\none\ntwo\nthree\n").unwrap();
+    write_atomically(&path, "zero\none\ntwo\nthree\n");
     text(card, &mut runtime, "zero\none\ntwo\nthree\n").await;
     assert!(!runtime.is_dirty());
     assert!(!runtime.has_save_conflict());
@@ -1085,9 +1095,10 @@ async fn clean_reload_is_one_undo_step_of_the_same_document() {
     assert_eq!(runtime.current_identity(card, "live.rs".into()), identity);
     let intents = runtime.take_lsp_intents();
     assert!(
-        intents
-            .iter()
-            .all(|intent| matches!(intent, LspIntent::Change { .. })),
+        !intents.is_empty()
+            && intents
+                .iter()
+                .all(|intent| matches!(intent, LspIntent::Change { .. })),
         "{intents:?}"
     );
     assert_eq!(
@@ -1102,13 +1113,17 @@ async fn clean_reload_is_one_undo_step_of_the_same_document() {
     settle(&mut runtime, task).await;
     assert_eq!(runtime.editor_text().as_deref(), Some("one\ntwo\nthree\n"));
     assert!(runtime.is_dirty(), "the undone reload differs from disk");
+    // Undoing a change made outside the editor is not a reason to write the
+    // old text back over it unasked.
+    assert!(runtime.has_save_conflict());
+    assert_eq!(runtime.auto_save_revision(), None);
     let task = runtime.update(RepositoryAction::Redo { card });
     settle(&mut runtime, task).await;
     assert_eq!(
         runtime.editor_text().as_deref(),
         Some("zero\none\ntwo\nthree\n")
     );
-    assert!(!runtime.is_dirty());
+    assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
 }
 
 #[tokio::test]
@@ -1119,7 +1134,7 @@ async fn changed_dirty_buffer_reloads_as_an_undoable_choice() {
     let (card, mut runtime) = opened(root.path(), "live.txt").await;
     runtime.set_auto_save(true);
     type_text(card, &mut runtime, "my edits").await;
-    std::fs::write(&path, "agent edits").unwrap();
+    write_atomically(&path, "agent edits");
     changed_underneath(card, &mut runtime).await;
     assert!(runtime.has_save_conflict());
     assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
@@ -1129,14 +1144,26 @@ async fn changed_dirty_buffer_reloads_as_an_undoable_choice() {
         "autosave waits for a choice"
     );
 
+    let task = runtime.update(RepositoryAction::CompareWithDisk { card });
+    settle(&mut runtime, task).await;
+    assert!(runtime.current_disk_comparison().is_some());
     let task = runtime.update(RepositoryAction::Reload { card });
     settle(&mut runtime, task).await;
     assert_eq!(runtime.editor_text().as_deref(), Some("agent edits"));
     assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
+    assert!(runtime.disk_comparison.is_none(), "nothing left to compare");
+    assert!(runtime.auto_save_revision().is_none(), "nothing to save");
+
+    // Undo brings the edits back, and the choice with them.
     let task = runtime.update(RepositoryAction::Undo { card });
     settle(&mut runtime, task).await;
     assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
-    assert!(runtime.is_dirty() && !runtime.has_save_conflict());
+    assert!(runtime.is_dirty() && runtime.has_save_conflict());
+    assert_eq!(runtime.auto_save_revision(), None);
+    let task = runtime.update(RepositoryAction::KeepBufferVersion { card });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.has_save_conflict());
+    assert!(runtime.auto_save_revision().is_some(), "autosave resumes");
 }
 
 #[tokio::test]
@@ -1151,15 +1178,22 @@ async fn keep_mine_saves_the_buffer_over_the_newer_file() {
     ));
     runtime.set_auto_save(true);
     type_text(card, &mut runtime, "my edits").await;
-    std::fs::write(&path, "agent edits").unwrap();
+    write_atomically(&path, "agent edits");
     changed_underneath(card, &mut runtime).await;
+    let task = runtime.update(RepositoryAction::CompareWithDisk { card });
+    settle(&mut runtime, task).await;
 
     let task = runtime.update(RepositoryAction::KeepBufferVersion { card });
     settle(&mut runtime, task).await;
     assert!(!runtime.has_save_conflict());
+    assert!(runtime.disk_comparison.is_none(), "the choice is made");
     assert!(runtime.is_dirty());
     assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
     assert!(runtime.auto_save_revision().is_some(), "autosave resumes");
+    // The version on disk is the baseline now: typing it back is clean.
+    type_text(card, &mut runtime, "agent edits").await;
+    assert!(!runtime.is_dirty());
+    type_text(card, &mut runtime, "my edits").await;
     let task = runtime.update(RepositoryAction::Save {
         card,
         overwrite: false,
@@ -1168,10 +1202,6 @@ async fn keep_mine_saves_the_buffer_over_the_newer_file() {
     assert!(!runtime.has_save_conflict(), "{:?}", runtime.save_error());
     assert!(!runtime.is_dirty());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "my edits");
-
-    // Typing back the version that was on disk is not a change from it.
-    type_text(card, &mut runtime, "agent edits").await;
-    assert!(runtime.is_dirty());
 }
 
 #[tokio::test]
@@ -1181,7 +1211,7 @@ async fn compare_shows_the_buffer_against_the_newer_file() {
     std::fs::write(&path, "shared\ndisk\n").unwrap();
     let (card, mut runtime) = opened(root.path(), "live.txt").await;
     type_text(card, &mut runtime, "shared\nmine\n").await;
-    std::fs::write(&path, "shared\nagent\n").unwrap();
+    write_atomically(&path, "shared\nagent\n");
     changed_underneath(card, &mut runtime).await;
 
     let task = runtime.update(RepositoryAction::CompareWithDisk { card });
@@ -1194,7 +1224,7 @@ async fn compare_shows_the_buffer_against_the_newer_file() {
     assert_eq!(&*model.before, "shared\nagent\n");
 
     // Another write to the file is what the reader now compares against.
-    std::fs::write(&path, "shared\nagent again\n").unwrap();
+    write_atomically(&path, "shared\nagent again\n");
     tokio::time::timeout(Duration::from_secs(5), async {
         while !matches!(&runtime.document, DocumentState::Editable(document)
             if document.disk_version.as_ref().is_some_and(|version| version.text.contains("again")))
@@ -1223,7 +1253,7 @@ async fn a_buffer_already_holding_the_new_file_needs_no_choice() {
     std::fs::write(&path, "disk").unwrap();
     let (card, mut runtime) = opened(root.path(), "live.txt").await;
     type_text(card, &mut runtime, "same edit").await;
-    std::fs::write(&path, "same edit").unwrap();
+    write_atomically(&path, "same edit");
     tokio::time::timeout(Duration::from_secs(5), async {
         while runtime.is_dirty() {
             change(card, &mut runtime).await;
