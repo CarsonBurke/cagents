@@ -1244,7 +1244,12 @@ impl Acp {
             actions,
         }));
         step.events.push(Event::Waiting(true));
-        if let Some(subagent) = &subagent {
+        // A subagent that has ended, such as one asking after its turn, is
+        // not shown waiting again.
+        if let Some(subagent) = subagent
+            .as_ref()
+            .filter(|subagent| self.subagents.is_live(subagent))
+        {
             step.events.push(subagents::waiting(subagent.clone(), true));
         }
         self.permissions.insert(

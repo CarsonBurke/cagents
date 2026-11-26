@@ -23,10 +23,10 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 
 /// The child sessions whose steps are kept, as the parent keeps its calls.
-const MAX_CHILDREN: usize = 16;
+pub(super) const MAX_CHILDREN: usize = 16;
 /// The `invoke_subagent` calls remembered, so a revision of one is not
 /// taken for another subagent.
-const MAX_INVOCATIONS: usize = 128;
+pub(super) const MAX_INVOCATIONS: usize = 128;
 /// A prompt's opening is enough to say what the subagent was asked to do.
 const MAX_PROMPT: usize = 16 * 1024;
 /// Shorter text, such as `ls`, would name a prompt by chance.
@@ -35,6 +35,29 @@ const MIN_EVIDENCE: usize = 8;
 /// The title agy gives an `invoke_subagent` call, which a revision of the
 /// call may carry without its name.
 const INVOKE_TITLE: &str = "Run invoke_subagent";
+
+/// A subagent as its `invoke_subagent` call lists it.
+struct Listing {
+    subagent: String,
+    role: String,
+    prompt: String,
+    model: Option<String>,
+}
+
+impl Listing {
+    fn event(&self, status: ToolStatus) -> Event {
+        Event::Subagent {
+            id: self.subagent.clone(),
+            kind: self.role.clone(),
+            description: self.prompt.clone(),
+            status: Some(status),
+            background: Some(false),
+            model: self.model.clone(),
+            waiting: Some(false),
+            detail: None,
+        }
+    }
+}
 
 struct Child {
     /// The subagent it is listed under: the call that started it, or its
@@ -50,6 +73,9 @@ pub(super) struct Subagents {
     unmatched: Vec<(String, String)>,
     /// The subagents of this turn, which end with it.
     live: Vec<String>,
+    /// This turn's calls still pending, such as one awaiting the reader's
+    /// approval, whose subagents have not started.
+    held: Vec<Listing>,
     /// Each with whether it has reported its subagent started.
     invocations: VecDeque<(String, bool)>,
     /// The role each remembered subagent was started under.
@@ -68,21 +94,28 @@ pub(super) fn child_of(id: &str) -> Option<&str> {
 }
 
 impl Subagents {
-    /// Lists the subagent an `invoke_subagent` call starts, the first time
-    /// the call is seen, and ends it if the call fails. Replayed, it has
-    /// ended.
+    /// Lists the subagent an `invoke_subagent` call starts, once the call is
+    /// under way, and ends it if the call fails. A call still pending, as
+    /// while it awaits approval, lists none yet. Replayed, it has ended.
     pub fn invoked(&mut self, update: &Value, live: bool) -> Option<Event> {
         let id = update["toolCallId"].as_str().filter(|id| !id.is_empty())?;
         let status = update["status"].as_str();
         let failed = status == Some("failed");
+        let begun = matches!(status, Some("in_progress" | "completed"));
         if let Some((_, started)) = self.invocations.iter_mut().find(|(known, _)| known == id) {
             // A call that reported its subagent started cannot take that
             // back: a later failure, delivered out of order, says less.
-            if *started || !failed {
-                *started |= status == Some("completed");
+            if *started {
                 return None;
             }
-            return self.unstarted(id, ToolStatus::Failed);
+            *started = status == Some("completed");
+            return if failed {
+                self.unstarted(id, ToolStatus::Failed)
+            } else if begun {
+                self.begin_held(id)
+            } else {
+                None
+            };
         }
         if update["name"].as_str() != Some("invoke_subagent")
             && update["title"].as_str() != Some(INVOKE_TITLE)
@@ -92,44 +125,70 @@ impl Subagents {
         if self.invocations.len() == MAX_INVOCATIONS
             && let Some((oldest, _)) = self.invocations.pop_front()
         {
-            self.roles.remove(&listed(&oldest));
+            let oldest = listed(&oldest);
+            self.roles.remove(&oldest);
+            self.held.retain(|held| held.subagent != oldest);
         }
         self.invocations
             .push_back((id.to_owned(), status == Some("completed")));
         // The step shows `rawInput`, and so does the step that links to it.
         let input = &update["rawInput"];
         let text = |field: &str| input[field].as_str().map(str::trim).unwrap_or_default();
-        let prompt = bounded(text("Prompt"));
-        let role = bounded(text("Role"));
-        let subagent = listed(id);
-        self.roles.insert(subagent.clone(), role.clone());
-        // Only this turn's children can be matched to it.
-        let started = live && !failed;
-        if started {
-            if self.unmatched.len() == MAX_INVOCATIONS {
-                self.unmatched.remove(0);
-            }
-            self.unmatched.push((subagent.clone(), prompt.clone()));
-            self.live.push(subagent.clone());
-        }
-        Some(Event::Subagent {
-            id: subagent,
-            kind: role,
-            description: prompt,
-            status: Some(if failed {
-                ToolStatus::Failed
-            } else if live {
-                ToolStatus::Running
-            } else {
-                ToolStatus::Ended
-            }),
-            background: Some(false),
+        let listing = Listing {
+            subagent: listed(id),
+            role: bounded(text("Role")),
+            prompt: bounded(text("Prompt")),
             model: Some(text("Model"))
                 .filter(|model| !model.is_empty() && *model != "inherit")
                 .map(str::to_owned),
-            waiting: Some(false),
-            detail: None,
-        })
+        };
+        self.roles
+            .insert(listing.subagent.clone(), listing.role.clone());
+        if failed {
+            Some(listing.event(ToolStatus::Failed))
+        } else if !live {
+            Some(listing.event(ToolStatus::Ended))
+        } else if begun {
+            Some(self.begin(listing))
+        } else {
+            // Still pending, the call may yet be refused: its subagent is
+            // listed once it starts.
+            if self.held.len() == MAX_INVOCATIONS {
+                self.held.remove(0);
+            }
+            self.held.push(listing);
+            None
+        }
+    }
+
+    /// Lists a subagent of this turn as started, where children may be
+    /// matched to it.
+    fn begin(&mut self, listing: Listing) -> Event {
+        if self.unmatched.len() == MAX_INVOCATIONS {
+            self.unmatched.remove(0);
+        }
+        self.unmatched
+            .push((listing.subagent.clone(), listing.prompt.clone()));
+        self.keep_live(listing.subagent.clone());
+        listing.event(ToolStatus::Running)
+    }
+
+    /// Starts the subagent of the pending call `id`, if it is held.
+    fn begin_held(&mut self, id: &str) -> Option<Event> {
+        let subagent = listed(id);
+        let index = self
+            .held
+            .iter()
+            .position(|held| held.subagent == subagent)?;
+        let listing = self.held.remove(index);
+        Some(self.begin(listing))
+    }
+
+    fn keep_live(&mut self, subagent: String) {
+        if self.live.len() == MAX_INVOCATIONS {
+            self.live.remove(0);
+        }
+        self.live.push(subagent);
     }
 
     /// Shows a subagent's step in its own transcript. `None` when `update`
@@ -146,6 +205,12 @@ impl Subagents {
                 .and_then(|index| self.evicted.remove(index))
                 .map(|(_, subagent)| subagent);
             let new = known.is_none();
+            if new && live {
+                // A new child shows that the calls still pending started.
+                for listing in std::mem::take(&mut self.held) {
+                    events.push(self.begin(listing));
+                }
+            }
             let subagent = known.unwrap_or_else(|| self.matched(&child, update));
             if new && subagent == child {
                 events.push(Event::Subagent {
@@ -163,7 +228,7 @@ impl Subagents {
                     detail: None,
                 });
                 if live {
-                    self.live.push(child.clone());
+                    self.keep_live(child.clone());
                 }
             }
             if self.order.len() == MAX_CHILDREN
@@ -283,6 +348,7 @@ impl Subagents {
             });
         }
         self.unmatched.clear();
+        self.held.clear();
         events
     }
 
@@ -290,6 +356,9 @@ impl Subagents {
     /// to start, when the call failed or will not run: no child can be its.
     pub fn unstarted(&mut self, id: &str, status: ToolStatus) -> Option<Event> {
         let subagent = listed(id);
+        if let Some(index) = self.held.iter().position(|held| held.subagent == subagent) {
+            return Some(self.held.remove(index).event(status));
+        }
         let index = self.live.iter().position(|live| *live == subagent)?;
         self.live.remove(index);
         self.unmatched
@@ -304,6 +373,11 @@ impl Subagents {
             waiting: Some(false),
             detail: None,
         })
+    }
+
+    /// Whether `subagent` is one of this turn's, which can wait on the reader.
+    pub fn is_live(&self, subagent: &str) -> bool {
+        self.live.iter().any(|live| live == subagent)
     }
 
     /// Whether a subagent of this turn is still at work.
