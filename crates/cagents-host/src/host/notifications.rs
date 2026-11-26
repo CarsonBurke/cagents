@@ -73,7 +73,7 @@ struct Pending {
     inboxes: Option<InboxAttention>,
     retired: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
-    predecessor_reads: BTreeSet<TerminalId>,
+    predecessor_reads: BTreeMap<Uuid, TerminalId>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
     /// The portal service's latest owner, when it changed; `Some(None)` means
@@ -109,11 +109,7 @@ impl Pending {
                 self.acknowledged.insert(id);
             }
         }
-        for session in newer.predecessor_reads {
-            if self.predecessor_reads.len() < MAX_PENDING {
-                self.predecessor_reads.insert(session);
-            }
-        }
+        self.read_predecessors(newer.predecessor_reads);
         self.committed_events.extend(newer.committed_events);
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
@@ -130,6 +126,15 @@ impl Pending {
         self.tests.extend(newer.tests);
         self.stopped |= newer.stopped;
         self
+    }
+
+    fn read_predecessors(&mut self, reads: BTreeMap<Uuid, TerminalId>) {
+        for (id, session) in reads {
+            if self.predecessor_reads.len() >= MAX_PENDING {
+                break;
+            }
+            self.predecessor_reads.insert(id, session);
+        }
     }
 
     /// The work that waits for an unavailable journal rather than being lost:
@@ -323,52 +328,51 @@ impl Handle {
     }
 }
 
-/// Queue a read of the durable predecessors of an attached conversation.
+/// Capture the exact committed predecessor notices at authenticated read
+/// acceptance. The broker remains the only writer, and a replacement committed
+/// before it handles this batch must remain unread.
 pub(super) fn acknowledge_predecessors(host: &SharedHost, session: TerminalId) {
-    let notifications = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .notifications
-        .clone();
-    let Some(notifications) = notifications else {
+    let (notifications, registry) = {
+        let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            state.notifications.clone(),
+            state.execution_registry.clone(),
+        )
+    };
+    let (Some(notifications), Some(registry), Some(path)) =
+        (notifications, registry, journal_path())
+    else {
         return;
     };
-    let mut pending = notifications
-        .0
-        .pending
+    let predecessors = registry
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if !pending.stopped && pending.predecessor_reads.len() < MAX_PENDING {
-        pending.predecessor_reads.insert(session);
-        drop(pending);
-        let _ = notifications.0.wake.try_send(());
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .notice_predecessors(session);
+    let reads = predecessors.and_then(|predecessors| {
+        if predecessors.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        Journal::open_reader(&path)?.unread_session_ids(&predecessors)
+    });
+    match reads {
+        Ok(reads) if !reads.is_empty() => notifications.change(|pending| {
+            pending.read_predecessors(reads);
+        }),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(%session, %error, "could not capture committed predecessor attention")
+        }
     }
 }
 
 fn apply_predecessor_reads(
     journal: &mut Journal,
-    sessions: &BTreeSet<TerminalId>,
-    predecessors: impl Fn(TerminalId) -> Result<BTreeSet<TerminalId>, String>,
-    mut cleared: impl FnMut(&Notice),
+    reads: &BTreeMap<Uuid, TerminalId>,
+    mut cleared: impl FnMut(Uuid, TerminalId),
 ) -> Result<(), String> {
-    if sessions.is_empty() {
-        return Ok(());
-    }
-    let mut prior = BTreeSet::new();
-    for session in sessions {
-        prior.extend(predecessors(*session)?);
-    }
-    if prior.is_empty() {
-        return Ok(());
-    }
-    // A commit receipt is observable before the broker publishes a snapshot.
-    // Read the journal here, before admitting any later events in this batch.
-    for notice in journal.list()? {
-        if matches!(notice.event.target, Target::Session(id) if prior.contains(&id))
-            && !notice.acknowledged
-        {
-            journal.acknowledge(notice.id)?;
-            cleared(&notice);
+    for (&id, &session) in reads {
+        if journal.acknowledge(id)?.is_some() {
+            cleared(id, session);
         }
     }
     Ok(())
@@ -769,15 +773,17 @@ impl JournalTestBridge {
     }
 }
 
+fn journal_path() -> Option<std::path::PathBuf> {
+    crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"))
+}
+
 async fn run(
     shared: Weak<Shared>,
     host: Weak<HostLock>,
     mut receiver: mpsc::Receiver<()>,
     application: crate::notifications::Application,
 ) {
-    let path =
-        crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"));
-    let mut store = journal::Reopening::open(path, Instant::now());
+    let mut store = journal::Reopening::open(journal_path(), Instant::now());
     // Work held while the journal is unavailable, applied before the next batch.
     let mut deferred = Pending::default();
     let settings = preferences();
@@ -984,20 +990,12 @@ async fn run(
                 snapshot.diagnostic = Some(error);
             }
         }
-        if let Err(error) = apply_predecessor_reads(
-            journal,
-            &pending.predecessor_reads,
-            |session| {
-                let host = host.upgrade().ok_or("The daemon has stopped")?;
-                let registry = super::agent_execution::registry(&host)?;
-                let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-                registry.notice_predecessors(session)
-            },
-            |notice| {
-                delivery.retain(|_, waiting| waiting.id != notice.id);
-                withdraw_notice(&mut withdrawals, notice);
-            },
-        ) {
+        if let Err(error) =
+            apply_predecessor_reads(journal, &pending.predecessor_reads, |id, session| {
+                delivery.retain(|_, waiting| waiting.id != id);
+                withdraw_target(&mut withdrawals, id, &Target::Session(session));
+            })
+        {
             snapshot.diagnostic = Some(error);
         }
         for id in pending.acknowledged {
@@ -1266,13 +1264,13 @@ mod tests {
     }
 
     #[test]
-    fn predecessor_read_clears_a_committed_notice_before_snapshot_publication() {
+    fn predecessor_read_uses_committed_ids_and_preserves_a_later_replacement() {
         let root = tempfile::tempdir().unwrap();
-        let (handle, mut bridge) =
-            JournalTestBridge::new(&root.path().join("attention.sqlite")).unwrap();
+        let path = root.path().join("attention.sqlite");
+        let (handle, mut bridge) = JournalTestBridge::new(&path).unwrap();
         let predecessor = TerminalId::new();
-        let current = TerminalId::new();
-        let other = TerminalId::new();
+        let replaced_predecessor = TerminalId::new();
+        let unrelated = TerminalId::new();
         let receipt = handle
             .record_committed(attention_event(predecessor, "first"))
             .unwrap();
@@ -1282,23 +1280,35 @@ mod tests {
             .unwrap();
         receipt.recv().unwrap().unwrap();
         assert!(handle.snapshot().notices.is_empty());
-
+        let replaced = bridge
+            .journal
+            .record(attention_event(replaced_predecessor, "earlier"), false)
+            .unwrap()
+            .unwrap();
         let unrelated = bridge
             .journal
-            .record(attention_event(other, "outside"), false)
+            .record(attention_event(unrelated, "outside"), false)
+            .unwrap()
+            .unwrap();
+        let reads = Journal::open_reader(&path)
+            .unwrap()
+            .unread_session_ids(&[predecessor, replaced_predecessor].into())
+            .unwrap();
+        assert_eq!(
+            reads,
+            [
+                (previous.id, predecessor),
+                (replaced.id, replaced_predecessor)
+            ]
+            .into()
+        );
+        let later = bridge
+            .journal
+            .record(attention_event(replaced_predecessor, "later"), false)
             .unwrap()
             .unwrap();
         let mut retired = Vec::new();
-        apply_predecessor_reads(
-            &mut bridge.journal,
-            &[current].into(),
-            |session| {
-                assert_eq!(session, current);
-                Ok([predecessor].into())
-            },
-            |notice| retired.push(notice.id),
-        )
-        .unwrap();
+        apply_predecessor_reads(&mut bridge.journal, &reads, |id, _| retired.push(id)).unwrap();
         assert_eq!(retired, [previous.id]);
         let visible = bridge.list().unwrap();
         assert!(
@@ -1309,12 +1319,7 @@ mod tests {
                 .acknowledged
         );
         assert!(visible.contains(&unrelated));
-        let later = bridge
-            .journal
-            .record(attention_event(predecessor, "later"), false)
-            .unwrap()
-            .unwrap();
-        assert!(bridge.list().unwrap().contains(&later));
+        assert!(visible.contains(&later));
     }
 
     #[test]

@@ -96,6 +96,45 @@ impl Journal {
         Ok(Self(connection))
     }
 
+    pub(super) fn open_reader(path: &Path) -> Result<Self, String> {
+        drop(
+            crate::secure_file::open_existing_private_file_readonly(path)
+                .map_err(|error| error.to_string())?,
+        );
+        let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let mut url = url::Url::from_file_path(absolute)
+            .map_err(|()| "Notification journal path cannot be represented as a file URI")?;
+        url.query_pairs_mut().append_pair("mode", "ro");
+        let mut connection =
+            SqliteConnection::establish(url.as_str()).map_err(|error| error.to_string())?;
+        connection
+            .batch_execute("PRAGMA query_only=ON; PRAGMA busy_timeout=100;")
+            .map_err(|error| error.to_string())?;
+        Ok(Self(connection))
+    }
+
+    pub(super) fn unread_session_ids(
+        &mut self,
+        sessions: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<std::collections::BTreeMap<Uuid, crate::model::TerminalId>, String> {
+        notices::table
+            .filter(notices::acknowledged.eq(false))
+            .select((notices::session, notices::id))
+            .limit(MAX_SESSIONS)
+            .load::<(String, String)>(&mut self.0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter_map(|(key, id)| {
+                let session = key
+                    .parse()
+                    .ok()
+                    .filter(|session| sessions.contains(session))?;
+                Some(Uuid::parse_str(&id).map(|id| (id, session)))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     /// Coalesce latest attention without resurrecting dismissed duplicates.
     pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
         event.validate()?;

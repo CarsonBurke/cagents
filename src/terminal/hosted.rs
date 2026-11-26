@@ -853,7 +853,7 @@ enum ClientCommand {
     },
     Visibility(TerminalVisibility),
     AcknowledgeOutput(u64),
-    AcknowledgeConversation,
+    AcknowledgeConversation(Instant),
     Hibernate,
     Resume {
         visible: bool,
@@ -878,12 +878,16 @@ impl ClientCommand {
             Self::Search { .. } => "search terminal",
             Self::Visibility(_) => "set terminal visibility",
             Self::AcknowledgeOutput(_) => "acknowledge terminal output",
-            Self::AcknowledgeConversation => "acknowledge conversation attention",
+            Self::AcknowledgeConversation(_) => "acknowledge conversation attention",
             Self::Hibernate => "hibernate terminal",
             Self::Resume { .. } => "resume terminal",
             Self::ShutdownTerminal(_) => "shutdown terminal",
             Self::Stop => "detach terminal",
         }
+    }
+
+    fn belongs_to_connection(&self, connected_at: Instant) -> bool {
+        !matches!(self, Self::AcknowledgeConversation(read_at) if *read_at < connected_at)
     }
 
     fn into_request(self, terminal_id: TerminalId) -> ClientRequest {
@@ -932,7 +936,7 @@ impl ClientCommand {
             Self::AcknowledgeOutput(epoch) => {
                 ClientRequest::TerminalAcknowledge { terminal_id, epoch }
             }
-            Self::AcknowledgeConversation => ClientRequest::ChatAcknowledge {
+            Self::AcknowledgeConversation(_) => ClientRequest::ChatAcknowledge {
                 chat_id: terminal_id,
                 epoch: 1,
             },
@@ -1229,7 +1233,11 @@ impl HostedTerminalHandle {
     /// A person has read the attached conversation. Reattaching never
     /// replays this request with the terminal's output-observation epoch.
     pub fn acknowledge_conversation_attention(&self) -> Result<(), TerminalSendError> {
-        self.try_command(ClientCommand::AcknowledgeConversation)
+        let read_at = Instant::now();
+        if !matches!(self.current_attachment(), Ok(Some(_))) {
+            return Err(TerminalSendError::Closed);
+        }
+        self.try_command(ClientCommand::AcknowledgeConversation(read_at))
     }
 
     pub fn events(&self) -> Receiver<TerminalEvent> {
@@ -2197,6 +2205,7 @@ fn serve_connection(
     } = context;
     let terminal_id = *terminal_id;
     published.clear_current_attachment();
+    let connected_at = Instant::now();
     // Retire currentness on every EOF, retry, stop, or unwind before the next
     // connection can authenticate. The remembered proof remains unchanged.
     let _attachment = CurrentAttachment(published);
@@ -2678,6 +2687,9 @@ fn serve_connection(
                 published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
+            }
+            if !command.belongs_to_connection(connected_at) {
+                continue;
             }
             let operation = command.operation();
             let pending_kind = match &command {
@@ -3432,8 +3444,14 @@ mod tests {
                     epoch: 8
                 }),
             );
+            let connected_at = Instant::now();
+            let previous =
+                ClientCommand::AcknowledgeConversation(connected_at - Duration::from_millis(1));
+            let current = ClientCommand::AcknowledgeConversation(connected_at);
+            assert!(!previous.belongs_to_connection(connected_at));
+            assert!(current.belongs_to_connection(connected_at));
             assert_eq!(
-                ClientCommand::AcknowledgeConversation.into_request(id),
+                current.into_request(id),
                 ClientRequest::ChatAcknowledge {
                     chat_id: id,
                     epoch: 1
