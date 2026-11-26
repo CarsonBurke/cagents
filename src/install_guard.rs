@@ -152,6 +152,8 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
     ] {
         command.env_remove(name);
     }
+    #[cfg(target_os = "macos")]
+    command.env_remove(crate::instance::ui_startup::SOCKET_ENV);
 }
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -1065,6 +1067,11 @@ pub(crate) fn staged_agent_owner_cli(executable: &Path) -> io::Result<Option<std
 
 /// The ownership marker a staging transaction recorded in `version_root`, if
 /// any. It is only private routing evidence; it never conveys authority.
+#[cfg(target_os = "macos")]
+pub(crate) fn has_staged_owner_marker(version_root: &Path) -> bool {
+    !matches!(read_staged_owner(version_root), Ok(None))
+}
+
 fn read_staged_owner(version_root: &Path) -> io::Result<Option<StagedOwner>> {
     use std::os::unix::fs::OpenOptionsExt;
     let marker = version_root.join(STAGED_OWNER);

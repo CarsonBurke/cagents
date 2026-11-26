@@ -43,6 +43,8 @@ mod completions;
 pub use automations::AutomationCommand;
 #[cfg(all(test, feature = "host"))]
 mod daemon_stop_tests;
+#[cfg(target_os = "macos")]
+mod darwin_ui;
 mod sessions;
 #[cfg(test)]
 mod startup_route;
@@ -4604,7 +4606,17 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<Option<Strin
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
-        .env(UI_LAUNCH_PANE_NOTES_ENV, "1")
+        .env(UI_LAUNCH_PANE_NOTES_ENV, "1");
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = crate::update::stable_ui_bundle(
+        Path::new(command.get_program()),
+        &crate::process::current_executable()?,
+    )
+    .map_err(io::Error::other)?
+    {
+        return darwin_ui::launch(command, &bundle, timeout);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

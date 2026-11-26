@@ -96,6 +96,10 @@ pub(crate) fn main_with_before_start(
         Ok(None) => return std::process::ExitCode::SUCCESS,
         Err(error) => return report(Err(error)),
     };
+    #[cfg(target_os = "macos")]
+    if let Err(error) = cagents::instance::connect_ui_launcher() {
+        return report(Err(error.into()));
+    }
     if let Err(error) = before_start() {
         return report(Err(error));
     }
