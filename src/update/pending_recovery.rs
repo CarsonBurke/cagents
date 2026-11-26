@@ -154,15 +154,35 @@ pub(crate) fn run(
                 )
             })
             .transpose()?;
-        if previous_link.is_none() {
-            select_target(&layout)?;
-        }
-        guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         #[cfg(target_os = "linux")]
         let parked = standby.is_some();
         #[cfg(not(target_os = "linux"))]
         let parked = false;
+        // Prepare the authority transport before closing windows or publishing
+        // the direct-start target. Darwin rejects inherited receipts here.
+        let direct_start = if parked {
+            None
+        } else {
+            let mut command = Command::new(&cli);
+            command
+                .args(["daemon", "start"])
+                .stdout(log.try_clone()?)
+                .stderr(log.try_clone()?);
+            crate::install_guard::sanitize_child_environment(&mut command);
+            unsafe {
+                command.pre_exec(crate::daemon::seal_inherited_descriptors);
+            }
+            guard.inherit_for_install(&mut command)?;
+            handoff.inherit(&mut command)?;
+            // Receipt forwarding must remain last, after every descriptor remap.
+            receipt.inherit(&mut command)?;
+            Some(command)
+        };
+        if previous_link.is_none() {
+            select_target(&layout)?;
+        }
+        guard.close_prepared_windows(&current_windows, Duration::from_secs(45))?;
         #[cfg(target_os = "linux")]
         if let Some(standby) = standby.as_mut() {
             let started = standby
@@ -179,20 +199,7 @@ pub(crate) fn run(
             started?;
             installed::selected_candidate(&layout.prefix, &layout.version_root)?;
         }
-        if !parked {
-            let mut command = Command::new(&cli);
-            command
-                .args(["daemon", "start"])
-                .stdout(log.try_clone()?)
-                .stderr(log.try_clone()?);
-            crate::install_guard::sanitize_child_environment(&mut command);
-            unsafe {
-                command.pre_exec(crate::daemon::seal_inherited_descriptors);
-            }
-            guard.inherit_for_install(&mut command)?;
-            handoff.inherit(&mut command)?;
-            // Receipt forwarding must remain last, after every descriptor remap.
-            receipt.inherit(&mut command)?;
+        if let Some(mut command) = direct_start {
             crate::install_guard::wait_daemon_start(&mut command, timeout)
             .map_err(|failure| invalid(format!("Target recovery startup failed: {}. Its checkpoint and claim were preserved; inspect {} before another recovery attempt", failure.error, job.log_path.display())))?;
         }
@@ -387,4 +394,115 @@ fn reserve_worker_descriptor(worker: &File) -> Result<File, UpdateError> {
         std::os::fd::AsFd::as_fd(worker),
         WORKER_LOCK_FD,
     )?))
+}
+
+#[cfg(all(test, target_os = "linux", not(any(feature = "host", feature = "ui"))))]
+mod tests {
+    use super::*;
+    use crate::{
+        daemon::RuntimePaths,
+        model::{HostIncarnation, HostSessionId, HostSessionProof},
+        upgrade::handoff::{Checkpoint, Store},
+    };
+
+    #[test]
+    fn refused_start_transport_keeps_current() {
+        const TEST: &str = "update::pending_recovery::tests::refused_start_transport_keeps_current";
+        const FIXTURE: &str = "CAGENTS_TEST_RECOVERY_START_PREFIX";
+        if let Some(prefix) = std::env::var_os(FIXTURE) {
+            let prefix = PathBuf::from(prefix);
+            let paths = RuntimePaths::discover().unwrap();
+            crate::secure_file::prepare_private_directory(&paths.directory).unwrap();
+            private_create(&paths.lock).unwrap();
+            let proof = HostSessionProof {
+                host_session_id: HostSessionId::new("recovery-start-source"),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: HostIncarnation::new("recovery-start-source"),
+            };
+            let store = Store::discover().unwrap();
+            store
+                .save(&Checkpoint::new(proof.clone(), vec![], vec![], vec![]))
+                .unwrap();
+            let before = fs::read(&store.path).unwrap();
+            let pending = PendingRecovery::inspect().unwrap().unwrap();
+            let census = prefix.join("census");
+            serde_json::to_writer(
+                private_create(&census).unwrap(),
+                &serde_json::json!({
+                    "version": 1,
+                    "transaction": uuid::Uuid::new_v4(),
+                    "source": proof,
+                    "terminals": [],
+                    "chats": [],
+                }),
+            )
+            .unwrap();
+            let error = run(&pending.checkpoint_hash, true, Some(&census)).unwrap_err();
+            // The attempt reached startup after obtaining all its leases and
+            // validating the checkpoint. Forwarding requires a descriptor
+            // numbered 200 or above, which this child cannot allocate.
+            let job: UpdateJob =
+                serde_json::from_slice(&fs::read(prefix.join(".update/status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(job.phase, UpdatePhase::Failed);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&io::Error::from_raw_os_error(libc::EINVAL).to_string())
+            );
+            assert_eq!(
+                fs::read_link(prefix.join("current")).unwrap(),
+                Path::new("versions/old")
+            );
+            assert_eq!(fs::read(&store.path).unwrap(), before);
+            return;
+        }
+
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let prefix = fixture.path().join("install");
+        let candidate = prefix.join("versions/new/bin");
+        fs::create_dir_all(&candidate).unwrap();
+        fs::create_dir(prefix.join("versions/old")).unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
+        let cli = candidate.join("cagents");
+        fs::copy(crate::process::current_executable().unwrap(), &cli).unwrap();
+        fs::write(candidate.join("cagentsd"), b"unused daemon").unwrap();
+        fs::write(candidate.join("cagents-ui"), b"unused window").unwrap();
+        let runtime = fixture.path().join("runtime");
+        crate::secure_file::prepare_private_directory(&runtime).unwrap();
+        let mut command = Command::new(cli);
+        command
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(FIXTURE, &prefix)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", fixture.path().join("data"))
+            .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+            .env("XDG_STATE_HOME", fixture.path().join("state"))
+            .env("XDG_CACHE_HOME", fixture.path().join("cache"))
+            .env("HOME", fixture.path());
+        // SAFETY: this only changes the descriptor limit of the test child.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limits = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                limits.rlim_cur = 200;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
 }
