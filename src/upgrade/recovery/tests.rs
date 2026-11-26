@@ -109,6 +109,30 @@ fn preparation(root: &Path) -> Preparation {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn standby_retry_requires_the_original_ready_inode_even_with_identical_bytes() {
+    let directory = private_root();
+    let mut preparation = preparation(directory.path());
+    let bytes = checkpoint(&preparation, "Ready");
+    let canonical = preparation.authority.checkpoint_path.clone();
+    save(&canonical, &bytes);
+    preparation.authority.checkpoint_hash = digest(&bytes);
+    let receipt = Receipt {
+        checkpoint: StandbyCheckpoint::Ready(open_checkpoint(&canonical).unwrap().unwrap()),
+        worker: preparation.worker,
+        fence: preparation.fence,
+        legacy: preparation.legacy,
+        daemon: None,
+        authority: preparation.authority,
+    };
+    assert!(receipt.ready_before_restore().unwrap());
+    let replacement = directory.path().join("rolled-back-ready");
+    save(&replacement, &bytes);
+    fs::rename(replacement, canonical).unwrap();
+    assert!(!receipt.ready_before_restore().unwrap());
+}
+
 fn checkpoint(preparation: &Preparation, phase: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "version": 2, "phase": phase, "proof": preparation.authority.source,

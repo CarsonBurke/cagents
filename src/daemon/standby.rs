@@ -176,7 +176,7 @@ pub(crate) struct Parked {
     #[cfg(target_os = "macos")]
     image: Option<ParkedImage>,
     #[cfg(target_os = "macos")]
-    _publication: fs::File,
+    publication: fs::File,
 }
 
 #[cfg(target_os = "macos")]
@@ -225,6 +225,25 @@ impl Parked {
         guard: &UiUpdateGuard,
         previous_current: Option<&Path>,
     ) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let publication = crate::install_guard::reserve_darwin_publication()?;
+        Self::launch_with_custody(
+            executable,
+            expected,
+            guard,
+            previous_current,
+            #[cfg(target_os = "macos")]
+            publication,
+        )
+    }
+
+    fn launch_with_custody(
+        executable: &Path,
+        expected: (u64, u64),
+        guard: &UiUpdateGuard,
+        previous_current: Option<&Path>,
+        #[cfg(target_os = "macos")] publication: fs::File,
+    ) -> io::Result<Self> {
         let (channel, receiver) = UnixStream::pair()?;
         crate::descriptor::keep_options_after_shutdown(channel.as_fd())?;
         let mut command = Command::new(executable);
@@ -245,8 +264,6 @@ impl Parked {
         unsafe { command.pre_exec(super::seal_inherited_descriptors) };
         guard.inherit_for_install(&mut command)?;
         #[cfg(target_os = "macos")]
-        let publication = crate::install_guard::reserve_darwin_publication()?;
-        #[cfg(target_os = "macos")]
         crate::install_guard::inherit_darwin_publication(&mut command, &publication)?;
         let child = command.spawn()?;
         // Command retains its socket copy for possible reuse. Only the
@@ -260,11 +277,53 @@ impl Parked {
             #[cfg(target_os = "macos")]
             image: None,
             #[cfg(target_os = "macos")]
-            _publication: publication,
+            publication,
         };
         parked.channel.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
         parked.verify_launch(pid, expected)?;
         Ok(parked)
+    }
+
+    /// A transport failure may leave a running custodian. An admission
+    /// refusal should also be reported as such instead of attempted again.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn exited_during_start(&mut self, error: &io::Error) -> bool {
+        !error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<AdmissionRejected>())
+            && self
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .is_ok_and(|status| status.is_some())
+    }
+
+    /// The prior child is reaped. Keep the same account publication
+    /// description and every caller-owned fence across the new launch.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn retry_exited(
+        &mut self,
+        executable: &Path,
+        expected: (u64, u64),
+        guard: &UiUpdateGuard,
+        previous_current: Option<&Path>,
+    ) -> io::Result<()> {
+        if self.child.as_mut().unwrap().try_wait()?.is_none() {
+            return Err(io::Error::other(
+                "The original standby still owns its process",
+            ));
+        }
+        let next = Self::launch_with_custody(
+            executable,
+            expected,
+            guard,
+            previous_current,
+            self.publication.try_clone()?,
+        )?;
+        drop(self.child.take());
+        *self = next;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -851,6 +910,27 @@ mod tests {
             panic!("buffered acknowledgement overdue")
         })
         .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exited_standby_can_retry_transport_loss_but_not_admission_refusal() {
+        let (channel, _peer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        let mut standby = Parked {
+            channel,
+            child: Some(child),
+            transferred: false,
+            image: None,
+            publication: tempfile::tempfile().unwrap(),
+        };
+        assert!(standby.exited_during_start(&io::Error::from(io::ErrorKind::UnexpectedEof)));
+        assert!(
+            !standby.exited_during_start(&io::Error::other(AdmissionRejected(
+                "fixture refusal".into()
+            )))
+        );
     }
 
     #[test]
