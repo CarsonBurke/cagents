@@ -172,6 +172,31 @@ impl Pending {
         }
     }
 
+    /// Apply the courier's latest inbox snapshot. That snapshot is complete,
+    /// so it retires inbox attention only when its mail is gone; offline
+    /// recipients keep theirs. Without the journal's notices it stays queued.
+    fn reconcile_inboxes(&mut self, journal: &mut Journal) -> Result<(), String> {
+        let Some(inboxes) = self.inboxes.take() else {
+            return Ok(());
+        };
+        let notices = match journal.list() {
+            Ok(notices) => notices,
+            Err(error) => {
+                self.inboxes = Some(inboxes);
+                return Err(error);
+            }
+        };
+        for notice in notices {
+            if let Target::SessionInbox(lineage) = notice.event.target
+                && !inboxes.pending.contains(&lineage)
+            {
+                self.retired.insert(Target::SessionInbox(lineage));
+            }
+        }
+        self.events.extend(inboxes.events);
+        Ok(())
+    }
+
     /// The work that waits for an unavailable journal rather than being lost:
     /// attention, retirements, acknowledgements and the settings and windows
     /// they are judged by. Receipts and tests are answered at once, and a
@@ -343,6 +368,10 @@ impl Handle {
 
     pub fn presence(&self, client: ClientId, presence: Option<Presence>) {
         let mut current = self.0.presence.lock().unwrap_or_else(|p| p.into_inner());
+        // Windows republish unchanged presence; the broker already has it.
+        if current.get(&client) == presence.as_ref() {
+            return;
+        }
         if let Some(presence) = presence {
             current.insert(client, presence);
         } else {
@@ -1274,6 +1303,9 @@ async fn run(
     let mut retry_delay = RETRY_DELAY;
     let mut withdrawal_retry = None;
     let mut automation_retry = AutomationRetry::default();
+    // Inbox reconciliation that could not read the journal. The courier
+    // publishes again only when its mail changes, so retry on a timer.
+    let mut inbox_retry = None;
     let mut snapshot = Snapshot {
         diagnostic: settings_error.clone(),
         ..Default::default()
@@ -1315,6 +1347,7 @@ async fn run(
             .chain(predecessor_retry.as_ref().map(|(due, _)| *due))
             .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
             .chain(automation_retry.deadline())
+            .chain(inbox_retry)
             .min()
         }),
     )
@@ -1324,6 +1357,8 @@ async fn run(
             break;
         };
         let mut pending = std::mem::take(&mut deferred).followed_by(take_pending(&core));
+        // This wake reaches any deferred inboxes; a failure below rearms it.
+        inbox_retry = None;
         let current_presence = pending.presence_changed.then(|| {
             core.presence
                 .lock()
@@ -1496,22 +1531,11 @@ async fn run(
             next_attempt = Instant::now();
             retry_delay = RETRY_DELAY;
         }
-        if let Some(inboxes) = pending.inboxes.take() {
-            // A complete durable pending snapshot retires inbox attention only
-            // when mail is gone; offline recipients keep existing attention.
-            match journal.list() {
-                Ok(notices) => {
-                    for notice in notices {
-                        if let Target::SessionInbox(lineage) = notice.event.target
-                            && !inboxes.pending.contains(&lineage)
-                        {
-                            pending.retired.insert(Target::SessionInbox(lineage));
-                        }
-                    }
-                }
-                Err(error) => snapshot.diagnostic = Some(error),
-            }
-            pending.events.extend(inboxes.events);
+        if let Err(error) = pending.reconcile_inboxes(journal) {
+            // A newer courier publication replaces this one first.
+            snapshot.diagnostic = Some(error);
+            deferred.inboxes = pending.inboxes.take();
+            inbox_retry = Some(Instant::now() + RETRY_DELAY);
         }
         for session in pending.retired {
             if settle_attention_at_shutdown(
@@ -2163,7 +2187,7 @@ mod tests {
         handle.record(attention_event(replaced, "older"));
         handle.record(attention_event(kept, "kept"));
         handle.acknowledge(acknowledged);
-        handle.presence(1, None);
+        handle.presence(1, Some(Presence::default()));
         let receipt = handle
             .record_committed(attention_event(kept, "receipt"))
             .unwrap();
@@ -2755,6 +2779,85 @@ mod tests {
         );
         shared.pending.lock().unwrap().stopped = true;
         assert!(handle.record_committed(event).is_err());
+    }
+
+    #[test]
+    fn presence_wakes_the_broker_only_when_a_client_presence_changes() {
+        let (shared, mut receiver) = shared();
+        let handle = Handle(shared.clone());
+        let session = TerminalId::new();
+        let mut presence = Presence {
+            window: "primary".into(),
+            sessions: vec![session],
+            ..Presence::default()
+        };
+
+        handle.presence(1, None);
+        assert!(receiver.try_recv().is_err());
+
+        handle.presence(1, Some(presence.clone()));
+        assert!(receiver.try_recv().is_ok());
+        assert!(take_pending(&shared).presence_changed);
+        handle.presence(1, Some(presence.clone()));
+        assert!(receiver.try_recv().is_err());
+        assert!(!take_pending(&shared).presence_changed);
+
+        presence.focused = Some(session);
+        handle.presence(1, Some(presence));
+        assert!(receiver.try_recv().is_ok());
+        assert!(take_pending(&shared).presence_changed);
+
+        handle.presence(1, None);
+        assert!(receiver.try_recv().is_ok());
+        assert!(take_pending(&shared).presence_changed);
+        handle.presence(1, None);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_unreadable_journal_keeps_the_inbox_snapshot_until_it_can_be_reconciled() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let lineage = crate::agent_execution::Lineage(session);
+        let inbox = Event {
+            content: None,
+            target: Target::SessionInbox(lineage),
+            source_session: Some(session),
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: crate::model::MessageId::new().to_string(),
+                kind: crate::notifications::Kind::MessageReceived,
+            },
+        };
+        journal.record(inbox.clone(), false).unwrap().unwrap();
+        // The broker has already listed this journal.
+        assert_eq!(journal.list().unwrap().len(), 1);
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute("UPDATE notices SET event = 'unreadable'", [])
+            .unwrap();
+        let mut pending = Pending {
+            inboxes: Some(InboxAttention::default()),
+            ..Pending::default()
+        };
+
+        assert!(pending.reconcile_inboxes(&mut journal).is_err());
+        assert!(pending.inboxes.is_some());
+        assert!(pending.retired.is_empty());
+
+        writer
+            .execute(
+                "UPDATE notices SET event = ?1",
+                [serde_json::to_string(&inbox).unwrap()],
+            )
+            .unwrap();
+        pending.reconcile_inboxes(&mut journal).unwrap();
+        assert!(pending.inboxes.is_none());
+        assert_eq!(pending.retired, BTreeSet::from([inbox.target()]));
     }
 
     #[test]
