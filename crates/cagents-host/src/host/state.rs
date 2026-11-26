@@ -1435,7 +1435,7 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
         epoch: u64,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<bool, ProtocolError> {
         self.attached_terminal(client_id, terminal_id)?;
         let observation = self
             .subscriptions
@@ -1445,8 +1445,9 @@ impl HostState {
         if epoch > observation.epoch {
             observation.epoch = epoch;
             self.rearm_output(client_id, terminal_id);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) fn list(&self, client_id: ClientId) -> Vec<TerminalDescriptor> {

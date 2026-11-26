@@ -398,6 +398,21 @@ impl Registry {
         Ok(sessions)
     }
 
+    pub(in crate::host) fn notice_predecessors(
+        &self,
+        session: TerminalId,
+    ) -> Result<std::collections::BTreeSet<TerminalId>, String> {
+        let Some(lineage) = self.session_lineage(session)? else {
+            return Ok(Default::default());
+        };
+        Ok(self
+            .lineage_succession(lineage)?
+            .into_iter()
+            .skip_while(|candidate| *candidate != session)
+            .skip(1)
+            .collect())
+    }
+
     pub(crate) fn session_channels(
         &self,
         sessions: &[TerminalId],
@@ -652,6 +667,38 @@ mod tests {
                 .filter(|lineage| *lineage == Lineage(first))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn reading_a_session_can_acknowledge_only_its_earlier_lineage_members() {
+        let (mut registry, _directory, _) = fixture();
+        let first = TerminalId::new();
+        registry
+            .fresh_agent_authority(&terminal(first, None))
+            .unwrap();
+        let second = TerminalId::new();
+        registry.succeed(second, first, None, |_| false).unwrap();
+        let newest = TerminalId::new();
+        registry.succeed(newest, second, None, |_| false).unwrap();
+        let unrelated = TerminalId::new();
+        registry.succeed(unrelated, first, None, |_| true).unwrap();
+
+        assert_eq!(
+            registry.notice_predecessors(newest).unwrap(),
+            [first, second].into()
+        );
+        assert_eq!(
+            registry.notice_predecessors(second).unwrap(),
+            [first].into()
+        );
+        assert!(registry.notice_predecessors(first).unwrap().is_empty());
+        assert!(registry.notice_predecessors(unrelated).unwrap().is_empty());
+        assert!(
+            registry
+                .notice_predecessors(TerminalId::new())
+                .unwrap()
+                .is_empty()
         );
     }
 

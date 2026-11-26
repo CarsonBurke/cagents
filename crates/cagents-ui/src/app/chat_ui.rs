@@ -5496,7 +5496,7 @@ impl Runtime {
         runtime
     }
     /// The live connection, once the conversation has started.
-    fn handle(&self) -> Option<&Arc<ClientHandle>> {
+    pub(super) fn handle(&self) -> Option<&Arc<ClientHandle>> {
         match &self.connection {
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
             Connection::Live(handle) => Some(handle),

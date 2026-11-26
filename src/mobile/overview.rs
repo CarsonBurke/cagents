@@ -3,7 +3,7 @@
 use std::{
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -14,14 +14,22 @@ use cagents_mobile_api as api;
 use super::{Failure, Outbox, WatchSocket, daemon_lost, translate};
 use crate::{
     control::{ControlClient, ControlError},
-    model::HostSessionProof,
+    model::{HostSessionProof, TerminalId},
     terminal::ipc::MobileWatch,
 };
+
+type SessionNotices = Vec<(TerminalId, uuid::Uuid)>;
+
+struct Publication {
+    event: api::Event,
+    session_notices: SessionNotices,
+}
 
 pub(super) struct Watch {
     stop: WatchSocket,
     active: Arc<AtomicBool>,
     outbox: Outbox,
+    session_notices: Arc<Mutex<SessionNotices>>,
 }
 
 impl Watch {
@@ -39,6 +47,8 @@ impl Watch {
         let active = Arc::new(AtomicBool::new(true));
         let watching = active.clone();
         let publish = outbox.clone();
+        let session_notices = Arc::new(Mutex::new(Vec::new()));
+        let sent_notices = session_notices.clone();
         thread::Builder::new()
             .name("mobile-overview".into())
             .spawn(move || {
@@ -67,12 +77,17 @@ impl Watch {
                     Ok((control, initial))
                 };
                 match open() {
-                    Ok((mut control, event)) => {
+                    Ok((mut control, initial)) => {
                         publish.ok(id);
-                        publish
-                            .send_while_watched(&watching, api::ServerLine::Event(event.clone()));
-                        if let Err(error) = follow(&mut control, topic, event, &publish, &watching)
-                        {
+                        let last = send(initial, &publish, &watching, &sent_notices);
+                        if let Err(error) = follow(
+                            &mut control,
+                            topic,
+                            last,
+                            &publish,
+                            &watching,
+                            &sent_notices,
+                        ) {
                             publish.close_while_watched(&watching, lost(&error));
                         }
                     }
@@ -97,7 +112,17 @@ impl Watch {
             stop,
             active,
             outbox: outbox.clone(),
+            session_notices,
         })
+    }
+
+    pub(super) fn session_notices(&self, session: TerminalId) -> Vec<uuid::Uuid> {
+        self.session_notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(target, id)| (*target == session).then_some(*id))
+            .collect()
     }
 }
 
@@ -108,7 +133,7 @@ impl Drop for Watch {
     }
 }
 
-fn snapshot(control: &mut ControlClient, topic: MobileWatch) -> Result<api::Event, ControlError> {
+fn snapshot(control: &mut ControlClient, topic: MobileWatch) -> Result<Publication, ControlError> {
     match topic {
         MobileWatch::Sessions => {
             let sessions = control
@@ -116,14 +141,45 @@ fn snapshot(control: &mut ControlClient, topic: MobileWatch) -> Result<api::Even
                 .iter()
                 .map(translate::session)
                 .collect();
-            Ok(api::Event::Sessions(api::Sessions { sessions }))
+            Ok(Publication {
+                event: api::Event::Sessions(api::Sessions { sessions }),
+                session_notices: Vec::new(),
+            })
         }
         MobileWatch::Notifications => {
-            let notices = translate::notices(&control.read_notifications()?);
-            Ok(api::Event::Notifications(api::Notifications { notices }))
+            let snapshot = control.read_notifications()?;
+            let notices = translate::notices(&snapshot);
+            let session_notices = snapshot
+                .notices
+                .into_iter()
+                .filter_map(|notice| match notice.event.target {
+                    crate::notifications::Target::Session(session) if !notice.acknowledged => {
+                        Some((session, notice.id))
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(Publication {
+                event: api::Event::Notifications(api::Notifications { notices }),
+                session_notices,
+            })
         }
         MobileWatch::Conversation(_) => unreachable!("conversation watches own their projection"),
     }
+}
+
+fn send(
+    publication: Publication,
+    outbox: &Outbox,
+    active: &AtomicBool,
+    session_notices: &Mutex<SessionNotices>,
+) -> api::Event {
+    // A conversation opened from this publication can see its exact notice
+    // IDs as soon as the phone receives it.
+    let mut sent = session_notices.lock().unwrap();
+    outbox.send_while_watched(active, api::ServerLine::Event(publication.event.clone()));
+    *sent = publication.session_notices;
+    publication.event
 }
 
 fn follow(
@@ -132,16 +188,16 @@ fn follow(
     mut last: api::Event,
     outbox: &Outbox,
     active: &AtomicBool,
+    session_notices: &Mutex<SessionNotices>,
 ) -> Result<(), ControlError> {
     loop {
         control.next_mobile_change()?;
         if !outbox.wait_for_room(active) {
             return Ok(());
         }
-        let event = snapshot(control, topic)?;
-        if event != last {
-            last = event.clone();
-            outbox.send_while_watched(active, api::ServerLine::Event(event));
+        let publication = snapshot(control, topic)?;
+        if publication.event != last {
+            last = send(publication, outbox, active, session_notices);
         }
     }
 }

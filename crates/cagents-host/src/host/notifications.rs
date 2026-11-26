@@ -316,6 +316,47 @@ impl Handle {
     }
 }
 
+/// A read of an attached conversation also covers notices from earlier
+/// owners of that conversation. Capture their UUIDs before resolving lineage
+/// so any newly published notice keeps its unread state.
+pub(super) fn acknowledge_predecessors(host: &SharedHost, session: TerminalId) {
+    let notifications = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .notifications
+        .clone();
+    let Some(notifications) = notifications else {
+        return;
+    };
+    let unread: Vec<_> = notifications
+        .snapshot()
+        .notices
+        .into_iter()
+        .filter_map(|notice| match notice.event.target {
+            Target::Session(id) if id != session && !notice.acknowledged => Some((id, notice.id)),
+            _ => None,
+        })
+        .collect();
+    if unread.is_empty() {
+        return;
+    }
+    let predecessors = (|| {
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        registry.notice_predecessors(session)
+    })();
+    match predecessors {
+        Ok(predecessors) => {
+            for (session, id) in unread {
+                if predecessors.contains(&session) {
+                    notifications.acknowledge(id);
+                }
+            }
+        }
+        Err(error) => tracing::debug!(%error, %session, "could not resolve attention lineage"),
+    }
+}
+
 pub(super) struct Broker {
     handle: Handle,
     thread: Option<JoinHandle<()>>,

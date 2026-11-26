@@ -101,12 +101,14 @@ impl Watch {
         socket: PathBuf,
         proof: HostSessionProof,
         outbox: Outbox,
+        unread: Vec<uuid::Uuid>,
         ended: impl FnOnce(TerminalId, Option<String>) + Send + 'static,
     ) -> std::io::Result<Self> {
         Self::start(
             id,
             chat_id,
             outbox,
+            unread,
             move |stop| {
                 let mut control = ControlClient::connect_observing_socket(&socket, |stream| {
                     stop.register(stream)
@@ -144,6 +146,7 @@ impl Watch {
         id: u64,
         chat_id: TerminalId,
         outbox: Outbox,
+        unread: Vec<uuid::Uuid>,
         open: impl FnOnce(&WatchSocket) -> Result<Opening, Failure> + Send + 'static,
         ended: impl FnOnce(TerminalId, Option<String>) + Send + 'static,
     ) -> std::io::Result<Self> {
@@ -193,7 +196,7 @@ impl Watch {
                     inputs,
                     pending: HashMap::new(),
                 };
-                let end = connection.run(id, session, feed);
+                let end = connection.run(id, session, feed, unread);
                 worker_stop.stop();
                 // Only a live watch can report an unexpected daemon loss.
                 // An unwatch also shuts down this stream to interrupt setup.
@@ -283,7 +286,13 @@ struct Followed {
 impl Connection {
     /// Follow the chat until the phone, the conversation or the daemon ends
     /// the watch.
-    fn run(&mut self, id: u64, session: chat::Session, feed: Sender<Input>) -> End {
+    fn run(
+        &mut self,
+        id: u64,
+        session: chat::Session,
+        feed: Sender<Input>,
+        unread: Vec<uuid::Uuid>,
+    ) -> End {
         let snapshot = match self.attach(session) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -322,6 +331,15 @@ impl Connection {
         if !opened {
             self.outbox.error(Some(id), stopped_during_attach());
             return End::Phone;
+        }
+        // This is the first read on this attached stream. The desktop uses
+        // the same acknowledgement to cover predecessor sessions.
+        let _ = self.request(ClientRequest::ChatAcknowledge {
+            chat_id: self.chat_id,
+            epoch: 1,
+        });
+        for id in unread {
+            let _ = self.request(ClientRequest::AcknowledgeNotification { id });
         }
         // From here on the reader thread waits for frames for as long as the
         // conversation is followed.

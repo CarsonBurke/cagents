@@ -4558,9 +4558,12 @@ fn process_inner(
             }
             let record = attached_mut(&mut state, client, chat_id)?;
             let observation = record.observations.entry(client).or_default();
-            if epoch > observation.epoch {
-                observation.acknowledge(epoch, record.handle.observe_next_update());
+            if epoch <= observation.epoch {
+                return Ok(ServerResponse::Accepted);
             }
+            observation.acknowledge(epoch, record.handle.observe_next_update());
+            drop(state);
+            super::notifications::acknowledge_predecessors(host, chat_id);
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatVisibility { chat_id, visible } => {
