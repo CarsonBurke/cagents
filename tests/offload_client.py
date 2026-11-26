@@ -73,7 +73,7 @@ sys.path.insert(0, sys.argv[1])
 from offload_client import LocalSyncCancelled, run_local
 
 try:
-    run_local(lambda: sys.exit(3), cancel_fd=0)
+    run_local(lambda _descriptor: sys.exit(3), cancel_fd=0)
 except LocalSyncCancelled:
     sys.exit(0)
 sys.exit(4)
@@ -87,7 +87,8 @@ sys.exit(4)
 
     def test_local_worker_lowers_priority_without_changing_caller(self):
         before = os.getpriority(os.PRIO_PROCESS, 0)
-        inside = run_local(os.getpriority, os.PRIO_PROCESS, 0, environment=self.environment)
+        inside = run_local(lambda _descriptor: os.getpriority(os.PRIO_PROCESS, 0),
+                           environment=self.environment)
         self.assertEqual(inside, min(before + 10, 19))
         self.assertEqual(os.getpriority(os.PRIO_PROCESS, 0), before)
 

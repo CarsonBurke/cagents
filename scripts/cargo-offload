@@ -1973,6 +1973,7 @@ class Offload:
         self.children = []
         self.command = None
         self.lease = None
+        self.local_sync_fd = None
         self.cancelled = 0
         # A Git marker above the slot's checkout, as its lease reported.
         self.marker = None
@@ -1997,7 +1998,7 @@ class Offload:
                 pass
         return self.connection(master=arguments[0] == "lease") + [self.host] + remote_command(arguments)
 
-    def spawn(self, command, *, timeout, remote_long=False, **options):
+    def spawn(self, command, *, timeout, remote_long=False, local_sync_fd=None, **options):
         # Own the whole transport tree, including ProxyCommand, even if ssh
         # exits first or this client is killed before it can cancel the child.
         supervisor = Path(__file__).resolve().with_name("cargo-gate-command.py")
@@ -2005,6 +2006,11 @@ class Offload:
                    "--parent", str(os.getpid()), "--timeout", str(timeout)]
         if not (self.loopback and remote_long):
             wrapper.append("--drain-on-exit")
+        if local_sync_fd is not None:
+            # The supervisor keeps admission until it has reaped the
+            # transfer, including if this client is killed.
+            wrapper += ["--hold-fd", str(local_sync_fd)]
+            options["pass_fds"] = (local_sync_fd,)
         if remote_long and not self.loopback:
             lower = Path(__file__).resolve().with_name("offload_client.py")
             command = [sys.executable, "-I", str(lower), "low", *command]
@@ -2021,7 +2027,7 @@ class Offload:
             failures.update((10, 12, 30, 35))  # Socket, protocol stream, I/O or connect timeout.
         for attempt in range(2):
             self.check_lease()
-            child = self.spawn(command, timeout=self.transfer_timeout,
+            child = self.spawn(command, timeout=self.transfer_timeout, local_sync_fd=self.local_sync_fd,
                                stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                                **options)
             output, errors = child.communicate(data)
@@ -2113,8 +2119,15 @@ class Offload:
             os.close(self.cancel_writer)
 
     def local(self, function, *arguments, admitting=False):
+        def work(descriptor):
+            self.local_sync_fd = descriptor
+            try:
+                return function(*arguments)
+            finally:
+                self.local_sync_fd = None
+
         deadline = admission_deadline(self.environment) if admitting else None
-        return offload_client.run_local(function, *arguments, environment=self.environment,
+        return offload_client.run_local(work, environment=self.environment,
                                         cancel_fd=self.cancel_reader,
                                         deadline=None if deadline is None else deadline / 1e9)
 

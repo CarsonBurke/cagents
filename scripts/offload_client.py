@@ -147,14 +147,14 @@ def lower_priority():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def run_local(function, *args, environment=os.environ, cancel_fd=None, deadline=None, **kwargs):
-    """Run a local phase on a worker, since a thread cannot raise its nice back."""
+def run_local(function, *, environment=os.environ, cancel_fd=None, deadline=None):
+    """Run a local phase, passing its lock descriptor to the worker function."""
     import concurrent.futures
 
     def work():
-        with local_phase(environment, cancel_fd=cancel_fd, deadline=deadline):
+        with local_phase(environment, cancel_fd=cancel_fd, deadline=deadline) as descriptor:
             lower_priority()
-            return function(*args, **kwargs)
+            return function(descriptor)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         return executor.submit(work).result()

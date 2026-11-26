@@ -17,6 +17,7 @@ import json
 import os
 import pwd
 import resource
+import select
 from pathlib import Path
 import shlex
 import shutil
@@ -442,6 +443,58 @@ class Transport(unittest.TestCase):
             self.assertEqual(result.stdout, b"retry\n")
             self.assertFalse(Path(f"/proc/{marker.read_text()}").exists())
             say.assert_called_once_with("transfer with host failed (status 124); retrying once")
+
+    def test_a_transfer_keeps_its_local_slot_while_its_dead_client_is_drained(self):
+        with FixtureDirectory() as scope:
+            prefix = Path(scope.name, "sync.lock")
+            transfer = textwrap.dedent("""
+                import os, signal
+                signal.signal(signal.SIGTERM, lambda *_: print("draining", flush=True))
+                print(os.getpid(), flush=True)
+                while True:
+                    signal.pause()
+            """)
+            client = textwrap.dedent("""
+                import runpy, sys
+                offload = runpy.run_path(sys.argv[1])
+                environment = {
+                    "CAGENTS_BUILD_LOCAL_SYNC_LOCK": sys.argv[2],
+                    "CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "1",
+                }
+                build = offload["Offload"]("host", offload["parse"](["check"]), environment)
+                build.run_build = lambda: build.local(
+                    lambda: build.transfer([sys.executable, "-c", sys.argv[3]]).returncode
+                )
+                sys.exit(build.run())
+            """)
+            environment = {
+                "CAGENTS_BUILD_LOCAL_SYNC_LOCK": str(prefix),
+                "CAGENTS_BUILD_LOCAL_SYNC_SLOTS": "1",
+            }
+            with subprocess.Popen([sys.executable, "-I", "-c", client,
+                                   str(ROOT / "scripts/cargo-offload"), str(prefix), transfer],
+                                  stdout=subprocess.PIPE) as process:
+                try:
+                    self.assertTrue(select.select([process.stdout], [], [], HANG_GUARD)[0])
+                    transfer_pid = int(process.stdout.readline())
+                    process.kill()
+                    process.wait(timeout=HANG_GUARD)
+                    self.assertTrue(select.select([process.stdout], [], [], HANG_GUARD)[0])
+                    self.assertEqual(process.stdout.readline(), b"draining\n")
+                    with open(f"{prefix}.0") as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # The supervisor holds stdout open through reaping.
+                    self.assertTrue(select.select([process.stdout], [], [], HANG_GUARD)[0])
+                    self.assertEqual(process.stdout.read(), b"")
+                    self.assertFalse(Path(f"/proc/{transfer_pid}").exists())
+                    with offload.offload_client.local_phase(
+                        environment, deadline=time.monotonic() + HANG_GUARD
+                    ):
+                        pass
+                finally:
+                    if process.poll() is None:
+                        process.kill()
 
     def test_a_run_channel_retries_before_sending_a_cargo_request(self):
         with FixtureDirectory() as scope:

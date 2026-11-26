@@ -182,6 +182,10 @@ def main():
             admission_deadline = positive_integer(value)
         elif option == "--timeout":
             command_deadline = time.monotonic_ns() + positive_integer(value) * 1_000_000_000
+        elif option == "--hold-fd":
+            # Keep this lock in the supervisor through drain(), without
+            # forwarding it to commands and their unrelated descendants.
+            os.set_inheritable(positive_integer(value), False)
         else:
             raise ValueError(f"unknown option {option}")
     signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
