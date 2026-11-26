@@ -106,7 +106,7 @@ pub struct Observer {
     accounts: Mutex<BTreeMap<Key, Arc<Mutex<Entry>>>>,
     rollouts: rollout::Rollouts,
     attention: Mutex<attention::Tails>,
-    waiting: Mutex<BTreeMap<(i32, u64), (ActivityState, Instant)>>,
+    claude_activity: Mutex<BTreeMap<(i32, u64), (ActivityState, Instant)>>,
 }
 
 #[derive(Default)]
@@ -114,6 +114,26 @@ pub struct Observation {
     pub activity: Option<Activity>,
     pub title: Option<String>,
     pub attention: Option<crate::notifications::Evidence>,
+    pub clear_attention: Option<AttentionClear>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionClear {
+    TurnStarted,
+    RequestResolved,
+}
+
+fn observed_claude_progress(
+    previous: Option<ActivityState>,
+    current: ActivityState,
+) -> Option<AttentionClear> {
+    match (previous?, current) {
+        (ActivityState::Idle, ActivityState::Working) => Some(AttentionClear::TurnStarted),
+        (previous, ActivityState::Idle | ActivityState::Working) if previous.waits_on_user() => {
+            Some(AttentionClear::RequestResolved)
+        }
+        _ => None,
+    }
 }
 
 pub enum ObserveError {
@@ -142,7 +162,7 @@ impl Observer {
         // the rollouts it holds open; only one that holds none can be a client
         // of the shared server the census asks.
         if provider == Provider::Codex
-            && let Some((state, attention)) = self.rollouts.observe(
+            && let Some((state, edges)) = self.rollouts.observe(
                 process.pid,
                 process.start,
                 u32::try_from(process.pid)
@@ -155,7 +175,8 @@ impl Observer {
             return Ok(Observation {
                 activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
                 title: None,
-                attention,
+                attention: edges.notice,
+                clear_attention: edges.started.then_some(AttentionClear::TurnStarted),
             });
         }
         let key = key(provider, recipe).map_err(|_| ObserveError::Unavailable)?;
@@ -251,41 +272,73 @@ impl Observer {
                                 (process.pid, process.start),
                             )
                             .ok()
-                            .flatten()
+                            .and_then(|edges| edges.notice)
                     })
             }
             Inventory::Codex(_) => None,
         };
-        let waiting = (|| {
+        let previous = (|| {
             // Claude's PID-scoped inventory explicitly distinguishes waiting.
             // A first census is a baseline, including when already waiting.
             if provider != Provider::Claude {
                 return None;
             }
-            let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
+            let mut activity = self
+                .claude_activity
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let key = (process.pid, process.start);
-            if !waiting.contains_key(&key) && waiting.len() >= 2048 {
-                let stale = waiting
+            if !activity.contains_key(&key) && activity.len() >= 2048 {
+                let stale = activity
                     .iter()
                     .min_by_key(|(_, (_, seen))| *seen)
                     .map(|(key, _)| *key);
                 if let Some(stale) = stale {
-                    waiting.remove(&stale);
+                    activity.remove(&stale);
                 }
             }
-            let old = waiting.insert(key, (state, Instant::now()));
-            (state.waits_on_user() && old.is_some_and(|(old, _)| old != state)).then(|| {
-                crate::notifications::Evidence {
-                    key: format!("waiting:{}", uuid::Uuid::new_v4()),
-                    kind: crate::notifications::Kind::Waiting,
-                }
-            })
+            activity
+                .insert(key, (state, Instant::now()))
+                .map(|(previous, _)| previous)
         })();
+        let waiting = (state.waits_on_user() && previous.is_some_and(|previous| previous != state))
+            .then(|| crate::notifications::Evidence {
+                key: format!("waiting:{}", uuid::Uuid::new_v4()),
+                kind: crate::notifications::Kind::Waiting,
+            });
         Ok(Observation {
             activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
             title,
             attention: waiting.or(attention),
+            clear_attention: observed_claude_progress(previous, state),
         })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn claude_terminal_needs_a_known_progress_transition_to_clear_attention() {
+    use ActivityState::*;
+    assert_eq!(
+        observed_claude_progress(Some(Idle), Working),
+        Some(AttentionClear::TurnStarted)
+    );
+    assert_eq!(
+        observed_claude_progress(Some(Approval), Working),
+        Some(AttentionClear::RequestResolved)
+    );
+    assert_eq!(
+        observed_claude_progress(Some(Question), Idle),
+        Some(AttentionClear::RequestResolved)
+    );
+    for (previous, current) in [
+        (None, Working),
+        (Some(Approval), Unknown),
+        (Some(Unknown), Working),
+        (Some(Working), Working),
+        (Some(Question), Approval),
+    ] {
+        assert_eq!(observed_claude_progress(previous, current), None);
     }
 }
 

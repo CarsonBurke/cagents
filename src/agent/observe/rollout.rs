@@ -91,22 +91,25 @@ impl Rollouts {
         pid: i32,
         process_start: u64,
         started: Option<u64>,
-    ) -> Option<(ActivityState, Option<crate::notifications::Evidence>)> {
+    ) -> Option<(ActivityState, super::attention::Edges)> {
         let mut state = None;
-        let mut evidence = None;
+        let mut edges = super::attention::Edges::default();
         for (file, name) in written_rollouts(pid)? {
             let turn = self.turn(&file, name);
             state = Some(merge(state, activity(turn, started)));
-            if let Ok(Some(observed)) = self
+            if let Ok(observed) = self
                 .attention
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .read_for_process(&file, super::attention::Format::Codex, (pid, process_start))
             {
-                evidence = Some(observed);
+                edges.started |= observed.started;
+                if observed.notice.is_some() {
+                    edges.notice = observed.notice;
+                }
             }
         }
-        state.map(|state| (state, evidence))
+        state.map(|state| (state, edges))
     }
 
     fn turn(&self, file: &File, name: OsString) -> Option<Turn> {
