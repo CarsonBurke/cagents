@@ -390,14 +390,14 @@ mod tests {
         let (window, worker) = connect(92);
         let (send, receive) = crossbeam_channel::bounded(1);
         let native = ClientHandle::fixture_restore_on(window, source.clone(), move |wake| {
-            if let Wake::CompletedQueue(id, messages) = wake {
-                let _ = send.try_send((id, messages));
+            if let Wake::CompletedQueue(source, messages) = wake {
+                let _ = send.try_send((source, messages));
             }
         })
         .unwrap();
         assert_eq!(
             receive.recv_timeout(Duration::from_secs(5)).unwrap(),
-            (id, vec![message.clone()])
+            (source.clone(), vec![message.clone()])
         );
 
         let (window, history_worker) = connect(93);

@@ -1821,6 +1821,13 @@ fn direct_same_id_start_waits_for_the_exact_queue_and_keeps_it_on_start_refusal(
 fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
     let source = omp_card(Some(CONVERSATION), None);
     let id = source.id;
+    let mut expected_prior = source.clone();
+    expected_prior.proof = Some(handoff_proof());
+    let mut expected_replacement = expected_prior.clone();
+    expected_replacement.native_continuity = super::super::NativeContinuity::Durable {
+        provider_version: "replacement-version".into(),
+    };
+    let replacement_source = expected_replacement.clone();
     let (client, mut server) = UnixStream::pair().unwrap();
     let (end_tx, end_rx) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
@@ -1878,7 +1885,7 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
             None,
             &proof,
             ServerMessage::ChatQueueEnded {
-                source: session.clone(),
+                source: replacement_source.clone(),
                 execution: replacement,
             },
         );
@@ -1921,12 +1928,13 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
         assert_eq!(
             read.request,
             ClientRequest::ChatReadExitedQueue {
-                source: session.clone(),
+                source: replacement_source.clone(),
                 execution: Some(replacement),
             }
         );
         let next =
-            postcard::to_allocvec(&exited_queue_fixture(&session, 1, "replacement")).unwrap();
+            postcard::to_allocvec(&exited_queue_fixture(&replacement_source, 1, "replacement"))
+                .unwrap();
         handoff_reply(
             &mut server,
             &mut codec,
@@ -1951,15 +1959,15 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
         None,
         None,
         move |wake| {
-            if let Wake::CompletedQueue(id, messages) = wake {
-                let _ = send.send((id, messages));
+            if let Wake::CompletedQueue(source, messages) = wake {
+                let _ = send.send((source, messages));
             }
         },
     )
     .unwrap();
     end_tx.send(()).unwrap();
     let (source, messages) = received.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(source, id);
+    assert_eq!(source, expected_prior);
     assert_eq!(messages.len(), 3);
     assert!(
         messages
@@ -1967,7 +1975,7 @@ fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
             .all(|message| message.text == "ø".repeat(384 * 1024))
     );
     let (source, messages) = received.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(source, id);
+    assert_eq!(source, expected_replacement);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].text, "replacement");
     assert!(

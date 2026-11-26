@@ -275,16 +275,16 @@ pub enum Wake {
     AgentAddresses,
     Disconnected(String),
     ExitedQueue(TerminalId, Vec<super::QueuedMessage>),
-    /// An attached provider ended and its whole exact queue is available,
-    /// regardless of whether a final visible snapshot has arrived.
-    CompletedQueue(TerminalId, Vec<super::QueuedMessage>),
+    /// The authenticated source and whole queue of an attached or archived
+    /// ended provider, independent of the current presentation descriptor.
+    CompletedQueue(Session, Vec<super::QueuedMessage>),
 }
 #[derive(Clone)]
 pub struct ClientHandle {
     inner: Arc<Inner>,
 }
 struct CompletedQueueRead {
-    source: TerminalId,
+    source: Session,
     request: u64,
     collector: Option<ipc::ExitedQueueCollector>,
 }
@@ -297,16 +297,21 @@ impl CompletedQueueRead {
         source: Session,
         execution: Option<uuid::Uuid>,
     ) -> Result<Self, String> {
-        let id = source.id;
+        if source.proof.as_ref() != Some(proof) {
+            return Err("Completed chat queue names a different daemon".into());
+        }
         let request = next.fetch_add(1, Ordering::Relaxed);
         transmit(
             wire,
             proof,
             request,
-            ClientRequest::ChatReadExitedQueue { source, execution },
+            ClientRequest::ChatReadExitedQueue {
+                source: source.clone(),
+                execution,
+            },
         )?;
         Ok(Self {
-            source: id,
+            source,
             request,
             collector: None,
         })
@@ -323,7 +328,7 @@ impl CompletedQueueRead {
         match message {
             ServerMessage::Response {
                 response: ServerResponse::ChatExitedQueue { source, queued },
-            } if self.collector.is_none() && source == self.source => {
+            } if self.collector.is_none() && source == self.source.id => {
                 let Some(first) = queued else {
                     return Ok(None);
                 };
