@@ -9,6 +9,7 @@ pub mod verified;
 #[cfg(feature = "host")]
 pub use retention::collect_superseded;
 
+use super::handoff::Phase;
 use crate::{
     chat::Session,
     daemon::lease_handoff::LeaseHandoff,
@@ -765,11 +766,20 @@ struct Continuity {
 struct CheckpointIndex {
     version: u16,
     proof: HostSessionProof,
-    phase: String,
+    #[serde(deserialize_with = "checkpoint_phase_from_string")]
+    phase: Phase,
     terminals: Vec<TerminalSource>,
     #[serde(default)]
     carried: Vec<TerminalSource>,
     chats: Vec<ChatSource>,
+}
+
+fn checkpoint_phase_from_string<'de, D>(deserializer: D) -> Result<Phase, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let phase = String::deserialize(deserializer)?;
+    Phase::deserialize(serde::de::value::StrDeserializer::new(&phase))
 }
 
 #[derive(Deserialize)]
@@ -969,11 +979,11 @@ impl PendingRecovery {
         };
         let checkpoint: CheckpointIndex =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if checkpoint.phase == "Ready" {
+        if checkpoint.phase == Phase::Ready {
             return Ok(None);
         }
         if !(1..=5).contains(&checkpoint.version)
-            || checkpoint.phase != "Prepared"
+            || checkpoint.phase != Phase::Prepared
             || !checkpoint.proof.is_complete()
             || checkpoint.terminals.len() + checkpoint.carried.len() > super::handoff::MAX_TERMINALS
             || checkpoint.chats.len() > super::handoff::MAX_CHATS
@@ -1077,7 +1087,7 @@ impl PendingRecovery {
                     .into(),
             );
         }
-        if validate_checkpoint(&self.authority(), bytes)? != "Prepared"
+        if validate_checkpoint(&self.authority(), bytes)? != Phase::Prepared
             || digest(bytes) != self.checkpoint_hash
         {
             return Err(
@@ -1558,7 +1568,7 @@ impl CapturedPreparation {
         let bytes = read_checkpoint(&preparation.authority.checkpoint_path)?
             .ok_or("The acknowledged checkpoint disappeared before recovery")?;
         let phase = validate_checkpoint(&preparation.authority, &bytes)?;
-        if phase == "Ready" {
+        if phase == Phase::Ready {
             // The same acknowledged source may finish Prepared -> Ready while
             // this worker continuously owns its fences. Retain the full
             // original scope for the exact final bytes consumed by normal
@@ -2035,7 +2045,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
     let bytes = super::handoff::Store::discover()?
         .read_bytes()?
         .ok_or("The acknowledged source has no Ready checkpoint")?;
-    if validate_checkpoint(&authority, &bytes)? != "Ready" {
+    if validate_checkpoint(&authority, &bytes)? != Phase::Ready {
         return Err("The acknowledged preparation is still Prepared; previous provider shutdown is unconfirmed and ordinary startup is refused".into());
     }
     Ok(())
@@ -2053,11 +2063,11 @@ pub fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, Termina
         .collect()
 }
 
-fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, String> {
+fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<Phase, String> {
     let checkpoint: CheckpointIndex = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if !(1..=5).contains(&checkpoint.version)
         || checkpoint.proof != authority.source
-        || !matches!(checkpoint.phase.as_str(), "Prepared" | "Ready")
+        || !matches!(checkpoint.phase, Phase::Prepared | Phase::Ready)
     {
         return Err("The checkpoint is not this update's acknowledged source preparation".into());
     }
@@ -2626,12 +2636,12 @@ fn validate_settled_record(
     let index: CheckpointIndex = serde_json::from_slice(checkpoint).map_err(|e| e.to_string())?;
     if record.checkpoint_hash != digest(checkpoint)
         || record.source != index.proof
-        || index.phase != "Prepared"
+        || index.phase != Phase::Prepared
     {
         return Err("Settled recovery does not match the exact Prepared checkpoint".into());
     }
     let authority = validate_settled_identity(record, checkpoint_path, target)?;
-    if validate_checkpoint(&authority, checkpoint)? != "Prepared" {
+    if validate_checkpoint(&authority, checkpoint)? != Phase::Prepared {
         return Err("Settled recovery no longer names a Prepared checkpoint".into());
     }
     Ok(())
@@ -4275,7 +4285,7 @@ fn validate_received_checkpoint(authority: &Authority) -> Result<(), String> {
     let checkpoint =
         read_checkpoint(&authority.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
     super::handoff::validate_checkpoint_bytes(&checkpoint)?;
-    if validate_checkpoint(authority, &checkpoint)? != "Prepared"
+    if validate_checkpoint(authority, &checkpoint)? != Phase::Prepared
         || digest(&checkpoint) != authority.checkpoint_hash
     {
         return Err(

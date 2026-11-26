@@ -387,13 +387,30 @@ fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
 }
 
 #[test]
+fn checkpoint_discovery_requires_a_known_string_phase() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    let path = &preparation.authority.checkpoint_path;
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&checkpoint(&preparation, "Prepared")).unwrap();
+    for phase in [
+        serde_json::json!({ "Ready": null }),
+        serde_json::json!("Future"),
+    ] {
+        checkpoint["phase"] = phase;
+        save(path, &serde_json::to_vec(&checkpoint).unwrap());
+        assert!(PendingRecovery::inspect_at(path).is_err());
+    }
+}
+
+#[test]
 fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let bytes = checkpoint(&preparation, "Prepared");
     assert_eq!(
         validate_checkpoint(&preparation.authority, &bytes).unwrap(),
-        "Prepared"
+        Phase::Prepared
     );
     let mut foreign: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     foreign["proof"]["host_incarnation"] = "unrelated-daemon".into();
@@ -449,7 +466,7 @@ fn a_reviewed_conversation_whose_provider_ended_need_not_be_checkpointed() {
     // window restarts the saved conversation.
     assert_eq!(
         check(&mut preparation, chat(PROVIDER_ENDED)).unwrap(),
-        "Prepared"
+        Phase::Prepared
     );
     // Any other reviewed conversation must still be in the checkpoint.
     assert_eq!(
@@ -868,7 +885,7 @@ fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issue
                 &serde_json::to_vec(&checkpoint).unwrap()
             )
             .unwrap(),
-            "Ready"
+            Phase::Ready
         );
         checkpoint["chats"][0]["launch"]["session_id"] = uuid::Uuid::new_v4().to_string().into();
         assert!(
