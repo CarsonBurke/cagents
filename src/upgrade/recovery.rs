@@ -2167,6 +2167,8 @@ fn open_recovery_executable(path: &Path) -> Result<File, String> {
 }
 
 fn hash_open_executable(file: &File) -> Result<String, String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut reader = file.take(512 * 1024 * 1024 + 1);
     let mut buffer = [0u8; 64 * 1024];
@@ -2177,7 +2179,12 @@ fn hash_open_executable(file: &File) -> Result<String, String> {
         }
         hash.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    let mut digest = String::with_capacity(64);
+    for byte in hash.finalize() {
+        use std::fmt::Write as _;
+        write!(&mut digest, "{byte:02x}").expect("formatting a SHA-256 digest into a string");
+    }
+    Ok(digest)
 }
 
 fn same_authority_path(left: &Path, right: &Path) -> bool {

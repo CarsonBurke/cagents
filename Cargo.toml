@@ -190,6 +190,11 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c255
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"], optional = true }
 ksni = { version = "0.3.6", optional = true }
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# Exact recovery repeatedly authenticates large executable images. This
+# version selects the arm64 SHA instructions in Rust without a C build.
+sha2-image = { package = "sha2", version = "0.11" }
+
 [dev-dependencies]
 tokio = { version = "1.47", features = ["test-util"] }
 tracing-log = "0.2"
