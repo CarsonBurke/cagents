@@ -30,6 +30,8 @@ word:
   background  starts a command in the background and waits, silent, for it
               to finish (FAKE_ACP_BACKGROUND_SECONDS, default 20); stopping
               the turn fails the command
+  subagent    starts a subagent, which asks to run `make check`; refusing
+              it leaves the checks unrun, stopping the turn fails it
   garbage     prints a line that is not JSON in the middle of its answer
   files       asks the client to read a file and reports what it was told
   mode        switches its own mode and reports its new config options
@@ -622,6 +624,8 @@ class Agent:
             stop = self.hold(session)
         elif "background" in words:
             stop = self.background(session)
+        elif "subagent" in words:
+            stop = self.subagent(session)
         elif "garbage" in words:
             self.say(session, "Before the stray line. ")
             noise("fake-acp-agent: a diagnostic line that is not JSON")
@@ -852,6 +856,57 @@ class Agent:
                         "status": "completed",
                         "rawOutput": {"output": "built\n", "exit_code": 0}})
         self.say(session, "The build finished.")
+        return "end_turn"
+
+    def subagent(self, session):
+        """Antigravity 1.5.17's `invoke_subagent`: the call ends as soon as
+        the subagent starts, and of the subagent's steps only those that need
+        approval reach the parent session, under `<child session>:<call>`,
+        and are not replayed. The turn ends once the subagent has reported;
+        stopping it fails the subagent's command."""
+        invoke = {"toolCallId": "call_" + str(uuid.uuid4().int)[:19], "name": "invoke_subagent",
+                  "kind": "other", "title": "Run invoke_subagent",
+                  "rawInput": {"Role": "Release Checker", "TypeName": "self", "Model": "inherit",
+                               "Prompt": "Run `make check` in the project and report whether "
+                                         "it passes."}}
+        session.update({"sessionUpdate": "tool_call", **invoke, "status": "in_progress"},
+                       record=False)
+        session.update({"sessionUpdate": "tool_call", **invoke, "status": "completed"})
+        self.say(session, "I asked a subagent to run the checks. Waiting for its report.")
+        self.usage(session)
+        command = {"toolCallId": f"{uuid.uuid4()}:call_{str(uuid.uuid4().int)[:19]}",
+                   "name": "run_command", "kind": "execute", "title": "make check",
+                   "rawInput": {"CommandLine": "make check", "Cwd": session.cwd,
+                                "WaitMsBeforeAsync": 5000}}
+        session.update({"sessionUpdate": "tool_call", **command, "status": "pending"},
+                       record=False)
+        asked = self.call("session/request_permission", {
+            "sessionId": session.id,
+            "toolCall": {"sessionUpdate": "tool_call", **command, "status": "pending"},
+            "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]})
+        answer = self.wait_response(asked, session)
+        outcome = ((answer or {}).get("result") or {}).get("outcome") or {}
+        if session.id in self.cancelled or outcome.get("outcome") == "cancelled":
+            session.update({"sessionUpdate": "tool_call_update", **command, "status": "failed"},
+                           record=False)
+            return "cancelled"
+        if outcome.get("optionId") != "allow":
+            session.update({"sessionUpdate": "tool_call_update", **command, "status": "failed",
+                            "rawOutput": {"output": "Refused by the user"}}, record=False)
+            self.say(session, "\n\nThe subagent was not allowed to run the checks.")
+            return "end_turn"
+        session.update({"sessionUpdate": "tool_call_update", **command, "status": "in_progress"},
+                       record=False)
+        if self.pause(2, session):
+            session.update({"sessionUpdate": "tool_call_update", **command, "status": "failed"},
+                           record=False)
+            return "cancelled"
+        session.update({"sessionUpdate": "tool_call_update", **command, "status": "completed",
+                        "rawOutput": {"output": "All 214 checks passed.\n", "exit_code": 0}},
+                       record=False)
+        self.usage(session)
+        self.say(session, "\n\nThe subagent reports that `make check` passes: all 214 checks.")
         return "end_turn"
 
     def index(self):

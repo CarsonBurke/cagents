@@ -324,6 +324,44 @@ fn diff(block: &Value) -> Option<FileChange> {
     })
 }
 
+/// What a call names that a prompt asking for it may name too: its command,
+/// as Antigravity's `CommandLine` or another agent's `command`, and the files
+/// it reads or changes, by path and by name.
+pub(super) fn evidence(update: &Value) -> Vec<String> {
+    let input = &update["rawInput"];
+    let mut named: Vec<String> = [
+        input["CommandLine"].as_str().map(str::to_owned),
+        command_line(input),
+        (update["kind"] == "execute")
+            .then(|| update["title"].as_str().map(str::to_owned))
+            .flatten(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let locations = update["locations"].as_array().into_iter().flatten();
+    let diffs = update["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "diff");
+    for path in locations
+        .chain(diffs)
+        .filter_map(|entry| entry["path"].as_str())
+    {
+        named.push(path.to_owned());
+        if let Some(name) = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            named.push(name.to_owned());
+        }
+    }
+    named.retain(|text| !text.trim().is_empty());
+    named.dedup();
+    named
+}
+
 fn command_line(input: &Value) -> Option<String> {
     match &input["command"] {
         Value::String(command) => Some(command.clone()),

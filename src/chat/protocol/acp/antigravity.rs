@@ -22,6 +22,7 @@ pub static PROFILE: Profile = Profile {
     steers: true,
     cancel_stops_background: true,
     backgrounds_commands: true,
+    subagents: true,
 };
 
 /// What `agy acp` takes as `agy` does, with a value.

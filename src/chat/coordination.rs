@@ -274,8 +274,9 @@ pub fn may_recognize(item: &Item, provider: Provider) -> bool {
                     | "listAgents"
             ),
             Provider::Omp => name == "task",
-            // Their coordination tools aren't read yet.
-            Provider::Antigravity | Provider::Muse => false,
+            Provider::Antigravity => name == ANTIGRAVITY_SUBAGENT,
+            // Its coordination tools aren't read yet.
+            Provider::Muse => false,
         },
         _ => false,
     }
@@ -779,9 +780,14 @@ fn native(
         Provider::Claude => claude(id, name, input, output),
         Provider::Codex => codex(name, input, output),
         Provider::Omp => omp(name, input),
-        Provider::Antigravity | Provider::Muse => None,
+        Provider::Antigravity => antigravity(id, name, input),
+        Provider::Muse => None,
     }
 }
+
+/// The title Antigravity gives its `invoke_subagent` call, which the ACP
+/// adapter shows as the step's name.
+const ANTIGRAVITY_SUBAGENT: &str = "Run invoke_subagent";
 
 fn field<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or_default()
@@ -1080,6 +1086,33 @@ fn omp(name: &str, input: &str) -> Option<Coordination> {
     })
 }
 
+/// Antigravity's `invoke_subagent` starts one subagent in the `Role` it
+/// names, and its call ends once the subagent has started: the subagent's
+/// own state is how the step stands. The ACP adapter lists the subagent
+/// under the step's ID.
+fn antigravity(id: &str, name: &str, input: &str) -> Option<Coordination> {
+    if name != ANTIGRAVITY_SUBAGENT {
+        return None;
+    }
+    let input: Value = serde_json::from_str(input).ok()?;
+    let model = field(&input, "Model");
+    Some(Coordination {
+        kind: Kind::Spawn(Spawn {
+            agents: vec![Delegate {
+                name: String::new(),
+                kind: field(&input, "Role").trim().into(),
+                description: String::new(),
+                prompt: Text::Inline(field(&input, "Prompt").trim().into()),
+            }],
+            model: if model == "inherit" { "" } else { model }.into(),
+            ..Spawn::default()
+        }),
+        outcome: Outcome::default(),
+        subagents: vec![id.to_owned()],
+        cli: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1298,6 +1331,53 @@ mod tests {
                 ""
             )
             .is_some()
+        );
+    }
+
+    /// The step that started an Antigravity subagent links to it, and the
+    /// subagent's own state, not the call's, says how it stands.
+    #[test]
+    fn an_antigravity_subagent_is_started_by_its_invoke_call() {
+        let input = r#"{"Model":"inherit","Prompt":"Run make check","Role":"Release Checker","TypeName":"self"}"#;
+        let started = native(
+            Provider::Antigravity,
+            "tool:call_1",
+            ANTIGRAVITY_SUBAGENT,
+            input,
+            "",
+        )
+        .unwrap();
+        assert_eq!(started.subagents, ["tool:call_1"]);
+        let Kind::Spawn(spawn) = &started.kind else {
+            panic!("an invoke call is a spawn");
+        };
+        assert!(!spawn.waits);
+        assert_eq!(spawn.model, "");
+        assert_eq!(
+            (spawn.agents[0].kind.as_str(), &spawn.agents[0].prompt),
+            ("Release Checker", &Text::Inline("Run make check".into()))
+        );
+        // Another provider's tool of that title is not one, nor is another
+        // of Antigravity's tools.
+        assert!(
+            native(
+                Provider::Muse,
+                "tool:call_1",
+                ANTIGRAVITY_SUBAGENT,
+                input,
+                ""
+            )
+            .is_none()
+        );
+        assert!(
+            native(
+                Provider::Antigravity,
+                "tool:call_2",
+                "Run list_dir",
+                "{}",
+                ""
+            )
+            .is_none()
         );
     }
 

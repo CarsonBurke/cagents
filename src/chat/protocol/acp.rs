@@ -23,14 +23,17 @@
 //! Antigravity 1.5.17 answers the running `session/prompt` at once, as
 //! `end_turn`, and carries on with its work, background commands included,
 //! under the new one, whose reply then ends the turn.
+//!
+//! Antigravity's subagents are listed apart from the parent, with the steps
+//! of theirs that reach its session; see [`subagents`].
 use super::{Adapter, ProcessSpec, Step};
 use crate::chat::{
     self, Capabilities, Choice, Command, Event, Item, ItemContent, Launch, PlanState, PlanStep,
-    PromptMode, Request, RequestKind, Role, SkillReach, SlashCommand,
+    PromptMode, Request, RequestKind, Role, SkillReach, SlashCommand, ToolStatus,
 };
 use crate::notifications::Kind;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 pub mod antigravity;
 mod config;
@@ -38,6 +41,7 @@ mod history;
 pub mod muse;
 mod prompt;
 mod rpc;
+mod subagents;
 #[cfg(test)]
 mod tests;
 mod tools;
@@ -105,6 +109,10 @@ pub struct Profile {
     /// `run_command` does past its `WaitMsBeforeAsync`. Only then is a
     /// command left running when the agent goes on taken for one.
     pub backgrounds_commands: bool,
+    /// Whether the agent starts subagents with `invoke_subagent` and reports
+    /// their steps under `<child session ID>:<call ID>`, as Antigravity
+    /// 1.5.17 does.
+    pub subagents: bool,
 }
 
 /// The ACP server's command line, and the settings to apply once its
@@ -304,6 +312,8 @@ struct Permission {
     options: Vec<(String, String)>,
     /// The tool call it asks about.
     call: String,
+    /// The subagent that asks, where it is not the parent.
+    subagent: Option<String>,
 }
 
 struct Acp {
@@ -325,6 +335,7 @@ struct Acp {
     commands: Vec<SlashCommand>,
     replay: Option<history::Replay>,
     calls: tools::Calls,
+    subagents: subagents::Subagents,
     segment: Option<Segment>,
     /// How many items each message identifier has opened, so a message the
     /// agent resumes after a tool call continues below it in a new item.
@@ -361,6 +372,7 @@ impl Acp {
             commands: Vec::new(),
             replay: None,
             calls: tools::Calls::default(),
+            subagents: subagents::Subagents::default(),
             segment: None,
             segment_ids: HashMap::new(),
             next_item: 0,
@@ -713,7 +725,9 @@ impl Acp {
         if !self.profile.backgrounds_commands {
             return;
         }
-        let waits = self.permissions.is_empty() && self.calls.only_background_live();
+        let waits = self.permissions.is_empty()
+            && !self.subagents.working()
+            && self.calls.only_background_live();
         if let Some(turn) = self.turn.as_mut().filter(|turn| !turn.cancelling)
             && waits
             && !turn.on_background
@@ -898,15 +912,18 @@ impl Acp {
         for (id, content) in self.calls.stop_running() {
             step.events.push(Event::Item(tool_item(id, content)));
         }
+        step.events.extend(self.subagents.settle(kind));
         // An agent that ended its turn can no longer act on an answer.
         if !self.permissions.is_empty() {
-            for (id, permission) in std::mem::take(&mut self.permissions) {
+            let unanswered = std::mem::take(&mut self.permissions);
+            for (id, permission) in &unanswered {
                 step.writes.push(rpc::result(
                     &permission.rpc,
                     json!({"outcome": {"outcome": "cancelled"}}),
                 ));
-                step.events.push(Event::RequestResolved { id });
+                step.events.push(Event::RequestResolved { id: id.clone() });
             }
+            self.released(unanswered.into_values(), &mut step.events);
             step.events.push(Event::Waiting(false));
         }
         if let Some(message) = notice {
@@ -1139,11 +1156,30 @@ impl Acp {
     fn permission(&mut self, rpc: &Value, params: &Value, step: &mut Step) {
         let call = &params["toolCall"];
         let call_id = call["toolCallId"].as_str().unwrap_or_default().to_owned();
-        if let Some((id, content)) = self.calls.merge(call) {
-            self.segment = None;
-            step.events.push(Event::Item(tool_item(id, content)));
-        }
-        self.at_work(&mut step.events);
+        let live = self.turn.is_some() && self.replay.is_none();
+        let child = if self.profile.subagents {
+            self.subagents.step(call, live)
+        } else {
+            None
+        };
+        let subagent = match child {
+            Some(events) => {
+                step.events.extend(events);
+                self.at_work(&mut step.events);
+                self.subagents.owner(&call_id).map(str::to_owned)
+            }
+            None => {
+                if self.profile.subagents {
+                    step.events.extend(self.subagents.invoked(call, live));
+                }
+                if let Some((id, content)) = self.calls.merge(call) {
+                    self.segment = None;
+                    step.events.push(Event::Item(tool_item(id, content)));
+                }
+                self.at_work(&mut step.events);
+                None
+            }
+        };
         let options = params["options"]
             .as_array()
             .into_iter()
@@ -1166,7 +1202,7 @@ impl Acp {
                 rpc,
                 json!({"outcome": {"outcome": "cancelled"}}),
             ));
-            self.calls.declined(&call_id);
+            self.declined(&call_id, ToolStatus::Stopped, &mut step.events);
             return;
         }
         self.next_permission += 1;
@@ -1190,19 +1226,27 @@ impl Acp {
                 .into(),
             })
             .collect();
+        let calls = self.subagents.calls(&call_id).unwrap_or(&self.calls);
+        // A subagent's request says which subagent asks: the agent's own
+        // says only what it asks to do.
+        let title = match (&subagent, calls.title(&call_id)) {
+            (Some(subagent), Some(title)) => format!("{}: {title}", self.subagents.name(subagent)),
+            (Some(subagent), None) => format!("{} asks to continue", self.subagents.name(subagent)),
+            (None, Some(title)) => title.to_owned(),
+            (None, None) => format!("{} asks to continue", self.profile.label),
+        };
         step.events.push(Event::Request(Request {
             kind: RequestKind::Approval,
             id: id.clone(),
-            title: self
-                .calls
-                .title(&call_id)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{} asks to continue", self.profile.label)),
-            description: self.calls.summary(&call_id),
+            title,
+            description: calls.summary(&call_id),
             fields: Vec::new(),
             actions,
         }));
         step.events.push(Event::Waiting(true));
+        if let Some(subagent) = &subagent {
+            step.events.push(subagents::waiting(subagent.clone(), true));
+        }
         self.permissions.insert(
             id,
             Permission {
@@ -1212,8 +1256,37 @@ impl Acp {
                     .map(|(option, _, kind)| (option, kind))
                     .collect(),
                 call: call_id,
+                subagent,
             },
         );
+    }
+
+    /// Notes that the call `id`, the parent's or a subagent's, will not run:
+    /// the reader refused it, or its request was cancelled. A subagent it
+    /// would have started ends as `status`.
+    fn declined(&mut self, id: &str, status: ToolStatus, events: &mut Vec<Event>) {
+        if !self.subagents.declined(id) {
+            self.calls.declined(id);
+            events.extend(self.subagents.unstarted(id, status));
+        }
+    }
+
+    /// The subagents of `answered` requests no longer wait, unless another
+    /// of theirs is still open.
+    fn released(&self, answered: impl IntoIterator<Item = Permission>, events: &mut Vec<Event>) {
+        let asked: BTreeSet<_> = answered
+            .into_iter()
+            .filter_map(|permission| permission.subagent)
+            .collect();
+        for subagent in asked {
+            if !self
+                .permissions
+                .values()
+                .any(|open| open.subagent.as_ref() == Some(&subagent))
+            {
+                events.push(subagents::waiting(subagent, false));
+            }
+        }
     }
 
     /// The agent no longer wants an answer to an approval it asked for.
@@ -1226,10 +1299,11 @@ impl Acp {
         else {
             return;
         };
-        self.permissions.remove(&id);
+        let withdrawn = self.permissions.remove(&id);
         step.writes
             .push(rpc::error(rpc, rpc::REQUEST_CANCELLED, "Request cancelled"));
         step.events.push(Event::RequestResolved { id });
+        self.released(withdrawn, &mut step.events);
         if self.permissions.is_empty() {
             step.events.push(Event::Waiting(false));
         }
@@ -1263,14 +1337,31 @@ impl Acp {
                 self.chunk(role, kind == "agent_thought_chunk", update, &mut events);
             }
             "tool_call" | "tool_call_update" => {
-                if let Some((id, content)) = self.calls.merge(update) {
-                    self.segment = None;
-                    events.push(Event::Item(tool_item(id, content)));
-                }
-                // A background command's own progress is not the agent at
-                // work; its end, or any other step, is.
-                if live && !self.calls.only_background_live() {
-                    self.at_work(&mut events);
+                // A subagent's step is its own, not the parent's, though the
+                // turn is at work on it.
+                let child = if self.profile.subagents {
+                    self.subagents.step(update, live)
+                } else {
+                    None
+                };
+                if let Some(child) = child {
+                    events.extend(child);
+                    if live {
+                        self.at_work(&mut events);
+                    }
+                } else {
+                    if self.profile.subagents {
+                        events.extend(self.subagents.invoked(update, live));
+                    }
+                    if let Some((id, content)) = self.calls.merge(update) {
+                        self.segment = None;
+                        events.push(Event::Item(tool_item(id, content)));
+                    }
+                    // A background command's own progress is not the agent
+                    // at work; its end, or any other step, is.
+                    if live && !self.calls.only_background_live() {
+                        self.at_work(&mut events);
+                    }
                 }
             }
             "plan" => events.push(Event::Plan {
@@ -1742,13 +1833,15 @@ impl Adapter for Acp {
                 // The protocol requires every open approval to be answered
                 // as cancelled once the turn is.
                 if !self.permissions.is_empty() {
-                    for (id, permission) in std::mem::take(&mut self.permissions) {
+                    let cancelled = std::mem::take(&mut self.permissions);
+                    for (id, permission) in &cancelled {
                         step.writes.push(rpc::result(
                             &permission.rpc,
                             json!({"outcome": {"outcome": "cancelled"}}),
                         ));
-                        step.events.push(Event::RequestResolved { id });
+                        step.events.push(Event::RequestResolved { id: id.clone() });
                     }
+                    self.released(cancelled.into_values(), &mut step.events);
                     step.events.push(Event::Waiting(false));
                 }
                 step.events.push(Event::Status {
@@ -1780,13 +1873,14 @@ impl Adapter for Acp {
                 let declined = self.answer_declines(&request_id, &action);
                 let permission = self.permissions.remove(&request_id).unwrap();
                 // A call refused is over, whether or not the agent says so.
-                if declined {
-                    self.calls.declined(&permission.call);
-                }
                 let mut step = Step::default();
+                if declined {
+                    self.declined(&permission.call, ToolStatus::Denied, &mut step.events);
+                }
                 step.writes
                     .push(rpc::result(&permission.rpc, json!({"outcome": outcome})));
                 step.events.push(Event::RequestResolved { id: request_id });
+                self.released([permission], &mut step.events);
                 if self.permissions.is_empty() {
                     step.events.push(Event::Waiting(false));
                 }
@@ -2008,6 +2102,7 @@ pub(crate) static TEST_PROFILE: Profile = Profile {
     steers: true,
     cancel_stops_background: true,
     backgrounds_commands: true,
+    subagents: true,
 };
 
 #[cfg(test)]
