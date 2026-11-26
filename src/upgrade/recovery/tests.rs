@@ -2778,7 +2778,7 @@ fn explicit_retry_reads_only_the_exact_completed_archive() {
     };
     persist_bound_capture(&files.checkpoint, &capture).unwrap();
     let inspect =
-        |hash| PendingRecovery::inspect_archived_at(&files.checkpoint, hash, &files.target);
+        |hash: &str| PendingRecovery::inspect_archived_at(&files.checkpoint, hash, &files.target);
     assert!(inspect(hash).unwrap().is_none());
 
     complete_files(&files);
