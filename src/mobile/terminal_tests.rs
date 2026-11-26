@@ -472,6 +472,7 @@ fn stopping_during_open_answers_once_and_fences_a_late_screen() {
     let watch = Watch {
         session,
         _stop: stop,
+        lookup: WatchSocket::default(),
         publisher: publisher.clone(),
     };
     drop(watch);
