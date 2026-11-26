@@ -218,21 +218,15 @@ impl Executable {
             }
             #[cfg(target_os = "macos")]
             Self::Installed { path, original } => {
-                if !same_companion_executable(original, &fs::symlink_metadata(path)?) {
-                    return Err(invalid("The staged candidate CLI changed before preflight"));
-                }
-                let output = companion_read(
-                    path,
-                    arguments,
-                    None,
+                let mut command = Command::new(path);
+                command.args(arguments);
+                companion_read(
+                    command,
                     "The staged candidate CLI",
                     operation,
                     cancellation,
-                )?;
-                if !same_companion_executable(original, &fs::symlink_metadata(path)?) {
-                    return Err(invalid("The staged candidate CLI changed during preflight"));
-                }
-                Ok(output)
+                    Some(original),
+                )
             }
         }
     }
@@ -258,6 +252,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn installed_candidate_probes_its_owned_physical_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
         let directory = tempfile::tempdir().unwrap();
         let cli = directory.path().join("cagents");
         fs::write(
