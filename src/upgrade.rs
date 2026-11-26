@@ -1757,6 +1757,25 @@ pub mod handoff {
     }
 
     impl RecoveredChats {
+        /// Add aliases the serving host authenticated with an adopted live
+        /// holder. This only verifies a listed session and persists nothing.
+        #[cfg(all(target_os = "macos", feature = "host"))]
+        pub(crate) fn observe_live_adoption(
+            &mut self,
+            session: &chat::Session,
+            sources: Vec<ChatSource>,
+        ) {
+            self.entries.push(RecoveredChat {
+                evidence: Chat {
+                    source: session.clone(),
+                    launch: session.launch.clone(),
+                    previous_sources: sources,
+                },
+                replacement: session.clone(),
+                aliases: Vec::new(),
+            });
+        }
+
         pub fn proves(
             &self,
             source: &chat::Session,

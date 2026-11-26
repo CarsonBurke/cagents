@@ -857,6 +857,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
+    #[cfg(target_os = "macos")]
+    let cutover_checkpoint = crate::update::cutover_startup_checkpoint();
     let listener = listener_before_restore(&paths, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
@@ -1103,12 +1105,26 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         if pending_publication.is_none() {
             acknowledge_standby(standby.take());
             if std::mem::take(&mut settle_startup_update) {
-                crate::update::settle_as_successor(
-                    host.lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .proof()
-                        .clone(),
-                );
+                let serving = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone();
+                let host = Arc::clone(&host);
+                crate::update::settle_as_successor(serving, cutover_checkpoint, move || {
+                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut chats = chat::chat_list_inventory(&state);
+                    chats.retain(|session| {
+                        state.chats.get(&session.id).is_some_and(|record| {
+                            record.handle.owns_work() && !record.handle.is_completed()
+                        })
+                    });
+                    crate::update::CutoverLiveInventory {
+                        terminals: state.list(0),
+                        chats,
+                        adopted_sources: state.upgrade_chats.clone(),
+                    }
+                });
             }
         }
         reap_finished(&mut clients);
