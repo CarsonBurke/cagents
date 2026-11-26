@@ -3750,3 +3750,21 @@ fn acknowledgement_race(before_rearm: bool) {
     drop(release);
     handle.close().unwrap();
 }
+
+#[test]
+fn fresh_launch_preserves_path_order_and_adds_missing_login_search_directories() {
+    let mut recipe = crate::model::LaunchRecipe {
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: "/project".into(),
+        environment: BTreeMap::from([("PATH".into(), "/selected:/shared".into())]),
+        unset_environment: Default::default(),
+    };
+    add_login_search_directories(&mut recipe, std::ffi::OsStr::new("/shared:./local:/login"));
+    assert_eq!(recipe.environment["PATH"], "/selected:/shared:/login");
+
+    recipe.environment.remove("PATH");
+    recipe.unset_environment.insert("PATH".into());
+    add_login_search_directories(&mut recipe, std::ffi::OsStr::new("/login"));
+    assert!(!recipe.environment.contains_key("PATH"));
+}
