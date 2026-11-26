@@ -197,11 +197,17 @@ impl Drop for Signals {
     }
 }
 
+pub(crate) enum InstallMode {
+    Replace,
+    Stage,
+    Publish,
+}
+
 pub(crate) fn run(
     prefix: &Path,
     installer: &Path,
     arguments: &[OsString],
-    stage_only: bool,
+    mode: InstallMode,
 ) -> io::Result<()> {
     if !prefix.is_absolute() {
         return Err(io::Error::other("installation prefix must be absolute"));
@@ -215,6 +221,18 @@ pub(crate) fn run(
     let _signals = Signals::install()?;
     let executable = prefix.join("current/bin/cagents-ui");
     let mut guard = UiUpdateGuard::acquire()?;
+    if matches!(mode, InstallMode::Publish) {
+        if guard.has_running_windows()? {
+            return Err(io::Error::other(
+                "quit cagents before publishing the installation",
+            ));
+        }
+        let mut command = installer_command(&script, arguments, &guard, None, None)?;
+        let published = execute(&mut command);
+        guard.leave_launch_fence_with_successor();
+        return published;
+    }
+    let stage_only = matches!(mode, InstallMode::Stage);
     let owner_bin = crate::daemon::running_executable()
         .map_err(io::Error::other)?
         .map(|executable| running_owner_bin(prefix, &executable))
@@ -244,43 +262,14 @@ pub(crate) fn run(
             .map(|_| ())
         })?
     };
-    let fd = script.as_raw_fd();
     let mut result = ResultPipe::new()?;
-    let result_fd = result.writer.as_raw_fd();
-    let mut command = Command::new("sh");
-    // Darwin's /dev/fd/N duplicates the descriptor instead of reopening it, so
-    // the shell shares its offset; this freshly opened script is at offset 0
-    // and nothing else reads it. The installer must therefore never reopen
-    // `$0` while guarded: there it would resume wherever sh had read to.
-    command
-        .arg(crate::descriptor::inherited_file_path(fd))
-        .args(arguments)
-        .env(RESULT_FD_ENV, result_fd.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .process_group(0);
-    if let Some(bin) = &owner_bin {
-        command.env(
-            OWNER_CLI_ENV,
-            bin.join(crate::companion::Product::Cli.file_name()),
-        );
-    } else {
-        command.env_remove(OWNER_CLI_ENV);
-    }
-    guard.inherit_for_install(&mut command)?;
-    // SAFETY: script remains open until the subprocess is reaped.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::fcntl(result_fd, libc::F_SETFD, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    let mut command = installer_command(
+        &script,
+        arguments,
+        &guard,
+        Some(&result.writer),
+        owner_bin.as_deref(),
+    )?;
     let installed = execute(&mut command);
     let deferred = result.deferred()?;
     if stage_only {
@@ -315,6 +304,55 @@ pub(crate) fn run(
             "{error}; reopening the current installation also failed: {reopen}"
         ))),
     }
+}
+
+/// Run a private script from the inherited open file. Its launch-fence copy
+/// remains live while it publishes, including if the coordinator is killed.
+fn installer_command(
+    script: &File,
+    arguments: &[OsString],
+    guard: &UiUpdateGuard,
+    result_writer: Option<&File>,
+    owner_bin: Option<&Path>,
+) -> io::Result<Command> {
+    let fd = script.as_raw_fd();
+    let result_fd = result_writer.map(AsRawFd::as_raw_fd);
+    let mut command = Command::new("sh");
+    // Darwin's /dev/fd/N duplicates the descriptor and shares its offset.
+    // The script starts at zero and cannot reopen $0 to start over.
+    command
+        .arg(crate::descriptor::inherited_file_path(fd))
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    if let Some(result_fd) = result_fd {
+        command.env(RESULT_FD_ENV, result_fd.to_string());
+    } else {
+        sanitize_child_environment(&mut command);
+    }
+    if let Some(bin) = owner_bin {
+        command.env(
+            OWNER_CLI_ENV,
+            bin.join(crate::companion::Product::Cli.file_name()),
+        );
+    } else {
+        command.env_remove(OWNER_CLI_ENV);
+    }
+    guard.inherit_for_install(&mut command)?;
+    // SAFETY: the script and optional result writer remain open through wait.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in [Some(fd), result_fd].into_iter().flatten() {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(command)
 }
 
 const STAGED_OWNER: &str = ".deferred-owner.json";
@@ -1189,6 +1227,96 @@ fn execute(command: &mut Command) -> io::Result<()> {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_keeps_the_launch_fence_after_coordinator_exit() {
+        use std::{ffi::CString, fs, os::unix::ffi::OsStrExt, path::PathBuf};
+
+        const ROLE: &str = "CAGENTS_TEST_INSTALL_PUBLICATION_ROLE";
+        const TEST: &str =
+            "install_guard::tests::publication_keeps_the_launch_fence_after_coordinator_exit";
+        if let Ok(role) = std::env::var(ROLE) {
+            match role.as_str() {
+                "publish" => {
+                    let root = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+                    run(
+                        &root,
+                        &root.join("publish.sh"),
+                        &[root.as_os_str().to_owned()],
+                        InstallMode::Publish,
+                    )
+                    .unwrap();
+                }
+                "excluded" => {
+                    let error = UiUpdateGuard::acquire()
+                        .err()
+                        .expect("launch fence was free");
+                    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                }
+                "available" => {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while let Err(error) = UiUpdateGuard::acquire() {
+                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                        assert!(Instant::now() < deadline, "{error}");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                _ => panic!("unexpected test role {role}"),
+            }
+            return;
+        }
+
+        let runtime = tempfile::tempdir().unwrap();
+        let root = runtime.path().canonicalize().unwrap();
+        let release = root.join("release");
+        let fifo = CString::new(release.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the FIFO path is in this private test directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut release = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&release)
+            .unwrap();
+        fs::write(
+            root.join("publish.sh"),
+            r#"set -eu
+test "${CAGENTS_UI_UPDATE_GUARD_FD:-}" = 197
+test -z "${CAGENTS_INSTALL_RESULT_FD+x}"
+exec 3< "$1/release"
+printf 'ready\n' > "$1/ready"
+IFS= read -r released <&3
+"#,
+        )
+        .unwrap();
+        let command = |role| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(ROLE, role)
+                .env("XDG_RUNTIME_DIR", &root);
+            command
+        };
+        let mut coordinator = command("publish").spawn().unwrap();
+        let ready = Instant::now() + Duration::from_secs(10);
+        while !root.join("ready").exists() {
+            assert!(coordinator.try_wait().unwrap().is_none());
+            if Instant::now() >= ready {
+                let _ = coordinator.kill();
+                let _ = coordinator.wait();
+                panic!("publication shell never reached its guarded step");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let before = command("excluded").output().unwrap();
+        coordinator.kill().unwrap();
+        coordinator.wait().unwrap();
+        let after = command("excluded").output().unwrap();
+        release.write_all(b"release\n").unwrap();
+        assert!(before.status.success(), "{before:?}");
+        assert!(after.status.success(), "{after:?}");
+        let available = command("available").output().unwrap();
+        assert!(available.status.success(), "{available:?}");
+    }
 
     #[test]
     fn lease_handoff_ordinary_child_receives_no_recovery_authority() {
