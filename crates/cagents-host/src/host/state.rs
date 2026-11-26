@@ -3900,9 +3900,29 @@ fn restore_upgrade_from(
         ensure_no_surviving_process(&terminal.source, std::process::id(), proc_root)?;
     }
     for chat in &checkpoint.chats {
+        let disposition = ChatRestore::of(chat);
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if ChatRestore::of(chat) == ChatRestore::Retained {
+        if disposition == ChatRestore::Retained {
+            continue;
+        }
+        // A standalone owned Codex listener has no terminal lineage. Use the
+        // confirmed checkpoint thread, pinned writers and account writer lock.
+        // The actual launch rechecks them under its allocation reservation.
+        #[cfg(target_os = "macos")]
+        if disposition == ChatRestore::CodexListener
+            && chat.source.terminal.is_none()
+            && proc_root == std::path::Path::new("/proc")
+        {
+            let source = crate::upgrade::handoff::restored_chat(&chat.source, &chat.launch)?;
+            let boot = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .proof()
+                .boot_id
+                .clone();
+            super::chat::require_ended_codex_execution(host, &source, &boot)
+                .map_err(|error| error.to_string())?;
             continue;
         }
         let terminal = TerminalSession {

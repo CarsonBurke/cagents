@@ -926,15 +926,26 @@ impl ExecutionEvidence {
     /// Classify execution independently of adoption capabilities. Missing
     /// listener ownership or continuity is not evidence of a surviving writer.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
-        saved_codex_execution(self.codex_execution(source))
+        saved_codex_execution(self.codex_retirement(source))
     }
 
     fn codex_execution(&self, source: &Session) -> CodexExecution {
-        self.inspect_codex_execution(source)
+        self.inspect_codex_execution(source, false)
             .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
     }
 
-    fn inspect_codex_execution(&self, source: &Session) -> Result<CodexExecution, String> {
+    // Saved-source inspection and lost Close can retire authority. They
+    // require the old source's exact proof when Darwin observes no writer.
+    fn codex_retirement(&self, source: &Session) -> CodexExecution {
+        self.inspect_codex_execution(source, true)
+            .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
+    }
+
+    fn inspect_codex_execution(
+        &self,
+        source: &Session,
+        require_receipt: bool,
+    ) -> Result<CodexExecution, String> {
         use crate::daemon::holder_registry::{self, Kind};
         let native_holders = self.native_holders.as_ref().map_err(Clone::clone)?;
         let mut controls = vec![holder_registry::socket(native_holders, source.id)];
@@ -1048,41 +1059,33 @@ impl ExecutionEvidence {
             self.starting_patience,
             self.deadline,
         );
+        #[cfg(target_os = "linux")]
+        let _ = require_receipt;
         #[cfg(target_os = "macos")]
-        let scan = if self.processes == Path::new("/proc") {
-            // A new allocation from the resume picker has no previous owner
-            // to retire. It still needs the writer scan here and the account's
-            // thread-lock check before it can start a provider.
-            let issued = source.proof.is_some()
+        let scan = if require_receipt
+            && self.processes == Path::new("/proc")
+            && !earlier_boot
+            && matches!(scan, Ok(CodexExecution::Ended))
+            && (source.proof.is_some()
                 || source.terminal.is_some()
                 || source.owned_codex_listener.is_some()
                 || source.recorded_codex_socket().is_some()
-                || holders.iter().any(Option::is_some);
-            match scan {
-                // Inspection errors must not use the old-boot exception
-                // when Darwin cannot inspect a potentially current writer.
-                Err(reason) => Ok(CodexExecution::Unproved { reason }),
-                Ok(CodexExecution::Ended) if issued && !earlier_boot => {
-                    let retired = holders.iter().all(Option::is_none)
-                        && crate::chat::native_holder::inspect_closed_source(source, &self.boot)?;
-                    if retired {
-                        Ok(CodexExecution::Ended)
-                    } else {
-                        Ok(CodexExecution::Unproved {
-                            reason:
-                                "No exact retirement proves the prior Darwin Codex writer is gone"
-                                    .into(),
-                        })
-                    }
-                }
-                other => other,
-            }
+                || holders.iter().any(Option::is_some))
+            && !(holders.iter().all(Option::is_none)
+                && crate::chat::native_holder::inspect_closed_source(source, &self.boot)?)
+        {
+            Ok(CodexExecution::Unproved {
+                reason: "No exact retirement proves the prior Darwin Codex writer is gone".into(),
+            })
         } else {
             scan
         };
         if let Some(deadline) = self.deadline {
             check_deadline(deadline)?;
         }
+        // An older source boot cannot settle a possibly current Darwin writer.
+        // Callers with the exact issued source can separately inspect its close
+        // receipt. The census also accepts successor and fresh descriptors.
         #[cfg(target_os = "macos")]
         let earlier_boot = earlier_boot && self.processes != Path::new("/proc");
         match (scan, retained_processes, unreadable_listener) {
@@ -1160,8 +1163,8 @@ pub(super) fn codex_execution(source: &Session, boot: &crate::model::BootId) -> 
     ExecutionEvidence::codex(boot).codex_execution(source)
 }
 
-/// Whether nothing of a Codex pane of `boot` can still run, by the evidence
-/// an upgrade requires before it replaces the service that ran it.
+/// Whether the Codex writer, holder, and listener observations are clear.
+/// A caller requiring exact retirement also verifies its issued receipt.
 pub(super) fn codex_execution_ended(source: &Session, boot: &crate::model::BootId) -> bool {
     codex_execution(source, boot) == CodexExecution::Ended
 }
@@ -1210,7 +1213,7 @@ pub(super) fn execution_end(
         ..ExecutionEvidence::codex(boot)
     };
     let saved = if source.launch.provider == crate::agent::Provider::Codex {
-        match evidence.codex_execution(source) {
+        match evidence.codex_retirement(source) {
             CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING => {
                 return ExecutionEnd::Starting;
             }
@@ -1420,7 +1423,7 @@ fn darwin_codex_writer(
         if let Some(deadline) = deadline {
             check_deadline(deadline)?;
         }
-        let observation = (|| {
+        let observation = observe_darwin_codex_process(deadline, || {
             let Some(program) = crate::process::inspect_account_program(pid, uid, |executable| {
                 let name = executable.file_name().unwrap_or_default();
                 named_codex_writer(name) || codex_interpreter(name)
@@ -1430,7 +1433,7 @@ fn darwin_codex_writer(
             };
             darwin_writer_matches(program.executable, &program.arguments, marker, conversation)
                 .map(|matches| matches.then_some(program.process))
-        })();
+        });
         match observation {
             Ok(Some(owner)) => return Ok((Some(owner), None)),
             Ok(None) => {}
@@ -1447,6 +1450,29 @@ fn darwin_codex_writer(
         }
     }
     Ok((None, uncertainty))
+}
+
+#[cfg(target_os = "macos")]
+fn observe_darwin_codex_process(
+    deadline: Option<Instant>,
+    mut observe: impl FnMut() -> io::Result<Option<crate::daemon::holder_registry::Process>>,
+) -> io::Result<Option<crate::daemon::holder_registry::Process>> {
+    let result = observe();
+    if result
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(libc::EIO))
+        && deadline.is_none_or(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) > STARTING_RETRY
+        })
+    {
+        // XNU can fail to copy the argument stack while a process changes.
+        // Only another observation can establish unrelatedness or exit.
+        std::thread::sleep(STARTING_RETRY);
+        if deadline.is_none_or(|deadline| Instant::now() < deadline) {
+            return observe();
+        }
+    }
+    result
 }
 
 #[cfg(target_os = "macos")]
@@ -2305,6 +2331,40 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_process_io_error_gets_one_fresh_observation() {
+        let mut calls = 0;
+        let result = observe_darwin_codex_process(None, || {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(None)
+            }
+        });
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(calls, 2);
+
+        calls = 0;
+        let error = observe_darwin_codex_process(None, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, 2);
+
+        calls = 0;
+        let error = observe_darwin_codex_process(Some(Instant::now()), || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, 1);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

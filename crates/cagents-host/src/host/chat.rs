@@ -1842,9 +1842,9 @@ fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool
     })? == SharedCodexService::Listening)
 }
 
-/// Read the same execution evidence for restart and picker preparation, so
-/// unreadable evidence retains its concrete diagnostic in both paths.
-fn require_ended_codex_execution(
+/// Read the same execution evidence for checkpoint restore, restart and
+/// picker preparation, preserving the diagnostic for unreadable evidence.
+pub(super) fn require_ended_codex_execution(
     host: &SharedHost,
     session: &Session,
     boot: &crate::model::BootId,
