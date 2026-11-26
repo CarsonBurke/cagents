@@ -112,8 +112,6 @@ pub(crate) fn run(
             "The selected checkpoint changed after acquiring recovery leases",
         ));
     }
-    let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
-    let windows = recovery_window_slots(&pending.windows, &current_windows);
     let id = uuid::Uuid::new_v4().to_string();
     let log_path = state.join(format!("{id}.log"));
     let log = private_create(&log_path)?;
@@ -159,7 +157,7 @@ pub(crate) fn run(
         let parked = standby.is_some();
         #[cfg(not(target_os = "linux"))]
         let parked = false;
-        // Prepare the authority transport before closing windows or publishing
+        // Prepare the authority transport before touching windows or publishing
         // the direct-start target. Darwin rejects inherited receipts here.
         let direct_start = if parked {
             None
@@ -179,6 +177,8 @@ pub(crate) fn run(
             receipt.inherit(&mut command)?;
             Some(command)
         };
+        let current_windows = guard.prepare_windows(Duration::from_secs(45))?;
+        let windows = recovery_window_slots(&pending.windows, &current_windows);
         if previous_link.is_none() {
             select_target(&layout)?;
         }
@@ -208,13 +208,13 @@ pub(crate) fn run(
         let pending = PendingRecovery::inspect()
             .map_err(invalid)?
             .ok_or_else(|| invalid("The Prepared evidence disappeared after recovery"))?;
-        let outcome = verify(&pending, &daemon)?;
+        verify(&pending, &daemon)?;
         receipt.release_daemon_reservation();
-        Ok::<_, UpdateError>(outcome)
+        Ok::<_, UpdateError>(windows)
     })();
     // Close the coordinator's reservation without unlocking the serving daemon.
     drop(handoff);
-    let result = result.and_then(|_| {
+    let result = result.and_then(|windows| {
         guard.relaunch_windows(&windows, &ui)?;
         // Opening saved panes may attach owners. Recheck actual serving
         // identity and full inventory after reopening before claiming Ready.
