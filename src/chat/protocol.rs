@@ -25,6 +25,21 @@ pub(crate) fn unknown_tool(provider: &str, tool: &str) -> String {
     format!("{provider} called a tool that doesn't exist: {tool}")
 }
 
+/// Whether a form's scalar answer was left blank, which reads as the field
+/// being absent rather than as an empty value.
+///
+/// The UI answers every field a form shows, so a field the reader left
+/// untouched, or typed into and cleared, arrives as no value; one empty
+/// string means the same. An adapter omits a blank optional field from its
+/// reply and reports a blank required one as missing.
+pub(crate) fn blank_form_answer(values: &[String]) -> bool {
+    match values {
+        [] => true,
+        [only] => only.is_empty(),
+        _ => false,
+    }
+}
+
 /// Startup recovery for the same card and exact conversation. Unavailable
 /// means another attempt may succeed after an external condition changes;
 /// it promises neither immediate success nor automatic replay of uncertain
