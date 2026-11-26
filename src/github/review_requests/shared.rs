@@ -3,6 +3,7 @@
 //! A caller advances at most one page, under a cancellable process lock. Other
 //! windows adopt its snapshot and due time instead of starting their own scan.
 use super::{HistoryPage, Page, scan::Scan, scan::Work};
+use crate::notifications::review::{Census, MonitorUpdate, ScanPoint};
 use crate::{
     github::{
         GitHubError, GitHubRepoKey, GitHubService, PullRequestKey, Revalidation, polling, pr_status,
@@ -47,6 +48,7 @@ pub struct PollResult {
     pub observation: (String, u64),
     /// Each follower consumes the bounded pages it has not yet observed.
     pub observed: Vec<Observation>,
+    pub census: Option<Census>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -71,6 +73,10 @@ struct Stored {
     pending: Option<(Option<String>, u64)>,
     #[serde(default)]
     probe_refused_at: Option<u64>,
+    #[serde(default)]
+    attention_scan_start: Option<ScanPoint>,
+    #[serde(default)]
+    attention_completed: Option<(u64, Census)>,
 }
 
 impl Default for Stored {
@@ -88,12 +94,14 @@ impl Default for Stored {
             census_at: 0,
             pending: None,
             probe_refused_at: None,
+            attention_scan_start: None,
+            attention_completed: None,
         }
     }
 }
 
 impl Stored {
-    fn result(self, now: u64) -> PollResult {
+    fn result(self, repository: &GitHubRepoKey, now: u64) -> PollResult {
         let observed = if self.error.is_none() {
             self.observed
                 .into_iter()
@@ -102,14 +110,57 @@ impl Stored {
         } else {
             Vec::new()
         };
+        let census = self
+            .attention_completed
+            .filter(|(at, _)| now.saturating_sub(*at) < OBSERVATION_AGE)
+            .map(|(_, census)| census)
+            .or_else(|| {
+                // An older process writing the shared cache removes newer
+                // fields. Require its successful settled census and use only
+                // the recorded beginning time, not the latest page revision.
+                if self.scan.settled()
+                    && self.pending.is_none()
+                    && self.census_at > 0
+                    && now.saturating_sub(self.census_at) < OBSERVATION_AGE
+                {
+                    return census_for(
+                        repository,
+                        &self.scan,
+                        ScanPoint::legacy_census(self.census_at),
+                    );
+                }
+                None
+            })
+            .filter(|census| {
+                self.error.is_none()
+                    && self
+                        .scan
+                        .viewer
+                        .as_ref()
+                        .is_some_and(|viewer| viewer.id == census.viewer)
+            });
         PollResult {
             scan: self.scan,
             error: self.error,
             due: self.due,
             observation: (self.incarnation, self.revision),
             observed,
+            census,
         }
     }
+}
+
+fn census_for(repository: &GitHubRepoKey, scan: &Scan, start: ScanPoint) -> Option<Census> {
+    Some(Census {
+        repository: repository.clone(),
+        start,
+        viewer: scan.viewer.as_ref()?.id.clone(),
+        current: scan
+            .requested
+            .iter()
+            .map(|(&number, request)| (number, request.current.id.clone()))
+            .collect(),
+    })
 }
 
 pub enum Reply {
@@ -120,6 +171,14 @@ pub enum Reply {
 pub fn poll(
     repository: &GitHubRepoKey,
     cancellation: &CancellationToken,
+) -> Result<PollResult, String> {
+    poll_observing(repository, cancellation, |_| Ok(()))
+}
+
+pub fn poll_observing(
+    repository: &GitHubRepoKey,
+    cancellation: &CancellationToken,
+    report: impl Fn(MonitorUpdate) -> Result<(), String>,
 ) -> Result<PollResult, String> {
     let credentials = pr_status::credential_fingerprint()?;
     polling::bind_scope(&repository.authority(), &credentials);
@@ -167,6 +226,13 @@ pub fn poll(
             )
         },
     )?;
+    // Each interested daemon can adopt a vetted census from the shared cache;
+    // the process that happened to fetch the last page is not its only owner.
+    if let Some(census) = &result.census
+        && let Err(error) = report(MonitorUpdate::Completed(census.clone()))
+    {
+        tracing::debug!(%error, "completed review census was not reported");
+    }
     Ok(result)
 }
 
@@ -232,7 +298,7 @@ fn poll_with(
         .unwrap_or_default();
     let now = clock();
     if stored.due > now {
-        return Ok(stored.result(now));
+        return Ok(stored.result(repository, now));
     }
     if let Some(limit) = pr_status::shared_cooldown(
         root,
@@ -244,7 +310,7 @@ fn poll_with(
         stored.error = Some(limit.to_string());
         stored.due = limit.retry_at;
         stored.observed.clear();
-        return Ok(stored.result(now));
+        return Ok(stored.result(repository, now));
     }
     if cancellation.is_cancelled() {
         return Err("Review-request read cancelled".into());
@@ -279,7 +345,7 @@ fn poll_with(
                     .saturating_add(REFRESH)
                     .min(stored.census_at.saturating_add(CENSUS_AFTER));
                 pr_status::store(&path, &stored).map_err(|error| error.to_string())?;
-                return Ok(stored.result(now));
+                return Ok(stored.result(repository, now));
             }
             Ok(Revalidation::Modified { etag, .. }) => {
                 stored.probe_refused_at = None;
@@ -296,6 +362,14 @@ fn poll_with(
         stored.pending = Some((validator, now));
     }
     let work = stored.scan.next_work();
+    if matches!(work, Work::Page { cursor: None }) {
+        stored.attention_scan_start = Some(ScanPoint {
+            incarnation: stored.incarnation.clone(),
+            revision: stored.revision,
+            at: now,
+        });
+    }
+    let previous_viewer = stored.scan.viewer.as_ref().map(|viewer| viewer.id.clone());
     let lease = lease()?;
     let reply = polling::with_scope(credentials, || read(&work, lease));
     // A gh auth switch can race a subprocess. Never publish the response under
@@ -325,6 +399,7 @@ fn poll_with(
         return Err("Review-request read cancelled".into());
     }
     let mut observed = Vec::new();
+    let mut finished_census = false;
     let applied = reply.map_err(|error| error.to_string()).and_then(|reply| {
         let viewer = match &reply {
             Reply::Page(page) => &page.viewer,
@@ -340,7 +415,15 @@ fn poll_with(
             },
         };
         let applied = match reply {
-            Reply::Page(page) => stored.scan.page(&work, page),
+            Reply::Page(page) => {
+                let first = matches!(work, Work::Page { cursor: None });
+                let same_viewer = previous_viewer.as_deref() == Some(viewer.as_str());
+                if !first && !same_viewer {
+                    stored.attention_scan_start = None;
+                }
+                finished_census = page.next_cursor.is_none() && (first || same_viewer);
+                stored.scan.page(&work, page)
+            }
             Reply::History(page) => stored.scan.history(&work, page),
         };
         if stored
@@ -354,6 +437,7 @@ fn poll_with(
         applied
     });
     if applied.is_err() {
+        stored.attention_scan_start = None;
         stored.scan.failed_history(&work);
         observed.clear();
         stored.failures = stored.failures.saturating_add(1);
@@ -413,8 +497,17 @@ fn poll_with(
             .observed
             .drain(..stored.observed.len() - OBSERVATION_PAGES);
     }
+    if finished_census
+        && stored.error.is_none()
+        && let Some(census) = stored
+            .attention_scan_start
+            .take()
+            .and_then(|start| census_for(repository, &stored.scan, start))
+    {
+        stored.attention_completed = Some((completed, census));
+    }
     pr_status::store(&path, &stored).map_err(|error| error.to_string())?;
-    Ok(stored.result(completed))
+    Ok(stored.result(repository, completed))
 }
 
 /// Census fixtures, including publisher processes, shared with the
@@ -1083,6 +1176,103 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(paused.due, retry_at);
+    }
+
+    #[test]
+    fn only_a_complete_successful_provider_scan_reports_absence() {
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let repository = repository();
+        let run = |now, reply: Option<Result<Reply, GitHubError>>| {
+            poll_with(
+                root.path(),
+                "account",
+                &repository,
+                &cancel,
+                || now,
+                |_, _| reply.expect("cache should not fetch another page"),
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        assert!(
+            run(1000, Some(Ok(page("viewer", &[1], Some("next")))))
+                .census
+                .is_none()
+        );
+        assert!(run(1001, None).census.is_none());
+        let completed = run(1006, Some(Ok(page("viewer", &[], None))));
+        let census = completed.census.as_ref().unwrap();
+        assert_eq!(census.start.at, 1000);
+        assert_eq!(census.start.revision, 0);
+        assert_eq!(census.viewer, "viewer");
+        assert_eq!(
+            census.current.get(&1).map(String::as_str),
+            Some("request-1")
+        );
+        let follower = run(1007, None);
+        assert_eq!(follower.census.as_ref(), Some(census));
+        let failed = run(1067, Some(Err(GitHubError::Inspection("offline".into()))));
+        assert!(failed.error.is_some());
+        assert!(failed.census.is_none());
+    }
+
+    #[test]
+    fn a_follower_recovers_a_complete_census_after_an_older_cache_writer() {
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let repository = repository();
+        let fetch = |now| {
+            poll_with(
+                root.path(),
+                "account",
+                &repository,
+                &cancel,
+                || now,
+                |_, _| Ok(page("viewer", &[], None)),
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        fetch(1000);
+        let first = fetch(1060);
+        let recent = first.census.unwrap();
+        let path = root
+            .path()
+            .join(format!("{}.json", name("account", &repository)));
+        let mut legacy = pr_status::load::<serde_json::Value>(&path)
+            .unwrap()
+            .unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("attention_scan_start");
+        object.remove("attention_completed");
+        assert_eq!(object["census_at"].as_u64(), Some(recent.start.at));
+        pr_status::store(&path, &legacy).unwrap();
+        let follower = |now| {
+            poll_with(
+                root.path(),
+                "account",
+                &repository,
+                &cancel,
+                || now,
+                |_, _| panic!("shared scan evidence must not fetch GitHub again"),
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap()
+        };
+        let fallback = follower(1061).census.unwrap();
+        assert_eq!(fallback.viewer, recent.viewer);
+        assert_eq!(fallback.current, recent.current);
+        assert_eq!(fallback.start, ScanPoint::legacy_census(recent.start.at));
+        assert!(!recent.start.precedes_census(&fallback.start));
+        MonitorUpdate::Completed(fallback).validate().unwrap();
+        let mut legacy_obj = legacy.as_object_mut().unwrap().clone();
+        legacy_obj.insert("error".into(), "offline".into());
+        pr_status::store(&path, &legacy_obj).unwrap();
+        assert!(follower(1061).census.is_none());
     }
 
     #[test]

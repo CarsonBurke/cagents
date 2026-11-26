@@ -9,12 +9,14 @@ pub(super) mod orphaned;
 mod osascript;
 #[cfg(target_os = "linux")]
 mod portal;
+mod review_monitor;
 mod withdrawals;
 use journal::Journal;
 #[cfg(target_os = "macos")]
 use osascript::{Activation, PortalOwner, connect, remove, send, send_test};
 #[cfg(target_os = "linux")]
 use portal::{Activation, PortalOwner, connect, remove, send, send_test};
+use review_monitor::ReviewMonitor;
 use withdrawals::Withdrawals;
 
 use std::{
@@ -34,6 +36,7 @@ use crate::{
 };
 
 const MAX_PENDING: usize = 2048;
+const MAX_REVIEW_UPDATES: usize = 16;
 // One stable portal ID and one legacy journal ID per retained notice.
 const MAX_WITHDRAWALS: usize = MAX_PENDING * 2;
 const MAX_ACTIONS: usize = 32;
@@ -79,6 +82,12 @@ impl Drop for CommitReceipt {
     }
 }
 
+enum ReviewUpdate {
+    Monitor(crate::notifications::review::MonitorUpdate),
+    Observed(crate::notifications::review::StampedRequests),
+    Legacy(crate::notifications::review::ObservedRequests),
+}
+
 #[derive(Default)]
 struct Pending {
     events: BTreeMap<Target, Event>,
@@ -90,6 +99,7 @@ struct Pending {
     cleared_waiting: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
     predecessor_reads: BTreeMap<Uuid, TerminalId>,
+    review_updates: VecDeque<ReviewUpdate>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
     /// The portal service's latest owner, when it changed; `Some(None)` means
@@ -129,6 +139,9 @@ impl Pending {
             }
         }
         self.read_predecessors(newer.predecessor_reads);
+        let review_room = MAX_REVIEW_UPDATES.saturating_sub(self.review_updates.len());
+        self.review_updates
+            .extend(newer.review_updates.into_iter().take(review_room));
         self.committed_events.extend(newer.committed_events);
         if newer.inboxes.is_some() {
             self.inboxes = newer.inboxes;
@@ -184,6 +197,7 @@ impl Pending {
             cleared_waiting: self.cleared_waiting,
             acknowledged: self.acknowledged,
             predecessor_reads: self.predecessor_reads,
+            review_updates: self.review_updates,
             presence_changed: self.presence_changed,
             reload: self.reload,
             preferences: self.preferences,
@@ -211,6 +225,36 @@ struct Shared {
 pub(super) struct Handle(Arc<Shared>);
 
 impl Handle {
+    pub(super) fn observe_review_monitor(
+        &self,
+        update: crate::notifications::review::MonitorUpdate,
+    ) -> Result<(), String> {
+        use crate::notifications::review::MonitorUpdate;
+        match update {
+            MonitorUpdate::Observations(observed) => {
+                self.enqueue_review_update(ReviewUpdate::Observed(observed))
+            }
+            update => self.enqueue_review_update(ReviewUpdate::Monitor(update)),
+        }
+    }
+
+    pub(super) fn observe_review_requests(
+        &self,
+        observed: crate::notifications::review::ObservedRequests,
+    ) -> Result<(), String> {
+        self.enqueue_review_update(ReviewUpdate::Legacy(observed))
+    }
+
+    fn enqueue_review_update(&self, update: ReviewUpdate) -> Result<(), String> {
+        let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.stopped || pending.review_updates.len() >= MAX_REVIEW_UPDATES {
+            return Err("Review reconciliation is busy".into());
+        }
+        pending.review_updates.push_back(update);
+        drop(pending);
+        let _ = self.0.wake.try_send(());
+        Ok(())
+    }
     /// Real bounded enqueue state without a broker, portal, or worker thread.
     #[cfg(test)]
     pub(in crate::host) fn inert_for_test() -> (Self, impl Fn() -> Vec<Event>) {
@@ -717,6 +761,54 @@ fn restore(
     reserve_withdrawals(journal, snapshot, withdrawals).map(|_| ())
 }
 
+fn review_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn expire_review_notices(
+    monitor: &mut ReviewMonitor,
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+) -> BTreeSet<Uuid> {
+    match monitor.expire(journal, &snapshot.notices, Instant::now(), review_clock()) {
+        Ok(ids) => acknowledge_review_notices(snapshot, withdrawals, ids, |id| {
+            journal.acknowledge(id).map(|_| ())
+        }),
+        Err(error) => {
+            snapshot.diagnostic = Some(error);
+            BTreeSet::new()
+        }
+    }
+}
+
+fn acknowledge_review_notices(
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    candidates: Vec<Uuid>,
+    mut persist: impl FnMut(Uuid) -> Result<(), String>,
+) -> BTreeSet<Uuid> {
+    let candidates: BTreeSet<_> = candidates.into_iter().collect();
+    let mut acknowledged = BTreeSet::new();
+    for notice in &mut snapshot.notices {
+        if candidates.contains(&notice.id) && !notice.acknowledged {
+            match persist(notice.id) {
+                Ok(()) => {
+                    notice.acknowledged = true;
+                    acknowledged.insert(notice.id);
+                    withdraw_notice(withdrawals, notice);
+                }
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
+    }
+    acknowledged
+}
+
 /// Desktop revocation must not depend on a successful SQLite rewrite. Preserve
 /// exact attention IDs while removing rich context from the published snapshot.
 fn revoke_previews(snapshot: &mut Snapshot, withdrawals: &mut Withdrawals) {
@@ -825,6 +917,75 @@ fn discard_resolved_delivery(
     }
     withdraw_notice(withdrawals, notice);
     Ok(())
+}
+
+struct ReviewDelivery<'a> {
+    pending: &'a mut BTreeMap<Target, Notice>,
+    schedule: &'a mut batching::Schedule,
+    presence: &'a BTreeMap<ClientId, Presence>,
+    policy: &'a Preferences,
+}
+
+fn apply_review_updates(
+    monitor: &mut ReviewMonitor,
+    journal: &mut Journal,
+    snapshot: &mut Snapshot,
+    withdrawals: &mut Withdrawals,
+    updates: VecDeque<ReviewUpdate>,
+    delivery: ReviewDelivery<'_>,
+) {
+    let seconds = review_clock();
+    for update in updates {
+        let observed: Vec<_> = match update {
+            ReviewUpdate::Observed(observed) => observed
+                .events()
+                .map(|(event, point)| (event, Some(point)))
+                .collect(),
+            ReviewUpdate::Legacy(observed) => {
+                observed.events().map(|event| (event, None)).collect()
+            }
+            ReviewUpdate::Monitor(update) => {
+                match monitor.apply(update, journal, &snapshot.notices, seconds) {
+                    Ok(ids) => {
+                        let cleared =
+                            acknowledge_review_notices(snapshot, withdrawals, ids, |_| Ok(()));
+                        if !cleared.is_empty() {
+                            delivery
+                                .pending
+                                .retain(|_, notice| !cleared.contains(&notice.id));
+                        }
+                    }
+                    Err(error) => snapshot.diagnostic = Some(error),
+                }
+                continue;
+            }
+        };
+        for (event, point) in observed {
+            let focused = delivery
+                .presence
+                .values()
+                .any(|window| window.focused_target.as_ref() == Some(&event.target));
+            let suppressed = !delivery.policy.allows(event.evidence.kind, focused);
+            match ReviewMonitor::record(journal, event, point, suppressed, seconds) {
+                Ok(Some(notice)) => {
+                    if !suppressed {
+                        delivery.schedule.update(
+                            notice.event.target(),
+                            notice.event.evidence.kind,
+                            Instant::now(),
+                        );
+                        delivery
+                            .pending
+                            .insert(notice.event.target(), notice.clone());
+                    }
+                    // The next census sees earlier observations in the same broker batch.
+                    snapshot.notices.push(notice);
+                }
+                Ok(None) => {}
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
+    }
 }
 
 fn delivery_batch(
@@ -1278,6 +1439,7 @@ async fn run(
         diagnostic: settings_error.clone(),
         ..Default::default()
     };
+    let mut review_monitor = ReviewMonitor::default();
     match store.journal() {
         Ok(journal) => {
             if let Err(error) = restore(journal, &policy, &mut snapshot, &mut withdrawals) {
@@ -1292,6 +1454,12 @@ async fn run(
                 &mut withdrawals,
                 true,
                 &mut automation_retry,
+            );
+            expire_review_notices(
+                &mut review_monitor,
+                journal,
+                &mut snapshot,
+                &mut withdrawals,
             );
         }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
@@ -1315,6 +1483,7 @@ async fn run(
             .chain(predecessor_retry.as_ref().map(|(due, _)| *due))
             .chain(withdrawal_retry.as_ref().map(|(due, _)| *due))
             .chain(automation_retry.deadline())
+            .chain(review_monitor.deadline())
             .min()
         }),
     )
@@ -1578,6 +1747,19 @@ async fn run(
                 withdraw_notice(&mut withdrawals, notice);
             }
         }
+        apply_review_updates(
+            &mut review_monitor,
+            journal,
+            &mut snapshot,
+            &mut withdrawals,
+            pending.review_updates,
+            ReviewDelivery {
+                pending: &mut delivery,
+                schedule: &mut delivery_schedule,
+                presence: &presence,
+                policy: &policy,
+            },
+        );
         let events = pending
             .events
             .into_values()
@@ -1636,6 +1818,15 @@ async fn run(
         match journal.list() {
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
+        }
+        let retired_review_ids = expire_review_notices(
+            &mut review_monitor,
+            journal,
+            &mut snapshot,
+            &mut withdrawals,
+        );
+        if !retired_review_ids.is_empty() {
+            delivery.retain(|_, notice| !retired_review_ids.contains(&notice.id));
         }
         restore_automation_attention(
             journal,
@@ -2107,6 +2298,63 @@ mod tests {
     }
 
     #[test]
+    fn an_old_client_positive_after_an_accepted_census_survives_its_replay() {
+        use crate::notifications::review::{Census, MonitorUpdate, ObservedRequests};
+        use review_monitor::tests::{observed, point, repo};
+        let directory = tempfile::tempdir().unwrap();
+        let (handle, mut bridge) =
+            JournalTestBridge::new(&directory.path().join("attention.sqlite")).unwrap();
+        let repository = repo(None);
+        let seconds = review_clock() as u64;
+        for (number, key) in [(1, "before"), (2, "after")] {
+            let stamped = observed(&repository, "alice", key, number, point(1, seconds));
+            handle
+                .observe_review_requests(ObservedRequests {
+                    destination: stamped.destination,
+                    requests: stamped
+                        .requests
+                        .into_iter()
+                        .map(|entry| entry.request)
+                        .collect(),
+                })
+                .unwrap();
+            handle
+                .observe_review_monitor(MonitorUpdate::Completed(Census {
+                    repository: repository.clone(),
+                    start: point(1, seconds),
+                    viewer: "alice".into(),
+                    current: BTreeMap::new(),
+                }))
+                .unwrap();
+        }
+        let pending = take_pending(&handle.0);
+        apply_review_updates(
+            &mut ReviewMonitor::default(),
+            &mut bridge.journal,
+            &mut Snapshot::default(),
+            &mut Withdrawals::default(),
+            pending.review_updates,
+            ReviewDelivery {
+                pending: &mut BTreeMap::new(),
+                schedule: &mut batching::Schedule::default(),
+                presence: &BTreeMap::new(),
+                policy: &Preferences::default(),
+            },
+        );
+        let exact = bridge
+            .journal
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|notice| (notice.event.evidence.key, notice.acknowledged))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            exact,
+            BTreeMap::from([("after".into(), false), ("before".into(), true)])
+        );
+    }
+
+    #[test]
     fn predecessor_read_keeps_withdrawals_when_new_attention_replaces_the_row() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("attention.sqlite");
@@ -2151,6 +2399,86 @@ mod tests {
 
         assert_eq!(published.notices, [current]);
         assert!(published.notices.iter().all(|notice| notice.id != old.id));
+    }
+
+    #[test]
+    fn queued_review_observation_is_cleared_by_the_same_batch_and_delayed_earlier_evidence_is_refused()
+     {
+        use crate::notifications::review::{Census, MonitorUpdate};
+        use review_monitor::tests::{observed, point, repo};
+        let directory = tempfile::tempdir().unwrap();
+        let (handle, mut bridge) =
+            JournalTestBridge::new(&directory.path().join("attention.sqlite")).unwrap();
+        let repository = repo(None);
+        let seconds = review_clock() as u64;
+        handle
+            .observe_review_monitor(MonitorUpdate::Observations(observed(
+                &repository,
+                "alice",
+                "queued",
+                1,
+                point(1, seconds),
+            )))
+            .unwrap();
+        handle
+            .observe_review_monitor(MonitorUpdate::Completed(Census {
+                repository: repository.clone(),
+                start: point(1, seconds),
+                viewer: "alice".into(),
+                current: BTreeMap::new(),
+            }))
+            .unwrap();
+        handle
+            .observe_review_monitor(MonitorUpdate::Observations(observed(
+                &repository,
+                "alice",
+                "delayed",
+                2,
+                point(1, seconds),
+            )))
+            .unwrap();
+        handle
+            .observe_review_monitor(MonitorUpdate::Observations(observed(
+                &repository,
+                "alice",
+                "fresh",
+                3,
+                point(2, seconds),
+            )))
+            .unwrap();
+        let pending = take_pending(&handle.0);
+        let mut delivery = BTreeMap::new();
+        apply_review_updates(
+            &mut ReviewMonitor::default(),
+            &mut bridge.journal,
+            &mut Snapshot::default(),
+            &mut Withdrawals::default(),
+            pending.review_updates,
+            ReviewDelivery {
+                pending: &mut delivery,
+                schedule: &mut batching::Schedule::default(),
+                presence: &BTreeMap::new(),
+                policy: &Preferences::default(),
+            },
+        );
+        let exact = bridge
+            .journal
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|notice| (notice.event.evidence.key, notice.acknowledged))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            exact,
+            BTreeMap::from([("fresh".into(), false), ("queued".into(), true)])
+        );
+        assert_eq!(
+            delivery
+                .into_values()
+                .map(|notice| notice.event.evidence.key)
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
     }
 
     #[test]

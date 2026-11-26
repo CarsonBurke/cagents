@@ -342,7 +342,9 @@ use crate::{
 /// Version 207 appends `queue_holds` to chat capabilities. Earlier clients
 /// receive the capabilities they know, and earlier update sources omit it.
 /// Version 208 appends connection-scoped mobile watch invalidations.
-pub const PROTOCOL_VERSION: u16 = 208;
+///
+/// Version 209 adds review monitor reports and complete review censuses.
+pub const PROTOCOL_VERSION: u16 = 209;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -889,6 +891,10 @@ pub enum ClientRequest {
     /// Watch one mobile projection until this connection disconnects.
     WatchMobile {
         topic: MobileWatch,
+    },
+    /// Report watcher presence or the boundary of an exact review census.
+    ObserveReviewMonitor {
+        update: crate::notifications::review::MonitorUpdate,
     },
 }
 

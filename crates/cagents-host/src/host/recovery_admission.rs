@@ -88,6 +88,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatCandidates { .. }
         | R::UpgradeImpact { .. }
         | R::ObserveReviewRequests { .. }
+        | R::ObserveReviewMonitor { .. }
         | R::WatchNotifications { .. }
         | R::NotificationPresence { .. }
         | R::ReadNotifications

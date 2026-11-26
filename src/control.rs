@@ -1678,6 +1678,13 @@ impl ControlClient {
         self.accepted(ClientRequest::ObserveReviewRequests { observed })
     }
 
+    pub fn observe_review_monitor(
+        &mut self,
+        update: crate::notifications::review::MonitorUpdate,
+    ) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::ObserveReviewMonitor { update })
+    }
+
     pub fn notification_presence(
         &mut self,
         presence: crate::notifications::Presence,
