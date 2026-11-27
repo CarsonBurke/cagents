@@ -664,21 +664,14 @@ impl State {
                 .unwrap_or_default(),
             if open { "Hide" } else { "Show" },
         );
-        let mut line = vec![
-            warning_icon(),
-            // Quieter than the cards: only the icon is in the warning colour.
-            crate::ui_controls::FadeText::caption(summary)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::Fill)
-                .into(),
-        ];
-        line.extend(count.map(|count| {
+        let mut trail = Vec::with_capacity(2);
+        trail.extend(count.map(|count| {
             design::caption(count)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into()
         }));
-        line.push(
+        trail.push(
             widget::icon(
                 if open {
                     Icon::ChevronUp
@@ -690,13 +683,26 @@ impl State {
             .size(design::COMPACT_ICON_SIZE)
             .into(),
         );
+        // The count and chevron stay beside the summary, which fades where
+        // the header runs out of room. Quieter than the cards: only the icon
+        // is in the warning colour.
+        let line = vec![
+            warning_icon(),
+            crate::ui_controls::trailing(
+                crate::ui_controls::FadeText::caption(summary)
+                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+                widget::row::with_children(trail)
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                space::XS,
+            ),
+        ];
         let anchor = widget::button::custom(
             widget::row::with_children(line)
                 .spacing(space::XS)
                 .align_y(Alignment::Center),
         )
         .name(name)
-        .width(Length::Fill)
         .class(crate::ui_controls::control_style(open, None))
         .padding([space::XXS, space::XS])
         .on_press(Action::Problems(!open));
