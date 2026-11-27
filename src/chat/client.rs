@@ -2205,6 +2205,7 @@ impl ClientHandle {
     }
 
     /// Drives the production connect/lineage/attach path for UI writer tests.
+    /// The scripted peer closes its socket after the handshake.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn fixture_upgrade_handshake(
@@ -2212,7 +2213,29 @@ impl ClientHandle {
         session: Session,
         snapshot: Snapshot,
     ) -> Result<Self, StartFailure> {
-        fixture::restore_with_lineage(source, Some(session), move |request| {
+        Self::upgrade_handshake_fixture(source, session, snapshot, false)
+    }
+
+    /// [`Self::fixture_upgrade_handshake`], but the peer keeps the attachment
+    /// open as a live daemon does.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fixture_live_upgrade_handshake(
+        source: Session,
+        session: Session,
+        snapshot: Snapshot,
+    ) -> Result<Self, StartFailure> {
+        Self::upgrade_handshake_fixture(source, session, snapshot, true)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn upgrade_handshake_fixture(
+        source: Session,
+        session: Session,
+        snapshot: Snapshot,
+        stay_open: bool,
+    ) -> Result<Self, StartFailure> {
+        fixture::restore_with_lineage_on(source, Some(session), stay_open, move |request| {
             let ClientRequest::ChatAttach { session } = request else {
                 panic!("expected exact upgrade attach");
             };
@@ -4279,6 +4302,20 @@ pub mod fixture {
         resolved: Option<Session>,
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
+        restore_with_lineage_on(session, resolved, false, answer)
+    }
+
+    /// Restores through a scripted peer. With `stay_open` the peer keeps the
+    /// attachment open after the handshake, as a daemon does, until the
+    /// handle closes its end; otherwise it closes. The open peer accepts only
+    /// visibility and follow-up holds, so a test that waits on any other
+    /// request's reply times out.
+    pub fn restore_with_lineage_on(
+        session: Session,
+        resolved: Option<Session>,
+        stay_open: bool,
+        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
+    ) -> Result<ClientHandle, StartFailure> {
         use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
         let live = resolved
             .as_ref()
@@ -4286,6 +4323,7 @@ pub mod fixture {
             .unwrap_or_else(|| host_proof("live"));
         let (client, mut server) = UnixStream::pair().unwrap();
         let proof = live.clone();
+        let (handshaken, handshake) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             server
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -4344,6 +4382,33 @@ pub mod fixture {
                 start.request_id,
                 answer(start.request),
             );
+            let _ = handshaken.send(());
+            if !stay_open {
+                return;
+            }
+            let _ = server.set_read_timeout(None);
+            // Accept the attachment's routine admissions as a daemon does.
+            // Leave anything else pending: an answer the fixture cannot give
+            // would publish a failure no daemon produces.
+            while let Ok(Some(request)) = codec.read::<ClientEnvelope>(&mut server) {
+                if !matches!(
+                    request.request,
+                    ClientRequest::ChatVisibility { .. } | ClientRequest::ChatHoldsFollowups { .. }
+                ) {
+                    continue;
+                }
+                let accepted = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                };
+                if codec.write(&mut server, &accepted).is_err() {
+                    break;
+                }
+            }
         });
         let result = ClientHandle::connect_on(
             client,
@@ -4356,7 +4421,11 @@ pub mod fixture {
             None,
             |_| {},
         );
-        worker.join().unwrap();
+        // A handshake assertion failure ends the worker before it reports.
+        // A closing peer has closed its socket once this returns.
+        if !stay_open || handshake.recv().is_err() {
+            worker.join().unwrap();
+        }
         result
     }
 }
