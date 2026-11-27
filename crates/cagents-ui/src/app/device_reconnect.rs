@@ -44,6 +44,8 @@ pub enum ReconnectMessage {
     UpdateFinished(Result<Success, Failure>),
     OpenHere,
     OpenedHere(Result<(), String>),
+    /// Copies a command the reason names.
+    CopyCommand(String),
     Close,
 }
 
@@ -291,6 +293,9 @@ impl cosmic::Application for Reconnect {
                 })
             }
             ReconnectMessage::Close if self.updating() => Task::none(),
+            ReconnectMessage::CopyCommand(command) => {
+                iced::clipboard::write(command).map(cosmic::Action::App)
+            }
             ReconnectMessage::OpenedHere(Ok(())) | ReconnectMessage::Close => iced::exit(),
             ReconnectMessage::OpenedHere(Err(error)) => {
                 self.notice = Some(error);
@@ -332,7 +337,18 @@ impl cosmic::Application for Reconnect {
             Phase::Failed(reason) => {
                 retry = true;
                 rows.push(design::title(self.failed_title()).into());
-                rows.push(design::body(reason.clone()).into());
+                rows.push(super::command_text::view(
+                    reason,
+                    |text| design::body(text).into(),
+                    |command| {
+                        crate::interaction::tooltip(
+                            crate::ui_controls::icon_button(Icon::Copy, "Copy command")
+                                .compact()
+                                .on_press(ReconnectMessage::CopyCommand(command.to_owned())),
+                            "Copy command",
+                        )
+                    },
+                ));
             }
             Phase::Needs {
                 need,

@@ -11,6 +11,7 @@ mod channel_ui;
 mod chat_close;
 mod chat_ui;
 mod chrome_ui;
+mod command_text;
 mod context_sections;
 mod daemon_health_ui;
 mod daemon_recovery;
@@ -808,6 +809,23 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .into()
+}
+/// A notice's message, with any command it names set apart to be read whole
+/// and copied (see [`command_text`]).
+fn notice_message<'a>(severity: NoticeSeverity, text: &'a str) -> Element<'a, Message> {
+    command_text::view(text, notice_body, move |command| {
+        crate::interaction::tooltip(
+            widget::button::icon(Icon::Copy)
+                .name("Copy command")
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .class(notice_surface_button(severity))
+                .on_press(Message::ChromeUi(chrome_ui::Action::CopyCommand(
+                    command.to_owned(),
+                ))),
+            "Copy command",
+        )
+    })
 }
 /// Selectable equivalent of `design::caption`: diagnostic detail the user
 /// needs to copy into a bug report, a shell, or a search. For a plain dialog

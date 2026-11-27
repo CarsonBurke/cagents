@@ -4925,17 +4925,30 @@ fn remote_ui_launch_timeout() -> Duration {
     REMOTE_HANDSHAKE_TIMEOUT + UI_LAUNCH_HANDSHAKE_TIMEOUT
 }
 
+/// Whether `command` starts a window on a device, which every launch of one
+/// names with `--device`.
+fn opens_device_window(command: &Command) -> bool {
+    command.get_args().any(|argument| argument == "--device")
+}
+
 pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
     // Remote windows attach to an already-running device daemon. Its handoff
     // budget is not stored on the client, whose repository filesystem is gated.
-    let timeout = if crate::device::is_remote() {
-        remote_ui_launch_timeout()
-    } else {
-        crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
-            + UI_LAUNCH_HANDSHAKE_TIMEOUT
+    // What the child opens decides, not what this process selected: a device
+    // window opened from this computer reaches its device all the same.
+    let local = || {
+        crate::upgrade::handoff::startup_timeout()
+            .map(|budget| budget + UI_LAUNCH_HANDSHAKE_TIMEOUT)
+            .map_err(io::Error::other)
+    };
+    let timeout = match (opens_device_window(command), crate::device::is_remote()) {
+        (true, true) => remote_ui_launch_timeout(),
+        (true, false) => local()?.max(remote_ui_launch_timeout()),
+        (false, true) => UI_LAUNCH_HANDSHAKE_TIMEOUT,
+        (false, false) => local()?,
     };
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
@@ -8393,6 +8406,14 @@ mod tests {
         // launcher outwaits that handshake rather than reporting a timeout
         // of its own over the window's reason.
         assert!(remote_ui_launch_timeout() > REMOTE_HANDSHAKE_TIMEOUT);
+        // Whichever device this launcher selected: the window it starts
+        // decides (#4505).
+        let mut window = Command::new("cagents-ui");
+        window.args(["--device", "build-host", "--device-window-scoped"]);
+        assert!(opens_device_window(&window));
+        let mut local = Command::new("cagents-ui");
+        local.args(["--new-window", "--window", "device-build-host"]);
+        assert!(!opens_device_window(&local));
         let error = device_app_error(slow());
         assert_eq!(error.kind, "device_unresponsive");
         assert_eq!(

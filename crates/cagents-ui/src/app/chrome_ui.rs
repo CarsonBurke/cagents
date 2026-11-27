@@ -2104,6 +2104,8 @@ pub enum Action {
     CloseToRight(CardId),
     Clone(CardId),
     CopyPath(CardId),
+    /// Copies a command a notice names.
+    CopyCommand(String),
     Reveal(CardId),
     ToggleProjects,
     ToggleNewTab,
@@ -2810,6 +2812,10 @@ impl Cagents {
                 chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(path.display().to_string())
             }),
+            Action::CopyCommand(command) => {
+                chat_ui::invalidate_copy_intent();
+                iced::clipboard::write(command)
+            }
             Action::Reveal(id) => {
                 let was_collapsed = self.chrome_ui.projects_collapsed;
                 self.chrome_ui.projects_collapsed = false;
@@ -3369,7 +3375,7 @@ impl Cagents {
                         continue;
                     }
                     let severity = entry.notice.severity;
-                    let mut lines = vec![super::notice_body(&entry.notice.message)];
+                    let mut lines = vec![super::notice_message(severity, &entry.notice.message)];
                     if let Some(details) = &entry.notice.details {
                         lines.push(super::notice_surface_details(severity, details));
                     }
