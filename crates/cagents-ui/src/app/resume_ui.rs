@@ -1950,7 +1950,8 @@ impl Cagents {
             self.resume_error(&missing_directory(session));
             return Task::none();
         }
-        let prepare = session.native_continuity.retains_provider() || unstarted_successor(session);
+        let prepare = session.native_continuity.retains_provider()
+            || chat::is_unstarted_resume_successor(session);
         let direct_history = !prepare
             && self.session.is_some()
             && session.proof.is_some()
@@ -2136,7 +2137,7 @@ impl Cagents {
         let origin = reopening.entry.card;
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let source = reopening.entry.session.clone();
-        let unstarted = unstarted_successor(&source);
+        let unstarted = chat::is_unstarted_resume_successor(&source);
         cosmic::task::future(async move {
             let response = tokio::task::spawn_blocking(move || {
                 let (socket, local) = locate().map_err(|error| error.to_string())?;
@@ -2280,7 +2281,9 @@ impl Cagents {
             return self.start_reopened(card, session);
         }
         let source = reopening.entry.session.clone();
-        if source.native_continuity.retains_provider() || unstarted_successor(&source) {
+        if source.native_continuity.retains_provider()
+            || chat::is_unstarted_resume_successor(&source)
+        {
             reopening.stage = ReopenStage::Preparing;
             return self.prepare_reopening(card);
         }
@@ -3220,17 +3223,6 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
     )
 }
 
-/// A resume successor the daemon prepared but that never started. Resuming it
-/// again through the daemon keeps the lineage, and the agent, it was prepared
-/// to take over.
-fn unstarted_successor(session: &chat::Session) -> bool {
-    session.launch.provider == Provider::Claude
-        && session.native_continuity == chat::NativeContinuity::ReconnectOnly
-        && session.proof.is_none()
-        && session.terminal.is_none()
-        && session.launch.session_id.is_some()
-}
-
 /// Indices of the rows matching `query` within `scope`.
 /// The rows `query` matches, best first, among those `scope` admits, and how
 /// many it matches at each reach. Every word is looked for on its own: in
@@ -3650,7 +3642,7 @@ mod tests {
         // A prepared successor the card closed before it ever started.
         let mut entry = saved(directory.path());
         entry.session.proof = None;
-        assert!(unstarted_successor(&entry.session));
+        assert!(chat::is_unstarted_resume_successor(&entry.session));
         let source = entry.session.clone();
         drop(app.resume_saved_conversation(entry.clone()));
         let (card, attempt) = reopening(&app);
@@ -4871,7 +4863,7 @@ mod tests {
         let mut entry = saved(directory.path());
         entry.session.proof = None;
         entry.session.launch.session_id = Some("unsaved-thread".into());
-        assert!(unstarted_successor(&entry.session));
+        assert!(chat::is_unstarted_resume_successor(&entry.session));
         assert!(!entry.session.launch.needs_read_only_history());
         drop(app.resume_saved_conversation(entry));
         let (card, attempt) = reopening(&app);

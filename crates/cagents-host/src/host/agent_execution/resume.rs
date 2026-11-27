@@ -8,17 +8,18 @@
 //! hold, and the proof that no earlier process still writes it. A conversation
 //! whose actor kept the provider (a retained Claude helper, a durable Codex
 //! listener) is first prepared, which proves that owner ended and gives the
-//! conversation a successor in its lineage; any other reopens in place. What
-//! the stopped provider held is never resent.
+//! conversation a successor in its lineage, as is a successor prepared earlier
+//! that never started; any other reopens in place. What the stopped provider
+//! held is never resent.
 use super::{EXECUTION_CLIENT, SharedHost, caller, directory, mailbox, registry, start_gate};
 use crate::{
     agent_execution::{
-        Agent, Authority, HostedSession, Origin,
+        Agent, Authority, HostedSession, Origin, Placement,
         directory::{Member, Scope as Sessions, Surface},
         resume::{Resumed, Scope, Stopped, StoppedSessions},
     },
     chat::{self, Session},
-    model::TerminalId,
+    model::{ChannelId, TerminalId},
     terminal_ipc::{ClientRequest, ProtocolError, ServerResponse},
 };
 use std::{
@@ -54,7 +55,6 @@ pub(super) fn stopped(
     scope: Scope,
 ) -> Result<StoppedSessions, String> {
     let (origin, _) = caller(host, authority)?;
-    let everywhere = scope == Scope::Sessions(Sessions::All);
     let wanted = match scope {
         Scope::Sessions(scope) => directory::Wanted::Scope(scope),
         Scope::Channel(channel) => directory::Wanted::Channel(channel),
@@ -72,12 +72,44 @@ pub(super) fn stopped(
         .filter(|member| !member.exited)
         .map(|member| member.session.lineage)
         .collect();
-    // Members come most recently active first, so a lineage's first
-    // resumable member is the conversation it last continued.
-    let candidates = listing.members().filter(|member| {
-        member.exited
-            && member.session.surface == Surface::Chat
-            && !running.contains(&member.session.lineage)
+    let mut candidates: Vec<&Member> = listing
+        .members()
+        .filter(|member| {
+            member.exited
+                && member.session.surface == Surface::Chat
+                && !running.contains(&member.session.lineage)
+        })
+        .collect();
+    // The listing orders sessions for reading, not by when each ran, so each
+    // lineage's members are put latest first by the order they succeeded one
+    // another, keeping the order the lineages first appear in.
+    let mut first_seen = std::collections::HashMap::new();
+    let mut latest_first = std::collections::HashMap::new();
+    {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        for member in &candidates {
+            let lineage = member.session.lineage;
+            let seen = first_seen.len();
+            if let std::collections::hash_map::Entry::Vacant(entry) = first_seen.entry(lineage) {
+                entry.insert(seen);
+                for (rank, id) in registry
+                    .lineage_succession(lineage)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    latest_first.insert(id, rank);
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|member| {
+        (
+            first_seen[&member.session.lineage],
+            latest_first
+                .get(&member.session.id)
+                .copied()
+                .unwrap_or(usize::MAX),
+        )
     });
     let mut found = one_per_lineage(
         candidates,
@@ -102,38 +134,88 @@ pub(super) fn stopped(
                 }),
                 // This daemon runs it after all.
                 Ok(None) => Candidate::Skip,
-                Ok(Some(_)) | Err(_) => Candidate::InAppOnly,
+                Ok(Some(_)) => Candidate::InAppOnly,
+                // Nothing saved to reopen, as for one closed meanwhile.
+                Err(error) => {
+                    tracing::debug!(session = %member.session.id, %error, "a stopped chat left out of the resumable listing");
+                    Candidate::Skip
+                }
             }
         },
     );
-    if everywhere {
-        // An agent no pane shows, such as one started from a shell on a
-        // machine no window opened, is listed by its agent alone.
-        let hosted: BTreeSet<TerminalId> = host
+    // An agent no pane shows, such as one started from a shell on a machine
+    // no window opened, is listed by its agent alone, in the scope it was
+    // placed in.
+    let in_scope = placed_in(&registry, &listing.served)?;
+    let hosted: BTreeSet<TerminalId> = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .keys()
+        .copied()
+        .collect();
+    found.sessions.extend(agents.iter().filter_map(|agent| {
+        let Some(HostedSession::Chat(session)) = &agent.session else {
+            return None;
+        };
+        (!listed.contains(&session.id)
+            && !hosted.contains(&session.id)
+            && in_scope(&agent.placement)
+            && resumable(session)
+            && may_resume(&origin, Some(agent)))
+        .then(|| Stopped {
+            id: session.id,
+            provider: session.launch.provider,
+            title: agent.name.clone(),
+            agent: Some(agent.id),
+            failure: None,
+        })
+    }));
+    Ok(found)
+}
+
+/// Whether an agent placed at a given placement is in the scope a listing
+/// served: anywhere for every project; its channel, or a view of the
+/// project's own, for a project; that channel alone for a channel.
+fn placed_in(
+    registry: &super::SharedRegistry,
+    served: &directory::Wanted,
+) -> Result<impl Fn(&Placement) -> bool, String> {
+    let channels: std::collections::HashMap<ChannelId, std::path::PathBuf> = match served {
+        directory::Wanted::Scope(Sessions::Project(_)) => registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .chats
-            .keys()
-            .copied()
-            .collect();
-        found.sessions.extend(agents.iter().filter_map(|agent| {
-            let Some(HostedSession::Chat(session)) = &agent.session else {
-                return None;
-            };
-            (!listed.contains(&session.id)
-                && !hosted.contains(&session.id)
-                && resumable(session)
-                && may_resume(&origin, Some(agent)))
-            .then(|| Stopped {
-                id: session.id,
-                provider: session.launch.provider,
-                title: agent.name.clone(),
-                agent: Some(agent.id),
-                failure: None,
-            })
-        }));
-    }
-    Ok(found)
+            .model()?
+            .channels
+            .into_iter()
+            .map(|channel| (channel.id, channel.repository))
+            .collect(),
+        _ => Default::default(),
+    };
+    let served = match served {
+        directory::Wanted::Scope(Sessions::All) => Served::All,
+        directory::Wanted::Scope(Sessions::Project(project)) => Served::Project(project.clone()),
+        directory::Wanted::Channel(Some(channel)) => Served::Channel(*channel),
+        // A listing serves a containing directory as its project and the
+        // caller's channel by its ID; nothing else is left to match.
+        _ => Served::Nothing,
+    };
+    Ok(move |placement: &Placement| match (&served, placement) {
+        (Served::All, _) => true,
+        (Served::Project(project), Placement::Worktree { repository, .. }) => repository == project,
+        (Served::Project(project), Placement::Channel(channel)) => {
+            channels.get(channel) == Some(project)
+        }
+        (Served::Channel(served), Placement::Channel(channel)) => served == channel,
+        _ => false,
+    })
+}
+
+enum Served {
+    All,
+    Project(std::path::PathBuf),
+    Channel(ChannelId),
+    Nothing,
 }
 
 /// What one stopped chat is to a listing of what may be resumed.
@@ -145,36 +227,35 @@ enum Candidate {
     Skip,
 }
 
-/// The first resumable candidate of each lineage, in the order lineages first
-/// appear, and how many lineages only the app can reopen.
-fn one_per_lineage<T, L: PartialEq>(
+/// Each lineage's latest conversation the caller may resume, in the order
+/// lineages first appear, and how many lineages only the app can reopen.
+/// Candidates come most recently active first, and a lineage offers only its
+/// first one that is not skipped: an older member would reopen a stale
+/// conversation in place of the one the lineage last continued.
+fn one_per_lineage<T, L: Eq + std::hash::Hash>(
     candidates: impl IntoIterator<Item = T>,
     lineage: impl Fn(&T) -> L,
     mut classify: impl FnMut(&T) -> Candidate,
 ) -> StoppedSessions {
-    let mut lineages: Vec<(L, Vec<T>)> = Vec::new();
+    let mut order: Vec<Vec<T>> = Vec::new();
+    let mut index: std::collections::HashMap<L, usize> = std::collections::HashMap::new();
     for candidate in candidates {
-        let key = lineage(&candidate);
-        match lineages.iter_mut().find(|(seen, _)| *seen == key) {
-            Some((_, members)) => members.push(candidate),
-            None => lineages.push((key, vec![candidate])),
-        }
+        let slot = *index.entry(lineage(&candidate)).or_insert_with(|| {
+            order.push(Vec::new());
+            order.len() - 1
+        });
+        order[slot].push(candidate);
     }
     let mut found = StoppedSessions::default();
-    for (_, members) in lineages {
-        let mut in_app_only = false;
-        let chosen = members.iter().find_map(|member| match classify(member) {
-            Candidate::Resumable(stopped) => Some(stopped),
-            Candidate::InAppOnly => {
-                in_app_only = true;
-                None
-            }
-            Candidate::Skip => None,
-        });
-        match chosen {
-            Some(stopped) => found.sessions.push(stopped),
-            None if in_app_only => found.in_app_only += 1,
-            None => {}
+    for members in order {
+        match members
+            .iter()
+            .map(&mut classify)
+            .find(|candidate| !matches!(candidate, Candidate::Skip))
+        {
+            Some(Candidate::Resumable(stopped)) => found.sessions.push(stopped),
+            Some(Candidate::InAppOnly) => found.in_app_only += 1,
+            Some(Candidate::Skip) | None => {}
         }
     }
     found
@@ -324,22 +405,25 @@ pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Resul
     let original = crate::upgrade::floor::load()
         .ok()
         .and_then(|ledger| ledger.resume_source(source).cloned());
-    let start = if source.native_continuity.retains_provider() || original.is_some() {
+    // A successor prepared but never started is prepared again, as its pane
+    // does: that is what refuses while an earlier process may still write
+    // its conversation.
+    let prepare = source.native_continuity.retains_provider()
+        || chat::is_unstarted_resume_successor(source)
+        || original.is_some();
+    let start = if prepare {
+        let asked = original.unwrap_or_else(|| source.clone());
         let ServerResponse::ChatResumePrepared { session: prepared } =
             request(ClientRequest::ChatPrepareResume {
-                source: original.unwrap_or_else(|| source.clone()),
+                source: asked.clone(),
             })?
         else {
             return Err("The daemon answered the resume with something else".into());
         };
-        if prepared.id == source.id {
-            // A live owner is restored, never replaced.
-            return Err(
-                "An earlier process still holds this conversation, so nothing was started in its place. Try again once it has finished closing, or close its pane in the app to end it; the conversation stays saved"
-                    .into(),
-            );
-        }
-        if !chat::is_prepared_resume(source, &prepared) {
+        // The conversation itself comes back when a live owner keeps it or a
+        // shared Codex server may serve it. The start then restores and
+        // reattaches that owner, never replacing it, as the pane's does.
+        if prepared != asked && !chat::is_prepared_resume(source, &prepared) {
             return Err(
                 "The daemon's resume would not reopen this exact conversation, so nothing was started"
                     .into(),
@@ -490,7 +574,7 @@ fn descriptor(
 }
 
 /// The open agent whose session `id` is.
-fn open_agent(agents: &[Agent], id: TerminalId) -> Option<&Agent> {
+pub(super) fn open_agent(agents: &[Agent], id: TerminalId) -> Option<&Agent> {
     agents.iter().find(|agent| {
         !agent.closed
             && agent
@@ -501,7 +585,7 @@ fn open_agent(agents: &[Agent], id: TerminalId) -> Option<&Agent> {
 }
 
 /// The person resumes anything; a session or automation only what it started.
-fn may_resume(origin: &Origin, agent: Option<&Agent>) -> bool {
+pub(super) fn may_resume(origin: &Origin, agent: Option<&Agent>) -> bool {
     *origin == Origin::User || agent.is_some_and(|agent| agent.origin == *origin)
 }
 
@@ -589,21 +673,32 @@ fn resolve<'a>(
         .copied()
         .filter(|member| member.session.surface == Surface::Chat)
         .collect();
-    // A session named by its own ID is that one; otherwise the lineage must
-    // leave one stopped conversation to reopen.
-    let chosen = match stopped
-        .iter()
-        .copied()
-        .filter(|member| matches(&member.session.id))
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    // A session named by its own ID is that one, and an agent named by its
+    // ID is its own session; otherwise the lineage must leave one stopped
+    // conversation to reopen.
+    let only = |chosen: Vec<&'a Member>| match chosen.as_slice() {
         [one] => Some(*one),
-        _ => match stopped.as_slice() {
-            [one] => Some(*one),
-            _ => None,
-        },
+        _ => None,
     };
+    let chosen = only(
+        stopped
+            .iter()
+            .copied()
+            .filter(|member| matches(&member.session.id))
+            .collect(),
+    )
+    .or_else(|| {
+        only(
+            stopped
+                .iter()
+                .copied()
+                .filter(|member| {
+                    agent_of(member.session.id).is_some_and(|agent| matches(&agent.id))
+                })
+                .collect(),
+        )
+    })
+    .or_else(|| only(stopped.clone()));
     match chosen {
         Some(member) => Ok(Resolved::Stopped(
             member.session.id,
@@ -672,31 +767,53 @@ mod tests {
             agent: None,
             failure: Some("Codex sign-in needs attention".into()),
         };
-        let [newest, older, other, paired, foreign] = std::array::from_fn(|_| TerminalId::new());
+        let [
+            newest,
+            older,
+            other,
+            paired,
+            foreign,
+            ahead,
+            stale,
+            not_theirs,
+            theirs,
+        ] = std::array::from_fn(|_| TerminalId::new());
+        #[derive(Clone, Copy)]
+        enum Is {
+            Resumable,
+            InAppOnly,
+            NotTheirs,
+        }
         // (session, lineage, what it is), most recently active first.
         let members = [
-            (newest, 1, Some(true)),
-            (other, 2, None),
-            (older, 1, Some(true)),
-            (paired, 3, Some(false)),
-            (foreign, 4, None),
+            (newest, 1, Is::Resumable),
+            (other, 2, Is::Resumable),
+            (older, 1, Is::Resumable),
+            (paired, 3, Is::InAppOnly),
+            (foreign, 4, Is::NotTheirs),
+            // Only the app reopens the conversation this lineage last
+            // continued, so it offers none of its older ones.
+            (ahead, 5, Is::InAppOnly),
+            (not_theirs, 6, Is::NotTheirs),
+            (stale, 5, Is::Resumable),
+            // One the caller may not resume leaves the lineage's next.
+            (theirs, 6, Is::Resumable),
         ];
         let found = one_per_lineage(
             members,
             |(_, lineage, _)| *lineage,
-            |(id, _, resumable)| match resumable {
-                Some(true) => Candidate::Resumable(stopped(*id)),
-                Some(false) => Candidate::InAppOnly,
-                None if *id == other => Candidate::Resumable(stopped(*id)),
-                None => Candidate::Skip,
+            |(id, _, is)| match is {
+                Is::Resumable => Candidate::Resumable(stopped(*id)),
+                Is::InAppOnly => Candidate::InAppOnly,
+                Is::NotTheirs => Candidate::Skip,
             },
         );
         assert_eq!(
             found.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
-            [newest, other],
-            "the lineage's latest conversation, once"
+            [newest, other, theirs],
+            "each lineage's latest conversation, once"
         );
-        assert_eq!(found.in_app_only, 1);
+        assert_eq!(found.in_app_only, 2);
         assert_eq!(
             found.sessions[0].failure.as_deref(),
             Some("Codex sign-in needs attention")

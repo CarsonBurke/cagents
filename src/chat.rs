@@ -1210,6 +1210,19 @@ pub fn is_prepared_resume(source: &Session, prepared: &Session) -> bool {
     &expected == prepared
 }
 
+/// Whether `session` is a Claude resume successor the daemon prepared but that
+/// never started: it names its conversation, yet no host has proved it ran.
+/// It must be prepared again rather than started in place, since preparing is
+/// what refuses while an earlier process may still write that conversation,
+/// and what keeps the lineage, and the agent, it was prepared to take over.
+pub fn is_unstarted_resume_successor(session: &Session) -> bool {
+    session.launch.provider == Provider::Claude
+        && session.native_continuity == NativeContinuity::ReconnectOnly
+        && session.proof.is_none()
+        && session.terminal.is_none()
+        && session.launch.session_id.is_some()
+}
+
 /// An identity-only projection: `replacement` is `source` with nothing changed
 /// but the conversation ID and native continuity its provider confirmed. It
 /// covers retained Claude helpers and daemon-hosted Codex threads on their own
