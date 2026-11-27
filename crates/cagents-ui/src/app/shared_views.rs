@@ -1166,6 +1166,12 @@ impl Cagents {
                 && !explicit_retry)
     }
 
+    /// Whether a peer can see this pane, including an insert already queued
+    /// for the registry and a view received before it has been projected.
+    pub(super) fn pane_is_shared(&self, card: CardId) -> bool {
+        self.shared_views.attached.contains(&card) || self.listed_in_registry(card)
+    }
+
     /// Whether the registry shows this card in any view, so another window
     /// may host it.
     fn listed_in_registry(&self, card: CardId) -> bool {
@@ -2499,7 +2505,7 @@ impl Cagents {
         {
             return FirstSendAdmission::Refused;
         }
-        let published = self.shared_views.attached.contains(&card) || self.listed_in_registry(card);
+        let published = self.pane_is_shared(card);
         if self.shared_registry_connecting()
             || !self.shared_views.initialized.contains(scope)
             || self.shared_views.seeding.contains(scope)
