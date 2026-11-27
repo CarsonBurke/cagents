@@ -102,14 +102,19 @@ impl Reconnect {
     /// Opening the window or updating the device, which leaving now would
     /// cut short.
     fn committed(&self) -> bool {
-        matches!(self.phase, Phase::Connecting)
-            || matches!(
-                self.phase,
-                Phase::Needs {
-                    status: Some(RunStatus::Running(_)),
-                    ..
-                }
-            )
+        matches!(self.phase, Phase::Connecting) || self.updating()
+    }
+
+    /// Updating the device, which closing would cut off partway: the update
+    /// stops once it can no longer report its progress here.
+    fn updating(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Needs {
+                status: Some(RunStatus::Running(_)),
+                ..
+            }
+        )
     }
 
     fn failed_title(&self) -> String {
@@ -285,6 +290,7 @@ impl cosmic::Application for Reconnect {
                     ReconnectMessage::OpenedHere(result)
                 })
             }
+            ReconnectMessage::Close if self.updating() => Task::none(),
             ReconnectMessage::OpenedHere(Ok(())) | ReconnectMessage::Close => iced::exit(),
             ReconnectMessage::OpenedHere(Err(error)) => {
                 self.notice = Some(error);
@@ -296,8 +302,9 @@ impl cosmic::Application for Reconnect {
     fn view(&self) -> Element<'_, ReconnectMessage> {
         let device = self.request.device.as_str();
         let committed = self.committed();
-        // Nothing runs on a device without cagents.
-        let mut hosts_work = true;
+        // Only a device that answered is known to keep its work running;
+        // nothing runs on one without cagents.
+        let mut hosts_work = false;
         let waiting = |title: String| -> Element<'_, ReconnectMessage> {
             widget::row::with_children(vec![
                 crate::ui_controls::activity_spinner(20.0, design::accent_color),
@@ -379,7 +386,7 @@ impl cosmic::Application for Reconnect {
         );
         actions.push(
             crate::ui_controls::button::secondary("Close")
-                .on_press(ReconnectMessage::Close)
+                .on_press_maybe((!self.updating()).then_some(ReconnectMessage::Close))
                 .into(),
         );
         rows.push(iced::widget::Space::new().height(Length::Fill).into());
@@ -523,6 +530,10 @@ mod tests {
             }
         ));
         assert!(screen.busy());
+        // Closing would cut the update off partway.
+        assert!(screen.updating());
+        let _ = screen.update(ReconnectMessage::Close);
+        assert!(screen.updating());
         let _ = screen.update(ReconnectMessage::UpdateProgress(
             "Sending cagents 40%".into(),
         ));
