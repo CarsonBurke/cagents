@@ -60,12 +60,12 @@ run = "scripts/doctor"
 # attached so Ctrl+C and the runner's prompts reach it.
 
 [tasks.dev]
-description = "Run the browserless development UI (arguments go to scripts/run-development)"
+description = "Run the browserless development UI (pass -- --dictation to build speech recognition)"
 raw = true
 run = "scripts/run-development --browserless"
 
 [tasks."dev:browser"]
-description = "Run the development UI with the embedded Servo browser"
+description = "Run the development UI with the embedded Servo browser (pass -- --dictation to build speech recognition)"
 raw = true
 run = "scripts/run-development"
 
