@@ -78,7 +78,11 @@ impl Changes {
 pub(super) struct TerminalChanges {
     _watcher: RecommendedWatcher,
     receiver: UnixDatagram,
+    sender: Arc<UnixDatagram>,
     available: Arc<AtomicBool>,
+    lease: PathBuf,
+    /// Whether a lease watch is armed. Each one reports a single release.
+    following_lease: Arc<AtomicBool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -101,22 +105,59 @@ impl TerminalChanges {
         sender.set_nonblocking(true)?;
         let sender = Arc::new(sender);
         let available = Arc::new(AtomicBool::new(true));
-        let supported = available.clone();
         let watcher = watch_file(
             directory.join("status.json"),
-            Some(&directory.join("lock")),
-            move |edge| {
-                if matches!(edge, Edge::Unavailable) {
-                    supported.store(false, Ordering::Release);
-                }
-                let _ = sender.send(b"u");
-            },
+            None,
+            Self::reporter(sender.clone(), available.clone()),
         )?;
-        Ok(Self {
+        let changes = Self {
             _watcher: watcher,
             receiver,
+            sender,
             available,
+            lease: directory.join("lock"),
+            following_lease: Arc::new(AtomicBool::new(false)),
+        };
+        changes.arm_lease()?;
+        Ok(changes)
+    }
+
+    fn reporter(sender: Arc<UnixDatagram>, available: Arc<AtomicBool>) -> impl Fn(Edge) + Clone {
+        move |edge| {
+            if matches!(edge, Edge::Unavailable) {
+                available.store(false, Ordering::Release);
+            }
+            let _ = sender.send(b"u");
+        }
+    }
+
+    /// Wakes a later wait when the worker that holds the lease now lets go.
+    ///
+    /// A worker can finish without publishing again: it records its final
+    /// phase and then releases the lease, which changes no file. The watch
+    /// armed at registration reports only the first release, which may be an
+    /// earlier holder's, or no holder at all before the worker took the lease,
+    /// so a follower that finds the lease held again arms another.
+    pub(super) fn follow_lease(&self) {
+        if self.arm_lease().is_err() {
+            // The next wait reports the watcher unavailable, and its caller
+            // falls back to reading the status on a timer.
+            self.available.store(false, Ordering::Release);
+            let _ = self.sender.send(b"u");
+        }
+    }
+
+    fn arm_lease(&self) -> Result<(), UpdateError> {
+        if self.following_lease.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let following = self.following_lease.clone();
+        let report = Self::reporter(self.sender.clone(), self.available.clone());
+        watch_lease(&self.lease, move |edge| {
+            following.store(false, Ordering::Release);
+            report(edge);
         })
+        .inspect_err(|_| self.following_lease.store(false, Ordering::Release))
     }
 
     pub(super) fn wait(&self, deadline: Instant) -> TerminalWake {
@@ -210,6 +251,45 @@ fn terminal_status_follows_a_published_phase_without_waiting_for_the_deadline() 
         TerminalWake::Input,
     );
     drop(active);
+}
+
+#[cfg(test)]
+#[test]
+fn a_follower_wakes_when_a_later_worker_releases_the_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let wait = |changes: &TerminalChanges| {
+        changes.wait(Instant::now() + std::time::Duration::from_secs(5))
+    };
+    let quiet = |changes: &TerminalChanges| {
+        changes.wait(Instant::now() + std::time::Duration::from_millis(300))
+            == TerminalWake::Deadline
+    };
+    // Registered while no worker held the lease, so the first watch has
+    // already reported.
+    drop(super::acquire_lock(directory.path()).unwrap());
+    let changes = TerminalChanges::watch_directory(directory.path()).unwrap();
+    assert_eq!(wait(&changes), TerminalWake::Changed);
+    // The worker takes the lease, publishes its final phase, and only then
+    // lets go, which changes no file.
+    let worker = super::acquire_lock(directory.path()).unwrap();
+    let staged = directory.path().join("status.tmp");
+    std::fs::write(&staged, "complete").unwrap();
+    std::fs::rename(staged, directory.path().join("status.json")).unwrap();
+    assert_eq!(wait(&changes), TerminalWake::Changed);
+    // The publication's events may arrive one at a time.
+    for _ in 0..10 {
+        if quiet(&changes) {
+            break;
+        }
+    }
+    changes.follow_lease();
+    changes.follow_lease();
+    assert!(changes.following_lease.load(Ordering::Acquire));
+    assert!(quiet(&changes), "nothing reports while the worker holds on");
+    drop(worker);
+    let started = Instant::now();
+    assert_eq!(wait(&changes), TerminalWake::Changed);
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
 }
 
 fn watch_file(
