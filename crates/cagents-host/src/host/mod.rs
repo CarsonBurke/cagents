@@ -527,12 +527,21 @@ fn announce_compacted_views(
 /// does not accept clients or publish readiness until restoration finishes.
 fn listener_before_restore(
     paths: &RuntimePaths,
+    reserved: Option<UnixListener>,
     restore: impl FnOnce() -> Result<(), HostError>,
 ) -> Result<UnixListener, HostError> {
+    let listener = match reserved {
+        Some(listener) => listener,
+        None => reserve_serving_listener(paths)?,
+    };
+    restore()?;
+    Ok(listener)
+}
+
+fn reserve_serving_listener(paths: &RuntimePaths) -> io::Result<UnixListener> {
     let listener = crate::descriptor::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    restore()?;
     Ok(listener)
 }
 
@@ -925,9 +934,17 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("daemon lease acquired", None);
     #[cfg(target_os = "macos")]
-    if let Some(ready) = &ready_admission {
+    let reserved_listener = if let Some(ready) = &ready_admission {
+        // A bind failure leaves this attempt eligible for the pre-effects
+        // retry. The lease cleans up the socket if later admission fails.
+        let listener = reserve_serving_listener(&paths)?;
         ready.begin_workspace_effects()?;
-    }
+        Some(listener)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let reserved_listener = None;
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
     let (_notification_broker, _agent_activity) =
         initialize_serving_host(&host, &paths, first_this_boot)?;
@@ -936,7 +953,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut installed_restoration = None;
     #[cfg(target_os = "macos")]
     let mut cutover_checkpoint = Some(crate::update::cutover_startup_checkpoint());
-    let listener = listener_before_restore(&paths, || {
+    let listener = listener_before_restore(&paths, reserved_listener, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
         let restored = (|| -> io::Result<()> {
