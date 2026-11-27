@@ -3053,7 +3053,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         }
                         for _ in 0..presses {
                             let input = KeyInput {
-                                action: KeyAction::Press,
+                                action: KeyAction::Tap,
                                 key,
                                 modifiers: state.modifiers,
                                 text: None,

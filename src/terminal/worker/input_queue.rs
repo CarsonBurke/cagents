@@ -204,7 +204,11 @@ impl PendingInput {
         self.append(bytes, Kind::Paste, true, permit);
         true
     }
-    fn admit_packet(&mut self, bytes: &[u8], permit: Option<Arc<admission::Permit>>) -> bool {
+    pub(super) fn admit_packet(
+        &mut self,
+        bytes: &[u8],
+        permit: Option<Arc<admission::Permit>>,
+    ) -> bool {
         if !self.fits(
             bytes.len(),
             usize::from(!bytes.is_empty()),

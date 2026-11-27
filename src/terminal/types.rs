@@ -141,6 +141,8 @@ pub enum KeyAction {
     Press,
     Release,
     Repeat,
+    /// A synthetic keystroke with no separate release command.
+    Tap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
