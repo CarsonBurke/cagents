@@ -852,6 +852,25 @@ enum QueueTiming {
     Unconfirmed(bool),
 }
 
+impl QueueTiming {
+    /// The glyph a waiting row leads with and what it says on hover, or
+    /// none for one on its way, which spins. Each timing has its own glyph,
+    /// so a message held for the reader is told apart from one waiting for
+    /// the turn without hovering it.
+    fn mark(self) -> Option<(Icon, &'static str)> {
+        Some(match self {
+            Self::NextStep => (Icon::Send, "Delivered at the agent's next step"),
+            Self::NextTurn => (Icon::Alarm, "Sent when this turn ends"),
+            Self::Held => (
+                Icon::AgentWaiting,
+                "Waiting for you: send a message, or Send now",
+            ),
+            Self::Leaving => return None,
+            Self::Unconfirmed(retry) => (Icon::Warning, unconfirmed_detail(retry)),
+        })
+    }
+}
+
 /// What a message of the reader's drawn ahead of the conversation is
 /// waiting on, as the line under it says.
 enum LocalStatus {
@@ -884,26 +903,14 @@ fn queue_row<'a>(
     attachments: &'a [Attachment],
     controls: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let marker = match timing {
-        QueueTiming::NextStep => crate::interaction::tooltip(
-            crate::ui_controls::passive_icon(Icon::Send, design::COMPACT_ICON_SIZE),
-            "Delivered at the agent's next step",
+    let marker = match timing.mark() {
+        Some((glyph, tip)) => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE),
+            tip,
         ),
-        QueueTiming::NextTurn => crate::interaction::tooltip(
-            crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
-            "Sent when this turn ends",
-        ),
-        QueueTiming::Held => crate::interaction::tooltip(
-            crate::ui_controls::passive_icon(Icon::Alarm, design::COMPACT_ICON_SIZE),
-            "Waiting for you: send a message, or Send now",
-        ),
-        QueueTiming::Leaving => crate::ui_controls::activity_spinner(
+        None => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::accent_color,
-        ),
-        QueueTiming::Unconfirmed(retry) => crate::interaction::tooltip(
-            crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-            unconfirmed_detail(retry),
         ),
     };
     // Named as the composer named them: an image by its `[Image N]`
@@ -2753,9 +2760,7 @@ impl Runtime {
         self.snapshot
             .queued_messages
             .iter()
-            .filter(|queued| {
-                !self.taken_back.contains(&queued.id) && !self.is_recalling(&queued.id)
-            })
+            .filter(|queued| !self.queue_taken_back(&queued.id) && !self.is_recalling(&queued.id))
             .count()
     }
 
@@ -2766,11 +2771,17 @@ impl Runtime {
     }
 
     /// Whether Send now can be asked for this moment: one already on its way
-    /// is not asked for twice, and one Claude declined is not asked again
-    /// until the queue changes.
+    /// is not asked for twice, one Claude declined is not asked again until
+    /// the queue changes, and a turn being stopped takes nothing until it
+    /// has.
     pub(super) fn can_send_now(&self) -> bool {
+        self.send_now_offered() && self.snapshot.send_now.is_none() && !self.snapshot.stopping()
+    }
+
+    /// Whether the conversation can take what is queued at all: it is
+    /// connected, running and writable, and has something to send.
+    fn send_now_offered(&self) -> bool {
         self.send_now_count() > 0
-            && self.snapshot.send_now.is_none()
             && !self.disconnected
             && !self.snapshot.exited
             && self.snapshot.read_only_reason.is_none()
@@ -2789,6 +2800,11 @@ impl Runtime {
             Some(chat::SendNow::Declined) if send_now > 0 => {
                 format!("Queued · {count} · couldn't send early")
             }
+            // Send now is disabled until the stop finishes, and a disabled
+            // control shows no tooltip, so the heading says why.
+            _ if self.snapshot.stopping() && send_now > 0 => {
+                format!("Queued · {count} · waiting for the turn to stop")
+            }
             _ if self.queue_held() => format!("Queued · {count} · waiting for you"),
             _ => format!("Queued · {count}"),
         }
@@ -2800,8 +2816,9 @@ impl Runtime {
         let count = self.send_now_count();
         // Nothing to send, or a conversation that can take nothing now
         // (disconnected, ended or read-only), offers no Send now; one asked
-        // for or declined stays, saying how it stands.
-        if count == 0 || (self.snapshot.send_now.is_none() && !self.can_send_now()) {
+        // for or declined, or waiting for a stop to finish, stays, saying how
+        // it stands.
+        if count == 0 || (self.snapshot.send_now.is_none() && !self.send_now_offered()) {
             return None;
         }
         let (label, name): (Cow<'_, str>, Cow<'_, str>) = if count == 1 {
@@ -2814,8 +2831,8 @@ impl Runtime {
         };
         // Enabled, it says how it differs from Stop, the other way to reach
         // a working turn; disabled, it says why: Claude found nothing it could
-        // take early, which holds until the queue changes, or a request is on
-        // its way.
+        // take early, which holds until the queue changes, a request is on
+        // its way, or the turn is still stopping.
         let (it, they) = if count == 1 {
             ("it", "it waits")
         } else {
@@ -2829,6 +2846,9 @@ impl Runtime {
             )
             .into(),
             Some(_) => "Sending now…".into(),
+            None if self.snapshot.stopping() => {
+                format!("{provider} is stopping this turn; send {it} once it has stopped.").into()
+            }
             None if self.queue_held() => format!(
                 "Send {it} to {provider} now, starting the next turn. A message you send goes \
                  after {it}."
@@ -2971,6 +2991,10 @@ impl Runtime {
                 .any(|agent| !agent.waiting && agent.is_running())
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
+        } else if snapshot.stopping() {
+            // Asked to stop, the agent is still winding down: its last
+            // activity would read as work going on regardless.
+            (Some(Icon::AgentWorking), chat::TURN_STOPPING)
         } else if snapshot.busy && snapshot.detail == chat::WAITING_ON_BACKGROUND_WORK {
             // The turn is open but the agent is idle until its background
             // commands finish, however long that takes; its last words
@@ -5121,7 +5145,9 @@ impl Runtime {
     /// after it steers or waits as it would once the turn shows.
     pub(super) fn submit_modes(&self) -> &'static [PromptMode] {
         if self.turn_under_way() {
-            match self.snapshot.capabilities.steer {
+            // A turn being stopped takes nothing steered into it; what is
+            // written meanwhile waits for it to stop.
+            match self.snapshot.capabilities.steer && !self.snapshot.stopping() {
                 // A message taken back from the queue goes back the way it
                 // was queued unless the other chord says otherwise.
                 true if self.resend == Some(PromptMode::Queue) => {
@@ -6141,7 +6167,9 @@ impl Runtime {
         use std::hash::{Hash, Hasher};
         let items = &self.snapshot.items;
         let now = self.source_now_ms();
-        let common = self.turn_common_hasher(turn, dark);
+        let mut common = self.turn_common_hasher(turn, dark);
+        // The rows keep what they were built with, colours included.
+        prose::inks(&settings.style).hash(&mut common);
         // Find reaches an exchange through its first row, whether or not
         // that row is mounted, and so does anything drawn before it.
         // Room for the row's own item too, which is usually all it holds.
@@ -7070,7 +7098,7 @@ impl Runtime {
         let mut rows = Vec::new();
         let held = self.queue_held();
         for queued in &self.snapshot.queued_messages {
-            if self.taken_back.contains(&queued.id) {
+            if self.queue_taken_back(&queued.id) {
                 continue;
             }
             let entry = QueueEntry::Provider(queued.id.clone());

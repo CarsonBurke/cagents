@@ -663,6 +663,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().completed,
         }
     }
+    /// Provider-owned input observed at verified exit. The live snapshot
+    /// remains a bounded presentation and may only show previews.
+    pub fn exited_recovery_queue(&self) -> Option<Vec<chat::QueuedMessage>> {
+        match &self.0 {
+            Owner::Local(local) => local.exited_recovery_queue().map(|queue| queue.to_vec()),
+            Owner::Remote(remote) => remote.exited_recovery_queue(),
+        }
+    }
     pub fn failure(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.failure(),

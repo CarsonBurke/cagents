@@ -1943,6 +1943,29 @@ pub struct QueuedMessage {
     pub attachments: Vec<Attachment>,
 }
 
+/// Authenticated final input of one retired provider, with the account
+/// identity the daemon captured when that provider started, if available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitedQueue {
+    pub messages: Vec<QueuedMessage>,
+    pub account_scope: Option<[u8; 32]>,
+    /// The provider's final thread, which may differ from an issued alias.
+    pub confirmed_session: Option<String>,
+}
+
+/// Identity of the exact ordered input in a retired queue. A direct actor can
+/// be replaced at the same session ID, so the session alone is insufficient.
+pub fn exited_queue_fingerprint<'a>(ids: impl IntoIterator<Item = &'a str>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    for id in ids {
+        hash.update((id.len() as u64).to_le_bytes());
+        hash.update(id.as_bytes());
+    }
+    hash.finalize().into()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchPoint {
     pub id: String,
@@ -2179,6 +2202,10 @@ impl Snapshot {
     /// its own background work.
     pub fn holds_work(&self) -> bool {
         self.turn_accepted() || self.subagents.iter().any(Subagent::is_live)
+    }
+    /// Whether the running turn is being stopped: see [`TURN_STOPPING`].
+    pub fn stopping(&self) -> bool {
+        self.busy && self.detail == TURN_STOPPING
     }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
@@ -3058,6 +3085,15 @@ pub const STOPPED_NOTICE: &str = "You stopped this turn";
 /// The status detail of a conversation whose last turn was stopped before it
 /// finished, whichever provider ran it.
 pub const TURN_INTERRUPTED: &str = "Turn interrupted";
+
+/// The status detail of a turn the provider has been asked to stop and has
+/// not yet ended. It takes no message meanwhile: what is queued waits for
+/// the turn to stop.
+///
+/// Clients read it from a snapshot's `detail` to tell a stopping turn from a
+/// working one, so it is part of the wire contract: changing it leaves an
+/// older client offering Send now to a turn that cannot take it.
+pub const TURN_STOPPING: &str = "Stopping";
 
 /// Where the person stopped a turn: a quiet marker in the timeline, in place
 /// of the provider's own record of the interruption, which reads as a

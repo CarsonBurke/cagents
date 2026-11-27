@@ -3715,6 +3715,59 @@ fn a_worktree_callers_child_lands_in_a_channel_for_its_checkout() {
     );
 }
 
+/// #3432: the working directory bounds what a child's provider approves on
+/// its own, so a request naming one outside its project is refused here,
+/// whatever client sent it, including a directory no open project contains.
+#[test]
+fn a_new_agent_works_only_in_a_directory_inside_its_project() {
+    if isolated("a_new_agent_works_only_in_a_directory_inside_its_project").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_path_buf();
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    // A link inside the project names where it leads.
+    let link = root.join("project").join("out");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    for (key, directory) in [
+        ("parent", root.clone()),
+        ("sibling", elsewhere),
+        ("link", link),
+    ] {
+        let mut outside = request.clone();
+        outside.idempotency_key = key.into();
+        let Destination::New(spec) = &mut outside.destination else {
+            unreachable!()
+        };
+        spec.target.directory = directory.clone();
+        let error = submit(&host, &Authority::default(), outside).unwrap_err();
+        assert!(
+            error.contains("is not in the project"),
+            "{key}: {directory:?} was not refused: {error}"
+        );
+    }
+    let open = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agents(None)
+        .unwrap();
+    assert!(open.is_empty(), "a refused request records no agent");
+
+    // A folder inside the project is the project's.
+    let nested = root.join("project").join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let mut inside = request;
+    let Destination::New(spec) = &mut inside.destination else {
+        unreachable!()
+    };
+    spec.target.directory = nested.clone();
+    let accepted = submit(&host, &Authority::default(), inside).unwrap();
+    assert_eq!(accepted.agent.spec.target.directory, nested);
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+}
+
 #[test]
 fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     use crate::agent_execution::directory::{Owner, Relation, Scope};
@@ -4085,7 +4138,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
         spec.permission_mode = mode.map(str::to_owned);
         request.prompt = prompt.into();
         request.idempotency_key = key.into();
-        submit(&host, authority, request)
+        submit(&host, authority, request).map_err(String::from)
     };
     let mode = |accepted: &Accepted| accepted.agent.spec.permission_mode.clone();
     let launched = || std::fs::read_to_string(root.join("claude-arguments")).unwrap();
@@ -7651,7 +7704,9 @@ fn a_retried_follow_up_says_the_agent_received_it() {
         )
         .unwrap();
 
-    let error = super::prompt(&host, &Authority::default(), follow_up, false).unwrap_err();
+    let error = super::prompt(&host, &Authority::default(), follow_up, false)
+        .unwrap_err()
+        .to_string();
     assert_eq!(
         error,
         format!(
@@ -7731,11 +7786,13 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
         let error = super::prompt(&host, &Authority::default(), follow_up.clone(), false)
             .expect_err(attempt);
         assert!(
-            error.starts_with(crate::agent_execution::NOT_SENT),
+            error
+                .to_string()
+                .starts_with(crate::agent_execution::NOT_SENT),
             "{attempt}: {error}"
         );
         assert!(
-            error.contains("Resume it from its pane"),
+            error.to_string().contains("Resume it from its pane"),
             "{attempt}: {error}"
         );
     }

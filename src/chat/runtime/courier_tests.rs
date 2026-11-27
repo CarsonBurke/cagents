@@ -14,6 +14,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 struct Observed {
     prompts: Mutex<Vec<String>>,
     echoed: Mutex<Vec<String>>,
+    /// How many times the actor told the daemon the courier may try again.
+    prompt_available: std::sync::atomic::AtomicUsize,
 }
 
 struct GatedAdapter {
@@ -108,6 +110,9 @@ impl Adapter for GatedAdapter {
                     ..Step::default()
                 });
             }
+            // As ACP does, a removal empties the queue in the command's own
+            // step, with no provider frame after it.
+            Command::RemoveQueued { .. } => vec![Event::QueueChanged(Vec::new())],
             _ => return Err("unsupported fixture command".into()),
         };
         Ok(Step {
@@ -147,7 +152,7 @@ impl RequestRaceFixture {
     }
 
     pub fn with_input_failure(fail_after_input: bool) -> Self {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
         std::fs::create_dir(&home).unwrap();
@@ -183,7 +188,22 @@ impl RequestRaceFixture {
         // Follow real preflight. Its cfg(test) Store owns a unique private
         // temporary cache; ProcessSpec does not override that cache's root.
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
+        let available = observed.clone();
+        let handle = Handle::start(
+            spec,
+            Box::new(adapter),
+            initial,
+            store,
+            None,
+            move |update| {
+                if matches!(update, Update::PromptAvailable) {
+                    available
+                        .prompt_available
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap();
         let fixture = Self {
             handle,
             entered,
@@ -268,6 +288,12 @@ impl RequestRaceFixture {
                 .is_empty(),
             !queued
         );
+    }
+
+    pub fn prompt_available_count(&self) -> usize {
+        self.observed
+            .prompt_available
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn prompt_count(&self) -> usize {
@@ -434,14 +460,38 @@ fn courier_prompt_waits_behind_a_message_the_person_queued_with_the_provider() {
     refused(fixture.handle.try_idle_prompt("courier delivery".into()));
     assert_eq!(fixture.prompt_count(), 0);
     assert_eq!(fixture.provider_write_count(), 0);
+    let announced = fixture.prompt_available_count();
     fixture.set_persons_queue(false);
     assert!(fixture.handle.takes_courier());
+    // The conversation stayed idle throughout, so only this announcement
+    // tells the courier that the mail it left can go now.
+    assert_eq!(fixture.prompt_available_count(), announced + 1);
     fixture
         .handle
         .try_idle_prompt("courier delivery".into())
         .unwrap();
     fixture.wait_for_provider_writes(1);
     assert_eq!(fixture.prompt_texts(), ["courier delivery"]);
+    fixture.close();
+}
+
+#[test]
+fn removing_the_persons_last_queued_message_announces_the_idle_conversation() {
+    let mut fixture = RequestRaceFixture::new();
+    fixture.set_persons_queue(true);
+    assert!(fixture.handle.is_idle());
+    assert!(!fixture.handle.takes_courier());
+    let announced = fixture.prompt_available_count();
+    fixture
+        .handle
+        .command(Command::RemoveQueued {
+            id: "person-1".into(),
+        })
+        .unwrap();
+    // The step is applied, and announced, before the command returns.
+    assert_eq!(fixture.prompt_available_count(), announced + 1);
+    assert!(fixture.handle.takes_courier());
+    assert_eq!(fixture.provider_write_count(), 0);
     fixture.close();
 }
 

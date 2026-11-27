@@ -898,6 +898,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
+            | RepositoryAction::DiffBasisRefreshed { .. }
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
@@ -4532,7 +4533,10 @@ impl Application for Editor {
                     Task::batch([finished, ask])
                 }
                 Message::Stepped(id, submitted, result) => {
-                    if matches!(result, Ok(MutationOutcome::Applied { .. }))
+                    if matches!(
+                        result,
+                        Ok(MutationOutcome::Applied { .. } | MutationOutcome::PartiallyApplied { .. })
+                    )
                         && let Some(tab) = self.tab_mut(id)
                         && tab.navigation.commit_message() == submitted
                     {
@@ -5459,6 +5463,8 @@ impl Application for Editor {
             return Some(dialog_overlay(
                 sidebar::git_confirmation_dialog(
                     pending,
+                    self.current()
+                        .and_then(|tab| tab.sidebar.source_control.as_ref()),
                     cagents_ui_kit::question::Question::ConfirmGitCommand.surface_id(),
                 )
                 .map(Message::Sidebar),
@@ -10515,6 +10521,7 @@ mod tests {
             submodule: false,
             added_lines: Some(1),
             removed_lines: Some(0),
+            index_oid: None,
         }
     }
 

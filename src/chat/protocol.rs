@@ -25,6 +25,21 @@ pub(crate) fn unknown_tool(provider: &str, tool: &str) -> String {
     format!("{provider} called a tool that doesn't exist: {tool}")
 }
 
+/// Whether a form's scalar answer was left blank, which reads as the field
+/// being absent rather than as an empty value.
+///
+/// The UI answers every field a form shows, so a field the reader left
+/// untouched, or typed into and cleared, arrives as no value; one empty
+/// string means the same. An adapter omits a blank optional field from its
+/// reply and reports a blank required one as missing.
+pub(crate) fn blank_form_answer(values: &[String]) -> bool {
+    match values {
+        [] => true,
+        [only] => only.is_empty(),
+        _ => false,
+    }
+}
+
 /// Startup recovery for the same card and exact conversation. Unavailable
 /// means another attempt may succeed after an external condition changes;
 /// it promises neither immediate success nor automatic replay of uncertain
@@ -473,6 +488,11 @@ pub trait Adapter: Send {
     fn outcome_pending(&self) -> bool {
         false
     }
+    /// Exact inputs still known to be held, in the order they would run.
+    /// `None` means this adapter has no verified recovery queue to report.
+    fn recovery_queue(&self) -> Option<Vec<super::QueuedMessage>> {
+        None
+    }
     fn command(&mut self, command: Command) -> Result<Step, String>;
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.
@@ -506,6 +526,50 @@ pub trait Adapter: Send {
         None
     }
 }
+
+/// Keeps the submitted input alongside the projection shown while it waits.
+/// Most messages fit in the projection, so they need no separate text.
+struct QueuedInput {
+    preview: super::QueuedMessage,
+    full_text: Option<String>,
+}
+
+impl QueuedInput {
+    fn new(
+        id: String,
+        text: String,
+        attachments: Vec<super::Attachment>,
+        delivery: super::QueueDelivery,
+    ) -> Self {
+        let (preview_text, full_text) = if text.len() > super::QueuedMessage::PREVIEW_BYTES {
+            // Let the ordinary preview formatter mark the text as truncated
+            // without cloning the entire input for it.
+            let end = text.ceil_char_boundary(super::QueuedMessage::PREVIEW_BYTES + 1);
+            (text[..end].to_owned(), Some(text))
+        } else {
+            (text, None)
+        };
+        let mut preview = super::QueuedMessage::new(id, preview_text);
+        preview.attachments = attachments;
+        preview.delivery = delivery;
+        Self { preview, full_text }
+    }
+
+    fn recovery(&self) -> super::QueuedMessage {
+        super::QueuedMessage {
+            id: self.preview.id.clone(),
+            text: self
+                .full_text
+                .as_ref()
+                .unwrap_or(&self.preview.text)
+                .clone(),
+            editable: true,
+            delivery: self.preview.delivery,
+            attachments: self.preview.attachments.clone(),
+        }
+    }
+}
+
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)
 }

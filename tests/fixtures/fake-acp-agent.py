@@ -65,6 +65,9 @@ Environment switches:
                             replays, as tests/fixtures/conversation-work.py
                             writes them
   FAKE_ACP_LOGIN_SECONDS=N  how long `login` waits before signing in
+  FAKE_ACP_CANCEL_SECONDS=N how long a stopped turn takes to end after
+                            `session/cancel`, as an agent that winds down
+                            its work first (default 0)
   FAKE_ACP_LIST_PAGE=N      list N conversations a page, each page after
                             the first by the `nextCursor` of the one before
   FAKE_ACP_PRESENCE=1       hold the lock the agent holds on a conversation
@@ -662,6 +665,8 @@ class Agent:
         self.usage(session)
         if session.id in self.cancelled:
             stop = "cancelled"
+        if stop == "cancelled":
+            time.sleep(float(os.environ.get("FAKE_ACP_CANCEL_SECONDS") or 0))
         result = {"stopReason": stop}
         if SHAPE == "agy":
             result["usage"] = USAGE

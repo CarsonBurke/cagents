@@ -1049,6 +1049,80 @@ fn a_message_queued_during_a_turn_waits_in_the_adapter() {
 }
 
 #[test]
+fn recovery_keeps_full_held_input_until_the_adapter_delivers_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let attachment = chat::Attachment::file(directory.path().join("notes.txt"));
+    std::fs::write(&attachment.path, "attachment content").unwrap();
+    let text = format!("held {} tail", "雪".repeat(7 * 1024));
+    for (profile, initialized, opened) in [
+        (&antigravity::PROFILE, agy_initialize(), agy_new()),
+        (&muse::PROFILE, muse_initialize(), muse_new()),
+    ] {
+        let mut acp = Acp {
+            cwd: "/work/project".into(),
+            ..Acp::new(profile)
+        };
+        let initialize = acp.initialize().unwrap();
+        let open = acp
+            .receive(reply(only_write(&initialize), initialized))
+            .unwrap();
+        let mut step = acp
+            .receive(reply(only_write(&open), opened.clone()))
+            .unwrap();
+        while let Some(setting) = step.writes.first().cloned() {
+            step = acp
+                .receive(reply(
+                    &setting,
+                    json!({"configOptions": opened["configOptions"]}),
+                ))
+                .unwrap();
+        }
+        let current = prompt(&mut acp, "working");
+        let step = acp
+            .command(Command::Prompt {
+                text: text.clone(),
+                attachments: vec![attachment.clone()],
+                mode: PromptMode::Queue,
+            })
+            .unwrap();
+        let preview = queue_listing(&step).unwrap();
+        assert_eq!(preview.len(), 1);
+        assert!(preview[0].1.ends_with("[Queue preview truncated]"));
+        let queued = acp.recovery_queue().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, preview[0].0);
+        assert_eq!(queued[0].text, text);
+        assert_eq!(queued[0].attachments, [attachment.clone()]);
+        assert_eq!(queued[0].delivery, chat::QueueDelivery::NextTurn);
+        assert!(queued[0].editable);
+
+        // Delivery transfers the input out of the held queue. A removal
+        // racing behind it cannot make that same input recoverable again.
+        let delivered = acp
+            .receive(reply(&current, json!({"stopReason": "end_turn"})))
+            .unwrap();
+        let next = delivered
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "session/prompt")
+            .unwrap();
+        assert_eq!(prompt_texts(next), [text.as_str()]);
+        let removal = acp
+            .command(Command::RemoveQueued {
+                id: queued[0].id.clone(),
+            })
+            .unwrap();
+        assert!(
+            removal
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::QueueRemoval(reply) if !reply.removed))
+        );
+        assert_eq!(acp.recovery_queue(), Some(Vec::new()));
+    }
+}
+
+#[test]
 fn the_prompt_reply_starts_everything_queued_in_the_same_step() {
     let mut acp = adapter(&[], None);
     let session = ready(&mut acp);
@@ -1219,6 +1293,25 @@ fn a_stopped_turn_holds_its_queue_until_the_reader_starts_it() {
         .find(|frame| frame["method"] == "session/prompt")
         .unwrap();
     assert_eq!(prompt_texts(next), ["one", "three"]);
+}
+
+#[test]
+fn removing_what_a_stop_held_empties_the_queue_in_the_command_step() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let request = prompt(&mut acp, "hold");
+    let step = acp.command(send("one", PromptMode::Queue)).unwrap();
+    let held = queue_listing(&step).unwrap()[0].0.to_owned();
+    acp.command(Command::Interrupt).unwrap();
+    let step = acp
+        .receive(reply(&request, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    assert_eq!(statuses(&step), [(false, chat::TURN_INTERRUPTED)]);
+    // No provider frame follows, so the runtime must announce from this
+    // command step that the idle conversation now takes courier mail.
+    let step = acp.command(Command::RemoveQueued { id: held }).unwrap();
+    assert!(step.writes.is_empty());
+    assert_eq!(queue_listing(&step), Some(Vec::new()));
 }
 
 #[test]
@@ -2351,21 +2444,74 @@ fn a_correlated_run_never_takes_the_readers_held_queue() {
     assert_eq!(acp.queued.len(), 1);
 }
 
+/// Whether the conversation last said, in a step, that it takes steering
+/// and Send now.
+fn steering(step: &Step) -> Option<(bool, bool)> {
+    step.events.iter().rev().find_map(|event| match event {
+        Event::Capabilities(capabilities) => {
+            Some((capabilities.steer, capabilities.send_queued_now))
+        }
+        _ => None,
+    })
+}
+
 /// A run's caller waits for its turn's answer, which a message steered in
-/// would change: the message is queued for the next turn instead.
+/// would change: the message is queued for the next turn instead, and the
+/// conversation says it takes no steering until the run is answered, so the
+/// composer offers to queue rather than steer and no Send now.
 #[test]
 fn a_correlated_runs_turn_is_never_steered() {
     let mut acp = adapter(&[], None);
     ready(&mut acp);
     let run = crate::model::RunId::new();
-    acp.command_for_run(run, send("the run's", PromptMode::Send))
+    let started = acp
+        .command_for_run(run, send("the run's", PromptMode::Send))
         .unwrap();
+    assert_eq!(steering(&started), Some((false, false)));
+    let request = only_write(&started).clone();
     let step = acp.command(send("mine", PromptMode::Steer)).unwrap();
     assert!(step.writes.is_empty(), "{:?}", step.writes);
     let refused = acp.command(Command::SendQueuedNow).unwrap_err();
     assert!(refused.contains("when the turn ends"), "{refused}");
     assert_eq!(acp.queued.len(), 1);
     assert_eq!(acp.turn.as_ref().unwrap().requests.len(), 1);
+    // Answered, the run lets go: the queue starts the next turn, which
+    // takes steering again.
+    let ended = acp
+        .receive(reply(&request, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert_eq!(steering(&ended), Some((true, true)));
+    assert!(acp.turn.as_ref().is_some_and(|turn| turn.run.is_none()));
+}
+
+/// A run the reader stops lets go of the conversation as one it answers
+/// does: once the stopped turn ends, the conversation takes steering again,
+/// and what was queued meanwhile waits for the reader.
+#[test]
+fn a_stopped_correlated_run_gives_steering_back() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let started = acp
+        .command_for_run(
+            crate::model::RunId::new(),
+            send("the run's", PromptMode::Send),
+        )
+        .unwrap();
+    let request = only_write(&started).clone();
+    acp.command(send("mine", PromptMode::Steer)).unwrap();
+    let stopping = acp.command(Command::Interrupt).unwrap();
+    assert!(stopping.events.contains(&Event::Status {
+        busy: true,
+        detail: crate::chat::TURN_STOPPING.into(),
+    }));
+    // Still stopping, the turn answers the run and takes nothing steered.
+    assert_eq!(steering(&stopping), None);
+    let ended = acp
+        .receive(reply(&request, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    assert_eq!(steering(&ended), Some((true, true)));
+    assert!(acp.turn.is_none());
+    assert_eq!(acp.queued.len(), 1);
 }
 
 #[test]

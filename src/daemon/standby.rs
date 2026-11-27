@@ -240,7 +240,7 @@ impl Parked {
         )
     }
 
-    fn launch_with_custody(
+    pub(crate) fn launch_with_custody(
         executable: &Path,
         expected: (u64, u64),
         guard: &UiUpdateGuard,

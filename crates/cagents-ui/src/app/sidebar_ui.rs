@@ -521,7 +521,10 @@ impl Cagents {
                 Self::mutation_task(key, operation, move |service, cancel| {
                     let outcome =
                         service.continue_operation(&worktree, kind, message.as_deref(), cancel);
-                    let applied = matches!(outcome, Ok(MutationOutcome::Applied { .. }));
+                    let applied = matches!(
+                        outcome,
+                        Ok(MutationOutcome::Applied { .. } | MutationOutcome::PartiallyApplied { .. })
+                    );
                     (mutation_report("Continue", outcome), applied)
                 })
             }
@@ -539,7 +542,10 @@ impl Cagents {
                 let worktree = key.canonical_path.clone();
                 Self::mutation_task(key, operation, move |service, cancel| {
                     let outcome = service.skip_operation(&worktree, kind, cancel);
-                    let applied = matches!(outcome, Ok(MutationOutcome::Applied { .. }));
+                    let applied = matches!(
+                        outcome,
+                        Ok(MutationOutcome::Applied { .. } | MutationOutcome::PartiallyApplied { .. })
+                    );
                     (mutation_report("Skip", outcome), applied)
                 })
             }

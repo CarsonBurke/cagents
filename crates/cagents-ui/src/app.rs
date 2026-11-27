@@ -166,8 +166,8 @@ use crate::{
         CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
         CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
         PathSelection, PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo,
-        RepositoryService, RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest,
-        WorktreeCreationOutcome, WorktreeRecord,
+        RepositoryService, RepositorySnapshot, SnapshotRead, StageRequest, StatusSnapshot,
+        UnstageRequest, WorktreeCreationOutcome, WorktreeRecord,
     },
     repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
     session::{
@@ -179,9 +179,9 @@ use crate::{
         PullRequestOpenTarget, TerminalCursorStyle,
     },
     sidebar::{
-        self, ActiveWorktreeKey, MutationKind, PanelSection, SidebarAction, SidebarDataState,
-        SidebarFocus, SidebarMode, SidebarModel, SidebarProject, SidebarPullRequest, SidebarState,
-        SidebarWorktree, SourceControlModel,
+        self, ActiveWorktreeKey, FileTree, MutationKind, PanelSection, SidebarAction,
+        SidebarDataState, SidebarFocus, SidebarMode, SidebarModel, SidebarProject,
+        SidebarPullRequest, SidebarState, SidebarWorktree, SourceControlModel,
     },
     splitter::{Edge as SplitterEdge, Splitter},
     terminal::{
@@ -1219,6 +1219,14 @@ enum Projection {
     TranscriptProbes,
     /// Anything else, including every user action.
     Full,
+}
+
+/// A dragged inspector width as the inspector takes it: whole pixels, as
+/// Settings shows and steps them, within the inspector's bounds.
+fn inspector_width(width: f32) -> f32 {
+    width
+        .round()
+        .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
 }
 
 impl Projection {
@@ -3143,6 +3151,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
+            | RepositoryAction::DiffBasisRefreshed { .. }
             | RepositoryAction::SaveFinished { .. }
             | RepositoryAction::RetainedSaveFinished { .. }
             // A dropped page render leaves the viewer reading "Rendering
@@ -5539,10 +5548,15 @@ pub enum Message {
 /// was built from.
 #[derive(Debug, Clone)]
 pub enum SourceControlRead {
-    /// The worktree differs from what the panel shows; rebuild from this.
-    Changed(Box<RepositorySnapshot>),
+    /// The worktree differs from what the panel shows. The reader built the
+    /// replacement model, so the UI thread only installs it.
+    Changed(Box<SourceControlModel>),
     /// The read equals the snapshot the panel shows, so its model stands.
-    Unchanged,
+    /// `digest` is what this read hashed to, which can differ from the
+    /// model's when a file was touched without being edited.
+    Unchanged {
+        digest: Option<crate::repository::SnapshotDigest>,
+    },
 }
 
 /// An application exit in progress.
@@ -8945,12 +8959,39 @@ impl Cagents {
         }
         let saved = self.persistent_workspace();
         self.record_shared_chat_identities();
+        // Queue recovery and its exact replay checkpoint belong to the same
+        // snapshot. An immediately following close cannot coalesce it away.
+        let queue_checkpoints: Vec<_> = self
+            .chat_ui
+            .pending_queue_checkpoints
+            .iter()
+            .copied()
+            .filter(|(origin, source)| {
+                saved
+                    .returned_chat_queues
+                    .get(origin)
+                    .and_then(|sources| sources.get(source))
+                    .and_then(|recipient| *recipient)
+                    .is_some_and(|recipient| {
+                        saved.chat_drafts.contains_key(&recipient)
+                            || saved.chat_draft_attachments.contains_key(&recipient)
+                            || saved
+                                .chat_waiting_messages
+                                .get(&recipient)
+                                .is_some_and(|queue| !queue.messages.is_empty())
+                    })
+            })
+            .collect();
         let offer = self.snapshot_offer(saved, ordinary);
         if let Some(writer) = &self.session {
             let result = if self.shared_views.adoptions.is_empty()
                 && self.shared_views.restorations.is_empty()
             {
-                writer.offer_snapshot(offer)
+                if queue_checkpoints.is_empty() {
+                    writer.offer_snapshot(offer)
+                } else {
+                    writer.offer_conversion(offer)
+                }
             } else {
                 writer.offer_terminal_panes(
                     offer,
@@ -8963,6 +9004,11 @@ impl Cagents {
                 self.shared_views.restorations.clear();
             }
             accepted = result.is_ok();
+            if accepted {
+                for checkpoint in queue_checkpoints {
+                    self.chat_ui.pending_queue_checkpoints.remove(&checkpoint);
+                }
+            }
             self.snapshot_offer_answered(accepted);
         } else if self.replica_capture.pending.is_none() {
             // Memory-only windows retain their existing navigation bookkeeping;
@@ -9758,6 +9804,8 @@ impl Cagents {
         }
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = projection_stage!("chrome", self.sync_chrome());
+        // The open palette lists panes by their chrome's titles.
+        projection_stage!("palette", self.refresh_palette());
         let terminal_probes =
             projection_stage!("transcript_probes", self.terminal_transcript_probes());
         // Another project shown, or a review or the workspace switcher closed.
@@ -12952,7 +13000,7 @@ impl Cagents {
                         && !self.pane_content_inputs_blocked(id),
                     move |payload| Message::TerminalDropped { card: id, payload },
                 );
-                let terminal = crate::ui_controls::popover(
+                let terminal = crate::ui_controls::popover_menu(
                     terminal,
                     self.terminal_menu(id),
                     widget::popover::Position::Point(
@@ -13657,7 +13705,8 @@ impl Cagents {
             return Task::none();
         }
         if !changed {
-            return self.load_pending_history();
+            let history = self.load_pending_history();
+            return Task::batch([history, self.load_deferred_files()]);
         }
         self.cancel_source_read();
         self.cancel_branch_changes();
@@ -14822,18 +14871,38 @@ impl Cagents {
         let previous_errors = bound
             .map(|source| source.ignored_directory_errors().clone())
             .unwrap_or_default();
-        let previous = bound.and_then(|source| source.source_snapshot().cloned());
+        let tree = if browse_files {
+            FileTree::Built
+        } else {
+            FileTree::Deferred
+        };
+        let (previous, previous_digest) = source_control_ui::kept_source(bound, tree);
         let expanded = self
             .sidebar_state
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
+        let key_for_read = key.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                let mut snapshot = service
-                    .snapshot_with_options(&worktree, options, &cancellation)
+                let read = service
+                    .snapshot_if_changed(
+                        &worktree,
+                        options,
+                        previous_digest.as_ref(),
+                        &cancellation,
+                    )
                     .map_err(|error| error.to_string())?;
+                let (mut snapshot, digest) = match source_control_ui::snapshot_to_build(
+                    read,
+                    previous.as_deref(),
+                    previous_digest,
+                    tree,
+                )? {
+                    ControlFlow::Continue(build) => build,
+                    ControlFlow::Break(kept) => return Ok(kept),
+                };
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
@@ -14849,8 +14918,11 @@ impl Cagents {
                     )?;
                 }
                 Ok(source_control_ui::source_control_read(
+                    key_for_read,
                     previous.as_deref(),
                     snapshot,
+                    digest,
+                    tree,
                 ))
             })
             .await
@@ -15390,10 +15462,7 @@ impl Cagents {
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Resize { width } => {
-                // Whole pixels, as Settings shows and steps them.
-                self.settings.inspector_width = width
-                    .round()
-                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                self.settings.inspector_width = inspector_width(width);
                 Task::none()
             }
             InspectorAction::ResizeFinished => {
@@ -17574,6 +17643,7 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(
                 sidebar::git_confirmation_dialog(
                     pending,
+                    self.sidebar_model.source_control.as_ref(),
                     dialog_ui::Question::ConfirmGitCommand.surface_id(),
                 )
                 .map(Message::Sidebar),
@@ -18429,7 +18499,16 @@ impl Cagents {
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
             Message::Phone(action) => self.update_phone(action),
-            Message::Palette(action) => self.update_palette(action),
+            Message::Palette(action) => {
+                // Typing a query narrows the palette's own list, which only
+                // its view reads.
+                if matches!(action, palette_ui::Action::Query(_))
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                self.update_palette(action)
+            }
             Message::RunCommand(command) => {
                 self.run_workspace_command(command, keyboard::Modifiers::empty())
             }
@@ -18746,7 +18825,30 @@ impl Cagents {
                 self.open_document_link(Some(card), &uri)
             }
             Message::Repository(RepositoryAction::Language { card, action }) => {
-                self.update_editor_lsp(card, action)
+                use repository_widget::EditorLspAction as Action;
+                // A hover request, and the end of one, is the editor's and
+                // the language server's alone. Completion requests, sent as
+                // trigger characters are typed, and moving through or
+                // dismissing the popup stay in the pane too, unless they
+                // change what the projection reads of it.
+                let pane = matches!(
+                    action,
+                    Action::CompleteAt { .. } | Action::Complete | Action::Next(_) | Action::Dismiss
+                )
+                .then(|| repository_ui::EditorProjectionInputs::capture(self, card))
+                .flatten();
+                let hover = matches!(action, Action::Hover(_));
+                let task = self.update_editor_lsp(card, action);
+                if (hover
+                    || pane.is_some_and(|before| {
+                        repository_ui::EditorProjectionInputs::capture(self, card)
+                            .is_some_and(|after| after == before)
+                    }))
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                task
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let target = match self.cards.get(&card) {
@@ -18868,7 +18970,23 @@ impl Cagents {
                 }
                 Task::batch(tasks)
             }
-            Message::Repository(action) => handled!(self.update_repository(action)),
+            Message::Repository(action) => {
+                // Typing, caret moves and scrolling confine themselves to
+                // the pane, and arrive once per key or wheel notch.
+                let pane = repository_ui::EditorProjectionInputs::pane(&action)
+                    .and_then(|card| {
+                        Some((card, repository_ui::EditorProjectionInputs::capture(self, card)?))
+                    });
+                let flow = self.update_repository(action);
+                if let Some((card, before)) = pane
+                    && repository_ui::EditorProjectionInputs::capture(self, card)
+                        .is_some_and(|after| after == before)
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                handled!(flow)
+            }
             Message::Sidebar(action) => handled!(self.update_sidebar(action)),
             Message::FoldInProgress { refocus } => {
                 if self.sidebar_state.fold_in_progress() && refocus {
@@ -19771,6 +19889,15 @@ impl Cagents {
                 Task::none()
             }
             Message::OpenLink(card, url, gesture) => {
+                // The terminal's menu offers the link too, and closes once
+                // it opens, as its other rows do.
+                if self
+                    .terminal_context
+                    .as_ref()
+                    .is_some_and(|context| context.card == card)
+                {
+                    self.terminal_context = None;
+                }
                 if url.scheme() == "file" {
                     self.open_document_link(Some(card), url.as_str())
                 } else {
@@ -20295,11 +20422,25 @@ impl Cagents {
             // Reported on the first layout and whenever the size changes,
             // including the width while the inspector slides open.
             Message::ContextSectionsMeasured(height) => {
+                // Only the inspector's view reads the height.
+                if !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
                 self.context_sections_height = Some(height);
                 Task::none()
             }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
-            Message::ContextInspector(action) => self.handle_context_inspector_action(action),
+            Message::ContextInspector(action) => {
+                // A splitter drag reports every pointer move, most of which
+                // round to the width the inspector already has.
+                if matches!(action, InspectorAction::Resize { width }
+                    if inspector_width(width) == self.settings.inspector_width)
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                self.handle_context_inspector_action(action)
+            }
             Message::SelectSettingsCategory(category) => {
                 self.palette.clear_pressed_key_filter();
                 self.settings_search.clear();
@@ -20383,7 +20524,22 @@ impl Cagents {
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
-            Message::ResumeConversation(action) => self.update_resume(action),
+            Message::ResumeConversation(action) => {
+                // The picker's search, its scope, the row under the pointer
+                // and how many rows it lists are its own: the pointer
+                // crossing rows must not rebuild every card's chrome.
+                if matches!(
+                    action,
+                    resume_ui::Action::Query(_)
+                        | resume_ui::Action::Reach(_)
+                        | resume_ui::Action::Point(..)
+                        | resume_ui::Action::More
+                ) && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                self.update_resume(action)
+            }
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::WorktreesUi(action) => self.update_worktrees_ui(action),
@@ -20469,6 +20625,13 @@ impl Cagents {
                     }
                     return self
                         .reveal_context_section(card, context_sections::Section::Locations);
+                }
+                // Diagnostics, progress, status and answers land in the
+                // editor and its inspector section, which their views read;
+                // no projection does. Progress arrives as fast as the UI
+                // drains it while a server indexes.
+                if !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
                 }
                 Task::none()
             }
@@ -20744,6 +20907,7 @@ impl Cagents {
                     }
                     _ => projection_stage!("chrome", self.sync_chrome()),
                 };
+                projection_stage!("palette", self.refresh_palette());
                 phase.mark("selected_chrome");
                 let snapshot = if matches!(projection, Projection::ScopedChrome(_)) {
                     self.arm_replica_capture()

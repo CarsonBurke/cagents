@@ -82,13 +82,19 @@ reset that clears more account limits than you named, give its full label,
 such as `--scope 'Weekly + Fable'` or `--scope 'Session + Weekly'`. A Claude
 reset with nothing to refill, such as a Fable reset while Fable is unused, is
 listed as not usable now. Spending a reset cannot be undone.
-Agent-authenticated sessions cannot spend resets.
+A hosted agent may spend a reset when you ask it to, using the full account
+ID and `--yes`. It must select the scope if the available grants differ. The
+daemon records the authenticated agent lineage and, when local, its session
+with the reset attempt. Account linking, default changes, and removal require
+your own system terminal.
 
 Each attempt has an idempotency key. If the result is uncertain, cagents reads
 the account again and shows the reported state. It never automatically retries
 a consume request. Keep the reported key for any deliberate retry of that same
 attempt; reuse both `--reset-id ID` and `--idempotency-key KEY` from the printed
 recovery command rather than creating a new operation.
+If the provider no longer lists that grant, the person can recover it from a
+system terminal using those same values.
 
 Claude's recurring session reset has no server idempotency contract; cagents
 cannot make that API idempotent. Its local request key only prevents submitting

@@ -77,6 +77,28 @@ impl LeaseHandoff {
         self.lock.as_fd()
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn recorded_source_is(&self, proof: &HostSessionProof) -> io::Result<bool> {
+        use std::os::unix::fs::FileExt;
+
+        #[derive(serde::Deserialize)]
+        struct Owner {
+            proof: HostSessionProof,
+        }
+
+        // Positional reads keep the transferred OFD's cursor unchanged. The
+        // stopped lease must still name the last source, not a later restart.
+        const LIMIT: u64 = 16 * 1024;
+        let len = self.lock.metadata()?.len();
+        if len > LIMIT {
+            return Ok(false);
+        }
+        let mut bytes = vec![0; len as usize];
+        self.lock.read_exact_at(&mut bytes, 0)?;
+        let owner: Owner = serde_json::from_slice(&bytes)?;
+        Ok(&owner.proof == proof)
+    }
+
     pub(crate) fn duplicate_for_recovery(&self) -> io::Result<File> {
         self.lock.try_clone()
     }

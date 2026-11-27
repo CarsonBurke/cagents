@@ -255,7 +255,9 @@ pub enum Update {
     },
     /// The provider began taking prompts, which leaves activity unchanged.
     Ready,
-    /// The parent can accept a new prompt, independently of running children.
+    /// The parent can accept a new prompt, independently of running children,
+    /// or one it already accepted is no longer held behind what the person
+    /// queued with the provider, so the courier may start a turn.
     PromptAvailable,
     /// The provider reported on the account the conversation runs on. It
     /// concerns every surface showing the account, whatever this
@@ -274,6 +276,9 @@ pub enum Update {
         model: Option<super::ActiveModel>,
     },
     ConversationNameChanged,
+    /// A local conversation's record changed for its Work reader.
+    #[serde(skip)]
+    RecordChanged,
     /// Local edge for directory readers. Retained helpers carry the failure
     /// in resident metadata, from which the host emits its own edge.
     #[serde(skip)]
@@ -401,8 +406,10 @@ struct Inner {
     prompt_cache: PromptCache,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
+    record_observer: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
+    exited_recovery_queue: Arc<Mutex<Option<Arc<[super::QueuedMessage]>>>>,
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -699,8 +706,10 @@ impl LocalHandle {
         }));
         let visible = Arc::new(AtomicBool::new(false));
         let observe_next = Arc::new(AtomicBool::new(true));
+        let record_observer = spec.followed.then(|| Arc::new(AtomicBool::new(false)));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
+        let exited_recovery_queue = Arc::new(Mutex::new(None));
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
@@ -724,8 +733,10 @@ impl LocalHandle {
             prompt_cache: prompt_cache.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
+            record_observer: record_observer.clone(),
             stop: stop.clone(),
             completed: completed.clone(),
+            exited_recovery_queue: exited_recovery_queue.clone(),
             draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
@@ -781,6 +792,7 @@ impl LocalHandle {
                     store,
                     visible,
                     observe_next,
+                    record_observer,
                     stop,
                     detached_work: detached_work.clone(),
                     incoming,
@@ -788,6 +800,7 @@ impl LocalHandle {
                     notify,
                     resident_changed,
                     resident_dirty: false,
+                    followed_generation: spec.followed.then_some(0),
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
@@ -802,6 +815,7 @@ impl LocalHandle {
                     activity: ActivityState::Idle,
                     ready: false,
                     prompt_available: false,
+                    courier_available: false,
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
@@ -910,6 +924,7 @@ impl LocalHandle {
                         actor.publish_current_attention(evidence);
                     }
                 }
+                let had_provider = actor.child.is_some() || actor.native_holder.is_some();
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
                     let code = child
@@ -978,6 +993,15 @@ impl LocalHandle {
                         tracing::warn!(%error, "steps left running could not be marked stopped");
                     }
                     stop_snapshot_steps(&mut actor.state.lock().unwrap_or_else(|p| p.into_inner()));
+                }
+                // Publish the adapter's exact final input before any exit
+                // notification lets a reader fetch it. A detached or
+                // unproved process might still consume its own queue.
+                if had_provider && direct_closed && native_closed && !preserve_holder {
+                    *exited_recovery_queue
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) =
+                        actor.adapter.recovery_queue().map(Arc::from);
                 }
                 actor.apply(Event::Exited { code });
                 let usage = actor
@@ -1476,6 +1500,10 @@ impl LocalHandle {
     /// follows the conversation without presenting it; `again` names items
     /// to serve once more. See [`store::Unread`].
     pub fn unread(&self, again: &[String]) -> Result<(store::Unread, bool), String> {
+        // Arm before reading, so a write racing this read still signals.
+        if let Some(observer) = &self.0.record_observer {
+            observer.store(true, Ordering::Release);
+        }
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let unread = store.unread(again)?;
         let busy = self.0.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
@@ -1707,6 +1735,13 @@ impl LocalHandle {
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
+    }
+    fn exited_recovery_queue(&self) -> Option<Arc<[super::QueuedMessage]>> {
+        self.0
+            .exited_recovery_queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     /// When the latest turn and its delegated work finished, in daemon Unix
     /// milliseconds; absent while a turn runs or before the first one ends.
@@ -2682,6 +2717,7 @@ struct Actor {
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
+    record_observer: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     /// What teardown leaves running; see [`ActorCommand::CloseIfIdle`].
     detached_work: Arc<DetachedDecision>,
@@ -2692,6 +2728,7 @@ struct Actor {
     /// presentation and the once-per-unread-epoch output observation.
     resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
     resident_dirty: bool,
+    followed_generation: Option<u64>,
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
@@ -2710,6 +2747,8 @@ struct Actor {
     /// Whether the provider was taking prompts when activity was last published.
     ready: bool,
     prompt_available: bool,
+    /// Whether the courier could start a turn when activity was last published.
+    courier_available: bool,
     attention: TurnAttention,
     execution: execution::Tracker,
     attention_baselined: bool,
@@ -4437,6 +4476,11 @@ impl Actor {
         let prompt_available = accepts_prompt(&state) && !self.stop.load(Ordering::Acquire);
         let became_available = prompt_available && !self.prompt_available;
         self.prompt_available = prompt_available;
+        // The person's queue can empty while the conversation stays idle,
+        // which changes neither activity nor prompt availability.
+        let courier_available = prompt_available && state.queued_messages.is_empty();
+        let courier_released = courier_available && !self.courier_available;
+        self.courier_available = courier_available;
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         let activity_changed = activity != self.activity;
@@ -4468,7 +4512,16 @@ impl Actor {
             // leaves its geometric allocation resident for the lifetime of a
             // retained actor, one process per Claude conversation.
             self.reclaim_idle_frame_buffer();
+        }
+        if became_available || courier_released {
             (self.notify)(Update::PromptAvailable);
+        }
+        if let Some(previous) = &mut self.followed_generation
+            && std::mem::replace(previous, generation) != generation
+            && let Some(observer) = &self.record_observer
+            && observer.swap(false, Ordering::AcqRel)
+        {
+            (self.notify)(Update::RecordChanged);
         }
         // apply_step has installed confirmed_session before reaching here.
         self.publish_resident_metadata();

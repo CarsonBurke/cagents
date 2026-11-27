@@ -446,6 +446,46 @@ fn manually_expanded_details_survive_find_query_changes_and_close_without_new_pu
     assert!(Arc::ptr_eq(&original, &runtime.snapshot.items[0]));
 }
 
+/// While a subagent's transcript is open, a usage limit on the main
+/// conversation still marks its tab, with the limit's own glyph.
+#[test]
+fn a_usage_limited_main_conversation_marks_its_tab() {
+    let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.subagents = vec![child("only-worker", ToolStatus::Succeeded, false)];
+    snapshot.error = Some(quota("1:30pm", "parent-tab"));
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(
+        runtime.parent_tab_state(),
+        Some((Icon::UsageLimit, "Account limit reached".to_owned()))
+    );
+}
+
+/// A usage limit the transcript records but the conversation no longer
+/// reports has lapsed: its notice stays, but is no longer current, so its
+/// mark is not drawn in the attention tone.
+#[test]
+fn a_recorded_usage_limit_is_current_only_while_reported() {
+    let text = quota("1:30pm", "lapsed");
+    let (mut runtime, handle) =
+        frame_cost::live_runtime(&[provider_error("limit", Provider::Claude, &text)]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.error = Some(text);
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot.clone());
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert!(runtime.failure_ui.incidents[0].current());
+    snapshot.error = None;
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert!(!runtime.failure_ui.incidents[0].current());
+}
+
 #[test]
 fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked() {
     let (mut runtime, handle) = frame_cost::live_runtime(&[]);

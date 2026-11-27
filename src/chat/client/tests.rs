@@ -1454,6 +1454,7 @@ fn a_lost_codex_resume_reply_attaches_its_allocated_listener() {
             &mut None,
             &mut None,
             Intent::RetryStart,
+            &|_| {},
         );
         worker.join().unwrap();
         if conflict == 0 {
@@ -1588,6 +1589,23 @@ fn resume_stranded(
     source: Session,
     answer: impl FnOnce(&Session) -> ServerMessage + Send + 'static,
 ) -> (Result<ClientRequest, StartFailure>, Option<Session>, usize) {
+    resume_stranded_with_wake(source, answer, &|_| {})
+}
+
+fn resume_stranded_with_wake(
+    source: Session,
+    answer: impl FnOnce(&Session) -> ServerMessage + Send + 'static,
+    wake: &dyn Fn(Wake),
+) -> (Result<ClientRequest, StartFailure>, Option<Session>, usize) {
+    resume_stranded_exchange(source, answer, |_, _, _| unreachable!(), wake)
+}
+
+fn resume_stranded_exchange(
+    source: Session,
+    answer: impl FnOnce(&Session) -> ServerMessage + Send + 'static,
+    mut page: impl FnMut(TerminalId, uuid::Uuid, u32) -> ServerMessage + Send + 'static,
+    wake: &dyn Fn(Wake),
+) -> (Result<ClientRequest, StartFailure>, Option<Session>, usize) {
     let live = host_proof("current");
     let (mut client, mut server) = UnixStream::pair().unwrap();
     client
@@ -1615,9 +1633,25 @@ fn resume_stranded(
                         false,
                     ))
                 }
-                ClientRequest::ChatPrepareResume { source } if source == expected => {
-                    (answer.take().unwrap())(&source)
+                ClientRequest::ChatPrepareResumeWithQueue { source } if source == expected => {
+                    match (answer.take().unwrap())(&source) {
+                        ServerMessage::Response {
+                            response: ServerResponse::ChatResumePrepared { session },
+                        } => ServerMessage::Response {
+                            response: ServerResponse::ChatResumePreparedWithQueue {
+                                source: source.id,
+                                queued: None,
+                                prepared: Ok(session),
+                            },
+                        },
+                        message => message,
+                    }
                 }
+                ClientRequest::ChatReadExitedQueuePage {
+                    source,
+                    receipt,
+                    offset,
+                } => page(source, receipt, offset),
                 other => panic!("unexpected stranded-card request: {other:?}"),
             };
             codec
@@ -1644,6 +1678,7 @@ fn resume_stranded(
         &mut None,
         &mut resumed,
         Intent::Restore,
+        wake,
     );
     drop(client);
     (result, resumed, worker.join().unwrap())
@@ -1657,6 +1692,600 @@ fn stranded_claude(session_id: Option<&str>) -> Session {
     source.native_continuity = super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 };
     assert!(source.has_valid_native_continuity());
     source
+}
+
+fn exited_queue_fixture(source: &Session, count: usize, text: &str) -> crate::chat::ExitedQueue {
+    crate::chat::ExitedQueue {
+        messages: (0..count)
+            .map(|index| crate::chat::QueuedMessage {
+                id: format!("held-{index}"),
+                text: text.into(),
+                editable: true,
+                delivery: Default::default(),
+                attachments: Vec::new(),
+            })
+            .collect(),
+        account_scope: None,
+        confirmed_session: source.launch.session_id.clone(),
+    }
+}
+
+fn queue_page(receipt: uuid::Uuid, bytes: &[u8], offset: usize) -> ipc::ExitedQueuePage {
+    let end = (offset + ipc::EXITED_QUEUE_PAGE_BYTES).min(bytes.len());
+    ipc::ExitedQueuePage {
+        receipt,
+        total: bytes.len() as u32,
+        offset: offset as u32,
+        bytes: bytes[offset..end].to_vec(),
+    }
+}
+
+#[test]
+fn direct_same_id_start_waits_for_the_exact_queue_and_keeps_it_on_start_refusal() {
+    for fail_queue in [false, true] {
+        let proof = handoff_proof();
+        let source = omp_card(Some(CONVERSATION), Some(proof.clone()));
+        let expected = source.clone();
+        let id = source.id;
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert_eq!(read.proof, Some(proof.clone()));
+            assert_eq!(
+                read.request,
+                ClientRequest::ChatReadExitedQueue {
+                    source: expected.clone(),
+                    execution: None,
+                }
+            );
+            let refuse = |message| {
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    message,
+                    true,
+                ))
+            };
+            let response = if fail_queue {
+                refuse("The exact queue read can be retried")
+            } else {
+                let queue = exited_queue_fixture(&expected, 1, &"x".repeat(20 * 1024));
+                let bytes = postcard::to_allocvec(&queue).unwrap();
+                ServerMessage::Response {
+                    response: ServerResponse::ChatExitedQueue {
+                        source: id,
+                        queued: Some(queue_page(uuid::Uuid::new_v4(), &bytes, 0)),
+                    },
+                }
+            };
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(read.request_id),
+                &proof,
+                response,
+            );
+            let start: Option<ClientEnvelope> = codec.read(&mut server).unwrap();
+            if fail_queue {
+                assert!(start.is_none(), "a failed queue read must not send Start");
+                return;
+            }
+            let start = start.unwrap();
+            assert!(matches!(
+                start.request, ClientRequest::ChatStart { session, .. } if session == expected
+            ));
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(start.request_id),
+                &proof,
+                refuse("The successor could not start"),
+            );
+        });
+        let (send, received) = std::sync::mpsc::channel();
+        let failure = ClientHandle::connect_on(
+            client,
+            source,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                if let Wake::ExitedQueue(source, messages) = wake {
+                    let _ = send.send((source, messages));
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        if fail_queue {
+            assert!(failure.message.contains("exact queue read can be retried"));
+            assert!(received.try_recv().is_err());
+        } else {
+            assert!(failure.message.contains("successor could not start"));
+            let (source, queue) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(source, id);
+            assert_eq!(queue[0].text, "x".repeat(20 * 1024));
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn a_hidden_native_reader_finishes_the_prior_queue_before_reading_a_new_exit() {
+    let source = omp_card(Some(CONVERSATION), None);
+    let id = source.id;
+    let mut expected_prior = source.clone();
+    expected_prior.proof = Some(handoff_proof());
+    let mut expected_replacement = expected_prior.clone();
+    expected_replacement.native_continuity = super::super::NativeContinuity::Durable {
+        provider_version: "replacement-version".into(),
+    };
+    let replacement_source = expected_replacement.clone();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let (end_tx, end_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        handoff_handshake(&mut server, &mut codec);
+        let proof = handoff_proof();
+        let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        let ClientRequest::ChatStart { mut session, .. } = start.request else {
+            panic!("expected native start");
+        };
+        session.proof = Some(proof.clone());
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            Some(start.request_id),
+            &proof,
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached {
+                    session: session.clone(),
+                    snapshot: Snapshot::default(),
+                },
+            },
+        );
+        end_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let execution = uuid::Uuid::new_v4();
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            None,
+            &proof,
+            ServerMessage::ChatQueueEnded {
+                source: session.clone(),
+                execution,
+                current: false,
+            },
+        );
+        let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert_eq!(read.proof, Some(proof.clone()));
+        assert_eq!(
+            read.request,
+            ClientRequest::ChatReadExitedQueue {
+                source: session.clone(),
+                execution: Some(execution),
+            }
+        );
+        let queue = exited_queue_fixture(&session, 3, &"ø".repeat(384 * 1024));
+        let bytes = postcard::to_allocvec(&queue).unwrap();
+        let receipt = uuid::Uuid::new_v4();
+        let replacement = uuid::Uuid::new_v4();
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            None,
+            &proof,
+            ServerMessage::ChatQueueEnded {
+                source: replacement_source.clone(),
+                execution: replacement,
+                current: true,
+            },
+        );
+        // A runtime completion can be sent both by the attachment path and
+        // the worker observer. Ignore a duplicate even after another receipt
+        // was announced while the first read was in progress.
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            None,
+            &proof,
+            ServerMessage::ChatQueueEnded {
+                source: session.clone(),
+                execution,
+                current: false,
+            },
+        );
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            Some(read.request_id),
+            &proof,
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueue {
+                    source: id,
+                    queued: Some(queue_page(receipt, &bytes, 0)),
+                },
+            },
+        );
+        let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert_eq!(read.proof, Some(proof.clone()));
+        assert_eq!(
+            read.request,
+            ClientRequest::ChatReadExitedQueuePage {
+                source: id,
+                receipt,
+                offset: ipc::EXITED_QUEUE_PAGE_BYTES as u32,
+            }
+        );
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            Some(read.request_id),
+            &proof,
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueuePage {
+                    source: id,
+                    page: queue_page(receipt, &bytes, ipc::EXITED_QUEUE_PAGE_BYTES),
+                },
+            },
+        );
+        let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert_eq!(read.proof, Some(proof.clone()));
+        assert_eq!(
+            read.request,
+            ClientRequest::ChatReadExitedQueue {
+                source: replacement_source.clone(),
+                execution: Some(replacement),
+            }
+        );
+        let next =
+            postcard::to_allocvec(&exited_queue_fixture(&replacement_source, 1, "replacement"))
+                .unwrap();
+        handoff_reply(
+            &mut server,
+            &mut codec,
+            Some(read.request_id),
+            &proof,
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueue {
+                    source: id,
+                    queued: Some(queue_page(uuid::Uuid::new_v4(), &next, 0)),
+                },
+            },
+        );
+    });
+    let (send, received) = std::sync::mpsc::channel();
+    let handle = ClientHandle::connect_on(
+        client,
+        source,
+        Intent::Start,
+        None,
+        false,
+        None,
+        None,
+        None,
+        move |wake| {
+            if let Wake::CompletedQueue {
+                source,
+                messages,
+                current,
+            } = wake
+            {
+                let _ = send.send((*source, messages, current));
+            }
+        },
+    )
+    .unwrap();
+    end_tx.send(()).unwrap();
+    let (source, messages, current) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(source, expected_prior);
+    assert!(!current);
+    assert_eq!(messages.len(), 3);
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.text == "ø".repeat(384 * 1024))
+    );
+    let (source, messages, current) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(source, expected_replacement);
+    assert!(current);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "replacement");
+    assert!(
+        !handle.snapshot().exited,
+        "the hidden body supplied no exit presentation"
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn a_refused_completed_queue_page_allows_exact_recovery_after_reattach() {
+    let proof = handoff_proof();
+    let source = omp_card(Some(CONVERSATION), Some(proof.clone()));
+    let id = source.id;
+    let execution = uuid::Uuid::new_v4();
+    let receipt = uuid::Uuid::new_v4();
+    let queue = exited_queue_fixture(&source, 1, &"ø".repeat(ipc::EXITED_QUEUE_PAGE_BYTES / 2));
+    let bytes = Arc::new(postcard::to_allocvec(&queue).unwrap());
+    assert!(bytes.len() > ipc::EXITED_QUEUE_PAGE_BYTES);
+
+    for refuse in [true, false] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (done, release) = std::sync::mpsc::channel();
+        let proof = proof.clone();
+        let expected = source.clone();
+        let bytes = bytes.clone();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            let reply = |server: &mut UnixStream, codec: &mut FrameCodec, request_id, message| {
+                handoff_reply(server, codec, request_id, &proof, message);
+            };
+            let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert_eq!(
+                attach.request,
+                ClientRequest::ChatAttach {
+                    session: expected.clone()
+                }
+            );
+            reply(
+                &mut server,
+                &mut codec,
+                None,
+                ServerMessage::ChatQueueEnded {
+                    source: expected.clone(),
+                    execution,
+                    current: false,
+                },
+            );
+            reply(
+                &mut server,
+                &mut codec,
+                Some(attach.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session: expected.clone(),
+                        snapshot: Snapshot::default(),
+                    },
+                },
+            );
+            let first: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert_eq!(first.proof, Some(proof.clone()));
+            assert_eq!(
+                first.request,
+                ClientRequest::ChatReadExitedQueue {
+                    source: expected,
+                    execution: Some(execution),
+                }
+            );
+            reply(
+                &mut server,
+                &mut codec,
+                Some(first.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatExitedQueue {
+                        source: id,
+                        queued: Some(queue_page(receipt, &bytes, 0)),
+                    },
+                },
+            );
+            let next: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert_eq!(
+                next.request,
+                ClientRequest::ChatReadExitedQueuePage {
+                    source: id,
+                    receipt,
+                    offset: ipc::EXITED_QUEUE_PAGE_BYTES as u32,
+                }
+            );
+            let reply = if refuse {
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "The held input page expired",
+                    true,
+                ))
+            } else {
+                ServerMessage::Response {
+                    response: ServerResponse::ChatExitedQueuePage {
+                        source: id,
+                        page: queue_page(receipt, &bytes, ipc::EXITED_QUEUE_PAGE_BYTES),
+                    },
+                }
+            };
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(next.request_id),
+                &proof,
+                reply,
+            );
+            // A refusal must reach the caller before any socket EOF.
+            release.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let (send, receive) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            source.clone(),
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                if matches!(wake, Wake::CompletedQueue { .. } | Wake::Disconnected(_)) {
+                    let _ = send.send(wake);
+                }
+            },
+        )
+        .unwrap();
+        match receive.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Wake::Disconnected(error) if refuse => {
+                assert!(error.contains("The held input page expired"), "{error}");
+                assert!(error.contains("Reconnect to retry"), "{error}");
+            }
+            Wake::CompletedQueue {
+                source: recovered,
+                messages,
+                current: false,
+            } if !refuse => {
+                assert_eq!(*recovered, source);
+                assert_eq!(messages, queue.messages);
+            }
+            other => panic!(
+                "unexpected completed queue event {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        drop(handle);
+        done.send(()).unwrap();
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn a_retired_queue_larger_than_one_frame_arrives_complete_before_the_wake() {
+    let source = stranded_claude(Some(CONVERSATION));
+    let pending = exited_queue_fixture(&source, 9, &"é".repeat(480 * 1024));
+    let bytes = postcard::to_allocvec(&pending).unwrap();
+    let expected = pending.messages;
+    let complete = std::cell::Cell::new(false);
+    assert!(bytes.len() > ipc::MAX_FRAME_BYTES);
+    let receipt = uuid::Uuid::new_v4();
+    let first = queue_page(receipt, &bytes, 0);
+    let last_offset = std::cell::Cell::new(0);
+    let id = source.id;
+    let (result, successor, asked) = resume_stranded_exchange(
+        source.clone(),
+        move |source| ServerMessage::Response {
+            response: ServerResponse::ChatResumePreparedWithQueue {
+                source: source.id,
+                queued: Some(first),
+                prepared: Err(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "The successor could not start",
+                    true,
+                )),
+            },
+        },
+        move |source, actual, offset| {
+            assert_eq!(source, id);
+            assert_eq!(actual, receipt);
+            let previous = last_offset.replace(offset);
+            assert_eq!(
+                offset as usize,
+                previous as usize + ipc::EXITED_QUEUE_PAGE_BYTES
+            );
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueuePage {
+                    source,
+                    page: queue_page(receipt, &bytes, offset as usize),
+                },
+            }
+        },
+        &|wake| {
+            if let Wake::ExitedQueue(source, messages) = wake {
+                assert_eq!(source, id);
+                assert_eq!(messages, expected);
+                assert!(!complete.replace(true));
+            }
+        },
+    );
+    assert!(complete.get());
+    assert!(
+        result
+            .unwrap_err()
+            .message
+            .contains("The successor could not start")
+    );
+    assert_eq!(successor, None);
+    assert!(asked >= 5);
+}
+
+#[test]
+fn a_mismatched_retired_queue_page_cannot_wake_the_pane_with_partial_input() {
+    let source = stranded_claude(Some(CONVERSATION));
+    let pending = exited_queue_fixture(&source, 3, &"x".repeat(768 * 1024));
+    let bytes = postcard::to_allocvec(&pending).unwrap();
+    let receipt = uuid::Uuid::new_v4();
+    let first = queue_page(receipt, &bytes, 0);
+    let (result, successor, _) = resume_stranded_exchange(
+        source,
+        move |source| ServerMessage::Response {
+            response: ServerResponse::ChatResumePreparedWithQueue {
+                source: source.id,
+                queued: Some(first),
+                prepared: Ok(source.clone()),
+            },
+        },
+        move |source, _, offset| ServerMessage::Response {
+            response: ServerResponse::ChatExitedQueuePage {
+                source,
+                page: queue_page(uuid::Uuid::new_v4(), &bytes, offset as usize),
+            },
+        },
+        &|wake| {
+            assert!(!matches!(wake, Wake::ExitedQueue(..)));
+        },
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .message
+            .contains("invalid retired input queue")
+    );
+    assert_eq!(successor, None);
+}
+
+#[test]
+fn an_exited_queue_reaches_the_window_even_when_resume_preparation_fails() {
+    let source = stranded_claude(Some(CONVERSATION));
+    let queued = std::cell::RefCell::new(None);
+    let (result, successor, _) = resume_stranded_with_wake(
+        source.clone(),
+        |source| ServerMessage::Response {
+            response: ServerResponse::ChatResumePreparedWithQueue {
+                source: source.id,
+                queued: {
+                    let mut queue = exited_queue_fixture(source, 1, "Check the migration");
+                    queue.messages[0].id = "held-final".into();
+                    let bytes = postcard::to_allocvec(&queue).unwrap();
+                    Some(queue_page(uuid::Uuid::new_v4(), &bytes, 0))
+                },
+                prepared: Err(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::TerminalUnavailable,
+                    "The successor could not start",
+                    true,
+                )),
+            },
+        },
+        &|wake| {
+            if let Wake::ExitedQueue(source, messages) = wake {
+                *queued.borrow_mut() = Some((source, messages[0].text.clone()));
+            }
+        },
+    );
+    assert_eq!(
+        queued.into_inner(),
+        Some((source.id, "Check the migration".into()))
+    );
+    assert_eq!(successor, None);
+    assert!(
+        result
+            .unwrap_err()
+            .message
+            .contains("The successor could not start")
+    );
 }
 
 #[test]
@@ -1902,6 +2531,7 @@ fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
             &mut None,
             &mut None,
             Intent::RetryStart,
+            &|_| {},
         );
         worker.join().unwrap();
         match state {
@@ -1993,6 +2623,7 @@ fn negotiate_with_restore_policy(
         } else {
             Intent::Restore
         },
+        &|_| {},
     );
     (outcome, worker.join().unwrap(), recovery)
 }
@@ -2460,6 +3091,7 @@ fn recovery_restore_keeps_exact_live_and_issued_history_attachments() {
         &mut None,
         &mut None,
         Intent::RestoreExisting,
+        &|_| {},
     )
     .unwrap();
     assert!(matches!(request, ClientRequest::ChatAttach { session } if session == same_owner));
@@ -2721,6 +3353,7 @@ fn a_restarted_daemon_still_resumes_the_conversation_a_card_was_showing() {
         &mut None,
         &mut None,
         Intent::Restore,
+        &|_| {},
     )
     .expect("a live proof attaches");
     assert!(matches!(attach, ClientRequest::ChatAttach { .. }));

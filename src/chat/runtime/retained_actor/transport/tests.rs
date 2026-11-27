@@ -589,6 +589,7 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
             socket_identity: (metadata.dev(), metadata.ino()),
             _directory: None,
             closed_snapshot: None,
+            published_exit_queue: None,
             session_stopping: false,
             attachment_preserved: false,
             close_only: false,
@@ -597,6 +598,27 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
         root,
     )
 }
+#[test]
+fn retained_exit_queue_requires_authenticated_and_completed_provider() {
+    let mut fixture = resident_fixture();
+    let proof = fixture.server.proof.clone();
+    let epoch = fixture.server.epoch;
+    let request = |epoch| Invocation {
+        proof: proof.clone(),
+        epoch,
+        method: "exit_recovery_queue".into(),
+        args: Value::Null,
+    };
+    let refusal = fixture
+        .server
+        .invoke(request(Some(uuid::Uuid::new_v4())))
+        .unwrap_err();
+    assert!(refusal.contains("superseded"));
+    let refusal = fixture.server.invoke(request(Some(epoch))).unwrap_err();
+    assert!(refusal.contains("exit has not been proved"));
+    assert!(fixture.server.published_exit_queue.is_none());
+}
+
 #[test]
 fn continuity_loss_refuses_unchanged_presentation_without_mutating_source_or_copy() {
     let body = "Retained answer λ\n  preserve source and copy";

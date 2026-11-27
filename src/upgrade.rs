@@ -1964,7 +1964,7 @@ pub mod handoff {
         /// Observe existing authority without repairing its permissions.
         /// A holder making a release decision must not promote previously
         /// untrusted storage into private evidence.
-        #[cfg(all(target_os = "macos", feature = "host"))]
+        #[cfg(target_os = "macos")]
         pub(crate) fn observe_existing() -> Result<Option<Self>, String> {
             let directory = Self::directory()?;
             crate::secure_file::reject_symlink_components(&directory)

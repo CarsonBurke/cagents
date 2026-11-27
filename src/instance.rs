@@ -337,6 +337,10 @@ impl Drop for OwnedLock {
 }
 
 pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
+    owned_file_lock(open_owned_lock(path)?, operation)
+}
+
+fn open_owned_lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -353,7 +357,7 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
         ));
     }
     lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    owned_file_lock(lock, operation)
+    Ok(lock)
 }
 
 /// Acquire the existing drop-safe advisory lock on a file a confined storage
@@ -1609,6 +1613,35 @@ fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
     }
 }
 
+/// An open observation of the exact launch fence an update already holds.
+#[cfg(feature = "host")]
+#[doc(hidden)]
+pub struct UpdateFenceRelease(File);
+
+#[cfg(feature = "host")]
+impl UpdateFenceRelease {
+    pub fn observe(runtime: &Path) -> io::Result<Option<Self>> {
+        let path = daemon_admission::fence_path_in(runtime);
+        let file = open_owned_lock(&path)?;
+        match file.try_lock_shared() {
+            Ok(()) => file.unlock().map(|()| None),
+            Err(fs::TryLockError::WouldBlock) => {
+                let opened = file.metadata()?;
+                let named = fs::symlink_metadata(&path)?;
+                if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+                    return Err(io::Error::other("the observed update fence changed"));
+                }
+                Ok(Some(Self(file)))
+            }
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    pub fn wait(self) -> io::Result<()> {
+        owned_file_lock(self.0, libc::LOCK_SH).map(drop)
+    }
+}
+
 pub fn update_in_progress() -> bool {
     runtime_directory()
         .and_then(|runtime| {
@@ -2465,7 +2498,7 @@ pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
 }
 
 pub const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", target_os = "macos"))]
 pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_directory()?;
     Ok((

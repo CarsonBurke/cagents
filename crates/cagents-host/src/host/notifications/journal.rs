@@ -100,7 +100,25 @@ struct SchemaVersion {
     user_version: i32,
 }
 
-pub(super) struct Journal(SqliteConnection);
+/// A journal connection, with the notices it last decoded.
+pub(super) struct Journal(SqliteConnection, Option<Listed>);
+
+/// What `list` decoded at one revision of the database.
+struct Listed {
+    revision: Revision,
+    notices: Vec<Notice>,
+}
+
+/// Every committed write changes this: `total_changes` counts rows this
+/// connection modified, and `data_version` changes when another connection
+/// commits. A rolled-back write still counts, which only costs a reread.
+#[derive(diesel::QueryableByName, Clone, Copy, PartialEq, Eq)]
+struct Revision {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    changes: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    data_version: i64,
+}
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Admission {
@@ -162,7 +180,7 @@ impl Journal {
                 session TEXT PRIMARY KEY, actor TEXT NOT NULL, generation INTEGER NOT NULL,
                 outcome_through INTEGER NOT NULL);
             PRAGMA user_version=3;").map_err(|error| error.to_string())?;
-        Ok(Self(connection))
+        Ok(Self(connection, None))
     }
 
     /// The broker remains the sole writer. A reader can observe committed
@@ -181,7 +199,7 @@ impl Journal {
         connection
             .batch_execute("PRAGMA query_only=ON; PRAGMA busy_timeout=100;")
             .map_err(|error| error.to_string())?;
-        Ok(Self(connection))
+        Ok(Self(connection, None))
     }
 
     pub(super) fn unread_session_ids(
@@ -578,7 +596,32 @@ impl Journal {
         }
     }
 
+    /// The retained notices, newest first. The broker lists after each batch
+    /// of work, usually with nothing written since the previous list, so an
+    /// unchanged database reuses the notices already decoded.
     pub fn list(&mut self) -> Result<Vec<Notice>, String> {
+        // Read the revision first. A commit that lands during the load then
+        // forces another read rather than being attributed to this one.
+        let revision = diesel::sql_query(
+            "SELECT total_changes() AS changes, data_version FROM pragma_data_version",
+        )
+        .get_result::<Revision>(&mut self.0)
+        .map_err(|error| error.to_string())?;
+        if let Some(listed) = &self.1
+            && listed.revision == revision
+        {
+            return Ok(listed.notices.clone());
+        }
+        self.1 = None;
+        let notices = self.load()?;
+        self.1 = Some(Listed {
+            revision,
+            notices: notices.clone(),
+        });
+        Ok(notices)
+    }
+
+    fn load(&mut self) -> Result<Vec<Notice>, String> {
         notices::table
             .left_join(owners::table.on(owners::session.eq(notices::session)))
             .select((
@@ -1113,6 +1156,43 @@ mod tests {
         notifications::{Evidence, Kind},
     };
     use rusqlite::Connection;
+
+    #[test]
+    fn listing_reads_again_after_any_committed_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let notice = journal
+            .record(event(session, "done"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.list().unwrap(), std::slice::from_ref(&notice));
+        assert_eq!(journal.list().unwrap(), std::slice::from_ref(&notice));
+
+        // Writes through this connection.
+        journal.remember_window([session], "primary").unwrap();
+        assert_eq!(
+            journal.list().unwrap()[0].window.as_deref(),
+            Some("primary")
+        );
+        journal.acknowledge(notice.id).unwrap();
+        assert!(journal.list().unwrap()[0].acknowledged);
+
+        // Another connection's commit changes only its data_version.
+        let other = Connection::open(&path).unwrap();
+        other
+            .execute("UPDATE notices SET event = 'unreadable'", [])
+            .unwrap();
+        assert!(journal.list().is_err());
+        other
+            .execute(
+                "UPDATE notices SET event = ?1",
+                [serde_json::to_string(&notice.event).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(journal.list().unwrap()[0].id, notice.id);
+    }
 
     #[test]
     fn a_journal_that_failed_to_open_is_reopened_after_a_bounded_wait() {

@@ -88,14 +88,40 @@ impl Snapshot {
 
     pub fn hints(&self) -> ForgeHints {
         let mut hints = ForgeHints::default();
-        for pull_request in self.pull_requests.iter().chain(self.others.values()) {
+        // Only a pull request from a repository the remotes name can be a
+        // local branch's, as `for_branch` says.
+        for (pull_request, repository) in self
+            .pull_requests
+            .iter()
+            .chain(self.others.values())
+            .filter_map(|pull_request| {
+                let repository = self
+                    .remotes
+                    .iter()
+                    .find(|remote| pull_request.belongs_to_head(remote))?;
+                Some((pull_request, repository))
+            })
+        {
             hints.branches.insert(pull_request.head_ref_name.clone());
-            if pull_request.state.0 == "MERGED" && !pull_request.head_ref_oid.is_empty() {
-                hints
-                    .merged
-                    .entry(pull_request.head_ref_name.clone())
-                    .or_default()
-                    .insert(pull_request.head_ref_oid.clone());
+            if pull_request.head_ref_oid.is_empty() {
+                continue;
+            }
+            match pull_request.state.0.as_str() {
+                "MERGED" => {
+                    hints
+                        .merged
+                        .entry(pull_request.head_ref_name.clone())
+                        .or_default()
+                        .insert(pull_request.head_ref_oid.clone());
+                }
+                "OPEN" => {
+                    hints
+                        .open
+                        .entry(pull_request.head_ref_name.clone())
+                        .or_default()
+                        .insert(pull_request.head_ref_oid.clone(), repository.clone());
+                }
+                _ => {}
             }
         }
         hints
@@ -772,6 +798,13 @@ mod tests {
             hints.merged,
             BTreeMap::from([("feature".to_owned(), BTreeSet::from(["b".to_owned()]))])
         );
+        assert_eq!(
+            hints.open,
+            BTreeMap::from([(
+                "feature".to_owned(),
+                BTreeMap::from([("c".to_owned(), key("me"))])
+            )])
+        );
 
         let fork = Snapshot {
             remotes: vec![key("someone")],
@@ -780,6 +813,11 @@ mod tests {
         assert!(
             fork.for_branch("feature", Some("b")).is_none(),
             "a same-named branch from an unrelated repository is not this one"
+        );
+        assert_eq!(
+            fork.hints(),
+            ForgeHints::default(),
+            "nor does the scan measure it for one"
         );
     }
 

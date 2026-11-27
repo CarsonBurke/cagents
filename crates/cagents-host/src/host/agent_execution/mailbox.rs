@@ -20,6 +20,9 @@
 //! tells every surface showing such a conversation that it is limited and
 //! until when, so the daemon gives one account of a limit everywhere.
 
+mod account_watch;
+mod wait;
+
 use super::{SharedHost, SharedRegistry, caller, directory, registry};
 use crate::{
     agent_execution::{
@@ -36,19 +39,21 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Condvar, Mutex, Weak},
+    path::PathBuf,
+    sync::{Arc, Mutex, Weak},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-/// The longest the courier sleeps while anything is outstanding: a pending
-/// message, a usage limit, a queued run that failed to start, or a failed
-/// pass. Edges wake it sooner; this covers the changes no edge reports (a
-/// terminal's provider detected, a limit lifted by another process's usage
-/// reading, a handoff failure only logged) and keeps a far deadline honest
-/// across a suspend, which the monotonic wait does not count. With nothing
-/// outstanding the courier sleeps until an edge or the hourly prune.
-const FALLBACK: Duration = Duration::from_secs(15);
+#[cfg(test)]
+use std::sync::Condvar;
+
+/// When the courier looks again after a pass, a queued run or a handoff
+/// failed, or while it cannot watch the account files for a usage limit to
+/// lift. Everything else that lets a message advance wakes it: a
+/// conversation or terminal starting, settling or leaving, a window releasing
+/// the person's follow-ups, an account file changing, or a deadline.
+const RETRY: Duration = Duration::from_secs(15);
 /// The longest the courier waits, once a conversation is idle, for a window
 /// to send the follow-ups the person wrote during its turn, which go before
 /// any message from another session. A window sends them the moment it sees
@@ -88,13 +93,15 @@ pub(in crate::host) fn post(
 /// which must see every prompt its readiness check admitted. `None`, without
 /// running it, once the daemon no longer takes work.
 pub(super) fn with_control<T>(host: &SharedHost, work: impl FnOnce() -> T) -> Option<T> {
-    let gate = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .control_gate
-        .clone();
+    let (gate, courier) = {
+        let host = host.lock().unwrap_or_else(|p| p.into_inner());
+        (host.control_gate.clone(), host.mailbox.clone())
+    };
     let _control = gate.shared();
     crate::host::client::ensure_control_open(host).ok()?;
+    if courier.is_some_and(|courier| courier.defers_for_update()) {
+        return None;
+    }
     Some(work())
 }
 
@@ -120,7 +127,7 @@ pub(in crate::host) fn hand(
             .clone()
             .ok_or("The mailbox key is unavailable")?;
         let message = &delivery.sent.message;
-        let handoff = to_agent(host, &registry, &seal, message, limited)?;
+        let (handoff, _) = to_agent(host, &registry, &seal, message, limited)?;
         if handoff.is_some() {
             return Ok(handoff);
         }
@@ -196,20 +203,23 @@ fn message_run(
 /// Only an agent a session or the user's CLI owns qualifies, and only until
 /// a person takes it over: an automation's agent runs only what its schedule
 /// gives it, and a person's conversation is theirs to prompt.
-pub(super) fn to_agent(
+///
+/// The flag says the handoff failed rather than being held for a reason that
+/// reports its own end, so the courier must try again.
+fn to_agent(
     host: &SharedHost,
     registry: &SharedRegistry,
     seal: &Seal,
     message: &Message,
     limited: bool,
-) -> Result<Option<Handoff>, String> {
+) -> Result<(Option<Handoff>, bool), String> {
     let Some(lineage) = message.to.lineage else {
-        return Ok(None);
+        return Ok((None, false));
     };
     let (agent, request, previous, eligible, unverified, ahead) = {
         let store = registry.lock().unwrap_or_else(|p| p.into_inner());
         let Some(agent) = store.lineage_agent(lineage)? else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let request = message_run(agent.id, message, seal);
         let previous = store.previous_agent_acceptance(&agent.origin, &request)?;
@@ -223,10 +233,10 @@ pub(super) fn to_agent(
         (agent, request, previous, eligible, unverified, ahead)
     };
     let Some(crate::agent_execution::HostedSession::Chat(session)) = &agent.session else {
-        return Ok(None);
+        return Ok((None, false));
     };
     if !eligible || previous.is_some() {
-        return Ok(None);
+        return Ok((None, false));
     }
     // What the person wrote for its conversation goes first, and the message
     // after it, together with any other waiting, as a person's conversation
@@ -237,23 +247,27 @@ pub(super) fn to_agent(
         .held_followups
         .contains_key(&session.id)
     {
-        return Ok(Some(Handoff::Held {
-            agent: agent.id,
-            reason: "A person wrote its conversation a prompt; it receives the message after that"
-                .into(),
-        }));
+        return Ok((
+            Some(Handoff::Held {
+                agent: agent.id,
+                reason:
+                    "A person wrote its conversation a prompt; it receives the message after that"
+                        .into(),
+            }),
+            false,
+        ));
     }
     if unverified {
-        return Ok(Some(Handoff::Held {
+        return Ok((Some(Handoff::Held {
             agent: agent.id,
             reason: "A run of it was interrupted without proof of what it did, so cagents starts no more runs for it".into(),
-        }));
+        }), false));
     }
     if limited {
-        return Ok(Some(Handoff::Held {
+        return Ok((Some(Handoff::Held {
             agent: agent.id,
             reason: "A usage limit stops its conversation; it receives the message once the limit resets".into(),
-        }));
+        }), false));
     }
     // A busy agent takes it too, as a run that waits behind its current work:
     // the order of its runs is then the order they were accepted in.
@@ -269,24 +283,36 @@ pub(super) fn to_agent(
         );
     let accepted = match handoff {
         Ok(MessageHandoff::Accepted(accepted)) => *accepted,
-        Ok(MessageHandoff::Settled) => return Ok(None),
-        Ok(MessageHandoff::Behind) => return Ok(Some(Handoff::Behind { agent: agent.id })),
-        Ok(MessageHandoff::NoSlot) => return Ok(Some(Handoff::NoSlot { agent: agent.id })),
+        Ok(MessageHandoff::Settled) => return Ok((None, false)),
+        Ok(MessageHandoff::Behind) => {
+            return Ok((Some(Handoff::Behind { agent: agent.id }), false));
+        }
+        Ok(MessageHandoff::NoSlot) => {
+            return Ok((Some(Handoff::NoSlot { agent: agent.id }), false));
+        }
         Ok(MessageHandoff::QueueFull) => {
-            return Ok(Some(Handoff::Waiting {
-                agent: agent.id,
-                behind: ahead,
-            }));
+            return Ok((
+                Some(Handoff::Waiting {
+                    agent: agent.id,
+                    behind: ahead,
+                }),
+                false,
+            ));
         }
         Err(reason) => {
-            return Ok(Some(Handoff::Held {
-                agent: agent.id,
-                reason,
-            }));
+            return Ok((
+                Some(Handoff::Held {
+                    agent: agent.id,
+                    reason,
+                }),
+                true,
+            ));
         }
     };
     super::announce(host, registry);
-    Ok(Some(started(host, registry, &accepted, message.id)))
+    let handoff = started(host, registry, &accepted, message.id);
+    let failed = matches!(handoff, Handoff::Held { .. });
+    Ok((Some(handoff), failed))
 }
 
 /// Has every message to `agent` that waits to become one of its runs take
@@ -317,7 +343,7 @@ pub(super) fn hand_earlier(
         else {
             return Ok(());
         };
-        let why = match to_agent(host, registry, &seal, &message, limited)? {
+        let why = match to_agent(host, registry, &seal, &message, limited)?.0 {
             Some(Handoff::Run { .. } | Handoff::Ended { .. } | Handoff::Unknown { .. }) => continue,
             // Settled meanwhile, or not the agent's to take as a run, which
             // the follow-up's own acceptance then decides.
@@ -789,14 +815,24 @@ pub(in crate::host) fn wake(host: &SharedHost) {
 struct WakeState {
     generation: u64,
     stopped: bool,
+    update: UpdateWait,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum UpdateWait {
+    #[default]
+    Open,
+    Held,
+    Retry,
 }
 
 struct Inner {
+    update_runtime: Option<PathBuf>,
     host: Weak<crate::host::state::HostLock>,
     registry: SharedRegistry,
     seal: Arc<Seal>,
     state: Mutex<WakeState>,
-    changed: Condvar,
+    wait: wait::Wait,
     /// What each conversation's subscribers were last told of its limit.
     limits: Mutex<BTreeMap<TerminalId, Told>>,
     /// When the courier first found each conversation idle while a window
@@ -823,7 +859,53 @@ impl Handle {
     pub(in crate::host) fn wake(&self) {
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         state.generation = state.generation.wrapping_add(1);
-        self.0.changed.notify_one();
+        self.0.wait.wake();
+    }
+
+    /// Keep unclaimed inputs durable during approved interruption. Follow the
+    /// fence without holding daemon control or joining its waiter at shutdown.
+    fn defers_for_update(&self) -> bool {
+        let Some(runtime) = &self.0.update_runtime else {
+            return false;
+        };
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.update != UpdateWait::Open {
+            return true;
+        }
+        let release = match crate::instance::UpdateFenceRelease::observe(runtime) {
+            Ok(None) => return false,
+            Ok(Some(release)) => release,
+            Err(error) => {
+                tracing::warn!(%error, "cannot check the update fence before message delivery");
+                state.update = UpdateWait::Retry;
+                return true;
+            }
+        };
+        let owner = Arc::downgrade(&self.0);
+        match std::thread::Builder::new()
+            .name("courier-update-fence".into())
+            .spawn(move || {
+                let released = release.wait();
+                if let Some(owner) = owner.upgrade() {
+                    let mut state = owner.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.update = match released {
+                        Ok(()) => UpdateWait::Open,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not follow the update fence release");
+                            UpdateWait::Retry
+                        }
+                    };
+                    state.generation = state.generation.wrapping_add(1);
+                    owner.wait.wake();
+                }
+            }) {
+            Ok(_) => state.update = UpdateWait::Held,
+            Err(error) => {
+                tracing::warn!(%error, "could not observe the update fence release");
+                state.update = UpdateWait::Retry;
+            }
+        }
+        true
     }
 }
 
@@ -870,7 +952,17 @@ impl Courier {
         self.wait_for_scan(generation);
     }
 
+    #[cfg(test)]
     pub(in crate::host) fn start(host: &SharedHost) -> Result<Self, String> {
+        Self::start_in(host, None)
+    }
+
+    pub(in crate::host) fn start_with_update_fence(host: &SharedHost) -> Result<Self, String> {
+        let runtime = crate::instance::runtime_directory().map_err(|error| error.to_string())?;
+        Self::start_in(host, Some(runtime))
+    }
+
+    fn start_in(host: &SharedHost, update_runtime: Option<PathBuf>) -> Result<Self, String> {
         let registry = registry(host)?;
         let seal = host
             .lock()
@@ -879,11 +971,12 @@ impl Courier {
             .clone()
             .ok_or("The mailbox key is unavailable")?;
         let handle = Handle(Arc::new(Inner {
+            update_runtime,
             host: Arc::downgrade(host),
             registry,
             seal,
             state: Mutex::new(WakeState::default()),
-            changed: Condvar::new(),
+            wait: wait::Wait::new(),
             limits: Mutex::new(BTreeMap::new()),
             yielding: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -892,11 +985,15 @@ impl Courier {
             scanned: Condvar::new(),
         }));
         let owner = handle.clone();
+        // Publish the handle before the first pass reads HostState, so no
+        // edge raised in between goes to a courier that is not there yet,
+        // and the first pass sees its update fence before it claims work.
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let thread = std::thread::Builder::new()
             .name("message-courier".into())
             .spawn(move || owner.run())
             .map_err(|error| error.to_string())?;
-        host.lock().unwrap_or_else(|p| p.into_inner()).mailbox = Some(handle.clone());
+        state.mailbox = Some(handle.clone());
         Ok(Self {
             handle,
             thread: Some(thread),
@@ -912,31 +1009,34 @@ impl Drop for Courier {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .stopped = true;
-        self.handle.0.changed.notify_all();
+        self.handle.0.wait.wake();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-/// How long the courier sleeps after a pass: until the deadline the pass
-/// reported, clamped to keep it off a spin and honest across a suspend, or
-/// the fallback after a failed pass; at most until the next prune.
-fn courier_wait(pass: &Result<Option<u64>, String>, now_ms: u64, prune_in: Duration) -> Duration {
+/// When, in milliseconds since the epoch, the courier looks again after a
+/// pass: at the deadline the pass reported, after [`RETRY`] if it failed, and
+/// at most at the next prune; never so soon that it spins.
+fn courier_deadline(pass: &Result<Option<u64>, String>, now_ms: u64, prune_in: Duration) -> u64 {
     let delivery = match pass {
-        Ok(Some(due_ms)) => Some(
-            Duration::from_millis(due_ms.saturating_sub(now_ms))
-                .clamp(Duration::from_millis(50), FALLBACK),
-        ),
-        Ok(None) => None,
-        Err(_) => Some(FALLBACK),
+        Ok(due) => *due,
+        Err(_) => Some(now_ms.saturating_add(RETRY.as_millis() as u64)),
     };
-    delivery.map_or(prune_in, |delay| delay.min(prune_in))
+    delivery
+        .unwrap_or(u64::MAX)
+        .min(now_ms.saturating_add(prune_in.as_millis() as u64))
+        .max(now_ms.saturating_add(50))
 }
 
 impl Handle {
     fn run(&self) {
-        self.run_with(|| self.prune(), |host| self.deliver(host));
+        let mut accounts = account_watch::AccountWatch::new();
+        self.run_with(
+            || self.prune(),
+            |host| self.deliver(host, accounts.refresh(self)),
+        );
     }
 
     fn run_with(
@@ -952,11 +1052,14 @@ impl Handle {
                     tracing::warn!(%error, "cannot forget old messages");
                 }
             }
+            #[cfg_attr(not(test), allow(unused_variables))]
             let observed = {
                 let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.stopped {
                     return;
                 }
+                // An edge from here on ends the wait after this pass.
+                self.0.wait.begin_pass();
                 state.generation
             };
             let Some(host) = self.0.host.upgrade() else {
@@ -969,7 +1072,7 @@ impl Handle {
             let prune_in = pruned_at.map_or(PRUNE_EVERY, |at| {
                 (at + PRUNE_EVERY).saturating_duration_since(Instant::now())
             });
-            let delay = courier_wait(&pass, super::now(), prune_in);
+            let deadline = courier_deadline(&pass, super::now(), prune_in);
             drop(host);
             #[cfg(test)]
             {
@@ -980,16 +1083,16 @@ impl Handle {
                     .unwrap_or_else(|p| p.into_inner()) = Some(observed);
                 self.0.scanned.notify_all();
             }
-            let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-            let (state, _) = self
-                .0
-                .changed
-                .wait_timeout_while(state, delay, |state| {
-                    !state.stopped && state.generation == observed
-                })
-                .unwrap_or_else(|p| p.into_inner());
-            if state.stopped {
-                return;
+            if let Err(error) = self.0.wait.until(deadline) {
+                // Rescan on a short interval rather than leave mail stranded.
+                // Edges, including the one that stops the courier, still end
+                // the wait at once.
+                tracing::error!(%error, "cannot wait for a delivery deadline");
+                let remaining = Duration::from_millis(deadline.saturating_sub(super::now()));
+                if let Err(error) = self.0.wait.edge_within(remaining.min(RETRY)) {
+                    tracing::error!(%error, "cannot wait for message delivery");
+                    std::thread::sleep(RETRY);
+                }
             }
         }
     }
@@ -1091,10 +1194,11 @@ impl Handle {
     /// Gives each lineage with a live, idle conversation the messages waiting
     /// for it. Returns when the courier must look again: when the next held
     /// reply is released, a known usage limit resets or a conversation stops
-    /// waiting for the person's follow-ups, and soon while a message is
-    /// pending, a conversation is limited or a queued run failed to start;
-    /// `None` when nothing is outstanding.
-    fn deliver(&self, host: &SharedHost) -> Result<Option<u64>, String> {
+    /// waiting for the person's follow-ups, and after [`RETRY`] when a step
+    /// failed or, unless `watching_accounts`, a conversation is limited;
+    /// `None` when only an edge can advance delivery. A message pending for
+    /// a recipient that cannot take it now waits for such an edge.
+    fn deliver(&self, host: &SharedHost, watching_accounts: bool) -> Result<Option<u64>, String> {
         let limits = self.publish_limits(host, super::now());
         let reset = limits
             .values()
@@ -1104,10 +1208,22 @@ impl Handle {
             .min();
         self.forget_yields(host);
         let (queued_failed, deferred) = self.start_queued(host);
-        let (released, pending) = self.deliver_messages(host, &limits)?;
-        let outstanding = (queued_failed || pending || !limits.is_empty())
-            .then(|| super::now().saturating_add(FALLBACK.as_millis() as u64));
-        Ok([released, reset, outstanding, deferred]
+        let (released, delivery_failed) = self.deliver_messages(host, &limits)?;
+        let update = {
+            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            let update = state.update;
+            if update == UpdateWait::Retry {
+                state.update = UpdateWait::Open;
+            }
+            update
+        };
+        // A held update fence wakes the courier when it releases.
+        let retry = (queued_failed
+            || (delivery_failed && update != UpdateWait::Held)
+            || update == UpdateWait::Retry
+            || !watching_accounts && !limits.is_empty())
+        .then(|| super::now().saturating_add(RETRY.as_millis() as u64));
+        Ok([released, reset, retry, deferred]
             .into_iter()
             .flatten()
             .min())
@@ -1209,8 +1325,7 @@ impl Handle {
     }
 
     /// Returns when the courier must look again for a held reply's release
-    /// or a person's follow-ups, and whether any message is still pending for
-    /// a recipient.
+    /// or a person's follow-ups, and whether handing a message over failed.
     fn deliver_messages(
         &self,
         host: &SharedHost,
@@ -1225,7 +1340,6 @@ impl Handle {
             let lineages = registry.session_lineages(live.iter().map(|entry| entry.id))?;
             (pending, released, heads, pending_lineages, lineages)
         };
-        let outstanding = !pending_lineages.is_empty();
         let notifications = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1243,7 +1357,7 @@ impl Handle {
             notifications.reconcile_inboxes(pending_lineages, events);
         }
         if pending.is_empty() {
-            return Ok((released, outstanding));
+            return Ok((released, false));
         }
         let chats: Vec<Conversation> = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1265,6 +1379,7 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .session_lineages(chats.iter().map(|chat| chat.id))?;
         let mut due = released;
+        let mut failed = false;
         let mut prompted = BTreeSet::new();
         for message in pending {
             let Some(recipient) = message.to.lineage else {
@@ -1286,7 +1401,9 @@ impl Handle {
                     host, &message, recipient, limited, &chats, &lineages, limits,
                 )
             }) else {
-                return Ok((due, outstanding));
+                // The daemon takes no work while an upgrade or shutdown holds
+                // control. Look again in case it reopens.
+                return Ok((due, true));
             };
             match delivered? {
                 Delivered::Prompted => {
@@ -1294,9 +1411,10 @@ impl Handle {
                 }
                 Delivered::Yields(until) => due = Some(due.map_or(until, |due| due.min(until))),
                 Delivered::Elsewhere => {}
+                Delivered::Failed => failed = true,
             }
         }
-        Ok((due, outstanding))
+        Ok((due, failed))
     }
 
     /// Gives one pending message to its recipient: as a run of the agent
@@ -1313,36 +1431,38 @@ impl Handle {
         lineages: &BTreeMap<TerminalId, crate::agent_execution::Lineage>,
         limits: &BTreeMap<TerminalId, UsageLimit>,
     ) -> Result<Delivered, String> {
-        {
-            match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
-                // Its run has it, or it waits its turn to become one.
-                Ok(Some(
+        let failed = match to_agent(host, &self.0.registry, &self.0.seal, message, limited) {
+            // Its run has it, or it waits its turn to become one.
+            Ok((
+                Some(
                     Handoff::Run { .. }
                     | Handoff::Waiting { .. }
                     | Handoff::Behind { .. }
                     | Handoff::NoSlot { .. },
-                )) => return Ok(Delivered::Elsewhere),
-                Ok(Some(Handoff::Ended { reason, run, .. })) => {
-                    tracing::info!(%reason, %run, message = %message.id, "a message's run ended");
-                    return Ok(Delivered::Elsewhere);
-                }
-                // Its run has it, perhaps already with the provider.
-                Ok(Some(Handoff::Unknown { reason, run, .. })) => {
-                    tracing::warn!(%reason, %run, message = %message.id, "a message's run ended without proof of delivery");
-                    return Ok(Delivered::Elsewhere);
-                }
-                // Not as a run, but as a message, as a person's conversation
-                // takes one.
-                Ok(Some(Handoff::Held { reason, .. })) => {
-                    tracing::debug!(%reason, message = %message.id, "an agent takes a message as a message");
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%error, message = %message.id, "cannot hand a message to its agent");
-                    return Ok(Delivered::Elsewhere);
-                }
+                ),
+                _,
+            )) => return Ok(Delivered::Elsewhere),
+            Ok((Some(Handoff::Ended { reason, run, .. }), _)) => {
+                tracing::info!(%reason, %run, message = %message.id, "a message's run ended");
+                return Ok(Delivered::Elsewhere);
             }
-        }
+            // Its run has it, perhaps already with the provider.
+            Ok((Some(Handoff::Unknown { reason, run, .. }), _)) => {
+                tracing::warn!(%reason, %run, message = %message.id, "a message's run ended without proof of delivery");
+                return Ok(Delivered::Elsewhere);
+            }
+            // Not as a run, but as a message, as a person's conversation
+            // takes one.
+            Ok((Some(Handoff::Held { reason, .. }), failed)) => {
+                tracing::debug!(%reason, message = %message.id, "an agent takes a message as a message");
+                failed
+            }
+            Ok((None, _)) => false,
+            Err(error) => {
+                tracing::warn!(%error, message = %message.id, "cannot hand a message to its agent");
+                return Ok(Delivered::Failed);
+            }
+        };
         // An idle conversation whose provider holds nothing the person
         // queued: what they queued goes first, and its turn ends idle again.
         let Some(chat) = chats.iter().find(|chat| {
@@ -1350,7 +1470,11 @@ impl Handle {
                 && chat.handle.takes_courier()
                 && !limits.contains_key(&chat.id)
         }) else {
-            return Ok(Delivered::Elsewhere);
+            return Ok(if failed {
+                Delivered::Failed
+            } else {
+                Delivered::Elsewhere
+            });
         };
         let now = super::now();
         if chat.held
@@ -1360,8 +1484,11 @@ impl Handle {
             return Ok(Delivered::Yields(until));
         }
         let messages = self.together(message, recipient, now)?;
-        self.hand_over(&messages, chat.id, &chat.handle)?;
-        Ok(Delivered::Prompted)
+        Ok(if self.hand_over(&messages, chat.id, &chat.handle)? {
+            Delivered::Prompted
+        } else {
+            Delivered::Failed
+        })
     }
 
     /// Until when, in milliseconds since the epoch, `session`, idle while a
@@ -1418,12 +1545,16 @@ impl Handle {
     /// but did not acknowledge in time may still run, so its messages stay
     /// delivered: a message reaches a conversation at most once. Each message
     /// settles on its own, as its recipient reading it would settle it.
+    ///
+    /// Returns false when the courier must try again on its own: the
+    /// conversation refused the prompt yet is still idle, so no edge will
+    /// report it free.
     fn hand_over(
         &self,
         messages: &[Message],
         session: TerminalId,
         handle: &chat::runtime::Handle,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let registry = &self.0.registry;
         let ids: Vec<MessageId> = messages.iter().map(|message| message.id).collect();
         let claimed = registry
@@ -1431,7 +1562,7 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .deliver_messages(&ids, session, super::now())?;
         if claimed.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let given = messages
             .iter()
@@ -1450,12 +1581,16 @@ impl Handle {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .undeliver_messages(&claimed, session)?;
+                // A turn the person started, or what they queued with the
+                // provider, ends in an edge. A refusal that leaves the
+                // conversation free reports nothing.
+                return Ok(handle.is_completed() || !handle.takes_courier());
             }
             Err(Rejection::Unacknowledged(error)) => {
                 tracing::warn!(%error, messages = claimed.len(), %session, "conversation did not acknowledge messages");
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1475,13 +1610,54 @@ enum Delivered {
     /// Its conversation waits until then for a window to send the person's
     /// follow-ups first.
     Yields(u64),
-    /// An agent's run took it or will, or no conversation can take it now.
+    /// An agent's run took it or will, or no conversation can take it now;
+    /// a change that lets one take it wakes the courier.
     Elsewhere,
+    /// Handing it over failed in a way nothing reports, so the courier tries
+    /// again after [`RETRY`].
+    Failed,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn courier_defers_new_dispatch_and_wakes_when_the_update_releases_its_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path();
+        let filename = if crate::instance::IS_DEVELOPMENT {
+            "cagents-development-ui.lock.update"
+        } else {
+            "cagents-ui.lock.update"
+        };
+        let fence = crate::instance::owned_file_lock(
+            std::fs::File::create(runtime.join(filename)).unwrap(),
+            libc::LOCK_EX,
+        )
+        .unwrap();
+        let host = crate::host::service::test_host();
+        {
+            let mut state = host.lock().unwrap();
+            state.execution_registry = Some(Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&runtime.join("model.sqlite3")).unwrap(),
+            )));
+            state.mailbox_seal = Some(Arc::new(Seal::new([7; 32])));
+        }
+        let courier = Courier::start_in(&host, Some(runtime.into())).unwrap();
+        for _ in 0..2 {
+            assert!(with_control(&host, || panic!("started during the update")).is_none());
+        }
+        let generation = {
+            let state = courier.handle.0.state.lock().unwrap();
+            assert!(state.update == UpdateWait::Held);
+            state.generation
+        };
+        drop(fence);
+        courier.wait_for_scan(generation + 1);
+        assert!(courier.handle.0.state.lock().unwrap().update == UpdateWait::Open);
+        assert_eq!(with_control(&host, || "delivered"), Some("delivered"));
+    }
 
     #[test]
     fn courier_requeues_a_claim_if_a_request_arrives_after_its_idle_scan() {
@@ -1510,11 +1686,12 @@ mod tests {
         };
         registry.lock().unwrap().post_message(&message).unwrap();
         let courier = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Weak::new(),
             registry: registry.clone(),
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
-            changed: Condvar::new(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -1536,7 +1713,7 @@ mod tests {
         let delivery_courier = courier.clone();
         let delivery_handle = actor.handle.clone();
         let delivery_message = message.clone();
-        struct Delivery(Option<std::thread::JoinHandle<Result<(), String>>>);
+        struct Delivery(Option<std::thread::JoinHandle<Result<bool, String>>>);
         impl Delivery {
             fn finish(mut self) {
                 self.0.take().unwrap().join().unwrap().unwrap();
@@ -1637,11 +1814,12 @@ mod tests {
         };
         registry.lock().unwrap().post_message(&message).unwrap();
         let courier = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Weak::new(),
             registry: registry.clone(),
             seal: Arc::new(Seal::new([8; 32])),
             state: Mutex::default(),
-            changed: Condvar::new(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -1706,11 +1884,12 @@ mod tests {
             };
             registry.lock().unwrap().post_message(&message).unwrap();
             let courier = Handle(Arc::new(Inner {
+                update_runtime: None,
                 host: Weak::new(),
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([9; 32])),
                 state: Mutex::default(),
-                changed: Condvar::new(),
+                wait: wait::Wait::new(),
                 limits: Mutex::default(),
                 yielding: Mutex::default(),
                 scanned_generation: Mutex::new(None),
@@ -1828,13 +2007,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let host = crate::host::service::test_host();
         let handle = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Arc::downgrade(&host),
             registry: Arc::new(Mutex::new(
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
             )),
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
-            changed: Condvar::new(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -1857,6 +2037,7 @@ mod tests {
                     // The guard from the failed attempt has unwound.
                     let _guard = host.lock().unwrap();
                     owner.0.state.lock().unwrap().stopped = true;
+                    owner.0.wait.wake();
                     reported.send(deliveries).unwrap();
                     Ok(None)
                 },
@@ -1867,29 +2048,129 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_courier_sleeps_until_the_prune_and_a_busy_one_rechecks_soon() {
+    fn courier_uses_real_deadlines_and_retries_only_failures() {
         let prune_in = Duration::from_secs(1800);
         let now = 1_000_000;
-        assert_eq!(courier_wait(&Ok(None), now, prune_in), prune_in);
-        assert_eq!(courier_wait(&Err("no".into()), now, prune_in), FALLBACK);
+        assert_eq!(courier_deadline(&Ok(None), now, prune_in), now + 1_800_000);
         assert_eq!(
-            courier_wait(&Ok(Some(now - 5)), now, prune_in),
-            Duration::from_millis(50),
+            courier_deadline(&Err("no".into()), now, prune_in),
+            now + RETRY.as_millis() as u64
+        );
+        assert_eq!(
+            courier_deadline(&Ok(Some(now - 5)), now, prune_in),
+            now + 50,
             "a past deadline must not spin"
         );
         assert_eq!(
-            courier_wait(&Ok(Some(now + 3_000)), now, prune_in),
-            Duration::from_secs(3)
+            courier_deadline(&Ok(Some(now + 3_000)), now, prune_in),
+            now + 3_000
         );
         assert_eq!(
-            courier_wait(&Ok(Some(now + 3_600_000)), now, prune_in),
-            FALLBACK,
-            "a far deadline is rechecked, as a suspend stops the monotonic wait"
+            courier_deadline(&Ok(Some(now + 300_000)), now, prune_in),
+            now + 300_000,
+            "a far deadline needs no recheck"
         );
         assert_eq!(
-            courier_wait(&Ok(None), now, Duration::from_secs(2)),
-            Duration::from_secs(2)
+            courier_deadline(&Ok(Some(now + 3_600_000)), now, prune_in),
+            now + 1_800_000
         );
+    }
+
+    #[test]
+    fn an_edge_after_a_pass_begins_ends_the_next_wait() {
+        // Linux falls back to the condition variable when it cannot create
+        // the descriptors, so both must hold the same contract there.
+        #[cfg(target_os = "linux")]
+        let waits = [wait::Wait::new(), wait::Wait::portable()];
+        #[cfg(not(target_os = "linux"))]
+        let waits = [wait::Wait::new()];
+        for wait in waits {
+            wait.wake();
+            wait.begin_pass();
+            // The edge before the pass began was consumed by it.
+            let start = Instant::now();
+            wait.until(super::super::now() + 50).unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(40));
+            wait.begin_pass();
+            wait.wake();
+            let start = Instant::now();
+            wait.until(super::super::now() + 60_000).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(5));
+            // The fallback wait without a deadline timer ends on an edge too.
+            wait.begin_pass();
+            let start = Instant::now();
+            wait.edge_within(Duration::from_millis(50)).unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(40));
+            wait.wake();
+            let start = Instant::now();
+            wait.edge_within(Duration::from_secs(60)).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn atomic_account_cache_replacement_wakes_the_courier() {
+        let temporary = tempfile::tempdir().unwrap();
+        let handle = Handle(Arc::new(Inner {
+            host: Weak::new(),
+            registry: Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&temporary.path().join("model.sqlite3")).unwrap(),
+            )),
+            seal: Arc::new(Seal::new([7; 32])),
+            state: Mutex::default(),
+            wait: wait::Wait::new(),
+            limits: Mutex::default(),
+            yielding: Mutex::default(),
+            update_runtime: None,
+            scanned_generation: Mutex::new(None),
+            scanned: Condvar::new(),
+        }));
+        let account = temporary.path().join("account-usage.json");
+        std::fs::write(&account, "initial fixture").unwrap();
+        let mut watched = account_watch::AccountWatch::for_files(vec![account.clone()].into());
+        assert!(watched.refresh(&handle));
+        let sibling = temporary.path().join("replacement.json");
+        std::fs::write(&sibling, "fixture replacement").unwrap();
+        // Private reads of the account registry repeat its chmod.
+        std::fs::set_permissions(&account, std::fs::metadata(&account).unwrap().permissions())
+            .unwrap();
+        handle.0.wait.until(super::super::now() + 50).unwrap();
+        assert_eq!(handle.0.state.lock().unwrap().generation, 0);
+        std::fs::rename(sibling, account).unwrap();
+        handle.0.wait.until(super::super::now() + 5_000).unwrap();
+        assert!(handle.0.state.lock().unwrap().generation > 0);
+    }
+
+    #[test]
+    fn pending_mail_for_an_offline_lineage_needs_no_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut model =
+            crate::host::model::Registry::at(&temporary.path().join("model.sqlite3")).unwrap();
+        model
+            .post_message(&Message {
+                id: MessageId::new(),
+                to: Party {
+                    lineage: Some(Lineage(TerminalId::new())),
+                    session: None,
+                    title: None,
+                },
+                from: Party {
+                    lineage: None,
+                    session: None,
+                    title: None,
+                },
+                reply_to: None,
+                body: "Read when you return".into(),
+                wait_until_ms: None,
+                state: State::Pending,
+                created_ms: super::super::now(),
+            })
+            .unwrap();
+        let host = crate::host::service::test_host();
+        host.lock().unwrap().install_model(model);
+        let courier = Courier::start(&host).unwrap();
+        courier.wait_for_scan(0);
+        assert_eq!(courier.handle.deliver(&host, true).unwrap(), None);
     }
 
     #[test]
@@ -1897,13 +2178,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let host = crate::host::service::test_host();
         let handle = Handle(Arc::new(Inner {
+            update_runtime: None,
             host: Arc::downgrade(&host),
             registry: Arc::new(Mutex::new(
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
             )),
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
-            changed: Condvar::new(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -1920,6 +2202,7 @@ mod tests {
                     reported.send(deliveries).unwrap();
                     if deliveries == 2 {
                         handle.0.state.lock().unwrap().stopped = true;
+                        handle.0.wait.wake();
                     }
                     Ok(None)
                 },
@@ -2011,11 +2294,12 @@ mod tests {
                 registry.lock().unwrap().post_message(message).unwrap();
             }
             let courier = Handle(Arc::new(Inner {
+                update_runtime: None,
                 host: Arc::downgrade(&host),
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([7; 32])),
                 state: Mutex::default(),
-                changed: Condvar::new(),
+                wait: wait::Wait::new(),
                 limits: Mutex::default(),
                 yielding: Mutex::default(),
                 scanned_generation: Mutex::new(None),
@@ -2122,10 +2406,13 @@ mod tests {
         fixture.actor.set_persons_queue(false);
         assert!(fixture.actor.handle.takes_courier());
         fixture.actor.set_persons_queue(true);
-        fixture
-            .courier
-            .hand_over(&fixture.messages, fixture.session, &fixture.actor.handle)
-            .unwrap();
+        assert!(
+            fixture
+                .courier
+                .hand_over(&fixture.messages, fixture.session, &fixture.actor.handle)
+                .unwrap(),
+            "the turn for the person's queue ends in a wake; no retry is needed"
+        );
         assert_eq!(fixture.actor.prompt_count(), 0);
         assert_eq!(fixture.states(), fixture.all(State::Pending));
 

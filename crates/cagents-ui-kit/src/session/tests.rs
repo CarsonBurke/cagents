@@ -229,6 +229,7 @@ fn workspace() -> WorkspaceState {
         chat_draft_models: HashMap::new(),
         chat_waiting_messages: HashMap::new(),
         kept_chat_drafts: HashMap::new(),
+        returned_chat_queues: Default::default(),
         stopping_chats: Vec::new(),
         agent_updates: BTreeMap::new(),
         workspace_history: Vec::new(),

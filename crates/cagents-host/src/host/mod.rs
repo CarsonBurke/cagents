@@ -736,15 +736,31 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // data, which a daemon in another runtime directory may already serve.
     // Declared after the lease, it is released first. Darwin's installer
     // checks the production claim before changing or removing any saved data.
-    let _state = match crate::instance::state_claim::claim_daemon_state(
-        &paths.lock,
-        proof.host_session_id.as_str(),
-    ) {
+    let claim_state = || {
+        crate::instance::state_claim::claim_daemon_state(
+            &paths.lock,
+            proof.host_session_id.as_str(),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let state = ready_admission.as_ref().map_or_else(claim_state, |ready| {
+        crate::instance::state_claim::claim_daemon_state_from(
+            &paths.lock,
+            proof.host_session_id.as_str(),
+            ready.source(),
+        )
+    });
+    #[cfg(not(target_os = "macos"))]
+    let state = claim_state();
+    let _state = match state {
         Ok(claim) => Some(claim),
         Err(error) => match crate::instance::state_claim::state_in_use(&error) {
             Some(refusal) => return Err(HostError::StateInUse(refusal.clone())),
             #[cfg(target_os = "macos")]
-            None if !crate::instance::IS_DEVELOPMENT || crate::update::runs_from_installation() => {
+            None if ready_admission.is_some()
+                || !crate::instance::IS_DEVELOPMENT
+                || crate::update::runs_from_installation() =>
+            {
                 return Err(error.into());
             }
             None => {
@@ -794,6 +810,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     observe_fixture_startup("opening workspace model", None);
     match model::Registry::open() {
         Ok(mut registry) => {
+            match crate::agent_execution::concurrency::Setting::configured() {
+                Ok(setting) => registry.use_concurrency(setting),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "the agent concurrency limits cannot be configured; the defaults apply"
+                ),
+            }
             // Before any client reads the model: a window must never see a
             // worktree's panes outside its checkout's channel.
             match registry.adopt_worktree_views() {
@@ -1050,7 +1073,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut courier = if recovery_only {
         None
     } else {
-        match agent_execution::mailbox::Courier::start(&host) {
+        match agent_execution::mailbox::Courier::start_with_update_fence(&host) {
             Ok(courier) => Some(courier),
             Err(error) => {
                 tracing::warn!(%error, "messages between sessions are unavailable");

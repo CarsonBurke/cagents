@@ -54,6 +54,7 @@ pub fn changed(
         submodule: false,
         added_lines: counts.map(|(added, _)| added),
         removed_lines: counts.map(|(_, removed)| removed),
+        index_oid: None,
     }
 }
 

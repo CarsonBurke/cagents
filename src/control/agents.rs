@@ -165,7 +165,30 @@ pub enum AgentCommand {
     /// Stop and close an agent, including its background subagents.
     Close {
         #[arg(help = "Agent handle, ID, or unique ID prefix")]
-        agent: String,
+        #[arg(
+            required_unless_present = "interrupted",
+            conflicts_with = "interrupted"
+        )]
+        agent: Option<String>,
+        /// Close every open agent of yours with an interrupted run, releasing
+        /// the agent slots interrupted runs hold.
+        #[arg(long)]
+        interrupted: bool,
+    },
+    /// Show or change how many agent runs may be active at once.
+    #[command(
+        after_help = "A run holds a slot while it is accepted, running or waiting, and an \
+        interrupted run holds one until its agent is closed. A caller is a session and its \
+        successors, your shells together, or one automation. The daemon applies a change at \
+        its next submission."
+    )]
+    Limits {
+        /// Runs one caller may hold at once.
+        #[arg(long, value_name = "N")]
+        per_caller: Option<usize>,
+        /// Runs every caller may hold together.
+        #[arg(long, value_name = "N")]
+        total: Option<usize>,
     },
 }
 
@@ -328,6 +351,32 @@ impl ShowArgs {
             lines[hidden..].join("\n")
         )
     }
+}
+
+/// Refuses a working directory that the open project `containing` it, if
+/// any, shows is not in `project`. The refusal names the project by the
+/// checkout a person opened, not its Git directory.
+///
+/// A `keyed` request may retry one the daemon accepted while its directory
+/// was there; once gone, that directory is in no project, so the daemon,
+/// which knows the first acceptance, judges it.
+fn inside_project(
+    directory: &Path,
+    project: &Path,
+    containing: Option<&Path>,
+    keyed: bool,
+) -> Result<(), AppError> {
+    if containing == Some(project) || (containing.is_none() && keyed) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "target",
+        format!(
+            "{} is not in the project {}; pass a directory inside it",
+            super::format::location(directory, None),
+            super::format::location(primary_checkout(project), None)
+        ),
+    ))
 }
 
 pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
@@ -1218,6 +1267,7 @@ pub(super) fn execute_with_context(
     let mut session = Session::new(context);
     match command {
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),
+        AgentCommand::Limits { per_caller, total } => limits(per_caller, total, context),
         AgentCommand::Spawn {
             prompt,
             name,
@@ -1306,19 +1356,17 @@ pub(super) fn execute_with_context(
                     match given {
                         // A target given in full is sent as given, so retrying
                         // it stays exact even after its directory has moved;
-                        // only a directory known to be elsewhere is refused.
+                        // only a directory known to be elsewhere is refused,
+                        // including one no open project contains. The daemon
+                        // refuses it too; this says so before anything is sent.
                         Some(_) => {
-                            if let (Ok(named), Some(containing)) = (&named, &containing)
-                                && named != containing
-                            {
-                                return Err(AppError::new(
-                                    "target",
-                                    format!(
-                                        "{} is not in the project {}",
-                                        here.display(),
-                                        named.display()
-                                    ),
-                                ));
+                            if let Ok(named) = &named {
+                                inside_project(
+                                    &here,
+                                    named,
+                                    containing.as_deref(),
+                                    retry.idempotency_key.is_some(),
+                                )?;
                             }
                             let repository = if project.is_absolute() {
                                 project
@@ -1558,10 +1606,11 @@ pub(super) fn execute_with_context(
             // hint, after them all, so a wait prints one however many.
             let single = statuses.len() == 1;
             let now = super::sessions::now_ms();
+            let mut named = Vec::new();
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
-                    with_standing(
+                    with_standing_once(
                         status_lines(
                             agent,
                             run,
@@ -1572,6 +1621,7 @@ pub(super) fn execute_with_context(
                         ),
                         member_of(&members, agent.id),
                         now,
+                        &mut named,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1687,7 +1737,17 @@ pub(super) fn execute_with_context(
                 ),
             })
         }
-        AgentCommand::Close { agent } => {
+        AgentCommand::Close {
+            agent: None,
+            interrupted: true,
+        } => close_interrupted(&mut session),
+        AgentCommand::Close { agent, .. } => {
+            let Some(agent) = agent else {
+                return Err(AppError::new(
+                    "agent.close",
+                    "Name an agent or pass --interrupted",
+                ));
+            };
             let agent = session.agent(&agent)?;
             let Reply::Closed(agent) = session.call(Operation::Close(agent))? else {
                 return Err(AppError::new("agent.close", "Unexpected close response"));
@@ -1702,6 +1762,143 @@ pub(super) fn execute_with_context(
             })
         }
     }
+}
+
+/// Closes each of the caller's open agents with an interrupted run, which
+/// holds its agent slot until then. One that cannot be closed does not stop
+/// the rest; the error names what was and was not closed.
+fn close_interrupted(session: &mut Session) -> Result<CommandOutput, AppError> {
+    let interrupted: Vec<AgentId> = session
+        .summaries()?
+        .iter()
+        .filter(|summary| summary.state == crate::agent_execution::State::Interrupted)
+        .map(|summary| summary.agent.id)
+        .collect();
+    let handles = session.handles(&[]);
+    let mut closed: Vec<crate::agent_execution::Agent> = Vec::with_capacity(interrupted.len());
+    let mut failed: Vec<(AgentId, AppError)> = Vec::new();
+    for agent in interrupted {
+        match session.call(Operation::Close(agent)) {
+            Ok(Reply::Closed(agent)) => closed.push(agent),
+            Ok(_) => failed.push((
+                agent,
+                AppError::new("agent.close", "Unexpected close response"),
+            )),
+            Err(error) => failed.push((agent, error)),
+        }
+    }
+    if !failed.is_empty() {
+        let names = |agents: &mut dyn Iterator<Item = AgentId>| {
+            agents
+                .map(|agent| handles.name(agent))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut message = format!(
+            "Could not close {}: {}",
+            names(&mut failed.iter().map(|(agent, _)| *agent)),
+            failed
+                .iter()
+                .map(|(_, error)| error.message.trim_end_matches('.'))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        if !closed.is_empty() {
+            message.push_str(&format!(
+                ". Closed: {}",
+                names(&mut closed.iter().map(|agent| agent.id))
+            ));
+        }
+        let failed_ids: Vec<AgentId> = failed.iter().map(|(agent, _)| *agent).collect();
+        let (_, first) = failed.swap_remove(0);
+        return Err(AppError {
+            kind: first.kind,
+            message,
+            details: Some(json!({
+                "closed": closed,
+                "failed": failed_ids,
+            })),
+        });
+    }
+    let human = match closed.as_slice() {
+        [] => "No open agent of yours has an interrupted run".to_owned(),
+        agents => format!(
+            "Closed {} interrupted agent{}: {}",
+            agents.len(),
+            if agents.len() == 1 { "" } else { "s" },
+            agents
+                .iter()
+                .map(|agent| handles.name(agent.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Ok(CommandOutput {
+        command: "agent.close",
+        human,
+        data: json!({ "agents": closed }),
+    })
+}
+
+/// Shows the agent concurrency limits, after changing those given. Only a
+/// person changes them: a session's agents are what they limit.
+fn limits(
+    per_caller: Option<usize>,
+    total: Option<usize>,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    use crate::agent_execution::concurrency;
+    let refused = |message: String| AppError::new("agent.limits", message);
+    if crate::device::is_remote() {
+        return Err(refused(
+            "Agent limits are set on the device itself; run this there".into(),
+        ));
+    }
+    let changed = per_caller.is_some() || total.is_some();
+    if changed && context.scoped() {
+        return Err(refused(
+            "Only a person can change the agent limits, from a shell cagents does not host".into(),
+        ));
+    }
+    let path = concurrency::path().map_err(|error| refused(error.to_string()))?;
+    let unwritable = |error: std::io::Error| refused(format!("{}: {error}", path.display()));
+    // Both given replace whatever the file holds, even a file that cannot be
+    // read, which is how a person repairs it.
+    let mut limits = match (per_caller, total) {
+        (Some(per_caller), Some(total)) => concurrency::Limits { per_caller, total },
+        _ => concurrency::load().map_err(|error| {
+            refused(format!(
+                "{}: {error}. The daemon is using the defaults; `--per-caller N --total N` together replace the file",
+                path.display()
+            ))
+        })?,
+    };
+    if changed {
+        limits = concurrency::Limits {
+            per_caller: per_caller.unwrap_or(limits.per_caller),
+            total: total.unwrap_or(limits.total),
+        }
+        .validate()
+        .map_err(refused)?;
+        concurrency::save(limits).map_err(unwritable)?;
+    }
+    Ok(CommandOutput {
+        command: "agent.limits",
+        human: if changed {
+            format!(
+                "Agents may now have {} runs at once per caller and {} in all; the daemon applies this at its next submission.",
+                limits.per_caller, limits.total
+            )
+        } else {
+            format!(
+                "Agents may have {} runs at once per caller and {} in all ({}).",
+                limits.per_caller,
+                limits.total,
+                path.display()
+            )
+        },
+        data: json!({ "limits": limits, "changed": changed, "path": path }),
+    })
 }
 
 /// The daemon's refusal of a follow-up for an agent a usage limit stops
@@ -1730,12 +1927,102 @@ fn is_limited_refusal(error: &AppError) -> bool {
         .starts_with(crate::agent_execution::LIMITED_REFUSAL)
 }
 
+/// A refusal for the runs holding agent slots, listing them for a person by
+/// the handles and names the caller knows them by, with what frees one.
+/// JSON output keeps the daemon's sentence and the structured details.
+fn limit_holders(session: &mut Session, mut error: AppError) -> AppError {
+    use crate::agent_execution::concurrency::LimitReached;
+    if error.kind != "limit_reached" || !super::human_output() {
+        return error;
+    }
+    let Some(refusal) = LimitReached::recognize(&error.message, true) else {
+        return error;
+    };
+    let ids: Vec<String> = refusal
+        .holders
+        .iter()
+        .map(|holder| holder.agent.to_string())
+        .collect();
+    let handles = session.handles(&ids);
+    let names: std::collections::HashMap<AgentId, String> = session
+        .summaries
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|summary| Some((summary.agent.id, summary.agent.name.clone()?)))
+        .collect();
+    error.message = limit_message(&refusal, handles, &names);
+    error
+}
+
+/// A person's account of `refusal`: what is full, which runs hold it, by
+/// handle and, for the caller's own agents, name, and what frees a slot.
+fn limit_message(
+    refusal: &crate::agent_execution::concurrency::LimitReached,
+    handles: Handles,
+    names: &std::collections::HashMap<AgentId, String>,
+) -> String {
+    use crate::agent_execution::{State, concurrency::Scope};
+    let program = super::format::program();
+    let (running, limit) = (refusal.running, refusal.limit);
+    let mut text = match refusal.scope {
+        Scope::Caller => format!(
+            "Agent limit reached: you have {running} agent runs active or unconfirmed, and may have {limit} at once. Nothing was started."
+        ),
+        Scope::Global => format!(
+            "Agent limit reached: {running} agent runs are active or unconfirmed across all callers, and the daemon allows {limit} at once. Nothing was started."
+        ),
+    };
+    if !refusal.holders.is_empty() {
+        text.push_str("\nYours:");
+        for holder in &refusal.holders {
+            let handle = handles.name(holder.agent);
+            let state = holder.state.key();
+            match names.get(&holder.agent) {
+                Some(name) => text.push_str(&format!("\n  {handle}  {name}  {state}")),
+                None => text.push_str(&format!("\n  {handle}  {state}")),
+            }
+        }
+        let named = refusal.holders.len();
+        let yours = refusal.yours.saturating_sub(named);
+        if yours > 0 {
+            text.push_str(&format!("\n  and {yours} more"));
+        }
+        let others = running.saturating_sub(refusal.yours.max(named));
+        if others > 0 {
+            text.push_str(&format!("\n  and {others} held by other callers"));
+        }
+        text.push_str(&format!(
+            "\nRetry once one finishes (`{program} agent wait AGENT`), or close one you no longer need (`{program} agent close AGENT`)."
+        ));
+    } else {
+        text.push_str("\nRetry once a run finishes.");
+    }
+    if refusal
+        .holders
+        .iter()
+        .any(|holder| holder.state == State::Interrupted)
+    {
+        text.push_str(&format!(
+            " An interrupted run keeps its slot until its agent is closed; `{program} agent close --interrupted` closes all of yours."
+        ));
+    }
+    let flag = match refusal.scope {
+        Scope::Caller => "--per-caller",
+        Scope::Global => "--total",
+    };
+    text.push_str(&format!(
+        "\nA person can raise the limit with `{program} agent limits {flag} N`."
+    ));
+    text
+}
+
 /// `error` with the key that makes retrying its submission safe, when a
 /// retry could still start the work.
 fn with_retry_key(mut error: AppError, key: &str) -> AppError {
     // A limit's refusal is definite: nothing was accepted to retry. A run
     // that ended has spent its key: retrying reports the same end.
-    if is_limited_refusal(&error) || ended_run(&error) {
+    if is_limited_refusal(&error) || ended_run(&error) || error.kind == "limit_reached" {
         return error;
     }
     error.message = format!(
@@ -1814,7 +2101,7 @@ fn submitted(
     };
     let (reply, retried) = session
         .submit(request, operation)
-        .map_err(|error| with_retry_key(error, &key))?;
+        .map_err(|error| with_retry_key(limit_holders(session, error), &key))?;
     let (accepted, start) = match reply {
         Reply::Accepted(accepted) => (accepted, None),
         Reply::Prompted { accepted, start } => (accepted, Some(start)),
@@ -1896,7 +2183,8 @@ fn submitted(
             data["messages"] = json!(messages);
         }
     }
-    // A run that settled says what stops its provider now, and the account.
+    // A run that settled says what stops its provider now, and the account
+    // when it needs attention.
     let members = session.members(&[accepted.agent.id]);
     let member = member_of(&members, accepted.agent.id);
     let now = super::sessions::now_ms();
@@ -1931,9 +2219,24 @@ fn woke(after: Option<&Value>, before: &Value) -> bool {
 }
 
 /// A status with what stops the agent's provider, the account it runs on
-/// and whether its prompt cache has likely expired, as of `now`, after its
-/// first line, which readers of the output parse.
+/// when that account could change what the caller does next, and whether
+/// its prompt cache has likely expired, as of `now`, after its first line,
+/// which readers of the output parse. Status and wait run in loops, so an
+/// account with ordinary allowance left goes unsaid; `--json` and `ls`
+/// still name it.
 fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
+    with_standing_once(lines, member, now, &mut Vec::new())
+}
+
+/// [`with_standing`] for one of several runs printed together, naming each
+/// account at most once among them: `named` holds the accounts already
+/// named.
+fn with_standing_once(
+    lines: String,
+    member: Option<&Member>,
+    now: u64,
+    named: &mut Vec<crate::account::AccountId>,
+) -> String {
     let Some(member) = member else {
         return lines;
     };
@@ -1944,7 +2247,13 @@ fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
             super::sessions::limit_phrase(limit, now)
         ));
     }
-    if let Some(account) = &member.account {
+    if let Some(account) = member
+        .account
+        .as_ref()
+        .filter(|account| member.limit.is_some() || account_needs_attention(account))
+        .filter(|account| !named.contains(&account.id))
+    {
+        named.push(account.id.clone());
         standing.push_str(&format!(
             "\nAccount {}",
             super::sessions::account_phrase(account, now)
@@ -1959,6 +2268,28 @@ fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
     match lines.split_once('\n') {
         Some((head, rest)) => format!("{head}{standing}\n{rest}"),
         None => format!("{lines}{standing}"),
+    }
+}
+
+/// Whether an account's standing is worth a line in a run's status: its
+/// allowance is past the warning mark, used up, or needs a new sign-in.
+/// Once one of the reading's windows has reset, its Warning or Limited
+/// counts only while a window that has not reset is still past the warning
+/// mark: the old status no longer says anything about the allowance. A
+/// reading that is merely old is still believed.
+fn account_needs_attention(account: &crate::agent_execution::directory::SessionAccount) -> bool {
+    use crate::account::UsageStatus;
+    let still_spent = || {
+        !account.remaining.iter().any(|window| window.reset_elapsed)
+            || account.remaining.iter().any(|window| {
+                !window.reset_elapsed
+                    && window.remaining_fraction < 1.0 - crate::account::WARNING_FRACTION
+            })
+    };
+    match account.status {
+        Some(UsageStatus::NeedsLogin) => true,
+        Some(UsageStatus::Warning | UsageStatus::Limited) => still_spent(),
+        _ => account.ordinary_usage_allowed == Some(false) && still_spent(),
     }
 }
 
@@ -2446,6 +2777,90 @@ mod tests {
             );
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         }
+    }
+
+    /// A submission refused for the runs holding agent slots reads as
+    /// `limit_reached`, retryable, with its counts and holders as details,
+    /// and a person sees the holders named and what frees a slot. No retry
+    /// key is attached: nothing was accepted.
+    #[test]
+    fn a_full_agent_limit_reports_its_counts_holders_and_remedy() {
+        use crate::agent_execution::{
+            State,
+            concurrency::{Holder, LimitReached, Scope},
+        };
+        use crate::terminal::ipc::ProtocolErrorCode;
+        let (mine, theirs) = (AgentId::new(), AgentId::new());
+        let refusal = LimitReached {
+            scope: Scope::Caller,
+            running: 3,
+            limit: 3,
+            yours: 3,
+            holders: vec![
+                Holder {
+                    agent: mine,
+                    run: RunId::new(),
+                    state: State::Running,
+                },
+                Holder {
+                    agent: theirs,
+                    run: RunId::new(),
+                    state: State::Interrupted,
+                },
+            ],
+        };
+        let remote = |retryable| ControlError::Remote {
+            code: ProtocolErrorCode::QueueFull,
+            message: refusal.to_string(),
+            retryable,
+        };
+        assert_eq!(remote(true).to_string(), refusal.to_string());
+        let error = with_retry_key(protocol_error(remote(true)), "k1");
+        assert_eq!(error.kind, "limit_reached");
+        assert_eq!(error.message, refusal.to_string());
+        let details = error.details.unwrap();
+        assert_eq!(details["retryable"], true);
+        assert_eq!(details["scope"], "caller");
+        assert_eq!(details["running"], 3);
+        assert_eq!(details["limit"], 3);
+        assert_eq!(details["yours"], 3);
+        assert_eq!(details["holders"][1]["agent"], theirs.to_string());
+        assert_eq!(details["holders"][1]["state"], "interrupted");
+        assert!(details.get("idempotency_key").is_none());
+
+        let names = std::collections::HashMap::from([(mine, "reviewer".to_owned())]);
+        let text = limit_message(&refusal, Handles::default(), &names);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "Agent limit reached: you have 3 agent runs active or unconfirmed, and may have 3 at once. Nothing was started."
+        );
+        assert_eq!(lines[1], "Yours:");
+        let handle = |id: AgentId| Handles::default().name(id);
+        assert_eq!(lines[2], format!("  {}  reviewer  running", handle(mine)));
+        assert_eq!(lines[3], format!("  {}  interrupted", handle(theirs)));
+        assert_eq!(lines[4], "  and 1 more");
+        assert!(lines[5].contains("agent close --interrupted"), "{text}");
+        assert!(lines[6].contains("agent limits --per-caller N"), "{text}");
+
+        // Another caller's runs are counted, never named.
+        let global = LimitReached {
+            scope: Scope::Global,
+            running: 32,
+            limit: 32,
+            yours: 0,
+            holders: Vec::new(),
+        };
+        let text = limit_message(&global, Handles::default(), &names);
+        assert!(!text.contains("Yours"), "{text}");
+        assert!(
+            text.contains("32 agent runs are active or unconfirmed across all callers"),
+            "{text}"
+        );
+        assert!(text.contains("agent limits --total N"), "{text}");
+
+        // A sentence that only looks like one, or a final refusal, is not.
+        assert_eq!(protocol_error(remote(false)).kind, "protocol");
     }
 
     #[test]
@@ -4386,6 +4801,96 @@ mod tests {
         assert_eq!(data["account"]["id"], "claude/system");
         assert!(data.get("cache").is_none(), "no estimate");
 
+        // Without a limit, the account is named only when its standing
+        // could change what the caller does; JSON names it either way.
+        let mut unlimited = found.unwrap().clone();
+        unlimited.limit = None;
+        for (usage, shown) in [
+            (None, false),
+            (Some(crate::account::UsageStatus::Ok), false),
+            (Some(crate::account::UsageStatus::Unavailable), false),
+            (Some(crate::account::UsageStatus::Warning), true),
+            (Some(crate::account::UsageStatus::Limited), true),
+            (Some(crate::account::UsageStatus::NeedsLogin), true),
+        ] {
+            unlimited.account.as_mut().unwrap().status = usage;
+            let human = with_standing(status.into(), Some(&unlimited), 0);
+            assert_eq!(
+                human.contains("\nAccount claude/system"),
+                shown,
+                "{usage:?}: {human}"
+            );
+            let mut data = json!({});
+            standing_json(&mut data, Some(&unlimited), 0);
+            assert_eq!(data["account"]["id"], "claude/system", "{usage:?}");
+        }
+        let account = unlimited.account.as_mut().unwrap();
+        account.status = Some(crate::account::UsageStatus::Ok);
+        account.ordinary_usage_allowed = Some(false);
+        assert!(with_standing(status.into(), Some(&unlimited), 0).contains("\nAccount "));
+
+        // A stale Limited reading counts while a window it saw spent has not
+        // reset, and not once every such window has.
+        let spent = |reset_elapsed| crate::account::info::RemainingWindow {
+            window: crate::account::UsageWindow {
+                key: "weekly".into(),
+                kind: crate::account::WindowKind::Weekly,
+                label: "Weekly".into(),
+                used: 1.0,
+                resets_at: None,
+                span_secs: None,
+                binding: false,
+            },
+            remaining_fraction: 0.0,
+            reset_elapsed,
+        };
+        let account = unlimited.account.as_mut().unwrap();
+        account.ordinary_usage_allowed = None;
+        account.status = Some(crate::account::UsageStatus::Limited);
+        account.stale = true;
+        account.remaining = vec![spent(false)];
+        assert!(account_needs_attention(account), "not reset yet");
+        account.remaining = vec![spent(true)];
+        assert!(!account_needs_attention(account), "reset since the reading");
+        account.remaining = vec![spent(true), spent(false)];
+        assert!(
+            account_needs_attention(account),
+            "another window still spent"
+        );
+        let mut unspent = spent(false);
+        unspent.remaining_fraction = 0.9;
+        account.remaining = vec![spent(true), unspent];
+        assert!(
+            !account_needs_attention(account),
+            "the other window has room"
+        );
+        // A reading that is only old, with no window reset, is believed:
+        // a provider's own Limited or Warning, or its refusal of ordinary
+        // use, needs no spent window behind it.
+        account.remaining = Vec::new();
+        assert!(account_needs_attention(account), "provider-limited, old");
+        account.status = Some(crate::account::UsageStatus::Warning);
+        assert!(account_needs_attention(account), "provider warning, old");
+        let mut healthy = spent(false);
+        healthy.remaining_fraction = 0.9;
+        account.remaining = vec![healthy];
+        account.status = Some(crate::account::UsageStatus::Ok);
+        account.ordinary_usage_allowed = Some(false);
+        assert!(
+            account_needs_attention(account),
+            "refused ordinary use, old"
+        );
+        account.ordinary_usage_allowed = None;
+        account.status = Some(crate::account::UsageStatus::Limited);
+        account.stale = false;
+
+        // Several runs on one account name it once among them.
+        let mut named = Vec::new();
+        let first = with_standing_once(status.into(), Some(&unlimited), 0, &mut named);
+        let second = with_standing_once(status.into(), Some(&unlimited), 0, &mut named);
+        assert!(first.contains("\nAccount claude/system"), "{first}");
+        assert_eq!(second, status);
+
         // A cache that likely expired gets a line among the standing, and
         // the same `now` decides the text and the JSON.
         let mut cold = found.unwrap().clone();
@@ -4801,6 +5306,26 @@ mod tests {
             Path::new("/repo")
         );
         assert_eq!(primary_checkout(Path::new("/notes")), Path::new("/notes"));
+    }
+
+    /// #3432: an explicit directory is refused unless the open project
+    /// containing it is the one named, including when no open project
+    /// contains it at all, such as the home directory.
+    #[test]
+    fn an_explicit_directory_must_be_in_the_named_project() {
+        let project = Path::new("/srv/app/.git");
+        assert!(inside_project(Path::new("/srv/app/src"), project, Some(project), false).is_ok());
+        let other = Some(Path::new("/srv/other/.git"));
+        for (containing, keyed) in [(None, false), (other, false), (other, true)] {
+            let error = inside_project(Path::new("/srv"), project, containing, keyed).unwrap_err();
+            assert_eq!(error.kind, "target");
+            assert_eq!(
+                error.message,
+                "/srv is not in the project /srv/app; pass a directory inside it"
+            );
+        }
+        // A keyed retry whose directory is gone is the daemon's to judge.
+        assert!(inside_project(Path::new("/srv/gone"), project, None, true).is_ok());
     }
 
     #[test]

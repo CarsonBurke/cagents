@@ -530,11 +530,13 @@ impl Runtime {
     }
 
     /// While a subagent's transcript is open, the main conversation's own
-    /// work, a question for the reader or a failure is marked on its tab,
-    /// since its transcript is not there to say so. What its subagents do is
-    /// on their own tabs, so it is not repeated here.
-    pub(super) fn parent_tab_state(&self) -> Option<(Icon, &str)> {
-        let (glyph, label) = self.conversation_status_base(false);
+    /// work, a question for the reader, a usage limit or a failure is marked
+    /// on its tab, since its transcript is not there to say so. What its
+    /// subagents do is on their own tabs, so it is not repeated here. It is
+    /// the status the inspector gives the conversation, so a usage limit
+    /// reads as one rather than as a bare error.
+    pub(super) fn parent_tab_state(&self) -> Option<(Icon, String)> {
+        let (glyph, label) = self.own_conversation_status();
         match glyph? {
             Icon::AgentWorking if self.snapshot.busy => Some((Icon::AgentWorking, label)),
             glyph
@@ -544,7 +546,7 @@ impl Runtime {
             {
                 Some((glyph, label))
             }
-            glyph @ (Icon::Warning | Icon::Error) => Some((glyph, label)),
+            glyph @ (Icon::Warning | Icon::Error | Icon::UsageLimit) => Some((glyph, label)),
             _ => None,
         }
     }

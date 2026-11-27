@@ -688,6 +688,31 @@ pub fn tooltip_beside<'a, Message: 'a>(
     tooltip_positioned(content, label, TipPlacement::Beside)
 }
 
+/// A tooltip that says why its disabled control can't be used, such as
+/// "Turn off regular expressions (.*) to preserve case".
+///
+/// [`tooltip`] names a control and hides on a disabled one, whose name is no
+/// longer an offer. This one shows on a disabled control, so wrap a control
+/// with it only while the control is disabled, and with [`tooltip`]
+/// otherwise; give the control the reason as its accessible description too.
+pub fn disabled_tooltip<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    reason: impl Into<Cow<'a, str>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Tooltip,
+        tip: Some(Tip {
+            label: reason.into(),
+            placement: TipPlacement::Below,
+            explains_disabled: true,
+            content: None,
+        }),
+        on_focused_key: None,
+    }
+    .into()
+}
+
 /// Where a tooltip opens around its control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TipPlacement {
@@ -709,6 +734,7 @@ fn tooltip_positioned<'a, Message: 'a>(
         tip: Some(Tip {
             label: label.into(),
             placement,
+            explains_disabled: false,
             content: None,
         }),
         on_focused_key: None,
@@ -2341,6 +2367,9 @@ struct Effect<'a, Message> {
 struct Tip<'a, Message> {
     label: Cow<'a, str>,
     placement: TipPlacement,
+    /// Whether the label says why the control is disabled, so it shows while
+    /// the control is; see [`disabled_tooltip`].
+    explains_disabled: bool,
     /// The tip's surface, built when it first opens. A view names a tooltip
     /// for nearly every control and shows at most one of them, so the text,
     /// its container and their widget state are not built until then.
@@ -2973,7 +3002,12 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         {
             state.tip_suppressed = None;
         }
-        if matches!(self.kind, Kind::Tooltip) && inside && state.inspect_control {
+        let explains_disabled = self.tip.as_ref().is_some_and(|tip| tip.explains_disabled);
+        if matches!(self.kind, Kind::Tooltip)
+            && inside
+            && state.inspect_control
+            && !explains_disabled
+        {
             // The Widget API has no enabled query. COSMIC buttons expose this
             // through their root a11y node. Inspect on entry/rebuild, not every
             // animation frame; noninteractive explanatory tooltips still work.
@@ -2984,9 +3018,12 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             state.disabled = nodes.root().len() == 1 && nodes.root()[0].node().is_disabled();
             state.inspect_control = false;
         }
-        inside &= !state.disabled;
+        inside &= explains_disabled || !state.disabled;
+        // A press acts, so the tip steps aside. A press on a control that is
+        // unavailable does nothing, and is when its reason is most wanted.
         if matches!(self.kind, Kind::Tooltip)
             && inside
+            && !explains_disabled
             && matches!(
                 event,
                 Event::Mouse(mouse::Event::ButtonPressed(_))
@@ -3800,6 +3837,85 @@ mod tests {
             state.tip_open,
             "returning to the control after leaving its region shows the tooltip"
         );
+    }
+
+    /// Whether `element`'s tip opens for a pointer resting on it, pressing
+    /// it first when `press`.
+    fn tip_opens(mut element: Element<'_, u8>, press: bool) -> bool {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
+        let pointer = node.bounds().center();
+        let mut messages = Vec::new();
+        let mut events = vec![Event::Mouse(mouse::Event::CursorMoved {
+            position: pointer,
+        })];
+        if press {
+            events.push(Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left,
+            )));
+        }
+        events.push(Event::Window(window::Event::RedrawRequested(
+            Instant::now() + 2 * TOOLTIP_DELAY,
+        )));
+        for event in events {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        tree.state.downcast_ref::<State>().tip_open
+    }
+
+    /// A tooltip that names a control hides on a disabled one, whose name is
+    /// no longer an offer, and a disabled checkbox is one: it has no
+    /// `on_toggle` (#3514). A tooltip that says why a control is disabled
+    /// shows on it, even after a press, which is when the reason is wanted.
+    #[test]
+    fn disabled_checkboxes_hide_name_tips_and_show_disabled_reasons() {
+        let checkbox = || crate::ui_controls::field::checkbox::<u8>(false).label("Selection");
+        assert!(
+            tip_opens(
+                tooltip(checkbox().on_toggle(|_| 1), "Search the selection"),
+                false
+            ),
+            "an enabled checkbox shows its tip"
+        );
+        assert!(
+            !tip_opens(
+                tooltip(checkbox().on_toggle(|_| 1), "Search the selection"),
+                true
+            ),
+            "pressing an enabled checkbox puts its tip away"
+        );
+        assert!(
+            !tip_opens(tooltip(checkbox(), "Search the selection"), false),
+            "a disabled checkbox hides its name tip"
+        );
+        for press in [false, true] {
+            assert!(
+                tip_opens(disabled_tooltip(checkbox(), "Select text first"), press),
+                "a disabled checkbox shows why it is disabled (pressed: {press})"
+            );
+        }
+        let button = || cosmic::widget::button::text("Refresh");
+        assert!(!tip_opens(tooltip(button(), "Refresh"), false));
+        assert!(tip_opens(
+            disabled_tooltip(button(), "Opening agent…"),
+            true
+        ));
     }
 
     /// A Work list row is a `button::custom` holding tooltip-bearing

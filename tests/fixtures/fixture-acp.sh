@@ -13,7 +13,8 @@
 # `acp/AGENT/no-allowance` refuses every prompt as a login with no usage
 # allowance, and `acp/agy/hang-probe` makes the account probe's session
 # never answer, as one that times out. `acp/AGENT/background-seconds` holds
-# how long a `background` prompt's command runs.
+# how long a `background` prompt's command runs, and `acp/AGENT/cancel-seconds`
+# how long a stopped turn takes to end.
 #
 # Every frame the agent receives goes to acp/AGENT/frames.log, so a check can
 # read which settings and prompts cagents sent.
@@ -38,6 +39,10 @@ mkdir -p -- "$FAKE_ACP_STATE"
 if [ -z "${FAKE_ACP_BACKGROUND_SECONDS:-}" ] && [ -s "$FAKE_ACP_STATE/background-seconds" ]; then
     FAKE_ACP_BACKGROUND_SECONDS=$(cat -- "$FAKE_ACP_STATE/background-seconds")
     export FAKE_ACP_BACKGROUND_SECONDS
+fi
+if [ -z "${FAKE_ACP_CANCEL_SECONDS:-}" ] && [ -s "$FAKE_ACP_STATE/cancel-seconds" ]; then
+    FAKE_ACP_CANCEL_SECONDS=$(cat -- "$FAKE_ACP_STATE/cancel-seconds")
+    export FAKE_ACP_CANCEL_SECONDS
 fi
 if [ "$shape" = muse ]; then
     export FAKE_ACP_AUTH_FILE="$fixture/config/muse/auth.json"

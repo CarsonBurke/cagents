@@ -2,7 +2,7 @@
 //! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
-use super::{Adapter, ProcessSpec, Step};
+use super::{Adapter, ProcessSpec, QueuedInput, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat;
@@ -779,7 +779,7 @@ struct Stream {
 }
 
 struct Submission {
-    preview: chat::QueuedMessage,
+    input: QueuedInput,
     mode: PromptMode,
     /// Queued input enters the transcript only when the provider consumes it.
     deferred: Option<Vec<Item>>,
@@ -1790,11 +1790,12 @@ impl Claude {
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
         if self.async_input {
-            let mut preview = chat::QueuedMessage::new(id.clone(), text);
-            preview.attachments = attachments;
-            if mode == PromptMode::Steer {
-                preview.delivery = chat::QueueDelivery::NextStep;
-            }
+            let delivery = if mode == PromptMode::Steer {
+                chat::QueueDelivery::NextStep
+            } else {
+                chat::QueueDelivery::NextTurn
+            };
+            let input = QueuedInput::new(id.clone(), text, attachments, delivery);
             let deferred = if mode != PromptMode::Send {
                 let mut items = Vec::new();
                 for event in std::mem::take(&mut step.events) {
@@ -1818,7 +1819,7 @@ impl Claude {
                 } else {
                     self.queued.len()
                 };
-                self.queued.insert(position, preview.clone());
+                self.queued.insert(position, input.preview.clone());
                 step.events.push(Event::QueueChanged(self.queued.clone()));
                 Some(items)
             } else {
@@ -1827,7 +1828,7 @@ impl Claude {
             self.submissions.insert(
                 id.clone(),
                 Submission {
-                    preview,
+                    input,
                     mode,
                     deferred,
                     deferred_bytes,
@@ -4115,6 +4116,23 @@ impl Adapter for Claude {
     fn outcome_pending(&self) -> bool {
         !self.deferred_attention.is_empty()
     }
+
+    fn recovery_queue(&self) -> Option<Vec<chat::QueuedMessage>> {
+        if !self.async_input {
+            return None;
+        }
+        let proved: Vec<_> = self
+            .queued
+            .iter()
+            .filter_map(|message| self.submissions.get(&message.id))
+            .filter(|submission| submission.admitted)
+            .map(|submission| submission.input.recovery())
+            .collect();
+        // Optimistically shown submissions have not been reported held by
+        // the provider. A later receipt must never claim they were returned.
+        (!proved.is_empty() || (self.queued.is_empty() && self.submissions.is_empty()))
+            .then_some(proved)
+    }
     fn metadata_wake(&self) -> Option<super::MetadataWake<'_>> {
         // Result frames account for ordinary writes during a turn. While
         // idle a title can change without any provider frame to wake us.
@@ -5418,7 +5436,7 @@ impl Claude {
                         if let Some(message) = self.submissions.get_mut(id) {
                             message.admitted = true;
                             if !self.queued.iter().any(|queued| queued.id == id) {
-                                self.queued.push(message.preview.clone());
+                                self.queued.push(message.input.preview.clone());
                             }
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
@@ -10322,9 +10340,10 @@ impl Claude {
                     let schema = &request["requested_schema"];
                     let fields = elicitation_fields(schema)?;
                     let mut content = serde_json::Map::new();
+                    let mut answered = HashSet::new();
                     for answer in &answers {
                         if !fields.iter().any(|field| field.id == answer.field)
-                            || content.contains_key(&answer.field)
+                            || !answered.insert(answer.field.as_str())
                         {
                             return Err(
                                 "Claude elicitation answer has an unknown or duplicate field"
@@ -10332,6 +10351,13 @@ impl Claude {
                             );
                         }
                         let field_schema = &schema["properties"][&answer.field];
+                        // A blank scalar is an absent field: an optional one is
+                        // omitted, and a required one is reported missing below.
+                        if string(field_schema, "type") != "array"
+                            && super::blank_form_answer(&answer.values)
+                        {
+                            continue;
+                        }
                         let value = elicitation_value(field_schema, &answer.values)?;
                         content.insert(answer.field.clone(), value);
                     }

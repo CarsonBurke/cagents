@@ -1384,6 +1384,7 @@ impl Registry {
         now_ms: u64,
     ) -> Result<Claimed, String> {
         use crate::automations::{SkipReason, Trigger};
+        let limits = self.concurrency();
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1497,7 +1498,15 @@ impl Registry {
         }
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                now_ms,
+                limits,
+            )?
         } else {
             None
         };
@@ -1541,6 +1550,7 @@ impl Registry {
         now_ms: u64,
     ) -> Result<Option<crate::agent_execution::Accepted>, String> {
         use crate::{automations::SkipReason, host::automations::precheck::Outcome};
+        let limits = self.concurrency();
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1609,7 +1619,15 @@ impl Registry {
         } else {
             let definition = read_definition(&tx, firing.automation, firing.revision)?;
             let key = occurrence_key(firing.revision, &firing.trigger);
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                now_ms,
+                limits,
+            )?
         };
         if !firing.state.is_active() {
             firing.finished_ms = Some(now_ms);
@@ -1654,6 +1672,7 @@ fn accept_firing(
     definition: &Definition,
     key: &str,
     now_ms: u64,
+    limits: crate::agent_execution::concurrency::Limits,
 ) -> Result<Option<crate::agent_execution::Accepted>, String> {
     use crate::{
         agent_execution::{Destination, Origin, Submit},
@@ -1708,6 +1727,7 @@ fn accept_firing(
         &Origin::Automation { id: automation.id },
         &request,
         now_ms,
+        limits,
     );
     match accepted {
         Ok(accepted) => {
@@ -1748,7 +1768,18 @@ fn accept_firing(
                 .map_err(|error| error.to_string())?;
             firing.state = FiringState::Failed;
             firing.finished_ms = Some(now_ms);
-            let mut diagnostic = error;
+            // The automation's own runs are listed with its firings, so the
+            // diagnostic keeps the counts rather than every holder's IDs.
+            let mut diagnostic = match error {
+                crate::agent_execution::AcceptanceError::LimitReached(refusal) => {
+                    crate::agent_execution::concurrency::LimitReached {
+                        holders: Vec::new(),
+                        ..refusal
+                    }
+                    .to_string()
+                }
+                error => error.to_string(),
+            };
             crate::agent_execution::truncate(
                 &mut diagnostic,
                 crate::agent_execution::MAX_DIAGNOSTIC_BYTES,

@@ -111,6 +111,10 @@ pub struct RepositoryFile {
     pub unstaged: bool,
     pub status: Option<String>,
     pub directory: bool,
+    /// What the index holds for a tracked change. Staging new contents can
+    /// leave the status code as it was, and this is what then shows that the
+    /// staged and unstaged comparisons are out of date.
+    pub index_oid: Option<String>,
 }
 
 impl RepositoryFile {
@@ -689,6 +693,27 @@ pub enum RepositoryAction {
     Reload {
         card: CardId,
     },
+    /// Keeps the buffer's edits over a newer file on disk, which the next
+    /// save replaces.
+    KeepBufferVersion {
+        card: CardId,
+    },
+    /// Shows, or hides, how the buffer differs from the newer file on disk.
+    CompareWithDisk {
+        card: CardId,
+    },
+    DiskComparisonLoaded {
+        identity: AsyncIdentity,
+        revision: u64,
+        disk_hash: blake3::Hash,
+        result: Result<Option<DiffModel>, String>,
+    },
+    DiskComparisonViewport {
+        card: CardId,
+        offset: f32,
+        height: f32,
+        horizontal: f32,
+    },
     DiscardEdits {
         card: CardId,
     },
@@ -736,6 +761,13 @@ pub enum RepositoryAction {
     DiffBasisResolved {
         identity: AsyncIdentity,
         choice: CommittedChoice,
+        result: Result<ResolvedBasis, String>,
+    },
+    /// The chosen Branch or Last commit comparison, named again after the
+    /// checkout's `HEAD` moved, replacing `previous` if that is still shown.
+    DiffBasisRefreshed {
+        identity: AsyncIdentity,
+        previous: DiffBasis,
         result: Result<ResolvedBasis, String>,
     },
     RetryDiff {
@@ -899,6 +931,9 @@ impl RepositoryAction {
             | Self::RetryDocumentWatch { card }
             | Self::DocumentChanged { card, .. }
             | Self::Reload { card }
+            | Self::KeepBufferVersion { card }
+            | Self::CompareWithDisk { card }
+            | Self::DiskComparisonViewport { card, .. }
             | Self::DiscardEdits { card }
             | Self::Undo { card }
             | Self::Redo { card }
@@ -955,7 +990,9 @@ impl RepositoryAction {
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
             | Self::WorkingDiffLoaded { identity, .. }
+            | Self::DiskComparisonLoaded { identity, .. }
             | Self::DiffBasisResolved { identity, .. }
+            | Self::DiffBasisRefreshed { identity, .. }
             | Self::AutoSaveDue { identity, .. }
             | Self::SaveFinished { identity, .. }
             | Self::RetainedSaveFinished { identity, .. } => identity.card,
@@ -1050,6 +1087,15 @@ struct EditorDocument {
     lsp_version: i32,
     active_save: Option<SaveTicket>,
     conflict: bool,
+    /// The newer file, read while this buffer could not take it. Present
+    /// exactly while the reader is asked whether to reload, compare or keep
+    /// their edits.
+    disk_version: Option<DiskVersion>,
+    /// The history revision a reload from disk replaced, and the disk
+    /// version it took, while that is still the file's version. Undoing back
+    /// to it reverts a change made outside the editor, which autosave must
+    /// not write without the reader choosing to.
+    reload_undo: Option<(u64, blake3::Hash)>,
     error: Option<String>,
     error_from_document_watch: bool,
     durability_warning: Option<String>,
@@ -1059,6 +1105,18 @@ struct EditorDocument {
     history: History,
     #[cfg(any(test, feature = "test-support"))]
     history_time: Option<Instant>,
+}
+
+/// Why a save was refused: the file changed after the buffer read it.
+const SAVE_CONFLICT: &str = "The file changed on disk after it was opened.";
+
+/// A file's contents on disk, newer than the ones its buffer was loaded from.
+struct DiskVersion {
+    text: String,
+    disk_hash: blake3::Hash,
+    /// The reader undid a reload, rather than the file changing under
+    /// their edits.
+    undone: bool,
 }
 
 /// What one editor action did to the buffer's text.
@@ -1141,6 +1199,8 @@ impl EditorDocument {
             lsp_version: 1,
             active_save: None,
             conflict: false,
+            disk_version: None,
+            reload_undo: None,
             error: None,
             error_from_document_watch: false,
             durability_warning: None,
@@ -1153,6 +1213,8 @@ impl EditorDocument {
 
     fn note_document_watch_error(&mut self, error: String) {
         self.conflict = true;
+        // Whatever was read before no longer describes the file.
+        self.disk_version = None;
         // An observation must not replace a newer Save failure.
         if self.error.is_none() || self.error_from_document_watch {
             self.error = Some(error);
@@ -1165,6 +1227,16 @@ impl EditorDocument {
             self.conflict = false;
             self.error = None;
             self.error_from_document_watch = false;
+        }
+        // The file is back to the bytes the buffer was loaded from. An
+        // undone reload left those bytes on disk on purpose, and its choice
+        // stays open.
+        if !self
+            .disk_version
+            .as_ref()
+            .is_some_and(|version| version.undone)
+        {
+            self.disk_version = None;
         }
     }
 
@@ -1283,6 +1355,28 @@ impl EditorDocument {
         if !edits.is_empty() {
             self.text_changed();
         }
+        if !redo
+            && !self.conflict
+            && self.reload_undo == Some((self.history.revision(), self.disk_hash))
+        {
+            // The file still holds what the reload took; the buffer is back
+            // to what it replaced. Ask, as for a change under unsaved edits.
+            self.reload_undo = None;
+            self.conflict = true;
+            self.disk_version = Some(DiskVersion {
+                text: self.saved_text.clone(),
+                disk_hash: self.disk_hash,
+                undone: true,
+            });
+        } else if !self.dirty
+            && self
+                .disk_version
+                .as_ref()
+                .is_some_and(|version| version.undone && version.disk_hash == self.disk_hash)
+        {
+            // Redone: the buffer holds the file's text again.
+            self.resolve_disk_state();
+        }
         Some(edits)
     }
 
@@ -1293,12 +1387,126 @@ impl EditorDocument {
     /// cannot be addressed the way the history needs is rebuilt instead,
     /// which cannot be undone and forgets the history.
     fn discard_edits(&mut self) -> Vec<Option<LspTextEdit>> {
-        // The reader keeps their place: the caret and the viewport stay where
-        // they were rather than following the replaced text.
+        let edits = self.replace_with_saved_text();
+        self.history.adopt_revision(self.saved_history_revision);
+        self.dirty = false;
+        debug_assert!(self.active_save.is_none());
+        self.resolve_disk_state();
+        edits
+    }
+
+    /// Makes `text`, just read from disk, the buffer's saved contents and
+    /// shows it, as one step the user can undo: undoing it brings back the
+    /// text the buffer held, unsaved, against the new file.
+    ///
+    /// The document keeps its identity, so its language-server session, Find
+    /// state and comparisons carry on with the new text. Reported like
+    /// [`EditorDocument::step_history`].
+    fn reload_from_disk(
+        &mut self,
+        text: String,
+        disk_hash: blake3::Hash,
+    ) -> Vec<Option<LspTextEdit>> {
+        self.saved_text = text;
+        self.disk_hash = disk_hash;
+        let replaced = self.history.revision();
+        let edits = self.replace_with_saved_text();
+        self.saved_snapshot = self.content.text_snapshot();
+        self.saved_history_revision = self.history.revision();
+        self.dirty = false;
+        self.durability_warning = None;
+        self.resolve_disk_state();
+        // Only a recorded step can be undone back to the replaced text; a
+        // buffer that already held the file's text recorded none.
+        self.reload_undo = (self.history.revision() != replaced).then_some((replaced, disk_hash));
+        edits
+    }
+
+    /// Records that the file on disk now holds `text`, which the buffer has
+    /// not taken, because it holds unsaved edits or a disk problem the
+    /// reader has to see.
+    ///
+    /// A buffer that already reads exactly `text` is simply in step with the
+    /// file again, such as after an agent wrote the same edit, and needs no
+    /// choice.
+    fn observe_disk(&mut self, text: String, disk_hash: blake3::Hash) {
+        if self.durability_warning.is_none()
+            && (self.error.is_none() || self.error_from_document_watch || self.conflict)
+            && content_matches(&self.content, &text)
+        {
+            self.saved_text = text;
+            self.disk_hash = disk_hash;
+            self.saved_snapshot = self.content.text_snapshot();
+            self.saved_history_revision = self.history.revision();
+            self.dirty = false;
+            self.resolve_disk_state();
+            return;
+        }
+        self.note_document_watch_error(
+            "The file changed on disk while it had unsaved edits, which are kept until you choose."
+                .into(),
+        );
+        self.disk_version = Some(DiskVersion {
+            text,
+            disk_hash,
+            undone: false,
+        });
+    }
+
+    /// Keeps the buffer as it is and lets it replace the newer file: the
+    /// version on disk becomes the one the buffer is compared and saved
+    /// against, so autosave, or the next Save, writes the buffer over it
+    /// without another conflict. A later change on disk conflicts again.
+    ///
+    /// Answers `false` when the newer file has not been read, and so cannot
+    /// be the baseline.
+    fn keep_buffer(&mut self) -> bool {
+        let Some(DiskVersion {
+            text, disk_hash, ..
+        }) = self.disk_version.take()
+        else {
+            return false;
+        };
+        // Measured once, on the reader's choice, rather than for every disk
+        // change: the snapshot is what tells a later return to these exact
+        // bytes, typed or undone, that the buffer is clean.
+        self.saved_snapshot =
+            text_editor::Content::<cosmic::Renderer>::with_text(&text).text_snapshot();
+        self.saved_text = text;
+        self.disk_hash = disk_hash;
+        // No state in the history holds the disk's bytes, so none may claim
+        // to be saved until it is shown to match.
+        self.saved_history_revision = self.history.reserve_revision();
+        self.refresh_dirty();
+        self.resolve_disk_state();
+        true
+    }
+
+    /// Clears every disk-side condition a reader resolves by choosing which
+    /// text the file should hold.
+    fn resolve_disk_state(&mut self) {
+        self.conflict = false;
+        self.error = None;
+        self.error_from_document_watch = false;
+        self.disk_version = None;
+        self.reload_undo = None;
+    }
+
+    /// Replaces the buffer with [`EditorDocument::saved_text`] as one undo
+    /// step, keeping the reader's place.
+    ///
+    /// The caret and the viewport keep pointing at the same text: lines the
+    /// replacement added or removed above them move them by as much, and a
+    /// place inside the replaced text keeps its line and column, which is
+    /// where an edit in place leaves the same text. A buffer whose lines
+    /// cannot be addressed the way the history needs is rebuilt instead,
+    /// which cannot be undone and forgets the history.
+    fn replace_with_saved_text(&mut self) -> Vec<Option<LspTextEdit>> {
         let scroll = self.content.scroll_position();
         let cursor = self.content.cursor();
         let change = self.content.replacement_to_text(&self.saved_text);
         let mut edits = Vec::new();
+        let mut scroll = scroll;
         if let Some(change) = change {
             let mut buffer = ProtocolTracked {
                 content: &mut self.content,
@@ -1316,7 +1524,21 @@ impl EditorDocument {
             let replayed = buffer.edits;
             if replaced && content_matches(&self.content, &self.saved_text) {
                 edits = replayed;
-                self.content.set_cursor(cursor);
+                let (removed_end, inserted_end) = (change.removed_end(), change.inserted_end());
+                if scroll.line > removed_end.line {
+                    scroll.line = scroll.line - removed_end.line + inserted_end.line;
+                }
+                self.content.set_cursor(text_editor::Cursor {
+                    position: map_through_replacement(
+                        cursor.position,
+                        change.start,
+                        removed_end,
+                        inserted_end,
+                    ),
+                    selection: cursor.selection.map(|selection| {
+                        map_through_replacement(selection, change.start, removed_end, inserted_end)
+                    }),
+                });
                 self.history.record_group(
                     vec![change],
                     cursor,
@@ -1325,7 +1547,7 @@ impl EditorDocument {
                 );
             } else {
                 tracing::warn!(
-                    "discarded edits by rebuilding the editor buffer; they cannot be undone"
+                    "replaced the editor buffer by rebuilding it; the replacement cannot be undone"
                 );
                 self.content = text_editor::Content::with_text(&self.saved_text);
                 self.history.clear();
@@ -1335,12 +1557,6 @@ impl EditorDocument {
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
         self.content_invalidated();
-        self.history.adopt_revision(self.saved_history_revision);
-        self.dirty = false;
-        debug_assert!(self.active_save.is_none());
-        self.conflict = false;
-        self.error = None;
-        self.error_from_document_watch = false;
         edits
     }
 
@@ -1618,6 +1834,42 @@ impl EditBuffer for ProtocolTracked<'_> {
 
     fn set_cursor(&mut self, cursor: text_editor::Cursor) {
         self.content.set_cursor(cursor);
+    }
+}
+
+/// Where `position` lands once the text from `start` to `removed_end` has been
+/// replaced by text ending at `inserted_end`.
+///
+/// Before the replacement it stays. After it, it keeps its distance from the
+/// replacement's end: its column on the replacement's last line, its line
+/// count further down. Inside the replaced text it keeps its line and column,
+/// clamped to the replacement, which follows an edit that changed those lines
+/// in place.
+fn map_through_replacement(
+    position: text_editor::Position,
+    start: text_editor::Position,
+    removed_end: text_editor::Position,
+    inserted_end: text_editor::Position,
+) -> text_editor::Position {
+    let key = |position: text_editor::Position| (position.line, position.column);
+    if key(position) < key(start) {
+        position
+    } else if key(position) >= key(removed_end) {
+        if position.line == removed_end.line {
+            text_editor::Position {
+                line: inserted_end.line,
+                column: inserted_end.column + (position.column - removed_end.column),
+            }
+        } else {
+            text_editor::Position {
+                line: position.line - removed_end.line + inserted_end.line,
+                column: position.column,
+            }
+        }
+    } else if key(position) <= key(inserted_end) {
+        position
+    } else {
+        inserted_end
     }
 }
 
@@ -2228,6 +2480,19 @@ struct RetainedDiff {
     restyle: bool,
 }
 
+/// The open buffer against the newer file on disk, for one buffer revision
+/// and one disk version: either moving makes it a comparison of something
+/// else, and it is no longer shown.
+struct DiskComparison {
+    identity: AsyncIdentity,
+    revision: u64,
+    disk_hash: blake3::Hash,
+    state: DiffState,
+    viewport: ListViewport,
+    horizontal: f32,
+    scroll_id: widget::Id,
+}
+
 /// One immutable snapshot is in flight; further edits only advance the desired
 /// revision/deadline. Cancellation does not release the slot until it returns.
 struct WorkingDiffJob {
@@ -2395,6 +2660,11 @@ const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
 /// Room for the widest zoom step the viewer's label can hold, so the controls
 /// either side of it do not move when the step changes.
 const ZOOM_LABEL_WIDTH: f32 = 48.0;
+/// Why the find bar's Selection option is unavailable: there is no
+/// selection to search, which a selection in the file supplies.
+const FIND_SELECTION_UNAVAILABLE: &str = "Select text in the file to search only within it";
+/// Why Replace's Preserve case option is unavailable while Regex is on.
+const PRESERVE_CASE_UNAVAILABLE: &str = "Turn off regular expressions (.*) to preserve case";
 /// How many committed comparisons one open file keeps.
 ///
 /// Viewed working bases stay cached until a save or mutation invalidates them.
@@ -2539,13 +2809,24 @@ pub struct RepositoryRuntime {
     /// the generation that asked for it. Committed into
     /// [`RepositoryRuntime::file_list_digest`] only once the matching list
     /// has actually been installed.
-    file_list_deposit: Arc<std::sync::Mutex<Option<(u64, FileInventoryDigest)>>>,
+    file_list_deposit: Arc<std::sync::Mutex<Option<ListDeposit>>>,
+    /// The commit `HEAD` named in the installed file list, `Some(None)` on an
+    /// unborn branch, and `None` before a list has said. A Branch or Last
+    /// commit comparison chosen against one `HEAD` is named again when it
+    /// moves.
+    list_head: Option<Option<String>>,
+    /// The last attempt to name the shown comparison again for a moved
+    /// `HEAD`, so a running or failed one is not repeated on every read.
+    head_refresh: Option<HeadRefresh>,
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
     /// Last comparison stays readable while Git refreshes this file, or
     /// while it is rebuilt in a new presentation.
     stale_diff: Option<RetainedDiff>,
+    /// The buffer compared with the newer file on disk, while the reader
+    /// decides whether to keep their edits. Shown in the editor's place.
+    disk_comparison: Option<DiskComparison>,
     /// Advances whenever comparisons must be styled or measured again: a
     /// syntax palette or editor font family change.
     diff_presentation: u64,
@@ -2769,10 +3050,13 @@ impl RepositoryRuntime {
             file_list_digest: None,
             file_list_read: None,
             file_list_deposit: Arc::new(std::sync::Mutex::new(None)),
+            list_head: None,
+            head_refresh: None,
             file_list_refresh_queued: false,
             background_file_refresh: false,
             mutation_refresh_pending: false,
             stale_diff: None,
+            disk_comparison: None,
             diff_presentation: 0,
             diff_hide_unchanged: true,
             files: FileListState::Loading,
@@ -3294,6 +3578,7 @@ impl RepositoryRuntime {
             unstaged: true,
             status: Some(" M".into()),
             directory: false,
+            index_oid: None,
         }]);
         runtime.selected = runtime.file(&path).cloned();
         let identity = AsyncIdentity {
@@ -3362,6 +3647,7 @@ impl RepositoryRuntime {
                     unstaged: true,
                     status: Some(" M".into()),
                     directory: false,
+                    index_oid: None,
                 })
                 .collect(),
         );
@@ -3436,6 +3722,7 @@ impl RepositoryRuntime {
                     unstaged: true,
                     status: Some(" M".into()),
                     directory: false,
+                    index_oid: None,
                 })
                 .collect(),
         );
@@ -6484,6 +6771,105 @@ impl RepositoryRuntime {
         })
     }
 
+    /// Shows the file's new contents in the open buffer as one undoable edit,
+    /// keeping the document, its caret, scroll position and comparisons.
+    ///
+    /// The working comparison follows the new text the way it follows typing;
+    /// the index and committed sides it compares against are unchanged by a
+    /// write to the worktree file.
+    fn reload_in_place(
+        &mut self,
+        card: CardId,
+        text: String,
+        disk_hash: blake3::Hash,
+    ) -> Task<RepositoryAction> {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        let edits = document.reload_from_disk(text, disk_hash);
+        self.disk_comparison = None;
+        self.push_lsp_edits(edits);
+        // Completions and hover answered positions in the replaced text.
+        self.dismiss_editor_results();
+        self.refresh_find_matches();
+        Task::batch([self.markdown_task(card), self.diagram_task(card)])
+    }
+
+    /// The comparison with the newer file on disk, while it still compares
+    /// the buffer and the disk version the reader is deciding between.
+    fn current_disk_comparison(&self) -> Option<&DiskComparison> {
+        let comparison = self.disk_comparison.as_ref()?;
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        (self.accepts_selected(&comparison.identity)
+            && comparison.revision == document.revision
+            && document
+                .disk_version
+                .as_ref()
+                .is_some_and(|version| version.disk_hash == comparison.disk_hash))
+        .then_some(comparison)
+    }
+
+    /// Starts comparing the buffer with the newer file on disk, off the UI
+    /// thread, and shows the comparison in the editor's place.
+    fn compare_with_disk(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let DocumentState::Editable(document) = &self.document else {
+            return Task::none();
+        };
+        let Some(version) = &document.disk_version else {
+            self.disk_comparison = None;
+            return Task::none();
+        };
+        let identity = self.current_identity(card, document.path.clone());
+        let (revision, disk_hash) = (document.revision, version.disk_hash);
+        let cancellation = CancellationToken::new();
+        // A comparison rebuilt for a newer file keeps the reader's place.
+        let (viewport, horizontal, scroll_id) = self.disk_comparison.take().map_or_else(
+            || (ListViewport::default(), 0.0, widget::Id::unique()),
+            |previous| (previous.viewport, previous.horizontal, previous.scroll_id),
+        );
+        let comparison = |state| DiskComparison {
+            identity: identity.clone(),
+            revision,
+            disk_hash,
+            state,
+            viewport,
+            horizontal,
+            scroll_id: scroll_id.clone(),
+        };
+        let after = document.content.text();
+        if after.len() as u64 > MAX_DIFF_SIDE_BYTES
+            || version.text.len() as u64 > MAX_DIFF_SIDE_BYTES
+        {
+            self.disk_comparison = Some(comparison(DiffState::ready(RenderedDiff::Error(
+                "This file is too large to compare. Reload or keep your edits without a comparison."
+                    .into(),
+            ))));
+            return Task::none();
+        }
+        let before: Arc<str> = Arc::from(version.text.as_str());
+        let source = document.source.clone();
+        let (syntax_theme, font) = (self.syntax_theme, self.editor_font);
+        self.disk_comparison = Some(comparison(DiffState::Loading {
+            request: 0,
+            cancellation: cancellation.clone(),
+        }));
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                build_document_diff(before, &after, &source, syntax_theme, font, &cancellation)
+            })
+            .await
+            .map_err(|error| format!("Diff worker failed: {error}"));
+            RepositoryAction::DiskComparisonLoaded {
+                identity,
+                revision,
+                disk_hash,
+                result,
+            }
+        })
+    }
+
     fn reload_changed_document(&mut self, card: CardId) -> Task<RepositoryAction> {
         if !self.document_reload_pending
             || self.document_reading
@@ -6593,7 +6979,9 @@ impl RepositoryRuntime {
                 }
                 // Nothing in the worktree moved, so nothing here moves
                 // either: no rebuild, no assignment to `files`, no repaint.
-                Task::none()
+                // A comparison that could not be named again last time, for
+                // a save or a choice in progress, gets another chance.
+                self.refresh_head_basis(identity.card)
             }
             RepositoryAction::FilesLoaded { identity, result } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
@@ -6609,13 +6997,20 @@ impl RepositoryRuntime {
                 // Committed only now: a digest recorded for a list this card
                 // never installed would make the next refresh believe the
                 // worktree it describes is already on screen.
-                let deposited = *self
+                let deposited = self
                     .file_list_deposit
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                self.file_list_digest = deposited
-                    .filter(|(generation, _)| *generation == identity.generation)
-                    .map(|(_, digest)| digest);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .filter(|deposit| deposit.generation == identity.generation);
+                self.file_list_digest = deposited.as_ref().map(|deposit| deposit.digest);
+                let head_moved = match deposited {
+                    Some(deposit) => self
+                        .list_head
+                        .replace(deposit.head.clone())
+                        .is_some_and(|previous| previous != deposit.head),
+                    None => false,
+                };
                 let result = result.map(|files| self.merge_directory_listing(files));
                 let changed = match (&result, &self.selected) {
                     (Ok(after), Some(selected)) => {
@@ -6625,19 +7020,24 @@ impl RepositoryRuntime {
                         after
                             .iter()
                             .find(|file| file.path == selected.path)
-                            .map_or(selected.changed(), |file| file != selected)
+                            .map_or(selected.changed(), |file| status_moved(file, selected))
                     }
                     _ => false,
                 };
+                // A moved `HEAD` changes what the staged comparison is taken
+                // against even when the file's own status reads the same, and
+                // whichever read sees the move first is the only one that
+                // will.
                 let background_changed =
-                    std::mem::take(&mut self.background_file_refresh) && changed;
+                    (std::mem::take(&mut self.background_file_refresh) && changed) || head_moved;
                 if background_changed {
                     self.drop_mutable_diffs();
                 }
                 let refresh_selected =
                     (self.mutation_refresh_pending || background_changed) && result.is_ok();
                 self.files = result.map_or_else(FileListState::Failed, FileListState::Ready);
-                let relist = self.relist_expanded_directories(identity.card);
+                let rebase = self.refresh_head_basis(identity.card);
+                let relist = Task::batch([self.relist_expanded_directories(identity.card), rebase]);
                 if refresh_selected {
                     self.mutation_refresh_pending = false;
                     Task::batch([relist, self.refresh_selected_status(identity.card)])
@@ -6725,6 +7125,7 @@ impl RepositoryRuntime {
                 // retained buffer merely because its read succeeded.
                 let attested = result.is_ok() && !self.rejects_reload_replacement(&result);
                 if background {
+                    let comparing = self.current_disk_comparison().is_some();
                     if let DocumentState::Editable(document) = &mut self.document {
                         let unchanged = matches!(&result, Ok(LoadedFile { source, content: FileContent::Editable { content_hash, .. } }) if *content_hash == document.disk_hash && *source == document.source);
                         if unchanged {
@@ -6738,23 +7139,71 @@ impl RepositoryRuntime {
                         // A missing or refused symlink target is classified
                         // as read-only rather than an I/O error. It still
                         // cannot replace the last readable editor buffer.
-                        if result.is_err()
+                        let unavailable = result.is_err()
                             || matches!(
                                 &result,
                                 Ok(LoadedFile {
                                     content: FileContent::ReadOnly(ReadOnlyReason::Symlink { .. }),
                                     ..
                                 })
-                            )
-                            || document.dirty
+                            );
+                        let held = document.dirty
                             || document.durability_warning().is_some()
-                            || (document.error.is_some() && !document.error_from_document_watch)
-                        {
-                            document.note_document_watch_error(match &result {
-                                Err(error) => format!("File unavailable on disk: {error}. Your text is preserved. Reload to retry."),
-                                Ok(LoadedFile { source, content: FileContent::ReadOnly(reason @ ReadOnlyReason::Symlink { .. }) }) => format!("File unavailable on disk: {} Your text is preserved. Reload to retry.", read_only_detail(source, reason)),
-                                _ => "File changed on disk. Your edits are preserved. Reload or overwrite to resolve.".into(),
-                            });
+                            || (document.error.is_some() && !document.error_from_document_watch);
+                        // Still the same file and still text, so the buffer
+                        // can take the new contents as an edit of its own.
+                        let in_place = matches!(&result, Ok(LoadedFile { source, content: FileContent::Editable { .. } }) if *source == document.source);
+                        if in_place && !held {
+                            let Ok(LoadedFile {
+                                content:
+                                    FileContent::Editable {
+                                        text, content_hash, ..
+                                    },
+                                ..
+                            }) = result
+                            else {
+                                unreachable!("an in-place reload reads editable text");
+                            };
+                            self.original_read_attested = attested;
+                            // A change on disk is not a foreground navigation,
+                            // and must not take the keyboard.
+                            self.pending_editor_focus = None;
+                            return self.reload_in_place(identity.card, text, content_hash);
+                        }
+                        if unavailable || held {
+                            if let Ok(LoadedFile {
+                                content: FileContent::Editable { content_hash, .. },
+                                ..
+                            }) = &result
+                                && in_place
+                                && document
+                                    .disk_version
+                                    .as_ref()
+                                    .is_some_and(|version| version.disk_hash == *content_hash)
+                            {
+                                // Already the version the reader is deciding
+                                // about.
+                                return Task::none();
+                            }
+                            match result {
+                                Ok(LoadedFile {
+                                    content:
+                                        FileContent::Editable {
+                                            text, content_hash, ..
+                                        },
+                                    ..
+                                }) if in_place => document.observe_disk(text, content_hash),
+                                Err(error) => document.note_document_watch_error(format!("File unavailable on disk: {error}. Your text is preserved. Reload to retry.")),
+                                Ok(LoadedFile { source, content: FileContent::ReadOnly(reason @ ReadOnlyReason::Symlink { .. }) }) => document.note_document_watch_error(format!("File unavailable on disk: {} Your text is preserved. Reload to retry.", read_only_detail(&source, &reason))),
+                                Ok(LoadedFile { content: FileContent::Editable { .. }, .. }) => document.note_document_watch_error("The link now points to a different file. Your edits are kept. Reload to open the file it points to now.".into()),
+                                Ok(_) => document.note_document_watch_error("The file changed on disk and no longer opens as editable text. Your edits are kept. Reload to open it as it is now.".into()),
+                            }
+                            // An open comparison follows the file it compares
+                            // against, or closes once there is none.
+                            if comparing {
+                                return self.compare_with_disk(identity.card);
+                            }
+                            self.disk_comparison = None;
                             return Task::none();
                         }
                     }
@@ -7371,8 +7820,26 @@ impl RepositoryRuntime {
                             document.saved_history_revision = ticket.history_revision;
                             document.saved_snapshot = ticket.snapshot_source;
                             document.refresh_dirty();
-                            document.conflict = false;
-                            document.error = None;
+                            let undone = document
+                                .disk_version
+                                .as_ref()
+                                .is_some_and(|version| version.undone);
+                            // The buffer now is the file, whichever version
+                            // was waiting to be chosen.
+                            document.resolve_disk_state();
+                            self.disk_comparison = None;
+                            if undone && document.dirty {
+                                // Undone past this save while it was written:
+                                // the buffer is still text the reader took
+                                // back from the file, and must not be saved
+                                // over it unasked.
+                                document.conflict = true;
+                                document.disk_version = Some(DiskVersion {
+                                    text: document.saved_text.clone(),
+                                    disk_hash: content_hash,
+                                    undone: true,
+                                });
+                            }
                             document.durability_warning = match durability {
                                 SaveDurability::Durable => None,
                                 SaveDurability::Unconfirmed { error } => Some(format!(
@@ -7383,8 +7850,10 @@ impl RepositoryRuntime {
                         }
                         Ok(SaveOutcome::Conflict { .. }) => {
                             document.conflict = true;
-                            document.error =
-                                Some("The file changed on disk after it was opened.".into());
+                            document.error = Some(SAVE_CONFLICT.into());
+                            // Read the newer file, so the reader can compare
+                            // it or keep their edits over it.
+                            self.document_reload_pending = self.document_watch.is_some();
                         }
                         Err(error) => {
                             let error = error.to_string();
@@ -7449,10 +7918,99 @@ impl RepositoryRuntime {
                 {
                     return Task::none();
                 }
+                // The newer file is already read: taking it is an edit the
+                // reader can undo to get their own text back.
+                if !self.has_editor_recovery()
+                    && let DocumentState::Editable(document) = &mut self.document
+                    && let Some(DiskVersion {
+                        text, disk_hash, ..
+                    }) = document.disk_version.take()
+                {
+                    let reload = self.reload_in_place(card, text, disk_hash);
+                    // Find keeps the keyboard while it is open.
+                    if self.search_mode {
+                        return reload;
+                    }
+                    return Task::batch([reload, self.focus_editor(card)]);
+                }
                 let Some(path) = self.selected.as_ref().map(|file| file.path.clone()) else {
                     return Task::none();
                 };
                 self.open_file(card, path)
+            }
+            RepositoryAction::KeepBufferVersion { card } => {
+                if self.is_saving() || self.has_editor_recovery() {
+                    return Task::none();
+                }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if !document.keep_buffer() {
+                    return Task::none();
+                }
+                self.disk_comparison = None;
+                // Autosave, when on, writes the buffer from here; the shell
+                // asks for it after every action.
+                if self.search_mode {
+                    return Task::none();
+                }
+                self.focus_editor(card)
+            }
+            RepositoryAction::CompareWithDisk { card } => {
+                if self.current_disk_comparison().is_some() {
+                    self.disk_comparison = None;
+                    if self.search_mode {
+                        return Task::none();
+                    }
+                    return self.focus_editor(card);
+                }
+                self.compare_with_disk(card)
+            }
+            RepositoryAction::DiskComparisonLoaded {
+                identity,
+                revision,
+                disk_hash,
+                result,
+            } => {
+                let row_height = self.diff_typography().line_height;
+                let accepted = self.accepts_selected(&identity);
+                let Some(comparison) = &mut self.disk_comparison else {
+                    return Task::none();
+                };
+                if comparison.revision != revision || comparison.disk_hash != disk_hash || !accepted
+                {
+                    return Task::none();
+                }
+                comparison.state = DiffState::ready(match result {
+                    Ok(Some(model)) => RenderedDiff::Text {
+                        model,
+                        old_label: "On disk".into(),
+                        new_label: "Your text".into(),
+                    },
+                    Ok(None) => return Task::none(),
+                    Err(error) => RenderedDiff::Error(error),
+                });
+                if let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) =
+                    &mut comparison.state
+                {
+                    // The reader is deciding about every difference, so none
+                    // is folded away.
+                    layout.set_folding(model, false);
+                    layout.set_row_height(row_height);
+                }
+                Task::none()
+            }
+            RepositoryAction::DiskComparisonViewport {
+                offset,
+                height,
+                horizontal,
+                ..
+            } => {
+                if let Some(comparison) = &mut self.disk_comparison {
+                    comparison.viewport = ListViewport { offset, height };
+                    comparison.horizontal = horizontal;
+                }
+                Task::none()
             }
             RepositoryAction::DiscardEdits { card } => {
                 if !self.can_discard_edits() {
@@ -7461,6 +8019,12 @@ impl RepositoryRuntime {
                 let DocumentState::Editable(document) = &mut self.document else {
                     return Task::none();
                 };
+                // The file already holds a newer version than the one the
+                // edits started from: discarding them means taking that, not
+                // going back to text that is no longer on disk.
+                if document.disk_version.is_some() {
+                    return self.update_inner(RepositoryAction::Reload { card });
+                }
                 // `discard_edits` changes the buffer without going through
                 // an editor action, so nothing else here would notice that
                 // the server's copy just became wrong.
@@ -7724,6 +8288,61 @@ impl RepositoryRuntime {
                     }
                 }
                 Task::none()
+            }
+            RepositoryAction::DiffBasisRefreshed {
+                identity,
+                previous,
+                result,
+            } => {
+                // A comparison that cannot be named for this `HEAD` is
+                // remembered, so the next read does not ask again until
+                // `HEAD` moves; one waiting only on the reader, who moved on
+                // or started a save meanwhile, is forgotten so the next read
+                // tries again.
+                let unnamed = match &result {
+                    Ok(ResolvedBasis::Ready(basis)) => !matches!(
+                        self.diff_basis_refusal(basis),
+                        None | Some(DiffBasisRefusal::Saving)
+                    ),
+                    _ => true,
+                };
+                if self
+                    .head_refresh
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.basis == previous)
+                {
+                    if unnamed {
+                        if let Some(attempt) = &mut self.head_refresh {
+                            attempt.running = false;
+                        }
+                    } else {
+                        self.head_refresh = None;
+                    }
+                }
+                // Only a comparison still on its old `HEAD`, with no choice
+                // in progress, is replaced; anything else has moved on.
+                if !self.accepts_selected(&identity)
+                    || self.diff_basis != previous
+                    || self.basis_resolution.is_some()
+                {
+                    return Task::none();
+                }
+                let Ok(ResolvedBasis::Ready(basis)) = result else {
+                    // The old comparison stays readable; choosing again
+                    // reports what went wrong.
+                    return Task::none();
+                };
+                if basis == previous || !self.can_select_diff_basis(&basis) {
+                    return Task::none();
+                }
+                self.capture_native_viewport();
+                // The comparison it replaces names commits that no longer
+                // describe the branch.
+                self.diffs.retain(|(candidate, _)| *candidate != previous);
+                self.diff_basis = basis;
+                let load = self.ensure_current_diff(identity.card);
+                self.restore_native_viewport();
+                load
             }
             RepositoryAction::ApplyDiffBasis { card, basis } => {
                 if !self.can_select_diff_basis(&basis) {
@@ -8137,6 +8756,76 @@ impl RepositoryRuntime {
         });
     }
 
+    /// Names the chosen Branch or Last commit comparison again after `HEAD`
+    /// moved, off the update thread. Both were resolved against the old
+    /// `HEAD` and would otherwise keep showing it: a commit made since would
+    /// be missing from the branch, and Last commit would name the one
+    /// before. A commit opened from History, or a pull request, names its
+    /// own commits and stays as it is.
+    ///
+    /// Each comparison names the commit it was taken at, so this compares
+    /// that with the `HEAD` the installed list last read rather than
+    /// remembering moves: one skipped while a save or a choice was in
+    /// progress is caught on the next read.
+    fn refresh_head_basis(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let previous = self.diff_basis.clone();
+        let Some(Some(head)) = self.list_head.clone() else {
+            return Task::none();
+        };
+        let named = match &previous {
+            DiffBasis::MergeBaseToHead { head, .. }
+            | DiffBasis::CommitToParent { oid: head, .. } => head.as_str(),
+            _ => return Task::none(),
+        };
+        let opened_directly = self
+            .committed_selection
+            .as_ref()
+            .is_some_and(|(basis, _)| *basis == previous);
+        if named == head
+            || opened_directly
+            || self.basis_resolution.is_some()
+            || self.is_saving()
+            || self.head_refresh.as_ref().is_some_and(|attempt| {
+                attempt.head == head && (attempt.running || attempt.basis == previous)
+            })
+        {
+            return Task::none();
+        }
+        let Some(selected) = self.selected.as_ref() else {
+            return Task::none();
+        };
+        let identity = self.current_identity(card, selected.path.clone());
+        // Running, or failed for this `HEAD` and this comparison: either
+        // way not asked again until one of them changes.
+        self.head_refresh = Some(HeadRefresh {
+            head,
+            basis: previous.clone(),
+            running: true,
+        });
+        let worktree = identity.worktree.clone();
+        let resolve: Box<dyn FnOnce() -> Result<ResolvedBasis, String> + Send> = match &previous {
+            // The base the reader chose, or the default one, stays the base.
+            DiffBasis::MergeBaseToHead { base_ref, .. } => {
+                let base_ref = base_ref.clone();
+                Box::new(move || resolved_branch_basis(&worktree, base_ref))
+            }
+            DiffBasis::CommitToParent { .. } => {
+                Box::new(move || resolve_basis(&worktree, CommittedChoice::LastCommit))
+            }
+            _ => return Task::none(),
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(resolve)
+                .await
+                .unwrap_or_else(|error| Err(format!("basis worker failed: {error}")));
+            RepositoryAction::DiffBasisRefreshed {
+                identity,
+                previous,
+                result,
+            }
+        })
+    }
+
     /// Only the visible comparison earns a worker. Completed comparisons remain
     /// cached, but navigating away cancels unfinished work rather than merely
     /// discarding its expensive result later.
@@ -8278,6 +8967,7 @@ impl RepositoryRuntime {
                     unstaged: false,
                     status: None,
                     directory: false,
+                    index_oid: None,
                 }
             }
             None => return Task::none(),
@@ -8338,6 +9028,7 @@ impl RepositoryRuntime {
         };
         let retained_source = predecessor.as_ref().map(|document| document.source.clone());
         self.document = DocumentState::Loading { predecessor };
+        self.disk_comparison = None;
         self.diffs.clear();
         self.expect_git_comparison();
         self.basis_resolution = None;
@@ -8990,7 +9681,7 @@ fn files_task(
     identity: AsyncIdentity,
     directory_only: bool,
     previous: Option<FileInventoryDigest>,
-    deposit: Arc<std::sync::Mutex<Option<(u64, FileInventoryDigest)>>>,
+    deposit: Arc<std::sync::Mutex<Option<ListDeposit>>>,
     cancellation: CancellationToken,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
@@ -9008,12 +9699,15 @@ fn files_task(
         .and_then(|result| result);
         match result {
             Ok(FileListRead::Unchanged) => RepositoryAction::FileListUnchanged { identity },
-            Ok(FileListRead::Listed(digest, files)) => {
-                if let Some(digest) = digest {
+            Ok(FileListRead::Listed(read, files)) => {
+                if let Some((digest, head)) = read {
                     *deposit
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        Some((generation, digest));
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ListDeposit {
+                        generation,
+                        digest,
+                        head,
+                    });
                 }
                 RepositoryAction::FilesLoaded {
                     identity,
@@ -9479,9 +10173,22 @@ enum FileListRead {
     /// Git's raw output is byte-for-byte what the card already digested, so
     /// there is nothing to rebuild and nothing to repaint.
     Unchanged,
-    /// A fresh list, with the digest of the read behind it. Folder tabs
-    /// carry no digest: they list one level and are merged into the tree.
-    Listed(Option<FileInventoryDigest>, Vec<RepositoryFile>),
+    /// A fresh list, with the digest of the read behind it and the commit
+    /// `HEAD` named then. Folder tabs carry neither: they list one level and
+    /// are merged into the tree.
+    Listed(
+        Option<(FileInventoryDigest, Option<String>)>,
+        Vec<RepositoryFile>,
+    ),
+}
+
+/// What a file-list read leaves for the card to commit once it installs the
+/// list, tagged with the generation that asked for it.
+#[derive(Debug, Clone)]
+struct ListDeposit {
+    generation: u64,
+    digest: FileInventoryDigest,
+    head: Option<String>,
 }
 
 /// Reads the repository's file list through [`RepositoryService`], reporting
@@ -9513,9 +10220,40 @@ fn read_repository_files(
         })? {
         FileInventoryRead::Unchanged => Ok(FileListRead::Unchanged),
         FileInventoryRead::Changed(inventory) => Ok(FileListRead::Listed(
-            Some(inventory.digest),
+            Some((inventory.digest, head_oid(&inventory.status.head))),
             repository_files(&inventory.files, &inventory.status),
         )),
+    }
+}
+
+/// One attempt at naming a comparison again for a moved `HEAD`.
+#[derive(Debug, Clone)]
+struct HeadRefresh {
+    head: String,
+    basis: DiffBasis,
+    running: bool,
+}
+
+/// Whether the selected file's row says something changed since it was
+/// read. An index object the selection never recorded, as after a save
+/// marked it modified, is no news: saving the worktree leaves the index as
+/// it was.
+fn status_moved(listed: &RepositoryFile, selected: &RepositoryFile) -> bool {
+    if selected.index_oid.is_none() {
+        return RepositoryFile {
+            index_oid: None,
+            ..listed.clone()
+        } != *selected;
+    }
+    listed != selected
+}
+
+/// The commit `HEAD` names, if the branch has one.
+fn head_oid(head: &crate::repository::HeadState) -> Option<String> {
+    match head {
+        crate::repository::HeadState::Branch { oid, .. }
+        | crate::repository::HeadState::Detached { oid } => Some(oid.clone()),
+        crate::repository::HeadState::Unborn { .. } | crate::repository::HeadState::Unknown => None,
     }
 }
 
@@ -9526,6 +10264,7 @@ struct FileStatus {
     unstaged: Option<u8>,
     staged_old_path: Option<OldPath>,
     unstaged_old_path: Option<OldPath>,
+    index_oid: Option<String>,
 }
 
 impl FileStatus {
@@ -9547,6 +10286,9 @@ fn repository_files(files: &WorkingFiles, status: &StatusSnapshot) -> Vec<Reposi
     let mut statuses = HashMap::<&Path, FileStatus>::new();
     for entry in &status.entries {
         let status = statuses.entry(entry.path.as_path()).or_default();
+        if entry.index_oid.is_some() {
+            status.index_oid.clone_from(&entry.index_oid);
+        }
         match entry.area {
             ChangeArea::Staged => {
                 status.staged = Some(entry.kind.code());
@@ -9593,6 +10335,7 @@ fn repository_files(files: &WorkingFiles, status: &StatusSnapshot) -> Vec<Reposi
                 unstaged: status.is_some_and(|status| status.unstaged.is_some()),
                 status: status.map(FileStatus::display_code),
                 directory: false,
+                index_oid: status.and_then(|status| status.index_oid.clone()),
             }
         })
         .collect()
@@ -10288,7 +11031,6 @@ fn find_strip<'a>(
         runtime.find_options.case_sensitive,
         runtime.find_options.regex,
         runtime.find_options.whole_word,
-        true,
         move |option, enabled| RepositoryAction::FindOptionsChanged {
             card,
             option,
@@ -10297,16 +11039,21 @@ fn find_strip<'a>(
     )];
     let selection_enabled =
         runtime.find_selection.is_some() || runtime.find_selection_candidate.is_some();
-    let mut selection =
+    let selection =
         crate::ui_controls::field::checkbox(runtime.find_selection.is_some()).label("Selection");
-    if selection_enabled {
-        selection = selection
-            .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled });
-    }
-    options.push(crate::interaction::tooltip(
-        selection,
-        "Search the selection captured when enabled",
-    ));
+    options.push(if selection_enabled {
+        crate::interaction::tooltip(
+            selection
+                .on_toggle(move |enabled| RepositoryAction::FindSelectionChanged { card, enabled }),
+            "Search the selection captured when enabled",
+        )
+    } else {
+        // Nothing is selected to search within.
+        crate::interaction::disabled_tooltip(
+            selection.description(FIND_SELECTION_UNAVAILABLE),
+            FIND_SELECTION_UNAVAILABLE,
+        )
+    });
     strips.push(
         widget::row::with_children(options)
             .spacing(space::S)
@@ -10343,18 +11090,22 @@ fn find_strip<'a>(
                     move || RepositoryAction::CloseFind { card },
                 ),
                 {
-                    let mut preserve =
+                    let preserve =
                         crate::ui_controls::field::checkbox(runtime.replace_preserve_case)
                             .label("Preserve case");
-                    if !runtime.find_options.regex {
-                        preserve = preserve.on_toggle(move |enabled| {
-                            RepositoryAction::PreserveCaseChanged { card, enabled }
-                        });
+                    if runtime.find_options.regex {
+                        crate::interaction::disabled_tooltip(
+                            preserve.description(PRESERVE_CASE_UNAVAILABLE),
+                            PRESERVE_CASE_UNAVAILABLE,
+                        )
+                    } else {
+                        crate::interaction::tooltip(
+                            preserve.on_toggle(move |enabled| {
+                                RepositoryAction::PreserveCaseChanged { card, enabled }
+                            }),
+                            "Keep each matched word's upper, lower or title case",
+                        )
                     }
-                    crate::interaction::tooltip(
-                        preserve,
-                        "Keep each matched word's upper, lower or title case (plain text)",
-                    )
                 },
                 crate::ui_controls::button::secondary("Replace")
                     .on_press_maybe(
@@ -10737,55 +11488,263 @@ fn completion_row(
     Some(crate::ui_controls::owned(key, button))
 }
 
+/// What the reader must know about the file on disk, and their way out.
+///
+/// A newer file the buffer could not take gets the labelled choice: Reload
+/// (an edit the reader can undo), Compare, or Keep mine. Every other disk or
+/// save problem says what happened beside the one or two commands that
+/// resolve it.
+fn disk_notice<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    document: &'a EditorDocument,
+) -> Option<Element<'a, RepositoryAction>> {
+    use crate::ui_controls::button;
+    let choosable = !runtime.is_saving() && !runtime.has_editor_recovery();
+    let reload = (!runtime.is_saving()).then_some(RepositoryAction::Reload { card });
+    let (heading, detail, actions): (Option<&str>, &str, Vec<Element<'a, RepositoryAction>>) =
+        if let Some(version) = &document.disk_version {
+            let comparing = runtime.current_disk_comparison().is_some();
+            let reload = choosable.then_some(RepositoryAction::Reload { card });
+            // A save that failed for its own reason, not because of this
+            // newer file, still needs saying.
+            let save_error = document
+                .error
+                .as_deref()
+                .filter(|error| !document.error_from_document_watch && *error != SAVE_CONFLICT);
+            // Autosave is only worth mentioning to someone who has it on.
+            let (heading, detail) = match (version.undone, runtime.auto_save) {
+                (true, true) => (
+                    "Undid a change from disk",
+                    "Your text no longer matches the file on disk, and autosave is paused until you choose. Reload takes the file on disk; Keep mine saves this text over it.",
+                ),
+                (true, false) => (
+                    "Undid a change from disk",
+                    "Your text no longer matches the file on disk. Reload takes the file on disk; Keep mine lets your next save replace it.",
+                ),
+                (false, true) => (
+                    "Changed on disk",
+                    "Your unsaved edits are kept, and autosave is paused until you choose. Reload takes the new version, and you can undo it.",
+                ),
+                (false, false) => (
+                    "Changed on disk",
+                    "Your unsaved edits are kept. Reload takes the new version, and you can undo it.",
+                ),
+            };
+            (
+                Some(heading),
+                save_error.unwrap_or(detail),
+                vec![
+                    button::primary("Reload")
+                        .description("Replace your edits with the file on disk")
+                        .on_press_maybe(reload)
+                        .into(),
+                    button::secondary("Compare")
+                        .instead("Hide comparison", comparing)
+                        .description("Show how your edits differ from the file on disk")
+                        .on_press(RepositoryAction::CompareWithDisk { card })
+                        .into(),
+                    button::secondary("Keep mine")
+                        .description("Keep your edits; the next save replaces the file on disk")
+                        .on_press_maybe(
+                            choosable.then_some(RepositoryAction::KeepBufferVersion { card }),
+                        )
+                        .into(),
+                ],
+            )
+        } else if let Some(error) = document.error.as_deref() {
+            let mut actions: Vec<Element<'a, RepositoryAction>> = Vec::new();
+            if document.conflict {
+                actions.push(
+                    button::primary("Reload")
+                        .description("Open the file as it is on disk now")
+                        .on_press_maybe(reload)
+                        .into(),
+                );
+                // Saving over a missing or unreadable file recreates it, which
+                // is the reader's call.
+                actions.push(
+                    button::secondary("Overwrite")
+                        .description("Save your edits over the file on disk")
+                        .on_press_maybe(runtime.can_save().then_some(RepositoryAction::Save {
+                            card,
+                            overwrite: true,
+                        }))
+                        .into(),
+                );
+            }
+            (None, error, actions)
+        } else {
+            let warning = document.durability_warning()?;
+            (
+                None,
+                warning,
+                vec![
+                    button::primary("Retry save")
+                        .on_press_maybe(runtime.can_save().then_some(RepositoryAction::Save {
+                            card,
+                            overwrite: false,
+                        }))
+                        .into(),
+                    button::secondary("Reload").on_press_maybe(reload).into(),
+                ],
+            )
+        };
+    let text = widget::column::with_children(
+        heading
+            .map(|heading| crate::design::heading(heading).into())
+            .into_iter()
+            .chain(std::iter::once(
+                crate::design::body(detail)
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
+            ))
+            .collect::<Vec<Element<'a, RepositoryAction>>>(),
+    )
+    .spacing(space::XXS)
+    .width(Length::Fill);
+    Some(
+        widget::container(
+            widget::row::with_children([
+                text.into(),
+                widget::row::with_children(actions)
+                    .spacing(space::S)
+                    .align_y(Alignment::Center)
+                    .into(),
+            ])
+            .spacing(space::M)
+            .align_y(Alignment::Center),
+        )
+        .class(cosmic::theme::Container::Secondary)
+        .padding([space::S, space::M])
+        .width(Length::Fill)
+        .into(),
+    )
+}
+
+/// The buffer against the newer file on disk, read-only, in the comparison
+/// layout the reader chose for diffs: lines only on disk are removed, lines
+/// only in the buffer are added.
+fn disk_comparison_view<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    comparison: &'a DiskComparison,
+) -> Element<'a, RepositoryAction> {
+    let (model, layout) = match &comparison.state {
+        DiffState::Loading { .. } => return loading(),
+        DiffState::Ready(RenderedDiff::Text { model, .. }, layout) => (model, layout),
+        DiffState::Ready(RenderedDiff::Error(error), _) => {
+            return information_state("Could not compare with the file on disk", error.clone());
+        }
+        DiffState::Ready(RenderedDiff::NoText(content), _) => return no_text_view(content),
+    };
+    if model.is_empty() {
+        return information_state(
+            "No differences",
+            "Your edits and the file on disk hold the same text.",
+        );
+    }
+    let mode = runtime.diff_mode;
+    // Which side is which, in the tones the rows use: neither side is the
+    // reader's mistake, so the names say where the text is, not who is right.
+    let side = |label: &'static str, style: fn(&cosmic::Theme) -> iced::widget::text::Style| {
+        crate::design::caption(label).class(cosmic::theme::Text::Custom(style))
+    };
+    let legend = widget::row::with_children([
+        side("\u{2212} On disk", crate::design::removed_text).into(),
+        side("+ Your text", crate::design::added_text).into(),
+    ])
+    .spacing(space::M)
+    .padding([space::XS, space::M]);
+    let rows = crate::ui_controls::responsive(move |size| {
+        let typography = runtime.diff_typography();
+        let gutter = typography.gutter_width(model.row_count(DiffMode::Inline));
+        let code_width = typography.code_width(model);
+        let geometry = DiffScrollGeometry::new(size.width, gutter, mode);
+        let viewport_width = geometry.viewport_width;
+        let overflow = geometry.overflow(code_width);
+        let horizontal = comparison.horizontal.clamp(0.0, overflow);
+        let rows = layout.rows(mode);
+        let visible = visible_diff_rows(rows, comparison.viewport);
+        let mut children = Vec::with_capacity(visible.end - visible.start + 3);
+        if visible.top_space > 0.0 {
+            children.push(iced::widget::Space::new().height(visible.top_space).into());
+        }
+        for row in visible.start..visible.end {
+            children.push(match mode {
+                DiffMode::Inline => inline_diff_row_with_review(
+                    &model.inline_rows[row],
+                    &model.syntax,
+                    gutter,
+                    code_width,
+                    horizontal,
+                    None,
+                    typography,
+                ),
+                DiffMode::Split => split_diff_row_with_review(
+                    &model.split_rows[row],
+                    &model.syntax,
+                    gutter,
+                    code_width,
+                    horizontal,
+                    None,
+                    typography,
+                ),
+            });
+        }
+        if visible.bottom_space > 0.0 {
+            children.push(
+                iced::widget::Space::new()
+                    .height(visible.bottom_space)
+                    .into(),
+            );
+        }
+        // The horizontal thumb's rail, as in `diff_model_view`.
+        children.push(
+            iced::widget::Space::new()
+                .height(crate::design::SCROLLBAR_GUTTER)
+                .into(),
+        );
+        let canvas = Element::new(DiffHorizontalContent {
+            content: widget::column::with_children(children)
+                .width(viewport_width)
+                .into(),
+            width: Length::Fixed(size.width + overflow),
+            content_width: viewport_width,
+            offset: -horizontal,
+            accessible_text: None,
+            viewport: Some(iced::Size::new(viewport_width, size.height)),
+        });
+        widget::scrollable(canvas)
+            .direction(iced::widget::scrollable::Direction::Both {
+                vertical: crate::design::scrollbar(),
+                horizontal: crate::design::scrollbar(),
+            })
+            .id(comparison.scroll_id.clone())
+            .on_scroll(move |viewport| RepositoryAction::DiskComparisonViewport {
+                card,
+                offset: viewport.absolute_offset().y,
+                height: viewport.bounds().height,
+                horizontal: viewport.absolute_offset().x,
+            })
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .into()
+    });
+    widget::column::with_children([legend.into(), rows.into()]).into()
+}
+
 fn editable_document_view<'a>(
     card: CardId,
     runtime: &'a RepositoryRuntime,
     document: &'a EditorDocument,
 ) -> Element<'a, RepositoryAction> {
-    let mut error_rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
-    if let Some(error) = document
-        .error
-        .as_ref()
-        .or(document.durability_warning.as_ref())
-    {
-        let mut actions: Vec<Element<'a, RepositoryAction>> =
-            vec![crate::design::body(error).width(Length::Fill).into()];
-        if document.conflict || document.durability_warning().is_some() {
-            actions.push(
-                icon_button(Icon::Refresh, "Reload file from disk")
-                    .on_press_maybe(
-                        (!runtime.is_saving()).then(|| RepositoryAction::Reload { card }),
-                    )
-                    .into(),
-            );
-        }
-        if document.conflict {
-            actions.push(
-                icon_button(Icon::Save, "Overwrite conflicting file on disk")
-                    .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
-                        card,
-                        overwrite: true,
-                    }))
-                    .into(),
-            );
-        } else if document.durability_warning().is_some() {
-            actions.push(
-                icon_button(Icon::Save, "Retry save")
-                    .on_press_maybe(runtime.can_save().then(|| RepositoryAction::Save {
-                        card,
-                        overwrite: false,
-                    }))
-                    .into(),
-            );
-        }
-        error_rows.push(
-            widget::container(widget::row::with_children(actions).spacing(space::S))
-                .class(cosmic::theme::Container::Secondary)
-                .padding(space::M)
-                .into(),
-        );
-    }
-    let content: Element<'a, RepositoryAction> = if runtime.source_surface == SourceSurface::Editor
+    let error_rows: Vec<Element<'a, RepositoryAction>> =
+        disk_notice(card, runtime, document).into_iter().collect();
+    let comparison = runtime.current_disk_comparison();
+    let content: Element<'a, RepositoryAction> = if let Some(comparison) = comparison {
+        disk_comparison_view(card, runtime, comparison)
+    } else if runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Preview
     {
         // The preview is the same document the editor shows, so it reads at

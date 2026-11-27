@@ -178,6 +178,8 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ChatRead { .. }
             | ClientRequest::ChatAcknowledge { .. }
             | ClientRequest::ChatList
+            | ClientRequest::ChatReadExitedQueuePage { .. }
+            | ClientRequest::ChatReadExitedQueue { .. }
             | ClientRequest::ReadWorkspaceModel
             | ClientRequest::ReadWorkspaceView { .. }
             | ClientRequest::ReadWorkspaceSnapshot
@@ -499,6 +501,9 @@ fn chat_startup_request(request: &ClientRequest) -> bool {
             | ClientRequest::ChatList
             | ClientRequest::ResolveUpgradeChat { .. }
             | ClientRequest::ChatPrepareResume { .. }
+            | ClientRequest::ChatPrepareResumeWithQueue { .. }
+            | ClientRequest::ChatReadExitedQueuePage { .. }
+            | ClientRequest::ChatReadExitedQueue { .. }
     )
 }
 
@@ -1461,10 +1466,11 @@ fn process_admitted_request(
     match request {
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountReset { request } = operation {
-                let outcome = super::agent_execution::account_info::consume(host, request)
+                let actor = super::agent_execution::terminals::reset_actor(host, client_id)?;
+                let outcome = super::agent_execution::account_info::consume(host, request, actor)
                     .map_err(|message| {
-                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
-                    })?;
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                })?;
                 let value = serde_json::to_value(outcome).map_err(|_| {
                     ProtocolError::new(
                         ProtocolErrorCode::Internal,
@@ -1699,6 +1705,11 @@ fn process_admitted_request(
                     }
                     crate::agent_execution::AcceptanceError::MailboxFull(message) => {
                         ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
+                    }
+                    // Its sentence carries the counts and holders, which the
+                    // CLI reads back out of it.
+                    crate::agent_execution::AcceptanceError::LimitReached(refusal) => {
+                        ProtocolError::new(ProtocolErrorCode::QueueFull, refusal.to_string(), true)
                     }
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
@@ -1991,6 +2002,11 @@ fn process_admitted_request(
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatStartInPane { .. }
         | ClientRequest::ChatPrepareResume { .. }
+        | ClientRequest::ChatPrepareResumeWithQueue { .. }
+        | ClientRequest::ChatQueueRecipientScope { .. }
+        | ClientRequest::ChatReadExitedQueuePage { .. }
+        | ClientRequest::ChatReadExitedQueue { .. }
+        | ClientRequest::ChatCommitExitedQueue { .. }
         | ClientRequest::ChatRecoverAccount { .. }
         | ClientRequest::ChatPreview { .. }
         | ClientRequest::ChatCandidates { .. }

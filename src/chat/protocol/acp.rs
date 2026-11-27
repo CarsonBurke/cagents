@@ -26,7 +26,7 @@
 //!
 //! Antigravity's subagents are listed apart from the parent, with the steps
 //! of theirs that reach its session; see [`subagents`].
-use super::{Adapter, ProcessSpec, Step};
+use super::{Adapter, ProcessSpec, QueuedInput, Step};
 use crate::chat::{
     self, Capabilities, Choice, Command, Event, Item, ItemContent, Launch, PlanState, PlanStep,
     PromptMode, Request, RequestKind, Role, SkillReach, SlashCommand, ToolStatus,
@@ -288,7 +288,7 @@ const RUN_TURN_REFUSAL: &str = "This turn is answering a message that waits for 
 
 /// A message written during a turn, held for the next one.
 struct Queued {
-    message: chat::QueuedMessage,
+    input: QueuedInput,
     blocks: Vec<Value>,
     /// The message as the transcript shows it once it is sent.
     items: Vec<Item>,
@@ -492,8 +492,13 @@ impl Acp {
     }
 
     fn capabilities(&self) -> Event {
+        // A turn answering a correlated run takes no message into it, which
+        // would change the reply the run's caller waits for: what is written
+        // meanwhile is queued for the next turn.
+        let steers =
+            self.profile.steers && !self.turn.as_ref().is_some_and(|turn| turn.run.is_some());
         Event::Capabilities(Capabilities {
-            steer: self.profile.steers,
+            steer: steers,
             // A message queued during a turn waits here for the next one.
             queue: true,
             queue_remove: true,
@@ -502,7 +507,7 @@ impl Acp {
             queue_start: true,
             queue_holds: true,
             // Sending what is queued now steers it into the running turn.
-            send_queued_now: self.profile.steers,
+            send_queued_now: steers,
             interrupt_stops_background: self.profile.cancel_stops_background,
             attachments: true,
             compact: self.compacts(),
@@ -768,10 +773,14 @@ impl Acp {
             ));
         }
         self.next_queued += 1;
-        let mut message = chat::QueuedMessage::new(self.queued_id(self.next_queued), text);
-        message.attachments = attachments;
+        let input = QueuedInput::new(
+            self.queued_id(self.next_queued),
+            text,
+            attachments,
+            chat::QueueDelivery::NextTurn,
+        );
         self.queued.push(Queued {
-            message,
+            input,
             blocks,
             items,
             bytes,
@@ -799,7 +808,7 @@ impl Acp {
         step.events.push(Event::QueueChanged(
             self.queued
                 .iter()
-                .map(|queued| queued.message.clone())
+                .map(|queued| queued.input.preview.clone())
                 .collect(),
         ));
     }
@@ -983,6 +992,8 @@ impl Acp {
                 run,
                 event: ProviderEvent::Finished { outcome: kind },
             });
+            // The run answered, the conversation takes steering again.
+            step.events.push(self.capabilities());
         }
         step.events.push(Event::TurnFinished {
             key: Some(turn.key),
@@ -1674,6 +1685,15 @@ fn tool_item(id: String, content: ItemContent) -> Item {
 }
 
 impl Adapter for Acp {
+    fn recovery_queue(&self) -> Option<Vec<chat::QueuedMessage>> {
+        Some(
+            self.queued
+                .iter()
+                .map(|queued| queued.input.recovery())
+                .collect(),
+        )
+    }
+
     fn initialize(&mut self) -> Result<Step, String> {
         let (_, frame) = self.request(
             "initialize",
@@ -1771,6 +1791,8 @@ impl Adapter for Acp {
                 },
             },
         );
+        // While it answers the run, the turn takes nothing steered into it.
+        step.events.push(self.capabilities());
         Ok(step)
     }
 
@@ -1900,7 +1922,7 @@ impl Adapter for Acp {
                 }
                 step.events.push(Event::Status {
                     busy: true,
-                    detail: "Stopping".into(),
+                    detail: chat::TURN_STOPPING.into(),
                 });
                 Ok(step)
             }
@@ -1998,7 +2020,7 @@ impl Adapter for Acp {
                 let position = self
                     .queued
                     .iter()
-                    .position(|queued| queued.message.id == id);
+                    .position(|queued| queued.input.preview.id == id);
                 if let Some(position) = position {
                     self.queued.remove(position);
                 }
@@ -2044,7 +2066,7 @@ impl Adapter for Acp {
                 let position = self
                     .queued
                     .iter()
-                    .position(|queued| queued.message.id == id)
+                    .position(|queued| queued.input.preview.id == id)
                     .ok_or_else(|| format!("That message is no longer queued with {label}."))?;
                 let between = self.turn.is_none();
                 if between {

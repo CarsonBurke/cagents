@@ -13,7 +13,6 @@ pub fn find_options<'a, Message: Clone + 'static>(
     case_sensitive: bool,
     regex: bool,
     whole_word: bool,
-    enabled: bool,
     on_toggle: impl Fn(FindOption, bool) -> Message + Copy + 'a,
 ) -> Element<'a, Message> {
     widget::row::with_children(
@@ -34,10 +33,9 @@ pub fn find_options<'a, Message: Clone + 'static>(
         ]
         .into_iter()
         .map(|(option, selected, label, description)| {
-            let mut control = super::field::checkbox(selected).label(label);
-            if enabled {
-                control = control.on_toggle(move |value| on_toggle(option, value));
-            }
+            let control = super::field::checkbox(selected)
+                .label(label)
+                .on_toggle(move |value| on_toggle(option, value));
             crate::interaction::tooltip(control, description)
         }),
     )

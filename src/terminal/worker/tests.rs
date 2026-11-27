@@ -527,13 +527,29 @@ fn a_shell_location_title_gives_way_to_the_foreground_command() {
         .unwrap()
         .join("billing-service");
     std::fs::create_dir(&working).unwrap();
+    // The foreground command must stay put while the titles are compared:
+    // the launch holder execs it, and one that exits leaves only its name.
+    // A builtin readiness message proves the shell holds the foreground,
+    // and its builtin read keeps it there until the worker drops.
     let (mut worker, events) = capture_worker_for(LaunchRecipe {
         unset_environment: Default::default(),
-        program: "/usr/bin/true".into(),
-        arguments: Vec::new(),
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), "printf ready; IFS= read -r release".into()],
         working_directory: working.clone(),
         environment: BTreeMap::new(),
     });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut received = Vec::new();
+    while !received.ends_with(b"ready") {
+        match worker
+            .pty_rx
+            .recv_deadline(deadline)
+            .expect("the shell never reported readiness")
+        {
+            PtyMessage::Bytes(bytes) => received.extend(bytes),
+            other => panic!("the shell ended before reporting readiness: {other:?}"),
+        }
+    }
     let titles = |events: &Receiver<TerminalEvent>| {
         events
             .try_iter()
@@ -569,12 +585,8 @@ fn a_shell_location_title_gives_way_to_the_foreground_command() {
             .all(|title| title.ends_with(" · billing-service") && !title.contains('/')),
         "{shown:?}"
     );
-    // Whatever holds the foreground in this harness names the command.
     let fallback = worker.display_title.clone();
-    assert!(
-        fallback.ends_with(" · billing-service") && !fallback.contains('/'),
-        "{fallback:?}"
-    );
+    assert_eq!(fallback, "sh · billing-service");
     worker.process_output(b"\x1b]2;main.rs - VIM\x07".to_vec());
     assert_eq!(titles(&events), vec!["main.rs - VIM".to_owned()]);
     worker.process_output(format!("\x1b]2;cargo build {}\x07", canonical.display()).into_bytes());

@@ -27,8 +27,9 @@ use cagents::repository::{
     HistoryRequest, HistoryRevision, InProgressOperation, MutationFailure, MutationLocks,
     MutationOutcome, Oid, OperationKind, PathSelection, ProcessExecutor, ProcessFailure,
     ProcessFailureKind, ProcessOutput, PushOutcome, PushRequest, PushTarget, RemoteSideRef,
-    RepoPath, RepositoryService, RepositorySnapshot, StageRequest, SystemProcessExecutor,
-    TrackingState, UnstageRequest, ValidatedBranchName, ValidatedRefName,
+    RepoPath, RepositoryService, RepositorySnapshot, SnapshotDigest, SnapshotOptions, SnapshotRead,
+    StageRequest, SystemProcessExecutor, TrackingState, UnstageRequest, ValidatedBranchName,
+    ValidatedRefName,
 };
 
 /// Applies configuration isolation and a fixed identity to every command,
@@ -5660,5 +5661,98 @@ fn a_continue_with_nothing_staged_leaves_later_messages_alone() {
         fixture.text(&["log", "--format=%s", "-3"]),
         "three\ntwo\none",
         "no commit took the box's message"
+    );
+}
+
+/// Starting or skipping an empty cherry-pick changes neither the status nor
+/// HEAD, so a refresh that compares only those would keep the old banner;
+/// the operation is part of what decides whether a worktree changed.
+#[test]
+fn a_refresh_sees_an_operation_that_changes_nothing_else() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    diverged(&fixture);
+    let service = fixture.service();
+    let cancel = CancellationToken::new();
+    let read = |previous: Option<&SnapshotDigest>| {
+        service
+            .snapshot_if_changed(
+                &fixture.work(),
+                SnapshotOptions::default(),
+                previous,
+                &cancel,
+            )
+            .expect("snapshot")
+    };
+    let SnapshotRead::Changed { digest, .. } = read(None) else {
+        panic!("a first read is a full one");
+    };
+    let clean = digest.expect("nothing changed recently");
+    assert_eq!(read(Some(&clean)), SnapshotRead::Unchanged);
+
+    fixture.run_failing(&fixture.work(), &["cherry-pick", "side"]);
+    fixture.git_in_work(&["checkout", "--ours", "--", "f.txt", "g.txt"]);
+    fixture.git_in_work(&["add", "f.txt", "g.txt"]);
+    assert_eq!(fixture.porcelain(), "", "the tree reads as before");
+    let SnapshotRead::Changed { snapshot, digest } = read(Some(&clean)) else {
+        panic!("the stopped cherry-pick is a change");
+    };
+    assert_eq!(
+        snapshot.operation.map(|operation| operation.kind),
+        Some(OperationKind::CherryPick)
+    );
+    let picking = digest.expect("nothing changed recently");
+
+    service
+        .skip_operation(&fixture.work(), OperationKind::CherryPick, &cancel)
+        .expect("skip");
+    let SnapshotRead::Changed { snapshot, .. } = read(Some(&picking)) else {
+        panic!("the skipped cherry-pick is a change");
+    };
+    assert_eq!(snapshot.operation, None);
+}
+
+/// A Continue that commits a step and then stops for a reason other than
+/// a conflict reports both: the progress, and why it stopped.
+#[test]
+fn a_continue_that_stops_for_another_reason_says_why() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("f.txt", b"base\n");
+    fixture.commit_all("base");
+    fixture.git_in_work(&["checkout", "--quiet", "-b", "side"]);
+    fixture.write("f.txt", b"side\n");
+    fixture.commit_all("side one");
+    fixture.write("new.txt", b"from side\n");
+    fixture.commit_all("side two");
+    fixture.git_in_work(&["checkout", "--quiet", "main"]);
+    fixture.write("f.txt", b"main\n");
+    fixture.commit_all("main");
+    fixture.git_in_work(&["checkout", "--quiet", "side"]);
+    fixture.run_failing(&fixture.work(), &["rebase", "main"]);
+    fixture.write("f.txt", b"resolved\n");
+    fixture.git_in_work(&["add", "f.txt"]);
+    // The next step would overwrite this untracked file.
+    fixture.write("new.txt", b"in the way\n");
+    let before = fixture.head();
+
+    let continued = fixture
+        .service()
+        .continue_operation(
+            &fixture.work(),
+            OperationKind::Rebase,
+            None,
+            &CancellationToken::new(),
+        )
+        .expect("continue");
+    assert_ne!(fixture.head(), before, "the first step was committed");
+    assert!(
+        matches!(
+            &continued,
+            MutationOutcome::PartiallyApplied { failures, .. } if failures.len() == 1
+        ),
+        "{continued:?}"
     );
 }

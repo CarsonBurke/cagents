@@ -116,8 +116,12 @@ fn inventory_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.cutover-inventory.json"))
 }
 
-#[cfg(feature = "host")]
-fn persist(state: &Path, target: &Path, bytes: &[u8], exclusive: bool) -> Result<(), UpdateError> {
+pub(super) fn persist(
+    state: &Path,
+    target: &Path,
+    bytes: &[u8],
+    exclusive: bool,
+) -> Result<(), UpdateError> {
     let temporary = state.join(format!(".cutover-{}", uuid::Uuid::new_v4()));
     let saved = (|| {
         let mut file = private_create(&temporary)?;
@@ -141,6 +145,14 @@ fn persist(state: &Path, target: &Path, bytes: &[u8], exclusive: bool) -> Result
         let _ = fs::remove_file(temporary);
     }
     saved
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn persist_ready_activation_claim(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
+    let state = path
+        .parent()
+        .ok_or_else(|| invalid("Ready claim has no update directory"))?;
+    persist(state, path, bytes, true)
 }
 
 fn has_witness(state: &Path, job: &str) -> Result<bool, UpdateError> {

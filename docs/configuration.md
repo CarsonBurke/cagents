@@ -20,6 +20,7 @@ without replacing the last valid value.
 cagents follows the XDG base-directory convention. Production paths are:
 
 - Settings: `${XDG_CONFIG_HOME:-$HOME/.config}/cagents/settings.toml`
+- Agent concurrency limits: `${XDG_CONFIG_HOME:-$HOME/.config}/cagents/agent-concurrency.toml`, set with `cagents agent limits` (see [Concurrent runs](agent-execution.md#concurrent-runs))
 - Session database: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/sessions.sqlite3`
 - Named-window databases: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/windows/<name>/sessions.sqlite3`
 - Full-upgrade checkpoint: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/daemon-upgrade/`

@@ -7240,6 +7240,14 @@ pub(in crate::app) fn write(app: &mut Cagents, card: CardId, text: &str) {
     )));
 }
 
+pub(in crate::app) fn dismiss_restored_queue_notice(app: &mut Cagents, card: CardId) {
+    let runtime = chat_runtime(app, card);
+    assert!(runtime.restored_waiting.is_some());
+    let target = runtime.target;
+    drop(app.update(Message::ChatUi(Action::DismissRestoredWaiting(target))));
+    assert!(chat_runtime(app, card).restored_waiting.is_none());
+}
+
 /// Lay out the real chat and dispatch a key through its focused composer.
 /// This uses native text shaping and widget bindings, without host input.
 fn composer_history_key(
@@ -9320,7 +9328,7 @@ pub(in crate::app) fn starting_chat_in(
     (card, target)
 }
 
-pub(super) fn answer_start(
+pub(in crate::app) fn answer_start(
     app: &mut Cagents,
     target: Target,
     result: Result<Arc<ClientHandle>, chat::StartFailure>,
@@ -9568,7 +9576,7 @@ fn account_commit_reply(task: Task<Message>) -> Message {
         })
 }
 
-pub(super) fn fixture_handle(
+pub(in crate::app) fn fixture_handle(
     app: &Cagents,
     card: CardId,
     session_id: Option<&str>,
@@ -10722,7 +10730,7 @@ fn failed_chat(app: &mut Cagents) -> CardId {
     card
 }
 
-pub(super) fn chat_runtime_attempt(app: &Cagents, card: CardId) -> Target {
+pub(in crate::app) fn chat_runtime_attempt(app: &Cagents, card: CardId) -> Target {
     app.chat_ui
         .attempt(card)
         .expect("a start is in flight")
@@ -12438,6 +12446,7 @@ fn reopen_with(
             host: Some(daemon_proof(queue_daemon)),
             messages: waiting,
             stopped: false,
+            restored: None,
         },
     );
     let target = chat_runtime_attempt(&app, card);
@@ -12593,10 +12602,10 @@ fn a_queue_the_new_provider_still_lists_stays_with_the_provider() {
         let runtime = chat_runtime(&app, card);
         // Renumbered, the listed message carries the other saved
         // message's id, yet its words still claim the message it is: either
-        // way only the message the provider no longer holds comes back.
+        // way what remains is only a preview, so the draft stays as typed.
         assert_eq!(
             runtime.composer.text().trim(),
-            "And summarize\ntyped after",
+            "typed after",
             "renumbered: {renumbered}"
         );
         assert!(runtime.attachments.is_empty());
@@ -12739,6 +12748,7 @@ fn a_provider_queue_is_saved_while_it_holds_messages() {
             host: Some(daemon_proof("fixture")),
             messages: saved_queue(),
             stopped: false,
+            restored: None,
         })
     );
     // The provider's next publication is saved when it arrives.
@@ -18734,6 +18744,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                 intent: chat::Intent::Restore,
                 session: source.clone(),
                 recovery: None,
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
@@ -18793,6 +18804,7 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
                     intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
+                    disconnect: None,
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
@@ -24618,6 +24630,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                     committed: false,
                     submit: None,
                 }),
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
@@ -24636,6 +24649,7 @@ fn retained_live_model_upgrade_does_not_supersede_account_return_or_close_owners
                     intent: chat::Intent::Restore,
                     session: other,
                     recovery: None,
+                    disconnect: None,
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
@@ -24943,6 +24957,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                 intent: chat::Intent::Restore,
                 session: source.clone(),
                 recovery: None,
+                disconnect: None,
                 upgrade_committed: false,
                 resume_committed: false,
                 upgrade_admission: None,
@@ -25022,6 +25037,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
                     intent: chat::Intent::Restore,
                     session: source.clone(),
                     recovery: None,
+                    disconnect: None,
                     upgrade_committed: false,
                     resume_committed: false,
                     upgrade_admission: None,
@@ -26484,4 +26500,720 @@ fn a_turn_waiting_on_background_commands_says_so() {
         runtime.conversation_status(false).0,
         Some(Icon::AgentWorking)
     );
+}
+
+#[test]
+fn ended_acp_queue_returns_to_the_existing_draft_once() {
+    for observed_exit in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Antigravity);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.queued_messages = saved_queue();
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.refresh();
+        runtime.replace_draft(text_editor::Content::with_text("typed after"));
+
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.exited = true;
+        handle.publish_snapshot_for_test(snapshot);
+        if observed_exit {
+            let saves = crate::app::terminal_output_tests::persists();
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            assert!(crate::app::terminal_output_tests::persists() > saves);
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        }
+        // Opening a fresh conversation can also replace the runtime before
+        // it processes the exit wake.
+        app.stash_unsent_chat(card);
+        assert!(app.chat_waiting_to_save(card).messages.is_empty());
+        let mut replacement = Runtime::new(
+            target,
+            chat_runtime(&app, card).session.clone(),
+            Connection::Live(handle.clone()),
+            true,
+            app.settings.editor_syntax_theme,
+        );
+        app.restore_saved_draft(card, &mut replacement);
+        app.cards
+            .insert(card, CardRuntime::Chat(Box::new(replacement)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "Then run the tests\nAnd summarize\ntyped after"
+        );
+        assert_eq!(
+            runtime.attachments,
+            [Attachment::file("/project/notes.txt")]
+        );
+        assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(2));
+        assert!(runtime.commands.outgoing().next().is_none());
+    }
+}
+
+#[test]
+fn reopening_a_direct_provider_does_not_return_the_same_exit_queue_again() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Antigravity);
+    let source = chat_runtime(&app, card).session.clone();
+    let mut exit = (*handle.snapshot()).clone();
+    exit.generation += 1;
+    exit.exited = true;
+    exit.queued_messages = saved_queue();
+    handle.publish_snapshot_for_test(exit);
+    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(2));
+    runtime.replace_draft(text_editor::Content::with_text("edited after exit"));
+    runtime.replace_attachments(Vec::new());
+    let saved = app.persistent_workspace();
+    assert!(saved.chat_waiting_messages[&card].restored.is_some());
+
+    app.chat_ui = State::for_workspace(&saved);
+    app.cards.remove(&card);
+    drop(app.start_chat(card, source, chat::Intent::Resume, None, false));
+    let target = chat_runtime_attempt(&app, card);
+    let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+    drop(app.handle_chat_ui(Action::Ready(target, ready)));
+
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.composer.text().trim(), "edited after exit");
+    assert!(runtime.attachments.is_empty());
+    assert!(runtime.restored_waiting.is_none());
+    assert!(runtime.waiting_messages().is_empty());
+}
+
+#[test]
+fn a_retained_provider_exit_returns_the_queue_but_a_disconnected_attachment_does_not() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let mut session = chat_runtime(&app, card).session.clone();
+    session.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    let handle = Arc::new(ClientHandle::fixture(
+        session.clone(),
+        Snapshot {
+            ready: true,
+            session_id: session.launch.session_id.clone(),
+            queued_messages: saved_queue(),
+            ..Snapshot::default()
+        },
+    ));
+    {
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.session = session;
+        runtime.connection = Connection::Live(handle.clone());
+        assert!(!runtime.restore_exited_queue());
+        assert!(runtime.composer.text().trim().is_empty());
+    }
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.exited = true;
+    handle.publish_snapshot_for_test(snapshot);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.restore_exited_queue());
+    assert!(!runtime.restore_exited_queue());
+    assert_eq!(
+        runtime.composer.text().trim(),
+        "Then run the tests
+And summarize"
+    );
+    assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(2));
+}
+
+#[test]
+fn retained_exit_queue_replay_restores_only_unseen_messages_after_reopen() {
+    for residency in [Residency::Cold, Residency::Hot, Residency::Hibernated] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let mut source = chat_runtime(&app, card).session.clone();
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+        let messages = saved_queue();
+        let key = completed_queue_key(source.id, &messages).unwrap();
+        let mut preview = messages[1].clone();
+        preview.editable = false;
+        preview.text = "And summa…".into();
+        let mut exit = Snapshot {
+            ready: true,
+            session_id: source.launch.session_id.clone(),
+            exited: true,
+            queued_messages: vec![messages[0].clone(), preview],
+            ..Snapshot::default()
+        };
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+                source.clone(),
+                exit.clone(),
+            )));
+            runtime.replace_draft(text_editor::Content::with_text("typed after"));
+            assert!(runtime.restore_exited_queue());
+        }
+
+        let saved = app.persistent_workspace();
+        assert_eq!(
+            saved.chat_waiting_messages[&card].restored,
+            Some(RestoredQueue {
+                source: source.id,
+                ids: vec![messages[0].id.clone()],
+            }),
+        );
+        let waiting = &saved.chat_waiting_messages[&card].messages;
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].id, messages[1].id);
+        assert!(!waiting[0].editable);
+        assert!(!saved.chat_drafts[&card].contains("And summa…"));
+        assert!(!saved.returned_chat_queues.contains_key(&card));
+
+        // Start again from the checkpoint, with the saved draft but without
+        // its old attachment or its previous in-memory reconciliation.
+        app.chat_ui = State::for_workspace(&saved);
+        app.cards.remove(&card);
+        if residency != Residency::Cold {
+            exit.queued_messages.clear();
+            let mut runtime = Runtime::new(
+                target,
+                source.clone(),
+                Connection::Live(Arc::new(ClientHandle::fixture(source.clone(), exit))),
+                true,
+                app.settings.editor_syntax_theme,
+            );
+            app.restore_saved_draft(card, &mut runtime);
+            if residency == Residency::Hibernated {
+                app.chat_ui.parked.insert(card, Box::new(runtime));
+            } else {
+                app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+            }
+        }
+        drop(app.start_chat(card, source.clone(), chat::Intent::Resume, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let failed = Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            "The resume did not prepare a successor",
+        ))))));
+        drop(app.handle_chat_ui(Action::ReadyAfterExitedQueue(
+            target,
+            source.id,
+            Arc::new(messages.clone()),
+            failed,
+        )));
+        if residency == Residency::Hot {
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(1));
+        }
+        let saved = app.persistent_workspace();
+        let text = &saved.chat_drafts[&card];
+        assert_eq!(text.matches("Then run the tests").count(), 1);
+        assert_eq!(text.matches("And summarize").count(), 1);
+        assert_eq!(text.matches("typed after").count(), 1);
+        assert_eq!(
+            saved.chat_draft_attachments[&card],
+            [Attachment::file("/project/notes.txt")]
+        );
+        assert_eq!(
+            saved.chat_waiting_messages[&card]
+                .restored
+                .as_ref()
+                .unwrap()
+                .ids,
+            messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(saved.returned_chat_queues[&card][&key], Some(card));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("direct-queue.sqlite3");
+        let boot = crate::model::BootId::new("direct-queue-fixture");
+        let store = crate::persistence::StateStore::open(&path, boot.clone()).unwrap();
+        let commit = store
+            .save_workspace(
+                &saved,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.has_returned_chat_queue(card, key).unwrap());
+
+        if residency == Residency::Hibernated {
+            // A parked runtime has already exercised the atomic composer
+            // capture. Its async close belongs to the terminal handoff path.
+            continue;
+        }
+        drop(app.begin_chat_close(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        let drafts = &mut Arc::make_mut(&mut app.durable).kept_chat_drafts;
+        for index in 0..=crate::model::KeptChatDraft::LIMIT {
+            drafts.insert(
+                CardId::new(),
+                crate::model::KeptChatDraft {
+                    text: format!("other draft {index}"),
+                    closed_at_unix_ms: unix_millis() + index as i64,
+                    ..Default::default()
+                },
+            );
+        }
+        store
+            .save_workspace(
+                &app.persistent_workspace(),
+                crate::persistence::SnapshotBase {
+                    workspace: commit.generation,
+                    cards: &commit.card_generations,
+                },
+            )
+            .unwrap();
+        drop(store);
+        drop(app);
+
+        let store = crate::persistence::StateStore::open(&path, boot).unwrap();
+        let original = store
+            .saved_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.card == card)
+            .expect("the original named chat remains");
+        assert_eq!(original.session.id, source.id);
+        let saved = store.load_workspace(saved.id, None).unwrap().unwrap();
+        assert!(!saved.kept_chat_drafts.contains_key(&card));
+        assert_eq!(saved.returned_chat_queues[&card][&key], None);
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace = Cagents::rebuild_workspace(&saved);
+        app.chat_ui = State::for_workspace(&saved);
+        app.durable = Arc::new(saved);
+        assert!(!app.keep_reopened_queue(
+            card,
+            &original.session,
+            &chat::ExitedQueue {
+                messages,
+                account_scope: None,
+                confirmed_session: original.session.launch.session_id.clone(),
+            }
+        ));
+        assert!(!app.durable.kept_chat_drafts.contains_key(&card));
+    }
+}
+
+#[test]
+fn refused_direct_queue_recovery_is_committed_before_an_immediate_close() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let runtime = chat_runtime(&app, card);
+    let mut source = runtime.session.clone();
+    source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().session = source.clone();
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("coalesced-queue.sqlite3");
+    let boot = crate::model::BootId::new("coalesced-queue-fixture");
+    let (writer, _) = crate::session::SessionRuntime::open(&path, boot.clone()).unwrap();
+    let workspace = app.durable.id;
+    app.session = Some(writer);
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(10))
+        .unwrap();
+
+    let mut message = provider_message("final-1", "Then summarize the complete result");
+    message.attachments = vec![Attachment::file("/project/notes.txt")];
+    let queue = Arc::new(vec![message]);
+    let next = Arc::new(vec![provider_message("next-1", "A later actor's queue")]);
+    let key = completed_queue_key(source.id, &queue).unwrap();
+    let next_key = completed_queue_key(source.id, &next).unwrap();
+    let mut preview = queue[0].clone();
+    preview.text = "Then summarize…".into();
+    preview.editable = false;
+    for messages in [Arc::new(vec![preview]), queue.clone(), next, queue.clone()] {
+        drop(app.start_chat(card, source.clone(), chat::Intent::Resume, None, false));
+        let attempt = chat_runtime_attempt(&app, card);
+        let failure = Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            "The resume did not prepare a successor",
+        ))))));
+        drop(app.handle_chat_ui(Action::ReadyAfterExitedQueue(
+            attempt,
+            source.id,
+            messages.clone(),
+            failure,
+        )));
+        if !messages[0].editable {
+            assert!(!app.returned_chat_queue(card, key));
+            assert!(
+                !app.chat_composer_text(card)
+                    .unwrap()
+                    .contains("Then summarize…")
+            );
+        }
+    }
+
+    // No flush separates confirmation, close, and the final autosave. The
+    // writer must keep the snapshot containing the composer out of that
+    // coalesced lane even after every ordinary draft displaced its kept copy.
+    drop(app.begin_chat_close(card));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert_eq!(
+        app.durable.kept_chat_drafts[&card].text.trim(),
+        "A later actor's queue\nThen summarize the complete result",
+    );
+    let drafts = &mut Arc::make_mut(&mut app.durable).kept_chat_drafts;
+    for index in 0..=crate::model::KeptChatDraft::LIMIT {
+        drafts.insert(
+            CardId::new(),
+            crate::model::KeptChatDraft {
+                text: format!("other draft {index}"),
+                closed_at_unix_ms: unix_millis() + index as i64,
+                ..Default::default()
+            },
+        );
+    }
+    app.persist();
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(10))
+        .unwrap();
+    let store = app.session.as_ref().unwrap().operation_store();
+    let saved = store.load_workspace(workspace, None).unwrap().unwrap();
+    assert!(!saved.kept_chat_drafts.contains_key(&card));
+    assert!(store.has_returned_chat_queue(card, key).unwrap());
+    assert!(store.has_returned_chat_queue(card, next_key).unwrap());
+    let original = store
+        .saved_conversations()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.card == card)
+        .expect("the original history remains");
+    assert!(!app.keep_reopened_queue(
+        card,
+        &original.session,
+        &chat::ExitedQueue {
+            messages: (*queue).clone(),
+            account_scope: None,
+            confirmed_session: original.session.launch.session_id.clone(),
+        }
+    ));
+}
+
+#[test]
+fn early_completed_queues_recover_in_delivery_order() {
+    for refused in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+        let source = chat_runtime(&app, card).session.clone();
+        let mut anonymous_source = source.clone();
+        anonymous_source.launch.session_id = None;
+        app.cards.remove(&card);
+        app.chat_ui
+            .drafts
+            .insert(card, "independently typed".into());
+
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("early-receipts.sqlite3"),
+            crate::model::BootId::new("early-completed-queue-fixture"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        drop(app.start_chat(card, source.clone(), chat::Intent::Restore, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        let archived = provider_message("archived-1", "The previous actor's queued message");
+        let current = provider_message("current-1", "The current actor's queued message");
+        let previous_key = completed_queue_key(source.id, std::slice::from_ref(&archived)).unwrap();
+        let current_key = completed_queue_key(source.id, std::slice::from_ref(&current)).unwrap();
+        let mut preview = current.clone();
+        preview.text = "The current actor…".into();
+        preview.editable = false;
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.queued_messages = vec![preview.clone()];
+        handle.publish_snapshot_for_test(snapshot.clone());
+
+        // A duplicated old notice and an incomplete preview do not take the
+        // second slot from the later exact completion of the replacement.
+        for (source, message, current) in [
+            (anonymous_source.clone(), archived.clone(), false),
+            (anonymous_source, archived, false),
+            (source.clone(), preview, true),
+            (source.clone(), current, true),
+        ] {
+            drop(app.handle_chat_ui(Action::Wake(
+                target,
+                Wake::CompletedQueue {
+                    source: Box::new(source),
+                    messages: vec![message],
+                    current,
+                },
+            )));
+        }
+        assert_eq!(app.chat_ui.completed_queues[&card].receipts.len(), 2);
+        assert!(
+            app.chat_ui.completed_queues[&card].receipts[0]
+                .source
+                .launch
+                .session_id
+                .is_none()
+        );
+        assert!(!app.returned_chat_queue(card, previous_key));
+        assert!(!app.returned_chat_queue(card, current_key));
+        if refused {
+            answer_start(
+                &mut app,
+                target,
+                Err(chat::StartFailure::retry("The attachment was refused")),
+            );
+        } else {
+            answer_start(&mut app, target, Ok(handle.clone()));
+            snapshot.generation += 1;
+            snapshot.exited = true;
+            handle.publish_snapshot_for_test(snapshot);
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            assert!(chat_runtime(&app, card).complete_exit_queue);
+        }
+        assert!(!app.chat_ui.completed_queues.contains_key(&card));
+
+        let saved = app.persistent_workspace();
+        assert_eq!(
+            saved.chat_drafts[&card].trim(),
+            "The previous actor's queued message\nThe current actor's queued message\nindependently typed",
+        );
+        assert!(saved.chat_waiting_messages[&card].messages.is_empty());
+        assert_eq!(saved.returned_chat_queues[&card][&previous_key], Some(card));
+        assert_eq!(saved.returned_chat_queues[&card][&current_key], Some(card));
+        let writer = app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let store = writer.operation_store();
+        assert!(store.has_returned_chat_queue(card, previous_key).unwrap());
+        assert!(store.has_returned_chat_queue(card, current_key).unwrap());
+    }
+}
+
+#[test]
+fn a_later_completion_stays_after_the_recovered_prefix_or_the_edited_draft() {
+    for edited in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+        let source = chat_runtime(&app, card).session.clone();
+        app.cards.remove(&card);
+        app.chat_ui
+            .drafts
+            .insert(card, "Independently typed".into());
+        let typed_file = Attachment::file("/project/typed.txt");
+        app.chat_ui
+            .draft_attachments
+            .insert(card, vec![typed_file.clone()]);
+
+        drop(app.start_chat(card, source.clone(), chat::Intent::Restore, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        let older_file = Attachment::file("/project/older.txt");
+        let current_file = Attachment::file("/project/current.txt");
+        let mut older = provider_message("older-1", "Earlier recovered résumé");
+        older.attachments.push(older_file.clone());
+        drop(app.handle_chat_ui(Action::Wake(
+            target,
+            Wake::CompletedQueue {
+                source: Box::new(source.clone()),
+                messages: vec![older],
+                current: false,
+            },
+        )));
+        answer_start(&mut app, target, Ok(handle));
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "Earlier recovered résumé\nIndependently typed",
+        );
+        dismiss_restored_queue_notice(&mut app, card);
+
+        let revised_file = Attachment::file("/project/revised.txt");
+        if edited {
+            write(&mut app, card, " with a user edit");
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .attach([revised_file.path.clone()]);
+        }
+        let before = chat_runtime(&app, card).composer.text();
+        let mut current = provider_message("current-1", "Later recovered message");
+        current.attachments.push(current_file.clone());
+        drop(app.handle_chat_ui(Action::Wake(
+            target,
+            Wake::CompletedQueue {
+                source: Box::new(source),
+                messages: vec![current],
+                current: true,
+            },
+        )));
+
+        let runtime = chat_runtime(&app, card);
+        let (text, files) = if edited {
+            (
+                format!("{}\nLater recovered message", before.trim_end()),
+                vec![older_file, typed_file, revised_file, current_file],
+            )
+        } else {
+            (
+                "Earlier recovered résumé\nLater recovered message\nIndependently typed".into(),
+                vec![older_file, current_file, typed_file],
+            )
+        };
+        assert_eq!(runtime.composer.text().trim(), text, "edited={edited}");
+        assert_eq!(runtime.attachments, files, "edited={edited}");
+    }
+}
+
+#[test]
+fn refused_queue_read_before_ready_keeps_the_exact_attachment_retryable() {
+    const REFUSAL: &str = "The held input page expired";
+    for (early_refusal, dead_handle, expected) in [
+        (true, true, Some(REFUSAL)),
+        (false, false, None),
+        (false, true, Some("Conversation connection closed")),
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+        let existing = chat_runtime(&app, card);
+        let stale = existing.target;
+        let source = existing.session.clone();
+        let typed_file = Attachment::file("/project/typed.txt");
+        write(&mut app, card, "Independently typed");
+        app.chat_runtime_mut(stale)
+            .unwrap()
+            .attach([typed_file.path.clone()]);
+        drop(app.start_chat(card, source, chat::Intent::Restore, None, false));
+
+        let target = chat_runtime_attempt(&app, card);
+        assert_ne!(target, stale);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        if dead_handle {
+            handle.disconnect_for_test();
+        }
+        // An old reader's callback cannot poison this attempt.
+        drop(app.handle_chat_ui(Action::Wake(
+            stale,
+            Wake::Disconnected("Old reader closed".into()),
+        )));
+        if early_refusal {
+            // The queue reader reports a refused page as a disconnect and
+            // sends no CompletedQueue event with the partially read body.
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Disconnected(REFUSAL.into()))));
+            drop(app.handle_chat_ui(Action::Wake(
+                target,
+                Wake::Disconnected("Daemon disconnected".into()),
+            )));
+        }
+        answer_start(&mut app, target, Ok(handle));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.target, target);
+        assert_eq!(runtime.disconnected, dead_handle);
+        assert_eq!(runtime.error.as_deref(), expected);
+        assert_eq!(runtime.composer.text().trim(), "Independently typed");
+        assert_eq!(runtime.attachments, vec![typed_file]);
+        assert!(runtime.restored_queue.is_none());
+
+        if dead_handle {
+            drop(app.handle_chat_ui(Action::Reconnect(target)));
+            assert_ne!(chat_runtime_attempt(&app, card), target);
+        }
+    }
+}
+
+#[test]
+fn recovering_a_prior_archive_leaves_the_live_replacements_queue_waiting() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let source = chat_runtime(&app, card).session.clone();
+    let handle = chat_runtime(&app, card).handle().unwrap().clone();
+    let held = provider_message("replacement-1", "The live actor is still holding this");
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.queued_messages = vec![held.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+
+    let previous = provider_message("archived-1", "The old queue");
+    let key = completed_queue_key(source.id, std::slice::from_ref(&previous)).unwrap();
+    let mut foreign = source.clone();
+    foreign.proof.as_mut().unwrap().host_incarnation = "different-daemon".into();
+    drop(app.handle_chat_ui(Action::Wake(
+        target,
+        Wake::CompletedQueue {
+            source: Box::new(foreign),
+            messages: vec![previous.clone()],
+            current: true,
+        },
+    )));
+    assert!(!app.returned_chat_queue(card, key));
+
+    drop(app.handle_chat_ui(Action::Wake(
+        target,
+        Wake::CompletedQueue {
+            source: Box::new(source),
+            messages: vec![previous],
+            current: false,
+        },
+    )));
+    assert!(app.returned_chat_queue(card, key));
+    assert!(!chat_runtime(&app, card).complete_exit_queue);
+    assert_eq!(app.chat_waiting_to_save(card).messages, [held]);
+}
+
+#[test]
+fn startup_releases_only_a_complete_direct_queue_after_its_checkpoint() {
+    for (retained, editable) in [(false, true), (true, true), (false, false)] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let mut source = chat_runtime(&app, card).session.clone();
+        if retained {
+            source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        }
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target).unwrap().session = source.clone();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup-queue.sqlite3");
+        let boot = crate::model::BootId::new("startup-queue-fixture");
+        let (writer, _) = crate::session::SessionRuntime::open(&path, boot).unwrap();
+        app.session = Some(writer);
+        let intent = if retained {
+            chat::Intent::Resume
+        } else {
+            chat::Intent::Start
+        };
+        drop(app.start_chat(card, source.clone(), intent, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let mut message = provider_message("held-input", "Keep the queued message");
+        message.editable = editable;
+        let messages = Arc::new(vec![message]);
+        let key = completed_queue_key(source.id, &messages);
+        let ready = Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            "The replacement start was refused",
+        ))))));
+        let task = app.handle_chat_ui(Action::ReadyAfterExitedQueue(
+            target, source.id, messages, ready,
+        ));
+
+        assert_eq!(task.units(), usize::from(!retained && editable));
+        // Inspect the actual writer state without executing the daemon request.
+        drop(task);
+        let writer = app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let store = writer.operation_store();
+        let saved = store.load_workspace(app.durable.id, None).unwrap().unwrap();
+        if let Some(key) = key {
+            assert!(store.has_returned_chat_queue(card, key).unwrap());
+            assert_eq!(saved.chat_drafts[&card].trim(), "Keep the queued message");
+        } else {
+            assert!(!saved.returned_chat_queues.contains_key(&card));
+            assert!(!saved.chat_drafts.contains_key(&card));
+        }
+    }
 }

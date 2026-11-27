@@ -3180,6 +3180,79 @@ fn idle_steer_waits_for_consumption_and_starts_a_turn() {
 }
 
 #[test]
+fn recovery_keeps_full_acknowledged_input_and_omits_unproved_or_consumed_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let attachment = Attachment::file(directory.path().join("notes.txt"));
+    std::fs::write(&attachment.path, "attachment content").unwrap();
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        async_input: true,
+        ..Default::default()
+    };
+    let next_turn = format!("first {} tail", "雪".repeat(7 * 1024));
+    let next_step = format!("second {} tail", "水".repeat(7 * 1024));
+    let submit = |adapter: &mut Claude, text: &str, attachments, mode| {
+        let mut step = adapter.send_prompt(text.into(), attachments, mode).unwrap();
+        step.writes.remove(0)["uuid"].as_str().unwrap().to_owned()
+    };
+    let first = submit(
+        &mut adapter,
+        &next_turn,
+        vec![attachment.clone()],
+        PromptMode::Queue,
+    );
+    assert!(adapter.recovery_queue().is_none());
+    let second = submit(&mut adapter, &next_step, Vec::new(), PromptMode::Steer);
+    let lifecycle =
+        |id: &str, state| json!({"type":"command_lifecycle","command_uuid":id,"state":state});
+    adapter.receive(lifecycle(&first, "queued")).unwrap();
+
+    let partial = adapter.recovery_queue().unwrap();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].id, first);
+    assert_eq!(partial[0].text, next_turn);
+    assert_eq!(partial[0].attachments, [attachment]);
+    assert!(partial[0].editable);
+
+    let step = adapter.receive(lifecycle(&second, "queued")).unwrap();
+    assert!(
+        step.events
+            .iter()
+            .any(|event| matches!(event, Event::QueueChanged(messages)
+                if messages.iter().all(|message| !message.editable
+                    && message.text.ends_with("[Queue preview truncated]"))
+            ))
+    );
+    let proved = adapter.recovery_queue().unwrap();
+    assert_eq!(
+        proved
+            .iter()
+            .map(|message| (message.id.as_str(), message.text.as_str(), message.delivery))
+            .collect::<Vec<_>>(),
+        [
+            (
+                second.as_str(),
+                next_step.as_str(),
+                chat::QueueDelivery::NextStep
+            ),
+            (
+                first.as_str(),
+                next_turn.as_str(),
+                chat::QueueDelivery::NextTurn
+            )
+        ]
+    );
+
+    adapter.receive(lifecycle(&second, "started")).unwrap();
+    assert_eq!(adapter.recovery_queue().unwrap()[0].id, first);
+    adapter.receive(lifecycle(&first, "cancelled")).unwrap();
+    // A delayed admission for a cancelled message does not put it back.
+    adapter.receive(lifecycle(&first, "queued")).unwrap();
+    assert_eq!(adapter.recovery_queue(), Some(Vec::new()));
+}
+
+#[test]
 fn queued_input_is_visible_immediately_but_enters_transcript_only_on_delivery() {
     let directory = tempfile::tempdir().unwrap();
     let attachment = directory.path().join("notes.txt");
@@ -11201,6 +11274,90 @@ fn rejected_model_change_does_not_apply_or_report_effort() {
     );
     assert_eq!(adapter.selected.as_deref(), Some("old"));
     assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+}
+
+#[test]
+fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
+    let mut adapter = Claude::default();
+    adapter.receive(json!({"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+    let answers = |query: Vec<String>, limit: Vec<String>| {
+        vec![
+            Answer {
+                field: "query".into(),
+                values: query,
+            },
+            Answer {
+                field: "limit".into(),
+                values: limit,
+            },
+        ]
+    };
+    // A blank required field is missing, and the request stays pending.
+    for blank in [vec![], vec![String::new()]] {
+        let error = adapter
+            .answer("e1".into(), "accept".into(), answers(blank, vec![]))
+            .unwrap_err();
+        assert!(error.contains("Missing required Claude field"), "{error}");
+    }
+    // Skipping a blank answer must not hide a duplicate or unknown field.
+    for field in ["limit", "unknown"] {
+        let mut duplicate = answers(vec!["search".into()], vec![]);
+        duplicate.push(Answer {
+            field: field.into(),
+            values: if field == "limit" {
+                vec!["5".into()]
+            } else {
+                vec![]
+            },
+        });
+        let error = adapter
+            .answer("e1".into(), "accept".into(), duplicate)
+            .unwrap_err();
+        assert!(error.contains("unknown or duplicate field"), "{error}");
+    }
+    // An untouched optional field arrives with no value; a cleared one may
+    // arrive as one empty string. Either way it is left out of the reply.
+    for (id, blank) in [("e2", vec![]), ("e3", vec![String::new()])] {
+        adapter.receive(json!({"type":"control_request","request_id":id,"request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+        let step = adapter
+            .answer(
+                id.into(),
+                "accept".into(),
+                answers(vec!["search".into()], blank),
+            )
+            .unwrap();
+        assert_eq!(
+            step.writes[0]["response"]["response"],
+            json!({"action":"accept","content":{"query":"search"}})
+        );
+    }
+    let step = adapter
+        .answer(
+            "e1".into(),
+            "accept".into(),
+            answers(vec!["search".into()], vec!["5".into()]),
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"query":"search","limit":5}})
+    );
+    // An empty multi-select is a selection of nothing, not a blank field.
+    adapter.receive(json!({"type":"control_request","request_id":"e4","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string","enum":["a","b"]}}},"required":["tags"]}}})).unwrap();
+    let step = adapter
+        .answer(
+            "e4".into(),
+            "accept".into(),
+            vec![Answer {
+                field: "tags".into(),
+                values: vec![],
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"tags":[]}})
+    );
 }
 
 #[test]
