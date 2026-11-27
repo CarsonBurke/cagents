@@ -525,7 +525,7 @@ impl Cagents {
                         };
                         if worktree.path == main {
                             self.status = Some(TransientNotice::warning(
-                                "The main checkout can't be deleted. Remove the project instead.",
+                                "The main checkout can't be deleted on its own. It goes when the project is removed.",
                             ));
                             return Task::none();
                         }
