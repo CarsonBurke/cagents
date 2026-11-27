@@ -325,6 +325,15 @@ fn device_access(operation: &DeviceOperation) -> Access<'static> {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn restoring_terminals() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        "The application update is still restoring its terminals",
+        true,
+    )
+}
+
 /// Refuses what startup recovery's hold on original ownership does not admit.
 /// Called before and after the control gate; admitting a fresh start records
 /// its identity as independent of recovery, which repeating does not change.
@@ -332,6 +341,21 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
     let access = access(request);
     let mut guard = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut state: &mut HostState = &mut guard;
+    #[cfg(target_os = "macos")]
+    if state.has_parked_update()
+        && !matches!(
+            request,
+            ClientRequest::Connect { .. }
+                | ClientRequest::Authenticate { .. }
+                | ClientRequest::BuildInfo
+                | ClientRequest::StartupState
+                | ClientRequest::List
+                | ClientRequest::ListPage { .. }
+                | ClientRequest::ChatList
+        )
+    {
+        return Err(restoring_terminals());
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if state.publishing_startup && !matches!(access, Access::Open | Access::Close(_)) {
         return Err(ProtocolError::new(

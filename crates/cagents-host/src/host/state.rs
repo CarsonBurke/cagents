@@ -290,8 +290,14 @@ struct PendingPublication {
     handle: TerminalHandle,
     source: TerminalSession,
     pane: Option<crate::model::CardId>,
-    original: Option<(crate::model::CardId, u64)>,
+    original: PublicationSource,
     reservation: Option<super::workspace::PendingTerminal>,
+}
+
+enum PublicationSource {
+    Observed(Option<(crate::model::CardId, u64)>),
+    /// Staging an existing PTY did not open the model writer.
+    AfterSelection,
 }
 
 struct MobileSubscription {
@@ -326,6 +332,8 @@ pub(crate) struct HostState {
     startup_custody: BTreeSet<TerminalId>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) publishing_startup: bool,
+    #[cfg(target_os = "macos")]
+    parked_update: Option<ParkedUpdate>,
     publication_pending: BTreeMap<TerminalId, PendingPublication>,
     /// Missing original owners after an acknowledged incomplete update. Their
     /// saved pane recipes are evidence, never automatic execution authority.
@@ -561,6 +569,8 @@ impl HostState {
             startup_custody: BTreeSet::new(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             publishing_startup: false,
+            #[cfg(target_os = "macos")]
+            parked_update: None,
             publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
             startup_recovery: None,
@@ -2687,6 +2697,12 @@ impl HostState {
         if let Some(held) = super::fixture_startup_recovery::held() {
             return held.state();
         }
+        #[cfg(target_os = "macos")]
+        if let Some(update) = &self.parked_update {
+            return StartupState::Restoring {
+                awaiting: update.promotions.len() as u64,
+            };
+        }
         match &self.startup_recovery {
             Some(detail) => StartupState::Retained {
                 detail: detail.clone(),
@@ -4135,7 +4151,7 @@ struct RestoreFinalization {
     store: Arc<crate::upgrade::handoff::Store>,
     interrupted_setups: bool,
     #[cfg(target_os = "macos")]
-    restoring_digest: String,
+    restoring_digest: Option<String>,
 }
 
 impl RestoredUpgrade {
@@ -4149,7 +4165,7 @@ impl RestoredUpgrade {
         self.finalization
             .as_ref()
             .filter(|finalization| !finalization.interrupted_setups)
-            .map(|finalization| finalization.restoring_digest.as_str())
+            .and_then(|finalization| finalization.restoring_digest.as_deref())
     }
 
     #[cfg(target_os = "macos")]
@@ -4185,6 +4201,233 @@ impl RestoredUpgrade {
         state.retained_startup_checkpoint.take();
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+struct ParkedUpdate {
+    expected: BTreeSet<TerminalId>,
+    promotions: BTreeMap<TerminalId, crate::terminal::ParkedTerminalPromotion>,
+}
+
+#[cfg(target_os = "macos")]
+impl HostState {
+    pub(super) fn has_parked_update(&self) -> bool {
+        self.parked_update.is_some()
+    }
+
+    fn parks_update_terminal(&self, id: TerminalId) -> bool {
+        self.parked_update
+            .as_ref()
+            .is_some_and(|update| update.expected.contains(&id))
+    }
+
+    pub(super) fn parked_update_inventory(&self) -> Result<Vec<TerminalDescriptor>, String> {
+        let update = self
+            .parked_update
+            .as_ref()
+            .ok_or("No carried terminal update is staged")?;
+        if self.terminals.len() != update.expected.len()
+            || update.promotions.len() != update.expected.len()
+            || !self.chats.is_empty()
+        {
+            return Err("The staged update did not hold exactly the reviewed terminals".into());
+        }
+        update
+            .expected
+            .iter()
+            .map(|id| {
+                let record = self
+                    .terminals
+                    .get(id)
+                    .ok_or_else(|| format!("Terminal {id} was not parked"))?;
+                if !record.handle.is_parked_for_update()
+                    || !record.handle.holder_identity().is_some_and(|holder| {
+                        holder.holder.is_current() && holder.root.is_current()
+                    })
+                {
+                    return Err(format!(
+                        "Terminal {id} no longer has its original live holder"
+                    ));
+                }
+                self.descriptor(0, *id).map_err(|error| error.message)
+            })
+            .collect()
+    }
+
+    pub(super) fn grant_parked_update(&mut self) -> Result<(), String> {
+        let update = self
+            .parked_update
+            .as_mut()
+            .ok_or("No carried terminal update is staged")?;
+        for (id, promotion) in &mut update.promotions {
+            promotion
+                .grant()
+                .map_err(|error| format!("Terminal {id}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn parked_update_promotions_confirmed(&mut self) -> Result<bool, String> {
+        let update = self
+            .parked_update
+            .as_mut()
+            .ok_or("No carried terminal update is staged")?;
+        let mut settled = Vec::new();
+        for (id, promotion) in &update.promotions {
+            if promotion
+                .outcome()
+                .map_err(|error| format!("Terminal {id}: {error}"))?
+                .is_some()
+            {
+                settled.push(*id);
+            }
+        }
+        for id in settled {
+            update.promotions.remove(&id);
+        }
+        Ok(update.promotions.is_empty())
+    }
+
+    pub(super) fn end_parked_update(&mut self) {
+        self.parked_update.take();
+    }
+}
+
+/// Park the acknowledged holders under the inherited runtime lease. The
+/// checkpoint stays Ready on disk until the selected daemon finishes.
+#[cfg(target_os = "macos")]
+pub(super) fn stage_installed_carried_terminals(
+    host: &SharedHost,
+    store: crate::upgrade::handoff::Store,
+    checkpoint: crate::upgrade::handoff::Checkpoint,
+) -> Result<Option<RestoredUpgrade>, String> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let holders = holder_directory()?;
+    let expected = checkpoint
+        .carried
+        .iter()
+        .map(|terminal| terminal.source.id)
+        .collect();
+    let records = registry::observe_update_roster(Kind::Terminal, &checkpoint.proof.boot_id)
+        .map_err(|error| error.to_string())?;
+    let actual = records
+        .iter()
+        .map(|record| record.terminal)
+        .collect::<BTreeSet<_>>();
+    if expected != actual
+        || !registry::observe_update_roster(Kind::Native, &checkpoint.proof.boot_id)
+            .map_err(|error| error.to_string())?
+            .is_empty()
+    {
+        return Ok(None);
+    }
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    for record in records {
+        let socket = registry::socket(&holders, record.terminal);
+        if !crate::terminal::holder_protects_replay(&socket, &record, &proof)? {
+            return Ok(None);
+        }
+    }
+    if crate::daemon::termination_requested() {
+        return Err(RESTORE_TERMINATED.to_owned());
+    }
+    let store = Arc::new(store);
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.enable_holder_recovery();
+        state.parked_update = Some(ParkedUpdate {
+            expected,
+            promotions: BTreeMap::new(),
+        });
+        state.retained_startup_checkpoint = Some(checkpoint.clone());
+        state.upgrade_evidence = Some(store.clone());
+    }
+    for terminal in &checkpoint.carried {
+        if crate::daemon::termination_requested() {
+            return Err(RESTORE_TERMINATED.to_owned());
+        }
+        if !adopt_carried_terminal(
+            host,
+            terminal,
+            Some(&holders),
+            std::path::Path::new("/proc"),
+            false,
+        ) {
+            return Err(format!(
+                "The original holder for terminal {} could not be parked",
+                terminal.source.id
+            ));
+        }
+        if let Some(error) = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .startup_recovery()
+        {
+            return Err(error.to_owned());
+        }
+    }
+    Ok(Some(RestoredUpgrade {
+        unattached: Vec::new(),
+        finalization: Some(RestoreFinalization {
+            store,
+            interrupted_setups: false,
+            restoring_digest: None,
+        }),
+    }))
+}
+
+/// Once the selected successor acknowledges every original terminal, publish
+/// its model sources and move durable execution authority to those owners.
+#[cfg(target_os = "macos")]
+pub(super) fn finish_installed_carried_terminals(host: &SharedHost) -> Result<(), String> {
+    let publications = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let update = state
+            .parked_update
+            .as_ref()
+            .ok_or("No carried terminal update is staged")?;
+        update
+            .expected
+            .iter()
+            .map(|id| {
+                let record = state
+                    .terminals
+                    .get(id)
+                    .ok_or_else(|| format!("Terminal {id} disappeared after promotion"))?;
+                if record.handle.is_completed()
+                    || record.handle.startup_unresolved()
+                    || !record.handle.holder_identity().is_some_and(|holder| {
+                        holder.holder.is_current() && holder.root.is_current()
+                    })
+                {
+                    return Err(format!(
+                        "Terminal {id} did not prove live original custody after promotion"
+                    ));
+                }
+                let (source, previous) = record
+                    .upgrade_sources
+                    .split_last()
+                    .ok_or_else(|| format!("Terminal {id} has no original lineage"))?;
+                Ok((
+                    *id,
+                    record.handle.clone(),
+                    record.options.clone(),
+                    source.clone(),
+                    previous.to_vec(),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+    for (id, handle, options, source, previous) in publications {
+        publish_installed_terminal(host, None, id, &handle, &options)
+            .map_err(|error| error.message)?;
+        restore_terminal_execution_authority(host, &source, &previous)?;
+    }
+    Ok(())
 }
 
 /// Stop starting checkpointed processes as soon as termination is requested.
@@ -4568,7 +4811,7 @@ fn restore_upgrade_checkpoint(
             store,
             interrupted_setups,
             #[cfg(target_os = "macos")]
-            restoring_digest,
+            restoring_digest: Some(restoring_digest),
         }),
     })
 }
@@ -4711,6 +4954,13 @@ fn adopt_carried_terminal(
     allow_restart: bool,
 ) -> bool {
     let id = terminal.source.id;
+    #[cfg(target_os = "macos")]
+    let parked = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .parks_update_terminal(id);
+    #[cfg(not(target_os = "macos"))]
+    let parked = false;
     let mut error = "no directory for holders".to_owned();
     if let Some(holders) = holders {
         let socket = holder_socket(holders, id);
@@ -4795,6 +5045,11 @@ fn adopt_carried_terminal(
                         tracing::info!(terminal = %id, "adopted a terminal carried across the upgrade");
                     }
                     drop(state);
+                    if parked {
+                        // The selected daemon publishes execution authority
+                        // after every parked worker confirms promotion.
+                        return true;
+                    }
                     if let Err(error) = restore_terminal_execution_authority(
                         host,
                         &previous.source,
@@ -5463,6 +5718,14 @@ fn start_terminal_view_owned_reserved(
         )?;
     }
     let terminal_id = session.id;
+    #[cfg(target_os = "macos")]
+    let parked = adoption.is_some()
+        && shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .parks_update_terminal(terminal_id);
+    #[cfg(not(target_os = "macos"))]
+    let parked = false;
     let retained_environment = execution_environment.clone();
     // Adoption already inspected this holder's issued source. Keep that exact
     // receipt alias in the independently installed owner, including when the
@@ -5472,11 +5735,19 @@ fn start_terminal_view_owned_reserved(
         .map_or_else(|| session.clone(), |previous| previous.source.clone());
     // Pane reservations are read on the workspace writer, which is always
     // locked before HostState and never while holding it.
-    let pending_writer = match super::workspace::writer(shared) {
-        Ok(writer) => Some(writer),
-        #[cfg(test)]
-        Err(_) if pending_pane.is_none() => None,
-        Err(error) => return Err(error),
+    let pending_writer = if parked {
+        assert!(
+            pending_pane.is_none(),
+            "a carried holder has no fresh pane reservation"
+        );
+        None
+    } else {
+        match super::workspace::writer(shared) {
+            Ok(writer) => Some(writer),
+            #[cfg(test)]
+            Err(_) if pending_pane.is_none() => None,
+            Err(error) => return Err(error),
+        }
     };
     let (holder_recovery, publication_source, pending_reservation) = {
         let registry = pending_writer
@@ -5742,58 +6013,73 @@ fn start_terminal_view_owned_reserved(
     let install_environment = retained_environment.clone();
     let install_execution = execution_recipe.clone();
     let install_redraw = redraw.clone();
-    let handle = match TerminalHandle::spawn_with_execution_installed(
-        session.clone(),
-        config,
-        execution_recipe.clone(),
-        move |wake| {
-            wake_redraw.publish(wake.generation);
-        },
-        |handle| {
-            if !adopting {
-                return Ok(());
-            }
-            let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
-            // This record, not the returned error, independently owns the
-            // exact Handle before its thread may send CommitAdoption.
-            state
-                .install_startup_parent(
-                    subscriber,
-                    install_session,
-                    handle.clone(),
-                    false,
-                    install_execution,
-                    install_environment,
-                )
-                .map_err(|error| error.message)?;
-            state
-                .terminals
-                .get_mut(&terminal_id)
-                .expect("installed startup owner")
-                .options = install_options;
+    let wake = move |wake: crate::terminal::TerminalWake| wake_redraw.publish(wake.generation);
+    let install = |handle: &TerminalHandle| {
+        if !adopting {
+            return Ok(());
+        }
+        let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+        // This record, not the returned error, independently owns the
+        // exact Handle before its thread may send CommitAdoption.
+        state
+            .install_startup_parent(
+                subscriber,
+                install_session,
+                handle.clone(),
+                false,
+                install_execution,
+                install_environment,
+            )
+            .map_err(|error| error.message)?;
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("installed startup owner")
+            .options = install_options;
+        if !parked {
             state.startup_custody.insert(terminal_id);
-            let _ = install_redraw.worker.set(handle.downgrade());
-            handle.set_event_observer(move |source, event| {
-                install_redraw.record_event(source, event);
-            });
-            #[cfg(test)]
-            if state.test_fail_startup_commit == Some(terminal_id) {
-                handle.fail_startup_commit_after_ack_for_test();
-            }
-            #[cfg(test)]
-            if state
-                .test_checkpoint_failure_at
-                .as_ref()
-                .is_some_and(|(id, _)| *id == terminal_id)
-            {
-                let (_, path) = state.test_checkpoint_failure_at.take().unwrap();
-                std::fs::rename(&path, path.with_extension("before-failure.json")).unwrap();
-                std::fs::create_dir(&path).unwrap();
-            }
-            Ok(())
-        },
-    ) {
-        Ok(handle) => handle,
+        }
+        let _ = install_redraw.worker.set(handle.downgrade());
+        handle.set_event_observer(move |source, event| {
+            install_redraw.record_event(source, event);
+        });
+        #[cfg(test)]
+        if state.test_fail_startup_commit == Some(terminal_id) {
+            handle.fail_startup_commit_after_ack_for_test();
+        }
+        #[cfg(test)]
+        if state
+            .test_checkpoint_failure_at
+            .as_ref()
+            .is_some_and(|(id, _)| *id == terminal_id)
+        {
+            let (_, path) = state.test_checkpoint_failure_at.take().unwrap();
+            std::fs::rename(&path, path.with_extension("before-failure.json")).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        }
+        Ok(())
+    };
+    let result = if parked {
+        TerminalHandle::spawn_parked_for_update(
+            session.clone(),
+            config,
+            execution_recipe.clone(),
+            wake,
+            install,
+        )
+        .map(|(handle, promotion)| (handle, Some(promotion)))
+    } else {
+        TerminalHandle::spawn_with_execution_installed(
+            session.clone(),
+            config,
+            execution_recipe.clone(),
+            wake,
+            install,
+        )
+        .map(|handle| (handle, None))
+    };
+    let (handle, promotion) = match result {
+        Ok(started) => started,
         Err(crate::terminal::TerminalStartError::CustodyRetained { handle, message }) => {
             let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
             assert!(
@@ -5879,7 +6165,11 @@ fn start_terminal_view_owned_reserved(
                 handle: handle.clone(),
                 source: session.clone(),
                 pane: pending_pane,
-                original: publication_source,
+                original: if parked {
+                    PublicationSource::AfterSelection
+                } else {
+                    PublicationSource::Observed(publication_source)
+                },
                 reservation: pending_reservation,
             },
         );
@@ -5894,6 +6184,24 @@ fn start_terminal_view_owned_reserved(
     redraw_handle.set_event_observer(move |handle, event| {
         redraw.record_event(handle, event);
     });
+
+    if let Some(promotion) = promotion {
+        #[cfg(target_os = "macos")]
+        {
+            let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
+            let update = state
+                .parked_update
+                .as_mut()
+                .expect("the installed update owns this terminal reservation");
+            update.promotions.insert(terminal_id, promotion);
+            return Ok((state.descriptor(0, terminal_id)?, redraw_handle));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            drop(promotion);
+            unreachable!("only installed Darwin updates park terminal adoption");
+        }
+    }
 
     let descriptor = match publish_installed_terminal(
         shared,
@@ -5928,6 +6236,29 @@ fn publish_installed_terminal(
     let mut registry = writer
         .as_ref()
         .map(|w| w.lock().unwrap_or_else(|p| p.into_inner()));
+    #[cfg(target_os = "macos")]
+    let reads_selected_source = shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .publication_pending
+        .get(&id)
+        .is_some_and(|pending| {
+            pending.handle.same_worker(expected)
+                && matches!(pending.original, PublicationSource::AfterSelection)
+        });
+    #[cfg(target_os = "macos")]
+    let selected_source = if reads_selected_source {
+        registry
+            .as_deref()
+            .map(|registry| registry.terminal_publication_source(id))
+            .transpose()
+            .map_err(model_unavailable)?
+            .flatten()
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let selected_source = None;
     // Writer admission precedes resident serialization, including repair.
     let sql = registry
         .as_deref_mut()
@@ -5940,7 +6271,10 @@ fn publish_installed_terminal(
         .get(&id)
         .filter(|p| p.handle.same_worker(expected))
         .ok_or_else(|| not_found(id))?;
-    let original = pending.original;
+    let original = match pending.original {
+        PublicationSource::Observed(original) => original,
+        PublicationSource::AfterSelection => selected_source,
+    };
     let pane = pending.pane;
     if let (Some(reservation), Some(sql)) = (&pending.reservation, &sql) {
         reservation.validate(sql)?;

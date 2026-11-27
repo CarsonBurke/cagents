@@ -65,6 +65,34 @@ impl ReadyCapture {
     pub fn checkpoint_digest(&self) -> &str {
         &self.checkpoint_hash
     }
+
+    #[cfg(any(test, target_os = "macos"))]
+    pub fn covers_only_carried_terminals(
+        &self,
+        checkpoint: &crate::upgrade::handoff::Checkpoint,
+    ) -> bool {
+        let census = &self.capture.census;
+        if !checkpoint.preserve_carried
+            || checkpoint.carried.is_empty()
+            || !checkpoint.terminals.is_empty()
+            || !checkpoint.chats.is_empty()
+            || !census.is_terminal_only()
+            || census.terminals.len() != checkpoint.carried.len()
+        {
+            return false;
+        }
+        let originals = census
+            .terminals
+            .iter()
+            .map(|source| (source.id, source))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        originals.len() == checkpoint.carried.len()
+            && checkpoint.carried.iter().all(|carried| {
+                originals
+                    .get(&carried.source.id)
+                    .is_some_and(|source| same_terminal(source, &carried.source))
+            })
+    }
 }
 
 #[cfg(feature = "host")]
@@ -72,6 +100,40 @@ pub fn capture() -> Result<Option<ReadyCapture>, String> {
     let Some(store) = super::super::super::handoff::Store::existing()? else {
         return Ok(None);
     };
+    capture_from(&store)
+}
+
+#[cfg(all(feature = "host", target_os = "macos"))]
+pub struct ObservedCarriedReady {
+    pub capture: ReadyCapture,
+    pub store: crate::upgrade::handoff::Store,
+    pub checkpoint: crate::upgrade::handoff::Checkpoint,
+}
+
+/// Observe precisely the approved Ready payload without repairing storage
+/// permissions or transitioning the checkpoint to Restoring.
+#[cfg(all(feature = "host", target_os = "macos"))]
+pub fn observe_carried(expected: &str) -> Result<Option<ObservedCarriedReady>, String> {
+    let store = crate::upgrade::handoff::Store::observe_existing()?
+        .ok_or("Installed startup lost its acknowledged Ready checkpoint")?;
+    let capture = capture_from(&store)?
+        .filter(|capture| capture.checkpoint_digest() == expected)
+        .ok_or("Installed startup lost its acknowledged Ready capture")?;
+    let checkpoint = store
+        .load_for_restore(Some(expected))?
+        .ok_or("Installed startup lost its approved Ready checkpoint")?;
+    if !capture.covers_only_carried_terminals(&checkpoint) {
+        return Ok(None);
+    }
+    Ok(Some(ObservedCarriedReady {
+        capture,
+        store,
+        checkpoint,
+    }))
+}
+
+#[cfg(feature = "host")]
+fn capture_from(store: &crate::upgrade::handoff::Store) -> Result<Option<ReadyCapture>, String> {
     let Some(status) = store.checkpoint_status()? else {
         return Ok(None);
     };
@@ -479,6 +541,66 @@ pub fn publish(
 mod tests {
     use super::super::tests::{private_root, proof, source, write_private};
     use super::*;
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn parking_requires_exact_acknowledged_terminal_only_coverage() {
+        use crate::{
+            model::TerminalContinuity,
+            upgrade::handoff::{Carried, Checkpoint},
+        };
+        let original = proof("terminal-owner");
+        let source = TerminalSession {
+            id: TerminalId::new(),
+            launch: crate::model::LaunchRecipe::shell("/".into()).unwrap(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::Live {
+                host_session_id: original.host_session_id.clone(),
+                boot_id: original.boot_id.clone(),
+                host_incarnation: original.host_incarnation.clone(),
+            },
+        };
+        let mut ready = ReadyCapture {
+            checkpoint_hash: String::new(),
+            capture_hash: String::new(),
+            capture: CapturedCensus {
+                producer: None,
+                source: original.clone(),
+                checkpoint_hash: None,
+                census: Census {
+                    terminals: vec![source.clone()],
+                    ..Default::default()
+                },
+                windows: Vec::new(),
+            },
+        };
+        let mut checkpoint = Checkpoint::new(
+            original,
+            Vec::new(),
+            vec![Carried {
+                source,
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: Default::default(),
+            }],
+            Vec::new(),
+        );
+        assert!(!ready.covers_only_carried_terminals(&checkpoint));
+        checkpoint.preserve_carried = true;
+        assert!(ready.covers_only_carried_terminals(&checkpoint));
+        ready.capture.census.terminals[0].id = TerminalId::new();
+        assert!(!ready.covers_only_carried_terminals(&checkpoint));
+        ready.capture.census.terminals[0].id = checkpoint.carried[0].source.id;
+        ready.capture.census.chats.push(super::super::tests::source(
+            crate::agent::Provider::Claude,
+            std::path::Path::new("/"),
+        ));
+        assert!(!ready.covers_only_carried_terminals(&checkpoint));
+    }
 
     #[test]
     fn ready_paused_publication_requires_serving_owner_exact_capture_and_fresh_retention() {

@@ -162,6 +162,8 @@ enum Report {
         record: Record,
         recovery: Box<Recovery>,
         screen_lost: bool,
+        #[serde(default)]
+        protects_replay: bool,
     },
     /// Carries the PTY master, then a pin of the root, to a successor.
     Attached {
@@ -547,6 +549,12 @@ impl Attachment {
     }
 }
 
+impl ParkedAdoption {
+    pub(super) fn prepare_worker(self) -> Adopted {
+        self.0
+    }
+}
+
 /// Attaches to a terminal a previous daemon
 /// [detached](Holder::detach) onto `socket`. A root that exited meanwhile
 /// has its exit delivered to `exits` straight away.
@@ -569,7 +577,18 @@ pub(super) fn attach(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Attachment, String> {
-    attach_with_replay_protection(socket, exits, recovery, cfg!(target_os = "macos"))
+    attach_with_replay_protection(socket, exits, recovery, cfg!(target_os = "macos"), false)
+}
+
+pub(super) fn attach_parked(
+    socket: &Path,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+) -> Result<ParkedAdoption, String> {
+    match attach_with_replay_protection(socket, exits, recovery, true, true)? {
+        Attachment::Parked(parked) => Ok(parked),
+        Attachment::Legacy(_) => Err("The registered terminal holder cannot park replay".into()),
+    }
 }
 
 fn attach_with_replay_protection(
@@ -577,11 +596,15 @@ fn attach_with_replay_protection(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
     protect_replay: bool,
+    require_registered: bool,
 ) -> Result<Attachment, String> {
     let evidence = crate::daemon::holder_registry::recovery_candidate(
         socket,
         crate::daemon::holder_registry::Kind::Terminal,
     )?;
+    if require_registered && (evidence.is_none() || recovery.is_none()) {
+        return Err("Parking a terminal requires an authenticated registered holder".into());
+    }
     let mut original_role = None;
     if let Some(record) = &evidence
         && record.application != crate::instance::APPLICATION_ID
@@ -689,6 +712,9 @@ fn attach_with_replay_protection(
             "terminal holder at {} speaks protocol {protocol}, which this daemon cannot adopt",
             socket.display()
         ));
+    }
+    if require_registered && protocol < PARKABLE {
+        return Err("The registered terminal holder cannot park replay".into());
     }
     if evidence.as_ref().is_some_and(|record| {
         record.root.pid != pid || (exited.is_none() && !record.root.is_current())
@@ -2040,6 +2066,7 @@ fn hand_over(
                     record: record.clone(),
                     recovery: Box::new(recovery),
                     screen_lost: replay.screen_lost,
+                    protects_replay: true,
                 },
                 &[],
                 deadline,
@@ -2145,6 +2172,23 @@ pub fn inspect(
     expected: &Record,
     proof: &crate::model::HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
+    inspect_replay(socket, expected, proof).map(|(recovery, lost, _)| (recovery, lost))
+}
+
+#[cfg(target_os = "macos")]
+pub fn protects_replay(
+    socket: &Path,
+    expected: &Record,
+    proof: &crate::model::HostSessionProof,
+) -> Result<bool, String> {
+    inspect_replay(socket, expected, proof).map(|(_, _, supported)| supported)
+}
+
+fn inspect_replay(
+    socket: &Path,
+    expected: &Record,
+    proof: &crate::model::HostSessionProof,
+) -> Result<(Recovery, bool, bool), String> {
     let control =
         crate::daemon::holder_registry::connect(socket).map_err(|error| error.to_string())?;
     let peer = peer_credentials(&control).map_err(|error| error.to_string())?;
@@ -2173,6 +2217,7 @@ pub fn inspect(
             record,
             recovery,
             screen_lost,
+            protects_replay,
         },
         descriptors,
     )) = receive::<Report>(&control).map_err(|error| error.to_string())?
@@ -2183,7 +2228,7 @@ pub fn inspect(
         return Err("holder discovery evidence changed".into());
     }
     recovery.validate(&record.boot, record.terminal)?;
-    Ok((*recovery, screen_lost))
+    Ok((*recovery, screen_lost, protects_replay))
 }
 
 fn authorize_successor(pid: i32, proof: &crate::model::HostSessionProof) -> io::Result<()> {
@@ -3732,10 +3777,48 @@ mod tests {
         };
         assert_eq!(retry.0.output, replay);
         drop(retry);
+        let transcript = directory.join("unopened-parked-transcript");
+        let mut session = next.source.clone();
+        session.transcript_path = Some(transcript.clone());
+        let (worker, promotion) = crate::terminal::TerminalHandle::spawn_parked_for_update(
+            session,
+            crate::terminal::TerminalConfig {
+                adoption: Some(socket.clone()),
+                holder_recovery: Some(next.clone()),
+                initially_visible: false,
+                ..Default::default()
+            },
+            None,
+            |_| {},
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(worker.is_parked_for_update());
+        assert_eq!(
+            worker.input(b"finish\n".to_vec()),
+            Err(crate::terminal::TerminalSendError::Closed)
+        );
+        assert!(matches!(
+            worker.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Unknown(_)
+        ));
+        assert!(
+            !transcript.exists(),
+            "the candidate did not open a transcript before activation"
+        );
+        drop(promotion);
+        crate::test_timing::eventually("the abandoned parked worker to exit", || {
+            worker.is_completed()
+        });
+        assert!(
+            record.root.is_current(),
+            "dropping the promotion ticket kept the original root"
+        );
         let (exits, _) = crossbeam_channel::bounded(1);
-        let mut protected = attach_with_replay_protection(&socket, exits, Some(next.clone()), true)
-            .unwrap()
-            .into_worker();
+        let mut protected =
+            attach_with_replay_protection(&socket, exits, Some(next.clone()), true, false)
+                .unwrap()
+                .into_worker();
         assert_eq!(protected.output, replay);
         protected.held.holder.commit_adoption().unwrap();
         let mut writer = File::from(protected.held.master.duplicate().unwrap());
@@ -3746,9 +3829,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let (mut adopted, exited) = loop {
             let (exits, exited) = crossbeam_channel::bounded(1);
-            let adopted = attach_with_replay_protection(&socket, exits, Some(next.clone()), false)
-                .unwrap()
-                .into_worker();
+            let adopted =
+                attach_with_replay_protection(&socket, exits, Some(next.clone()), false, false)
+                    .unwrap()
+                    .into_worker();
             if String::from_utf8_lossy(&adopted.output)
                 .lines()
                 .any(|line| line == "still-running:fresh-after-ack")
@@ -3850,6 +3934,77 @@ mod tests {
             registry::cleanup::confirmed(&original, &record, &retry).unwrap(),
             "terminal proof survives the daemon loss between paired cleanup and native receipt confirmation"
         );
+
+        let unusable_transcript = directory.join("unusable-transcript");
+        std::fs::create_dir(&unusable_transcript).unwrap();
+        let source = crate::model::TerminalSession {
+            id: crate::model::TerminalId::new(),
+            continuity: crate::model::TerminalContinuity::DetachedSameBoot {
+                host_session_id: retry.host_session_id.clone(),
+                boot_id: retry.boot_id.clone(),
+                host_incarnation: retry.host_incarnation.clone(),
+            },
+            transcript_path: Some(unusable_transcript),
+            ..original
+        };
+        let recovery = Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: Default::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let mut held = spawn_recoverable(
+            command("echo ready; read line; [ \"$line\" = finish ]"),
+            size(),
+            exits,
+            Some(recovery.clone()),
+            false,
+        )
+        .unwrap();
+        cleanup.holder = Some(PinnedProcess::open(holder_pid(&held)).unwrap());
+        read_until(&held.master, "ready");
+        let socket = registry::socket(&holders, source.id);
+        held.holder.detach(&socket, b"").unwrap();
+        drop(held);
+        let (worker, mut promotion) = crate::terminal::TerminalHandle::spawn_parked_for_update(
+            source,
+            crate::terminal::TerminalConfig {
+                adoption: Some(socket),
+                holder_recovery: Some(recovery),
+                initially_visible: false,
+                ..Default::default()
+            },
+            None,
+            |_| {},
+            |_| Ok(()),
+        )
+        .unwrap();
+        promotion.grant().unwrap();
+        crate::test_timing::eventually("promotion despite an unusable transcript", || {
+            promotion.outcome().unwrap().is_some()
+        });
+        assert!(!worker.startup_unresolved());
+        assert!(worker.transcript_location().is_none());
+        let events = worker.events();
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            crate::terminal::TerminalEvent::Error {
+                operation: "open transcript",
+                ..
+            }
+        )));
+        worker.input(b"finish\n".to_vec()).unwrap();
+        crate::test_timing::eventually("the promoted terminal to accept input and exit", || {
+            events.try_iter().any(|event| {
+                matches!(
+                    event,
+                    crate::terminal::TerminalEvent::Completed { exit_code: 0, .. }
+                )
+            })
+        });
     }
 
     #[test]

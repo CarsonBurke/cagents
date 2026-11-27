@@ -1132,6 +1132,12 @@ pub(super) fn record(
         })?,
         true,
     )?;
+    cutover::persist(
+        state,
+        &parked_support_path(state, &job.id),
+        &serde_json::to_vec(&digest)?,
+        true,
+    )?;
     store.create_installed_activation(&bytes).map_err(invalid)?;
     Ok(Recorded {
         path: store.installed_activation_path(),
@@ -1141,6 +1147,28 @@ pub(super) fn record(
 
 fn source_process_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.ready-source-process.json"))
+}
+
+fn parked_support_path(state: &Path, job: &str) -> PathBuf {
+    state.join(format!("{job}.ready-parked-support.json"))
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn admits_parked(
+    ready: &crate::upgrade::recovery::Authority,
+) -> Result<bool, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(false);
+    };
+    if !reservation.plan.ready.same_authority(ready) {
+        return Err(invalid(
+            "The parked checkpoint has a different update reservation",
+        ));
+    }
+    let Some(bytes) = read(&parked_support_path(&reservation.state(), &reservation.job))? else {
+        return Ok(false);
+    };
+    Ok(bytes == serde_json::to_vec(&reservation.stored_digest)?)
 }
 
 fn source_path(state: &Path, job: &str) -> PathBuf {

@@ -2876,6 +2876,17 @@ fn prepare_resume(
         failure.retryable = true;
         failure
     })?;
+    #[cfg(target_os = "macos")]
+    if !cursors.is_empty()
+        && host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .has_parked_update()
+    {
+        // An empty handshake can inspect StartupState. A resume attaches to
+        // the terminal and can change presentation, so it waits for promotion.
+        return Err(super::recovery_admission::restoring_terminals());
+    }
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {

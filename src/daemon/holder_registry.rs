@@ -573,10 +573,48 @@ fn evidence_inner(socket: &Path, kind: Kind, recovery: bool) -> Result<Option<Re
 /// never creates directories, removes stale files, or contacts a helper.
 pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
     let directory = directory(kind).map_err(io::Error::other)?;
-    crate::secure_file::reject_symlink_components(&directory)?;
-    let metadata = match fs::symlink_metadata(&directory) {
+    let Some(entries) = observed_directory(&directory)? else {
+        return Ok(Vec::new());
+    };
+    let boot = crate::daemon::read_boot_id()?;
+    observe_records(&directory, entries, kind, &boot, |record| {
+        record.supported_version()
+            && record.application == crate::instance::APPLICATION_ID
+            && record.holder.is_current()
+    })
+}
+
+/// Same-boot holder evidence for selecting a carried-terminal update. A
+/// native provider can still own work after its holder dies on Darwin, so
+/// include those records when deciding whether this is a terminal-only batch.
+#[cfg(all(feature = "host", target_os = "macos"))]
+pub fn observe_update_roster(kind: Kind, boot: &BootId) -> io::Result<Vec<Record>> {
+    let directory = directory(kind).map_err(io::Error::other)?;
+    let Some(entries) = observed_directory(&directory)? else {
+        return Ok(Vec::new());
+    };
+    observe_update_records(&directory, entries, kind, boot)
+}
+
+#[cfg(all(feature = "host", any(test, target_os = "macos")))]
+fn observe_update_records(
+    directory: &Path,
+    entries: fs::ReadDir,
+    kind: Kind,
+    boot: &BootId,
+) -> io::Result<Vec<Record>> {
+    observe_records(directory, entries, kind, boot, |record| {
+        (record.application == crate::instance::APPLICATION_ID
+            || recovery_role(&record.application))
+            && (kind == Kind::Native || record.holder.is_current() || record.root.is_current())
+    })
+}
+
+fn observed_directory(directory: &Path) -> io::Result<Option<fs::ReadDir>> {
+    crate::secure_file::reject_symlink_components(directory)?;
+    let metadata = match fs::symlink_metadata(directory) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     if !metadata.is_dir()
@@ -588,9 +626,18 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
             "unsafe holder directory",
         ));
     }
-    let boot = crate::daemon::read_boot_id()?;
+    fs::read_dir(directory).map(Some)
+}
+
+fn observe_records(
+    directory: &Path,
+    entries: fs::ReadDir,
+    kind: Kind,
+    boot: &BootId,
+    admits: impl Fn(&Record) -> bool,
+) -> io::Result<Vec<Record>> {
     let mut records = Vec::new();
-    for (index, entry) in fs::read_dir(&directory)?.enumerate() {
+    for (index, entry) in entries.enumerate() {
         if index >= 8192 {
             return Err(io::Error::other("holder discovery limit exceeded"));
         }
@@ -600,11 +647,9 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
         }
         let record = read(&path)?;
         if record.kind == kind
-            && record.supported_version()
-            && record.application == crate::instance::APPLICATION_ID
-            && record.boot == boot
-            && record.path(&directory) == path
-            && record.holder.is_current()
+            && &record.boot == boot
+            && record.path(directory) == path
+            && admits(&record)
         {
             records.push(record);
         }
@@ -726,6 +771,56 @@ fn discover_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn update_observation_preserves_absent_directories_and_stale_records() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = root.path().join("holders");
+        assert!(observed_directory(&directory).unwrap().is_none());
+        assert!(!directory.exists());
+
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let mut terminal = record();
+        terminal.holder.start += 1;
+        terminal.root.start += 1;
+        terminal.create(&directory).unwrap();
+        let terminal_path = terminal.path(&directory);
+        let terminal_bytes = fs::read(&terminal_path).unwrap();
+
+        let mut native = terminal.clone();
+        native.kind = Kind::Native;
+        native.terminal = TerminalId::new();
+        native.create(&directory).unwrap();
+        let native_path = native.path(&directory);
+        let native_bytes = fs::read(&native_path).unwrap();
+
+        let terminals = observe_update_records(
+            &directory,
+            observed_directory(&directory).unwrap().unwrap(),
+            Kind::Terminal,
+            &terminal.boot,
+        )
+        .unwrap();
+        assert!(terminals.is_empty());
+        let native_records = observe_update_records(
+            &directory,
+            observed_directory(&directory).unwrap().unwrap(),
+            Kind::Native,
+            &native.boot,
+        )
+        .unwrap();
+        assert_eq!(native_records, [native]);
+        assert_eq!(fs::read(&terminal_path).unwrap(), terminal_bytes);
+        assert_eq!(fs::read(&native_path).unwrap(), native_bytes);
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(observed_directory(&directory).is_err());
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
 
     /// Linux only: Darwin has no stat file to hold open across the reap.
     #[cfg(target_os = "linux")]
