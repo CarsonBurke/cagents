@@ -37,10 +37,20 @@ only for a user with lingering enabled; `enable` and `status` say when it is
 off and how to turn it on:
 
 ```sh
-cagents daemon boot enable
+cagents daemon boot enable --resume-sessions
 sudo loginctl enable-linger "$USER"   # once, if enable reports linger is off
 cagents daemon boot status
 ```
+
+`--resume-sessions` also turns on that computer's **Resume sessions when this
+computer starts** setting (`resume_sessions_after_reboot` in its
+`settings.toml`), so the daemon reopens stopped chats and agents after a
+restart without waiting for a window; `--no-resume-sessions` turns it off, and
+leaving both out keeps it as it is. It changes only that setting, which takes
+effect from the next restart, and `disable` leaves it as it is. **Settings**
+in the app sets it only on the computer the window runs on, so this flag is how
+to set it on another, such as a headless one over SSH. `status` says whether it
+is on, and `enable` says how to turn it on when it is off.
 
 The unit coexists with the autostart entry, a window's own start, and an
 update's handover: whichever starts first owns the daemon's lock, and the others
@@ -83,9 +93,14 @@ it. `enable` and `disable` leave alone a unit of that name that cagents did not
 write. To manage another machine, run the command there, for example
 `ssh HOST cagents daemon boot enable`.
 
-Starting the daemon does not reopen agent chats that exited when the machine
-went down; resume them with `cagents resume` (see the
-[user guide](user-guide.md)).
+After a restart, the daemon reopens stopped chats and agents by itself only
+when the computer's **Resume sessions when this computer starts** setting is
+on, as `cagents daemon boot enable --resume-sessions` turns it on; otherwise,
+resume them with `cagents resume`. A session that could not resume is reported
+in notifications, which a computer with no window never shows, so there run
+`cagents resume`: it lists whatever is still stopped, and counts the chats only
+the app can resume (see
+[Resume a saved conversation](user-guide.md#resume-a-saved-conversation)).
 
 Full and browserless production builds share one daemon socket
 (`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes
@@ -181,7 +196,7 @@ cagents daemon stop --confirm
 | `ui [--new-window \| --window NAME]` | Launch the UI, open another window, or open a named window |
 | `daemon start` | Start the daemon if it is not already running |
 | `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
-| `daemon boot enable`, `disable`, `status` | Start the daemon at boot through a systemd user unit (Linux; see [Starting at boot](#starting-at-boot)) |
+| `daemon boot enable [--resume-sessions \| --no-resume-sessions]`, `disable`, `status` | Start the daemon at boot through a systemd user unit, and optionally resume stopped sessions when this computer starts (Linux; see [Starting at boot](#starting-at-boot)) |
 | `daemon upgrade [--yes] [--interrupt]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
 | `daemon stop` | Stop the daemon and wait for exit (see below) |
 | `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |

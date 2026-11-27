@@ -1050,24 +1050,34 @@ resumes from its pane in the app.
 
 To have this happen by itself, turn on **Resume sessions when this computer
 starts** under **Settings → Terminal → Restarts**
-(`resume_sessions_after_reboot = true` in `settings.toml`). The first time the
-daemon runs after the computer starts, it resumes every stopped chat pane and
-agent that the earlier boot ran, as `cagents resume --all` would, without
-waiting for a window. This covers more than a window restores when it opens: a
-window shows a Claude conversation's saved history until you send it a message,
-while this starts its provider. A pane that a window has already opened
-is left to that window. One that cannot resume gets a **Did
-not resume when this computer started** notification naming the
-`cagents resume` command for it, and the ones it leaves untried, such as chats
-paired with their provider's terminal, share one notification. They follow
-your **Failure or cancellation** notification setting, and each can still be
-resumed from its pane in the app or, unless it is paired with a terminal, with
-`cagents resume`. On a computer no one logs in to, start the daemon at boot
-too, with `cagents daemon boot enable`. Once that resume has run, a daemon
-restarted within the same boot, as by an update or after a crash, resumes
-nothing by itself. If the first daemon was held back for recovery, or an update
-or shutdown interrupted its resume, the next daemon of that boot runs it, and
-it never reopens a conversation that boot already ran.
+(`resume_sessions_after_reboot = true` in `settings.toml`). It applies to the
+computer the window runs on. For another computer, such as one no one logs in
+to, run `cagents daemon boot enable --resume-sessions` there, for example over
+SSH: it also starts that computer's daemon when it starts.
+
+After a restart, the first daemon to run resumes every stopped chat and agent
+that an earlier boot ran, as `cagents resume --all` would, without waiting for
+a window. That includes ones that had already stopped before the restart, not
+only those running when it went down. With the daemon started at boot, that is
+as soon as the computer starts; otherwise it is the first time the daemon
+starts, such as when you open the app or run a `cagents` command. This covers
+more than a window restores when it opens: a window shows a Claude
+conversation's saved history until you send it a message, while this starts its
+provider. A pane that a window has already opened is left to that window.
+
+One that cannot resume gets a **Did not resume when this computer started**
+notification naming the `cagents resume` command for it, and the ones it leaves
+untried, such as chats paired with their provider's terminal, share one
+notification. They follow your **Failure or cancellation** notification
+setting. On a computer with no window, where no notification shows, run
+`cagents resume`: it lists everything still stopped, and counts the chats only
+the app can resume. Each can still be
+resumed from the app or, unless it is paired with a terminal, with
+`cagents resume`. Once that resume has run, a daemon restarted within the same
+boot, as by an update or after a crash, resumes nothing by itself. If the first
+daemon was held back for recovery, or an update or shutdown interrupted its
+resume, the next daemon of that boot runs it, and it never reopens a
+conversation that boot already ran.
 
 ### Image references and local image storage
 

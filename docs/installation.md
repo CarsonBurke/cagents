@@ -230,7 +230,8 @@ the copy is restored.
 The standard installation starts its per-user `cagentsd` immediately and
 registers it for graphical-login autostart. On a machine without a graphical
 login, such as a server you reach over SSH, run `cagents daemon boot enable` so
-the daemon starts at boot (see [Starting at boot](daemon.md#starting-at-boot)).
+the daemon starts at boot, adding `--resume-sessions` to have it reopen stopped
+chats and agents then too (see [Starting at boot](daemon.md#starting-at-boot)).
 See [Daemon and upgrades](daemon.md) for how the daemon, sessions, and upgrades
 interact.
 
