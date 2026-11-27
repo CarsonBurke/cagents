@@ -112,7 +112,7 @@ pub async fn consume(
     } else {
         None
     };
-    match write_attempt(&binding) {
+    let replay = match write_attempt(&binding) {
         Ok(false) if reset_id == "juniper_tide" => {
             return ConsumeOutcome {
                 status: ConsumeStatus::Unconfirmed,
@@ -125,33 +125,32 @@ pub async fn consume(
         Err(message) => {
             return unsent(prior, message, Some(before));
         }
-        _ => {}
-    }
+        Ok(created) => !created,
+    };
     let submitted = tokio::time::timeout(TIMEOUT, async {
         match account.provider {
             Provider::Claude => claude
                 .unwrap()
                 .consume(&reset_id, &idempotency_key)
                 .await
-                .map(|body| claude_status(&body)),
-            Provider::Codex => {
-                codex_consume(
-                    &account,
-                    &program,
-                    search.as_deref(),
-                    &reset_id,
-                    &idempotency_key,
-                    &expected,
-                )
-                .await
-            }
-            _ => Ok(ConsumeStatus::Unavailable),
+                .map(|body| claude_result(&body, replay)),
+            Provider::Codex => codex_consume(
+                &account,
+                &program,
+                search.as_deref(),
+                &reset_id,
+                &idempotency_key,
+                &expected,
+            )
+            .await
+            .map(|status| (status, None)),
+            _ => Ok((ConsumeStatus::Unavailable, None)),
         }
     })
     .await;
-    let status = match submitted {
-        Ok(Ok(status)) => status,
-        _ => ConsumeStatus::Unconfirmed,
+    let (status, detail) = match submitted {
+        Ok(Ok(result)) => result,
+        _ => (ConsumeStatus::Unconfirmed, None),
     };
     if let Some(actor) = actor {
         tracing::info!(
@@ -174,13 +173,15 @@ pub async fn consume(
         } if may_act_for(Some(&identity), Some(&expected)) => Some(*snapshot),
         _ => None,
     };
-    let message = match (status, snapshot.is_some()) {
-        (ConsumeStatus::Unconfirmed, true) => Some("The reset result is unconfirmed. Usage has been refreshed; retry only with the same reset and idempotency key".into()),
-        (ConsumeStatus::Unconfirmed, false) => Some("The reset result and refreshed usage are unconfirmed. Retry only with the same reset and idempotency key".into()),
-        (_, false) => Some("The provider answered, but refreshed usage could not be read".into()),
-        (ConsumeStatus::NoCredit, true) => Some("This reset is no longer available; usage has been refreshed".into()),
-        (ConsumeStatus::NotLimited, true) => Some("No eligible window needs a reset".into()),
-        (ConsumeStatus::Unavailable, true) => Some("The provider did not apply a reset; usage has been refreshed".into()),
+    let message = match (detail, status, snapshot.is_some()) {
+        (Some(detail), _, true) => Some(format!("{detail} Usage refreshed.")),
+        (Some(detail), _, false) => Some(format!("{detail} Current usage could not be refreshed.")),
+        (None, ConsumeStatus::Unconfirmed, true) => Some("The reset result is unconfirmed. Usage has been refreshed; retry only with the same reset and idempotency key".into()),
+        (None, ConsumeStatus::Unconfirmed, false) => Some("The reset result and refreshed usage are unconfirmed. Retry only with the same reset and idempotency key".into()),
+        (None, _, false) => Some("The provider answered, but refreshed usage could not be read".into()),
+        (None, ConsumeStatus::NoCredit, true) => Some("This reset is no longer available; usage has been refreshed".into()),
+        (None, ConsumeStatus::NotLimited, true) => Some("No eligible window needs a reset".into()),
+        (None, ConsumeStatus::Unavailable, true) => Some("The provider did not apply a reset; usage has been refreshed".into()),
         _ => None,
     };
     ConsumeOutcome {
@@ -213,15 +214,37 @@ fn unsent(
     }
 }
 
-pub(super) fn claude_status(body: &Value) -> ConsumeStatus {
+pub(super) fn claude_result(body: &Value, replay: bool) -> (ConsumeStatus, Option<&'static str>) {
     if matches!(
         body["reason"].as_str(),
         Some("stamp_indeterminate" | "reset_unconfirmed")
     ) {
-        return ConsumeStatus::Unconfirmed;
+        return (ConsumeStatus::Unconfirmed, None);
     }
-    match body["result"].as_str() {
+    let status = match body["result"].as_str() {
         Some("reset") => ConsumeStatus::Reset,
+        // Claude can also return already_used for a spent grant on a new
+        // request. Only a replay carrying the original cleared scopes
+        // confirms that this request applied the reset.
+        Some("already_used") if replay => {
+            return if body["cleared"].as_array().is_some_and(|cleared| {
+                cleared
+                    .iter()
+                    .any(|scope| scope.as_str().is_some_and(|scope| !scope.is_empty()))
+            }) {
+                (
+                    ConsumeStatus::Reset,
+                    Some("The original reset was already applied."),
+                )
+            } else {
+                (
+                    ConsumeStatus::NoCredit,
+                    Some(
+                        "The provider reports this reset was already used and could not confirm the original request.",
+                    ),
+                )
+            };
+        }
         Some("already_used") => ConsumeStatus::NoCredit,
         Some("not_limited") => ConsumeStatus::NotLimited,
         Some("ineligible") if body["reason"].as_str() == Some("no_grant") => {
@@ -230,7 +253,8 @@ pub(super) fn claude_status(body: &Value) -> ConsumeStatus {
         Some("ineligible" | "cooldown") => ConsumeStatus::Unavailable,
         // Claude retains its unsettled claim for unavailable, even on 200.
         _ => ConsumeStatus::Unconfirmed,
-    }
+    };
+    (status, None)
 }
 
 pub(super) async fn codex_consume(
@@ -385,12 +409,31 @@ mod tests {
             json!({"result":"unavailable","reason":"reset_unconfirmed"}),
             json!({"result":"ineligible","reason":"stamp_indeterminate"}),
         ] {
-            assert_eq!(claude_status(&body), ConsumeStatus::Unconfirmed);
+            assert_eq!(
+                claude_result(&body, true),
+                (ConsumeStatus::Unconfirmed, None)
+            );
         }
         assert_eq!(
-            claude_status(&json!({"result":"already_used"})),
-            ConsumeStatus::NoCredit
+            claude_result(&json!({"result":"already_used"}), false),
+            (ConsumeStatus::NoCredit, None)
         );
+    }
+
+    #[test]
+    fn an_already_used_grant_only_confirms_a_replay_with_cleared_scopes() {
+        let applied = json!({"result":"already_used","cleared":["seven_day"]});
+        assert_eq!(
+            claude_result(&applied, false),
+            (ConsumeStatus::NoCredit, None)
+        );
+        assert_eq!(claude_result(&applied, true).0, ConsumeStatus::Reset);
+        for cleared in [Value::Null, json!([]), json!([null, ""])] {
+            let spent = json!({"result":"already_used","cleared":cleared});
+            let (status, detail) = claude_result(&spent, true);
+            assert_eq!(status, ConsumeStatus::NoCredit);
+            assert!(detail.unwrap().contains("already used"));
+        }
     }
     #[test]
     fn reset_attempt_preserves_the_original_authenticated_actor_during_recovery() {
