@@ -1,0 +1,106 @@
+[package]
+name = "servo-net"
+version = "0.1.3"
+authors = ["The Servo Project Developers"]
+license = "MPL-2.0"
+edition = "2024"
+publish = true
+rust-version = "1.86.0"
+repository = "https://github.com/servo/servo"
+description = "A component of the servo web-engine."
+autotests = false # Inhibit lookup for tests/*.rs without [[test]] sections
+
+[lib]
+name = "net"
+path = "lib.rs"
+test = false
+doctest = false
+
+[features]
+test-util = ["hyper-util/server-graceful", "dep:servo-default-resources"]
+
+[dependencies]
+async-compression = { version = "0.4.12", default-features = false, features = ["brotli", "gzip", "tokio", "zlib", "zstd"] }
+async-recursion = "1.1"
+async-tungstenite = { version = "0.34", features = ["tokio-rustls-webpki-roots"] }
+base64 = { version = "0.22.1" }
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+content-security-policy = { version = "0.8.0", features = ["serde"] }
+cookie = { version = "0.18" }
+crossbeam-channel = { version = "0.5" }
+data-url = { version = "0.3" }
+devtools_traits = { package = "servo-devtools-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+embedder_traits = { package = "servo-embedder-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+fst = "0.4"
+futures = { version = "0.3", default-features = false }
+futures-core = { version = "0.3", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+generic-array = "0.14"
+headers = { version = "0.4" }
+http = { version = "1.4" }
+http-body-util = { version = "0.1" }
+hyper = { version = "1.8", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "tls12", "webpki-tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio", "client-proxy"] }
+hyper_serde = { package = "servo-hyper-serde", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+imsz = { version = "0.4" }
+ipc-channel = { version = "0.21" }
+itertools = { version = "0.14" }
+log = { version = "0.4.29" }
+malloc_size_of = { package = "servo-malloc-size-of", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+malloc_size_of_derive = { version = "0.1" }
+mime = { version = "0.3.13" }
+mime_guess = { version = "2.0.5" }
+net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+nom = { version = "8.0.0" }
+paint_api = { package = "servo-paint-api", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+parking_lot = { version = "0.12", features = ["serde"] }
+pixels = { package = "servo-pixels", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+profile_traits = { package = "servo-profile-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+quick_cache = { version = "0.6.18", default-features = false, features = ["ahash"] }
+regex = { version = "1.12" }
+resvg = { version = "0.45.0" }
+rustc-hash = { version = "2.1.2" }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "aws-lc-rs"] }
+rustls-pki-types = { version = "1.14" }
+rustls-platform-verifier = { version = "0.6.2" }
+serde = { version = "1.0.228" }
+servo_arc = { version = "0.4.3" }
+servo-base = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+servo-config = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+servo-default-resources = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
+servo-url = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+sha2 = { version = "0.10" }
+time = { version = "0.3", features = ["large-dates", "local-offset", "serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging"] }
+tokio-stream = { version = "0.1" }
+tokio-util = { version = "0.7.18", default-features = false, features = ["codec", "io"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tungstenite = { version = "0.29" }
+url = { version = "2.5" }
+uuid = { version = "1.23.0", features = ["v4", "v5"] }
+webpki-roots = { version = "1.0" }
+webrender_api = { version = "0.68" }
+
+[dev-dependencies]
+servo-default-resources = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+flate2 = { version = "1.1" }
+fst = "0.4"
+hyper = { version = "1.8", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio", "client-proxy", "server-graceful"] }
+# This must always be a path dependency, we don't want to add a dependency on a
+# crates.io version of ourselves - we want to enable a feature of ourselves.
+net = { package = "servo-net", path = ".", features = ["test-util"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "aws-lc-rs"] }
+
+[[test]]
+name = "main"
+path = "tests/main.rs"
+
+[workspace]
+
+# Standalone test runs only; the parent workspace's own [patch] governs the app.
+[patch."https://github.com/servo/servo.git"]
+servo-net-traits = { path = "../servo-net-traits" }
