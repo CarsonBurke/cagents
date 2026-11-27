@@ -99,7 +99,19 @@ impl ResetScope {
     }
 }
 
+/// A provider-offered grant held while every limit it clears is unused, or
+/// the live observation that released that local hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnusedLimitHold {
+    Held,
+    Released {
+        window_key: String,
+        observed_at: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct UsageReset {
     /// Opaque provider selection, never a credential.
     pub id: String,
@@ -110,9 +122,68 @@ pub struct UsageReset {
     /// Inventory can include grants that are paused or have nothing to
     /// refill.
     pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unused_limit_hold: Option<UnusedLimitHold>,
+}
+
+/// Account-info RPC retains its fixed postcard fields. The local hold is
+/// needed only in snapshots, which the cache and probe RPC encode as JSON.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "UsageReset")]
+struct UsageResetWire<Id, Scopes> {
+    id: Id,
+    kind: ResetKind,
+    scopes: Scopes,
+    available_count: u64,
+    expires_at: Option<i64>,
+    usable: bool,
+}
+
+impl Serialize for UsageReset {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return Self::serialize(self, serializer);
+        }
+        UsageResetWire {
+            id: self.id.as_str(),
+            kind: self.kind,
+            scopes: self.scopes.as_slice(),
+            available_count: self.available_count,
+            expires_at: self.expires_at,
+            usable: self.usable,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UsageReset {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            return Self::deserialize(deserializer);
+        }
+        let wire = UsageResetWire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id,
+            kind: wire.kind,
+            scopes: wire.scopes,
+            available_count: wire.available_count,
+            expires_at: wire.expires_at,
+            usable: wire.usable,
+            unused_limit_hold: None,
+        })
+    }
 }
 
 impl UsageReset {
+    /// Whether both rows describe the same grant and remaining credit.
+    pub fn same_grant(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.kind == other.kind
+            && self.available_count == other.available_count
+            && self.expires_at == other.expires_at
+            && ordered_scopes(&self.scopes) == ordered_scopes(&other.scopes)
+    }
+
     pub fn label(&self) -> String {
         scope_label(&self.scopes)
     }
@@ -285,6 +356,93 @@ pub fn inventory_lines(resets: &[UsageReset], now_secs: i64) -> Vec<String> {
 }
 
 impl UsageSnapshot {
+    /// Integrate a complete inventory into newer usage figures.
+    pub fn merge_reset_inventory(
+        &mut self,
+        full: &Self,
+        now: u64,
+        retain_window: impl Fn(&UsageWindow) -> bool,
+    ) {
+        let mut resets = full.resets.clone();
+        self.retain_newer_reset_releases(&mut resets, full.observed_at, now, retain_window);
+        self.resets = resets;
+    }
+
+    /// A scoped frame does not move the account-wide clock. Keep the scoped
+    /// figure that released a hold if a complete probe observed it earlier.
+    pub fn retain_newer_scoped_reset_usage(
+        &mut self,
+        previous: &Self,
+        now: u64,
+        retain_window: impl Fn(&UsageWindow) -> bool,
+    ) -> bool {
+        let mut retained = false;
+        let windows = &mut self.windows;
+        previous.retain_newer_reset_releases(&mut self.resets, self.observed_at, now, |window| {
+            if window.kind != WindowKind::Scoped || !retain_window(window) {
+                return false;
+            }
+            let key = super::claude::stable_window_key(&window.key);
+            if let Some(probed) = windows
+                .iter_mut()
+                .find(|probed| super::claude::stable_window_key(&probed.key) == key)
+            {
+                probed.used = window.used;
+                probed.resets_at = window.resets_at.or(probed.resets_at);
+            } else {
+                windows.push(window.clone());
+            }
+            retained = true;
+            true
+        });
+        if retained
+            && self.status == super::UsageStatus::Ok
+            && super::status_for(&self.windows, false, false) == super::UsageStatus::Warning
+        {
+            self.status = super::UsageStatus::Warning;
+        }
+        retained
+    }
+
+    fn retain_newer_reset_releases(
+        &self,
+        resets: &mut [UsageReset],
+        read_at: u64,
+        now: u64,
+        mut retain_window: impl FnMut(&UsageWindow) -> bool,
+    ) {
+        for previous in &self.resets {
+            let Some(UnusedLimitHold::Released {
+                window_key,
+                observed_at,
+            }) = &previous.unused_limit_hold
+            else {
+                continue;
+            };
+            if *observed_at <= read_at
+                || *observed_at > now.saturating_add(super::schedule::CLOCK_SLACK)
+            {
+                continue;
+            }
+            let Some(window) = self.windows.iter().find(|window| {
+                window.used > 0.0
+                    && super::claude::stable_window_key(&window.key) == window_key.as_str()
+            }) else {
+                continue;
+            };
+            if let Some(reset) = resets.iter_mut().find(|reset| {
+                (reset.usable || reset.unused_limit_hold == Some(UnusedLimitHold::Held))
+                    && reset.same_grant(previous)
+            }) && retain_window(window)
+            {
+                reset.usable = true;
+                reset
+                    .unused_limit_hold
+                    .clone_from(&previous.unused_limit_hold);
+            }
+        }
+    }
+
     /// One usable reset for a window that is near or at its limit.
     pub fn actionable_reset(&self, window: &UsageWindow, now_secs: i64) -> Option<&UsageReset> {
         (window.used >= super::WARNING_FRACTION || window.binding)
@@ -344,6 +502,60 @@ impl ConsumeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_reset_holds_preserve_the_previous_postcard_inventory_shape() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct PreviousReset {
+            id: String,
+            kind: ResetKind,
+            scopes: Vec<ResetScope>,
+            available_count: u64,
+            expires_at: Option<i64>,
+            usable: bool,
+        }
+        let offered = UsageReset {
+            id: "weekly".into(),
+            kind: ResetKind::Granted,
+            scopes: vec![ResetScope::AccountWeekly],
+            available_count: 2,
+            expires_at: Some(100),
+            usable: true,
+            unused_limit_hold: None,
+        };
+        let held = UsageReset {
+            id: "fable".into(),
+            scopes: vec![ResetScope::Model("Fable".into())],
+            usable: false,
+            unused_limit_hold: Some(UnusedLimitHold::Held),
+            ..offered.clone()
+        };
+        let current = vec![held, offered];
+        let previous: Vec<_> = current
+            .iter()
+            .map(|reset| PreviousReset {
+                id: reset.id.clone(),
+                kind: reset.kind,
+                scopes: reset.scopes.clone(),
+                available_count: reset.available_count,
+                expires_at: reset.expires_at,
+                usable: reset.usable,
+            })
+            .collect();
+        let encoded = postcard::to_stdvec(&current).unwrap();
+        assert_eq!(encoded, postcard::to_stdvec(&previous).unwrap());
+        let decoded = postcard::from_bytes::<Vec<UsageReset>>(&encoded).unwrap();
+        assert_eq!(
+            decoded,
+            current
+                .into_iter()
+                .map(|reset| UsageReset {
+                    unused_limit_hold: None,
+                    ..reset
+                })
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn reset_login_eligibility_preserves_backend_identity_rules() {
@@ -482,6 +694,7 @@ mod tests {
             available_count: 2,
             expires_at: Some(200),
             usable: true,
+            unused_limit_hold: None,
         };
         assert!(reset.is_available(199));
         assert!(!reset.is_available(200));
@@ -529,6 +742,7 @@ mod tests {
                 available_count: 2,
                 expires_at: None,
                 usable: true,
+                unused_limit_hold: None,
             };
             assert_eq!(
                 reset.confirmation_question("fixture@example.test"),

@@ -335,7 +335,7 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
 /// Inventory from the private usage endpoint. Only the provider's explicit
 /// `clears` list authorizes clearing a window; display labels never do.
 pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
-    use super::{ResetKind, ResetScope, UsageReset};
+    use super::{ResetKind, ResetScope, UsageReset, resets::UnusedLimitHold};
     let mut resets = Vec::new();
     let program = &body["cedar_ember"];
     for grant in program["grants"].as_array().into_iter().flatten().take(256) {
@@ -385,8 +385,7 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
                         .is_none_or(|used| used != 0.0)
                 })
         });
-        let usable = valid_times
-            && refills_usage
+        let offered = valid_times
             && program["eligible"].as_bool() == Some(true)
             && grant["usable_now"].as_bool() == Some(true)
             && grant["paused"].as_bool() != Some(true)
@@ -399,7 +398,8 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
             scopes,
             available_count,
             expires_at,
-            usable,
+            usable: offered && refills_usage,
+            unused_limit_hold: (offered && !refills_usage).then_some(UnusedLimitHold::Held),
         });
     }
     let session = &body["juniper_tide"];
@@ -412,6 +412,7 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
             available_count: u64::from(available),
             expires_at: session["weekly_resets_at"].as_str().and_then(parse_rfc3339),
             usable: available && session["eligible"].as_bool() == Some(true),
+            unused_limit_hold: None,
         });
     }
     resets
@@ -874,6 +875,17 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
     let previous_ranks = (has_binding && !update.windows.is_empty())
         .then(|| snapshot.windows.iter().map(rank).collect::<Vec<_>>());
     for window in update.windows {
+        if window.used > 0.0 {
+            for reset in &mut snapshot.resets {
+                if reset.unused_limit_hold.is_some() && reset.clears(&window) {
+                    reset.unused_limit_hold = Some(super::resets::UnusedLimitHold::Released {
+                        window_key: stable_window_key(&window.key).to_owned(),
+                        observed_at,
+                    });
+                    reset.usable = true;
+                }
+            }
+        }
         let fable = window.key == FABLE;
         match snapshot
             .windows
@@ -2012,6 +2024,73 @@ mod reset_tests {
             );
             assert_eq!(resets[0].is_available(1), usable, "{percent_used}");
         }
+    }
+
+    #[test]
+    fn live_usage_lifts_only_the_hold_for_unused_limits_it_updates() {
+        use super::super::LiveReport;
+
+        let now = 1_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits":{
+            "limits":[
+                {"kind":"weekly_all","percent":20},
+                {"kind":"weekly_scoped","scope":"Fable 5.1","percent":0}
+            ],
+            "cedar_ember":{"eligible":true,"at_limit":false,"grants":[
+                {"id":"fable","resets_left":1,"clears":["seven_day_overage_included"],
+                 "usable_now":true,"use_requires_limit":false,
+                 "percent_used":{"seven_day_overage_included":0}},
+                {"id":"paused","resets_left":1,"clears":["seven_day_overage_included"],
+                 "usable_now":true,"paused":true,"use_requires_limit":false,
+                 "percent_used":{"seven_day_overage_included":0}},
+                {"id":"limit-required","resets_left":1,"clears":["seven_day_overage_included"],
+                 "usable_now":true,"use_requires_limit":true,
+                 "percent_used":{"seven_day_overage_included":0}}
+            ]}}}),
+            now,
+        );
+        assert_eq!(usage.resets.len(), 3);
+        assert!(usage.resets.iter().all(|reset| !reset.is_available(1)));
+        let stored = serde_json::to_value(&usage).unwrap();
+        usage = serde_json::from_value(stored).unwrap();
+        let mut delayed = usage.clone();
+        delayed.observed_at = now + 2;
+
+        let update = |kind, used| {
+            LiveReport::Claude(
+                parse_rate_limit_event(&json!({"rateLimitType":kind,"utilization":used})).unwrap(),
+            )
+        };
+        assert!(update("seven_day", 1.0).apply(&mut usage, now + 1, now + 1));
+        assert!(!update("seven_day_overage_included", 1.0).apply(&mut usage, now, now + 1));
+        assert!(update("seven_day_overage_included", 0.0).apply(&mut usage, now + 2, now + 2));
+        assert!(usage.resets.iter().all(|reset| !reset.is_available(1)));
+
+        assert!(update("seven_day_overage_included", 0.01).apply(&mut usage, now + 3, now + 3));
+        assert!(usage.resets[0].is_available(1));
+        assert!(usage.resets[1..].iter().all(|reset| !reset.is_available(1)));
+
+        let mut spent = delayed.clone();
+        spent.resets[0].available_count = 0;
+        let mut with_spent_inventory = usage.clone();
+        with_spent_inventory.merge_reset_inventory(&spent, now + 3, |_| true);
+        assert_eq!(with_spent_inventory.resets, spent.resets);
+
+        let mut fable_reset = usage.clone();
+        assert!(update("seven_day_overage_included", 0.0).apply(
+            &mut fable_reset,
+            now + 4,
+            now + 4
+        ));
+        fable_reset.merge_reset_inventory(&delayed, now + 4, |_| true);
+        assert!(!fable_reset.resets[0].is_available(1));
+
+        // Newer weekly usage cannot stand in for a Fable observation after this read.
+        delayed.observed_at = now + 4;
+        assert!(update("seven_day", 1.0).apply(&mut usage, now + 5, now + 5));
+        usage.merge_reset_inventory(&delayed, now + 5, |_| true);
+        assert!(!usage.resets[0].is_available(1));
     }
 
     #[test]
