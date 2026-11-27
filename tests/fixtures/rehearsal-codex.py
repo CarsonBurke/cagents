@@ -65,6 +65,32 @@ def configure_peer(root):
     return retained
 
 
+class RetainedNotifications:
+    """The app-server continues producing turn events across client reconnects."""
+    def __init__(self):
+        self._clients = set()
+        self._lock = threading.Lock()
+
+    def subscribe(self, send):
+        with self._lock:
+            self._clients.add(send)
+
+    def unsubscribe(self, send):
+        with self._lock:
+            self._clients.discard(send)
+
+    def publish(self, response):
+        with self._lock:
+            clients = tuple(self._clients)
+        for send in clients:
+            try:
+                send(response)
+            except OSError:
+                # Losing a client cannot cancel provider-side playback or its
+                # delivery to an already initialized replacement connection.
+                self.unsubscribe(send)
+
+
 def listener_path(args, runtime):
     address = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--listen=")), None)
     if "--listen" in args:
@@ -271,12 +297,13 @@ def main():
         listener.listen()
         record("listening", socket=str(path))
         scenario, request_lock = LoggedScenario(), threading.Lock()
+        notifications = RetainedNotifications() if retained else None
         while True:
             connection, _ = listener.accept()
 
             def worker(connection=connection):
                 try:
-                    peer.serve(connection, str(home), scenario, request_lock)
+                    peer.serve(connection, str(home), scenario, request_lock, notifications)
                 except (EOFError, ConnectionError):
                     record("disconnected")
                 except Exception as error:
