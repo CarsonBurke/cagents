@@ -2,7 +2,8 @@
 # The Work board at a long-lived installation's scale, for native evidence of
 # its cards and columns: eight projects, about seventy cards, most of them old
 # checkouts, a detached checkout, pull requests in every state, and a card with
-# four agents at once. See tests/fixtures/work-board.py for the data.
+# five agents at once, more than its menu lists. See tests/fixtures/work-board.py
+# for the data.
 #
 # Run in a session, from a steps file or a shell on the build host, with
 # CAGENTS_EVIDENCE_TASK naming a scripts/native-evidence task (see "Native
@@ -14,9 +15,9 @@
 #
 # `live` makes the projects and seeds the forge (once per fixture), opens the
 # projects, then starts synthetic Claude agents
-# (tests/fixtures/chat-composer-claude.sh): four in atlas's
+# (tests/fixtures/chat-composer-claude.sh): five in atlas's
 # feat/search-ranking worktree, one working, one asking for permission, one
-# asking a question and one finished, and one working in journal's
+# asking a question and two finished, and one working in journal's
 # feat/offline-mode. A stopped session keeps no running agent, so it runs in
 # every session. Git dates are relative to the time it first runs, so ages
 # read the same in every session of a task that seeds again.
@@ -72,6 +73,7 @@ cmd_live() {
     agent working "$ranking"
     agent permission "$ranking"
     agent question "$ranking"
+    agent finished "$ranking"
     agent finished "$ranking"
     agent working "$fixture/projects/journal/.worktrees/feat-offline-mode"
     rm -f -- "$frames"
