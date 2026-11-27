@@ -77,7 +77,7 @@ class Generated(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.scratch = tempfile.TemporaryDirectory(prefix="fixture-workspace-")
+        cls.scratch = tempfile.TemporaryDirectory(prefix="fixture-workspace-", dir="/var/tmp")
         cls.root = os.path.join(cls.scratch.name, "workspace")
         run("generate", "--profile", "small", "--edge-case", "all", "--root", cls.root)
         with open(os.path.join(cls.root, "plan.json")) as file:
@@ -106,6 +106,7 @@ class Generated(unittest.TestCase):
 
     def test_everything_stays_under_the_root(self):
         root = os.path.realpath(self.root)
+        self.assertTrue(Path(root, ".cagents-fixture-root").is_file())
         self.assertTrue(self.home.startswith(root + os.sep))
         for entry in self.plan["history"]["claude"] + self.plan["history"]["codex"]:
             self.assertTrue(entry["file"].startswith(root + os.sep), entry["file"])
@@ -293,7 +294,7 @@ class Generated(unittest.TestCase):
 
 class Reproducible(unittest.TestCase):
     def setUp(self):
-        self.scratch = tempfile.TemporaryDirectory(prefix="fixture-workspace-")
+        self.scratch = tempfile.TemporaryDirectory(prefix="fixture-workspace-", dir="/var/tmp")
         self.addCleanup(self.scratch.cleanup)
         self.root = os.path.join(self.scratch.name, "workspace")
 
@@ -491,9 +492,14 @@ WATCHED = ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_ST
 class Apply(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.scratch = tempfile.TemporaryDirectory(prefix="fixture-workspace-")
+        cls.scratch = tempfile.TemporaryDirectory(prefix="fixture-workspace-", dir="/var/tmp")
         cls.root = os.path.join(cls.scratch.name, "workspace")
         run("generate", "--profile", "small", "--root", cls.root)
+        cls.caller = Path(cls.scratch.name) / "caller"
+        cls.caller.mkdir()
+        cls.caller_environment = {name: str(cls.caller / leaf) for name, leaf in (
+            ("HOME", "home"), ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"))}
         cls.bin = os.path.join(cls.scratch.name, "bin")
         os.makedirs(cls.bin)
         for name in ("cagentsd", "cagents-ui"):
@@ -509,7 +515,8 @@ class Apply(unittest.TestCase):
         log = os.path.join(self.scratch.name, "log")
         if os.path.exists(log):
             os.remove(log)
-        env = dict(os.environ, STUB_LOG=log, CAGENTS_DEVELOPMENT_INSTANCE="leaked", **(extra or {}))
+        env = dict(os.environ, **self.caller_environment, STUB_LOG=log,
+                   CAGENTS_DEVELOPMENT_INSTANCE="leaked", **(extra or {}))
         result = run("apply", "--root", self.root, "--bin-dir", self.bin, *arguments, env=env, check=False)
         calls = [json.loads(line) for line in Path(log).read_text().splitlines()] if os.path.exists(log) else []
         return result, calls
@@ -537,11 +544,20 @@ class Apply(unittest.TestCase):
         self.assertEqual(len({call["env"]["XDG_RUNTIME_DIR"] for call in calls}), 1)
         self.assertFalse(os.path.exists(calls[0]["env"]["XDG_RUNTIME_DIR"]))
 
+    def test_a_generated_workspace_from_before_the_shared_marker_can_still_be_applied(self):
+        marker = Path(self.root, ".cagents-fixture-root")
+        marker.unlink()
+        self.addCleanup(marker.touch)
+        result, calls = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.is_file())
+        self.assertTrue(calls)
+
     def test_an_instance_keeps_the_callers_directories(self):
         _, calls = self.apply("--instance", "seeded")
         for call in calls:
             self.assertEqual(call["env"]["CAGENTS_DEVELOPMENT_INSTANCE"], "seeded")
-            self.assertEqual(call["env"]["HOME"], os.environ.get("HOME"))
+            self.assertEqual(call["env"]["HOME"], self.caller_environment["HOME"])
 
     def test_the_unnamed_instance_is_refused(self):
         for name in ("", "../x", "a b", "a_b", "-a", "x" * 25):
@@ -594,7 +610,8 @@ class WriterLocks(unittest.TestCase):
     def test_held_locks_are_exclusive_flocks(self):
         import fcntl
 
-        with tempfile.TemporaryDirectory(prefix="fixture-workspace-") as home:
+        with tempfile.TemporaryDirectory(prefix="fixture-workspace-", dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             thread = "019e0000-0000-7000-8000-000000000001"
             held = codex.hold_writer_locks(home, [thread])
             try:

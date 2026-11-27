@@ -23,12 +23,20 @@ if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
     printf '%s\n' 'unnamed-agent-thread-scene: run on the native-evidence host through plain SSH; inherited agent authority was not modified' >&2
     exit 77
 fi
+fixture_guard=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh
+if [ ! -f "$fixture_guard" ] && [ -n "${CAGENTS_EVIDENCE_TASK:-}" ]; then
+    fixture_guard=$CAGENTS_EVIDENCE_TASK/fixture/bin/lib/fixture-home.sh
+fi
+. "$fixture_guard"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 scene=${1:?usage: unnamed-agent-thread-scene.sh seed|forget|forget-pane|survive|survivors|end|show}
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
 : "${CAGENTS_EVIDENCE_TOOL:?name scripts/native-evidence on the host}"
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 fixture=$CAGENTS_EVIDENCE_TASK/fixture
 scene_state=$fixture/state/unnamed-agent-thread-scene
+require_fixture_home XDG_STATE_HOME "$scene_state"
 mkdir -p "$scene_state"
 # Outside the fixture, which each start restores from its seed.
 listeners=$CAGENTS_EVIDENCE_TASK/unnamed-agent-thread-listeners

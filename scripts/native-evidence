@@ -9,6 +9,7 @@ set -euo pipefail
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
 source "$tool_root/scripts/git-ancestry.sh"
+. "$tool_root/tests/fixtures/lib/fixture-home.sh"
 session_name=evidence
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
 # A session holds one of the host's few native slots while it runs, so it is
@@ -200,10 +201,15 @@ select_task() {
     compositor_home=$task/compositor
     # Sessions replace their fixture and runtime directories, so never adopt a
     # directory that holds anything else.
-    if [ ! -e "$task/.native-evidence" ]; then
+    [ ! -L "$task/.native-evidence" ] || die "native-evidence task marker must be a regular file" 2
+    if [ ! -f "$task/.native-evidence" ]; then
         [ -z "$(ls -A -- "$task")" ] || die "not a native-evidence task directory, and not empty: $task" 2
         touch -- "$task/.native-evidence"
     fi
+    mark_fixture_root "$task"
+    require_task_path 'session logs' "$logs"
+    require_task_path 'session state' "$state"
+    require_task_path 'session shots' "$shots"
     mkdir -p -- "$logs" "$state" "$shots"
     instance_name=$(cat "$state/instance" 2>/dev/null) || instance_name=
 }
@@ -553,8 +559,28 @@ current_side() {
 # remote, which the offline forge needs, is never fetched from or pushed to.
 session_variables=
 session_path=
+require_task_path() {
+    require_fixture_home "$1" "$2"
+    case "$fixture_home_resolved/" in
+        "$task/"*) ;;
+        *) die "fixture path must stay under its task: $2" ;;
+    esac
+}
+
+require_fixture_environment() {
+    require_task_path HOME "$fixture/home"
+    require_task_path CLAUDE_CONFIG_DIR "$fixture/home/.claude"
+    require_task_path CODEX_HOME "$fixture/home/.codex"
+    require_task_path XDG_DATA_HOME "$fixture/data"
+    require_task_path XDG_CONFIG_HOME "$fixture/config"
+    require_task_path XDG_CACHE_HOME "$fixture/cache"
+    require_task_path XDG_STATE_HOME "$fixture/state"
+    require_task_path XDG_RUNTIME_DIR "$runtime"
+}
+
 fixture_env() {
     local name passed=()
+    require_fixture_environment
     # WGPU_BACKEND picks the app's graphics backend, such as `gl` for the
     # OpenGL fallback a machine without a working Vulkan driver renders with.
     for name in LANG LC_ALL LC_CTYPE TERM WGPU_BACKEND $session_variables; do
@@ -569,6 +595,7 @@ fixture_env() {
     fi
     env -i "${passed[@]}" \
         HOME="$fixture/home" XDG_RUNTIME_DIR="$runtime" \
+        CLAUDE_CONFIG_DIR="$fixture/home/.claude" CODEX_HOME="$fixture/home/.codex" \
         XDG_DATA_HOME="$fixture/data" XDG_CONFIG_HOME="$fixture/config" \
         XDG_CACHE_HOME="$fixture/cache" XDG_STATE_HOME="$fixture/state" \
         CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
@@ -586,6 +613,8 @@ seeded_home_identity() {
 
 # Keep the stopped fixture as the seed every later start restores.
 save_seed() {
+    require_task_path HOME "$fixture"
+    require_fixture_environment
     rm -rf -- "$seed" "$seed_home"
     cp -a --reflink=auto -- "$fixture" "$seed"
     seeded_home_identity >"$seed_home"
@@ -597,6 +626,9 @@ restore_seed_in_place() {
 
 prepare_fixture() {
     local keep_state=$1
+    require_task_path HOME "$fixture"
+    require_task_path 'fixture seed' "$seed"
+    require_fixture_environment
     if [ "$keep_state" = false ]; then
         if [ -d "$seed" ] && [ -d "$fixture" ]; then
             # Restore the seed into the fixture rather than replacing it: a
@@ -622,7 +654,17 @@ prepare_fixture() {
     fi
     # home/.config holds the forge's switch and avatars its seeds; a steps file
     # writes into both without creating them.
+    require_fixture_environment
+    local path
+    for path in bin bin/lib bin/curl bin/muse home/.config home/.gemini avatars project \
+                libexec libexec/claude-terminal scripts acp/agy acp/muse; do
+        require_task_path 'fixture state' "$fixture/$path"
+    done
+    require_task_path 'fixture sign-in record' "$fixture/config/muse/auth.json"
     mkdir -p "$fixture"/{bin,home/.claude,home/.config,avatars,data,config,cache,state,project}
+    mkdir -p "$fixture/bin/lib" "$fixture/scripts"
+    install -m 644 "$tool_root/tests/fixtures/lib/fixture-home.sh" "$fixture/bin/lib/fixture-home.sh"
+    install -m 644 "$tool_root/scripts/fixture_home.py" "$fixture/scripts/fixture_home.py"
     # The Codex peers refuse a root others can read; so would a seed's mode.
     chmod 700 -- "$fixture"
     # Both sides get this tool's synthetic provider: the data must not differ
@@ -631,6 +673,8 @@ prepare_fixture() {
     # Its interactive terminal form, which it runs under node in a terminal pane.
     install -D -m 755 "$tool_root/tests/fixtures/claude-terminal.js" \
         "$fixture/libexec/claude-terminal/claude"
+    install -m 644 "$tool_root/tests/fixtures/lib/fixture-home.js" \
+        "$fixture/libexec/claude-terminal/fixture-home.js"
     # Refuses everything until home/.config/fixture-forge exists; see docs/fixtures.md.
     install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$fixture/bin/gh"
     # Avatars come only from the seeds the forge copies into the app's cache.

@@ -17,12 +17,15 @@ HANG_GUARD = 60
 
 class RedrawArtifacts(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="redraw-artifacts-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="redraw-artifacts-", dir="/var/tmp")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.calls = self.root / "calls.jsonl"
+        self.write(".cagents-fixture-root", "Fixture provider and app state stays below this root.\n")
         for name in ("run-redraw-latency", "build-ceditor-product", "cargo_artifacts.py"):
             self.write("scripts/" + name, (ROOT / "scripts" / name).read_text())
+        self.write("tests/fixtures/lib/fixture-home.sh",
+                   (ROOT / "tests/fixtures/lib/fixture-home.sh").read_text())
         self.write("fixtures/redraw-scheduling.schema.json", "{}\n")
         self.write(".cargo/config.toml", '[build]\ntarget = "x86_64-unknown-linux-gnu"\n')
         self.target = self.root / "configured target"

@@ -26,6 +26,7 @@ class AccountRegistryFixtureTests(unittest.TestCase):
         (self.task / ".native-evidence").touch(mode=0o600)
         self.root = self.task / "fixture"
         self.root.mkdir(mode=0o700)
+        (self.root / ".cagents-fixture-root").touch()
         for name in ("home", "data", "config"):
             (self.root / name).mkdir(mode=0o700)
         # Only this in-process invented filesystem test models a User caller.

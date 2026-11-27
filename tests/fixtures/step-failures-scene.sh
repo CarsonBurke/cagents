@@ -32,14 +32,17 @@ scene=${1:?usage: step-failures-scene.sh show LABEL | retheme KEY | theme KEY}
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name a native-evidence task}"
+. "$here/lib/fixture-home.sh"
 fixture=$CAGENTS_EVIDENCE_TASK/fixture
 config=$fixture/home/.claude
+require_fixture_home HOME "$fixture/home"
 
 if [ "$scene" = theme ]; then
     key=${2:?dark or light}
     case $key in dark|light) ;; *) exit 2 ;; esac
     # A session restores its fixture from the seed, so the theme goes there.
     settings=$CAGENTS_EVIDENCE_TASK/fixture-seed/config/cagents-development/settings.toml
+    require_fixture_home XDG_CONFIG_HOME "$settings"
     mkdir -p "${settings%/*}"
     if [ -f "$settings" ] && grep -q '^app_theme' "$settings"; then
         sed -i "s/^app_theme = .*/app_theme = \"$key\"/" "$settings"
@@ -67,6 +70,8 @@ label=${2:?name the shot}
 reply='type error is|checks cleanly|crate checks'
 
 if [ "$scene" = show ]; then
+    require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-frames.jsonl"
+    require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-reply.md"
     mkdir -p "$config"
     cp "$here/step-failures-scene/frames.jsonl" "$config/fixture-frames.jsonl"
     printf '%s\n' 'The type error is fixed and the crate checks cleanly.' >"$config/fixture-reply.md"
@@ -82,6 +87,7 @@ else
     evidence nested niri msg action close-window >/dev/null
     sleep 4
     settings=$fixture/config/cagents-development/settings.toml
+    require_fixture_home XDG_CONFIG_HOME "$settings"
     mkdir -p "${settings%/*}"
     if [ -f "$settings" ] && grep -q '^app_theme' "$settings"; then
         sed -i "s/^app_theme = .*/app_theme = \"$label\"/" "$settings"
@@ -91,6 +97,7 @@ else
         printf 'schema_version = 3\napp_theme = "%s"\n' "$label" >"$settings"
     fi
     # The relaunch stays until the session stops; it holds no build lock.
+    require_fixture_home 'fixture log' "$CAGENTS_EVIDENCE_TASK/logs/step-failures-relaunch.log"
     mkdir -p "$CAGENTS_EVIDENCE_TASK/logs"
     nohup "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" \
         --task "$CAGENTS_EVIDENCE_TASK" relaunch \

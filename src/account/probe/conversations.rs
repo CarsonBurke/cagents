@@ -436,13 +436,23 @@ mod tests {
     fn installed(name: &str, state: &Path, environment: &[(&str, &str)]) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let bin = tempfile::tempdir().unwrap();
+        std::fs::write(state.join(".cagents-fixture-root"), "").unwrap();
+        std::fs::create_dir(bin.path().join("scripts")).unwrap();
+        std::fs::write(
+            bin.path().join("scripts/fixture_home.py"),
+            include_str!("../../../scripts/fixture_home.py"),
+        )
+        .unwrap();
         let agent = bin.path().join("fake-acp-agent.py");
         std::fs::write(
             &agent,
             include_str!("../../../tests/fixtures/fake-acp-agent.py"),
         )
         .unwrap();
-        let mut script = format!("#!/bin/sh\nexport FAKE_ACP_STATE='{}'\n", state.display());
+        let mut script = format!(
+            "#!/bin/sh\nexport HOME='{0}' FAKE_ACP_STATE='{0}'\n",
+            state.display()
+        );
         for (name, value) in environment {
             script.push_str(&format!("export {name}='{value}'\n"));
         }

@@ -22,7 +22,10 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 ne=$here/../../scripts/native-evidence
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
+. "$here/lib/fixture-home.sh"
 config=$CAGENTS_EVIDENCE_TASK/fixture/home/.claude
+require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-frames.jsonl"
+require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-reply.md"
 
 log() { printf '== %s %s\n' "$(date +%T)" "$*"; }
 

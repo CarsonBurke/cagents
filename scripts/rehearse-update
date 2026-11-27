@@ -10,6 +10,7 @@ set -euo pipefail
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
 source "$tool_root/scripts/git-ancestry.sh"
+. "$tool_root/tests/fixtures/lib/fixture-home.sh"
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
 real_home=$HOME
 
@@ -139,8 +140,20 @@ session_name=rehearsal-${root##*/}
 
 # The private user's environment: nothing from this shell beyond locale and
 # terminal, and the toolchain locations a later build may want.
+require_fixture_environment() {
+    require_fixture_home HOME "$user_home"
+    require_fixture_home CLAUDE_CONFIG_DIR "$user_home/.claude"
+    require_fixture_home CODEX_HOME "$user_home/.codex"
+    require_fixture_home XDG_DATA_HOME "$user_home/.local/share"
+    require_fixture_home XDG_CONFIG_HOME "$user_home/.config"
+    require_fixture_home XDG_CACHE_HOME "$user_home/.cache"
+    require_fixture_home XDG_STATE_HOME "$user_home/.local/state"
+    require_fixture_home XDG_RUNTIME_DIR "$runtime"
+}
+
 user_env() {
     local name passed=()
+    require_fixture_environment
     for name in LANG LC_ALL LC_CTYPE TERM; do
         [ -z "${!name+x}" ] || passed+=("$name=${!name}")
     done
@@ -182,24 +195,35 @@ require_init() {
     [ -f "$root/.rehearse-update" ] && [ ! -L "$root/.rehearse-update" ] &&
         [ "$(cat -- "$root/.rehearse-update")" = "$root" ] ||
         die "not initialized with a matching root marker; run: --root $root init"
+    mark_fixture_root "$root"
 }
 
 cmd_init() {
     if [ -e "$root" ] && [ ! -e "$root/.rehearse-update" ]; then
         [ -z "$(ls -A -- "$root")" ] || die "not a rehearsal root, and not empty: $root" 2
     fi
-    if [ -e "$root/.rehearse-update" ] || [ -L "$root/.rehearse-update" ]; then
-        require_init
-    fi
     # Recovery storage refuses to live inside a Git checkout.
     local marker
     if marker=$(find_git_marker_in_ancestry "$root"); then
         die "root must be outside Git ancestry; found $marker" 2
     fi
+    if [ -e "$root/.rehearse-update" ] || [ -L "$root/.rehearse-update" ]; then
+        require_init
+    fi
     mkdir -p -- "$root"
     chmod 700 "$root"
     printf '%s\n' "$root" >"$root/.rehearse-update"
+    mark_fixture_root "$root"
+    require_fixture_environment
+    local path
+    for path in "$bin/lib" "$bin/curl" "$logs" "$root/records" "$root/shots" "$root/scripts" \
+                "$root/libexec/codex" "$user_home/.local/bin" "$user_home/src/alpha" "$user_home/src/beta"; do
+        require_fixture_home 'rehearsal state' "$path"
+    done
     mkdir -p -- "$bin" "$logs" "$root/records" "$root/shots" "$user_home"/{.claude,.codex,.config,.cache,.local/bin,.local/share,.local/state}
+    mkdir -p -- "$bin/lib" "$root/scripts"
+    install -m 644 "$tool_root/tests/fixtures/lib/fixture-home.sh" "$bin/lib/fixture-home.sh"
+    install -m 644 "$tool_root/scripts/fixture_home.py" "$root/scripts/fixture_home.py"
     mkdir -m 700 -p -- "$runtime"
     # The fixture ignores probes in this counter; real chat starts append once.
     [ ! -L "$user_home/.claude/fixture-launches" ] \
@@ -258,6 +282,8 @@ cmd_feed() {
     [ -f "$sums" ] || die "the feed's latest release $latest has no SHA256SUMS" 2
     grep -q '  install\.sh$' "$sums" ||
         die "$sums does not cover install.sh; package the release without --archive-only" 2
+    require_fixture_home 'rehearsal feed' "$root/feed"
+    require_fixture_home 'rehearsal curl' "$bin/curl"
     printf '%s\n' "$feed" >"$root/feed"
     { printf '#!/bin/bash\nfeed=%s\n' "$feed"; cat <<'CURL'
 # Only this feed's file:// URLs, and github.com's release URLs it stands in for.

@@ -26,6 +26,7 @@ pub fn private_cli(root: &Path) -> CommandSpec {
     }
     for (name, leaf) in [
         ("HOME", "home"),
+        ("CLAUDE_CONFIG_DIR", "home/.claude"),
         ("XDG_RUNTIME_DIR", "run"),
         ("XDG_DATA_HOME", "data"),
         ("XDG_CONFIG_HOME", "config"),
@@ -117,13 +118,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let spec = private_program(root.path(), "/bin/sh").args([
             "-c",
-            "printf '%s\\n' \"$HOME\" \"$TMPDIR\" \"${CAGENTS_AGENT_AUTHORITY+present}\"",
+            "printf '%s\\n' \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$TMPDIR\" \"${CAGENTS_AGENT_AUTHORITY+present}\"",
         ]);
         let command = spec.to_command();
         let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
         assert_eq!(
             environment.values().filter(|value| value.is_some()).count(),
-            7
+            8
         );
         assert!(std::env::vars_os().all(|(name, _)| {
             name == cagents::agent_execution::AUTHORITY_ENV
@@ -134,6 +135,7 @@ mod tests {
         let variables = String::from_utf8(output.stdout).unwrap();
         let mut values = variables.lines();
         assert_eq!(values.next(), root.path().join("home").to_str());
+        assert_eq!(values.next(), root.path().join("home/.claude").to_str());
         assert_eq!(values.next(), root.path().join("tmp").to_str());
         let authority = std::env::var_os(cagents::agent_execution::AUTHORITY_ENV);
         assert_eq!(

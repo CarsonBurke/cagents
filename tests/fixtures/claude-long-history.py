@@ -10,13 +10,23 @@ blocks, lists and attached screenshots.
 Code writes around a tool call, and a one-line answer, so a saved page of 100
 records holds only a few rows, as in an agent's long working session.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 import base64
 import json
 import struct
 import zlib
 import os
-from pathlib import Path
 import re
 import time
 import uuid
@@ -37,6 +47,8 @@ parser.add_argument("--varied", action="store_true",
 parser.add_argument("--working", type=int, default=0, metavar="N",
                     help="run N commands per exchange, each with its hook records")
 args = parser.parse_args()
+home = require_fixture_home("HOME")
+config = require_fixture_home("CLAUDE_CONFIG_DIR", home / ".claude")
 if args.turns < 129:
     parser.error("use at least 129 turns to exercise history eviction")
 if args.scale < 1:
@@ -134,12 +146,13 @@ def working(turn, count):
 
 project = os.path.realpath(args.project)
 session = str(uuid.uuid5(uuid.NAMESPACE_URL, f"claude-long-history:{project}"))
-directory = Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", project)
-directory.mkdir(parents=True, exist_ok=True)
+directory = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", project)
+path = require_fixture_home("CLAUDE_CONFIG_DIR", directory / f"{session}.jsonl")
+path.parent.mkdir(parents=True, exist_ok=True)
 parent = None
 clock = time.time() - (args.turns * (3 if args.varied else 1) * (1 + 2 * args.working)
                        + (args.turns // 32 if args.tool_bytes else 0)) * 90
-with (directory / f"{session}.jsonl").open("w") as transcript:
+with path.open("w") as transcript:
     for turn in range(1, args.turns + 1):
         # Newer pages are taller: paging backward must discard their extent,
         # rather than leaving a blank tail with the old content height.

@@ -15,6 +15,8 @@ import fcntl
 import json
 import os
 
+from fixture_home import require_fixture_home
+
 from . import content
 from .determinism import day_path, file_stamp, iso
 
@@ -141,6 +143,7 @@ def path(codex_home, thread_id, started_at, archived=False):
 
 
 def write(codex_home, spec, stream):
+    codex_home = str(require_fixture_home("CODEX_HOME", codex_home))
     rollout = Rollout(stream, spec["thread_id"], spec["cwd"], spec["branch"], spec["started_at"])
     rollout.session_meta(spec.get("parent"), spec.get("nickname"))
     rollout.harness_context()
@@ -157,6 +160,7 @@ def write(codex_home, spec, stream):
 def write_index(codex_home, names, modified):
     """session_index.jsonl: one line per rename, oldest first, as codex
     appends them, last modified at `modified` (Unix seconds)."""
+    codex_home = str(require_fixture_home("CODEX_HOME", codex_home))
     os.makedirs(codex_home, exist_ok=True)
     index = os.path.join(codex_home, "session_index.jsonl")
     with open(index, "w") as file:
@@ -172,6 +176,7 @@ def lock_path(codex_home, thread_id):
 def hold_writer_locks(codex_home, thread_ids):
     """Takes each thread's writer lock, as a live codex writing that thread
     does, and returns the open files: the locks last while they stay open."""
+    codex_home = str(require_fixture_home("CODEX_HOME", codex_home))
     held = []
     for thread_id in thread_ids:
         target = lock_path(codex_home, thread_id)

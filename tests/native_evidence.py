@@ -304,10 +304,9 @@ class GitAncestry(unittest.TestCase):
 
 class Evidence(unittest.TestCase):
     def setUp(self) -> None:
-        # Use the native evidence task's usual base, short enough for sockets.
-        state = Path.home() / ".local" / "state"
-        state.mkdir(parents=True, exist_ok=True)
-        self.root = Path(tempfile.mkdtemp(prefix="ne-", dir=state))
+        # Keep fixture paths short even when the caller's isolated HOME is long;
+        # the native runner's socket path limit remains part of the contract.
+        self.root = Path(tempfile.mkdtemp(prefix="ne-", dir="/var/tmp"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.task = self.root / "task"
         self.logs = self.root / "logs"
@@ -1735,7 +1734,9 @@ class Evidence(unittest.TestCase):
         fixture = self.task / "fixture"
         self.assertIn(f"HOME={fixture}/home\n", environment)
         self.assertIn(f"XDG_RUNTIME_DIR={self.task}/rt\n", environment)
-        self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={fixture}/home/.claude\n", environment)
+        self.assertIn(f"CODEX_HOME={fixture}/home/.codex\n", environment)
+        self.assertTrue((self.task / ".cagents-fixture-root").is_file())
         self.assertTrue((fixture / "bin" / "claude").is_file())
         self.assertFalse((fixture / "bin" / "claude").is_symlink())
         self.assertEqual(
@@ -1816,6 +1817,19 @@ class Evidence(unittest.TestCase):
         self.assertIsNone(unrelated.poll())
         self.assertIn("daemon stop --confirm capability", (self.logs / "cli").read_text())
         self.assertEqual(self.run_tool("cli", "print-env", check=False).returncode, 1)
+
+    def test_fixture_symlink_cannot_mark_or_install_providers_into_another_home(self) -> None:
+        self.built("after")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "account.json").write_text("outside the fixture")
+        fixture = self.task / "fixture"
+        fixture.symlink_to(outside, target_is_directory=True)
+        started = self.run_tool("start", "after", "--keep-state", check=False)
+        self.assertNotEqual(started.returncode, 0)
+        self.assertTrue(fixture.is_symlink())
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["account.json"])
+        self.assertIn("fixture-home: refusing", (self.task / "logs/session-after.log").read_text())
 
     def test_seed_restores_identical_data_for_each_side(self) -> None:
         self.built("after")
@@ -2679,9 +2693,8 @@ REMOTE_TOOL = """
 
 class RemoteEvidence(unittest.TestCase):
     def setUp(self) -> None:
-        state = Path.home() / ".local" / "state"
-        state.mkdir(parents=True, exist_ok=True)
-        self.root = Path(tempfile.mkdtemp(prefix="ner-", dir=state))
+        # Remote task names also obey the native runner's socket path limit.
+        self.root = Path(tempfile.mkdtemp(prefix="ner-", dir="/var/tmp"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.logs = self.root / "logs"
         self.logs.mkdir()
@@ -3566,6 +3579,9 @@ class SeedRestore(unittest.TestCase):
                     prefix="native-seed-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
                 seed, fixture = root / "seed", root / "fixture"
+                for parent in (seed, fixture):
+                    parent.mkdir()
+                    (parent / ".cagents-fixture-root").touch()
                 relatives = ("project/.git/objects/4b/object", "home/.claude/session.jsonl")
                 original = {}
                 for relative in relatives:
@@ -3587,6 +3603,7 @@ class SeedRestore(unittest.TestCase):
                     (parent / "external").symlink_to(unrelated)
                 helper = root / "restore.py"
                 shutil.copyfile(REPOSITORY / "scripts/native-evidence-seed.py", helper)
+                shutil.copyfile(REPOSITORY / "scripts/fixture_home.py", root / "fixture_home.py")
                 credentials = {}
                 if os.geteuid() == 0:
                     for directory, subdirs, files in os.walk(root):
@@ -3613,6 +3630,8 @@ class SeedRestore(unittest.TestCase):
             seed, fixture, binaries = root / "seed", root / "fixture", root / "bin"
             for directory in (seed, fixture, binaries):
                 directory.mkdir()
+            for parent in (seed, fixture):
+                (parent / ".cagents-fixture-root").touch()
             (seed / "file").write_text("saved")
             target = fixture / "file"
             target.write_text("changed")

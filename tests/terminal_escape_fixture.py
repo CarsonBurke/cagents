@@ -16,7 +16,8 @@ HANG_GUARD = 60
 
 class TerminalEscapeFixture(unittest.TestCase):
     def test_aggregate_gate_cannot_mask_streaming_output(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory)
             messages = []
             worker_errors = []

@@ -34,12 +34,14 @@ set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 ne() { "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
+. "$here/lib/fixture-home.sh"
 fixture=$CAGENTS_EVIDENCE_TASK/fixture
 work=$CAGENTS_EVIDENCE_TASK/image-gallery-scene
 
 picture() { # NAME WIDTH HEIGHT FROM TO LABEL
     local file=$work/$1
     [ -s "$file" ] && return
+    require_fixture_home 'fixture images' "$file"
     magick -size "$2x$3" "gradient:$4-$5" \
         -fill '#ffffff22' -draw "roundrectangle 40,40 $(($2 - 40)),110 12,12" \
         -fill '#ffffff18' -draw "roundrectangle 40,140 $(($2 / 3)),$(($3 - 40)) 12,12" \
@@ -49,6 +51,7 @@ picture() { # NAME WIDTH HEIGHT FROM TO LABEL
 }
 
 frames() {
+    require_fixture_home 'fixture images' "$work/frames.jsonl"
     mkdir -p "$work"
     # Each is the size Claude shows the model; reads of larger files say so.
     picture proposed-slow.png 1568 1045 '#1e293b' '#475569' 'Proposed: slow'
@@ -130,6 +133,7 @@ cmd_theme() { # Between sessions: the fixture's and any saved seed's settings.
     for root in "$fixture" "$CAGENTS_EVIDENCE_TASK/fixture-seed"; do
         [ -d "$root" ] || continue
         settings=$root/config/cagents-development/settings.toml
+        require_fixture_home XDG_CONFIG_HOME "$settings"
         mkdir -p "${settings%/*}"
         if [ -f "$settings" ] && grep -q '^app_theme' "$settings"; then
             sed -i "s/^app_theme = .*/app_theme = \"$key\"/" "$settings"

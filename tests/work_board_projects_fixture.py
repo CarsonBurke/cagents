@@ -26,6 +26,9 @@ class WorkBoardProjects(unittest.TestCase):
         self.fixture = Path(self.directory.name).resolve() / "fixture"
         for name in ("bin", "home/.config"):
             (self.fixture / name).mkdir(parents=True)
+        (self.fixture / ".cagents-fixture-root").touch()
+        (self.fixture / "bin/lib").mkdir()
+        shutil.copy(FORGE.parent / "lib/fixture-home.sh", self.fixture / "bin/lib/fixture-home.sh")
         shutil.copy(FORGE, self.fixture / "bin" / "gh")
         self.config = self.fixture / "home" / ".config"
 

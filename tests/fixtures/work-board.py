@@ -34,6 +34,10 @@ import subprocess
 import sys
 import time
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from fixture_home import require_fixture_home
+
 DAY = 24 * 60 * 60
 HOUR = 60 * 60
 NOW = int(time.time())
@@ -89,13 +93,14 @@ def fail(message):
 
 def git(directory, *arguments, at=NOW):
     date = f"@{at} +0000"
+    directory = require_fixture_home("fixture repository", directory)
     environment = {**os.environ, **GIT_ENVIRONMENT, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
     return subprocess.run(["git", "-C", str(directory), *arguments], env=environment, check=True,
                           stdout=subprocess.PIPE, text=True).stdout.strip()
 
 
 def commit(directory, name, content, message, at):
-    path = directory / name
+    path = require_fixture_home("fixture repository file", directory / name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
     git(directory, "add", "--", name)
@@ -215,7 +220,7 @@ def special_cards(projects):
 def write(path, content):
     """Whole or not at all: the forge reads it on every call."""
     partial = path.with_name(path.name + ".next")
-    partial.write_text(content)
+    require_fixture_home("fixture output", partial).write_text(content)
     partial.replace(path)
 
 
@@ -225,18 +230,18 @@ def main():
     fixture = os.environ.get("CAGENTS_EVIDENCE_FIXTURE")
     if not fixture:
         fail("run it in a native-evidence fixture: scripts/native-evidence env python3 -I " + sys.argv[0])
-    fixture = Path(fixture).resolve()
+    fixture = require_fixture_home("CAGENTS_EVIDENCE_FIXTURE", fixture)
     home = fixture / "home"
     # Never write forge files except inside an evidence fixture's HOME.
     if not ((fixture / "bin").is_dir() and Path.home().resolve() == home):
         fail(f"{fixture} is not a native-evidence fixture whose HOME is this one; start a session first")
-    projects = fixture / "projects"
+    projects = require_fixture_home("fixture repositories", fixture / "projects")
+    config = require_fixture_home("XDG_CONFIG_HOME", home / ".config")
     for name in RECENT:
         make_project(projects, name)
     seeds = special_cards(projects)
-    config = home / ".config"
     config.mkdir(exist_ok=True)
-    (config / "fixture-forge").touch()
+    require_fixture_home("fixture forge", config / "fixture-forge").touch()
     write(config / "fixture-forge-prs.json", json.dumps(seeds, indent=1) + "\n")
     for name in RECENT:
         print(projects / name)

@@ -6,12 +6,14 @@
 # turn instead finishes by itself that long after it starts, as real work
 # does, unless it is interrupted first.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home CLAUDE_CONFIG_DIR
 
 if [ "${1:-}" = --version ]; then
     printf '%s\n' '2.1.286 (Claude Code fixture)'
     exit 0
 fi
-config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+config=$fixture_home_resolved
 if [ "${1:-}" = auth ]; then
     if [ -f "$config/fixture-auth-status.json" ]; then
         cat "$config/fixture-auth-status.json"
@@ -74,6 +76,12 @@ if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
         exit 2
     fi
 fi
+cwd=$(pwd -P)
+project=$(printf '%s\n' "$cwd" | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
+history=$config/projects/$project/$session.jsonl
+require_fixture_home CLAUDE_CONFIG_DIR "$history"
+require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-launches"
+require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-frames.exited"
 # Optional launch record: while fixture-launches exists, each provider start
 # appends the conversation it resumed, or `new`, so a check can tell a
 # resume of the same conversation from a second start.
@@ -88,9 +96,6 @@ if [ "$probe" = false ] && [ -n "$resumed" ] && [ -e "$config/fixture-fail-resum
     printf '%s\n' 'fixture: the resumed provider could not start' >&2
     exit 1
 fi
-cwd=$(pwd -P)
-project=$(printf '%s\n' "$cwd" | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
-history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
 parent=null
 turn=0

@@ -932,7 +932,10 @@ Seed a fresh private fixture with a parent-linked conversation before its first
 native start:
 
 ```sh
-python3 tests/fixtures/claude-resume-history.py /path/to/private/fixture --turns 50
+fixture=/path/to/new/private/fixture
+mkdir -p "$fixture"
+touch "$fixture/.cagents-fixture-root"
+python3 tests/fixtures/claude-resume-history.py "$fixture" --turns 50
 python3 tests/fixtures/check-claude-resume-history.py
 ```
 
@@ -1394,7 +1397,8 @@ arguments, so a launch recipe written for the real agent runs it unchanged,
 except Antigravity's `--app-data-dir DIR`: like `agy`, a process started
 with it keeps its conversations apart from the ones it lists otherwise, so
 the account check's own sessions are not listed as the reader's.
-It contacts no model, account or network.
+Standalone runs set `HOME` and `FAKE_ACP_STATE` to paths under a marked
+fixture root. It contacts no model, account or network.
 
 In the Muse shape, three account commands answer the way `muse` does, so the
 fixture can stand in for `muse-upstream` on a fixture `PATH`:
@@ -1530,10 +1534,18 @@ through a real pipe.
 For saved Codex turns in the Resume conversation picker, use
 [`tests/fixtures/codex-resume-history.py`](../tests/fixtures/codex-resume-history.py).
 
-`/usr/bin/python3 tests/fixtures/codex-resume-history.py ROOT --turns 3`
-creates one invented conversation under `ROOT/home/.codex` and prints its
-thread ID, rollout path and working directory as JSON. Run it once in a new
-fixture before saving the seed; it refuses an existing Codex home. For native
+Create a fresh marked root before saving the seed:
+
+```sh
+fixture=/path/to/new/private/fixture
+mkdir -p "$fixture"
+touch "$fixture/.cagents-fixture-root"
+/usr/bin/python3 tests/fixtures/codex-resume-history.py "$fixture" --turns 3
+```
+
+The generator creates one invented conversation under `$fixture/home/.codex`
+and prints its thread ID, rollout path and working directory as JSON. It
+requires a fresh Codex home. For native
 evidence, use that home with a real Codex executable and the ordinary development
 runner. The generator does not install or launch Codex, sign in, or call a model.
 

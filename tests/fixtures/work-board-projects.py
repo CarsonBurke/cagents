@@ -29,6 +29,10 @@ import subprocess
 import sys
 import time
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from fixture_home import require_fixture_home
+
 OWNER = "octo-org"
 # Names a team's repositories have; none is anyone's real project.
 PROJECTS = ("api-gateway", "billing", "docs-site", "mobile-app", "design-system", "infra",
@@ -59,6 +63,7 @@ DAY = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
 
 
 def git(directory, *arguments, date=f"{DAY}T09:00:00Z"):
+    directory = require_fixture_home("fixture repository", directory)
     environment = {**os.environ, **GIT_ENVIRONMENT, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
     return subprocess.run(["git", "-C", str(directory), *arguments], env=environment, check=True,
                           stdout=subprocess.PIPE, text=True).stdout.strip()
@@ -120,7 +125,7 @@ def seed(index, name, branch, oid):
 def write(path, content):
     """Whole or not at all: the forge reads these on every call."""
     partial = path.with_name(path.name + ".next")
-    partial.write_text(content)
+    require_fixture_home("fixture output", partial).write_text(content)
     partial.replace(path)
 
 
@@ -128,12 +133,12 @@ def fixture_root():
     fixture = os.environ.get("CAGENTS_EVIDENCE_FIXTURE")
     if not fixture:
         fail("run it in a native-evidence fixture: scripts/native-evidence env python3 " + sys.argv[0])
-    fixture = Path(fixture).resolve()
+    fixture = require_fixture_home("CAGENTS_EVIDENCE_FIXTURE", fixture)
     home = fixture / "home"
     # Never write forge files except inside an evidence fixture's HOME.
     if not ((fixture / "bin").is_dir() and home.is_dir() and Path.home().resolve() == home):
         fail(f"{fixture} is not a native-evidence fixture whose HOME is this one; start a session first")
-    (home / ".config").mkdir(exist_ok=True)
+    require_fixture_home("XDG_CONFIG_HOME", home / ".config").mkdir(exist_ok=True)
     return fixture
 
 
@@ -151,11 +156,12 @@ def main():
     arguments = sys.argv[1:]
     if arguments not in ([], ["rate-limit"], ["rate-limit", "off"]):
         fail("takes no arguments, `rate-limit` or `rate-limit off`")
-    config = fixture_root() / "home" / ".config"
+    fixture = fixture_root()
+    config = fixture / "home" / ".config"
     if arguments:
         print(json.dumps(rate_limit(config, arguments[-1])))
         return
-    root = fixture_root() / "projects"
+    root = require_fixture_home("fixture repositories", fixture / "projects")
     made = [(index, name, *prepare(root, index, name)) for index, name in enumerate(PROJECTS)]
     prs = config / "fixture-forge-prs.json"
     ours = tuple(f"https://github.com/{OWNER}/{name}/pull/" for name in PROJECTS)
@@ -168,7 +174,7 @@ def main():
     seeds = [seed(index, name, branch, oid) for index, name, branch, oid in made if index % 2 == 0]
     # The switch goes on before the projects are opened: a failed read while
     # a remote is there makes the app wait before asking again.
-    (config / "fixture-forge").touch()
+    require_fixture_home("fixture forge", config / "fixture-forge").touch()
     write(prs, json.dumps(kept + seeds, indent=1) + "\n")
     print(json.dumps({"projects": [str(root / name) for name in PROJECTS]}))
 

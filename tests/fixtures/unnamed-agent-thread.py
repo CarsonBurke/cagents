@@ -15,22 +15,35 @@ the thread, and nothing put the ID in the pane before its process ended.
 one per line, for a stand-in provider that outlived its daemon.
 """
 
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+_here = Path(__file__).resolve().parent
+if _here.name == "tools" and (_here.parent / ".native-evidence").is_file():
+    # Copied scenes use the same helpers native-evidence installs for providers.
+    _scripts = _here.parent / "fixture/scripts"
+else:
+    _scripts = _here.parents[1] / "scripts"
+sys.path.insert(0, str(_scripts))
+from fixture_home import require_fixture_home
+
 import argparse
 import json
 import os
-from pathlib import Path
 import sqlite3
 import stat
 
 
 def registry_path():
+    require_fixture_home("HOME")
     raw = os.environ.get("CAGENTS_EVIDENCE_FIXTURE")
     if not raw:
         raise ValueError("run through native-evidence env inside its private fixture")
     root = Path(raw).resolve(strict=True)
     if root.stat().st_uid != os.getuid() or stat.S_IMODE(root.stat().st_mode) & 0o077:
         raise ValueError("the fixture root must be private and owned by this user")
-    data = Path(os.environ.get("XDG_DATA_HOME", "")).resolve(strict=True)
+    data = require_fixture_home("XDG_DATA_HOME").resolve(strict=True)
     if data != root / "data":
         raise ValueError("XDG_DATA_HOME must be the fixture's data directory")
     paths = list(data.glob("cagents-development*/workspace-model.sqlite3"))

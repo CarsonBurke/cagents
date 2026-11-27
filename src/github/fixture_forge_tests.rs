@@ -20,10 +20,28 @@ struct Forge {
 
 fn forge() -> Forge {
     let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
+    std::fs::create_dir_all(root.path().join("bin/lib")).unwrap();
+    std::fs::write(
+        root.path().join("bin/lib/fixture-home.sh"),
+        include_str!("../../tests/fixtures/lib/fixture-home.sh"),
+    )
+    .unwrap();
     let gh = root.path().join("bin/gh");
     std::fs::create_dir_all(gh.parent().unwrap()).unwrap();
     // Embedded, not copied: a test built on the build host runs elsewhere.
-    std::fs::write(&gh, include_str!("../../tests/fixtures/fixture-gh.sh")).unwrap();
+    std::fs::write(
+        &gh,
+        format!(
+            "{}\n{}",
+            r#"#!/bin/sh
+fixture_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+export HOME="$fixture_root/home"
+export XDG_CACHE_HOME="$fixture_root/cache""#,
+            include_str!("../../tests/fixtures/fixture-gh.sh"),
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let switch = root.path().join("home/.config/fixture-forge");
     std::fs::create_dir_all(switch.parent().unwrap()).unwrap();

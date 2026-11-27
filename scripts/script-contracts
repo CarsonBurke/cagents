@@ -56,9 +56,12 @@ class Job:
     shards: int = 1
 
 
+FIXTURE_HOME_HELPERS = ("scripts/fixture_home.py", "tests/fixtures/lib/fixture-home.sh",
+                        "tests/fixtures/lib/fixture-home.js")
+
 # What the update rehearsal's suites load from scripts/, and the fixtures its
 # private user runs in place of providers and GitHub.
-REHEARSAL_SCRIPTS = ("scripts/rehearse-update", "scripts/git-ancestry.sh", "scripts/native_slots.py",
+REHEARSAL_SCRIPTS = (*FIXTURE_HOME_HELPERS, "scripts/rehearse-update", "scripts/git-ancestry.sh", "scripts/native_slots.py",
                      *(f"scripts/rehearse_update_{module}.py" for module in ("records", "run", "restart", "fault", "pty")))
 REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
     "chat-composer-claude.sh", "fixture-gh.sh", "rehearsal-codex.sh", "rehearsal-codex.py",
@@ -69,7 +72,8 @@ REHEARSAL_FIXTURES = tuple(f"tests/fixtures/{fixture}" for fixture in (
 JOBS = (
     Job("native evidence", shards=3, suites=(
         Suite("native evidence", "tests/native_evidence.py",
-              sources=("scripts/native-evidence", "scripts/native-evidence-remote", "scripts/native-evidence-shots.py",
+              sources=(*FIXTURE_HOME_HELPERS, "scripts/native-evidence", "scripts/native-evidence-remote",
+                       "scripts/native-evidence-shots.py",
                        "scripts/pr-screenshots", "scripts/offload_client.py",
                        "scripts/cargo-gate-command.py", "scripts/git-ancestry.sh", "scripts/native_slots.py",
                        "scripts/run-development", "scripts/cargo-lane", "scripts/cargo_warnings.py"),
@@ -113,6 +117,11 @@ JOBS = (
         Suite("release prebuild", "tests/prebuild_release.py", sources=("scripts/prebuild-release",)),
     )),
     Job("tooling", suites=(
+        Suite("fixture home guard", "tests/fixture_home_guard.py",
+              sources=(*FIXTURE_HOME_HELPERS, "scripts/rehearse_update_fault.py",
+                       "scripts/run-redraw-latency"),
+              syntax=(("sh", "tests/fixtures/lib/fixture-home.sh"),
+                      ("sh", "scripts/run-redraw-latency"))),
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
         Suite("vendored checkout-cache hooks", "tests/checkout_cache_vendor_hooks.py",
               sources=("scripts/qualify-checkout-cache.py", "Cargo.toml", "vendor/iced-widget/build.rs",

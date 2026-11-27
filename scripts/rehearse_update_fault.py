@@ -1,5 +1,9 @@
 #!/usr/bin/python3
 """Create a verified startup-failing candidate only inside a marked rehearsal."""
+import sys
+
+sys.dont_write_bytecode = True
+
 import argparse
 import hashlib
 from pathlib import Path
@@ -8,22 +12,36 @@ import shutil
 import tarfile
 import tempfile
 
+from fixture_home import require_fixture_home
+
 
 def private_root(root, version):
     root = Path(root).resolve()
+    require_fixture_home('HOME', root)
+    require_fixture_home('HOME', root / 'home')
     marker = root / '.rehearse-update'
     if marker.is_symlink() or marker.read_text().strip() != str(root):
         raise ValueError('fault injection requires a matching rehearsal root')
     if version in ('', '.', '..') or '/' in version:
         raise ValueError('fault injection requires a single version name')
+    require_fixture_home('XDG_DATA_HOME', root / 'home/.local/share/cagents-install')
+    for path in (root / 'logs', root / 'logs/daemon-start-failure.txt', root / 'logs/startup-fault.txt'):
+        require_fixture_home('HOME', path)
     return root
 
 
 def wrap_daemon(root, version, candidate, helper=None):
+    root = private_root(root, version)
+    require_fixture_home('HOME', candidate)
     daemon = candidate / 'bin/cagentsd'
     if daemon.is_symlink() or not daemon.is_file():
         raise ValueError('fault injection requires a regular candidate daemon')
     original = helper or daemon.with_name('cagentsd-rehearsal-real')
+    require_fixture_home('HOME', original)
+    marker = candidate / '.cagents-daemon-protocol'
+    require_fixture_home('HOME', marker)
+    shell_helper = root / 'bin/lib/fixture-home.sh'
+    require_fixture_home('HOME', shell_helper)
     if helper:
         if original.is_symlink() or not original.is_file():
             raise ValueError('fault introspection requires the exact private daemon helper')
@@ -33,8 +51,29 @@ def wrap_daemon(root, version, candidate, helper=None):
             raise ValueError('candidate already has a startup fault')
         daemon.rename(original)
         delegate = '"${0%/*}/cagentsd-rehearsal-real"'
+    shell_helper.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(Path(__file__).resolve().parents[1] / 'tests/fixtures/lib/fixture-home.sh', shell_helper)
     receipt = shlex.quote(str(root / 'logs/daemon-start-failure.txt'))
     daemon.write_text(f'''#!/bin/sh
+. {shlex.quote(str(shell_helper))}
+require_fixture_home HOME {shlex.quote(str(root))}
+export HOME={shlex.quote(str(root / 'home'))}
+export XDG_RUNTIME_DIR={shlex.quote(str(root / 'rt'))}
+export XDG_DATA_HOME={shlex.quote(str(root / 'home/.local/share'))}
+export XDG_CONFIG_HOME={shlex.quote(str(root / 'home/.config'))}
+export XDG_CACHE_HOME={shlex.quote(str(root / 'home/.cache'))}
+export XDG_STATE_HOME={shlex.quote(str(root / 'home/.local/state'))}
+export CLAUDE_CONFIG_DIR={shlex.quote(str(root / 'home/.claude'))}
+export CODEX_HOME={shlex.quote(str(root / 'home/.codex'))}
+require_fixture_home HOME
+require_fixture_home XDG_RUNTIME_DIR
+require_fixture_home XDG_DATA_HOME
+require_fixture_home XDG_CONFIG_HOME
+require_fixture_home XDG_CACHE_HOME
+require_fixture_home XDG_STATE_HOME
+require_fixture_home CLAUDE_CONFIG_DIR
+require_fixture_home CODEX_HOME
+require_fixture_home HOME {receipt}
 # Informational and authenticated source-inspection entrypoints never serve.
 case ${{1-}} in
     --help|--version|--stored-schema)
@@ -47,7 +86,6 @@ printf '%s\\n' 'forced rehearsal daemon startup failure' >&2
 exit 1
 ''')
     daemon.chmod(0o755)
-    marker = candidate / '.cagents-daemon-protocol'
     if marker.exists():
         protocol, _ = marker.read_text().split()
         marker.write_text(f'{protocol} {hashlib.sha256(daemon.read_bytes()).hexdigest()}\n')
@@ -60,6 +98,7 @@ def fail_start(root, version):
     root = private_root(root, version)
     prefix = root / 'home/.local/share/cagents-install'
     candidate = prefix / 'versions' / version
+    require_fixture_home('HOME', candidate)
     if candidate.parent != prefix / 'versions' or (prefix / 'current').resolve() != candidate:
         raise ValueError('fault injection requires the staged current candidate')
     wrap_daemon(root, version, candidate)
@@ -77,6 +116,7 @@ def failing_archive(root, version, archive_dir):
     if expected != [source_hash]:
         raise ValueError('startup fault requires the checksum-verified source archive')
     destination = root / 'startup-fault-archive'
+    require_fixture_home('HOME', destination)
     destination.mkdir(mode=0o700)
     with tempfile.TemporaryDirectory(prefix='tree-',dir=destination) as temporary:
         tree = Path(temporary)

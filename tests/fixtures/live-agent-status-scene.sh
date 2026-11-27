@@ -7,6 +7,9 @@
 # CAGENTS_EVIDENCE_NARROW_WIDTH=900 to capture ordinary states at both widths
 # within one session. Tooltip captures stay at the initial wide width.
 set -euo pipefail
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 here=$(cd "$(dirname "$0")" && pwd)
 ne=${CAGENTS_EVIDENCE_COMMAND:-$here/../../scripts/native-evidence}
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"

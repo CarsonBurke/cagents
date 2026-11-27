@@ -20,10 +20,15 @@ XDG_DATA_HOME, and refuses anywhere else.
 import glob
 import json
 import os
+from pathlib import Path
 import sqlite3
 import sys
 import time
 import uuid
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from fixture_home import require_fixture_home
 
 
 def main():
@@ -33,12 +38,17 @@ def main():
     draft = sys.argv[2] if len(sys.argv) == 3 else " "
     if not os.environ.get("CAGENTS_EVIDENCE_FIXTURE"):
         sys.exit("Run this through scripts/native-evidence env, in a fixture.")
+    fixture = require_fixture_home("CAGENTS_EVIDENCE_FIXTURE")
+    data = require_fixture_home("XDG_DATA_HOME")
     stores = glob.glob(
-        os.path.join(os.environ["XDG_DATA_HOME"], "cagents-development*", "sessions.sqlite3")
+        os.path.join(data, "cagents-development*", "sessions.sqlite3")
     )
     if len(stores) != 1:
         sys.exit(f"Expected one development store, found {stores}")
-    db = sqlite3.connect(stores[0])
+    database = require_fixture_home("workspace database", stores[0])
+    if not database.is_relative_to(fixture):
+        sys.exit(f"{database} is outside the fixture {fixture}")
+    db = sqlite3.connect(database)
 
     def meta(key):
         row = db.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()

@@ -3,6 +3,9 @@
 # pane Attention rows and `agent spawn --worktree` introduced by #2806.
 set -euo pipefail
 fx=$(evidence env sh -c 'printf %s "$CAGENTS_EVIDENCE_FIXTURE"' | tail -1)
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "$fx/home"
+require_fixture_home CLAUDE_CONFIG_DIR "$fx/home/.claude"
 config=$fx/home/.claude
 mkdir -p "$config"
 printf '1\n' >"$config/fixture-first-turn-seconds"

@@ -34,13 +34,15 @@ class BusyButtonsFixture(unittest.TestCase):
             "code": -32602, "message": "Prompt the fixture parent"}}])
 
     def test_login_holds_its_terminal_but_status_ignores_the_delay(self):
-        with tempfile.TemporaryDirectory(prefix="codex-login-fixture-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-login-fixture-", dir="/var/tmp") as directory:
             root = Path(directory)
+            (root / ".cagents-fixture-root").touch()
             (root / "bin").mkdir()
             home = root / "home/.codex"
             home.mkdir(parents=True)
             executable = root / "bin/codex"
             shutil.copy2(FIXTURES / "fixture-codex.sh", executable)
+            shutil.copytree(FIXTURES / "lib", root / "bin/lib")
             switch = home / "fixture-sign-in-seconds"
             switch.write_text("1\n")
             environment = {"HOME": str(root / "home"), "CODEX_HOME": str(home),
@@ -60,14 +62,15 @@ class BusyButtonsFixture(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("fixture-sign-in-seconds", result.stderr)
 
-            with tempfile.TemporaryDirectory(prefix="codex-login-outside-") as outside:
+            with tempfile.TemporaryDirectory(prefix="codex-login-outside-", dir="/var/tmp") as outside:
                 alias = root / "linked-home"
                 alias.symlink_to(outside, target_is_directory=True)
                 for refused in [outside, str(alias)]:
                     environment["CODEX_HOME"] = refused
                     result = login()
-                    self.assertEqual(result.returncode, 2)
-                    self.assertIn("beneath its private root", result.stderr)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("fixture-home: refusing CODEX_HOME=", result.stderr)
+                    self.assertIn(str(Path(outside).resolve()), result.stderr)
 
 
 if __name__ == "__main__":
