@@ -15,6 +15,9 @@ use crate::workspace_model::{
     project_order_after,
 };
 
+#[cfg(feature = "development")]
+mod terminal_creation_fixture;
+
 /// How long a thread waits before reconnecting.
 ///
 /// A window can open before any daemon exists, and the daemon can be replaced
@@ -40,12 +43,19 @@ type Unsent = (ModelRequest, std::time::SystemTime);
 pub(super) struct ModelRequest {
     pub(super) edit: ModelEdit,
     pub(super) seed_attempt: Option<uuid::Uuid>,
+    #[cfg(feature = "development")]
+    fixture_unchanged_edge: bool,
 }
 
 impl From<ModelEdit> for ModelRequest {
     fn from(edit: ModelEdit) -> Self {
         let seed_attempt = matches!(&edit, ModelEdit::SeedView { .. }).then(uuid::Uuid::new_v4);
-        Self { edit, seed_attempt }
+        Self {
+            edit,
+            seed_attempt,
+            #[cfg(feature = "development")]
+            fixture_unchanged_edge: false,
+        }
     }
 }
 
@@ -615,6 +625,13 @@ fn publish_with_mirror(
                 std::time::SystemTime::now(),
             ),
         };
+        #[cfg(feature = "development")]
+        if let Some(update) = terminal_creation_fixture::update(&request, client)? {
+            updates
+                .send_blocking(update)
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some((request.clone(), first));
@@ -4060,6 +4077,19 @@ impl Cagents {
             _ => None,
         };
         let request = ModelRequest::from(edit);
+        #[cfg(feature = "development")]
+        if terminal_creation_fixture::terminal_insert(&request.edit).is_some()
+            && terminal_creation_fixture::take(terminal_creation_fixture::UNQUEUED)
+        {
+            tracing::info!(target: "cagents::workspace_projection", "Native fixture left a terminal Insert unqueued");
+            // Queue just the observer echo so it arrives after the UI has
+            // recorded the Insert that was not queued.
+            let _ = self.workspace_model_tx.try_send(ModelRequest {
+                fixture_unchanged_edge: true,
+                ..request
+            });
+            return false;
+        }
         let seed = match &request.edit {
             ModelEdit::SeedView { scope, .. } => {
                 Some((scope.clone(), request.seed_attempt.unwrap()))

@@ -13326,6 +13326,8 @@ impl Cagents {
                             ])
                             .spacing(space::M)
                             .into()
+                        } else if self.terminal_creation_failed(id) {
+                            self.terminal_diagnostic_controls(id)
                         } else {
                             iced::widget::Space::new().into()
                         },

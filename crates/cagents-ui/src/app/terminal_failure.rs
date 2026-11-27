@@ -8,6 +8,7 @@ use std::ops::Deref;
 pub(super) enum Failure {
     Generic(String),
     Creation {
+        code: &'static str,
         message: String,
         guidance: Option<&'static str>,
     },
@@ -188,6 +189,7 @@ pub(super) fn creation_title(pane: Option<&str>) -> Cow<'static, str> {
 pub(super) fn creation_failure(reason: &str, login_busy: bool) -> Failure {
     if login_busy {
         return Failure::Creation {
+            code: "login_callback_busy",
             message: account::login::PORT_BUSY.into(),
             guidance: None,
         };
@@ -198,6 +200,7 @@ pub(super) fn creation_failure(reason: &str, login_busy: bool) -> Failure {
         .and_then(|tail| tail.strip_suffix(": No such file or directory (os error 2)"))
     {
         return Failure::Creation {
+            code: "terminal_directory_missing",
             message: format!(
                 "The terminal’s folder is missing: {}.",
                 bounded_path_text(path)
@@ -216,6 +219,7 @@ pub(super) fn creation_failure(reason: &str, login_busy: bool) -> Failure {
         sentence.push('.');
     }
     Failure::Creation {
+        code: "start_failed",
         message: sentence,
         guidance: Some("Fix the problem above, then choose Retry."),
     }
@@ -400,6 +404,11 @@ fn known_failure(code: &str) -> (&'static str, &'static str) {
             "Another running terminal already holds this terminal's work.",
         ),
         "start_failed" => ("start_failed", "The terminal could not be started."),
+        "terminal_directory_missing" => (
+            "terminal_directory_missing",
+            "The terminal's launch directory is missing.",
+        ),
+        "login_callback_busy" => ("login_callback_busy", account::login::PORT_BUSY),
         "runtime_hydration_failed" => (
             "runtime_hydration_failed",
             "The terminal could not be restored.",
@@ -763,6 +772,20 @@ impl Cagents {
         {
             return Some((**details).clone());
         }
+        if let Some(CardRuntime::Failed(Failure::Creation { code, guidance, .. })) =
+            self.cards.get(&card)
+        {
+            let mut details = self.capture_terminal_details(card, true)?;
+            (details.code, details.message) = known_failure(code);
+            if crate::device::is_remote() {
+                details.cwd =
+                    bounded_path_text(&session.launch.working_directory.to_string_lossy());
+            }
+            if let Some(guidance) = guidance {
+                details.consequence = Cow::Borrowed(guidance);
+            }
+            return Some(details);
+        }
         self.capture_terminal_details(card, false)
     }
     fn capture_terminal_details(&self, card: CardId, failed: bool) -> Option<Details> {
@@ -839,6 +862,19 @@ impl Cagents {
                     })
             })
     }
+    fn terminal_creation_without_transcript(&self, card: CardId) -> bool {
+        // A worker might have started before a generic attachment error
+        // reached this window. Only these refusals prove no launch ran.
+        self.shared_views.refused_creations.contains_key(&card)
+            || matches!(
+                self.cards.get(&card),
+                Some(CardRuntime::Failed(Failure::Creation {
+                    code: "terminal_directory_missing",
+                    ..
+                }))
+            )
+    }
+
     pub(super) fn terminal_transcript_probes(&mut self) -> Task<Message> {
         let sessions: HashMap<_, _> = self
             .durable
@@ -849,7 +885,9 @@ impl Cagents {
                 matches!(
                     self.cards.get(&state.id),
                     Some(CardRuntime::Failed(Failure::Terminal(_)) | CardRuntime::Completed)
-                ) || self.ended_terminal(state.id).is_some()
+                ) || (self.terminal_creation_failed(state.id)
+                    && !self.terminal_creation_without_transcript(state.id))
+                    || self.ended_terminal(state.id).is_some()
                     || self.saved_terminal_diagnostics_allowed(state.id)
             })
             .filter_map(|state| {
@@ -983,8 +1021,12 @@ impl Cagents {
     ) -> Element<'static, Message> {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
-        let available = !remote && probe.is_some_and(|probe| probe.available && !probe.pending);
+        let no_transcript = self.terminal_creation_without_transcript(card);
+        let available = !no_transcript
+            && !remote
+            && probe.is_some_and(|probe| probe.available && !probe.pending);
         let folder = crate::ui_controls::button::secondary("Open transcript folder")
+            .instead("No transcript created", no_transcript)
             .instead(
                 "Checking transcript…",
                 !remote && probe.is_some_and(|probe| probe.pending),
@@ -1351,6 +1393,42 @@ mod tests {
         let details = app.terminal_details(card).unwrap();
         assert_eq!(details.consequence, "Retry to reconnect or start it again.");
         assert!(!details.copy_text().contains("new terminal"));
+    }
+
+    #[test]
+    fn creation_failure_copies_its_classification_and_next_step_without_backend_text() {
+        let (mut app, card, session) = app_and_session();
+        let _ = app.workspace.resize_viewport(1200.0);
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        app.fail_terminal_creation(
+            card,
+            "The workspace refused launch with token backend-secret",
+        );
+        let report = app.terminal_details(card).unwrap().copy_text();
+        assert!(report.contains("Code: start_failed"));
+        assert!(report.contains(&format!("Terminal: {}", session.id)));
+        assert!(report.contains("Fix the problem above, then choose Retry."));
+        assert!(!report.contains("backend-secret"));
+        assert!(!app.terminal_creation_without_transcript(card));
+        drop(app.terminal_transcript_probes());
+        assert!(app.terminal_failure.probes.contains_key(&card));
+
+        app.fail_terminal_creation(
+            card,
+            "terminal worker failed to start: pin terminal launch directory /repo: No such file or directory (os error 2)",
+        );
+        let details = app.terminal_details(card).unwrap();
+        let report = details.copy_text();
+        assert!(report.contains("Code: terminal_directory_missing"));
+        assert!(report.contains("Restore the folder and choose Retry"));
+        assert!(!report.contains("pin terminal launch directory"));
+        assert!(details.exit.is_none());
+        assert!(app.terminal_creation_without_transcript(card));
+        drop(app.terminal_transcript_probes());
+        assert!(!app.terminal_failure.probes.contains_key(&card));
     }
 
     #[test]
