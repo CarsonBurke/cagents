@@ -11157,6 +11157,9 @@ impl Cagents {
         if let Some(task) = self.daemon_health_key_event(&event, captured) {
             return (task, Projection::Full);
         }
+        if let Some(task) = self.device_diff_key(&event, captured) {
+            return (task, Projection::Full);
+        }
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.keyboard_modifiers = *modifiers;
         }

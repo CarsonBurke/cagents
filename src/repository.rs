@@ -3671,7 +3671,7 @@ impl From<OidError> for ValidationError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct ValidatedBranchName(String);
 
 impl ValidatedBranchName {
@@ -3710,6 +3710,20 @@ impl ValidatedBranchName {
 
     pub fn full_ref(&self) -> String {
         format!("refs/heads/{}", self.0)
+    }
+}
+
+impl TryFrom<String> for ValidatedBranchName {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<ValidatedBranchName> for String {
+    fn from(value: ValidatedBranchName) -> Self {
+        value.0
     }
 }
 
@@ -10542,6 +10556,10 @@ mod tests {
             ValidatedBranchName::parse("feature/safe").unwrap().as_str(),
             "feature/safe"
         );
+        let encoded = r#""feature/safe""#;
+        let branch = serde_json::from_str::<ValidatedBranchName>(encoded).unwrap();
+        assert_eq!(serde_json::to_string(&branch).unwrap(), encoded);
+
         for invalid in [
             "-force",
             "bad name",
@@ -10553,6 +10571,11 @@ mod tests {
             "feature/.hidden",
         ] {
             assert!(ValidatedBranchName::parse(invalid).is_err(), "{invalid}");
+            let encoded = serde_json::to_string(invalid).unwrap();
+            assert!(
+                serde_json::from_str::<ValidatedBranchName>(&encoded).is_err(),
+                "{invalid}"
+            );
         }
     }
 

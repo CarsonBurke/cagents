@@ -4,8 +4,8 @@
 //! rest of its Changes group, and the stage or unstage that finishes with it.
 use super::*;
 use crate::repository::{
-    ChangeArea, DiffBasis, DiffContent, DiffRequest, RepositoryReply, RepositoryRequest,
-    UnstageRequest,
+    ChangeArea, DiffBasis, DiffContent, DiffEntry, DiffRequest, DiffSide, RepositoryReply,
+    RepositoryRequest, UnstageRequest,
 };
 use chat_ui::patch_view;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +33,9 @@ pub(in crate::app) struct Diff {
     /// act in. A committed comparison has none.
     area: Option<ChangeArea>,
     read: u64,
+    reading: bool,
+    refresh_owed: bool,
+    showing_file: bool,
     content: Content,
     view: patch_view::ViewState,
     /// The source-control read current when this dialog last staged or
@@ -43,8 +46,21 @@ pub(in crate::app) struct Diff {
 
 enum Content {
     Loading,
-    Ready(Prepared),
+    Ready(PreparedRead),
     Failed(String),
+}
+
+/// The patch and the revision's file, both from the same Git answer.
+#[derive(Debug, Clone)]
+pub struct PreparedRead {
+    patch: Prepared,
+    file: Option<CommittedFile>,
+}
+
+#[derive(Debug, Clone)]
+struct CommittedFile {
+    text: Arc<str>,
+    label: String,
 }
 
 /// A comparison read for drawing, off the update thread.
@@ -65,7 +81,7 @@ pub enum Prepared {
 pub enum Action {
     Loaded {
         read: u64,
-        result: Result<Prepared, String>,
+        result: Result<PreparedRead, String>,
     },
     View(patch_view::Event),
     /// To the previous or next change in its group.
@@ -74,8 +90,10 @@ pub enum Action {
     },
     /// Stages the change, or unstages a staged one, then moves on.
     Stage,
-    /// Opens the file in Device files.
+    /// Opens the working copy in Device files.
     OpenFile,
+    /// Shows the immutable contents in place of their comparison.
+    ShowFile(bool),
 }
 
 /// A working change's comparison, as the local Changes panel opens it.
@@ -98,7 +116,7 @@ pub(in crate::app) fn working_request(
 
 /// Reads `content` for drawing, with its syntax coloured in `theme`.
 fn prepare(
-    content: DiffContent,
+    content: &DiffContent,
     path: &Path,
     theme: crate::settings::EditorSyntaxTheme,
 ) -> Prepared {
@@ -107,7 +125,7 @@ fn prepare(
         new,
         old_label,
         new_label,
-    } = &content
+    } = content
         && old.is_diffable()
         && new.is_diffable()
     {
@@ -144,50 +162,60 @@ fn prepare(
             text,
         };
     }
-    let (title, detail) = crate::repository_widget::no_text_summary(&content);
+    let (title, detail) = crate::repository_widget::no_text_summary(content);
     Prepared::Note { title, detail }
 }
 
-impl Cagents {
-    /// Opens `request`'s comparison in the device dialog. `area` is the
-    /// Changes group it belongs to, for a working change.
-    pub(in crate::app) fn open_device_diff(
-        &mut self,
-        key: ActiveWorktreeKey,
-        request: DiffRequest,
-        area: Option<ChangeArea>,
-    ) -> Task<Message> {
-        let read = NEXT_READ.fetch_add(1, Ordering::Relaxed);
-        self.device_ui.open = true;
-        self.device_ui.menu_open = false;
-        self.device_ui.configure = false;
-        self.device_ui.choosing = false;
-        self.device_ui.notice = None;
-        // A step keeps showing as much of the next change as of the last.
-        let (view, settling) = match &self.device_ui.diff {
-            Some(diff) if diff.key == key => (diff.view.clone(), diff.settling),
-            _ => (opened_view(), None),
+impl PreparedRead {
+    fn new(
+        content: DiffContent,
+        request: &DiffRequest,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> Self {
+        let patch = prepare(&content, request.path.as_path(), theme);
+        let file = match content {
+            DiffContent::Comparison {
+                old,
+                new,
+                old_label,
+                new_label,
+            } if request.basis.is_immutable() => {
+                // A deletion only has the parent/base version to show.
+                let (side, label) = if matches!(new, DiffSide::Absent) {
+                    (old, old_label)
+                } else {
+                    (new, new_label)
+                };
+                match side {
+                    DiffSide::Text { text, .. } => Some(CommittedFile {
+                        text: text.into(),
+                        label,
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
         };
-        self.device_ui.diff = Some(Diff {
-            key,
-            request: request.clone(),
-            area,
-            read,
-            content: Content::Loading,
-            view,
-            settling,
-        });
-        let theme = self.settings.editor_syntax_theme;
+        Self { patch, file }
+    }
+}
+
+impl Diff {
+    fn read(&mut self, theme: crate::settings::EditorSyntaxTheme) -> Task<Message> {
+        let read = NEXT_READ.fetch_add(1, Ordering::Relaxed);
+        self.read = read;
+        self.reading = true;
+        self.refresh_owed = false;
+        let request = self.request.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let path = request.path.as_path().to_owned();
                     let content = crate::device_service::answer_repository(
-                        RepositoryRequest::Diff(request),
+                        RepositoryRequest::Diff(request.clone()),
                         &CancellationToken::default(),
                     )
                     .and_then(RepositoryReply::into_diff)?;
-                    Ok(prepare(content, &path, theme))
+                    Ok(PreparedRead::new(content, &request, theme))
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -200,6 +228,43 @@ impl Cagents {
             },
         )
     }
+}
+
+impl Cagents {
+    /// Opens `request`'s comparison in the device dialog. `area` is the
+    /// Changes group it belongs to, for a working change.
+    pub(in crate::app) fn open_device_diff(
+        &mut self,
+        key: ActiveWorktreeKey,
+        request: DiffRequest,
+        area: Option<ChangeArea>,
+    ) -> Task<Message> {
+        self.device_ui.open = true;
+        self.device_ui.menu_open = false;
+        self.device_ui.configure = false;
+        self.device_ui.choosing = false;
+        self.device_ui.notice = None;
+        // A step keeps showing as much of the next change as of the last.
+        let (view, settling) = match &self.device_ui.diff {
+            Some(diff) if diff.key == key => (diff.view.clone(), diff.settling),
+            _ => (opened_view(), None),
+        };
+        let mut diff = Diff {
+            key,
+            request,
+            area,
+            read: 0,
+            reading: false,
+            refresh_owed: false,
+            showing_file: false,
+            content: Content::Loading,
+            view,
+            settling,
+        };
+        let read = diff.read(self.settings.editor_syntax_theme);
+        self.device_ui.diff = Some(diff);
+        read
+    }
 
     pub(super) fn update_device_diff(&mut self, action: Action) -> Task<Message> {
         if self.device_ui.diff.is_none() {
@@ -210,10 +275,16 @@ impl Cagents {
                 if let Some(diff) = self.device_ui.diff.as_mut()
                     && read == diff.read
                 {
+                    diff.reading = false;
                     diff.content = match result {
                         Ok(prepared) => Content::Ready(prepared),
                         Err(error) => Content::Failed(error),
                     };
+                    if diff.refresh_owed {
+                        // Keep making visible progress if a checkout is
+                        // edited more often than the device can read a diff.
+                        return diff.read(self.settings.editor_syntax_theme);
+                    }
                 }
                 Task::none()
             }
@@ -225,20 +296,7 @@ impl Cagents {
             }
             Action::Step { forward } => {
                 self.device_source_activity(false);
-                let Some((key, area, rows, index)) = self.device_diff_position() else {
-                    return Task::none();
-                };
-                let next = if forward {
-                    index.map_or(Some(0), |index| index.checked_add(1))
-                } else {
-                    index.and_then(|index| index.checked_sub(1))
-                };
-                let Some(row) = next.and_then(|next| rows.get(next)) else {
-                    return Task::none();
-                };
-                let request = working_request(key, row, area);
-                let key = key.clone();
-                self.open_device_diff(key, request, Some(area))
+                self.step_device_diff(forward)
             }
             Action::Stage => {
                 if !self.device_diff_can_stage() {
@@ -309,7 +367,11 @@ impl Cagents {
                 Task::batch([change, next])
             }
             Action::OpenFile => {
-                let Some(diff) = self.device_ui.diff.take() else {
+                let Some(diff) = self
+                    .device_ui
+                    .diff
+                    .take_if(|diff| !diff.request.basis.is_immutable())
+                else {
                     return Task::none();
                 };
                 let path = diff.key.canonical_path.join(diff.request.path.as_path());
@@ -318,7 +380,91 @@ impl Cagents {
                     fragment: None,
                 })
             }
+            Action::ShowFile(showing) => {
+                if let Some(diff) = self.device_ui.diff.as_mut()
+                    && matches!(&diff.content, Content::Ready(read) if read.file.is_some())
+                {
+                    diff.showing_file = showing;
+                }
+                Task::none()
+            }
         }
+    }
+
+    pub(in crate::app) fn device_diff_key(
+        &mut self,
+        event: &keyboard::Event,
+        captured: bool,
+    ) -> Option<Task<Message>> {
+        if !self.device_ui.open
+            || self.device_ui.diff.is_none()
+            || self.device_ui.worktree_source.is_some()
+            || self.transient_work_close.is_some()
+            || self.automation_ui.draft_dialog_open()
+        {
+            return None;
+        }
+        let keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            repeat: false,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        // An arrow can be captured by a widget beneath the modal that
+        // still has keyboard focus. The modal owns its navigation chord.
+        let action =
+            if modifiers.alt() && !modifiers.control() && !modifiers.logo() && !modifiers.shift() {
+                use keyboard::key::{Code, Named, Physical};
+                match (key, physical_key) {
+                    (keyboard::Key::Named(Named::ArrowUp), _)
+                    | (_, Physical::Code(Code::ArrowUp)) => Action::Step { forward: false },
+                    (keyboard::Key::Named(Named::ArrowDown), _)
+                    | (_, Physical::Code(Code::ArrowDown)) => Action::Step { forward: true },
+                    _ => return None,
+                }
+            } else if !captured
+                && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
+                && modifiers.shift()
+                && crate::interaction::latin_key(key, *physical_key) == Some('s')
+            {
+                Action::Stage
+            } else {
+                return None;
+            };
+        Some(self.update_device_diff(action))
+    }
+
+    fn step_device_diff(&mut self, forward: bool) -> Task<Message> {
+        let Some(diff) = self.device_ui.diff.as_ref() else {
+            return Task::none();
+        };
+        let (request, area) = if let Some((key, area, rows, index)) = self.device_diff_position() {
+            let Some(row) = step_index(index, forward).and_then(|index| rows.get(index)) else {
+                return Task::none();
+            };
+            (working_request(key, row, area), Some(area))
+        } else if let Some((rows, index)) = self.device_diff_commit_position() {
+            let Some(row) = step_index(Some(index), forward).and_then(|index| rows.get(index))
+            else {
+                return Task::none();
+            };
+            (
+                DiffRequest {
+                    path: row.path.clone(),
+                    old_path: row.old_path.clone(),
+                    ..diff.request.clone()
+                },
+                None,
+            )
+        } else {
+            return Task::none();
+        };
+        let key = diff.key.clone();
+        self.open_device_diff(key, request, area)
     }
 
     /// Notes that the source-control read `request` landed. One that began
@@ -340,11 +486,10 @@ impl Cagents {
             .as_ref()
             .is_some_and(sidebar::SourceControlModel::busy);
         !busy
-            && self
-                .device_ui
-                .diff
-                .as_ref()
-                .is_some_and(|diff| diff.settling.is_none())
+            && self.device_ui.diff.as_ref().is_some_and(|diff| {
+                diff.settling.is_none()
+                    && diff.area.is_some_and(|area| area != ChangeArea::Conflict)
+            })
     }
 
     /// The shown change's group, its rows, and where the change is among
@@ -377,6 +522,73 @@ impl Cagents {
         Some((&diff.key, area, rows, index))
     }
 
+    fn device_diff_commit_position(&self) -> Option<(&[DiffEntry], usize)> {
+        let diff = self.device_ui.diff.as_ref()?;
+        let DiffBasis::CommitToParent { oid, .. } = &diff.request.basis else {
+            return None;
+        };
+        let changes = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| source.key == diff.key)?
+            .commit_changes
+            .as_ref()
+            .filter(|changes| changes.commit.oid == *oid)?;
+        let rows = changes.result.as_ref()?.as_ref().ok()?;
+        let index = rows.iter().position(|row| row.path == diff.request.path)?;
+        Some((rows, index))
+    }
+
+    /// A status read saw a new digest. Re-read the current comparison, but
+    /// keep its patch in view and let an outstanding read finish first.
+    pub(in crate::app) fn refresh_device_working_diff(
+        &mut self,
+        key: &ActiveWorktreeKey,
+    ) -> Task<Message> {
+        let Some(diff) = self.device_ui.diff.as_mut().filter(|diff| &diff.key == key) else {
+            return Task::none();
+        };
+        let Some(area) = diff.area else {
+            return Task::none();
+        };
+        diff.request.old_path = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .and_then(|source| source.group(area))
+            .and_then(|group| {
+                group
+                    .rows()
+                    .iter()
+                    .find(|row| row.entry.path == diff.request.path)
+            })
+            .and_then(|row| row.entry.old_path.clone());
+        if diff.reading {
+            diff.refresh_owed = true;
+            Task::none()
+        } else {
+            diff.read(self.settings.editor_syntax_theme)
+        }
+    }
+
+    pub(in crate::app) fn device_working_diff_unavailable(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        error: &str,
+    ) {
+        if let Some(diff) = self.device_ui.diff.as_mut()
+            && &diff.key == key
+            && diff.area.is_some()
+        {
+            // An older answer can no longer replace the reported failure.
+            diff.read = NEXT_READ.fetch_add(1, Ordering::Relaxed);
+            diff.reading = false;
+            diff.refresh_owed = false;
+            diff.content = Content::Failed(error.to_owned());
+        }
+    }
+
     fn device_diff_notice(&self, key: &ActiveWorktreeKey) -> Option<&str> {
         self.device_ui.notice.as_deref().or_else(|| {
             self.sidebar_model
@@ -405,11 +617,21 @@ impl Cagents {
         if let Some(old) = &diff.request.old_path {
             context.push(format!("from {old}"));
         }
-        context.push(crate::repository_widget::basis_label(&diff.request.basis));
-        if let Content::Ready(Prepared::Patch { model, .. }) = &diff.content
-            && let Some((added, removed)) = model.counts()
-        {
-            context.push(format!("+{added} −{removed}"));
+        let prepared = match &diff.content {
+            Content::Ready(read) => Some(read),
+            _ => None,
+        };
+        let file = prepared.and_then(|read| read.file.as_ref());
+        let showing_file = file.filter(|_| diff.showing_file);
+        if let Some(file) = showing_file {
+            context.push(format!("{} · Read only", file.label));
+        } else {
+            context.push(crate::repository_widget::basis_label(&diff.request.basis));
+            if let Some(Prepared::Patch { model, .. }) = prepared.map(|read| &read.patch)
+                && let Some((added, removed)) = model.counts()
+            {
+                context.push(format!("+{added} −{removed}"));
+            }
         }
         let position = self.device_diff_position();
         let can_stage = self.device_diff_can_stage();
@@ -426,76 +648,103 @@ impl Cagents {
             .width(Length::Fill)
             .into(),
         ];
-        if let Some((_, _, rows, index)) = &position
-            && rows.len() > usize::from(index.is_some())
+        let neighbors = if let Some((_, _, rows, index)) = &position {
+            Some((rows.len(), *index))
+        } else {
+            self.device_diff_commit_position()
+                .map(|(rows, index)| (rows.len(), Some(index)))
+        };
+        if let Some((count, index)) = neighbors
+            && count > usize::from(index.is_some())
         {
-            let index = *index;
-            let previous = index.is_some_and(|index| index > 0);
-            let next = index.map_or(!rows.is_empty(), |index| index + 1 < rows.len());
-            header.push(
-                crate::ui_controls::icon_button(Icon::ChevronUp, "Previous change")
-                    .on_press_maybe(previous.then(|| action(Action::Step { forward: false })))
-                    .into(),
-            );
-            header.push(
-                crate::ui_controls::icon_button(Icon::ChevronDown, "Next change")
-                    .on_press_maybe(next.then(|| action(Action::Step { forward: true })))
-                    .into(),
-            );
+            let previous = step_index(index, false).is_some();
+            let next = step_index(index, true).is_some_and(|index| index < count);
+            for (icon, label, enabled, forward) in [
+                (Icon::ChevronUp, "Previous change (Alt+Up)", previous, false),
+                (Icon::ChevronDown, "Next change (Alt+Down)", next, true),
+            ] {
+                let button = crate::ui_controls::icon_button(icon, label)
+                    .on_press_maybe(enabled.then(|| action(Action::Step { forward })));
+                header.push(button.into());
+            }
         }
         let width = size.width.min(MAX_WIDTH);
         // The patch fits beside the region's scrollbar rail, so only a line
         // longer than that scrolls sideways.
         let body_width = (width - 2.0 * space::L - design::SCROLLBAR_GUTTER).max(1.0);
-        let body: Element<'_, Message> = match &diff.content {
-            Content::Loading => design::body("Reading the change from the device…").into(),
-            Content::Failed(error) => widget::column::with_children(vec![
-                design::heading("Couldn't read this change").into(),
-                design::body(error.as_str())
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .into(),
-            ])
-            .spacing(space::XS)
-            .into(),
-            Content::Ready(Prepared::Same) => design::body("Both sides hold the same text.").into(),
-            Content::Ready(Prepared::Note { title, detail }) => {
-                widget::column::with_children(vec![
-                    design::heading(title.as_str()).into(),
-                    design::body(detail.as_str())
+        let body: Element<'_, Message> = if let Some(file) = showing_file {
+            widget::text(file.text.as_ref())
+                .font(iced::Font::MONOSPACE)
+                .size(design::TEXT_CAPTION)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .into()
+        } else {
+            match &diff.content {
+                Content::Loading => design::body("Reading the change from the device…").into(),
+                Content::Failed(error) => widget::column::with_children(vec![
+                    design::heading("Couldn't read this change").into(),
+                    design::body(error.as_str())
                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                         .into(),
                 ])
                 .spacing(space::XS)
-                .into()
-            }
-            Content::Ready(Prepared::Patch { model, text }) => model
-                .view(
-                    &diff.view,
-                    patch_view::Options {
-                        width: body_width,
-                        theme: self.settings.editor_syntax_theme,
-                    },
-                    move |event| action(Action::View(event)),
-                    patch_view::plain,
-                )
-                .unwrap_or_else(|| {
-                    widget::text(text.as_ref())
-                        .font(iced::Font::MONOSPACE)
-                        .size(design::TEXT_CAPTION)
-                        .into()
-                }),
-        };
-        let mut actions: Vec<Element<'_, Message>> = vec![
-            crate::ui_controls::button::secondary("Open file")
-                .icon(Icon::OpenFolder)
-                .name("Open this file in Device files")
-                .on_press(action(Action::OpenFile))
                 .into(),
+                Content::Ready(read) => match &read.patch {
+                    Prepared::Same => design::body("Both sides hold the same text.").into(),
+                    Prepared::Note { title, detail } => widget::column::with_children(vec![
+                        design::heading(title.as_str()).into(),
+                        design::body(detail.as_str())
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                            .into(),
+                    ])
+                    .spacing(space::XS)
+                    .into(),
+                    Prepared::Patch { model, text } => model
+                        .view(
+                            &diff.view,
+                            patch_view::Options {
+                                width: body_width,
+                                theme: self.settings.editor_syntax_theme,
+                            },
+                            move |event| action(Action::View(event)),
+                            patch_view::plain,
+                        )
+                        .unwrap_or_else(|| {
+                            widget::text(text.as_ref())
+                                .font(iced::Font::MONOSPACE)
+                                .size(design::TEXT_CAPTION)
+                                .into()
+                        }),
+                },
+            }
+        };
+        let mut actions: Vec<Element<'_, Message>> = Vec::new();
+        if file.is_some() {
+            let label = if diff.showing_file {
+                "Back to diff"
+            } else {
+                "View committed file"
+            };
+            actions.push(
+                crate::ui_controls::button::secondary(label)
+                    .on_press(action(Action::ShowFile(!diff.showing_file)))
+                    .into(),
+            );
+        } else if !diff.request.basis.is_immutable() {
+            actions.push(
+                crate::ui_controls::button::secondary("Open file")
+                    .icon(Icon::OpenFolder)
+                    .name("Open this file in Device files")
+                    .on_press(action(Action::OpenFile))
+                    .into(),
+            );
+        }
+        actions.extend([
             widget::Space::new().width(Length::Fill).into(),
             crate::ui_controls::button::secondary("Close")
                 .on_press(Message::Device(super::Action::Close))
                 .into(),
-        ];
+        ]);
         // A conflict is marked resolved from Changes, which first checks it
         // for conflict markers.
         if let Some((_, area, _, Some(_))) = position
@@ -506,11 +755,16 @@ impl Cagents {
             } else {
                 "Stage"
             };
-            actions.push(
-                crate::ui_controls::button::primary(label)
-                    .on_press_maybe(can_stage.then(|| action(Action::Stage)))
-                    .into(),
-            );
+            let binding = if cfg!(target_os = "macos") {
+                "Cmd+Shift+S"
+            } else {
+                "Ctrl+Shift+S"
+            };
+            let hint = format!("{label} ({binding})");
+            let button = crate::ui_controls::button::primary(label)
+                .name(hint.clone())
+                .on_press_maybe(can_stage.then(|| action(Action::Stage)));
+            actions.push(crate::interaction::tooltip(button, hint));
         }
         // A stage can finish after the dialog advances. Keep its result
         // above the patch so it remains visible while reading the next file.
@@ -533,9 +787,7 @@ impl Cagents {
         }
         let height = (size.height - chrome_height).max(120.0);
         rows.extend([
-            widget::container(dialog_ui::scrolled_region(body, height))
-                .height(height)
-                .into(),
+            dialog_ui::scrolled_region(body, height),
             widget::row::with_children(actions)
                 .spacing(space::S)
                 .align_y(Alignment::Center)
@@ -545,6 +797,14 @@ impl Cagents {
             widget::column::with_children(rows).spacing(space::M),
             width,
         ))
+    }
+}
+
+fn step_index(index: Option<usize>, forward: bool) -> Option<usize> {
+    if forward {
+        index.map_or(Some(0), |index| index.checked_add(1))
+    } else {
+        index.and_then(|index| index.checked_sub(1))
     }
 }
 
@@ -559,7 +819,6 @@ fn opened_view() -> patch_view::ViewState {
 mod tests {
     use super::*;
     use crate::model::WorktreeId;
-    use crate::repository::DiffSide;
 
     #[test]
     fn the_next_device_diff_shows_the_worktrees_stage_failure() {
@@ -607,7 +866,7 @@ mod tests {
     #[test]
     fn a_text_change_is_drawn_as_its_patch() {
         let prepared = prepare(
-            comparison(text("one\ntwo\n"), text("one\n2\n")),
+            &comparison(text("one\ntwo\n"), text("one\n2\n")),
             Path::new("notes.txt"),
             crate::settings::EditorSyntaxTheme::default(),
         );
@@ -623,14 +882,14 @@ mod tests {
     fn a_change_with_no_text_says_what_its_sides_are() {
         assert!(matches!(
             prepare(
-                comparison(text("same\n"), text("same\n")),
+                &comparison(text("same\n"), text("same\n")),
                 Path::new("same.txt"),
                 crate::settings::EditorSyntaxTheme::default(),
             ),
             Prepared::Same
         ));
         let Prepared::Note { title, detail } = prepare(
-            comparison(text("small\n"), DiffSide::Oversize { bytes: 3_000_000 }),
+            &comparison(text("small\n"), DiffSide::Oversize { bytes: 3_000_000 }),
             Path::new("big.log"),
             crate::settings::EditorSyntaxTheme::default(),
         ) else {
@@ -639,7 +898,7 @@ mod tests {
         assert_eq!(title, "No text diff between Index and Working tree");
         assert_eq!(detail, "Working tree: 3000000 bytes, too large to compare");
         let Prepared::Note { title, detail } = prepare(
-            comparison(text("last\n"), text("last")),
+            &comparison(text("last\n"), text("last")),
             Path::new("unended.txt"),
             crate::settings::EditorSyntaxTheme::default(),
         ) else {
@@ -647,6 +906,175 @@ mod tests {
         };
         assert_eq!(title, "Only the final newline changed");
         assert_eq!(detail, "Working tree: no newline at the end of the file");
+    }
+
+    #[test]
+    fn device_commit_diff_steps_through_the_commits_paths_and_shows_the_committed_text() {
+        use crate::repository::{ChangeKind, CommitIdentity, Oid, RepoPath};
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: WorktreeId::new(),
+            canonical_path: "/repo".into(),
+        };
+        let oid = Oid::parse_object("11".repeat(20)).unwrap();
+        let parent = Oid::parse_object("22".repeat(20)).unwrap();
+        let identity = CommitIdentity {
+            name: "Fixture".into(),
+            email: "fixture@example.invalid".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        let mut source = SourceControlModel::loading(key.clone());
+        source.append_history(&[CommitSummary {
+            oid: oid.clone(),
+            parents: vec![parent.clone()],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Update two files".into(),
+            body: String::new(),
+        }]);
+        let a = RepoPath::parse("a.txt").unwrap();
+        let b = RepoPath::parse("b.txt").unwrap();
+        let prior = RepoPath::parse("old-b.txt").unwrap();
+        source.commit_changes = Some(sidebar::CommitChanges {
+            commit: source.history[0].clone(),
+            visible_files: 1,
+            result: Some(Ok(vec![
+                DiffEntry {
+                    path: a.clone(),
+                    old_path: None,
+                    kind: ChangeKind::Modified,
+                    added_lines: Some(1),
+                    removed_lines: Some(1),
+                },
+                DiffEntry {
+                    path: b.clone(),
+                    old_path: Some(prior.clone()),
+                    kind: ChangeKind::Renamed,
+                    added_lines: None,
+                    removed_lines: None,
+                },
+            ])),
+        });
+        app.sidebar_model.source_control = Some(source);
+        let request = DiffRequest {
+            worktree: key.canonical_path.clone(),
+            basis: DiffBasis::CommitToParent {
+                oid,
+                parent: Some(parent),
+            },
+            path: a.clone(),
+            old_path: None,
+        };
+        drop(app.open_device_diff(key, request.clone(), None));
+        assert!(!app.device_diff_can_stage());
+        let mut next = dialog_ui::tests::key_press(keyboard::key::Named::ArrowDown);
+        if let keyboard::Event::KeyPressed { modifiers, .. } = &mut next {
+            *modifiers = keyboard::Modifiers::ALT | keyboard::Modifiers::CAPS_LOCK;
+        }
+        drop(
+            app.device_diff_key(&next, true)
+                .expect("Alt+Down belongs to the open dialog"),
+        );
+        let diff = app.device_ui.diff.as_ref().unwrap();
+        assert_eq!(diff.request.path, b);
+        assert_eq!(diff.request.old_path, Some(prior));
+        assert_eq!(diff.request.basis, request.basis);
+        drop(app.update_device_diff(Action::Step { forward: false }));
+        let diff = app.device_ui.diff.as_ref().unwrap();
+        assert_eq!(diff.request.path, a);
+
+        let content = DiffContent::Comparison {
+            old: text("parent bytes\n"),
+            new: text("committed bytes\n"),
+            old_label: "Parent".into(),
+            new_label: "Commit".into(),
+        };
+        let result = PreparedRead::new(content, &request, app.settings.editor_syntax_theme);
+        assert_eq!(
+            result.file.as_ref().unwrap().text.as_ref(),
+            "committed bytes\n"
+        );
+        drop(app.update_device_diff(Action::Loaded {
+            read: diff.read,
+            result: Ok(result),
+        }));
+        drop(app.update_device_diff(Action::ShowFile(true)));
+        assert!(app.device_ui.diff.as_ref().unwrap().showing_file);
+        drop(app.update_device_diff(Action::OpenFile));
+        assert!(
+            app.device_ui.diff.is_some(),
+            "a commit never opens the current file"
+        );
+        drop(app.update_device_diff(Action::ShowFile(false)));
+        assert!(!app.device_ui.diff.as_ref().unwrap().showing_file);
+    }
+
+    #[test]
+    fn a_device_diff_refresh_keeps_the_patch_and_combines_overlapping_updates() {
+        use crate::repository::RepoPath;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: WorktreeId::new(),
+            canonical_path: "/repo".into(),
+        };
+        let request = DiffRequest {
+            worktree: key.canonical_path.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            path: RepoPath::parse("a.txt").unwrap(),
+            old_path: None,
+        };
+        let same = || {
+            Ok(PreparedRead {
+                patch: Prepared::Same,
+                file: None,
+            })
+        };
+        drop(app.open_device_diff(key.clone(), request, Some(ChangeArea::Unstaged)));
+        let first = app.device_ui.diff.as_ref().unwrap().read;
+        drop(app.update_device_diff(Action::Loaded {
+            read: first,
+            result: same(),
+        }));
+        drop(app.refresh_device_working_diff(&key));
+        let refreshing = app.device_ui.diff.as_ref().unwrap().read;
+        assert_ne!(first, refreshing);
+        assert!(matches!(
+            app.device_ui.diff.as_ref().unwrap().content,
+            Content::Ready(_)
+        ));
+
+        drop(app.refresh_device_working_diff(&key));
+        assert_eq!(app.device_ui.diff.as_ref().unwrap().read, refreshing);
+        drop(app.update_device_diff(Action::Loaded {
+            read: refreshing,
+            result: Ok(PreparedRead {
+                patch: Prepared::Note {
+                    title: "Second answer".into(),
+                    detail: "A newer read is still owed.".into(),
+                },
+                file: None,
+            }),
+        }));
+        assert!(matches!(
+            &app.device_ui.diff.as_ref().unwrap().content,
+            Content::Ready(PreparedRead { patch: Prepared::Note { title, .. }, .. })
+                if title == "Second answer"
+        ));
+        let latest = app.device_ui.diff.as_ref().unwrap().read;
+        assert_ne!(latest, refreshing);
+        app.device_working_diff_unavailable(&key, "Checkout moved");
+        drop(app.update_device_diff(Action::Loaded {
+            read: latest,
+            result: same(),
+        }));
+        assert!(matches!(
+            &app.device_ui.diff.as_ref().unwrap().content,
+            Content::Failed(error) if error == "Checkout moved"
+        ));
     }
 
     fn git(root: &Path, arguments: &[&str]) {
@@ -764,7 +1192,10 @@ mod tests {
         drop(app.update(Message::Device(super::super::Action::Diff(
             Action::Loaded {
                 read: read + 1,
-                result: Ok(Prepared::Same),
+                result: Ok(PreparedRead {
+                    patch: Prepared::Same,
+                    file: None,
+                }),
             },
         ))));
         assert!(
@@ -777,12 +1208,18 @@ mod tests {
         drop(app.update(Message::Device(super::super::Action::Diff(
             Action::Loaded {
                 read,
-                result: Ok(Prepared::Same),
+                result: Ok(PreparedRead {
+                    patch: Prepared::Same,
+                    file: None,
+                }),
             },
         ))));
         assert!(matches!(
             app.device_ui.diff.as_ref().unwrap().content,
-            Content::Ready(Prepared::Same)
+            Content::Ready(PreparedRead {
+                patch: Prepared::Same,
+                ..
+            })
         ));
 
         let step = |forward| Message::Device(super::super::Action::Diff(Action::Step { forward }));
