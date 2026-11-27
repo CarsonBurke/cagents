@@ -453,7 +453,7 @@ fn reply_wait(timeout: std::time::Duration) -> String {
 /// When the daemon was last heard from, on the reader's clock as the
 /// conversation's own times are: the time of day alone when it was today,
 /// and the day as well when the outage has run past midnight.
-fn local_moment(
+pub(super) fn local_moment(
     at: std::time::SystemTime,
     now: std::time::SystemTime,
     zone: &jiff::tz::TimeZone,

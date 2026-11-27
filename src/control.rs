@@ -4731,8 +4731,30 @@ fn launch_ui(
     } else {
         slot
     };
-    let scoped_slot =
-        crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?;
+    // A window switched to a device reopens there, unless this computer was
+    // asked for by name, as a switch back to it does. Any window already open
+    // comes forward first, as it always has.
+    let follow_placement =
+        !new_window && !crate::device::is_remote() && !crate::device::local_chosen();
+    if follow_placement
+        && slot.is_none()
+        && instance::activate_running_ui().map_err(|error| AppError::new("launch", error))?
+    {
+        return Ok(already_running_ui_output());
+    }
+    let placed = follow_placement
+        .then(|| placed_device(slot.unwrap_or(instance::PRIMARY_WINDOW)))
+        .flatten();
+    let device = placed
+        .clone()
+        .or_else(|| crate::device::selected().map(|device| device.name.clone()));
+    let scoped_slot = match &placed {
+        Some(placed) => Some(crate::device::scoped_window_slot(
+            placed,
+            slot.unwrap_or(instance::PRIMARY_WINDOW),
+        )),
+        None => crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?,
+    };
     let slot = scoped_slot.as_deref();
     let activate = || match slot {
         Some(slot) => instance::activate_window(slot),
@@ -4741,14 +4763,24 @@ fn launch_ui(
     if !new_window && activate().map_err(|error| AppError::new("launch", error))? {
         return Ok(already_running_ui_output());
     }
+    // A screen already says why this device window did not open, and offers
+    // to try again; another attempt beside it would only stack a second one.
+    // A caller that explains its own failure, such as the device menu, still
+    // tries: should the window open, that screen's Try again just raises it.
+    if device.is_some()
+        && !caller_reports_startup_failure
+        && slot.is_some_and(instance::device_reconnect_showing)
+    {
+        return Ok(already_running_ui_output());
+    }
     let executable = crate::companion::Product::Ui
         .beside_current()
         .map_err(|error| AppError::new("launch", error))?;
     let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
     loop {
         let mut command = Command::new(&executable);
-        if let Some(device) = crate::device::selected() {
-            command.args(["--device", &device.name, "--device-window-scoped"]);
+        if let Some(device) = &device {
+            command.args(["--device", device, "--device-window-scoped"]);
         }
         if new_window {
             command.arg("--new-window");
@@ -4788,7 +4820,28 @@ fn launch_ui(
     })
 }
 
-pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
+/// The saved device that window `slot` of this computer last switched to.
+/// A device no longer saved here leaves the window on this computer.
+fn placed_device(slot: &str) -> Option<String> {
+    let device = crate::device::placement::device(slot)
+        .inspect_err(|error| tracing::warn!(%error, "could not read which device a window shows"))
+        .ok()??;
+    let saved = crate::device::list()
+        .inspect_err(|error| tracing::warn!(%error, "could not read the saved devices"))
+        .ok()?;
+    if saved.iter().any(|saved| saved.name == device) {
+        Some(device)
+    } else {
+        tracing::warn!(
+            device,
+            slot,
+            "the device a window showed is no longer saved"
+        );
+        None
+    }
+}
+
+pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.

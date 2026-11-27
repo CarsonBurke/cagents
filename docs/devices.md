@@ -185,6 +185,17 @@ jobs continue. Save or discard editor changes before switching. Each device row
 also has an **Open in another window** action, so a desktop window and a build-host
 window can stay open together.
 
+A switched window stays on its device: `cagents ui`, the desktop icon and a
+reopen after a cagents update bring it back connected to that device, until you
+switch it back to **This device**. This computer records which device each of
+its windows shows in `window-devices.json` in its data directory. When the
+device takes more than two seconds to answer, a notice says cagents is
+connecting to it. When the window cannot reconnect, a screen says why, offers
+**Try again**, the device's update or install when versions differ, and
+**Open on this computer**, which opens the window here and forgets the device.
+`cagents --device local ui` opens this computer's window without changing the
+record.
+
 Clients on the same device and repository view (channel or worktree) share ordered pane IDs, titles, widths,
 and exact terminal/chat sessions. Creating, moving or closing a pane updates the
 other clients live. Focus, scrolling and unsent drafts belong to each window.
