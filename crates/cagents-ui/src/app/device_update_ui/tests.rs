@@ -100,18 +100,18 @@ fn a_finished_update_reports_what_changed_and_what_to_do() {
 #[test]
 fn a_failed_update_keeps_the_devices_explanation_without_its_progress() {
     let error = "rr has work that would stop: a native turn in api.";
-    let failure = outcome(
-        false,
-        &format!(r#"{{"ok":false,"error":{{"kind":"device","message":"{error}"}}}}"#),
-        vec![
-            "Checking rr…".into(),
-            "Sending cagents 0.2.5 to rr: 40%".into(),
-            "Kept: 3 terminals".into(),
-            "Disk is 100% full".into(),
-            format!("error: {error}"),
-        ],
-    )
-    .unwrap_err();
+    // The CLI writes its progress and then the failure's JSON to stderr.
+    let stderr = [
+        "Checking rr…".to_owned(),
+        "Sending cagents 0.2.5 to rr: 40%".into(),
+        "Kept: 3 terminals".into(),
+        "Disk is 100% full".into(),
+        format!(r#"{{"ok":false,"error":{{"kind":"device","message":"{error}"}}}}"#),
+    ];
+    let mut shown = Vec::new();
+    let (report, failed) = read_progress(stderr.into_iter(), |line| shown.push(line));
+    assert_eq!(shown.len(), 4, "the JSON is not progress: {shown:?}");
+    let failure = outcome(false, &failed.unwrap(), report).unwrap_err();
     assert_eq!(failure.error, error);
     assert_eq!(
         failure.report.as_deref(),

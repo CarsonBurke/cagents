@@ -483,24 +483,44 @@ fn update_device(device: &str, mut progress: impl FnMut(String)) -> Result<Succe
         let mut text = String::new();
         stdout.read_to_string(&mut text).map(|_| text)
     });
+    let stderr = std::io::BufReader::new(child.stderr.take().expect("piped stderr"));
+    let (report, failed) = read_progress(stderr.lines().map_while(Result::ok), &mut progress);
+    let status = child
+        .wait()
+        .map_err(|error| failure(format!("The update did not finish: {error}")))?;
+    let output = result.join().ok().and_then(Result::ok).unwrap_or_default();
+    // A failure's JSON comes on stderr, after the progress.
+    let output = match failed {
+        Some(failed) if !status.success() => failed,
+        _ => output,
+    };
+    outcome(status.success(), &output, report)
+}
+
+/// Splits what the update wrote to stderr into its latest lines, each also
+/// passed to `progress`, and the JSON a failure ends with.
+fn read_progress(
+    lines: impl Iterator<Item = String>,
+    mut progress: impl FnMut(String),
+) -> (Vec<String>, Option<String>) {
     let mut report = std::collections::VecDeque::with_capacity(REPORT_LINES);
-    for line in std::io::BufReader::new(child.stderr.take().expect("piped stderr")).lines() {
-        let Ok(line) = line else { break };
-        let line = line.trim_end().to_owned();
+    let mut failed = None;
+    for line in lines {
+        let line = line.trim_end();
         if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('{') {
+            failed = Some(line.to_owned());
             continue;
         }
         if report.len() == REPORT_LINES {
             report.pop_front();
         }
-        report.push_back(line.clone());
-        progress(line);
+        report.push_back(line.to_owned());
+        progress(line.to_owned());
     }
-    let status = child
-        .wait()
-        .map_err(|error| failure(format!("The update did not finish: {error}")))?;
-    let output = result.join().ok().and_then(Result::ok).unwrap_or_default();
-    outcome(status.success(), &output, report.into_iter().collect())
+    (report.into(), failed)
 }
 
 /// Reads the CLI's JSON result. On failure, its message is the error and the
