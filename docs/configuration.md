@@ -111,7 +111,7 @@ resume_sessions_after_reboot = false
 check_for_updates = true
 work_stale_after_days = 7
 shortcut_defaults_revision = 7
-preference_defaults_revision = 3
+preference_defaults_revision = 4
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -403,9 +403,10 @@ them back as version 3 the next time it saves.
   rather than one you chose, so a value matching a default a later revision
   changed takes the new default. `focus_follows_mouse = false`, the default
   before revision 2, becomes `true`. `sidebar_worktrees = "grouped"`, the
-  default before revision 3, becomes `"hidden"`; `"expanded"` is kept. The
-  next save records `preference_defaults_revision = 3`, after which an old
-  default chosen again is kept.
+  default before revision 3, becomes `"hidden"`; `"expanded"` is kept.
+  `context_usage_display = "left"`, the default before revision 4, becomes
+  `"used"`. The next save records `preference_defaults_revision = 4`, after
+  which an old default chosen again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
   `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Alt+Shift+R),

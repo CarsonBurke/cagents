@@ -485,7 +485,7 @@ fn settings_category_controls<'a>(
                     .keywords("account_usage_display remaining consumed"),
                     settings_choice(
                         "Context usage",
-                        "Left shows how much room a conversation has before the agent auto-compacts it, summarizing older messages to make space, or before its context window fills when auto-compaction is off. Used shows how much is taken.",
+                        "Used shows how much of a conversation's context is taken. Left shows how much room it has before the agent auto-compacts it, summarizing older messages to make space, or before its context window fills when auto-compaction is off.",
                         SettingsField::ContextUsageDisplay,
                         settings::AccountUsageDisplay::ALL.map(|display| {
                             (

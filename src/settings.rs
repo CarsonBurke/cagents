@@ -1389,6 +1389,11 @@ const fn default_shortcut_defaults_revision() -> u32 {
     SHORTCUT_DEFAULTS_REVISION
 }
 
+/// A conversation's context figure and gauge show how much is taken.
+pub const fn default_context_usage_display() -> AccountUsageDisplay {
+    AccountUsageDisplay::Used
+}
+
 /// Checkouts start hidden, with each open pane listed under its project.
 const fn default_sidebar_worktrees() -> SidebarWorktrees {
     SidebarWorktrees::Hidden
@@ -1693,9 +1698,9 @@ pub struct AppSettings {
     /// What account allowance labels and gauges show throughout the app.
     #[serde(default)]
     pub account_usage_display: AccountUsageDisplay,
-    /// What a conversation's context figure and gauge show: the room left
-    /// before auto-compaction (or a full window), or the context used.
-    #[serde(default)]
+    /// What a conversation's context figure and gauge show: the context
+    /// used, or the room left before auto-compaction (or a full window).
+    #[serde(default = "default_context_usage_display")]
     pub context_usage_display: AccountUsageDisplay,
     /// Preview rows by provider: `window:<provider key>` or `credits`.
     /// An absent provider retains its automatic headline; an empty list
@@ -1859,7 +1864,7 @@ impl Default for AppSettings {
             default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
             account_usage_display: AccountUsageDisplay::default(),
-            context_usage_display: AccountUsageDisplay::default(),
+            context_usage_display: default_context_usage_display(),
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             show_mentioned_pull_requests: false,
@@ -2087,8 +2092,8 @@ const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
 /// changed with this build's default.
 ///
 /// Revision 2 turned on `focus_follows_mouse`; revision 3 hid the sidebar's
-/// checkouts by default.
-pub const PREFERENCE_DEFAULTS_REVISION: u32 = 3;
+/// checkouts by default; revision 4 showed context usage as the share used.
+pub const PREFERENCE_DEFAULTS_REVISION: u32 = 4;
 
 /// The revision a file without `preference_defaults_revision` is at.
 const FIRST_PREFERENCE_DEFAULTS_REVISION: u32 = 1;
@@ -2101,6 +2106,11 @@ const RETIRED_PREFERENCE_DEFAULTS: &[(&str, u32, RetiredPreference)] = &[
         "sidebar_worktrees",
         3,
         RetiredPreference::String(SidebarWorktrees::Grouped.key()),
+    ),
+    (
+        "context_usage_display",
+        4,
+        RetiredPreference::String(AccountUsageDisplay::Left.key()),
     ),
 ];
 
@@ -5944,6 +5954,68 @@ new_thread = "Alt+Shift+G"
             revision_two_sidebar_worktrees(&path, mode);
             assert_eq!(load(&path).unwrap().sidebar_worktrees, mode);
         }
+    }
+
+    /// A file written at revision 3, as every save wrote it then, holding
+    /// `display` as the context usage display.
+    fn revision_three_context_usage(path: &Path, display: AccountUsageDisplay) {
+        let mut document = written(&AppSettings::default()).unwrap();
+        let table = document.as_table_mut().unwrap();
+        table.insert("preference_defaults_revision".into(), 3.into());
+        table.insert("context_usage_display".into(), display.key().into());
+        fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn context_usage_defaults_to_used_while_account_usage_stays_left() {
+        let defaults = AppSettings::default();
+        assert_eq!(defaults.context_usage_display, AccountUsageDisplay::Used);
+        assert_eq!(defaults.account_usage_display, AccountUsageDisplay::Left);
+        let mut absent = toml::Value::try_from(&defaults).unwrap();
+        absent
+            .as_table_mut()
+            .unwrap()
+            .remove("context_usage_display");
+        let absent: AppSettings = absent.try_into().unwrap();
+        assert_eq!(absent.context_usage_display, AccountUsageDisplay::Used);
+    }
+
+    #[test]
+    fn used_context_reaches_files_that_wrote_the_old_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_three_context_usage(&path, AccountUsageDisplay::Left);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.context_usage_display, AccountUsageDisplay::Used);
+        assert_eq!(
+            loaded.preference_defaults_revision,
+            PREFERENCE_DEFAULTS_REVISION
+        );
+        save(&path, &loaded).unwrap();
+        assert!(!saved(&path).contains_key("context_usage_display"));
+
+        // Choosing Left afterwards is a choice, and is kept.
+        let chosen = AppSettings {
+            context_usage_display: AccountUsageDisplay::Left,
+            ..loaded
+        };
+        save(&path, &chosen).unwrap();
+        assert_eq!(saved(&path)["context_usage_display"], "left".into());
+        assert_eq!(
+            load(&path).unwrap().context_usage_display,
+            AccountUsageDisplay::Left
+        );
+    }
+
+    #[test]
+    fn an_old_file_that_showed_used_context_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_three_context_usage(&path, AccountUsageDisplay::Used);
+        assert_eq!(
+            load(&path).unwrap().context_usage_display,
+            AccountUsageDisplay::Used
+        );
     }
 
     #[test]

@@ -3420,7 +3420,7 @@ impl Runtime {
             recovery,
             transition,
             enter_sends,
-            crate::settings::AccountUsageDisplay::default(),
+            crate::settings::default_context_usage_display(),
             shortcuts,
             content_width,
             transcript_clearance,

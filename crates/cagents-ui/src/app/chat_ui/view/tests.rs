@@ -6939,7 +6939,7 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
         assert_eq!(text.contains("Synthetic account"), fit == FooterFit::Wide);
         let roomy = fit != FooterFit::Tight;
         assert_eq!(text.contains("Claude Sonnet 4.5"), roomy, "{text}");
-        assert_eq!(text.contains("58% left"), roomy, "{text}");
+        assert_eq!(text.contains("42% used"), roomy, "{text}");
         assert_eq!(text.contains("$1.23"), roomy, "{text}");
         // The trailing group holds the footer's far edge at every width,
         // so model and spend never jump sides as the pane narrows.
@@ -6960,7 +6960,7 @@ fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
         let ring = laid
             .footer_names
             .iter()
-            .find(|name| name.starts_with("58% of context left"))
+            .find(|name| name.starts_with("42% of context used"))
             .unwrap_or_else(|| panic!("the ring is named at {width}: {names}"));
         // Where the cost is no longer drawn, the ring says it.
         assert_eq!(ring.contains("$1.23"), !roomy, "{ring}");
