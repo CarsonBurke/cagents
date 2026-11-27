@@ -32,6 +32,13 @@ fn path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.release-stage.json"))
 }
 
+fn read_stage(state: &Path, job: &str) -> Result<Stage, UpdateError> {
+    Ok(serde_json::from_slice(&read_private(
+        &path(state, job),
+        SMALL_ASSET_LIMIT,
+    )?)?)
+}
+
 fn extraction_directory(state: &Path) -> io::Result<tempfile::TempDir> {
     tempfile::Builder::new()
         .prefix(".release-stage-")
@@ -46,8 +53,7 @@ pub(super) fn resume(
     requested: &Release,
     request: &[u8; 32],
 ) -> Result<VerifiedCandidate, UpdateError> {
-    let stage: Stage =
-        serde_json::from_slice(&read_private(&path(state, &job.id), SMALL_ASSET_LIMIT)?)?;
+    let stage = read_stage(state, &job.id)?;
     if stage.job != job.id
         || stage.request != *request
         || job.version != requested.version
@@ -75,6 +81,29 @@ pub(super) fn resume(
         root: layout.version_root,
         binaries: stage.binaries,
     })
+}
+
+pub(super) fn verify_interrupted_candidate(
+    state: &Path,
+    job: &UpdateJob,
+    target: &Path,
+    previous: Option<&Path>,
+    request: &[u8; 32],
+) -> Result<String, UpdateError> {
+    let stage = read_stage(state, &job.id)?;
+    if stage.job != job.id
+        || &stage.request != request
+        || Some(stage.previous.as_path()) != previous
+    {
+        return Err(invalid(
+            "The staged release no longer matches the approved update",
+        ));
+    }
+    VerifiedCandidate {
+        root: target.to_owned(),
+        binaries: stage.binaries,
+    }
+    .digest()
 }
 
 pub(super) fn extract_and_exec(

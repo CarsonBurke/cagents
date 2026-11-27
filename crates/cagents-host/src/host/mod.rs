@@ -736,15 +736,31 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // data, which a daemon in another runtime directory may already serve.
     // Declared after the lease, it is released first. Darwin's installer
     // checks the production claim before changing or removing any saved data.
-    let _state = match crate::instance::state_claim::claim_daemon_state(
-        &paths.lock,
-        proof.host_session_id.as_str(),
-    ) {
+    let claim_state = || {
+        crate::instance::state_claim::claim_daemon_state(
+            &paths.lock,
+            proof.host_session_id.as_str(),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let state = ready_admission.as_ref().map_or_else(claim_state, |ready| {
+        crate::instance::state_claim::claim_daemon_state_from(
+            &paths.lock,
+            proof.host_session_id.as_str(),
+            ready.source(),
+        )
+    });
+    #[cfg(not(target_os = "macos"))]
+    let state = claim_state();
+    let _state = match state {
         Ok(claim) => Some(claim),
         Err(error) => match crate::instance::state_claim::state_in_use(&error) {
             Some(refusal) => return Err(HostError::StateInUse(refusal.clone())),
             #[cfg(target_os = "macos")]
-            None if !crate::instance::IS_DEVELOPMENT || crate::update::runs_from_installation() => {
+            None if ready_admission.is_some()
+                || !crate::instance::IS_DEVELOPMENT
+                || crate::update::runs_from_installation() =>
+            {
                 return Err(error.into());
             }
             None => {

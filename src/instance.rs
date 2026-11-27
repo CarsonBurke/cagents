@@ -2498,7 +2498,7 @@ pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
 }
 
 pub const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", target_os = "macos"))]
 pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_directory()?;
     Ok((

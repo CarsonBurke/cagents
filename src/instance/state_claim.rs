@@ -214,6 +214,50 @@ pub fn claims_directory() -> io::Result<PathBuf> {
     Ok(dirs.data_dir().join(CLAIMS_DIRECTORY))
 }
 
+/// A different runtime may have used the same shared data while no
+/// process held the old runtime's lock. Its last claimant must still be the
+/// acknowledged source; the caller holds the Darwin publication fence.
+#[cfg(target_os = "macos")]
+pub(crate) fn last_daemon_was(
+    lock: &Path,
+    proof: &crate::model::HostSessionProof,
+) -> io::Result<bool> {
+    let claim = claims_directory()?.join(DAEMON_CLAIM);
+    let guard = canonical_guard(lock);
+    Ok(read_path(&claim)?
+        .as_ref()
+        .is_some_and(|record| names_source(record, &guard, proof)))
+}
+
+#[cfg(target_os = "macos")]
+fn names_source(record: &Record, guard: &Path, proof: &crate::model::HostSessionProof) -> bool {
+    record.guard == guard
+        && record.host_session.as_deref() == Some(proof.host_session_id.as_str())
+        && record.boot.as_deref() == Some(proof.boot_id.as_str())
+}
+
+/// The acknowledged Ready successor may replace only its original source's
+/// saved-data claim. Compare under the exclusive lock before recording a
+/// successor so an intervening writer cannot race the coordinator's snapshot.
+#[cfg(target_os = "macos")]
+pub fn claim_daemon_state_from(
+    lock: &Path,
+    host_session: &str,
+    source: &crate::model::HostSessionProof,
+) -> io::Result<StateClaim> {
+    let claims = claims_directory()?;
+    prepare_claim_directory(&claims, Claimant::Daemon)?;
+    let ours = record(lock, Some(host_session))?;
+    let guard = ours.guard.clone();
+    acquire_checked(
+        &claims.join(DAEMON_CLAIM),
+        ours,
+        Claimant::Daemon,
+        DAEMON_PATIENCE,
+        |previous| previous.is_some_and(|previous| names_source(previous, &guard, source)),
+    )
+}
+
 /// Claim this instance's daemon state for the daemon that holds the runtime
 /// lease `lock`. The caller must hold that lease.
 pub fn claim_daemon_state(lock: &Path, host_session: &str) -> io::Result<StateClaim> {
@@ -474,12 +518,27 @@ fn acquire(
     claimant: Claimant,
     patience: Duration,
 ) -> io::Result<StateClaim> {
+    acquire_checked(path, ours, claimant, patience, |_| true)
+}
+
+fn acquire_checked(
+    path: &Path,
+    ours: Record,
+    claimant: Claimant,
+    patience: Duration,
+    accepts: impl Fn(Option<&Record>) -> bool,
+) -> io::Result<StateClaim> {
+    let unexpected =
+        || io::Error::other("The saved work no longer belongs to the update's acknowledged source");
     let started = std::time::Instant::now();
     let unreadable = || io::Error::other(unreadable(claimant));
     loop {
         let file = match open_claim(path, true) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !accepts(None) {
+                    return Err(unexpected());
+                }
                 match create_claim(path, &ours) {
                     Ok(lock) => return Ok(StateClaim { _lock: lock }),
                     Err(error)
@@ -512,6 +571,9 @@ fn acquire(
                 // The last holder may have released the claim but left the
                 // runtime lease in use by an updater or store maintenance.
                 let last = read(&lock).map_err(|_| unreadable())?;
+                if !accepts(Some(&last)) {
+                    return Err(unexpected());
+                }
                 if last.guard != ours.guard && taken_within(&last.guard, HANDOFF) {
                     let foreign = other_boot(&last, ours.boot.as_deref());
                     return Err(io::Error::other(refusal(claimant, Some(&last), foreign)));
@@ -1145,6 +1207,37 @@ mod tests {
         );
         assert_eq!(read_path(&claim).unwrap(), Some(claim_record.clone()));
         acquire(&claim, claim_record, Claimant::Daemon, Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn a_checked_handoff_keeps_an_intervening_saved_data_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new();
+        let _owner = runtime.hold();
+        let path = root.path().join(DAEMON_CLAIM);
+        let original = record(&runtime.lock, Some("original")).unwrap();
+        let other = record(&runtime.lock, Some("intervening")).unwrap();
+        let successor = record(&runtime.lock, Some("successor")).unwrap();
+        let handoff = || {
+            acquire_checked(
+                &path,
+                successor.clone(),
+                Claimant::Daemon,
+                Duration::ZERO,
+                |previous| previous == Some(&original),
+            )
+        };
+
+        assert!(handoff().is_err());
+        assert!(!path.exists());
+        drop(create_claim(&path, &original).unwrap());
+        drop(acquire(&path, other.clone(), Claimant::Daemon, Duration::ZERO).unwrap());
+        let saved = fs::read(&path).unwrap();
+        assert!(handoff().is_err());
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        drop(acquire(&path, original.clone(), Claimant::Daemon, Duration::ZERO).unwrap());
+        drop(handoff().unwrap());
+        assert_eq!(read_path(&path).unwrap(), Some(successor));
     }
 
     #[test]
