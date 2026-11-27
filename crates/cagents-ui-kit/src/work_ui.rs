@@ -1222,26 +1222,19 @@ impl State {
             }
             // The rest are in the worktree, the least urgent of them.
             let more = urgent.len().saturating_sub(MENU_AGENTS);
-            if more > 0 && item.worktree.is_some() {
-                items.push(
-                    popover_item(
-                        Icon::OpenFolder.handle(),
-                        format!(
-                            "{more} more {}",
-                            if more == 1 { "session" } else { "sessions" }
-                        ),
-                        "Open the worktree to see them",
-                        Action::OpenWorktree(card.clone()),
-                    )
-                    .into(),
-                );
-            }
             if let Some(worktree) = &item.worktree {
                 items.push(
                     popover_item(
                         Icon::OpenFolder.handle(),
                         "Open worktree",
-                        crate::ui_controls::display_path(&worktree.path),
+                        match more {
+                            0 => crate::ui_controls::display_path(&worktree.path).to_string(),
+                            more => format!(
+                                "{more} more {} there · {}",
+                                if more == 1 { "session" } else { "sessions" },
+                                crate::ui_controls::display_path(&worktree.path)
+                            ),
+                        },
                         Action::OpenWorktree(card.clone()),
                     )
                     .into(),
