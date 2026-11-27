@@ -624,6 +624,24 @@ impl Runtime {
         }
     }
 
+    /// How many finished children the finished control counts: those
+    /// without a tab of their own in the strip.
+    fn finished_beyond_tabs(&self) -> usize {
+        let focused = self.child_tab_focus.borrow();
+        let tabs = direct_tabs(
+            &self.snapshot.subagents,
+            self.selected_subagent.as_deref(),
+            focused.as_deref(),
+            self.child_strip_hold.as_ref(),
+        );
+        self.snapshot
+            .subagents
+            .iter()
+            .filter(|child| finished(child))
+            .count()
+            - tabs.into_iter().filter(|child| finished(child)).count()
+    }
+
     /// The tabs the strip shows now, held as they stand; see [`Hold`].
     pub(super) fn child_strip_now(&self) -> Hold {
         let focused = self.child_tab_focus.borrow();
@@ -657,6 +675,9 @@ impl Runtime {
             focused.as_deref(),
             self.child_strip_hold.as_ref(),
         );
+        // A finished child the pointer holds in the strip is counted there,
+        // by its tab, rather than again in the finished control.
+        let finished_tabs = shown.iter().filter(|child| finished(child)).count();
         let identities: HashMap<_, _> = shown
             .iter()
             .map(|child| (child_key(&child.id), child.id.clone()))
@@ -742,7 +763,7 @@ impl Runtime {
 
         // Finished children share one control that opens the chooser on
         // them, so finished work stays reachable without crowding the strip.
-        let done = children.iter().filter(|child| finished(child)).count();
+        let done = children.iter().filter(|child| finished(child)).count() - finished_tabs;
         let done = (done > 0).then(|| {
             crate::ui_controls::quiet_tab(
                 crate::ui_controls::QuietTab {
@@ -821,12 +842,17 @@ impl Runtime {
             .as_ref()
             .and_then(|picker| picker.opened_on)
         {
-            Some(Section::Finished) if self.snapshot.subagents.iter().any(finished) => {
+            Some(Section::Finished) if self.finished_beyond_tabs() > 0 => {
                 Some(card_control_id(target.card, FINISHED_CONTROL))
             }
-            Some(Section::Attention) => {
+            // The failures control sits on the closing line, so it is there
+            // only while that line is; one failure opens its own transcript
+            // rather than the chooser.
+            Some(Section::Attention)
+                if self.selected_subagent.is_none()
+                    && self.closing_activity(false, None).is_some() =>
+            {
                 let failed = self.snapshot.subagent_activity().failed;
-                // One failure opens its own transcript rather than the chooser.
                 (failed.len() > 1).then(|| Self::agent_failures_id(target, &failed))
             }
             _ => None,
@@ -2028,7 +2054,8 @@ mod tests {
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
         drop(app.handle_chat_ui(entered));
         // Bravo finishes under the pointer: Charlie, beneath it, stays put,
-        // and Bravo keeps its slot, now with its finished mark.
+        // and Bravo keeps its slot, now with its finished mark, counted by
+        // that tab rather than again in a finished control.
         let finish = |app: &mut crate::app::Cagents, id: &str| {
             let runtime = app.chat_runtime_mut(target).unwrap();
             std::sync::Arc::make_mut(&mut runtime.snapshot)
@@ -2041,10 +2068,7 @@ mod tests {
         finish(&mut app, "b");
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert_eq!(places(runtime), before);
-        assert_eq!(
-            mounted_finished(runtime).as_deref(),
-            Some("Choose from 1 finished subagent")
-        );
+        assert_eq!(mounted_finished(runtime), None);
         // A newcomer takes a slot after the held tabs.
         std::sync::Arc::make_mut(&mut runtime.snapshot)
             .subagents
@@ -2066,6 +2090,10 @@ mod tests {
             ["a", "c"]
         );
         assert!(settled[1].1 < before[2].1, "Charlie moves up once free");
+        assert_eq!(
+            mounted_finished(runtime).as_deref(),
+            Some("Choose from 1 finished subagent")
+        );
     }
 
     /// #3642: Escape, or the chooser's Close, returns focus to the control

@@ -7544,6 +7544,9 @@ impl Runtime {
 
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
+            // A strip that is no longer drawn hears no pointer leave it, so
+            // the hold the pointer took on it ends here instead.
+            self.child_strip_hold = None;
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
             self.forget_local_presentations();

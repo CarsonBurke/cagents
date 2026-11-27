@@ -14928,4 +14928,18 @@ fn a_selected_subagent_says_its_state_once() {
     );
     assert!(texts.iter().any(|text| text == "Scout"), "{texts:?}");
     assert!(texts.iter().any(|text| text == "Main"), "{texts:?}");
+
+    // Settled, no line closes its transcript, so its heading says how it
+    // stands, once, in words rather than only by the tab's mark.
+    for status in [chat::ToolStatus::Succeeded, chat::ToolStatus::Stopped] {
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].status = status;
+        let child = runtime.snapshot.subagents[0].clone();
+        let state = runtime.native_child_status(&child).to_owned();
+        let (_, texts) = strip_scene(&runtime);
+        assert_eq!(
+            texts.iter().filter(|text| **text == state).count(),
+            1,
+            "{status:?}: {texts:?}"
+        );
+    }
 }

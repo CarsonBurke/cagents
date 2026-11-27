@@ -2730,7 +2730,7 @@ impl Runtime {
     /// The row that closes the transcript above the composer: what
     /// [`Self::timeline_activity`] says, except a message the queue docked
     /// on the composer already says is on its way, which is said there once.
-    fn closing_activity(
+    pub(super) fn closing_activity(
         &self,
         transitioning: bool,
         selected: Option<&chat::Subagent>,
@@ -3604,12 +3604,24 @@ impl Runtime {
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
             // The selected tab already names the agent and marks how it
-            // stands, and the line closing its transcript says what it is
-            // doing, so neither is said again here. Beneath the tabs is only
-            // what the tab cannot hold: the task it was given, unless the
-            // tab already shows it whole, and where it runs on which model.
-            let mut summary = Vec::with_capacity(2);
-            if let Some(task) = Self::selected_task(agent) {
+            // stands, and while it works the line closing its transcript
+            // says what it is doing, so that is not said again here. Without
+            // that line, as once it has finished, stopped or failed, the
+            // heading says how it stands in words. Beyond that is only what
+            // the tab cannot hold: the task it was given, unless the tab
+            // already shows it whole, and where it runs on which model.
+            let closing = self.closing_activity(transitioning, Some(agent)).is_some();
+            let mut summary = Vec::with_capacity(3);
+            if !closing {
+                summary.push(
+                    design::caption(self.native_child_status(agent).to_owned())
+                        .class(cosmic::theme::Text::Default)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                );
+            }
+            let task = Self::selected_task(agent);
+            if let Some(task) = task {
                 summary.push(
                     // Only what the budget can show, and a character past
                     // it to say there is more, is copied on each frame.
@@ -3626,7 +3638,7 @@ impl Runtime {
             }
             summary.push(
                 crate::ui_controls::FadeText::caption(self.child_runtime(agent))
-                    .width(if summary.is_empty() {
+                    .width(if task.is_none() {
                         Length::Fill
                     } else {
                         Length::Shrink
@@ -3669,10 +3681,7 @@ impl Runtime {
                     .width(Length::Fill)
                     .into(),
             );
-            if let Some(placeholder) = child_placeholder(
-                agent,
-                self.closing_activity(transitioning, Some(agent)).is_some(),
-            ) {
+            if let Some(placeholder) = child_placeholder(agent, closing) {
                 transcript.push(transcript_body(placeholder, target));
             }
             let mut gallery_rest = 0;

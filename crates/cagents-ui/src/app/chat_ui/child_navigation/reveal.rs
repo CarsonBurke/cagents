@@ -132,6 +132,10 @@ impl Reveal<'_> {
         let selected_at = measure.selected.map(|bounds| bounds.x - scroll.content.x);
         let memory = tree.state.downcast_mut::<Memory>();
         let resized = memory.width != Some(scroll.viewport.width);
+        // Leaving the tabs for the main view, which sits before them, takes
+        // the strip back to its start, so it reads from its first tab rather
+        // than from wherever the last one left it.
+        let home = self.selected.is_none() && memory.selected.is_some() && scroll.offset > 0.0;
         let target = if self.selected != memory.selected {
             measure.selected
         } else if focused
@@ -150,7 +154,14 @@ impl Reveal<'_> {
         memory.selected_at = selected_at;
         memory.focused = focused.map(|(position, _)| position);
         memory.width = Some(scroll.viewport.width);
-        if let Some(bounds) = target {
+        if home {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut Offset(&self.scroll, 0.0),
+            );
+        } else if let Some(bounds) = target {
             // Focusable bounds use unscrolled content coordinates. Native
             // translation, not text length or tab index, supplies the offset.
             let left = bounds.x - scroll.content.x;
@@ -508,6 +519,22 @@ mod tests {
             0.0,
             "an unchanged selected identity must preserve manual scroll across rebuild"
         );
+        // Back on the main view, the strip reads from its first tab again
+        // rather than from wherever the last selection left it.
+        ui.operate(
+            &renderer,
+            &mut Offset(&card_control_id(target.card, "chat-subagent-tabs"), 120.0),
+        );
+        assert!(measure(&mut ui, &renderer, target).offset > 0.0);
+        let cache = ui.into_cache();
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        let mut ui = UserInterface::build(
+            chat(&app, target).child_navigation(360.0),
+            viewport,
+            cache,
+            &mut renderer,
+        );
+        assert_eq!(measure(&mut ui, &renderer, target).offset, 0.0);
     }
 
     #[test]
