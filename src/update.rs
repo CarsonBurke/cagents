@@ -13,6 +13,7 @@ pub(crate) use cutover::persist_ready_evidence;
 #[doc(hidden)]
 pub use cutover::{
     LiveInventory as CutoverLiveInventory, StartupCheckpoint as CutoverStartupCheckpoint,
+    retire_completed_checkpoint as retire_completed_cutover_checkpoint,
     selected_reconnectable_codex, startup_checkpoint as cutover_startup_checkpoint,
 };
 #[cfg(all(target_os = "macos", feature = "host"))]

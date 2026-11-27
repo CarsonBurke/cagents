@@ -2181,6 +2181,14 @@ pub mod handoff {
         }
 
         #[cfg(all(target_os = "macos", feature = "host"))]
+        #[doc(hidden)]
+        pub fn save_with_digest(&self, checkpoint: &Checkpoint) -> Result<String, String> {
+            let bytes = encode_checkpoint(checkpoint)?;
+            self.write_named(FILE, &bytes)?;
+            Ok(format!("{:x}", Sha256::digest(&bytes)))
+        }
+
+        #[cfg(all(target_os = "macos", feature = "host"))]
         pub(crate) fn load_with_digest(&self) -> Result<Option<(Checkpoint, String)>, String> {
             self.read_bytes()?
                 .map(|bytes| {

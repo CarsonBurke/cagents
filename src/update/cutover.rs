@@ -5,6 +5,7 @@ use super::*;
 use crate::model::HostSessionProof;
 #[cfg(feature = "host")]
 use crate::terminal_ipc::StartupState;
+use crate::upgrade::handoff::{CheckpointStatus, Phase, Store};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +50,7 @@ impl WitnessLocation {
 pub(crate) struct Original<'a> {
     pub(crate) source: &'a HostSessionProof,
     pub(crate) inventory: &'a crate::upgrade::recovery::Census,
+    pub(crate) restored_checkpoint_digest: Option<&'a str>,
     pub(crate) retry_of: Option<(
         &'a HostSessionProof,
         &'a crate::daemon::holder_registry::Process,
@@ -537,7 +539,30 @@ pub(crate) fn record(
         terminals: original.inventory.terminals.clone(),
         chats: original.inventory.chats.clone(),
     };
-    intent.publish_with_witness(&state, inventory, original.retry_of)
+    if let Some(digest) = original.restored_checkpoint_digest {
+        let store = Store::observe_existing().map_err(invalid)?.ok_or_else(|| {
+            invalid("The verified restored checkpoint disappeared before selection")
+        })?;
+        let checkpoint = store
+            .checkpoint_status()
+            .map_err(invalid)?
+            .filter(|checkpoint| {
+                checkpoint.phase == Phase::Restoring
+                    && checkpoint.proof == intent.source
+                    && checkpoint.digest == digest
+            })
+            .ok_or_else(|| invalid("The verified restored checkpoint changed before selection"))?;
+        let record = RestoredCheckpoint {
+            version: 1,
+            intent_digest: intent.pending_digest()?,
+            restoring_digest: checkpoint.digest,
+        };
+        let path = restored_checkpoint_path(&state, &intent.job);
+        intent.publish_with_witness(&state, inventory, original.retry_of)?;
+        persist(&state, &path, &serde_json::to_vec(&record)?, true)
+    } else {
+        intent.publish_with_witness(&state, inventory, original.retry_of)
+    }
 }
 
 pub(super) fn recorded_selection(
@@ -583,6 +608,81 @@ fn restart_intent(
     Ok(Some((intent, original)))
 }
 
+/// A Ready claimant verified the live inventory before selection. This
+/// receipt permits closing the exact completed checkpoint after selection,
+/// without making its launch entries available for a second restore.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoredCheckpoint {
+    version: u16,
+    intent_digest: String,
+    restoring_digest: String,
+}
+
+fn restored_checkpoint_path(state: &Path, job: &str) -> PathBuf {
+    state.join(format!("{job}.cutover-restored.json"))
+}
+
+fn checkpoint_retirement_matches(
+    state: &Path,
+    intent: &Intent,
+    checkpoint: &CheckpointStatus,
+) -> Result<bool, UpdateError> {
+    if checkpoint.phase != Phase::Restoring || checkpoint.proof != intent.source {
+        return Ok(false);
+    }
+    let bytes = match read_private(
+        &restored_checkpoint_path(state, &intent.job),
+        SMALL_ASSET_LIMIT,
+    ) {
+        Ok(bytes) => bytes,
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let retired: RestoredCheckpoint = serde_json::from_slice(&bytes)?;
+    Ok(retired.version == 1
+        && retired.intent_digest == intent.pending_digest()?
+        && retired.restoring_digest == checkpoint.digest)
+}
+
+/// Runs under the selected daemon's canonical saved-data and runtime claims,
+/// before ordinary recovery may read or act on checkpoint contents.
+#[cfg(feature = "host")]
+pub fn retire_completed_checkpoint() -> Result<(), UpdateError> {
+    let Some(store) = Store::observe_existing().map_err(invalid)? else {
+        return Ok(());
+    };
+    let Some(checkpoint) = store.checkpoint_status().map_err(invalid)? else {
+        return Ok(());
+    };
+    if checkpoint.phase != Phase::Restoring {
+        return Ok(());
+    }
+    let executable = crate::process::current_executable()?;
+    let layout = match locate(&executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let state = layout.prefix.join(".update");
+    let Some(job) = read_job(&state)? else {
+        return Ok(());
+    };
+    let Some((intent, _)) = restart_intent(&layout, &state, &job)? else {
+        return Ok(());
+    };
+    if crate::process::mapped_region_identity(
+        std::process::id(),
+        crate::process::own_code_address(),
+    )? == intent.target_image
+        && checkpoint_retirement_matches(&state, &intent, &checkpoint)?
+        && store.checkpoint_status().map_err(invalid)?.as_ref() == Some(&checkpoint)
+    {
+        store.remove().map_err(invalid)?;
+    }
+    Ok(())
+}
+
 pub(super) struct SelectedRestart {
     cli: PathBuf,
     intent: Intent,
@@ -600,12 +700,12 @@ pub(super) fn restart_after_worker(
     let Some((intent, _)) = restart_intent(&layout, state, job)? else {
         return Ok(None);
     };
-    // This entry point is for a completed restore followed by process loss.
-    // Keep any existing canonical checkpoint under its own recovery rules.
-    let Some(store) = crate::upgrade::handoff::Store::observe_existing().map_err(invalid)? else {
+    let Some(store) = Store::observe_existing().map_err(invalid)? else {
         return Ok(None);
     };
-    if store.checkpoint_status().map_err(invalid)?.is_some() {
+    if let Some(checkpoint) = store.checkpoint_status().map_err(invalid)?
+        && !checkpoint_retirement_matches(state, &intent, &checkpoint)?
+    {
         return Ok(None);
     }
     Ok(Some(SelectedRestart {
@@ -893,6 +993,46 @@ mod tests {
     }
 
     #[test]
+    fn completed_checkpoint_retirement_matches_the_selected_attempt_and_exact_bytes() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let selected = intent();
+        let mut checkpoint = CheckpointStatus {
+            proof: selected.source.clone(),
+            phase: Phase::Restoring,
+            digest: "c".repeat(64),
+        };
+        let eligible =
+            |intent, checkpoint| checkpoint_retirement_matches(state, intent, checkpoint).unwrap();
+        assert!(!eligible(&selected, &checkpoint));
+        let record = RestoredCheckpoint {
+            version: 1,
+            intent_digest: selected.pending_digest().unwrap(),
+            restoring_digest: checkpoint.digest.clone(),
+        };
+        persist(
+            state,
+            &restored_checkpoint_path(state, &selected.job),
+            &serde_json::to_vec(&record).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(eligible(&selected, &checkpoint));
+
+        let mut retry = selected.clone();
+        retry.process.start += 1;
+        assert!(!eligible(&retry, &checkpoint));
+        checkpoint.phase = Phase::Ready;
+        assert!(!eligible(&selected, &checkpoint));
+        checkpoint.phase = Phase::Restoring;
+        checkpoint.proof = selected.successor.clone();
+        assert!(!eligible(&selected, &checkpoint));
+        checkpoint.proof = selected.source.clone();
+        checkpoint.digest = "b".repeat(64);
+        assert!(!eligible(&selected, &checkpoint));
+    }
+
+    #[test]
     fn selected_launch_failure_marks_only_its_exact_attempt() {
         let directory = crate::test_fixture::tempdir().unwrap();
         let state = directory.path();
@@ -1152,6 +1292,7 @@ mod tests {
                 Original {
                     source: &intent.source,
                     inventory: &crate::upgrade::recovery::Census::default(),
+                    restored_checkpoint_digest: None,
                     retry_of: Some((&intent.successor, &intent.process)),
                 },
                 &intent.successor,

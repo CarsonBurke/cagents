@@ -4827,7 +4827,11 @@ impl ReadyAdmission {
     }
 
     /// Persist the work and window scope just verified by the startup publisher.
-    pub fn remember_cutover(&self, successor: &HostSessionProof) -> Result<(), String> {
+    pub fn remember_cutover(
+        &self,
+        successor: &HostSessionProof,
+        restored_checkpoint_digest: Option<&str>,
+    ) -> Result<(), String> {
         let authority = &self.authority;
         let retry_of = self
             .retry_predecessor
@@ -4841,6 +4845,7 @@ impl ReadyAdmission {
             crate::update::ReadyCutoverOriginal {
                 source: &authority.source,
                 inventory: &authority.census,
+                restored_checkpoint_digest,
                 retry_of,
             },
             successor,
