@@ -4707,6 +4707,7 @@ pub struct ReadyAdmission {
     successor: HostSessionProof,
     saved_predecessor: ReadyStatePredecessor,
     runtime_claim: Option<String>,
+    retry_predecessor: Option<ReadyClaim>,
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
@@ -4762,6 +4763,12 @@ impl ReadyAdmission {
     /// Persist the work and window scope just verified by the startup publisher.
     pub fn remember_cutover(&self, successor: &HostSessionProof) -> Result<(), String> {
         let authority = &self.authority;
+        let retry_of = self.retry_predecessor.as_ref().and_then(|claim| {
+            claim
+                .successor_proof
+                .as_ref()
+                .map(|proof| (proof, &claim.successor))
+        });
         crate::update::record_ready_cutover(
             &authority.job,
             &authority.job_request_hash,
@@ -4770,6 +4777,7 @@ impl ReadyAdmission {
             crate::update::ReadyCutoverOriginal {
                 source: &authority.source,
                 inventory: &authority.census,
+                retry_of,
             },
             successor,
             &authority.windows,
@@ -4986,7 +4994,7 @@ pub(crate) fn accept_ready_authority(
     // startup path that can act on the original provider or its database.
     let reserved = crate::update::admit_shared_ready(&authority).map_err(io::Error::other)?;
     let record_runtime = reserved.is_some();
-    let (saved_predecessor, retry_of) =
+    let (saved_predecessor, retry) =
         if ready_evidence_exists(&authority, "claim").map_err(io::Error::other)? {
             let original = reserved
                 .ok_or_else(|| io::Error::other("The Ready claim has no shared reservation"))?;
@@ -4999,7 +5007,7 @@ pub(crate) fn accept_ready_authority(
             let (claim, fingerprint) = original.retry_predecessor().map_err(io::Error::other)?;
             let predecessor = ready_state_predecessor(&authority, &custody.daemon, Some(&claim))
                 .map_err(io::Error::other)?;
-            (predecessor, Some(fingerprint))
+            (predecessor, Some((claim, fingerprint)))
         } else {
             require_no_ready_effects_or_retry(&authority).map_err(io::Error::other)?;
             ((authority.source.clone(), None), None)
@@ -5010,6 +5018,7 @@ pub(crate) fn accept_ready_authority(
             "Ready activation belongs to a previous boot",
         ));
     }
+    let (retry_predecessor, retry_of) = retry.unzip();
     let record_runtime = record_runtime && retry_of.is_none();
     let claim = claim_ready_activation(&authority, &capture_digest, &successor, retry_of)?;
     Ok(ReadyAdmission {
@@ -5018,6 +5027,7 @@ pub(crate) fn accept_ready_authority(
         successor,
         saved_predecessor,
         runtime_claim: record_runtime.then_some(claim),
+        retry_predecessor,
     })
 }
 

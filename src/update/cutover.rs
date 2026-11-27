@@ -49,6 +49,10 @@ impl WitnessLocation {
 pub(crate) struct Original<'a> {
     pub(crate) source: &'a HostSessionProof,
     pub(crate) inventory: &'a crate::upgrade::recovery::Census,
+    pub(crate) retry_of: Option<(
+        &'a HostSessionProof,
+        &'a crate::daemon::holder_registry::Process,
+    )>,
 }
 
 #[cfg(feature = "host")]
@@ -390,12 +394,29 @@ impl Intent {
         mut self,
         state: &Path,
         inventory: OriginalInventory,
+        retry_of: Option<(&HostSessionProof, &crate::daemon::holder_registry::Process)>,
     ) -> Result<(), UpdateError> {
         let recorded = read(state, &self.job)?;
+        let mut replace = false;
         if let Some(recorded) = &recorded {
             self.witness = recorded.witness;
             if self.pending_digest()? != recorded.pending_digest()? {
-                return Err(invalid("An exact cutover intent is already recorded"));
+                let Some((proof, process)) = retry_of else {
+                    return Err(invalid("An exact cutover intent is already recorded"));
+                };
+                let mut original = self.clone();
+                original.successor = proof.clone();
+                original.process = process.clone();
+                if recorded.stage != Stage::Pending
+                    || recorded.witness.is_legacy()
+                    || original.pending_digest()? != recorded.pending_digest()?
+                    || hashed_json(&recorded.read_witness(state)?)? != hashed_json(&inventory)?
+                {
+                    return Err(invalid(
+                        "The recorded cutover is not the exact unpublished predecessor",
+                    ));
+                }
+                replace = true;
             }
         }
         let witness = self.encode_witness(inventory)?;
@@ -407,14 +428,14 @@ impl Intent {
         } else {
             persist(state, &witness_path, &witness, true)?;
         }
-        if recorded.is_none() {
+        if replace || recorded.is_none() {
             // The intent is the reference to a complete immutable witness.
             // A crash before publishing it leaves no reference to this attempt.
             persist(
                 state,
                 &path(state, &self.job),
                 &serde_json::to_vec(&self)?,
-                true,
+                !replace,
             )?;
         }
         Ok(())
@@ -454,6 +475,11 @@ pub(crate) fn record(
     windows: &[String],
 ) -> Result<(), UpdateError> {
     let layout = locate(target)?;
+    // The admission also verified the original selector under the launch
+    // fence. A selected attempt must never be replaced, even by that retry.
+    if original.retry_of.is_some() && served_version_root(&layout)? == layout.version_root {
+        return Err(invalid("The recorded cutover is already selected"));
+    }
     let state = state_dir(&layout.prefix)?;
     let expected = read_job(&state)?.ok_or_else(|| invalid("The cutover job is missing"))?;
     if expected.id != job
@@ -489,7 +515,7 @@ pub(crate) fn record(
         terminals: original.inventory.terminals.clone(),
         chats: original.inventory.chats.clone(),
     };
-    intent.publish_with_witness(&state, inventory)
+    intent.publish_with_witness(&state, inventory, original.retry_of)
 }
 
 pub(super) fn recorded_selection(
@@ -710,7 +736,7 @@ mod tests {
         assert_ne!(unreferenced, path);
         assert!(!next.witness_present(state).unwrap());
         next.clone()
-            .publish_with_witness(state, empty_inventory())
+            .publish_with_witness(state, empty_inventory(), None)
             .unwrap();
         let recorded = read(state, &next.job).unwrap().unwrap();
         assert_eq!(recorded.witness_path(state).unwrap(), path);
@@ -720,7 +746,7 @@ mod tests {
         let third = first.clone();
         assert!(
             third
-                .publish_with_witness(state, empty_inventory())
+                .publish_with_witness(state, empty_inventory(), None)
                 .is_err()
         );
         assert_eq!(
@@ -731,6 +757,77 @@ mod tests {
                 .unwrap(),
             path
         );
+    }
+
+    #[test]
+    fn only_the_exact_pending_predecessor_can_be_replaced_by_the_authorized_retry() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let mut first = intent();
+        first.witness = WitnessLocation::Attempt;
+        first
+            .clone()
+            .publish_with_witness(state, empty_inventory(), None)
+            .unwrap();
+        let first_witness = first.witness_path(state).unwrap();
+        let first_bytes = fs::read(&first_witness).unwrap();
+
+        let mut retry = first.clone();
+        retry.successor.host_incarnation = crate::model::HostIncarnation::new("retry");
+        retry.process.start += 1;
+        let wrong = Some((&first.successor, &retry.process));
+        let exact = Some((&first.successor, &first.process));
+        assert!(
+            retry
+                .clone()
+                .publish_with_witness(state, empty_inventory(), wrong)
+                .is_err()
+        );
+
+        let mut different_scope = retry.clone();
+        different_scope.windows.push("other".into());
+        assert!(
+            different_scope
+                .publish_with_witness(state, empty_inventory(), exact)
+                .is_err()
+        );
+
+        let mut deferred = first.clone();
+        deferred.stage = Stage::Deferred;
+        deferred.persist(state).unwrap();
+        assert!(
+            retry
+                .clone()
+                .publish_with_witness(state, empty_inventory(), exact)
+                .is_err()
+        );
+        first.persist(state).unwrap();
+
+        fs::write(&first_witness, b"damaged witness").unwrap();
+        assert!(
+            retry
+                .clone()
+                .publish_with_witness(state, empty_inventory(), exact)
+                .is_err()
+        );
+        fs::write(&first_witness, &first_bytes).unwrap();
+        assert_eq!(
+            read(state, &first.job).unwrap().unwrap().process,
+            first.process
+        );
+        assert!(!retry.witness_present(state).unwrap());
+
+        retry
+            .clone()
+            .publish_with_witness(state, empty_inventory(), exact)
+            .unwrap();
+        let selected = read(state, &retry.job).unwrap().unwrap();
+        assert_eq!(selected.process, retry.process);
+        selected.read_witness(state).unwrap();
+        assert_eq!(fs::read(first_witness).unwrap(), first_bytes);
+        retry
+            .publish_with_witness(state, empty_inventory(), exact)
+            .unwrap();
     }
 
     #[test]
@@ -773,7 +870,7 @@ mod tests {
         repeated.stage = Stage::Pending;
         repeated.witness = WitnessLocation::Attempt;
         repeated
-            .publish_with_witness(state, empty_inventory())
+            .publish_with_witness(state, empty_inventory(), None)
             .unwrap();
         let latest = read(state, &legacy.job).unwrap().unwrap();
         assert!(latest.stage == Stage::Deferred);
@@ -817,6 +914,24 @@ mod tests {
             crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
         intent.successor.boot_id = crate::daemon::read_boot_id().unwrap();
         intent.source.boot_id = intent.successor.boot_id.clone();
+        #[cfg(feature = "host")]
+        {
+            let error = record(
+                &intent.job,
+                &intent.request_digest,
+                &intent.checkpoint_digest,
+                &intent.target,
+                Original {
+                    source: &intent.source,
+                    inventory: &crate::upgrade::recovery::Census::default(),
+                    retry_of: Some((&intent.successor, &intent.process)),
+                },
+                &intent.successor,
+                &intent.windows,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("already selected"));
+        }
         let job = UpdateJob {
             id: intent.job.clone(),
             version: version.into(),
