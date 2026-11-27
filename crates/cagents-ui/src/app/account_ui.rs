@@ -999,6 +999,15 @@ pub struct ProbeTicket {
     limit_identity: Option<Option<Identity>>,
     plan_invalidated: Option<u64>,
     usage_generation: u64,
+    codex_plan_update: Option<CodexPlanUpdate>,
+}
+
+/// A plan notification that a running inventory read may still verify.
+#[derive(Debug, Clone)]
+struct CodexPlanUpdate {
+    generation: u64,
+    previous_plan: Option<String>,
+    plan: String,
 }
 
 impl ProbeTicket {
@@ -1009,6 +1018,7 @@ impl ProbeTicket {
             limit_identity: None,
             plan_invalidated: None,
             usage_generation: 0,
+            codex_plan_update: None,
         }
     }
 
@@ -1090,6 +1100,28 @@ impl AccountState {
         self.schedule.invalidate();
     }
 
+    fn invalidate_usage_for_codex_plan(&mut self, plan: String, previous_plan: Option<String>) {
+        let prior = self.usage_generation;
+        self.invalidate_usage();
+        // The notification names a plan, so a forced read already in flight
+        // can still supply inventory if it verifies the plan and login.
+        // An intervening login or presence invalidation breaks that chain.
+        if let Some(ticket) = &mut self.pending_probe
+            && ticket.force
+            && (ticket.usage_generation == prior
+                || ticket
+                    .codex_plan_update
+                    .as_ref()
+                    .is_some_and(|update| update.generation == prior))
+        {
+            ticket.codex_plan_update = Some(CodexPlanUpdate {
+                generation: self.usage_generation,
+                previous_plan,
+                plan,
+            });
+        }
+    }
+
     fn invalidate_plan_profile(&mut self) {
         if self.account.provider != Provider::Claude {
             return;
@@ -1154,7 +1186,7 @@ impl AccountState {
         ticket
     }
 
-    fn consume_probe(&mut self, owner: u64, ticket: &ProbeTicket) -> bool {
+    fn consume_probe(&mut self, owner: u64, ticket: &mut ProbeTicket) -> bool {
         if self.owner != owner
             || !self
                 .pending_probe
@@ -1163,7 +1195,10 @@ impl AccountState {
         {
             return false;
         }
-        self.pending_probe = None;
+        ticket.codex_plan_update = self
+            .pending_probe
+            .take()
+            .and_then(|pending| pending.codex_plan_update);
         if ticket.limit_identity.as_ref().is_some_and(|expected| {
             expected
                 .as_ref()
@@ -3752,12 +3787,42 @@ impl Cagents {
         };
         let mut observed = false;
         let mut login_changed = false;
+        let mut codex_plan_changed = None;
+        let mut previous_codex_plan = None;
         for (report, observed_at) in reports {
             if report.provider() != provider {
                 continue;
             }
-            if let LiveReport::CodexLogin(login) = &report {
-                login_changed |= !login.describes(state.snapshot.as_ref(), state.identity.as_ref());
+            if let LiveReport::CodexLogin(login) = report {
+                let mode = account::codex::LoginUpdate {
+                    chatgpt: login.chatgpt,
+                    plan: None,
+                };
+                if !mode.describes(state.snapshot.as_ref(), state.identity.as_ref()) {
+                    login_changed = true;
+                    continue;
+                }
+                let notified_plan = codex_plan_changed.as_deref().or_else(|| {
+                    state
+                        .pending_probe
+                        .as_ref()?
+                        .codex_plan_update
+                        .as_ref()
+                        .filter(|update| update.generation == state.usage_generation)
+                        .map(|update| update.plan.as_str())
+                });
+                let plan_changed = notified_plan.map_or_else(
+                    || !login.describes(state.snapshot.as_ref(), state.identity.as_ref()),
+                    |previous| login.plan.as_deref().is_some_and(|plan| plan != previous),
+                );
+                if plan_changed && let Some(plan) = login.plan {
+                    previous_codex_plan = state
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.plan.clone())
+                        .or_else(|| state.identity.as_ref()?.plan.clone());
+                    codex_plan_changed = Some(plan);
+                }
             } else if let Some(snapshot) = state.snapshot.as_mut()
                 && report.apply(snapshot, observed_at, now)
             {
@@ -3786,15 +3851,18 @@ impl Cagents {
                 state.schedule.login_settled();
             }
         }
+        let refresh = login_changed || codex_plan_changed.is_some();
         if login_changed {
             state.invalidate_usage();
+        } else if let Some(plan) = codex_plan_changed {
+            state.invalidate_usage_for_codex_plan(plan, previous_codex_plan);
         }
         let save = if observed {
             self.save_live(id.clone())
         } else {
             Task::none()
         };
-        let probe = if login_changed && self.accounts_surface_visible() {
+        let probe = if refresh && self.accounts_surface_visible() {
             self.probe_account(&id, Trigger::Focus, now)
                 .unwrap_or_else(Task::none)
         } else {
@@ -4820,13 +4888,13 @@ impl Cagents {
         &mut self,
         id: AccountId,
         owner: u64,
-        ticket: ProbeTicket,
+        mut ticket: ProbeTicket,
         mut outcome: Outcome,
     ) -> Task<Message> {
         if !self
             .account_ui
             .account_mut(&id)
-            .is_some_and(|state| state.consume_probe(owner, &ticket))
+            .is_some_and(|state| state.consume_probe(owner, &mut ticket))
         {
             return Task::none();
         }
@@ -4886,6 +4954,40 @@ impl Cagents {
         let started = state.schedule.started();
         let mut learned = None;
         let mut merged_inventory = false;
+        let verified_codex_plan = ticket.codex_plan_update.as_ref().filter(|update| {
+            let Outcome::Answered {
+                identity: Some(identity),
+                snapshot,
+                ..
+            } = &outcome
+            else {
+                return false;
+            };
+            let account_plan = identity.plan.as_deref();
+            let usage_plan = snapshot.plan.as_deref();
+            let newer_plan = state
+                .snapshot
+                .as_ref()
+                .filter(|current| {
+                    current.observed_at > snapshot.observed_at
+                        && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+                })
+                .and_then(|current| current.plan.as_deref());
+            update.generation == state.usage_generation
+                && matches!(
+                    snapshot.status,
+                    UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+                )
+                && account::resets::may_act_for(Some(identity), Some(identity))
+                && same_usage_login(Some(identity), state.identity.as_ref())
+                && account_plan.or(usage_plan) == Some(update.plan.as_str())
+                && usage_plan.is_none_or(|reported| reported == update.plan)
+                && newer_plan.is_none_or(|plan| {
+                    plan == update.plan || Some(plan) == update.previous_plan.as_deref()
+                })
+        });
+        let inventory_current =
+            ticket.usage_generation == state.usage_generation || verified_codex_plan.is_some();
         match outcome {
             // A delayed probe or cached answer can predate live figures.
             // Keep the newer reading unless its future stamp indicates that
@@ -4898,7 +5000,7 @@ impl Cagents {
             }) =>
             {
                 if ticket.force
-                    && ticket.usage_generation == state.usage_generation
+                    && inventory_current
                     && matches!(provider, Provider::Claude | Provider::Codex)
                     && same_usage_login(identity.as_ref(), state.identity.as_ref())
                     && state.inventory_observed_at.is_none_or(|observed| {
@@ -4910,6 +5012,9 @@ impl Cagents {
                     // A later partial usage frame cannot erase fresh inventory
                     // returned by this owner/login's forced complete reading.
                     merge_complete_inventory(current, &snapshot, now, |_| true);
+                    if let Some(update) = verified_codex_plan {
+                        current.plan = Some(update.plan.clone());
+                    }
                     state.inventory_observed_at = Some(snapshot.observed_at);
                     state.usage_invalidated = false;
                     merged_inventory = true;
@@ -4951,7 +5056,7 @@ impl Cagents {
                 let unchanged_by_login =
                     state.schedule.awaiting_login(now) && !signed_in_here && !was_signed_out;
                 state.schedule.succeed(snapshot.observed_at);
-                if ticket.usage_generation == state.usage_generation {
+                if inventory_current {
                     state.inventory_observed_at = Some(snapshot.observed_at);
                     state.usage_invalidated = false;
                 }
@@ -15995,6 +16100,108 @@ mod app_tests {
             Some("forced limit probe")
         );
         assert!(state.pending_probe.is_none() && state.queued.is_none());
+    }
+    #[test]
+    fn live_codex_plan_changes_can_keep_verified_in_flight_inventory() {
+        let email = "fixture@example.test";
+        for (reply_email, reply_plan, status, live_plan, signed_out, merged) in [
+            (email, "pro", UsageStatus::Ok, None, false, true),
+            (
+                "other@example.test",
+                "pro",
+                UsageStatus::Ok,
+                None,
+                false,
+                false,
+            ),
+            (email, "plus", UsageStatus::Ok, None, false, false),
+            (email, "pro", UsageStatus::NeedsLogin, None, false, false),
+            (email, "pro", UsageStatus::Ok, Some("team"), false, false),
+            (email, "pro", UsageStatus::Ok, None, true, false),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = Account::system(Provider::Codex).id();
+            let recipe = recipe_on(&app, &id);
+            let now = now_ms();
+            app.refresh_ui.focused = true;
+            app.account_ui.registry_ready = true;
+            let state = app.account_ui.account_mut(&id).unwrap();
+            let identity = Identity {
+                email: Some(email.into()),
+                plan: Some("plus".into()),
+                ..Identity::default()
+            };
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "previous", now);
+            snapshot.plan = identity.plan.clone();
+            state.identity = Some(identity.clone());
+            state.snapshot = Some(snapshot);
+            state.inventory_observed_at = Some(now);
+            let (owner, ticket) = app
+                .account_ui
+                .begin_probe_for_test(&id, Trigger::Limit, now);
+            let login = |chatgpt, plan: Option<&str>| {
+                LiveReport::CodexLogin(account::codex::LoginUpdate {
+                    chatgpt,
+                    plan: plan.map(str::to_owned),
+                })
+            };
+            drop(app.account_reported(
+                Provider::Codex,
+                &recipe,
+                vec![(login(true, Some("pro")), now + 1)],
+            ));
+            let limits = account::codex::parse_update(&serde_json::json!({"rateLimits": {
+                "primary": {"usedPercent": 100, "windowDurationMins": 300},
+                "planType": live_plan,
+                "rateLimitReachedType": "primary"
+            }}))
+            .unwrap();
+            drop(app.account_reported(
+                Provider::Codex,
+                &recipe,
+                vec![(LiveReport::CodexLimits(limits), now + 3)],
+            ));
+            if signed_out {
+                drop(app.account_reported(
+                    Provider::Codex,
+                    &recipe,
+                    vec![(login(false, None), now + 4)],
+                ));
+            }
+            let state = app.account_ui.account(&id).unwrap();
+            assert!(state.usage_invalidated);
+            let mut full = UsageSnapshot::state(status, "forced", now + 2);
+            if status == UsageStatus::Ok {
+                full.plan = Some("pro".into());
+            }
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                ticket,
+                Outcome::Answered {
+                    identity: Some(Identity {
+                        email: Some(reply_email.into()),
+                        plan: Some(reply_plan.into()),
+                        ..identity
+                    }),
+                    catalog: None,
+                    snapshot: Box::new(full),
+                },
+            ));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.inventory_observed_at, merged.then_some(now + 2));
+            assert_eq!(state.usage_invalidated, !merged);
+            let snapshot = state.snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.windows[0].used, 1.0);
+            assert_eq!(
+                snapshot.plan.as_deref(),
+                Some(if merged {
+                    "pro"
+                } else {
+                    live_plan.unwrap_or("plus")
+                })
+            );
+        }
     }
     #[test]
     fn a_limit_intent_survives_unknown_policy_and_deadline_wakes_are_owned_and_coalesced() {

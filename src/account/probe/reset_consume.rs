@@ -51,6 +51,16 @@ pub async fn consume(
             return unsent(prior, "Another reset attempt is still being checked", None);
         }
     };
+    // Another request using this key may have recorded it while we looked
+    // up the executable. Check again under the lock before requiring credit.
+    let prior = if prior {
+        prior
+    } else {
+        match read_attempt(&binding) {
+            Ok(prior) => prior,
+            Err(message) => return ConsumeOutcome::unavailable(message),
+        }
+    };
     let before = match run(account.clone(), cache.clone(), true).await {
         Outcome::Answered {
             identity: Some(identity),

@@ -9,6 +9,7 @@ pub(super) struct State {
     /// Keyed by request, since different logins can receive the same reset ID.
     uncertain: BTreeMap<String, Attempt>,
     feedback: Option<Feedback>,
+    /// The latest proof for each login and reset, keyed by the request it settles.
     confirmed: BTreeMap<String, ConfirmedReset>,
 }
 
@@ -277,6 +278,20 @@ fn requested_as(attempt: &Attempt) -> Option<&str> {
         .and_then(|identity| identity.email.as_deref())
         .map(str::trim)
         .filter(|email| !email.is_empty())
+}
+
+fn requester_label(attempt: &Attempt, current: Option<&Identity>) -> Option<String> {
+    let email = requested_as(attempt)?;
+    // A person's address can belong to more than one organization's allowance.
+    if current
+        .and_then(|identity| identity.email.as_deref())
+        .is_some_and(|current| current.trim().eq_ignore_ascii_case(email))
+        && let Some(organization) = attempt.identity.as_ref()?.organization.as_deref()
+        && !organization.trim().is_empty()
+    {
+        return Some(format!("{email} ({})", organization.trim()));
+    }
+    Some(email.into())
 }
 
 /// Why an uncertain reset can't be retried by the `current` login, and the
@@ -558,14 +573,10 @@ impl Controls {
             .confirmed
             .retain(|_, proof| proof.incidents.contains(incident));
         if controls.state.feedback.as_ref().is_some_and(|feedback| {
-            feedback
-                .request
-                .as_ref()
-                .is_some_and(|request| request.status == ConsumeStatus::Reset)
-                && !feedback
-                    .reset
-                    .as_ref()
-                    .is_some_and(|reset| controls.state.confirmed.contains_key(&reset.id))
+            feedback.request.as_ref().is_some_and(|request| {
+                request.status == ConsumeStatus::Reset
+                    && !controls.state.confirmed.contains_key(&request.key)
+            })
         }) {
             controls.state.feedback = None;
         }
@@ -780,13 +791,12 @@ impl Controls {
                 // The account's name follows its current login, so name the
                 // login the request was made as once that has changed.
                 let requester = if login_changed {
-                    requested_as(attempt)
+                    requester_label(attempt, identity)
+                        .map(|requester| format!(" for {requester}"))
+                        .unwrap_or_default()
                 } else {
-                    Some(self.name.as_str())
+                    format!(" for {}", self.name)
                 };
-                let requester = requester
-                    .map(|requester| format!(" for {requester}"))
-                    .unwrap_or_default();
                 rows.push(
                     design::caption(format!(
                         "Requested {}{requester} · {} available when confirmed.",
@@ -796,12 +806,15 @@ impl Controls {
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
                 );
-                if !recurring {
-                    let guidance = if login_changed {
-                        retry_blocked_by_login(attempt, identity)
-                    } else {
-                        "Retries reuse the original request.".into()
-                    };
+                let guidance = match (recurring, login_changed) {
+                    (true, true) => {
+                        Some("Sign in to the original account to check its usage.".into())
+                    }
+                    (true, false) => None,
+                    (false, true) => Some(retry_blocked_by_login(attempt, identity)),
+                    (false, false) => Some("Retries reuse the original request.".into()),
+                };
+                if let Some(guidance) = guidance {
                     rows.push(
                         design::caption(guidance)
                             .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
@@ -1172,8 +1185,12 @@ impl Cagents {
             if status == ConsumeStatus::Reset
                 && let Some(attempt) = &submitted
             {
+                state.reset.confirmed.retain(|_, proof| {
+                    proof.reset.id != attempt.reset.id
+                        || !same_usage_login(proof.identity.as_ref(), attempt.identity.as_ref())
+                });
                 state.reset.confirmed.insert(
-                    attempt.reset.id.clone(),
+                    attempt.key.clone(),
                     ConfirmedReset {
                         reset: attempt.reset.clone(),
                         identity: attempt.identity.clone(),
@@ -2620,7 +2637,12 @@ pub(in crate::app) mod tests {
             captions
                 .iter()
                 .any(|caption| caption.starts_with("Requested")
-                    && caption.contains(identity.email.as_deref().unwrap()))
+                    && caption.contains("reset@example.com (fixture-organization)"))
+        );
+        assert!(
+            captions.iter().any(|caption| {
+                caption == "Sign in to the original account to check its usage."
+            })
         );
         state.reconcile(&snapshot, Some(&identity), now);
         assert!(state.uncertain.is_empty());
@@ -3607,7 +3629,7 @@ pub(in crate::app) mod tests {
             ..State::default()
         };
         state.confirmed.insert(
-            grant.id.clone(),
+            "old-request".into(),
             ConfirmedReset {
                 reset: grant,
                 identity: Some(reset_identity()),
@@ -3631,6 +3653,23 @@ pub(in crate::app) mod tests {
         let previous = controls.for_incident(&old);
         assert!(previous.limit_cleared("Claude Fable limit reached"));
         assert!(previous.state.feedback.is_some());
+        let mut unverified_replay = controls.clone();
+        unverified_replay
+            .state
+            .feedback
+            .as_mut()
+            .unwrap()
+            .request
+            .as_mut()
+            .unwrap()
+            .key = "new-request".into();
+        assert!(
+            unverified_replay
+                .for_incident(&old)
+                .state
+                .feedback
+                .is_none()
+        );
         let remaining_old_source =
             LimitIncidents(BTreeMap::from([("card/1/old".into(), BTreeSet::from([1]))]));
         assert!(
