@@ -14,7 +14,7 @@ const REPLACED: &str =
 /// Private evidence in the automation revision and agent policy records.
 /// Legacy records have just device and inode and still require an exact match.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::host) struct Identity {
+pub(crate) struct Identity {
     #[serde(flatten)]
     raw: DirectoryIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
