@@ -10,18 +10,21 @@ publish = false
 workspace = true
 
 [features]
-desktop-keyring = ["dep:secret-service"]
+desktop-keyring = ["dep:secret-service", "dep:zbus"]
 
 [dependencies]
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 pbkdf2 = "0.12"
-rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup", "serialize"] }
 secret-service = { version = "4", features = ["rt-tokio-crypto-rust"], optional = true }
+serde_json = "1.0"
 sha1 = "0.10"
 sha2 = "0.10"
 url = "2.5"
 zeroize = "1.8"
+# The same zbus the Secret Service client uses, for KWallet.
+zbus = { version = "4.4", default-features = false, features = ["tokio"], optional = true }
 
 [dev-dependencies]
 rusqlite = { version = "0.37", features = ["hooks"] }

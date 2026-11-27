@@ -1,163 +1,225 @@
-use crate::{Browser, Error, Keys};
+use crate::{Error, Keyring, Keys};
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-pub(super) fn decrypt(
-    bytes: &[u8],
-    host: &str,
-    version: i64,
-    browser: Browser,
-    keys: &mut impl Keys,
-    cached: &mut Option<Zeroizing<[u8; 16]>>,
-) -> Result<Zeroizing<String>, Error> {
-    let prefix = bytes.get(..3).ok_or(Error::Decryption)?;
-    let key = if prefix == b"v10" {
-        derive(b"peanuts")
-    } else if prefix == b"v11" {
-        if cached.is_none() {
-            *cached = Some(derive(&keys.password(browser)?));
+type Key = Zeroizing<[u8; 16]>;
+
+/// Decrypts one profile's Linux `v10`/`v11` cookie values (AES-128-CBC with
+/// a PBKDF2-SHA1 key). The keyring is asked at most once per profile, and only
+/// when a selected cookie needs it.
+pub(super) struct Decryptor {
+    keyring: Keyring,
+    /// `None` until the first `v11` value; then the keyring's candidates,
+    /// with the one that last verified first.
+    stored: Option<Result<Vec<Key>, Error>>,
+}
+
+impl Decryptor {
+    pub(super) fn new(keyring: Keyring) -> Self {
+        Self {
+            keyring,
+            stored: None,
         }
-        Zeroizing::new(**cached.as_ref().unwrap())
-    } else {
-        return Err(Error::Unsupported);
-    };
-    let cipher = cbc::Decryptor::<aes::Aes128>::new_from_slices(&key[..], &[b' '; 16])
-        .map_err(|_| Error::Decryption)?;
-    let mut plain = Zeroizing::new(bytes[3..].to_vec());
-    let decrypted = cipher
-        .decrypt_padded_mut::<Pkcs7>(&mut plain)
-        .map_err(|_| Error::Decryption)?;
+    }
+
+    /// `version` is the cookie database's `meta` version: from 24 on, each
+    /// plaintext begins with the SHA-256 of its host, which verifies the key.
+    pub(super) fn decrypt(
+        &mut self,
+        bytes: &[u8],
+        host: &str,
+        version: i64,
+        keys: &mut impl Keys,
+    ) -> Result<Zeroizing<String>, Error> {
+        let (prefix, ciphertext) = bytes.split_at_checked(3).ok_or(Error::Decryption)?;
+        let attempt = |key: &Key| open(key, ciphertext, host, version);
+        match prefix {
+            // `v10` uses a fixed password when no keyring was available.
+            // Chromium also falls back to an empty password for either
+            // prefix after a keyring failure, so try that last.
+            b"v10" => [derive(b"peanuts"), derive(b"")]
+                .iter()
+                .find_map(attempt)
+                .ok_or(Error::Decryption),
+            b"v11" => {
+                let stored = self.stored.get_or_insert_with(|| {
+                    keys.passwords(self.keyring)
+                        .map(|passwords| passwords.iter().map(|p| derive(p)).collect())
+                });
+                if let Ok(stored) = stored {
+                    for index in 0..stored.len() {
+                        if let Some(value) = attempt(&stored[index]) {
+                            // Keep the verified key first for the next value.
+                            stored[..=index].rotate_right(1);
+                            return Ok(value);
+                        }
+                    }
+                }
+                if let Some(value) = attempt(&derive(b"")) {
+                    return Ok(value);
+                }
+                match stored {
+                    Ok(stored) if !stored.is_empty() => Err(Error::Decryption),
+                    // Nothing to try: the keyring holds no key for this browser.
+                    Ok(_) => Err(Error::KeyringDenied),
+                    Err(error) => Err(*error),
+                }
+            }
+            _ => Err(Error::UnsupportedEncryption),
+        }
+    }
+}
+
+fn open(key: &Key, ciphertext: &[u8], host: &str, version: i64) -> Option<Zeroizing<String>> {
+    let cipher = cbc::Decryptor::<aes::Aes128>::new_from_slices(&key[..], &[b' '; 16]).ok()?;
+    let mut plain = Zeroizing::new(ciphertext.to_vec());
+    let decrypted = cipher.decrypt_padded_mut::<Pkcs7>(&mut plain).ok()?;
     let payload = if version >= 24 {
-        let hash = Sha256::digest(host.as_bytes());
-        if decrypted.get(..32) != Some(hash.as_slice()) {
-            return Err(Error::Decryption);
+        let (hash, payload) = decrypted.split_at_checked(32)?;
+        if hash != Sha256::digest(host.as_bytes()).as_slice() {
+            return None;
         }
-        &decrypted[32..]
+        payload
     } else {
         decrypted
     };
-    let value = std::str::from_utf8(payload).map_err(|_| Error::Decryption)?;
-    Ok(Zeroizing::new(value.to_owned()))
+    let value = std::str::from_utf8(payload).ok()?;
+    Some(Zeroizing::new(value.to_owned()))
 }
 
-fn derive(password: &[u8]) -> Zeroizing<[u8; 16]> {
+fn derive(password: &[u8]) -> Key {
     let mut key = Zeroizing::new([0; 16]);
     pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password, b"saltysalt", 1, &mut key[..]);
     key
 }
 
-#[cfg(feature = "desktop-keyring")]
-#[derive(Default)]
-pub struct DesktopKeys {
-    passwords: std::collections::HashMap<Browser, Zeroizing<Vec<u8>>>,
-    denied: std::collections::HashSet<Browser>,
-}
-
-#[cfg(feature = "desktop-keyring")]
-impl Keys for DesktopKeys {
-    fn password(&mut self, browser: Browser) -> Result<Zeroizing<Vec<u8>>, Error> {
-        if let Some(password) = self.passwords.get(&browser) {
-            return Ok(password.clone());
-        }
-        if !self.denied.insert(browser) {
-            return Err(Error::KeyringDenied);
-        }
-        use secret_service::{EncryptionType, blocking::SecretService};
-        let service =
-            SecretService::connect(EncryptionType::Dh).map_err(|_| Error::KeyringDenied)?;
-        let items = service
-            .search_items(std::collections::HashMap::from([(
-                "application",
-                browser.application(),
-            )]))
-            .map_err(|_| Error::KeyringDenied)?;
-        // Only unlock this browser's matching key. Never enumerate or log
-        // unrelated items, labels, or secret values from the desktop vault.
-        for item in items.unlocked.into_iter().chain(items.locked) {
-            item.unlock().map_err(|_| Error::KeyringDenied)?;
-            let value = item.get_secret().map_err(|_| Error::KeyringDenied)?;
-            if !value.is_empty() {
-                let value = Zeroizing::new(value);
-                self.passwords.insert(browser, value.clone());
-                return Ok(value);
-            }
-        }
-        Err(Error::KeyringDenied)
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aes::cipher::BlockEncryptMut;
-    struct Key(usize);
-    impl Keys for Key {
-        fn password(&mut self, _: Browser) -> Result<Zeroizing<Vec<u8>>, Error> {
-            self.0 += 1;
-            Ok(Zeroizing::new(b"fixture-keyring-password".to_vec()))
+
+    /// Answers with fixed passwords and counts how often it was asked.
+    struct Fixture(Vec<&'static [u8]>, usize);
+    impl Keys for Fixture {
+        fn passwords(&mut self, _: Keyring) -> Result<Vec<Zeroizing<Vec<u8>>>, Error> {
+            self.1 += 1;
+            Ok(self.0.iter().map(|p| Zeroizing::new(p.to_vec())).collect())
         }
     }
-    fn encrypted(prefix: &[u8], host: &str, version: i64) -> Vec<u8> {
+
+    pub(crate) fn encrypt(prefix: &[u8], password: &[u8], host: &str, version: i64) -> Vec<u8> {
         let mut payload = Vec::new();
         if version >= 24 {
             payload.extend_from_slice(&Sha256::digest(host.as_bytes()));
         }
         payload.extend_from_slice(b"fixture-cookie-value");
-        let key = derive(if prefix == b"v10" {
-            b"peanuts"
-        } else {
-            b"fixture-keyring-password"
-        });
         let mut result = prefix.to_vec();
         result.extend(
-            cbc::Encryptor::<aes::Aes128>::new_from_slices(&key[..], &[b' '; 16])
+            cbc::Encryptor::<aes::Aes128>::new_from_slices(&derive(password)[..], &[b' '; 16])
                 .unwrap()
                 .encrypt_padded_vec_mut::<Pkcs7>(&payload),
         );
         result
     }
+
     #[test]
-    fn verifies_chromium_domain_binding_and_caches_keyring_key() {
-        let mut key = Key(0);
-        let mut cached = None;
-        for prefix in [b"v10", b"v11", b"v11"] {
-            let bytes = encrypted(prefix, ".example.test", 24);
-            let value = decrypt(
-                &bytes,
-                ".example.test",
-                24,
-                Browser::Chrome,
-                &mut key,
-                &mut cached,
-            )
-            .unwrap();
+    fn verifies_domain_binding_and_asks_the_keyring_once() {
+        let mut keys = Fixture(vec![b"fixture-keyring-password"], 0);
+        let mut decryptor = Decryptor::new(Keyring::Chromium);
+        for (prefix, password) in [
+            (b"v10", &b"peanuts"[..]),
+            (b"v11", b"fixture-keyring-password"),
+            (b"v11", b"fixture-keyring-password"),
+        ] {
+            let bytes = encrypt(prefix, password, ".example.test", 24);
+            let value = decryptor
+                .decrypt(&bytes, ".example.test", 24, &mut keys)
+                .unwrap();
             assert_eq!(value.as_str(), "fixture-cookie-value");
             assert_eq!(
-                decrypt(
-                    &bytes,
-                    ".other.test",
-                    24,
-                    Browser::Chrome,
-                    &mut key,
-                    &mut cached
-                )
-                .err(),
+                decryptor
+                    .decrypt(&bytes, ".other.test", 24, &mut keys)
+                    .err(),
                 Some(Error::Decryption)
             );
         }
-        assert_eq!(key.0, 1);
+        assert_eq!(keys.1, 1);
+        for unsupported in [&b"v12nonce-and-ciphertext"[..], b"v20x", b"v1"] {
+            assert_eq!(
+                decryptor
+                    .decrypt(unsupported, "example.test", 24, &mut keys)
+                    .err(),
+                Some(if unsupported.len() < 3 {
+                    Error::Decryption
+                } else {
+                    Error::UnsupportedEncryption
+                })
+            );
+        }
+    }
+
+    /// Several keyring items can answer one name, such as a stale copy left
+    /// by an earlier install. The one that verifies wins, wherever it is.
+    #[test]
+    fn tries_each_stored_key_and_the_empty_password() {
+        let mut keys = Fixture(vec![b"stale", b"current"], 0);
+        let mut decryptor = Decryptor::new(Keyring::Chrome);
+        for password in [&b"current"[..], b"current", b"", b"stale"] {
+            let bytes = encrypt(b"v11", password, "example.test", 24);
+            assert_eq!(
+                decryptor
+                    .decrypt(&bytes, "example.test", 24, &mut keys)
+                    .unwrap()
+                    .as_str(),
+                "fixture-cookie-value"
+            );
+        }
+        let empty_v10 = encrypt(b"v10", b"", "example.test", 24);
+        assert!(
+            decryptor
+                .decrypt(&empty_v10, "example.test", 24, &mut keys)
+                .is_ok()
+        );
+        let unknown = encrypt(b"v11", b"another", "example.test", 24);
         assert_eq!(
-            decrypt(
-                b"v20unsupported",
-                "example.test",
-                24,
-                Browser::Chrome,
-                &mut key,
-                &mut cached
-            )
-            .err(),
-            Some(Error::Unsupported)
+            decryptor
+                .decrypt(&unknown, "example.test", 24, &mut keys)
+                .err(),
+            Some(Error::Decryption)
+        );
+        // A database from before version 24 has no host hash to check.
+        let legacy = encrypt(b"v11", b"current", "example.test", 23);
+        assert_eq!(
+            decryptor
+                .decrypt(&legacy, "anything", 23, &mut keys)
+                .unwrap()
+                .as_str(),
+            "fixture-cookie-value"
+        );
+        assert_eq!(keys.1, 1);
+    }
+
+    #[test]
+    fn a_missing_or_denied_key_is_a_keyring_error() {
+        struct Denied;
+        impl Keys for Denied {
+            fn passwords(&mut self, _: Keyring) -> Result<Vec<Zeroizing<Vec<u8>>>, Error> {
+                Err(Error::KeyringDenied)
+            }
+        }
+        let bytes = encrypt(b"v11", b"secret", "example.test", 24);
+        assert_eq!(
+            Decryptor::new(Keyring::Brave)
+                .decrypt(&bytes, "example.test", 24, &mut Denied)
+                .err(),
+            Some(Error::KeyringDenied)
+        );
+        assert_eq!(
+            Decryptor::new(Keyring::Brave)
+                .decrypt(&bytes, "example.test", 24, &mut Fixture(Vec::new(), 0))
+                .err(),
+            Some(Error::KeyringDenied)
         );
     }
 }

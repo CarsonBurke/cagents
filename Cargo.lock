@@ -1318,10 +1318,12 @@ dependencies = [
  "pbkdf2 0.12.2",
  "rusqlite",
  "secret-service",
+ "serde_json",
  "sha1 0.10.7",
  "sha2 0.10.9",
  "tempfile",
  "url",
+ "zbus 4.4.0",
  "zeroize",
 ]
 
