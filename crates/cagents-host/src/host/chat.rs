@@ -2668,6 +2668,29 @@ fn start_publishing(
             source_execution.as_ref()
         },
     )?;
+    #[cfg(target_os = "linux")]
+    let ambient_path = if source.is_none()
+        && session.terminal.is_none()
+        && reconnect.is_none()
+        && execution.is_none()
+        && !saved_history_only
+        && !process_launch.recipe.unset_environment.contains("PATH")
+    {
+        // The same refresh Accounts uses, on the connection's worker and
+        // before constructors or preflight inspect the provider executable.
+        // A checkpoint batch can share its successor's first shell read.
+        let caller = execution_environment.0.get("PATH").map(String::as_str);
+        daemon_shell_search_path(caller, restart_launch.is_none()).and_then(|shell_path| {
+            let selected = recorded_process_launch
+                .recipe
+                .environment
+                .get("PATH")
+                .map(String::as_str);
+            resolve_provider_path(&mut process_launch.recipe, selected, caller, &shell_path)
+        })
+    } else {
+        None
+    };
     #[cfg(target_os = "macos")]
     if source.is_none()
         && restart_launch.is_none()
@@ -3075,6 +3098,23 @@ fn start_publishing(
         }
         spec.withhold_environment();
         let recovery_environment = spec.environment.clone();
+        #[cfg(target_os = "linux")]
+        let recovery_environment = {
+            let mut environment = recovery_environment;
+            // A successor resolves its own ambient shell PATH. Continue to
+            // compare exact recorded/client selections and account settings.
+            if let Some(before_resolution) = ambient_path {
+                match before_resolution {
+                    Some(path) => {
+                        environment.insert("PATH".into(), path);
+                    }
+                    None => {
+                        environment.remove("PATH");
+                    }
+                }
+            }
+            environment
+        };
         if let Some(reconnect) = reconnect {
             // The owned-listener admission above proved the old execution
             // ended while this start held its reservation. Never replay its work.
@@ -3146,9 +3186,11 @@ fn start_publishing(
                 &spec.environment,
                 &spec.working_directory,
             );
-            if let Some(path) = crate::agent_execution::bundled::matched_path(
-                spec.environment.get("PATH").map(String::as_str),
-            ) {
+            if !spec.unset_environment.contains("PATH")
+                && let Some(path) = crate::agent_execution::bundled::matched_path(
+                    spec.environment.get("PATH").map(String::as_str),
+                )
+            {
                 spec.environment.insert("PATH".into(), path);
             }
         }
@@ -5935,6 +5977,43 @@ fn prepare_native_process_launch(
     Ok(process_launch)
 }
 
+#[cfg(target_os = "linux")]
+fn daemon_shell_search_path(caller: Option<&str>, refresh: bool) -> Option<std::ffi::OsString> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(crate::account::probe::launch_shell_search_path(
+        caller, refresh,
+    ))
+}
+
+/// Supply the shell's current order for shared directories and keep
+/// launcher-only directories first. Return the baseline for upgrade checks.
+#[cfg(target_os = "linux")]
+fn resolve_provider_path(
+    recipe: &mut crate::model::LaunchRecipe,
+    recorded: Option<&str>,
+    launcher: Option<&str>,
+    shell: &std::ffi::OsStr,
+) -> Option<Option<String>> {
+    if recipe.unset_environment.contains("PATH") {
+        return None;
+    }
+    // The client's launcher PATH was already used for shell discovery.
+    // Keep project-relative entries and distinct recorded selections too.
+    let selected = recorded.or(launcher);
+    let caller_directories = selected
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|directory| selected != launcher || !directory.is_absolute());
+    let path = crate::account::probe::login_path::merge_provider_path(caller_directories, shell)?;
+    if recipe.environment.get("PATH") == Some(&path) {
+        return None;
+    }
+    Some(recipe.environment.insert("PATH".into(), path))
+}
+
 /// A fresh provider keeps its caller's tool order. Supply directories absent
 /// from its PATH so a launcher can find dependencies installed for the user.
 #[cfg(any(target_os = "macos", test))]
@@ -5954,6 +6033,23 @@ fn combined_login_search_path(
         .chain(std::env::split_paths(login_path).filter(|directory| directory.is_absolute()))
         .filter(|directory| seen.insert(directory.clone()));
     std::env::join_paths(directories).ok()?.into_string().ok()
+}
+
+/// Keep the headless agent's resolved search path before its exact launch
+/// intent is persisted.
+#[cfg(target_os = "linux")]
+pub(super) fn record_agent_search_path(launch: &mut chat::Launch) {
+    if launch.recipe.unset_environment.contains("PATH") {
+        return;
+    }
+    let path = daemon_shell_search_path(None, true).and_then(|shell| {
+        crate::account::probe::login_path::merge_provider_path(std::iter::empty(), &shell)
+    });
+    if let Some(path) = path
+        && crate::model::agent_recovery::fresh_environment_key(launch.provider, "PATH", &path, true)
+    {
+        launch.recipe.environment.insert("PATH".into(), path);
+    }
 }
 
 /// Keep the headless agent's resolved search path before its exact launch

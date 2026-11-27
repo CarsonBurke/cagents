@@ -1080,6 +1080,8 @@ fn dispatch(
             .recipe
             .arguments
             .extend(launch_options(&accepted.agent.spec));
+        #[cfg(target_os = "linux")]
+        super::chat::record_agent_search_path(&mut session.launch);
         #[cfg(target_os = "macos")]
         super::chat::record_agent_login_path(&mut session.launch).map_err(|e| before(e.message))?;
         let (proof, listeners) = {

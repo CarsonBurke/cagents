@@ -6,18 +6,17 @@
 //! interactive SSH session reads. A window started by a desktop launcher, or
 //! by a session whose login shell is not POSIX, such as fish, carries what the
 //! display manager set, which commonly lacks `~/.local/bin` and the other
-//! directories installers add in login files. The terminals, provider CLIs and
-//! conversations the daemon starts would all miss them, while Accounts, which
-//! reads the shell, reports the same CLIs installed. Like the server VS Code
-//! starts over SSH, the daemon reads its user's login shell once at startup
-//! instead.
+//! directories installers add in login files. The daemon reads the login
+//! shell once for its inherited environment, including for terminals. Native
+//! provider discovery also reads interactive startup and can be refreshed
+//! while the daemon is running.
 
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
     io::Read,
     os::{fd::AsRawFd, unix::process::CommandExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -46,8 +45,11 @@ const LOGIN_SESSION_ENVIRONMENT: &[&str] = &[
 /// Set once a daemon has read the login shell, so that what it starts, such as
 /// a daemon started in its terminals, does not read it again: the `PATH` they
 /// inherit already holds the answer. A launcher whose `PATH` is deliberately
-/// complete, such as a test's private daemon, sets it to keep the shell out.
+/// complete, such as a test's private daemon, sets it to skip startup adoption.
 pub const ADOPTED_ENV: &str = "CAGENTS_LOGIN_PATH_ADOPTED";
+
+#[cfg(target_os = "linux")]
+static DAEMON_LAUNCHER_PATH: std::sync::OnceLock<Option<OsString>> = std::sync::OnceLock::new();
 
 /// Gives this process the login shell's `PATH`, whichever launcher started
 /// it. Directories only the inherited `PATH` names, such as a script's or a
@@ -61,6 +63,9 @@ pub const ADOPTED_ENV: &str = "CAGENTS_LOGIN_PATH_ADOPTED";
 /// Must be called before the process starts a second thread: it changes the
 /// process environment, which another thread may be reading.
 pub unsafe fn adopt() {
+    let inherited = std::env::var_os("PATH");
+    #[cfg(target_os = "linux")]
+    DAEMON_LAUNCHER_PATH.get_or_init(|| inherited.clone());
     if !wanted(|name| std::env::var_os(name).is_some()) {
         return;
     }
@@ -74,7 +79,7 @@ pub unsafe fn adopt() {
     let Some(login) = read(Path::new(&shell), Path::new(&home), SHELL_TIMEOUT) else {
         return;
     };
-    if let Some(path) = merged(std::env::var_os("PATH").as_deref(), &login) {
+    if let Some(path) = merged(inherited.as_deref(), &login) {
         // SAFETY: the caller guarantees the process is still single-threaded.
         unsafe { std::env::set_var("PATH", path) };
     }
@@ -91,15 +96,41 @@ fn wanted(set: impl Fn(&str) -> bool) -> bool {
 /// once. Relative and empty entries, which name a different directory wherever
 /// a program runs, are dropped from both.
 fn merged(current: Option<&OsStr>, login: &OsStr) -> Option<OsString> {
-    let login: Vec<_> = std::env::split_paths(login).collect();
+    merge_paths(
+        current
+            .into_iter()
+            .flat_map(std::env::split_paths)
+            .filter(|directory| directory.is_absolute()),
+        std::env::split_paths(login).filter(|directory| directory.is_absolute()),
+    )
+}
+
+/// Use the shell order for shared directories while keeping the caller's
+/// extra directories first. Relative caller entries keep their meaning in
+/// the provider's working directory.
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub fn merge_provider_path(caller: impl Iterator<Item = PathBuf>, shell: &OsStr) -> Option<String> {
+    let path = merge_paths(
+        caller,
+        std::env::split_paths(shell)
+            .filter(|directory| directory.is_absolute() && directory.to_str().is_some()),
+    )?
+    .into_string()
+    .ok()?;
+    (!path.is_empty()).then_some(path)
+}
+
+fn merge_paths(
+    current: impl Iterator<Item = PathBuf>,
+    login: impl Iterator<Item = PathBuf>,
+) -> Option<OsString> {
+    let login: Vec<_> = login.collect();
     let in_login: HashSet<_> = login.iter().cloned().collect();
     let mut seen = HashSet::new();
     let directories = current
-        .into_iter()
-        .flat_map(std::env::split_paths)
         .filter(|directory| !in_login.contains(directory))
         .chain(login)
-        .filter(|directory| directory.is_absolute() && seen.insert(directory.clone()));
+        .filter(|directory| seen.insert(directory.clone()));
     std::env::join_paths(directories).ok()
 }
 
@@ -112,12 +143,63 @@ fn merged(current: Option<&OsStr>, login: &OsStr) -> Option<OsString> {
 /// directly rather than through a runtime or a reader thread.
 fn read(shell: &Path, home: &Path, timeout: Duration) -> Option<OsString> {
     let deadline = Instant::now() + timeout;
+    let inherited = std::env::var_os("PATH");
     ["-il", "-i"]
         .into_iter()
-        .find_map(|mode| read_in_mode(shell, mode, home, deadline))
+        .find_map(|mode| read_in_mode(shell, mode, home, inherited.as_deref(), deadline))
 }
 
-fn read_in_mode(shell: &Path, mode: &str, home: &Path, deadline: Instant) -> Option<OsString> {
+/// Accounts and native starts begin with the original launcher PATH, so
+/// removing a directory from shell startup also removes it from discovery.
+#[cfg(target_os = "linux")]
+pub(super) fn launcher_path() -> Option<OsString> {
+    DAEMON_LAUNCHER_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::var_os("PATH"))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn discovery_path(inherited: Option<&OsStr>) -> Option<OsString> {
+    let shell = crate::model::login_shell().ok()?;
+    let home = std::env::var_os("HOME")?;
+    discover(
+        Path::new(&shell),
+        Path::new(&home),
+        inherited,
+        SHELL_TIMEOUT,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn discover(
+    shell: &Path,
+    home: &Path,
+    inherited: Option<&OsStr>,
+    timeout: Duration,
+) -> Option<OsString> {
+    // Start where a login leaves off, then let interactive startup make
+    // its own changes. Each mode keeps its original time budget so a slow
+    // but successful profile or interactive setup still supplies its PATH.
+    let login = read_in_mode(shell, "-il", home, inherited, Instant::now() + timeout)
+        .and_then(|path| merged(inherited, &path));
+    let interactive = read_in_mode(
+        shell,
+        "-i",
+        home,
+        login.as_deref().or(inherited),
+        Instant::now() + timeout,
+    );
+    interactive.or(login)
+}
+
+fn read_in_mode(
+    shell: &Path,
+    mode: &str,
+    home: &Path,
+    inherited: Option<&OsStr>,
+    deadline: Instant,
+) -> Option<OsString> {
     if Instant::now() >= deadline {
         return None;
     }
@@ -126,6 +208,10 @@ fn read_in_mode(shell: &Path, mode: &str, home: &Path, deadline: Instant) -> Opt
         .args([mode, "-c", SHELL_PATH_COMMAND])
         .env("HOME", home)
         .current_dir(home);
+    match inherited {
+        Some(path) => command.env("PATH", path),
+        None => command.env_remove("PATH"),
+    };
     for name in SCRUBBED_ENVIRONMENT
         .iter()
         .chain(SHELL_SCRUBBED_ENVIRONMENT)
@@ -184,6 +270,9 @@ fn read_value(stdout: &mut std::process::ChildStdout, deadline: Instant) -> Opti
     let mut chunk = [0; 4096];
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
         let mut poll = libc::pollfd {
             fd: stdout.as_raw_fd(),
             events: libc::POLLIN,
@@ -248,6 +337,70 @@ mod tests {
         assert_eq!(with(&["SSH_CONNECTION"]), !cfg!(target_os = "macos"));
         assert!(!with(&[ADOPTED_ENV]));
         assert!(!with(&["SSH_CONNECTION", ADOPTED_ENV]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_layers_interactive_tools_over_current_login_startup() {
+        let home = tempfile::tempdir().unwrap();
+        let shell = home.path().join("shell");
+        // Model bash with disjoint login and interactive files. The latter
+        // needs the version-manager directory put on PATH by the former.
+        std::fs::write(
+            &shell,
+            r#"#!/bin/sh
+case "$1" in
+    -il)
+        [ ! -d "$HOME/.local/bin" ] || PATH="$HOME/.local/bin:$PATH"
+        PATH="$HOME/login/bin:$PATH"
+        ;;
+    -i)
+        case "$PATH" in *"$HOME/login/bin"*) ;; *) exit 2 ;; esac
+        printf 'startup message\0'
+        PATH="$HOME/interactive/bin:$PATH"
+        ;;
+    *) exit 3 ;;
+esac
+eval "$3"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let root = home.path();
+        let launcher = OsStr::new("/usr/bin:/bin");
+        let discover = || discover(&shell, root, Some(launcher), Duration::from_secs(5)).unwrap();
+        let before: Vec<_> = std::env::split_paths(&discover()).collect();
+        assert_eq!(
+            before,
+            [
+                root.join("interactive/bin"),
+                root.join("login/bin"),
+                "/usr/bin".into(),
+                "/bin".into(),
+            ]
+        );
+        let installed = root.join(".local/bin");
+        std::fs::create_dir_all(&installed).unwrap();
+        let cli = installed.join("claude");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let after = discover();
+        assert_eq!(
+            super::super::find_executable("claude", Some(&after)),
+            Some(cli)
+        );
+        assert_eq!(
+            std::env::split_paths(&after).collect::<Vec<_>>(),
+            [
+                root.join("interactive/bin"),
+                root.join("login/bin"),
+                installed,
+                "/usr/bin".into(),
+                "/bin".into(),
+            ]
+        );
     }
 
     #[test]
