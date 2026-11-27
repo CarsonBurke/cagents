@@ -5139,6 +5139,35 @@ pub(super) fn spawn_terminal_view_owned(
     )
 }
 
+type ManagedTerminalDirectory = (
+    super::agent_execution::SharedRegistry,
+    super::agent_execution::working_directory::Opened,
+);
+
+pub(super) fn spawn_handoff_terminal(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    directory: Option<ManagedTerminalDirectory>,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned_reserved(
+        shared,
+        client_id,
+        session,
+        options,
+        Some(environment),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        directory,
+    )
+}
+
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
 /// adopting the one a predecessor daemon's holder waits with there.
 fn start_terminal_view(
@@ -5195,6 +5224,7 @@ fn start_terminal_view_owned(
         pending_pane,
         execution_recipe,
         None,
+        None,
     )
 }
 
@@ -5218,6 +5248,7 @@ pub(super) fn spawn_codex_view_reserved(
         None,
         None,
         Some(transition),
+        None,
     )
 }
 
@@ -5268,6 +5299,7 @@ pub(super) fn spawn_console_replacement(
         Some(&super::chat::TerminalViewReservation::retained_console(
             requested,
         )),
+        None,
     )?;
     let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
     state.adopt_upgrade_lineage(source, previous_sources, &relaunches)?;
@@ -5286,6 +5318,7 @@ fn start_terminal_view_owned_reserved(
     pending_pane: Option<crate::model::CardId>,
     execution_recipe: Option<crate::model::LaunchRecipe>,
     transition: Option<&super::chat::TerminalViewReservation<'_>>,
+    mut directory: Option<ManagedTerminalDirectory>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     if shared
         .lock()
@@ -5567,7 +5600,7 @@ fn start_terminal_view_owned_reserved(
                 };
                 source.resume_hint =
                     crate::model::agent_recovery::observed_hint_from_launch(&source.launch);
-                let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                let mut store = registry.lock().unwrap_or_else(|p| p.into_inner());
                 // A relaunch or recovery names the session it replaces; it
                 // inherits what that lineage owns once nothing else of it runs.
                 // A session saved before predecessors were recorded names only
@@ -5577,7 +5610,7 @@ fn start_terminal_view_owned_reserved(
                     .or(session.recovery_origin)
                     .filter(|predecessor| *predecessor != terminal_id)
                     .map_or(Ok(()), |predecessor| {
-                        registry
+                        store
                             .succeed(
                                 terminal_id,
                                 predecessor,
@@ -5591,22 +5624,54 @@ fn start_terminal_view_owned_reserved(
                             )
                             .map(drop)
                     });
-                match succeeded.and_then(|()| {
-                    registry.fresh_agent_authority(
-                        &crate::agent_execution::HostedSession::Terminal(source),
-                    )
-                }) {
+                drop(store);
+                let prepare = || {
+                    succeeded.map_err(model_unavailable)?;
+                    let effective = execution_recipe.as_ref().unwrap_or(&session.launch);
+                    if directory.is_none() {
+                        directory = super::agent_execution::working_directory::for_launch(
+                            &registry,
+                            terminal_id,
+                            &effective.working_directory,
+                        )
+                        .map_err(|message| {
+                            ProtocolError::new(
+                                ProtocolErrorCode::TerminalUnavailable,
+                                message,
+                                true,
+                            )
+                        })?
+                        .map(|pin| (registry.clone(), pin));
+                    }
+                    if let Some((_, pin)) = &directory {
+                        super::account_lifecycle::ensure_launch_at_directory(
+                            shared,
+                            &effective.working_directory,
+                            execution_environment
+                                .as_ref()
+                                .map(|environment| &environment.0)
+                                .unwrap_or(&effective.environment),
+                            &crate::account::launch_credential_overrides(effective),
+                            execution_environment.is_none(),
+                            Some(&pin.directory),
+                        )?;
+                    }
+                    registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .fresh_agent_authority(&crate::agent_execution::HostedSession::Terminal(
+                            source,
+                        ))
+                        .map_err(model_unavailable)
+                };
+                match prepare() {
                     Ok(authority) => authority,
                     Err(error) => {
                         shared
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .cancel_spawn(terminal_id);
-                        return Err(ProtocolError::new(
-                            ProtocolErrorCode::Internal,
-                            error,
-                            false,
-                        ));
+                        return Err(error);
                     }
                 }
             }
@@ -5641,6 +5706,7 @@ fn start_terminal_view_owned_reserved(
         execution_environment,
         adoption,
         holder_recovery,
+        launch_directory: directory.as_ref().map(|(_, pin)| pin.directory.clone()),
         ..TerminalConfig::default()
     };
     let wake_redraw = Arc::clone(&redraw);
@@ -5743,6 +5809,11 @@ fn start_terminal_view_owned_reserved(
             ));
         }
     };
+    if let Some((registry, opened)) = &directory
+        && let Err(error) = opened.started(registry)
+    {
+        tracing::warn!(%terminal_id, %error, "The agent's terminal directory was not recorded");
+    }
     // Bind before publishing the Host record. Pre-binding captures are covered
     // by the initial Spawn snapshot and acknowledge below, never by an ID lookup.
     let _ = redraw.worker.set(handle.downgrade());

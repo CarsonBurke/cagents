@@ -4065,14 +4065,23 @@ impl Actor {
                 .unwrap_or_else(|p| p.into_inner())
                 .notification_preview = Arc::new(preview.clone());
         }
-        // A new Codex thread is created asynchronously after initialize; check
-        // its RPC boundary too. Interrupts, denials and cleanup remain usable
-        // even if the approved directory disappears or is replaced.
-        if step
-            .writes
-            .iter()
-            .any(|frame| frame["method"] == "thread/start")
-            && let Some(context) = &self.launch_context
+        // Provider startup and queued turns can issue these requests after
+        // the command that led to them has returned. Recheck at the wire
+        // boundary while leaving interrupts and cleanup usable.
+        if let Some(context) = &self.launch_context
+            && step.writes.iter().any(|frame| {
+                matches!(
+                    frame["method"].as_str(),
+                    Some(
+                        "thread/start"
+                            | "thread/resume"
+                            | "session/new"
+                            | "session/load"
+                            | "turn/start"
+                            | "session/prompt"
+                    )
+                )
+            })
         {
             context.verify_directory(&self.working_directory)?;
         }

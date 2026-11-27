@@ -4148,3 +4148,96 @@ fn the_daemon_validates_and_reports_a_channels_checkout() {
         "the main checkout is recorded as no checkout"
     );
 }
+
+#[test]
+fn a_terminal_relaunch_uses_its_predecessor_agents_project() {
+    use crate::agent_execution::{HostedSession, Origin};
+    use crate::host::agent_execution::{self, tests::fixture};
+    const NAME: &str =
+        "host::state::tests::a_terminal_relaunch_uses_its_predecessor_agents_project";
+    if agent_execution::tests::isolated(NAME).is_some() {
+        return;
+    }
+    let (host, request, registry_path) = fixture();
+    let project = registry_path.parent().unwrap().join("project");
+    let recipe = crate::model::LaunchRecipe {
+        program: "/bin/sh".into(),
+        arguments: vec!["-c".into(), "pwd > launched; read line".into()],
+        working_directory: project.clone(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let proof = host.lock().unwrap().proof().clone();
+    let source = TerminalSession {
+        id: TerminalId::new(),
+        launch: recipe.clone(),
+        continuity: TerminalContinuity::Live {
+            host_session_id: proof.host_session_id,
+            boot_id: proof.boot_id,
+            host_incarnation: proof.host_incarnation,
+        },
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+    };
+    let registry = agent_execution::registry(&host).unwrap();
+    {
+        let mut store = registry.lock().unwrap();
+        let accepted = store.submit_agent(&Origin::User, &request, 1).unwrap();
+        store
+            .bind_agent(
+                accepted.agent.id,
+                None,
+                HostedSession::Terminal(source.clone()),
+            )
+            .unwrap();
+    }
+    let next = |working_directory| {
+        let mut recipe = recipe.clone();
+        recipe.working_directory = working_directory;
+        TerminalSession {
+            id: TerminalId::new(),
+            predecessor: Some(source.id),
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: recipe.clone(),
+                last_exit: None,
+            },
+            launch: recipe,
+            ..source.clone()
+        }
+    };
+    let outside = registry_path.parent().unwrap();
+    let request = next(outside.to_owned());
+    let error =
+        spawn_terminal(&host, 0, request.clone(), TerminalSpawnOptions::default()).unwrap_err();
+    assert!(error.message.contains("is not in the project"), "{error:?}");
+    assert!(!host.lock().unwrap().terminals.contains_key(&request.id));
+    assert!(!outside.join("launched").exists());
+
+    let started = spawn_terminal(
+        &host,
+        0,
+        next(project.clone()),
+        TerminalSpawnOptions::default(),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().terminals[&started.session.id]
+        .handle
+        .clone();
+    let marker = project.join("launched");
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !marker.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "managed terminal never started in its project"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    handle.shutdown().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        project.to_str().unwrap()
+    );
+}

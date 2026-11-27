@@ -40,6 +40,9 @@ pub struct TerminalConfig {
     pub adoption: Option<std::path::PathBuf>,
     #[cfg(feature = "host")]
     pub holder_recovery: Option<super::holder::Recovery>,
+    /// The directory the daemon admitted for a managed provider launch.
+    #[cfg(feature = "host")]
+    pub launch_directory: Option<std::sync::Arc<std::fs::File>>,
 }
 
 impl TerminalConfig {
@@ -67,6 +70,8 @@ impl Default for TerminalConfig {
             adoption: None,
             #[cfg(feature = "host")]
             holder_recovery: None,
+            #[cfg(feature = "host")]
+            launch_directory: None,
         }
     }
 }

@@ -246,28 +246,34 @@ pub(in crate::host) fn for_conversation(
     registry: &SharedRegistry,
     session: &crate::chat::Session,
 ) -> Result<Option<Opened>, String> {
+    for_launch(
+        registry,
+        session.id,
+        &session.launch.recipe.working_directory,
+    )
+}
+
+pub(in crate::host) fn for_launch(
+    registry: &SharedRegistry,
+    id: crate::model::TerminalId,
+    path: &Path,
+) -> Result<Option<Opened>, String> {
     let agent = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        // A reopened conversation runs under a new ID in its predecessor's
-        // lineage, or in place under the ID its agent is bound to. One that
-        // several agents claim is adopted by none of them.
-        let mut agents = registry.lineage_agents(session.id)?;
-        match agents.len() {
-            0 => registry.agent_for_session(session.id)?,
-            1 => agents.pop(),
-            _ => None,
+        match registry.agent_for_session(id)? {
+            Some(agent) => Some(agent),
+            None => {
+                let mut agents = registry.lineage_agents(id)?;
+                match agents.len() {
+                    1 => agents.pop(),
+                    _ => None,
+                }
+            }
         }
     };
-    // An agent in a terminal runs where its terminal does.
-    let Some(agent) = agent.filter(|agent| {
-        !matches!(
-            agent.session,
-            Some(crate::agent_execution::HostedSession::Terminal(_))
-        )
-    }) else {
+    let Some(agent) = agent else {
         return Ok(None);
     };
-    let path = &session.launch.recipe.working_directory;
     if *path == agent.spec.target.directory {
         return open_for_start(registry, &agent).map(Some);
     }
