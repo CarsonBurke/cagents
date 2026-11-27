@@ -144,6 +144,14 @@ pub enum ModelUpdate {
         channel: ChannelId,
         error: String,
     },
+    /// A definitive refusal of this window's change of a channel's name,
+    /// which no receipt will follow, with the registry's reason. The window
+    /// counts these changes until each is answered, so the publisher answers
+    /// every one it takes exactly once: with this, or with its receipt.
+    RetitleRefused {
+        channel: ChannelId,
+        error: String,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
@@ -665,6 +673,18 @@ fn publish_with_mirror(
                         let _ = updates.send_blocking(ModelUpdate::SeedRefused {
                             scope: scope.clone(),
                             attempt: seed_attempt.expect("a seed publication has an attempt"),
+                            error: message.clone(),
+                        });
+                    }
+                    if let (
+                        ModelEdit::RetitleChannel { id, .. },
+                        ControlError::Remote { message, .. },
+                    ) = (&request, &error)
+                    {
+                        // The window counts the channel as named until its
+                        // rename is answered, and this is the only answer.
+                        let _ = updates.send_blocking(ModelUpdate::RetitleRefused {
+                            channel: *id,
                             error: message.clone(),
                         });
                     }
@@ -1337,6 +1357,18 @@ impl Cagents {
             update => update,
         };
         trace_edge(&update);
+        // A receipt answers this window's change of a channel's name whichever
+        // registry sent it: no other answer follows one from a registry the
+        // window has since left. The latest one's receipt, from the registry
+        // the window is in, also puts the channel's row past every older
+        // model, so none of them shows the title before it afterwards.
+        if let ModelUpdate::Committed {
+            edit: ModelEdit::RetitleChannel { id, .. },
+            ..
+        } = &update
+        {
+            self.note_channel_retitle_answered(*id);
+        }
         let foreign = match &update {
             ModelUpdate::Committed { receipt, .. } => {
                 receipt.identity != self.workspace_model.identity
@@ -1746,12 +1778,6 @@ impl Cagents {
                 if receipt.identity != self.workspace_model.identity {
                     return Task::none();
                 }
-                // The registry holds this window's rename from here, and its
-                // row clock keeps any older model from showing the old title,
-                // even when a later edit already replaced this one's row.
-                if let ModelEdit::RetitleChannel { id, title } = &edit {
-                    self.note_channel_rename_held(*id, title);
-                }
                 let operation = match &edit {
                     ModelEdit::ChangeView { operation, .. } => Some(*operation),
                     _ => None,
@@ -1831,6 +1857,21 @@ impl Cagents {
                     &format!("Could not reopen the channel: {error}. Try reopening again."),
                 );
                 Task::none()
+            }
+            ModelUpdate::RetitleRefused { channel, error } => {
+                tracing::warn!(%channel, %error, "the registry refused a change of a channel's name");
+                self.status = Some(
+                    TransientNotice::warning("Could not change the channel's name")
+                        .with_details(error),
+                );
+                // A later change still unanswered brings its own row.
+                if self.note_channel_retitle_answered(channel) {
+                    return Task::none();
+                }
+                // The registry did not take the name shown here, so the
+                // channel goes back to the one it holds.
+                self.absorb_channel_title(channel)
+                    .unwrap_or_else(Task::none)
             }
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
@@ -3249,11 +3290,6 @@ impl Cagents {
 
     /// Takes the shared half of a channel this window already has.
     fn absorb_shared_channel(&mut self, index: usize, shared: &ModelChannel) -> bool {
-        // A model showing this window's rename, which may come before the
-        // rename's receipt. One with any other title may predate it.
-        if shared.title_source == crate::model::ChannelTitleSource::Manual {
-            self.note_channel_rename_held(shared.id, &shared.title);
-        }
         let local = &self.durable.channels[index];
         // The shared title wins even where this window's own derivation would
         // differ: one window deferring is better than two windows showing one
@@ -3275,10 +3311,10 @@ impl Cagents {
         // A name cleared in another window asks for the automatic one, which
         // this window offers if it runs the channel's conversation. A model
         // older than this window's own rename looks the same, so a rename
-        // still waiting for its echo is not forgotten (see
+        // the registry has not answered is not forgotten (see
         // `channel_is_named`): the registry refuses the offer once it holds
-        // the new name, whose echo then restores it. A clear after the echo
-        // leaves the channel unnamed.
+        // the new name, whose receipt then restores it. A clear after that
+        // answer leaves the channel unnamed.
         let cleared = retitle && !local.title.is_empty() && shared.title.is_empty();
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
         if retitle {
@@ -3747,6 +3783,10 @@ impl Cagents {
             &edit,
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
         );
+        let retitle = match &edit {
+            ModelEdit::RetitleChannel { id, title } => Some((*id, !title.is_empty())),
+            _ => None,
+        };
         let request = ModelRequest::from(edit);
         let seed = match &request.edit {
             ModelEdit::SeedView { scope, .. } => {
@@ -3773,6 +3813,11 @@ impl Cagents {
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
             }
+            if let Some((id, _)) = retitle {
+                self.note_channel_retitle_unqueued(id);
+            }
+        } else if let Some((id, gives_name)) = retitle {
+            self.note_channel_retitle_queued(id, gives_name);
         }
     }
 }

@@ -423,6 +423,17 @@ pub(super) enum Retirement {
     Unattended,
 }
 
+/// This window's changes to one channel's name that the registry has not
+/// answered yet.
+#[derive(Debug, Default)]
+struct Retitles {
+    /// How many are queued or sent without a receipt or a refusal. An entry
+    /// lasts only while this is above zero.
+    unanswered: usize,
+    /// Whether the latest of them gave a name, rather than clearing it.
+    gives_name: bool,
+}
+
 /// The pending deletion, held while its confirmation is on screen.
 #[derive(Debug, Default)]
 pub struct State {
@@ -464,13 +475,13 @@ pub struct State {
     /// reclaim it until it reports a name of its own, which one that fails
     /// to reconnect never does.
     names: HashMap<ChannelId, (String, crate::model::ChannelTitleSource)>,
-    /// Renames made in this window that the registry has not echoed yet,
-    /// with the name each sent. Until the echo, a model the registry sent
-    /// before the rename still shows the old title, so the channel counts as
-    /// named regardless. The echo ends that: from then the registry's title
-    /// alone says whether it is named, so a name another window clears is
-    /// cleared here too (#3403).
-    named: HashMap<ChannelId, String>,
+    /// This window's changes to a channel's name that the registry has not
+    /// answered yet. While the latest of them gives a name, a model sent
+    /// before it still shows the old title, so the channel counts as named
+    /// regardless. Once the registry has answered it, the registry's title
+    /// alone says whether the channel is named, so a name another window
+    /// clears is cleared here too (#3403).
+    retitles: HashMap<ChannelId, Retitles>,
     reopening: HashMap<ChannelId, PendingReopen>,
     /// Emptied channels waiting for their view publication to settle, by the
     /// incarnation the close saw, with what made each a candidate. The
@@ -1578,10 +1589,13 @@ impl Cagents {
     /// Whether `id` carries a name given to it rather than one suggested by
     /// its conversation: by a rename, or when it was made with a title.
     ///
-    /// A rename made here counts before the registry echoes it. Until then,
+    /// A rename made here counts before the registry answers it. Until then,
     /// a model the registry sent before the rename shows the old title.
     pub(super) fn channel_is_named(&self, id: ChannelId) -> bool {
-        self.channel_ui.named.contains_key(&id)
+        self.channel_ui
+            .retitles
+            .get(&id)
+            .is_some_and(|retitles| retitles.gives_name)
             || self.durable.channels.iter().any(|channel| {
                 channel.id == id
                     && channel.title_source == crate::model::ChannelTitleSource::Manual
@@ -1589,32 +1603,47 @@ impl Cagents {
             })
     }
 
-    /// Records that the person named channel `id` `title` in this window,
-    /// until the registry holds the name (see
-    /// [`Self::note_channel_rename_held`]).
-    pub(super) fn note_channel_named(&mut self, id: ChannelId, title: String) {
-        self.channel_ui.named.insert(id, title);
+    /// Records that this window queued a change of channel `id`'s name for
+    /// the registry: a rename, or with `gives_name` false a return to its
+    /// automatic name. A rename keeps the channel named until the registry
+    /// answers it (see [`Self::note_channel_retitle_answered`]).
+    pub(super) fn note_channel_retitle_queued(&mut self, id: ChannelId, gives_name: bool) {
+        let retitles = self.channel_ui.retitles.entry(id).or_default();
+        retitles.unanswered += 1;
+        retitles.gives_name = gives_name;
     }
 
-    /// Ends the wait of this window's rename of `id` to `title`, the latest
-    /// it made, once the registry holds it: the registry's title then says
-    /// whether the channel is named, so a later clear leaves it unnamed.
-    /// Called for the rename's receipt, and for any model showing the name,
-    /// which may arrive first.
-    pub(super) fn note_channel_rename_held(&mut self, id: ChannelId, title: &str) {
-        if self
-            .channel_ui
-            .named
-            .get(&id)
-            .is_some_and(|pending| pending == title)
-        {
-            self.channel_ui.named.remove(&id);
+    /// Records the registry's answer to the oldest change of channel `id`'s
+    /// name this window still waits on: its receipt, or its refusal. The
+    /// publisher sends them in order and each is answered once, so the
+    /// latest is answered when none is left, and the registry's title then
+    /// says whether the channel is named: a later clear leaves it unnamed.
+    ///
+    /// Only the latest one's own answer ends the wait. A model showing the
+    /// name does not, nor does the answer to an earlier rename, even one to
+    /// the same name (#4330): either may show a rename the window has since
+    /// cleared, and the model after that clear shows the channel unnamed.
+    /// Returns whether any is still waited on.
+    pub(super) fn note_channel_retitle_answered(&mut self, id: ChannelId) -> bool {
+        let std::collections::hash_map::Entry::Occupied(mut retitles) =
+            self.channel_ui.retitles.entry(id)
+        else {
+            return false;
+        };
+        retitles.get_mut().unanswered -= 1;
+        if retitles.get().unanswered == 0 {
+            retitles.remove();
+            return false;
         }
+        true
     }
 
-    /// Records that channel `id` went back to its automatic name.
-    pub(super) fn note_channel_unnamed(&mut self, id: ChannelId) {
-        self.channel_ui.named.remove(&id);
+    /// Records that a change of channel `id`'s name could not be queued. The
+    /// queue takes everything while its publisher lives, so no earlier
+    /// change will be answered either, and the registry's title says whether
+    /// the channel is named.
+    pub(super) fn note_channel_retitle_unqueued(&mut self, id: ChannelId) {
+        self.channel_ui.retitles.remove(&id);
     }
 
     /// Whether `id` holds nothing a person could lose with it, as this window

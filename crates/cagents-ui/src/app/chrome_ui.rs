@@ -787,7 +787,11 @@ mod tests {
                 focused: None,
                 checkout: None,
             }];
-            app.note_channel_named(id, title.into());
+            if given {
+                // Named in this window, and the registry has not answered.
+                app.note_channel_retitle_queued(id, true);
+            }
+            assert_eq!(app.channel_is_named(id), given);
             drop(app.update_chrome(Action::RenameChannel(id)));
             // No conversation here names the channel, so the copy says what
             // clearing does without promising a name.
@@ -824,7 +828,7 @@ mod tests {
                 assert!(sent.is_empty(), "{sent:?}");
                 assert_eq!(app.durable.channels[0].title, title);
                 assert_eq!(app.durable.channels[0].title_source, source);
-                assert!(app.channel_is_named(id));
+                assert!(!app.channel_is_named(id));
                 drop(app.update_chrome(Action::RenameCancel));
             }
         }
@@ -2738,12 +2742,8 @@ impl Cagents {
                             channel.title_source = crate::model::ChannelTitleSource::Manual;
                         }
                         self.publish_model_edit(
-                            crate::workspace_model::ModelEdit::RetitleChannel {
-                                id,
-                                title: title.clone(),
-                            },
+                            crate::workspace_model::ModelEdit::RetitleChannel { id, title },
                         );
-                        self.note_channel_named(id, title);
                         self.refresh_sidebar_channels();
                         self.persist();
                         return restore;
@@ -3742,7 +3742,6 @@ impl Cagents {
             id,
             title: String::new(),
         });
-        self.note_channel_unnamed(id);
         self.offer_channel_name_again(id);
         self.refresh_sidebar_channels();
         self.persist();
