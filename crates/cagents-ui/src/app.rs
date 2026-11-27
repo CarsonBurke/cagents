@@ -18345,7 +18345,7 @@ impl Cagents {
                     return ControlFlow::Break(self.update_device(device_ui::Action::Open));
                 }
                 Message::ResumeConversation(_) => {
-                    self.status = Some(TransientNotice::warning(resume_ui::UNAVAILABLE));
+                    self.status = Some(TransientNotice::warning(resume_ui::unavailable_message()));
                     return ControlFlow::Break(Task::none());
                 }
                 Message::Repository(_) | Message::ProjectUi(_) | Message::SubmitWorktree => {

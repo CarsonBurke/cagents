@@ -3047,7 +3047,10 @@ mod tests {
                     (app.notices.len() > reported)
                         .then(|| app.notices.recent().next().unwrap().notice.message.clone())
                 });
-            assert_eq!(shown.as_deref(), Some(resume_ui::UNAVAILABLE));
+            assert_eq!(
+                shown.as_deref(),
+                Some(resume_ui::unavailable_message().as_str())
+            );
         }
     }
 }

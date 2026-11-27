@@ -245,9 +245,16 @@ impl Runtime {
         // Attaching again would only bring back this same stopped actor, and
         // nothing here can start its provider on the conversation yet.
         Stopped {
-            guidance: format!(
-                "{provider} stopped, and this tab can't start it again. To continue, copy your unsent message, close this tab, then reopen the conversation with Resume conversation in the new tab (+) menu."
-            ),
+            guidance: if super::super::resume_ui::available() {
+                format!(
+                    "{provider} stopped, and this tab can't start it again. To continue, copy your unsent message, close this tab, then reopen the conversation with Resume conversation in the new tab (+) menu."
+                )
+            } else {
+                // A device window has no Resume conversation to point to.
+                format!(
+                    "{provider} stopped, and this tab can't start it again. To continue, copy your unsent message, close this tab, then start a new conversation."
+                )
+            },
             primary: None,
             secondary: None,
             primary_labels: &[],

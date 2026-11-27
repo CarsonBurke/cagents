@@ -335,7 +335,11 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
                     && !(permissions_available(snapshot)
                         && name.eq_ignore_ascii_case(PERMISSIONS_COMMAND))
             })
-            .chain([(RESUME_COMMAND, "Return to a saved conversation")]);
+            // A device window can't search this computer's history (#688).
+            .chain(
+                super::super::resume_ui::available()
+                    .then_some((RESUME_COMMAND, "Return to a saved conversation")),
+            );
         // Compaction is a capability rather than an advertised command for
         // some providers; the composer answers to it either way, so the list
         // says so too.
