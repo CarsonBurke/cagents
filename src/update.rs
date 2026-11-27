@@ -1737,6 +1737,12 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
     };
     #[cfg(target_os = "macos")]
     if job.phase == UpdatePhase::Failed {
+        if ready_plan::held_return_in_progress(&state, &job)? {
+            job.phase = UpdatePhase::Installing;
+            job.message = "Reopening the current version".into();
+            job.refusal = None;
+            return Ok(Some(job));
+        }
         let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
         if cutover::pending_selected(&layout, &state, &job)? {
             if let Some(reason) = cutover::selected_start_failure(&state, &job)? {

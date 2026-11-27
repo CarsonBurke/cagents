@@ -974,6 +974,7 @@ mod tests {
             process,
             expected: (metadata.dev(), metadata.ino()),
             address: crate::process::own_code_address(),
+            held_source_return: false,
         };
         image.verify().unwrap();
         // SAFETY: dlsym looks up a valid C string. The address belongs to

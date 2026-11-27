@@ -185,7 +185,7 @@ impl Reservation<'_> {
                 "The original process evidence belongs to a different update",
             ));
         }
-        Ok(record.process)
+        Ok(Some(record.process))
     }
 
     fn held_source_return(&self) -> HeldSourceReturn {
@@ -369,7 +369,9 @@ pub(crate) fn admit_held_source_return(
             "The held return did not start the exact source daemon",
         ));
     }
-    let process = reservation.original_process()?;
+    let process = reservation.original_process()?.ok_or_else(|| {
+        invalid("The original daemon did not record an exact held-return identity")
+    })?;
     reservation
         .plan
         .ready
@@ -391,13 +393,9 @@ pub(super) fn try_held_source_return(
     {
         return Ok(false);
     }
-    let Some(source_identity) = read(&source_process_path(state, &job.id))? else {
+    let Some(original) = reservation.original_process()? else {
         return Ok(false);
     };
-    let recorded: BoundSourceProcess = serde_json::from_slice(&source_identity)?;
-    if recorded.reservation_digest != reservation.stored_digest {
-        return Err(invalid("The held return points to another source daemon"));
-    }
     let source = locate(&reservation.prefix.join("current/bin/cagents"))?;
     if reservation
         .plan
@@ -421,7 +419,7 @@ pub(super) fn try_held_source_return(
     if reservation
         .plan
         .ready
-        .held_return_predecessor(&recorded.process, &runtime)
+        .held_return_predecessor(&original, &runtime)
         .is_err()
     {
         return Ok(false);
@@ -439,20 +437,28 @@ pub(super) fn try_held_source_return(
         return Ok(false);
     }
     let intent = reservation.held_source_return();
-    cutover::persist(
-        state,
-        &reservation.return_intent_path(),
-        &serde_json::to_vec(&intent)?,
-        true,
-    )?;
+    let intent_path = reservation.return_intent_path();
+    let bytes = serde_json::to_vec(&intent)?;
+    match read(&intent_path)? {
+        Some(recorded) if recorded != bytes => {
+            return Err(invalid("The held return decision changed"));
+        }
+        Some(_) => {}
+        None => cutover::persist(state, &intent_path, &bytes, true)?,
+    }
     let timeout = crate::install_guard::daemon_start_timeout()?;
     let started = standby.activate_held_source_return(&intent, worker, &guard, &handoff, timeout);
     if standby.may_own_runtime() {
         guard.leave_launch_fence_with_successor();
     }
-    if let Err(error) = installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout) {
+    let verified = reservation.verify_held_return_daemon(&source);
+    if !matches!(verified, Ok(true)) {
         started?;
-        return Err(error);
+        if !verified? {
+            return Err(invalid(
+                "The original daemon did not record a usable held return",
+            ));
+        }
     }
     drop(runtime);
     drop(handoff);
@@ -470,6 +476,24 @@ pub(crate) fn require_no_activation() -> Result<(), UpdateError> {
         return Err(UpdateError::Busy);
     }
     Ok(())
+}
+
+pub(super) fn held_return_in_progress(state: &Path, job: &UpdateJob) -> Result<bool, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(false);
+    };
+    if reservation.job != job.id
+        || reservation.state() != state
+        || reservation.phase()? != Phase::Claimed
+    {
+        return Ok(false);
+    }
+    let Some(bytes) = read(&reservation.return_intent_path())? else {
+        return Ok(false);
+    };
+    let intent: HeldSourceReturn = serde_json::from_slice(&bytes)?;
+    Ok(intent == reservation.held_source_return()
+        && matches!(acquire_lock(state), Err(UpdateError::Busy)))
 }
 
 pub(super) fn reserves_job(state: &Path, job: &UpdateJob) -> Result<bool, UpdateError> {
@@ -524,9 +548,15 @@ pub fn admit_saved_state(executable: &Path) -> Result<(), UpdateError> {
                 Err(UpdateError::Busy)
             }
         }
-        Phase::Claimed if executable.file_name() == Some(std::ffi::OsStr::new("cagents-ui")) => {
+        Phase::Claimed
+            if crate::instance::window_launch_restore_policy()
+                == crate::instance::WindowRestorePolicy::ExistingOnly
+                && executable.file_name() == Some(std::ffi::OsStr::new("cagents-ui")) =>
+        {
             let source = locate(executable)?;
-            if reservation.verify_held_return_daemon(&source)? {
+            if executable == source.version_root.join("bin/cagents-ui")
+                && reservation.verify_held_return_daemon(&source)?
+            {
                 Ok(())
             } else {
                 Err(UpdateError::Busy)
@@ -805,7 +835,7 @@ impl Reservation<'_> {
         };
         self.verify_held_source_image(source)?;
         let mut client =
-            source::Client::connect_matched(&crate::terminal_ipc::daemon_socket_path()?)
+            source::Client::connect_inventory(&crate::terminal_ipc::daemon_socket_path()?)
                 .map_err(|error| invalid(error.to_string()))?;
         let executable = source.version_root.join("bin/cagentsd");
         if client.peer_pid() != process.pid as u32

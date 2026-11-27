@@ -1858,6 +1858,8 @@ impl ReadyPlanEvidence<'_> {
             "init-start",
             "init-complete",
             "restore",
+            "return-claim",
+            "return-effects",
         ] {
             if ready_evidence_exists(authority, stage)? {
                 return Err("The installed successor began changing saved work".into());
@@ -4972,11 +4974,22 @@ impl ReadyAdmission {
         self.return_capture.is_some()
     }
 
-    pub fn finish_held_return(&self) -> Result<(), String> {
+    pub fn finish_held_return(&self, expected_checkpoint: &str) -> Result<(), String> {
         let capture = self
             .return_capture
             .as_ref()
             .ok_or("This startup is not a held source return")?;
+        let store =
+            super::handoff::Store::observe_existing()?.ok_or("The held checkpoint is missing")?;
+        let checkpoint = store
+            .checkpoint_status()?
+            .ok_or("The held checkpoint is missing")?;
+        if checkpoint.proof != self.authority.source
+            || checkpoint.phase != Phase::Restoring
+            || checkpoint.digest != expected_checkpoint
+        {
+            return Err("The held return changed its restoring checkpoint".into());
+        }
         let process = crate::daemon::holder_registry::Process::read(std::process::id() as i32)
             .map_err(|error| error.to_string())?;
         record_held_return_actor(
@@ -4985,7 +4998,9 @@ impl ReadyAdmission {
             "return-ready",
             &self.successor,
             process,
-        )
+        )?;
+        store.archive_claimed_update(&self.authority.job, &self.authority.source)?;
+        Ok(())
     }
 
     pub fn begin_workspace_effects(&self) -> io::Result<()> {
