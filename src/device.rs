@@ -206,6 +206,8 @@ fn ssh_reason(stderr: &str) -> Option<String> {
         "Permission denied",
         "Host key verification failed",
         "kex_exchange_identification",
+        "ssh_exchange_identification",
+        "Unable to negotiate with",
         "banner exchange",
         "Connection closed by",
         "Connection reset by",
