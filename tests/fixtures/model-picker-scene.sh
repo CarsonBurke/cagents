@@ -80,7 +80,7 @@ picker
 "$ne" drive type claude
 "$ne" drive key Return
 "$ne" drive wait 'models' --gone --timeout 20
-"$ne" drive click "$(locate Message)"
+# Choosing a model returns the keyboard to the composer.
 "$ne" drive type 'Show the picker of a conversation under way.'
 "$ne" drive key Return
 "$ne" drive wait 'picker fixture' --timeout 45
