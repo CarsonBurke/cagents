@@ -20530,6 +20530,13 @@ impl Cagents {
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::WorktreesUi(action) => self.update_worktrees_ui(action),
+            Message::GitUi(git_ui::Action::Changed) => {
+                // Untracked paths alone only owe the Changes panel a read.
+                if !self.git_watch_changed() && !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
+                self.start_git_reads()
+            }
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),

@@ -29,6 +29,11 @@ pub(super) const SOURCE_RELOAD_DELAY: Duration = Duration::from_millis(200);
 /// reads find nothing new in, such as an ignored log beside tracked files,
 /// waits twice as long after each such read, up to this.
 const MAX_UNTRACKED_RELOAD_DELAY: Duration = Duration::from_secs(5);
+/// How long untracked churn must stay quiet before the backoff is forgotten,
+/// so the first real file after it shows at [`SOURCE_RELOAD_DELAY`]. Churn
+/// that keeps going reads at least every [`MAX_UNTRACKED_RELOAD_DELAY`], well
+/// inside this.
+const UNTRACKED_BACKOFF_MEMORY: Duration = Duration::from_secs(30);
 
 /// When the Changes panel reads its checkout again because the watcher saw
 /// it change since the last read began. Unlike the periodic refresh, this
@@ -44,6 +49,8 @@ pub(super) struct SourceReload {
     reading_untracked: bool,
     /// Reads in a row, begun for untracked paths alone, that found nothing.
     quiet: u32,
+    /// When the last of those finished.
+    quiet_at: Option<Instant>,
 }
 
 impl SourceReload {
@@ -51,6 +58,13 @@ impl SourceReload {
     /// deadline and the rest join it, so a stream of writes still reads at
     /// most once per [`SOURCE_RELOAD_DELAY`] plus the read itself.
     pub(super) fn owe(&mut self, now: Instant, untracked_only: bool) {
+        if self
+            .quiet_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= UNTRACKED_BACKOFF_MEMORY)
+        {
+            self.quiet = 0;
+            self.quiet_at = None;
+        }
         let delay = if untracked_only {
             (SOURCE_RELOAD_DELAY * 2u32.pow(self.quiet.min(5))).min(MAX_UNTRACKED_RELOAD_DELAY)
         } else {
@@ -80,6 +94,7 @@ impl SourceReload {
             self.quiet = 0;
         } else if self.reading_untracked {
             self.quiet = self.quiet.saturating_add(1);
+            self.quiet_at = Some(now);
         }
         self.reading_untracked = false;
         if let Some(due) = &mut self.due {
@@ -1028,14 +1043,12 @@ mod tests {
             worktrees: BTreeSet::from([worktree]),
             ..Change::default()
         };
-        assert_eq!(
-            app.source_control_watch_change(key.project_id, &change(WorktreeId::new())),
-            None
-        );
-        assert_eq!(
-            app.source_control_watch_change(ProjectId::new(), &change(key.worktree_id)),
-            None
-        );
+        // Through the update's own handling of what the watcher drained:
+        // another checkout of the project, or another project's checkout
+        // with the same id, owes the panel nothing.
+        assert!(app.apply_git_changes([(key.project_id, change(WorktreeId::new()))]));
+        assert!(app.apply_git_changes([(ProjectId::new(), change(key.worktree_id))]));
+        assert_eq!(app.refresh_ui.source_reload.due(), None);
         let untracked = Change {
             untracked: BTreeSet::from([key.worktree_id]),
             ..Change::default()
@@ -1045,20 +1058,19 @@ mod tests {
             Some(true)
         );
 
-        let now = Instant::now();
-        for offset in 0..1_000 {
-            if let Some(untracked_only) =
-                app.source_control_watch_change(key.project_id, &change(key.worktree_id))
-            {
-                app.refresh_ui
-                    .source_reload
-                    .owe(now + Duration::from_micros(offset), untracked_only);
-            }
+        // A thousand changes to the shown checkout owe it one read, due the
+        // delay after the first.
+        let before = Instant::now();
+        for _ in 0..1_000 {
+            assert!(app.apply_git_changes([(key.project_id, change(key.worktree_id))]));
         }
-        assert_eq!(
-            app.refresh_ui.source_reload.due(),
-            Some(now + SOURCE_RELOAD_DELAY)
-        );
+        let after = Instant::now();
+        assert!(app.refresh_ui.source_reload.due().is_some_and(|due| due
+            >= before + SOURCE_RELOAD_DELAY
+            && due <= after + SOURCE_RELOAD_DELAY));
+        // Untracked paths alone owe the panel a read and nothing derived,
+        // so the update that takes them skips the workspace projection.
+        assert!(!app.apply_git_changes([(key.project_id, untracked)]));
         assert_ne!(
             app.refresh_subscription().units(),
             0,
@@ -1127,6 +1139,16 @@ mod tests {
         assert_eq!(delay(&mut reload, true), MAX_UNTRACKED_RELOAD_DELAY);
         reload.read_finished(Instant::now(), true);
         assert_eq!(delay(&mut reload, true), SOURCE_RELOAD_DELAY);
+
+        // Churn that stops is forgotten: backed off fully, then quiet for
+        // longer than the memory, a new untracked file reads promptly.
+        for _ in 0..8 {
+            delay(&mut reload, true);
+            reload.read_finished(Instant::now(), false);
+        }
+        let later = Instant::now() + UNTRACKED_BACKOFF_MEMORY;
+        reload.owe(later, true);
+        assert_eq!(reload.due().unwrap() - later, SOURCE_RELOAD_DELAY);
     }
 
     #[test]

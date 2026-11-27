@@ -818,6 +818,36 @@ impl Change {
         }
     }
 
+    /// Whether this reports nothing but untracked paths: no status read
+    /// without untracked files, ref, configuration or watch coverage moved,
+    /// so only a reader of untracked files has anything to do.
+    pub fn untracked_only(&self) -> bool {
+        // Destructured so a new field must be judged here.
+        let Self {
+            worktrees,
+            untracked,
+            references,
+            configuration,
+            rescan,
+            topology,
+            membership,
+            error,
+            coverage,
+            recoverable: _,
+            unwatched,
+        } = self;
+        !untracked.is_empty()
+            && worktrees.is_empty()
+            && !references
+            && !configuration
+            && !rescan
+            && !topology
+            && !membership
+            && error.is_none()
+            && coverage.is_none()
+            && unwatched.is_none()
+    }
+
     pub fn merge(&mut self, other: Self) {
         self.worktrees.extend(other.worktrees);
         self.untracked.extend(other.untracked);
