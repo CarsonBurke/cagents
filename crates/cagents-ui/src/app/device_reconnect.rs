@@ -95,8 +95,10 @@ impl Reconnect {
         })
     }
 
-    fn busy(&self) -> bool {
-        matches!(self.phase, Phase::Checking | Phase::Connecting)
+    /// Opening the window or updating the device, which leaving now would
+    /// cut short.
+    fn committed(&self) -> bool {
+        matches!(self.phase, Phase::Connecting)
             || matches!(
                 self.phase,
                 Phase::Needs {
@@ -105,6 +107,10 @@ impl Reconnect {
                 }
             )
     }
+
+    fn busy(&self) -> bool {
+        self.committed() || matches!(self.phase, Phase::Checking)
+    }
 }
 
 /// Opens this computer's window in place of the device's, and forgets that
@@ -112,18 +118,14 @@ impl Reconnect {
 fn open_here(device: &str, slot: &str) -> Result<(), String> {
     let origin =
         crate::device::placement::origin(device, slot).map_err(|error| error.to_string())?;
-    if let Some(origin) = &origin {
-        crate::device::placement::record(origin, None).map_err(|error| error.to_string())?;
-    }
     let launcher = crate::companion::Product::Cli
         .beside_current()
         .map_err(|error| error.to_string())?;
-    let mut command = std::process::Command::new(launcher);
-    command.args(["--device", "local", "ui"]);
-    if let Some(origin) = &origin {
-        command.args(["--window", origin]);
-    }
-    command
+    // Naming this computer skips the record, so it can go once the window
+    // is on its way.
+    std::process::Command::new(launcher)
+        .args(["--device", "local", "ui", "--window"])
+        .arg(origin.as_deref().unwrap_or(crate::instance::PRIMARY_WINDOW))
         .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV)
         .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
         .stdin(std::process::Stdio::null())
@@ -131,8 +133,13 @@ fn open_here(device: &str, slot: &str) -> Result<(), String> {
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("Could not open cagents on this computer: {error}"))
+        .map_err(|error| format!("Could not open cagents on this computer: {error}"))?;
+    if let Some(origin) = &origin
+        && let Err(error) = crate::device::placement::record(origin, None)
+    {
+        tracing::warn!(%error, "could not forget which device this window showed");
+    }
+    Ok(())
 }
 
 impl cosmic::Application for Reconnect {
@@ -224,8 +231,12 @@ impl cosmic::Application for Reconnect {
                     return Task::none();
                 };
                 match result {
-                    // The device can serve this window now.
-                    Ok(_) => self.connect(),
+                    // The device can serve this window now. A note, such as
+                    // an executable SSH commands miss, stays in view.
+                    Ok(Success { note, .. }) => {
+                        self.notice = note;
+                        self.connect()
+                    }
                     Err(Failure { error, report }) => {
                         *status = Some(RunStatus::Failed { error, report });
                         Task::none()
@@ -233,7 +244,7 @@ impl cosmic::Application for Reconnect {
                 }
             }
             ReconnectMessage::OpenHere => {
-                if self.busy() {
+                if self.committed() {
                     return Task::none();
                 }
                 let Request { device, slot, .. } = self.request.clone();
@@ -254,7 +265,9 @@ impl cosmic::Application for Reconnect {
 
     fn view(&self) -> Element<'_, ReconnectMessage> {
         let device = self.request.device.as_str();
-        let busy = self.busy();
+        let committed = self.committed();
+        // Nothing runs on a device without cagents.
+        let mut hosts_work = true;
         let waiting = |title: String| -> Element<'_, ReconnectMessage> {
             widget::row::with_children(vec![
                 crate::ui_controls::activity_spinner(20.0, design::accent_color),
@@ -289,6 +302,10 @@ impl cosmic::Application for Reconnect {
                 blocked,
                 status,
             } => {
+                hosts_work = *need != Need::Install;
+                // Without an update to offer here, the fix is made on the
+                // device or this computer, and then tried again.
+                retry = blocked.is_some() || matches!(need, Need::Newer(_));
                 rows.push(design::title(format!("Couldn't reconnect to {device}")).into());
                 rows.push(strip(
                     device,
@@ -300,12 +317,14 @@ impl cosmic::Application for Reconnect {
                 ));
             }
         }
-        rows.push(
-            design::caption(format!(
-                "Its terminals and conversations keep running on {device}."
-            ))
-            .into(),
-        );
+        if hosts_work {
+            rows.push(
+                design::caption(format!(
+                    "Its terminals and conversations keep running on {device}."
+                ))
+                .into(),
+            );
+        }
         if let Some(notice) = &self.notice {
             rows.push(design::caption(notice.clone()).into());
         }
@@ -320,7 +339,7 @@ impl cosmic::Application for Reconnect {
         actions.push(
             crate::ui_controls::button::secondary("Open on this computer")
                 .name("Open this window on this computer instead")
-                .on_press_maybe((!busy).then_some(ReconnectMessage::OpenHere))
+                .on_press_maybe((!committed).then_some(ReconnectMessage::OpenHere))
                 .into(),
         );
         actions.push(
@@ -342,6 +361,11 @@ impl cosmic::Application for Reconnect {
 /// instead, or is closed.
 pub fn run_device_reconnect(request: Request) -> Result<(), Box<dyn std::error::Error>> {
     request.validate()?;
+    // One screen per window: another start that failed the same way leaves
+    // this one to explain it.
+    let Some(_showing) = crate::instance::hold_device_reconnect(&request.slot)? else {
+        return Ok(());
+    };
     type Shell = Cosmic<Reconnect>;
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
     let request = std::cell::RefCell::new(Some(request));
@@ -400,6 +424,9 @@ mod tests {
     #[test]
     fn a_device_that_cannot_be_reached_offers_another_try() {
         let mut screen = screen(Phase::Checking);
+        // Checking an unreachable device takes its SSH timeouts; this
+        // computer's window stays a choice meanwhile.
+        assert!(!screen.committed());
         let _ = screen.update(ReconnectMessage::Diagnosed(OpenFailure::Other(
             "Could not connect to build-host.".into(),
         )));
@@ -407,6 +434,7 @@ mod tests {
         assert!(!screen.busy());
         let _ = screen.update(ReconnectMessage::Retry);
         assert!(matches!(screen.phase, Phase::Connecting));
+        assert!(screen.committed());
         // A second press while connecting starts nothing more.
         let _ = screen.update(ReconnectMessage::Retry);
         assert!(matches!(screen.phase, Phase::Connecting));

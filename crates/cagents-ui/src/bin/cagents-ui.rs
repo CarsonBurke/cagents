@@ -225,7 +225,7 @@ fn report_startup_failure(message: &str, still_starting: bool, reported_by_calle
                 spawn_device_reconnect(&cagents_ui::app::DeviceReconnectRequest {
                     device: device.clone(),
                     slot: slot.clone(),
-                    reason: message.to_owned(),
+                    reason: within_bytes(message, MAX_RECONNECT_REASON_BYTES).to_owned(),
                 })
             }
             None => spawn_startup_error_dialog(message, still_starting),
@@ -242,6 +242,20 @@ fn sentence(message: &str) -> String {
     characters.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(characters).collect::<String>() + "."
     })
+}
+
+/// What the reconnect screen accepts of a reason, in bytes. Its payload
+/// limit allows for every byte of it escaped.
+const MAX_RECONNECT_REASON_BYTES: usize = 2048;
+const MAX_RECONNECT_PAYLOAD_BYTES: usize = 6 * MAX_RECONNECT_REASON_BYTES + 1024;
+
+/// At most `limit` bytes of `text`, ending on a character boundary.
+fn within_bytes(text: &str, limit: usize) -> &str {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn truncated(message: &str) -> &str {
@@ -444,7 +458,7 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if arguments.peek() == Some(&DEVICE_RECONNECT) {
         arguments.next();
         let payload = arguments.next().ok_or("missing device window context")?;
-        if payload.len() > 8192 || arguments.next().is_some() {
+        if payload.len() > MAX_RECONNECT_PAYLOAD_BYTES || arguments.next().is_some() {
             return Err("invalid device window context".into());
         }
         let request: cagents_ui::app::DeviceReconnectRequest = serde_json::from_str(payload)?;
@@ -528,7 +542,9 @@ fn prepare_device(caller_reports_startup_failure: bool) -> std::io::Result<()> {
             let _ = done.send(());
             result
         });
-        if finished.recv_timeout(STARTUP_WAIT_NOTICE_DELAY).is_err() {
+        if finished.recv_timeout(STARTUP_WAIT_NOTICE_DELAY)
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
             // Shown from this thread, which outlives startup: the notice
             // ends with the thread that started it.
             show_startup_wait_notice(StartupWaitKind::Device(device.name.clone()));
@@ -884,7 +900,7 @@ impl cosmic::Application for StartupWait {
             ),
             StartupWaitKind::Device(name) => (
                 format!("Connecting to {name}…"),
-                format!("Your {name} window opens as soon as the connection is ready."),
+                format!("This window opens as soon as {name} answers."),
                 "Hiding this message does not stop the window from opening.",
             ),
         };
@@ -1008,4 +1024,23 @@ fn run_startup_error_dialog(
     })
     .run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod reconnect_payload_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_reason_still_fits_the_reconnect_screen() {
+        let reason = "é\u{1}".repeat(4096);
+        let cut = within_bytes(&reason, MAX_RECONNECT_REASON_BYTES);
+        assert!(cut.len() <= MAX_RECONNECT_REASON_BYTES && reason.starts_with(cut));
+        let payload = serde_json::to_string(&cagents_ui::app::DeviceReconnectRequest {
+            device: "build-host".into(),
+            slot: cagents::device::scoped_window_slot("build-host", "primary"),
+            reason: cut.to_owned(),
+        })
+        .unwrap();
+        assert!(payload.len() <= MAX_RECONNECT_PAYLOAD_BYTES);
+    }
 }

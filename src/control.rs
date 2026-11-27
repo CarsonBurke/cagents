@@ -4732,8 +4732,17 @@ fn launch_ui(
         slot
     };
     // A window switched to a device reopens there, unless this computer was
-    // asked for by name, as a switch back to it does.
-    let placed = (!new_window && !crate::device::is_remote() && !crate::device::local_chosen())
+    // asked for by name, as a switch back to it does. Any window already open
+    // comes forward first, as it always has.
+    let follow_placement =
+        !new_window && !crate::device::is_remote() && !crate::device::local_chosen();
+    if follow_placement
+        && slot.is_none()
+        && instance::activate_running_ui().map_err(|error| AppError::new("launch", error))?
+    {
+        return Ok(already_running_ui_output());
+    }
+    let placed = follow_placement
         .then(|| placed_device(slot.unwrap_or(instance::PRIMARY_WINDOW)))
         .flatten();
     let device = placed
@@ -4752,6 +4761,11 @@ fn launch_ui(
         None => instance::activate_running_ui(),
     };
     if !new_window && activate().map_err(|error| AppError::new("launch", error))? {
+        return Ok(already_running_ui_output());
+    }
+    // A screen already says why this device window did not open, and offers
+    // to try again; another attempt beside it would only stack a second one.
+    if device.is_some() && slot.is_some_and(instance::device_reconnect_showing) {
         return Ok(already_running_ui_output());
     }
     let executable = crate::companion::Product::Ui

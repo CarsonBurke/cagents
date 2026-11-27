@@ -2647,6 +2647,32 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
     .map(|_| ())
 }
 
+fn device_reconnect_lock_path(slot: &str) -> io::Result<PathBuf> {
+    validate_window_slot(slot)?;
+    Ok(runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}-reconnect-{slot}")))
+}
+
+/// Claims the screen that explains why device window `slot` did not open,
+/// or `None` when one already does.
+pub fn hold_device_reconnect(slot: &str) -> io::Result<Option<OwnedLock>> {
+    match owned_lock(
+        &device_reconnect_lock_path(slot)?,
+        libc::LOCK_EX | libc::LOCK_NB,
+    ) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a screen explains why device window `slot` did not open, so that
+/// opening it again waits for that screen's own Try again.
+pub fn device_reconnect_showing(slot: &str) -> bool {
+    device_reconnect_lock_path(slot)
+        .and_then(|path| owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB))
+        .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+}
+
 /// Opens saved window `slot` of `device` with this computer's UI. A start
 /// that fails is returned, not shown in a startup dialog: the caller explains
 /// it. An open window is brought forward instead.
@@ -2666,7 +2692,13 @@ pub fn launch_device_window(device: &str, slot: &str) -> io::Result<()> {
     match crate::control::spawn_ui_process(&mut command) {
         Ok(_) => Ok(()),
         Err(error) if error.to_string() == ApplicationLeaseError::AlreadyRunning.to_string() => {
-            activate_window(slot).map(|_| ())
+            if activate_window(slot)? {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "That window is still closing. Try again in a moment.",
+                ))
+            }
         }
         Err(error) => Err(error),
     }
