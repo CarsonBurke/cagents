@@ -18350,6 +18350,7 @@ impl Cagents {
                 | Message::ProjectUi(
                     project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
                 ) => return ControlFlow::Break(Task::none()),
+                Message::ProjectUi(action) if project_ui::runs_in_device_window(action) => {}
                 Message::ChatUi(
                     chat_ui::Action::Attach(_)
                     | chat_ui::Action::Attached(..)

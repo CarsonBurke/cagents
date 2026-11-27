@@ -2103,8 +2103,8 @@ impl Cagents {
                     super::notice_detail(removal.repository.display().to_string()),
                     super::notice_body(detail),
                     super::notice_detail(match removal.kind {
-                        ProjectKind::Folder => "Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay on disk.",
-                        ProjectKind::Git => "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
+                        ProjectKind::Folder => format!("Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay {}.", files_stay()),
+                        ProjectKind::Git => format!("Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay {}.", files_stay()),
                     }),
                 ])
                 .spacing(space::M),
@@ -2592,11 +2592,54 @@ pub(super) fn scope_resolutions() -> usize {
     SCOPE_RESOLUTIONS.get()
 }
 
+#[cfg(test)]
+pub(super) fn device_aware_scope_contains(roots: &[PathBuf], directory: &Path) -> bool {
+    ProjectSessionScope::new(roots.to_vec(), Vec::new()).contains(directory)
+}
+
 /// Resolves `path` on disk, as every root and directory a scope compares is.
+/// A device window's paths are the device's, as its daemon reported them,
+/// and resolving them here would read this computer's files instead.
 fn resolve_scope_path(path: &Path) -> Option<PathBuf> {
+    if crate::device::is_remote() {
+        return None;
+    }
     #[cfg(test)]
     SCOPE_RESOLUTIONS.set(SCOPE_RESOLUTIONS.get() + 1);
     path.canonicalize().ok()
+}
+
+/// Where a removed project's files stay: on this computer's disk, or on the
+/// device a device window shows.
+pub(super) fn files_stay() -> String {
+    match crate::device::selected() {
+        Some(device) => format!("on {}", device.name),
+        None => "on disk".to_owned(),
+    }
+}
+
+/// Whether `action` works in a device window, which refuses the rest of
+/// this computer's project and Git work. Removing a project reads and edits
+/// the device's registry, so its confirmation and results run there.
+pub(super) fn runs_in_device_window(action: &Action) -> bool {
+    match action {
+        Action::ConfirmRemove
+        | Action::RemovedProject { .. }
+        | Action::AwaitClosedProject(..)
+        | Action::ProjectSessionsClosed(..)
+        | Action::Dismiss => true,
+        // Deleting a worktree runs this computer's Git, as do opening an
+        // editor or file manager and inspecting a merged worktree.
+        Action::Command { .. }
+        | Action::EditorsLoaded(_)
+        | Action::ConfirmDelete
+        | Action::RetryDelete(_)
+        | Action::AwaitSessions(..)
+        | Action::MergedWorktreeKept { .. }
+        | Action::Deleted { .. }
+        | Action::AvatarLoaded { .. }
+        | Action::Finished(_) => false,
+    }
 }
 
 impl ProjectSessionScope {
@@ -2636,7 +2679,6 @@ fn shared_project_session_scope(
     projects: &[crate::workspace_model::ModelProject],
 ) -> Result<ProjectSessionScope, String> {
     let mut protected = Vec::new();
-    let service = RepositoryService::system("git");
     for project in projects {
         if project.repository == repository {
             continue;
@@ -2644,13 +2686,38 @@ fn shared_project_session_scope(
         match project.kind {
             ProjectKind::Folder => protected.push(project.repository.clone()),
             ProjectKind::Git => {
-                let records = service.list_worktrees(&project.repository, &CancellationToken::default())
+                let worktrees = list_worktree_paths(&project.repository)
                     .map_err(|error| format!("Could not verify worktrees owned by {} before removing this project: {error}", project.name))?;
-                protected.extend(records.into_iter().map(|record| record.path));
+                protected.extend(worktrees);
             }
         }
     }
     Ok(ProjectSessionScope::new(roots.to_vec(), protected))
+}
+
+/// The checkouts Git lists for `repository`, read where the repository is:
+/// on this computer, or through the device service in a device window,
+/// whose paths name nothing here.
+fn list_worktree_paths(repository: &Path) -> Result<Vec<PathBuf>, String> {
+    if crate::device::is_remote() {
+        return match crate::device_service::request(
+            crate::device_service::Operation::ProjectNavigation {
+                repository: repository.to_path_buf(),
+                kind: ProjectKind::Git,
+            },
+        )? {
+            crate::device_service::Reply::ProjectNavigation(navigation) => Ok(navigation
+                .worktrees
+                .into_iter()
+                .map(|worktree| worktree.path)
+                .collect()),
+            _ => Err("Unexpected project navigation reply".into()),
+        };
+    }
+    RepositoryService::system("git")
+        .list_worktrees(repository, &CancellationToken::default())
+        .map(|records| records.into_iter().map(|record| record.path).collect())
+        .map_err(|error| error.to_string())
 }
 
 fn project_session_roots(
@@ -2661,12 +2728,11 @@ fn project_session_roots(
     if kind == ProjectKind::Folder {
         return roots;
     }
-    let service = RepositoryService::system("git");
     // A missing checkout must still be removable using its saved roots.
-    if let Ok(records) = service.list_worktrees(repository, &CancellationToken::default()) {
-        for record in records {
-            if !roots.contains(&record.path) {
-                roots.push(record.path);
+    if let Ok(worktrees) = list_worktree_paths(repository) {
+        for path in worktrees {
+            if !roots.contains(&path) {
+                roots.push(path);
             }
         }
     }
