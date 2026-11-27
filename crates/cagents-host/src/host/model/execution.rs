@@ -617,30 +617,25 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT directory FROM agent_policies WHERE agent = ?1",
-                [id.to_string()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .flatten();
-        if previous
-            .as_deref()
-            .map(decode::<crate::agent_execution::DirectoryIdentity>)
-            .transpose()?
-            .is_some_and(|previous| previous != identity)
-        {
-            return Err("The agent's approved directory identity cannot change".into());
-        }
-        tx.execute(
-            "INSERT INTO agent_policies(agent, directory) VALUES (?1, ?2)
-            ON CONFLICT(agent) DO UPDATE SET directory = excluded.directory",
-            params![id.to_string(), encode(&identity)?],
-        )
-        .map_err(|error| error.to_string())?;
+        pin_agent_directory_in(&tx, id, identity)?;
         tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Records the directory `id`'s project admitted for its next provider,
+    /// in place of one that no longer sits at the agent's path.
+    pub(crate) fn record_agent_directory(
+        &mut self,
+        id: AgentId,
+        identity: crate::agent_execution::DirectoryIdentity,
+    ) -> Result<(), String> {
+        self.db
+            .execute(
+                "INSERT INTO agent_policies(agent, directory) VALUES (?1, ?2)
+                ON CONFLICT(agent) DO UPDATE SET directory = excluded.directory",
+                params![id.to_string(), encode(&identity)?],
+            )
+            .map(drop)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn agent_directory(
@@ -1443,14 +1438,18 @@ impl Registry {
         request: &Submit,
         now_ms: u64,
     ) -> Result<Accepted, AcceptanceError> {
-        self.submit_agent_with_spec(origin, request, None, now_ms)
+        self.submit_agent_with_spec(origin, request, None, None, now_ms)
     }
 
+    /// `directory` identifies the working directory the caller opened and
+    /// checked for a new agent. It is recorded with the agent, so no start
+    /// can find the agent accepted without the directory it was accepted in.
     pub(crate) fn submit_agent_with_spec(
         &mut self,
         origin: &Origin,
         request: &Submit,
         selected: Option<&crate::agent_execution::Spec>,
+        directory: Option<crate::agent_execution::DirectoryIdentity>,
         now_ms: u64,
     ) -> Result<Accepted, AcceptanceError> {
         let limits = self.concurrency();
@@ -1460,6 +1459,12 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let accepted =
             Self::submit_agent_selected_in(&tx, origin, request, selected, now_ms, limits)?;
+        if let Some(directory) = directory
+            && accepted.created
+            && matches!(request.destination, Destination::New(_))
+        {
+            pin_agent_directory_in(&tx, accepted.agent.id, directory)?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
@@ -2992,6 +2997,40 @@ fn unsettled(tx: &Connection, agent: AgentId) -> Result<bool, String> {
         |row| row.get(0),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Records the directory an agent was accepted in. A caller that holds
+/// another directory for the agent is refused: only a provider start that
+/// judges the agent's path anew records a different one.
+fn pin_agent_directory_in(
+    tx: &Connection,
+    id: AgentId,
+    identity: crate::agent_execution::DirectoryIdentity,
+) -> Result<(), String> {
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT directory FROM agent_policies WHERE agent = ?1",
+            [id.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .flatten();
+    if previous
+        .as_deref()
+        .map(decode::<crate::agent_execution::DirectoryIdentity>)
+        .transpose()?
+        .is_some_and(|previous| previous != identity)
+    {
+        return Err("The agent's approved directory identity cannot change".into());
+    }
+    tx.execute(
+        "INSERT INTO agent_policies(agent, directory) VALUES (?1, ?2)
+        ON CONFLICT(agent) DO UPDATE SET directory = excluded.directory",
+        params![id.to_string(), encode(&identity)?],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Whether a daemon stop recorded that this open agent's bound process ended.
@@ -6991,6 +7030,44 @@ mod tests {
         context.verify_directory(directory.path()).unwrap();
         let replacement = tempfile::tempdir().unwrap();
         assert!(context.verify_directory(replacement.path()).is_err());
+    }
+
+    /// #4327: the directory a new agent was checked in is recorded in the
+    /// transaction that accepts it, so no accepted agent is without one, and a
+    /// later start that judges another directory records that one instead.
+    #[test]
+    fn a_new_agents_directory_is_recorded_as_it_is_accepted() {
+        let (mut registry, directory, request) = fixture();
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(directory.path()).unwrap(),
+        );
+        let accepted = registry
+            .submit_agent_with_spec(&Origin::User, &request, None, Some(identity), 1)
+            .unwrap();
+        assert_eq!(
+            registry.agent_directory(accepted.agent.id).unwrap(),
+            Some(identity)
+        );
+        // Repeating the request accepts nothing new and records nothing.
+        let other = crate::agent_execution::DirectoryIdentity {
+            inode: identity.inode.wrapping_add(1),
+            ..identity
+        };
+        let repeated = registry
+            .submit_agent_with_spec(&Origin::User, &request, None, Some(other), 2)
+            .unwrap();
+        assert!(!repeated.created);
+        assert_eq!(
+            registry.agent_directory(accepted.agent.id).unwrap(),
+            Some(identity)
+        );
+        registry
+            .record_agent_directory(accepted.agent.id, other)
+            .unwrap();
+        assert_eq!(
+            registry.agent_directory(accepted.agent.id).unwrap(),
+            Some(other)
+        );
     }
 
     /// A channel beside the agent's own, to move its pane into: worktree

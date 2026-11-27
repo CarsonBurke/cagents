@@ -370,25 +370,6 @@ impl Registry {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    pub(crate) fn automation_project_kind(
-        &self,
-        repository: &std::path::Path,
-    ) -> Result<crate::model::ProjectKind, String> {
-        let kind: String = self
-            .db
-            .query_row(
-                "SELECT kind FROM projects WHERE repository=?1",
-                [super::repository_key(repository)?],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("The automation project is unavailable: {error}"))?;
-        match kind.as_str() {
-            "git" => Ok(crate::model::ProjectKind::Git),
-            "folder" => Ok(crate::model::ProjectKind::Folder),
-            _ => Err("The automation project has an unsupported kind".into()),
-        }
-    }
-
     pub(crate) fn active_automation_firings(&self) -> Result<Vec<Firing>, String> {
         let mut query = self.db.prepare("SELECT f.record FROM automations a JOIN automation_firings f ON f.id=a.active_firing ORDER BY f.created_ms,f.id")
             .map_err(|error| error.to_string())?;

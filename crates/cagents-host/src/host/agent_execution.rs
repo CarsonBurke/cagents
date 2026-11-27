@@ -25,6 +25,7 @@ mod ownership;
 pub(super) mod prompt_cache;
 pub(super) mod terminals;
 mod transcript;
+pub(super) mod working_directory;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run_under_control, interactive, reconcile_agent_run_under_control,
 };
@@ -273,6 +274,9 @@ fn accept(
     // Earlier messages are held exactly when the follow-up is refused: a
     // limit of unknown end lets both through, in order, to test it.
     let limited = limit.is_some_and(|limit| limit.resets_at.is_some());
+    // A new agent's directory, held open from here until its provider starts
+    // in it, so the directory checked is the directory used.
+    let mut directory = None;
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -285,22 +289,13 @@ fn accept(
         }
         // The working directory bounds what the provider approves and lets
         // the child write on its own, so it must lie in the project the agent
-        // is for: its checkout, one of its worktrees, or a folder in them.
-        // Projects can nest, so this is the nearest open one, as `sessions`
-        // and the CLI name it. The registry refuses a project that is not
-        // open; say that rather than that the directory is outside it.
-        if model.project(&selected.target.repository).is_none() {
-            return Err("The target project is not open".into());
-        }
-        let containing = crate::project_location::place(&selected.target.directory, &model).project;
-        if containing.as_ref() != Some(&selected.target.repository) {
-            return Err(format!(
-                "{} is not in the project {}; pass a directory inside it",
-                selected.target.directory.display(),
-                crate::workspace_model::primary_checkout(&selected.target.repository).display()
-            )
-            .into());
-        }
+        // is for. The registry refuses a project that is not open; the rule
+        // says that first, rather than that the directory is outside it.
+        directory = Some(working_directory::admit(
+            &selected.target.directory,
+            &selected.target.repository,
+            &model.projects,
+        )?);
         // An agent never gives its child more than it has itself.
         if let Some(ceiling) = caller_ceiling(host, authority)? {
             selected.permission_mode =
@@ -321,6 +316,10 @@ fn accept(
     } else {
         None
     };
+    let recorded = directory
+        .as_deref()
+        .map(working_directory::identity)
+        .transpose()?;
     // Messages sent to the agent earlier go first, so its runs keep the
     // order they were accepted in. One sent meanwhile is handed over too.
     let mut attempts = 0;
@@ -331,7 +330,7 @@ fn accept(
         match registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())
+            .submit_agent_with_spec(&origin, &request, selected.as_ref(), recorded, now())
         {
             Err(crate::agent_execution::AcceptanceError::Invalid(error))
                 if error == crate::host::model::EARLIER_MESSAGES && attempts < 3 =>
@@ -345,7 +344,12 @@ fn accept(
     let start = match &request.destination {
         Destination::Existing(_) => start(host, &accepted),
         Destination::New(_) => {
-            dispatch_accepted(host, accepted.clone())?;
+            match directory {
+                Some(directory) => {
+                    dispatch_accepted_in_directory(host, accepted.clone(), directory)?
+                }
+                None => dispatch_accepted(host, accepted.clone())?,
+            }
             Ok(Start::Sent { resumed: false })
         }
     };
@@ -591,6 +595,11 @@ fn resume(
                 .into(),
         );
     }
+    // The start below opens the agent's directory and runs the provider only
+    // there. Asking first refuses a directory that changed before anything
+    // about the conversation is prepared, and says why.
+    working_directory::open_for_start(registry, agent)
+        .map_err(|error| format!("Cannot reopen the agent's conversation: {error}"))?;
     let unavailable = |error: crate::terminal_ipc::ProtocolError| {
         format!("Cannot reopen the agent's conversation: {}", error.message)
     };
@@ -998,45 +1007,47 @@ fn dispatch(
     let gate = agent_gate(host, accepted.agent.id);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
-    let mut context = Arc::new(chat::protocol::ExecutionContext::new(directory));
-    context
-        .verify_directory(&accepted.agent.spec.target.directory)
-        .map_err(before)?;
     registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .validate_agent_dispatch(accepted)
         .map_err(before)?;
-    if let Some(identity) = context.directory_identity().map_err(before)? {
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .pin_agent_directory(accepted.agent.id, identity)
-            .map_err(before)?;
-    } else if let Some(identity) = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .agent_directory(accepted.agent.id)
-        .map_err(before)?
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&accepted.agent.spec.target.directory)
-            .map_err(|error| before(error.to_string()))?;
-        context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
-            directory,
-        ))));
-        if context.directory_identity().map_err(before)? != Some(identity) {
-            return Err(before(
-                "The approved agent directory changed before provider dispatch".into(),
-            ));
+    let path = &accepted.agent.spec.target.directory;
+    let directory = match directory {
+        // Opened and checked by the caller: a new agent's acceptance, or an
+        // automation's firing. An agent keeps the directory it began with.
+        Some(directory) => {
+            let identity = working_directory::identity(&directory).map_err(before)?;
+            working_directory::reopen(path, identity).map_err(before)?;
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pin_agent_directory(accepted.agent.id, identity)
+                .map_err(before)?;
+            Some(directory)
         }
-        context
-            .verify_directory(&accepted.agent.spec.target.directory)
-            .map_err(before)?;
-    }
+        None => {
+            let recorded = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_directory(accepted.agent.id)
+                .map_err(before)?;
+            if !matches!(accepted.agent.session, Some(HostedSession::Chat(_))) {
+                // This run starts the agent's provider.
+                Some(working_directory::for_start(&registry, &accepted.agent).map_err(before)?)
+            } else {
+                // A provider serves the agent already, in the recorded
+                // directory: its path must still name that one. One started
+                // before directories were recorded is left as it is, and its
+                // next start records one.
+                recorded
+                    .map(|recorded| working_directory::reopen(path, recorded))
+                    .transpose()
+                    .map_err(before)?
+            }
+        }
+    };
+    let context = Arc::new(chat::protocol::ExecutionContext::new(directory));
     if matches!(accepted.agent.origin, Origin::Automation { .. })
         && !registry
             .lock()
@@ -1275,9 +1286,9 @@ fn dispatch(
         create_console(host, &registry, accepted.agent.id, &session, &handle)
             .map_err(ConsoleError::run_failure)?;
     }
-    context
-        .verify_directory(&accepted.agent.spec.target.directory)
-        .map_err(before)?;
+    // The provider reads paths as well as its own directory, so the path must
+    // still name the directory when the prompt goes.
+    context.verify_directory(path).map_err(before)?;
     if matches!(accepted.agent.origin, Origin::Automation { .. }) {
         // Live interactive work may survive removal; each scheduled prompt
         // still requires its explicitly selected account to be registered.
