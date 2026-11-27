@@ -2524,6 +2524,21 @@ harness, it provides:
   width and size, so a pair can be compared and named in the PR. Shots are
   lossy WebP; `shot NAME --lossless` keeps every pixel, for comparing borders,
   edges and fades pixel by pixel.
+- **Edited shots stay edited.** Every capture also goes to the task's `raw/`,
+  and a capture replaces a shot in `shots/` only while that shot is missing or
+  still exactly the last capture. A shot you changed, such as one with an
+  address masked out, is never overwritten by a retake or, through `--remote`,
+  by a later `shot`, `fetch` or `pair` bringing the host's copies back: the
+  tool says it kept it and leaves the new capture in `raw/`. Copy that over
+  the shot to use it. `raw/` holds the unedited originals, so never publish
+  from it.
+- **Identities at shot time.** Fixture accounts use addresses such as
+  `fixture@example.test` that can never be real. Where the host has
+  tesseract with English data, `shot` reads the capture's text and warns when
+  it shows any other address or a private identity, as `scripts/pr-screenshots`
+  checks before publishing (see [Publishing screenshots](#publishing-screenshots)).
+  A live provider or a linked real account home shows its real address; capture
+  with fixture accounts instead.
 - **A shared path caveat.** With no worktree selected, the Workspace page shows
   the app's working directory, which is the checkout and so differs between
   sides. Select the fixture project's worktree before capturing a pair.
@@ -2729,7 +2744,7 @@ scripts/native-evidence stop
   refused while that side's session runs.
 - **The task.** Its directory's name, 1–18 letters, digits, dots, hyphens or
   underscores, names `~/.local/state/cev/NAME` on the host. Locally it holds only
-  `shots/` and `sources.tsv`. `where` prints the host's paths. The host
+  `shots/`, their originals in `raw/`, and `sources.tsv`. `where` prints the host's paths. The host
   records which machine and task directory a task belongs to, and refuses
   every command from another, and leaves alone one it didn't start, such as
   a task someone runs on the host directly, so two agents that pick the same
@@ -2751,6 +2766,43 @@ scripts/native-evidence stop
   runs, so the checkout is never rewritten under it. Stop the session first.
 - **Login shells.** Every script travels to `bash -s` on standard input, so the
   host's login shell may be fish. Commands get no standard input from here.
+
+### Publishing screenshots
+
+Publish a PR's screenshots only with `scripts/pr-screenshots publish`, never by
+committing or pushing images by hand. It refuses every image if any of them
+shows an identity, then commits exactly those images under `pr-screenshots/` on
+top of `BRANCH-screenshots`, without touching the checkout, its index or its
+branch, pushes it, and prints the immutable links with a Before/After table
+for each `before-NAME.webp` and `after-NAME.webp` pair:
+
+```sh
+scripts/pr-screenshots publish ~/.local/state/cev/pr1234-prs/shots/{before,after}-channel-prs.webp
+```
+
+`BRANCH` is the current branch unless you pass `--branch`. Run
+`scripts/pr-screenshots scan IMAGE...` for the same check alone. It reads each
+image's text by OCR and refuses:
+
+- an email address, unless its domain ends in `.test`, `.invalid`, `.example`
+  or `.localhost`, which fixtures use because they can never receive mail.
+  `--allow ADDRESS_OR_DOMAIN` accepts one that belongs in the image;
+- the repository's Git email;
+- each line of `~/.config/cagents/private-identities` (under
+  `XDG_CONFIG_HOME`), a private list of names, logins and addresses that must
+  never appear in a public image. It never leaves this machine. `--identity
+  TEXT` adds one for a single run.
+
+The report masks what it found. OCR needs tesseract with English data. Where
+this machine lacks it, the images, but not the identities, go to the host in
+`--ocr-host`, `CAGENTS_SCREENSHOT_OCR_HOST` or `CAGENTS_EVIDENCE_REMOTE` over
+SSH, so from a cagents session the check reads text on fw16. With no OCR at
+all, nothing is published.
+
+To mask an identity, edit the copy in `shots/` and publish that; the tool's
+original stays in `raw/`, which `publish` refuses. OCR misses tiny, faint or
+stylized text and avatars, so look at each image too: a clean
+check does not prove an image is safe. Prefer fixture accounts to masking.
 
 ## Installer and package checks
 

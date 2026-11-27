@@ -1,0 +1,311 @@
+#!/usr/bin/python3
+"""Check screenshots for identities, then publish them to a pull request's screenshot branch.
+
+  scripts/pr-screenshots scan [--warn] [CHECK OPTIONS] IMAGE...
+  scripts/pr-screenshots publish [--branch BRANCH] [--remote NAME] [-R OWNER/REPO] [CHECK OPTIONS] IMAGE...
+
+scan reads each image's text by OCR and refuses any that shows
+  - an email address, unless its domain ends in .test, .invalid, .example or
+    .localhost, which can never receive mail and are what fixtures use;
+  - this repository's Git email (git config user.email);
+  - a line of the private identities file,
+    ${XDG_CONFIG_HOME:-~/.config}/cagents/private-identities: names, logins,
+    addresses or anything else that must not appear in a public image, one
+    per line, # starting a comment. It stays on this machine.
+Matching ignores case and spaces, which OCR adds and drops. The report names
+each image and what kind of identity it shows, with the identity itself
+masked. --warn reports without failing, as native-evidence does at shot time.
+
+publish runs the same check on WebP images, refuses them all if any fails,
+and otherwise commits exactly those images under pr-screenshots/ on top of
+BRANCH-screenshots (BRANCH is the current branch by default), without touching
+the checkout, its index or its branch. It pushes that commit to the remote
+(origin by default) and prints the immutable links and a Before/After table for
+each before-NAME.webp and after-NAME.webp pair, to paste into the PR. It
+refuses a native-evidence task's raw/ copies: publish the shots in shots/.
+
+CHECK OPTIONS:
+  --identity TEXT  refuse TEXT as well; repeatable
+  --allow TEXT     accept this address, or any address at this domain; repeatable
+  --ocr-host HOST  read text on HOST over SSH when this machine has no
+                   tesseract with English data; the images go there, the
+                   identities never do. Defaults to CAGENTS_SCREENSHOT_OCR_HOST,
+                   then CAGENTS_EVIDENCE_REMOTE.
+
+OCR misses what it cannot read, such as tiny, faint or stylized text and
+avatars, so a clean scan does not replace looking at each image.
+
+Exit status: 0 when every image is clean (or with --warn), 1 when one shows
+an identity or publishing failed, 2 for a usage error, 3 when no OCR could run.
+"""
+
+import argparse
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+# Top-level domains reserved by RFC 2606 and RFC 6761 that never deliver mail.
+UNDELIVERABLE = frozenset({"test", "invalid", "example", "localhost"})
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.webp$")
+OCR_SECONDS = 120
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+# Sparse text: a screenshot is scattered labels rather than paragraphs.
+TESSERACT = ["tesseract", "stdin", "stdout", "--psm", "11"]
+
+
+class Unreadable(Exception):
+    """No OCR could read an image here."""
+
+
+def mask(text: str) -> str:
+    return text[0] + "…" + text[-1] if len(text) > 2 else "…"
+
+
+def normalized(text: str) -> str:
+    return "".join(text.split()).casefold()
+
+
+def identities_file() -> Path:
+    config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config) / "cagents" / "private-identities"
+
+
+def private_identities(extra: list[str]) -> list[tuple[str, str]]:
+    """(identity, where it came from) for everything that must not show."""
+    found = [(text, "--identity") for text in extra]
+    email = subprocess.run(["git", "config", "user.email"], capture_output=True, text=True).stdout.strip()
+    if email:
+        found.append((email, "the Git email"))
+    path = identities_file()
+    if path.is_file():
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                found.append((line, f"{path} line {number}"))
+    return [(text, source) for text, source in found if len(normalized(text)) >= 3]
+
+
+def allowed(address: str, allow: list[str]) -> bool:
+    domain = address.rsplit("@", 1)[1]
+    if domain.rsplit(".", 1)[-1] in UNDELIVERABLE:
+        return True
+    return any(address == entry or domain == entry or domain.endswith("." + entry) for entry in allow)
+
+
+def findings(text: str, identities: list[tuple[str, str]], allow: list[str]) -> list[str]:
+    allow = [entry.strip().casefold().lstrip("@") for entry in allow]
+    found = []
+    for match in EMAIL.finditer(text):
+        address = normalized(match.group()).rstrip(".")
+        local, domain = address.rsplit("@", 1)
+        if not re.fullmatch(r"[a-z]{2,}", domain.rsplit(".", 1)[-1]) or allowed(address, allow):
+            continue
+        description = f"an email address ({mask(local)}@{domain})"
+        if description not in found:
+            found.append(description)
+    flat = normalized(text)
+    for identity, source in identities:
+        if normalized(identity) in flat and normalized(identity) not in allow:
+            found.append(f"a private identity ({mask(identity)}, from {source})")
+    return found
+
+
+def has_english(command: list[str]) -> bool:
+    try:
+        listed = subprocess.run([*command, "tesseract", "--list-langs"], capture_output=True, text=True,
+                                timeout=OCR_SECONDS, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return listed.returncode == 0 and "eng" in (listed.stdout + listed.stderr).split()
+
+
+def ocr_route(host: str | None) -> list[str]:
+    """The prefix that runs tesseract: none here, or SSH to the host."""
+    if shutil.which("tesseract") and has_english([]):
+        return []
+    if host:
+        return [*SSH, host]
+    raise Unreadable("this machine has no tesseract with English data (tesseract-data-eng); "
+                     "install it, or name a host that has it with --ocr-host or CAGENTS_EVIDENCE_REMOTE")
+
+
+def read_text(image: Path, route: list[str]) -> str:
+    data = image.read_bytes()
+    # Larger, grey text reads more reliably; tesseract takes the image as is
+    # where ImageMagick is missing.
+    if shutil.which("magick"):
+        scaled = subprocess.run(["magick", str(image), "-colorspace", "Gray", "-resize", "200%", "png:-"],
+                                capture_output=True, timeout=OCR_SECONDS)
+        if scaled.returncode == 0 and scaled.stdout:
+            data = scaled.stdout
+    try:
+        read = subprocess.run([*route, *TESSERACT], input=data, capture_output=True, timeout=OCR_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Unreadable(f"could not read {image}: {error}") from error
+    if read.returncode != 0:
+        detail = read.stderr.decode(errors="replace").strip().splitlines()
+        where = f" on {route[-1]}" if route else ""
+        raise Unreadable(f"tesseract{where} could not read {image}: {detail[-1] if detail else read.returncode}")
+    return read.stdout.decode(errors="replace")
+
+
+def check(images: list[Path], options) -> dict[Path, list[str]]:
+    """What each image shows that it must not; raises Unreadable."""
+    identities = private_identities(options.identity)
+    route = ocr_route(options.ocr_host)
+    return {image: findings(read_text(image, route), identities, options.allow) for image in images}
+
+
+def report(results: dict[Path, list[str]], prefix: str) -> bool:
+    clean = True
+    for image, found in results.items():
+        for finding in found:
+            clean = False
+            print(f"{prefix}{image} shows {finding}", file=sys.stderr)
+    return clean
+
+
+def git(*arguments: str, environment=None, data: bytes | None = None) -> str:
+    result = subprocess.run(["git", *arguments], capture_output=True, input=data,
+                            env={**os.environ, **(environment or {})})
+    if result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(arguments)}: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout.decode().strip()
+
+
+def repository_slug(remote: str) -> str:
+    url = git("remote", "get-url", remote)
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", url)
+    if not match:
+        raise RuntimeError(f"cannot tell the GitHub repository of {remote} ({url}); pass -R OWNER/REPO")
+    return match.group(1)
+
+
+def refuse_unpublishable(images: list[Path]) -> list[str]:
+    problems, names = [], set()
+    for image in images:
+        if not image.is_file():
+            problems.append(f"{image}: no such file")
+            continue
+        if not NAME.fullmatch(image.name):
+            problems.append(f"{image}: name it NAME.webp with letters, digits, dots, hyphens or underscores")
+        with image.open("rb") as data:
+            header = data.read(12)
+        if header[:4] != b"RIFF" or header[8:12] != b"WEBP":
+            problems.append(f"{image}: not a WebP image")
+        if image.resolve().parent.name == "raw" and (image.resolve().parent.parent / "shots").is_dir():
+            problems.append(f"{image}: this is native-evidence's unedited copy; publish the one in shots/")
+        if image.name in names:
+            problems.append(f"{image}: another image has the same name")
+        names.add(image.name)
+    return problems
+
+
+def publish(images: list[Path], options) -> int:
+    branch = options.branch or git("branch", "--show-current")
+    if not branch:
+        print("pr-screenshots: no branch is checked out; pass --branch", file=sys.stderr)
+        return 2
+    target = branch if branch.endswith("-screenshots") else f"{branch}-screenshots"
+    slug = options.repository or repository_slug(options.remote)
+    listed = git("ls-remote", "--heads", options.remote, f"refs/heads/{target}")
+    base = None
+    if listed:
+        git("fetch", "-q", "--no-tags", options.remote, f"refs/heads/{target}")
+        base = git("rev-parse", "--verify", "FETCH_HEAD^{commit}")
+    index = Path(git("rev-parse", "--absolute-git-dir")) / f"pr-screenshots-index.{os.getpid()}"
+    environment = {"GIT_INDEX_FILE": str(index)}
+    try:
+        if base:
+            git("read-tree", base, environment=environment)
+        else:
+            git("read-tree", "--empty", environment=environment)
+        for image in images:
+            blob = git("hash-object", "-w", "--", str(image))
+            git("update-index", "--add", "--cacheinfo", f"100644,{blob},pr-screenshots/{image.name}",
+                environment=environment)
+        tree = git("write-tree", environment=environment)
+    finally:
+        index.unlink(missing_ok=True)
+    if base and git("rev-parse", f"{base}^{{tree}}") == tree:
+        commit = base
+    else:
+        parents = ["-p", base] if base else []
+        commit = git("commit-tree", tree, *parents, "-m", f"chore: add screenshots for {branch}")
+        git("push", "-q", options.remote, f"{commit}:refs/heads/{target}")
+    links = {image.name: f"https://github.com/{slug}/blob/{commit}/pr-screenshots/{image.name}?raw=true"
+             for image in images}
+    print(f"published {len(images)} image(s) to {target} at {commit}")
+    for name, link in links.items():
+        print(f"{name}\t{link}")
+    pairs = [name[len("before-"):-len(".webp")] for name in links
+             if name.startswith("before-") and f"after-{name[len('before-'):]}" in links]
+    for state in pairs:
+        print(f"\n| Before | After |\n| --- | --- |\n"
+              f"| ![Before]({links[f'before-{state}.webp']}) | ![After]({links[f'after-{state}.webp']}) |\n\n{state}")
+    return 0
+
+
+def main(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="pr-screenshots", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("scan", "publish"):
+        command = commands.add_parser(name)
+        command.add_argument("images", nargs="+", type=Path, metavar="IMAGE")
+        command.add_argument("--identity", action="append", default=[])
+        command.add_argument("--allow", action="append", default=[])
+        command.add_argument("--ocr-host", default=os.environ.get("CAGENTS_SCREENSHOT_OCR_HOST")
+                             or os.environ.get("CAGENTS_EVIDENCE_REMOTE") or None)
+        if name == "scan":
+            command.add_argument("--warn", action="store_true")
+        else:
+            command.add_argument("--branch")
+            command.add_argument("--remote", default="origin")
+            command.add_argument("-R", "--repository")
+    options = parser.parse_args(arguments)
+    warn = getattr(options, "warn", False)
+    prefix = "native-evidence: warning: " if warn else "pr-screenshots: "
+    if options.command == "publish" and (problems := refuse_unpublishable(options.images)):
+        for problem in problems:
+            print(f"pr-screenshots: {problem}", file=sys.stderr)
+        return 2
+    missing = [image for image in options.images if not image.is_file()]
+    if missing:
+        print(f"{prefix}no such file: {missing[0]}", file=sys.stderr)
+        return 0 if warn else 2
+    try:
+        results = check(options.images, options)
+    except Unreadable as error:
+        if warn:
+            print(f"{prefix}did not check the shot for identities: {error}", file=sys.stderr)
+            return 0
+        print(f"pr-screenshots: cannot check for identities, so nothing was published: {error}"
+              if options.command == "publish" else f"pr-screenshots: {error}", file=sys.stderr)
+        return 3
+    if not report(results, prefix):
+        if warn:
+            print(f"{prefix}scripts/pr-screenshots publish will refuse it; capture it with fixture accounts instead",
+                  file=sys.stderr)
+            return 0
+        if options.command == "publish":
+            print("pr-screenshots: nothing was published; use fixture accounts, or mask the identity and check again",
+                  file=sys.stderr)
+        return 1
+    if options.command == "scan":
+        for image in options.images:
+            print(f"{image}: no identity found")
+        return 0
+    try:
+        return publish(options.images, options)
+    except RuntimeError as error:
+        print(f"pr-screenshots: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
