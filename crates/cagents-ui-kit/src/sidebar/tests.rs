@@ -14007,3 +14007,56 @@ fn a_rebase_step_is_committed_by_continuing_from_the_commit_box() {
         "{texts:?}"
     );
 }
+
+/// A rebase stopped with nothing staged, at an `edit` or `break` or after a
+/// step resolved to ours, goes on without a message, since Git commits
+/// nothing for it. Skip is offered too, but not over unstaged edits, which
+/// `git rebase --skip` would reset away.
+#[test]
+fn a_rebase_with_nothing_staged_continues_without_a_message() {
+    let rebase = crate::repository::InProgressOperation {
+        kind: OperationKind::Rebase,
+        pending_commit: false,
+        sequence: false,
+        subject: Some("side".into()),
+        progress: Some((2, 5)),
+        message: None,
+    };
+    let mut snapshot = snapshot();
+    snapshot.status.entries.clear();
+    snapshot.status.dirty.conflicted = 0;
+    snapshot.operation = Some(rebase);
+    let (model, state) = operation_panel(&snapshot);
+    let source = model.source_control.as_ref().unwrap();
+    assert_eq!(state.commit_message(), "");
+    assert!(source.can_skip());
+    let actions = frame_enter_presses(
+        &headless_renderer(),
+        git_panel(&model, &state, 380.0, false),
+    );
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            SidebarAction::ContinueOperation {
+                kind: OperationKind::Rebase,
+                ..
+            }
+        )),
+        "{actions:?}"
+    );
+
+    let mut edited = super::test_support::snapshot();
+    edited
+        .status
+        .entries
+        .retain(|entry| entry.area == ChangeArea::Unstaged);
+    edited.status.dirty.conflicted = 0;
+    edited.operation = snapshot.operation.clone();
+    let source = SourceControlModel::ready(main_key(), &edited);
+    assert!(!source.group(ChangeArea::Unstaged).unwrap().rows.is_empty());
+    assert_eq!(source.staged_count, 0);
+    assert!(
+        !source.can_skip(),
+        "skipping would reset the unstaged edits"
+    );
+}

@@ -1132,9 +1132,10 @@ const OPERATION_STATE_PATHS: [&str; 5] = [
 /// overrides it.
 pub const DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
 
-/// The widest `conflict-marker-size` honoured; a larger attribute value is
-/// read as this.
-const MAX_CONFLICT_MARKER_SIZE: usize = 256;
+/// The widest `conflict-marker-size` scanned for, which bounds the scan's
+/// line buffer. A larger attribute value is clamped to it, so markers wider
+/// than this are not recognized and staging such a file is not questioned.
+const MAX_CONFLICT_MARKER_SIZE: usize = 4096;
 
 /// Whether `reader` holds a line that opens or closes a conflict block:
 /// exactly `width` `<` or `>` at the start of a line, followed by a space or
@@ -6252,9 +6253,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if let Some(refusal) = self.operation_refusal(worktree, expected, cancellation)? {
             return Ok(refusal);
         }
-        let message = message
+        // The message goes to the first commit Git opens an editor for,
+        // which is this step's only when something is staged for it. With
+        // nothing staged Git commits nothing here, or drops the step, and
+        // the first editor would be a later reword or squash step's.
+        let message = match message
             .map(str::trim_end)
-            .filter(|message| !message.is_empty());
+            .filter(|message| !message.is_empty())
+        {
+            Some(message) if self.has_staged_changes(worktree, cancellation)? => Some(message),
+            _ => None,
+        };
         let staging = message
             .map(|message| -> Result<_, RepositoryError> {
                 let directory =

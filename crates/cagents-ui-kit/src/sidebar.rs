@@ -2864,7 +2864,11 @@ impl SourceControlModel {
             .as_ref()
             .is_some_and(|operation| match operation.kind {
                 OperationKind::Merge => false,
-                OperationKind::Rebase => true,
+                // `git rebase --skip` resets the working tree, which would
+                // take unstaged edits with it.
+                OperationKind::Rebase => self
+                    .group(ChangeArea::Unstaged)
+                    .is_none_or(|group| group.rows.is_empty()),
                 OperationKind::CherryPick | OperationKind::Revert => operation.pending_commit,
             })
             && self.conflict_count() == 0
@@ -12531,9 +12535,12 @@ fn changes_footer<'a>(
     // so a ticked Amend waits until the operation is over.
     let amending = state.commit_draft.amend && source.operation.is_none();
     let continuing = source.commits_by_continuing();
+    // With nothing staged, Continue commits nothing for the step and the
+    // message is not used, so it needs none.
+    let continues_without_commit = continuing && source.staged_count == 0;
     let can_commit = !modal_open
         && !source.busy()
-        && !state.commit_draft.subject.trim().is_empty()
+        && (continues_without_commit || !state.commit_draft.subject.trim().is_empty())
         && (if continuing {
             source.conflict_count() == 0
         } else if amending {
@@ -12661,12 +12668,14 @@ fn changes_footer<'a>(
         "Commit"
     };
     let kind = source.operation.as_ref().map(|operation| operation.kind);
-    let commit_hint = if !has_subject {
+    let commit_hint = if !has_subject && !continues_without_commit {
         "Enter a commit summary"
     } else if source.busy() {
         "Git operation in progress"
     } else if continuing && source.conflict_count() > 0 {
         "Resolve conflicts to continue the rebase"
+    } else if continues_without_commit {
+        "Nothing is staged; go on with the rest of the rebase"
     } else if continuing {
         "Commit this step and replay the rest"
     } else if source.conflict_count() > 0 {

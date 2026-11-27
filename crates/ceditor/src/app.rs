@@ -276,6 +276,8 @@ pub enum Message {
     StartupWindowOpened,
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
+    /// A Continue or Skip, with the draft it was submitted with.
+    Stepped(CardId, String, Result<MutationOutcome, String>),
     /// A stage refused because conflicted paths in it still hold conflict
     /// markers, which the user is then asked about.
     StageNeedsConfirmation(CardId, Vec<PathSelection>, Vec<RepoPath>),
@@ -3094,6 +3096,36 @@ impl Editor {
         + Send
         + 'static,
     ) -> Task<Message> {
+        self.git_command_reporting(id, kind, run, move |result| {
+            Message::Mutation(id, result)
+        })
+    }
+
+    /// A Git step that may commit the tab's draft, `submitted`: the draft
+    /// is settled once the step is applied, as a commit's is.
+    fn git_step(
+        &mut self,
+        id: CardId,
+        kind: MutationKind,
+        submitted: String,
+        run: impl FnOnce(&RepositoryService, &Path) -> Result<MutationOutcome, RepositoryError>
+        + Send
+        + 'static,
+    ) -> Task<Message> {
+        self.git_command_reporting(id, kind, run, move |result| {
+            Message::Stepped(id, submitted, result)
+        })
+    }
+
+    fn git_command_reporting(
+        &mut self,
+        id: CardId,
+        kind: MutationKind,
+        run: impl FnOnce(&RepositoryService, &Path) -> Result<MutationOutcome, RepositoryError>
+        + Send
+        + 'static,
+        report: impl FnOnce(Result<MutationOutcome, String>) -> Message + Send + 'static,
+    ) -> Task<Message> {
         let Some(root) = self.begin_mutation(id, kind) else {
             return Task::none();
         };
@@ -3103,7 +3135,7 @@ impl Editor {
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result.map_err(|error| error.to_string()));
-            Message::Mutation(id, result)
+            report(result)
         })
     }
 }
@@ -4216,13 +4248,12 @@ impl Application for Editor {
                         }
                         SidebarAction::ContinueOperation { kind, .. } => {
                             // A rebase step commits with the commit box's message.
-                            let message = (kind == OperationKind::Rebase)
-                                .then(|| {
-                                    self.tab(id)
-                                        .map(|tab| tab.navigation.commit_message().to_owned())
-                                })
-                                .flatten();
-                            self.git_command(id, MutationKind::Continue, move |service, root| {
+                            let draft = self
+                                .tab(id)
+                                .map(|tab| tab.navigation.commit_message().to_owned())
+                                .unwrap_or_default();
+                            let message = (kind == OperationKind::Rebase).then(|| draft.clone());
+                            self.git_step(id, MutationKind::Continue, draft, move |service, root| {
                                 service.continue_operation(
                                     root,
                                     kind,
@@ -4232,7 +4263,12 @@ impl Application for Editor {
                             })
                         }
                         SidebarAction::SkipOperation { kind, .. } => {
-                            self.git_command(id, MutationKind::Skip, move |service, root| {
+                            // The draft was for the dropped step.
+                            let draft = self
+                                .tab(id)
+                                .map(|tab| tab.navigation.commit_message().to_owned())
+                                .unwrap_or_default();
+                            self.git_step(id, MutationKind::Skip, draft, move |service, root| {
                                 service.skip_operation(root, kind, &CancellationToken::default())
                             })
                         }
@@ -4494,6 +4530,15 @@ impl Application for Editor {
                         },
                     ));
                     Task::batch([finished, ask])
+                }
+                Message::Stepped(id, submitted, result) => {
+                    if matches!(result, Ok(MutationOutcome::Applied { .. }))
+                        && let Some(tab) = self.tab_mut(id)
+                        && tab.navigation.commit_message() == submitted
+                    {
+                        tab.navigation.clear_commit_message();
+                    }
+                    self.update(Message::Mutation(id, result))
                 }
                 Message::Mutation(id, result) => {
                     let notice = match result {

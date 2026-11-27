@@ -5617,3 +5617,48 @@ fn a_cherry_pick_is_found_under_the_reftable_backend() {
     assert_eq!(pick.kind, OperationKind::CherryPick);
     assert_eq!(pick.subject.as_deref(), Some("theirs"));
 }
+
+/// The commit box's message goes to the stopped step only when something
+/// is staged for it. At an `edit` stop with nothing staged, Continue commits
+/// nothing there, and the first editor Git opens is the next `reword`
+/// step's; that commit keeps its own message.
+#[test]
+fn a_continue_with_nothing_staged_leaves_later_messages_alone() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    for name in ["one", "two", "three"] {
+        fixture.write("f.txt", format!("{name}\n").as_bytes());
+        fixture.commit_all(name);
+    }
+    fixture.git_in_work(&[
+        "-c",
+        "sequence.editor=sed -i -e 1s/^pick/edit/ -e 2s/^pick/reword/",
+        "rebase",
+        "--quiet",
+        "-i",
+        "HEAD~2",
+    ]);
+    let stopped = operation(&fixture).expect("stopped at the edit");
+    assert_eq!(stopped.kind, OperationKind::Rebase);
+
+    let continued = fixture
+        .service()
+        .continue_operation(
+            &fixture.work(),
+            OperationKind::Rebase,
+            Some("the box's message"),
+            &CancellationToken::new(),
+        )
+        .expect("continue");
+    assert!(
+        matches!(continued, MutationOutcome::Applied { .. }),
+        "{continued:?}"
+    );
+    assert_eq!(operation(&fixture), None);
+    assert_eq!(
+        fixture.text(&["log", "--format=%s", "-3"]),
+        "three\ntwo\none",
+        "no commit took the box's message"
+    );
+}
