@@ -202,31 +202,30 @@ impl Default for Memory {
 /// project this cache, so clones and worktree descriptors sharing a remote
 /// make one GraphQL listing and one conditional REST probe per period.
 #[derive(Debug, Clone, Default)]
-pub(super) struct Listings(Arc<Mutex<HashMap<ListingKey, Listing>>>);
+pub(super) struct Listings(Arc<Mutex<HashMap<ListingKey, CachedListing>>>);
+
+#[derive(Debug, Clone)]
+enum CachedListing {
+    Ready(Listing),
+    InitialFailure { at: Instant, error: Failure },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ListingKey {
     repository: GitHubRepoKey,
-    credential: Option<String>,
+    credential: String,
 }
 
 impl Listings {
-    fn get(&self, key: &ListingKey) -> Option<Listing> {
+    fn get(&self, key: &ListingKey) -> Option<CachedListing> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
-            .filter(|listing| {
-                listing.repository == key.repository && listing.credential == key.credential
-            })
             .cloned()
     }
 
-    fn put(&self, listing: Listing) {
-        let key = ListingKey {
-            repository: listing.repository.clone(),
-            credential: listing.credential.clone(),
-        };
+    fn put(&self, key: ListingKey, listing: CachedListing) {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -235,7 +234,7 @@ impl Listings {
 
     #[cfg(test)]
     fn listing_mut(&self, key: &ListingKey, change: impl FnOnce(&mut Listing)) {
-        if let Some(listing) = self
+        if let Some(CachedListing::Ready(listing)) = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -249,10 +248,6 @@ impl Listings {
 /// The last listing read, and how to ask whether it is still current.
 #[derive(Debug, Clone)]
 struct Listing {
-    repository: GitHubRepoKey,
-    /// Whose credentials read it: after `gh auth switch` it is another
-    /// account's listing.
-    credential: Option<String>,
     at: Instant,
     /// When it was read by this clock, to compare with GitHub's dates.
     read_at: jiff::Timestamp,
@@ -387,6 +382,13 @@ pub(super) struct Failure {
     /// The Unix second the refusing limit resets. Every project read with
     /// the same account shares it, so none asks before then.
     pub retry_at: Option<u64>,
+}
+
+impl Failure {
+    fn retry_due(&self) -> bool {
+        self.retry_at
+            .is_some_and(|retry_at| crate::github::polling::now() >= retry_at)
+    }
 }
 
 impl From<GitHubError> for Failure {
@@ -528,26 +530,48 @@ fn listing<E: crate::repository::ProcessExecutor>(
     freshness: Freshness,
     cancellation: &CancellationToken,
 ) -> Result<Vec<PullRequest>, Failure> {
-    let credential = crate::github_status::credential_fingerprint().ok();
+    use crate::github_status::credential_fingerprint;
+
+    let Ok(credential) = credential_fingerprint() else {
+        // Without a credential identity the response cannot be shared.
+        return read_listing(gh, repository, Probe::Unknown, cancellation)
+            .map(|listing| listing.pull_requests);
+    };
     let key = ListingKey {
         repository: repository.clone(),
-        credential: credential.clone(),
+        credential,
     };
-    let Some(mut previous) = memory.listings.get(&key) else {
-        let read = read_listing(
-            gh,
-            repository,
-            credential.clone(),
-            Probe::Unknown,
-            cancellation,
-        )?;
-        let pull_requests = read.pull_requests.clone();
-        if crate::github_status::credential_fingerprint().ok() == credential {
-            memory.listings.put(read);
+    let mut previous = match memory.listings.get(&key) {
+        Some(CachedListing::Ready(listing)) => listing,
+        Some(CachedListing::InitialFailure { at, error })
+            if freshness != Freshness::Fresh && at.elapsed() < PROBE_FOR && !error.retry_due() =>
+        {
+            return Err(error);
         }
-        return Ok(pull_requests);
+        _ => {
+            let result = read_listing(gh, repository, Probe::Unknown, cancellation);
+            if !cancellation.is_cancelled()
+                && credential_fingerprint().is_ok_and(|current| current == key.credential)
+            {
+                let cached = match &result {
+                    Ok(listing) => CachedListing::Ready(listing.clone()),
+                    Err(error) => CachedListing::InitialFailure {
+                        at: Instant::now(),
+                        error: error.clone(),
+                    },
+                };
+                memory.listings.put(key, cached);
+            }
+            return result.map(|listing| listing.pull_requests);
+        }
     };
-    if freshness != Freshness::Fresh && previous.probed_at.elapsed() < PROBE_FOR {
+    if freshness != Freshness::Fresh
+        && previous.probed_at.elapsed() < PROBE_FOR
+        && previous
+            .failed
+            .as_ref()
+            .is_none_or(|error| !error.retry_due())
+    {
         return match previous.failed {
             Some(error) => Err(error),
             None => Ok(previous.pull_requests),
@@ -567,7 +591,7 @@ fn listing<E: crate::repository::ProcessExecutor>(
     {
         previous.probe = probe.clone();
         let pull_requests = previous.pull_requests.clone();
-        memory.listings.put(previous);
+        memory.listings.put(key, CachedListing::Ready(previous));
         return Ok(pull_requests);
     }
     let (probe, recent) = match answer {
@@ -581,9 +605,9 @@ fn listing<E: crate::repository::ProcessExecutor>(
             (etag.map_or(Probe::Unknown, Probe::Validator), Some(recent))
         }
     };
-    match read_listing(gh, repository, credential.clone(), probe, cancellation) {
+    match read_listing(gh, repository, probe, cancellation) {
         // Read as another account than it would be kept for.
-        Ok(read) if crate::github_status::credential_fingerprint().ok() != credential => {
+        Ok(read) if !credential_fingerprint().is_ok_and(|current| current == key.credential) => {
             Ok(read.pull_requests)
         }
         Ok(mut read) => {
@@ -595,13 +619,19 @@ fn listing<E: crate::repository::ProcessExecutor>(
                 read.probe = Probe::Unknown;
             }
             let pull_requests = read.pull_requests.clone();
-            memory.listings.put(read);
+            memory.listings.put(key, CachedListing::Ready(read));
             Ok(pull_requests)
         }
         Err(error) => {
-            // Its validator still matches it, for when GitHub answers again.
-            previous.failed = Some(error.clone());
-            memory.listings.put(previous);
+            if !cancellation.is_cancelled()
+                && credential_fingerprint().is_ok_and(|current| current == key.credential)
+            {
+                // Keep the validator and start the retry window when the
+                // relist returns, even if it ran longer than a poll interval.
+                previous.probed_at = Instant::now();
+                previous.failed = Some(error.clone());
+                memory.listings.put(key, CachedListing::Ready(previous));
+            }
             Err(error)
         }
     }
@@ -651,15 +681,12 @@ fn ask<E: crate::repository::ProcessExecutor>(
 fn read_listing<E: crate::repository::ProcessExecutor>(
     gh: &GitHubService<E>,
     repository: &GitHubRepoKey,
-    credential: Option<String>,
     probe: Probe,
     cancellation: &CancellationToken,
 ) -> Result<Listing, Failure> {
     let read_at = jiff::Timestamp::now();
     let read = gh.authored_pull_requests(repository, OPEN, AUTHORED, cancellation)?;
     Ok(Listing {
-        repository: repository.clone(),
-        credential,
         at: Instant::now(),
         read_at,
         pull_requests: merge(read.all, read.open),
@@ -853,6 +880,7 @@ mod tests {
         /// How the probe fails, if it does: a status line.
         probe_fails: std::sync::Mutex<Option<&'static str>>,
         listing_fails: std::sync::atomic::AtomicBool,
+        listing_failed_at: std::sync::Mutex<Option<Instant>>,
         /// When the listing's GraphQL quota resets, while it is spent.
         graphql_exhausted_until: std::sync::Mutex<Option<u64>>,
         listed: std::sync::Mutex<String>,
@@ -872,6 +900,7 @@ mod tests {
                 pending: false.into(),
                 probe_fails: Default::default(),
                 listing_fails: false.into(),
+                listing_failed_at: Default::default(),
                 graphql_exhausted_until: Default::default(),
                 listed: std::sync::Mutex::new(FIRST.into()),
                 calls: Default::default(),
@@ -913,6 +942,7 @@ mod tests {
             if arguments.iter().any(|argument| argument == "graphql") {
                 self.calls.lock().unwrap().push("listing");
                 if self.listing_fails.load(Ordering::SeqCst) {
+                    *self.listing_failed_at.lock().unwrap() = Some(Instant::now());
                     return output(false, "HTTP/2.0 502 Bad Gateway\r\n\r\n".into());
                 }
                 if let Some(reset) = *self.graphql_exhausted_until.lock().unwrap() {
@@ -983,7 +1013,7 @@ mod tests {
         let mut poll = |freshness| {
             let key = ListingKey {
                 repository: repository.clone(),
-                credential: crate::github_status::credential_fingerprint().ok(),
+                credential: crate::github_status::credential_fingerprint().unwrap(),
             };
             memory.listings.listing_mut(&key, |listing| {
                 listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
@@ -1026,7 +1056,7 @@ mod tests {
         let age = |memory: &mut Memory, by: Duration| {
             let key = ListingKey {
                 repository: repository.clone(),
-                credential: crate::github_status::credential_fingerprint().ok(),
+                credential: crate::github_status::credential_fingerprint().unwrap(),
             };
             memory.listings.listing_mut(&key, |listing| {
                 listing.at = Instant::now().checked_sub(by).unwrap();
@@ -1036,7 +1066,7 @@ mod tests {
         let poll = |memory: &mut Memory, freshness| {
             let key = ListingKey {
                 repository: repository.clone(),
-                credential: crate::github_status::credential_fingerprint().ok(),
+                credential: crate::github_status::credential_fingerprint().unwrap(),
             };
             memory.listings.listing_mut(&key, |listing| {
                 listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
@@ -1094,15 +1124,14 @@ mod tests {
             );
         });
         assert!(matches!(
-            memory
-                .listings
-                .get(&ListingKey {
-                    repository: repository.clone(),
-                    credential: crate::github_status::credential_fingerprint().ok(),
-                })
-                .unwrap()
-                .probe,
-            Probe::Validator(_)
+            memory.listings.get(&ListingKey {
+                repository: repository.clone(),
+                credential: crate::github_status::credential_fingerprint().unwrap(),
+            }),
+            Some(CachedListing::Ready(Listing {
+                probe: Probe::Validator(_),
+                ..
+            }))
         ));
         *forge.probe_fails.lock().unwrap() = None;
         assert_eq!(poll(&mut memory, Freshness::Watched), (true, vec!["probe"]));
@@ -1123,70 +1152,123 @@ mod tests {
     }
 
     #[test]
+    fn projects_with_the_same_remote_share_a_failed_initial_listing() {
+        use std::sync::atomic::Ordering;
+
+        let forge = Forge::new();
+        let gh = GitHubService::new("gh", forge.clone());
+        let repository = key("me");
+        let cancellation = CancellationToken::new();
+        let poll = |memory: &mut Memory, freshness| {
+            listing(&gh, &repository, memory, freshness, &cancellation)
+        };
+        // Separate project caches used to repeat the failed request.
+        forge.listing_fails.store(true, Ordering::SeqCst);
+        for mut project in [Memory::default(), Memory::default()] {
+            assert!(poll(&mut project, Freshness::Watched).is_err());
+        }
+        assert_eq!(forge.take(), ["listing", "listing"]);
+
+        let listings = Listings::default();
+        let mut first = Memory::with_listings(listings.clone());
+        let mut second = Memory::with_listings(listings.clone());
+
+        let error = poll(&mut first, Freshness::Watched).unwrap_err();
+        assert_eq!(poll(&mut second, Freshness::Watched).unwrap_err(), error);
+        assert_eq!(forge.take(), ["listing"]);
+
+        // An explicit refresh can ask again immediately.
+        assert_eq!(poll(&mut second, Freshness::Fresh).unwrap_err(), error);
+        assert_eq!(forge.take(), ["listing"]);
+
+        // Scheduled polls retry at the cadence or sooner if quota resets.
+        let key = ListingKey {
+            repository: repository.clone(),
+            credential: crate::github_status::credential_fingerprint().unwrap(),
+        };
+        forge.listing_fails.store(false, Ordering::SeqCst);
+        for (at, retry_at) in [
+            (Instant::now().checked_sub(PROBE_FOR).unwrap(), None),
+            (Instant::now(), Some(crate::github::polling::now())),
+        ] {
+            listings.put(
+                key.clone(),
+                CachedListing::InitialFailure {
+                    at,
+                    error: Failure {
+                        retry_at,
+                        ..error.clone()
+                    },
+                },
+            );
+            assert_eq!(poll(&mut first, Freshness::Watched).unwrap().len(), 1);
+            assert_eq!(poll(&mut second, Freshness::Watched).unwrap().len(), 1);
+            assert_eq!(forge.take(), ["listing"]);
+        }
+    }
+
+    #[test]
     fn projects_with_the_same_remote_share_a_listing_and_probe() {
         let forge = Forge::new();
         let gh = GitHubService::new("gh", forge.clone());
         let repository = key("me");
         let cancellation = CancellationToken::new();
+        let poll = |memory: &mut Memory| {
+            listing(&gh, &repository, memory, Freshness::Watched, &cancellation)
+        };
+        let cache_key = ListingKey {
+            repository: repository.clone(),
+            credential: crate::github_status::credential_fingerprint().unwrap(),
+        };
+        let due = |listings: &Listings| {
+            listings.listing_mut(&cache_key, |listing| {
+                listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
+            });
+        };
+
+        // With separate caches, each project lists and probes independently.
+        let mut separate = [Memory::default(), Memory::default()];
+        for project in &mut separate {
+            poll(project).unwrap();
+        }
+        assert_eq!(forge.take(), ["listing", "listing"]);
+        for _ in 0..2 {
+            for project in &mut separate {
+                due(&project.listings);
+                poll(project).unwrap();
+            }
+        }
+        assert_eq!(forge.take(), ["probe", "probe", "probe", "probe"]);
+
         let listings = Listings::default();
         let mut first = Memory::with_listings(listings.clone());
         let mut second = Memory::with_listings(listings.clone());
-
-        listing(
-            &gh,
-            &repository,
-            &mut first,
-            Freshness::Watched,
-            &cancellation,
-        )
-        .unwrap();
+        poll(&mut first).unwrap();
+        let shared = poll(&mut second).unwrap();
         assert_eq!(forge.take(), ["listing"]);
-
-        // A second local project on this remote reuses the same GraphQL
-        // result and its recent conditional probe.
-        let shared = listing(
-            &gh,
-            &repository,
-            &mut second,
-            Freshness::Watched,
-            &cancellation,
-        )
-        .unwrap();
-        assert!(forge.take().is_empty());
         assert_eq!(shared.len(), 1);
         assert_eq!(shared[0].number, 1);
 
-        let cache_key = ListingKey {
-            repository: repository.clone(),
-            credential: crate::github_status::credential_fingerprint().ok(),
-        };
-        listings.listing_mut(&cache_key, |listing| {
-            listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
-        });
-        listing(
-            &gh,
-            &repository,
-            &mut second,
-            Freshness::Watched,
-            &cancellation,
-        )
-        .unwrap();
-        assert_eq!(forge.take(), ["probe"]);
+        for _ in 0..2 {
+            due(&listings);
+            poll(&mut second).unwrap();
+            poll(&mut first).unwrap();
+        }
+        assert_eq!(forge.take(), ["probe", "probe"]);
 
-        // A revalidation that fails is not repeated by the other project in
-        // the same cadence, nor shown to it as current.
+        // Both projects report the same failed revalidation.
         forge.change(SECOND, "W/\"2\"");
         forge
             .listing_fails
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        listings.listing_mut(&cache_key, |listing| {
-            listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
-        });
-        let poll = |memory: &mut Memory| {
-            listing(&gh, &repository, memory, Freshness::Watched, &cancellation)
-        };
+        due(&listings);
         assert!(poll(&mut first).is_err());
         assert_eq!(forge.take(), ["probe", "listing"]);
+        let failed_at = forge.listing_failed_at.lock().unwrap().unwrap();
+        let Some(CachedListing::Ready(cached)) = listings.get(&cache_key) else {
+            panic!("the failure should retain the previous listing");
+        };
+        assert!(cached.probed_at >= failed_at);
         assert!(poll(&mut second).is_err());
         assert!(forge.take().is_empty());
     }
@@ -1219,7 +1301,7 @@ mod tests {
             *forge.graphql_exhausted_until.lock().unwrap() = Some(reset);
             let cache_key = ListingKey {
                 repository: repository.clone(),
-                credential: crate::github_status::credential_fingerprint().ok(),
+                credential: crate::github_status::credential_fingerprint().unwrap(),
             };
             let due = || {
                 listings.listing_mut(&cache_key, |listing| {
@@ -1305,11 +1387,18 @@ mod tests {
         .unwrap();
         let cache_key = ListingKey {
             repository: key("me"),
-            credential: crate::github_status::credential_fingerprint().ok(),
+            credential: crate::github_status::credential_fingerprint().unwrap(),
         };
-        memory.listings.listing_mut(&cache_key, |listing| {
-            listing.credential = Some("another account".into())
-        });
+        let cached = memory.listings.get(&cache_key).unwrap();
+        let other_account = Listings::default();
+        other_account.put(
+            ListingKey {
+                credential: "another account".into(),
+                ..cache_key
+            },
+            cached,
+        );
+        let mut memory = Memory::with_listings(other_account);
         listing(
             &gh,
             &key("me"),
@@ -1324,8 +1413,6 @@ mod tests {
     #[test]
     fn a_listing_reflects_the_changes_search_has_had_time_to_show() {
         let listing = |listed: &[(u64, &str)], read_at: &str| Listing {
-            repository: key("me"),
-            credential: None,
             at: Instant::now(),
             read_at: read_at.parse().unwrap(),
             pull_requests: listed
