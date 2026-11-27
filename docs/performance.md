@@ -11,6 +11,7 @@
 - [Workspace model edits](#workspace-model-edits)
 - [Native chat viewport](#native-chat-viewport)
 - [Idle retained actors](#idle-retained-actors)
+- [Idle Codex app-servers](#idle-codex-app-servers)
 - [Work board polling](#work-board-polling)
 - [Git watcher during builds](#git-watcher-during-builds)
 - [Reference results](#reference-results)
@@ -921,6 +922,25 @@ CPU across all 45 actors fell from 3.32% to 0.08% of one core.
 The remaining wakeups are that sweeper's 8 s ceiling, about one per actor every
 7.6 s: cgroup v2 has no fork notification, so the sweep is what finds a command
 started without an announcement.
+
+## Idle Codex app-servers
+
+On Linux, affected Codex versions watch the nearest existing parent of
+missing configuration and skill directories. When `/etc/codex` is missing,
+every app-server watches `/etc`. Opens of files such as `/etc/ld.so.cache`
+then wake each server even with no turn in progress. Codex discards these
+events after its watcher has received them. [Upstream Codex issue #49881](https://github.com/openai/codex/issues/49881)
+
+`mise run doctor` flags a missing local `/etc/codex` when Codex is on PATH.
+On a machine you administer, create the directory if it is absent:
+
+```sh
+sudo mkdir -p -m 0755 /etc/codex
+```
+
+An empty directory is sufficient for the system configuration watch to move
+off `/etc`. Start a fresh app-server to verify the new watch. Keep any
+existing administrator configuration and permissions as they are.
 
 ## Work board polling
 
