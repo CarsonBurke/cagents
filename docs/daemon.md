@@ -20,6 +20,12 @@ daemon's state, or an action's result for a few seconds, and how many hosted
 agents are working or waiting for you. Stopping a daemon that still hosts
 terminals or agent work asks for a counted confirmation first.
 
+On Linux the daemon reads your login shell's `PATH` once when it starts,
+whatever started it, so the terminals, provider CLIs and agents it launches
+find what your login startup files add, such as `~/.local/bin`. A window, the
+autostart entry or systemd can hand the daemon a much shorter `PATH`; see
+[Devices](devices.md) for the order the two are combined in.
+
 Full and browserless production builds share one daemon socket
 (`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes
 deliberately keep that socket namespace, so a newer daemon cannot start as a

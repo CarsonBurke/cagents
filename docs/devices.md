@@ -95,12 +95,15 @@ host without that login runtime directory must configure an owned private
 
 On Linux, SSH runs the bridge command without your login startup files, such
 as `~/.profile`, so its `PATH` can lack directories they add, such as
-`~/.local/bin`. A daemon started with SSH's variables in its environment reads
-your login shell once, as `ssh build-host` would start it, allowing 5 seconds
-for its startup files. It then uses that shell's `PATH`, followed by any other
+`~/.local/bin`. Every daemon on Linux reads your login shell once at startup,
+as `ssh build-host` would start it, allowing 5 seconds for its startup files.
+A daemon started over SSH then uses that shell's `PATH`, followed by any other
 directories its own had, so terminals, provider CLIs and conversations on the
-device find the same programs an SSH login does. If the shell does not answer
-in time, the daemon keeps the `PATH` it was given.
+device find the same programs an SSH login does. A daemon started any other
+way, such as by a window, the desktop autostart entry or the
+[boot unit](daemon.md), keeps the order of the `PATH` it was given and adds the
+login directories it lacks. If the shell does not answer in time, the daemon
+keeps the `PATH` it was given.
 
 A phone runs `cagents daemon bridge --mobile` instead, which speaks the
 stable, versioned [mobile API](mobile-api.md) rather than the daemon's

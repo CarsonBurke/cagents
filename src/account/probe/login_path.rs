@@ -1,12 +1,17 @@
-//! The `PATH` a daemon started by an SSH command adopts.
+//! The `PATH` a daemon adopts from its user's login shell.
 //!
-//! sshd runs a command, such as a device window's `cagents daemon bridge`,
-//! without the login startup files an interactive SSH session reads, so the
-//! `PATH` the daemon it starts inherits can lack what they add. Installers
-//! commonly add `~/.local/bin` and similar directories in login files such as
-//! `~/.profile`, and terminals, provider CLIs and conversations on the device
-//! would all miss them. Like the server VS Code starts over SSH,
-//! the daemon reads its user's login shell once at startup instead.
+//! Whatever starts the daemon hands it its own `PATH`, and on Linux that is
+//! often not the one a terminal sees. sshd runs a command, such as a device
+//! window's `cagents daemon bridge`, without the login startup files an
+//! interactive SSH session reads. The systemd user manager starts the boot
+//! unit with its own short default. A window started by a desktop launcher, or
+//! by a session whose login shell is not POSIX, such as fish, carries what the
+//! display manager set, which commonly lacks `~/.local/bin` and the other
+//! directories installers add in login files. The terminals, provider CLIs and
+//! conversations the daemon starts would all miss them, while Accounts, which
+//! reads the shell, reports the same CLIs installed. Like the server VS Code
+//! starts over SSH, the daemon reads its user's login shell once at startup
+//! instead.
 
 use std::{
     collections::HashSet,
@@ -32,10 +37,13 @@ const SSH_SESSION_ENVIRONMENT: &[&str] = &["SSH_CONNECTION", "SSH_CLIENT", "SSH_
 /// not read it again. The `PATH` they inherit already holds the answer.
 const ADOPTED_ENV: &str = "CAGENTS_LOGIN_PATH_ADOPTED";
 
-/// Puts the login shell's `PATH` ahead of this process's own when an SSH
-/// command started it. Elsewhere, and when the shell does not say, the `PATH`
-/// is left as it is: a desktop session already ran the login startup, and
-/// macOS reads the shell for each launch instead.
+/// Gives this process the login shell's `PATH` directories, whichever
+/// launcher started it. Under SSH, whose `PATH` is sshd's default rather than
+/// anyone's choice, the login's order wins, as in an interactive login.
+/// Elsewhere the `PATH` a desktop session, script or parent chose keeps its
+/// order, and the login's directories it lacks follow it. When the shell does
+/// not say, the `PATH` is left as it is. macOS reads the shell for each launch
+/// instead.
 ///
 /// # Safety
 ///
@@ -55,16 +63,23 @@ pub unsafe fn adopt() {
     let Some(login) = read(Path::new(&shell), Path::new(&home), SHELL_TIMEOUT) else {
         return;
     };
-    if let Some(path) = merged(&login, std::env::var_os("PATH").as_deref()) {
+    let current = std::env::var_os("PATH");
+    let merged = if std::env::var_os("SSH_CONNECTION").is_some() {
+        merged(&login, current.as_deref())
+    } else {
+        merged_after(current.as_deref(), &login)
+    };
+    if let Some(path) = merged {
         // SAFETY: the caller guarantees the process is still single-threaded.
         unsafe { std::env::set_var("PATH", path) };
     }
 }
 
 /// Whether a process whose environment holds the variables `set` names should
-/// read the login shell: one started by SSH, on Linux, not already answered.
+/// read the login shell: any daemon on Linux whose `PATH` no earlier daemon
+/// in its line has already answered for.
 fn wanted(set: impl Fn(&str) -> bool) -> bool {
-    !cfg!(target_os = "macos") && set("SSH_CONNECTION") && !set(ADOPTED_ENV)
+    !cfg!(target_os = "macos") && !set(ADOPTED_ENV)
 }
 
 /// `login`'s directories, then those of `current` it lacks, each once. As in
@@ -75,6 +90,18 @@ fn merged(login: &OsStr, current: Option<&OsStr>) -> Option<OsString> {
     let mut seen = HashSet::new();
     let directories = std::env::split_paths(login)
         .chain(current.into_iter().flat_map(std::env::split_paths))
+        .filter(|directory| directory.is_absolute() && seen.insert(directory.clone()));
+    std::env::join_paths(directories).ok()
+}
+
+/// `current`'s directories in their order, then those of `login` it lacks,
+/// each once, dropping relative and empty entries from both.
+fn merged_after(current: Option<&OsStr>, login: &OsStr) -> Option<OsString> {
+    let mut seen = HashSet::new();
+    let directories = current
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(std::env::split_paths(login))
         .filter(|directory| directory.is_absolute() && seen.insert(directory.clone()));
     std::env::join_paths(directories).ok()
 }
@@ -200,10 +227,30 @@ mod tests {
     }
 
     #[test]
-    fn only_a_process_started_over_ssh_reads_the_login_shell_once() {
+    fn a_chosen_path_keeps_its_order_and_gains_the_login_directories() {
+        // A desktop session's `PATH`, or a test's fixture directory ahead of
+        // the system's, is not reordered behind the login's.
+        assert_eq!(
+            merged_after(
+                Some(OsStr::new("/fixture/bin:/usr/bin:relative")),
+                OsStr::new("/home/a/.local/bin:/usr/bin:/fixture/bin")
+            ),
+            Some("/fixture/bin:/usr/bin:/home/a/.local/bin".into())
+        );
+        assert_eq!(
+            merged_after(None, OsStr::new("/opt/x/bin")),
+            Some("/opt/x/bin".into())
+        );
+    }
+
+    #[test]
+    fn every_launcher_reads_the_login_shell_once() {
         let with = |names: &'static [&'static str]| wanted(move |name| names.contains(&name));
+        // A window from a desktop launcher names no SSH session, and its
+        // `PATH` can lack the login directories all the same.
+        assert_eq!(with(&[]), !cfg!(target_os = "macos"));
         assert_eq!(with(&["SSH_CONNECTION"]), !cfg!(target_os = "macos"));
-        assert!(!with(&[]));
+        assert!(!with(&[ADOPTED_ENV]));
         assert!(!with(&["SSH_CONNECTION", ADOPTED_ENV]));
     }
 
