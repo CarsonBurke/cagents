@@ -33,8 +33,8 @@ use crate::{
         BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
         ConflictKind, DiffBasis, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid,
         PathSelection, PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo,
-        RepositorySnapshot, StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName,
-        WorktreeRecord, build_file_tree, build_file_tree_with_directories,
+        RepositorySnapshot, SnapshotDigest, StatusSnapshot, TrackingState, ValidatedBranchName,
+        ValidatedRefName, WorktreeRecord, build_file_tree, build_file_tree_with_directories,
     },
     splitter::{Edge as SplitterEdge, Splitter},
     ui_controls::Icon,
@@ -2295,12 +2295,31 @@ pub struct SourceControlModel {
     reloading: bool,
     chrome: SourceControlChrome,
     pub file_search: FileSearch,
+    /// False when the snapshot's Files tree was left unbuilt because only
+    /// Changes was showing; see [`FileTree`].
+    files_built: bool,
     /// The snapshot these rows were built from, while they still show
     /// exactly what it builds. A reload that reads an equal snapshot then
     /// keeps the model instead of rebuilding it; anything that edits
     /// snapshot-derived state afterwards must drop it, so the next read is
     /// applied rather than skipped.
     source_snapshot: Option<Arc<RepositorySnapshot>>,
+    /// What Git's reads of [`Self::source_snapshot`] hashed to, which lets
+    /// the next read stop before its expensive part when nothing changed.
+    /// Dropped with the snapshot.
+    source_digest: Option<SnapshotDigest>,
+}
+
+/// Whether [`SourceControlModel::build`] builds the Files tree.
+///
+/// The tree holds a row for every file in the worktree, which in a large
+/// repository costs more than everything else in the model together, and
+/// only the Files view reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTree {
+    Built,
+    /// Left empty until a read made while Files is shown builds it.
+    Deferred,
 }
 
 fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
@@ -2342,6 +2361,44 @@ fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<Fi
             }
         })
         .collect()
+}
+
+/// The Files tree's rows for one snapshot: tracked and untracked files, plus
+/// the ignored ones a Files read listed, dimmed.
+fn snapshot_file_rows(snapshot: &RepositorySnapshot) -> Vec<FileRow> {
+    let mut paths;
+    let paths = if snapshot.files.ignored.is_empty() {
+        &snapshot.files.paths
+    } else {
+        paths = snapshot.files.paths.clone();
+        paths.extend(snapshot.files.ignored.iter().cloned());
+        &paths
+    };
+    let mut files = file_rows_from_tree(build_file_tree_with_directories(
+        paths,
+        &snapshot.files.ignored_directories,
+    ));
+    let ignored: BTreeSet<_> = snapshot.files.ignored.iter().collect();
+    let ignored_directories: BTreeSet<_> = snapshot
+        .files
+        .ignored_directories
+        .iter()
+        .map(|path| path.as_path())
+        .collect();
+    for row in &mut files {
+        row.ignored = ignored.contains(&row.path)
+            || row
+                .path
+                .as_path()
+                .ancestors()
+                .any(|path| ignored_directories.contains(path));
+        // A force-added file inside an ignored folder is still tracked.
+        if row.ignored && !row.directory && snapshot.files.paths.binary_search(&row.path).is_ok() {
+            row.ignored = false;
+        }
+    }
+
+    files
 }
 
 impl SourceControlModel {
@@ -2434,12 +2491,20 @@ impl SourceControlModel {
             reloading: false,
             chrome,
             file_search: FileSearch::Inactive,
+            files_built: true,
             source_snapshot: None,
+            source_digest: None,
         }
     }
 
-    /// Builds the panel from a loaded snapshot.
+    /// Builds the panel, Files tree included, from a loaded snapshot.
     pub fn ready(key: ActiveWorktreeKey, snapshot: &RepositorySnapshot) -> Self {
+        Self::build(key, snapshot, FileTree::Built)
+    }
+
+    /// Builds the panel from a loaded snapshot, with or without the Files
+    /// tree.
+    pub fn build(key: ActiveWorktreeKey, snapshot: &RepositorySnapshot, tree: FileTree) -> Self {
         let worktree_id = key.worktree_id;
         // The header's label and the branch a push names come from the same
         // `HEAD` and are not the same value: the label is a lossy decoding of
@@ -2479,40 +2544,10 @@ impl SourceControlModel {
             .collect::<BTreeSet<_>>()
             .len();
         let change_count_label = (changed_paths > 0).then(|| tab_count_label(changed_paths));
-        let mut paths;
-        let paths = if snapshot.files.ignored.is_empty() {
-            &snapshot.files.paths
-        } else {
-            paths = snapshot.files.paths.clone();
-            paths.extend(snapshot.files.ignored.iter().cloned());
-            &paths
+        let files = match tree {
+            FileTree::Built => snapshot_file_rows(snapshot),
+            FileTree::Deferred => Vec::new(),
         };
-        let mut files = file_rows_from_tree(build_file_tree_with_directories(
-            paths,
-            &snapshot.files.ignored_directories,
-        ));
-        let ignored: BTreeSet<_> = snapshot.files.ignored.iter().collect();
-        let ignored_directories: BTreeSet<_> = snapshot
-            .files
-            .ignored_directories
-            .iter()
-            .map(|path| path.as_path())
-            .collect();
-        for row in &mut files {
-            row.ignored = ignored.contains(&row.path)
-                || row
-                    .path
-                    .as_path()
-                    .ancestors()
-                    .any(|path| ignored_directories.contains(path));
-            // A force-added file inside an ignored folder is still tracked.
-            if row.ignored
-                && !row.directory
-                && snapshot.files.paths.binary_search(&row.path).is_ok()
-            {
-                row.ignored = false;
-            }
-        }
 
         // An unborn `HEAD` has no commit and no history to walk; an unreadable
         // one has neither either, but it is not an empty repository.
@@ -2557,14 +2592,21 @@ impl SourceControlModel {
             key,
             chrome,
             file_search: FileSearch::Inactive,
+            files_built: tree == FileTree::Built,
             source_snapshot: None,
+            source_digest: None,
         }
     }
 
-    /// Records that this model is exactly what [`Self::ready`] builds from
+    /// Records that this model is exactly what [`Self::build`] builds from
     /// `snapshot`, so an identical read can leave it in place.
-    pub fn built_from(mut self, snapshot: Arc<RepositorySnapshot>) -> Self {
+    pub fn built_from(
+        mut self,
+        snapshot: Arc<RepositorySnapshot>,
+        digest: Option<SnapshotDigest>,
+    ) -> Self {
         self.source_snapshot = Some(snapshot);
+        self.source_digest = digest;
         self
     }
 
@@ -2572,6 +2614,31 @@ impl SourceControlModel {
     /// [`Self::built_from`].
     pub fn source_snapshot(&self) -> Option<&Arc<RepositorySnapshot>> {
         self.source_snapshot.as_ref()
+    }
+
+    /// The digest of the reads behind [`Self::source_snapshot`], if any.
+    pub fn source_digest(&self) -> Option<&SnapshotDigest> {
+        self.source_digest.as_ref()
+    }
+
+    /// Whether these rows can stand for a read that builds `tree`, so an
+    /// equal read may keep them. A model whose Files tree was left unbuilt
+    /// cannot stand for one that builds it, however equal Git's answers are.
+    pub fn stands_for(&self, tree: FileTree) -> bool {
+        self.files_built || tree == FileTree::Deferred
+    }
+
+    /// Records that a read whose snapshot equalled this model's hashed to
+    /// `digest`, as a touched but unedited file does.
+    pub fn set_source_digest(&mut self, digest: Option<SnapshotDigest>) {
+        if self.source_snapshot.is_some() {
+            self.source_digest = digest;
+        }
+    }
+
+    /// False while the Files tree was deliberately left unbuilt.
+    pub fn files_built(&self) -> bool {
+        self.files_built
     }
 
     /// The expanded ignored folders whose listing failed, with the reason.
@@ -2586,6 +2653,7 @@ impl SourceControlModel {
     pub fn retry_ignored_directory(&mut self, path: &RepoPath) {
         self.ignored_directory_errors.remove(path);
         self.source_snapshot = None;
+        self.source_digest = None;
     }
 
     /// Forgets every failed ignored-folder read; see
@@ -2593,6 +2661,7 @@ impl SourceControlModel {
     pub fn retry_ignored_directories(&mut self) {
         self.ignored_directory_errors.clear();
         self.source_snapshot = None;
+        self.source_digest = None;
     }
 
     /// Appends one loaded history page. A short page is the last one.
@@ -10938,7 +11007,11 @@ fn files_section<'a>(
                 false,
                 state.files_page,
             );
-            let notice = if source.files.is_empty() {
+            let notice = if !source.files_built() {
+                // Only Changes was showing when the rows were read; the read
+                // that showing Files starts is building them.
+                Some("Loading files…")
+            } else if source.files.is_empty() {
                 Some("This worktree has no tracked files.")
             } else if visible.is_empty() {
                 Some("No files match this filter.")
