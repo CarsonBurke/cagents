@@ -371,7 +371,9 @@ impl Cagents {
             );
         }
         let width = size.width.min(MAX_WIDTH);
-        let body_width = (width - 2.0 * space::L).max(1.0);
+        // The patch fits beside the region's scrollbar rail, so only a line
+        // longer than that scrolls sideways.
+        let body_width = (width - 2.0 * space::L - design::SCROLLBAR_GUTTER).max(1.0);
         let body: Element<'_, Message> = match &diff.content {
             Content::Loading => design::body("Reading the change from the device…").into(),
             Content::Failed(error) => widget::column::with_children(vec![
@@ -448,17 +450,9 @@ impl Cagents {
                     .into(),
                 // One height whatever the change, so stepping through a
                 // group leaves Previous, Next and Stage where they were.
-                widget::container(dialog_ui::scrolled_region(
-                    // Clear of the sideways scrollbar the patch draws over
-                    // its last line.
-                    widget::container(body).padding(Padding {
-                        bottom: space::M,
-                        ..Padding::ZERO
-                    }),
-                    height,
-                ))
-                .height(height)
-                .into(),
+                widget::container(dialog_ui::scrolled_region(body, height))
+                    .height(height)
+                    .into(),
                 widget::row::with_children(actions)
                     .spacing(space::S)
                     .align_y(Alignment::Center)
