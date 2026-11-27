@@ -9999,7 +9999,7 @@ impl Cagents {
             );
         }
         Some(format!(
-            "No agent you use is installed on {}. Install one there, such as Claude Code or Codex, then open Agent accounts to check again.",
+            "No agent you use is installed on {}. Install one there, such as Claude Code or Codex, then open Accounts to check again.",
             conversation_place()
         ))
     }

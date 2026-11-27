@@ -25799,7 +25799,7 @@ fn a_new_thread_skips_a_provider_whose_cli_is_missing() {
     assert_eq!(
         unknown.no_chat_provider_note().as_deref(),
         Some(
-            "No agent you use is installed on this computer. Install one there, such as Claude Code or Codex, then open Agent accounts to check again."
+            "No agent you use is installed on this computer. Install one there, such as Claude Code or Codex, then open Accounts to check again."
         )
     );
     // Turned off rather than missing, they are turned on in Settings.

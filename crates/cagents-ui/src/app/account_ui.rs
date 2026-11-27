@@ -2999,8 +2999,9 @@ impl Cagents {
     fn locate_accounts_for(&mut self, manual: Option<(AccountId, u64)>) -> Task<Message> {
         // A device window learns which CLIs exist from its device's accounts
         // snapshot; this computer's PATH would describe the wrong machine.
+        // What follows a discovery, checking the accounts, still does.
         if crate::device::is_remote() {
-            return Task::none();
+            return self.probe_accounts(Trigger::Focus);
         }
         if let Some((id, owner)) = manual {
             self.account_ui.discovery_manual.insert(id, owner);
