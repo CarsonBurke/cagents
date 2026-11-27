@@ -759,35 +759,61 @@ fn notice_surface<'a>(
     action: Option<Element<'a, Message>>,
     compact: bool,
 ) -> Element<'a, Message> {
-    let mut children = vec![severity.icon().handle().icon().size(16).into(), body];
+    notice_surface_with_footer(severity, body, action, None, compact)
+}
+
+/// [`notice_surface`], with `footer` beneath the body and its action, as wide
+/// as both, for what the action beside the body would leave too little room.
+fn notice_surface_with_footer<'a>(
+    severity: NoticeSeverity,
+    body: Element<'a, Message>,
+    action: Option<Element<'a, Message>>,
+    footer: Option<Element<'a, Message>>,
+    compact: bool,
+) -> Element<'a, Message> {
+    const ICON_SIZE: u16 = 16;
+    let mut children = vec![severity.icon().handle().icon().size(ICON_SIZE).into(), body];
     if let Some(action) = action {
         children.push(action);
     }
-    let mut surface = widget::container(
-        widget::row::with_children(children)
-            .align_y(Alignment::Center)
-            .spacing(space::S),
-    )
-    .class(cosmic::theme::Container::custom(move |theme| {
-        let component = severity.component(theme.cosmic());
-        cosmic::iced::widget::container::Style {
-            icon_color: Some(component.on.into()),
-            text_color: Some(component.on.into()),
-            background: Some(iced::Background::Color(component.base.into())),
-            border: iced::Border {
-                width: 1.0,
-                color: component.border.into(),
+    let row: Element<'a, Message> = widget::row::with_children(children)
+        .align_y(Alignment::Center)
+        .spacing(space::S)
+        .into();
+    let content = match footer {
+        // Aligned with the body, past the severity icon.
+        Some(footer) => widget::column::with_children(vec![
+            row,
+            widget::container(footer)
+                .padding(Padding::ZERO.left(f32::from(ICON_SIZE) + space::S))
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(space::XS)
+        .into(),
+        None => row,
+    };
+    let mut surface = widget::container(content)
+        .class(cosmic::theme::Container::custom(move |theme| {
+            let component = severity.component(theme.cosmic());
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(component.on.into()),
+                text_color: Some(component.on.into()),
+                background: Some(iced::Background::Color(component.base.into())),
+                border: iced::Border {
+                    width: 1.0,
+                    color: component.border.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        }
-    }))
-    .padding(if compact {
-        Padding::from([0.0, space::M])
-    } else {
-        Padding::from(space::M)
-    })
-    .width(Length::Fill);
+            }
+        }))
+        .padding(if compact {
+            Padding::from([0.0, space::M])
+        } else {
+            Padding::from(space::M)
+        })
+        .width(Length::Fill);
     if compact {
         surface = surface.height(Length::Fixed(NOTICE_ROW_HEIGHT));
     }
@@ -810,25 +836,28 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
         .width(Length::Fill)
         .into()
 }
-/// A notice's message, with any command it names set apart to be read whole
-/// and copied (see [`command_text`]).
-fn notice_message<'a>(severity: NoticeSeverity, text: &'a str) -> Element<'a, Message> {
-    command_text::view(
-        text,
-        notice_body,
-        move |command| {
-            crate::interaction::tooltip(
-                widget::button::icon(Icon::Copy)
-                    .name("Copy command")
-                    .width(ICON_CONTROL_SIZE)
-                    .height(ICON_CONTROL_SIZE)
-                    .class(notice_surface_button(severity))
-                    .on_press(Message::ChromeUi(chrome_ui::Action::CopyCommand(
-                        command.to_owned(),
-                    ))),
-                "Copy command",
-            )
-        },
+/// The command a notice ends with, on its own line across the notice's
+/// whole width, with a control, `copy_id`, that copies it (see
+/// [`command_text`]).
+fn notice_command<'a>(
+    severity: NoticeSeverity,
+    command: &'a str,
+    copy_id: widget::Id,
+) -> Element<'a, Message> {
+    command_text::command_row(
+        command,
+        crate::interaction::tooltip(
+            widget::button::icon(Icon::Copy)
+                .id(copy_id)
+                .name(format!("Copy the command {command}"))
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .class(notice_surface_button(severity))
+                .on_press(Message::ChromeUi(chrome_ui::Action::CopyCommand(
+                    command.to_owned(),
+                ))),
+            "Copy command",
+        ),
         move |theme| severity.component(theme.cosmic()).base.into(),
     )
 }

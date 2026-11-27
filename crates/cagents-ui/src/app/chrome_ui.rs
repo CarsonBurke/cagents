@@ -1425,6 +1425,31 @@ mod tests {
         assert_eq!(app.chrome_ui.focus_index, 2);
     }
 
+    /// The copy control of a command a notice ends with is in Tab's ring,
+    /// after that notice's Dismiss (#4505).
+    #[test]
+    fn tab_reaches_the_copy_control_of_a_notice_command() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.notices.record(TransientNotice::warning(
+            "box was reached over SSH, but its cagents daemon did not answer within 30 seconds. It may be busy or stuck: try again, or check it with `ssh box cagents daemon status`.",
+        ));
+        app.notices
+            .record(TransientNotice::warning("`/srv/repo` is not a directory"));
+        let _ = app.update_chrome(Action::ToggleNotices);
+        // Newest first: the path, then the command.
+        let ids: Vec<u64> = app.notices.recent().map(|entry| entry.id).collect();
+        assert_eq!(
+            app.popup_focus_ring(Popup::Notices),
+            [
+                NOTICES_DISMISS_ALL_ID.to_owned(),
+                NOTICES_CLOSE_ID.to_owned(),
+                notice_dismiss_id(ids[0]),
+                notice_dismiss_id(ids[1]),
+                notice_copy_id(ids[1]),
+            ]
+        );
+    }
+
     #[test]
     fn an_open_popup_owns_tab_until_it_closes() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -2357,6 +2382,10 @@ fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
 
+fn notice_copy_id(id: u64) -> String {
+    format!("chrome.notices.copy.{id}")
+}
+
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
@@ -2467,11 +2496,14 @@ impl Cagents {
                     ring.push(Cow::Borrowed(NOTICES_DISMISS_ALL_ID));
                 }
                 ring.push(Cow::Borrowed(NOTICES_CLOSE_ID));
-                ring.extend(
-                    self.notices
-                        .recent()
-                        .map(|entry| Cow::Owned(notice_dismiss_id(entry.id))),
-                );
+                // Each notice's Dismiss, then, under it, the copy control of
+                // the command it ends with.
+                for entry in self.notices.recent() {
+                    ring.push(Cow::Owned(notice_dismiss_id(entry.id)));
+                    if super::command_text::trailing_command(&entry.notice.message).is_some() {
+                        ring.push(Cow::Owned(notice_copy_id(entry.id)));
+                    }
+                }
                 // In the order the notices draw them: the lane's own notice,
                 // then the refused writes. Only one of them offers a retry.
                 let health = self.save_health.as_ref();
@@ -3375,24 +3407,54 @@ impl Cagents {
                         continue;
                     }
                     let severity = entry.notice.severity;
-                    let mut lines = vec![super::notice_message(severity, &entry.notice.message)];
+                    let trailing = super::command_text::trailing_command(&entry.notice.message);
+                    let mut lines = Vec::new();
+                    // A closing command takes the notice's whole width, under
+                    // its Dismiss, with the details after it.
+                    match &trailing {
+                        Some(trailing) => {
+                            if let Some(prose) = &trailing.prose {
+                                lines.push(super::notice_body(prose.clone()));
+                            }
+                        }
+                        None => lines.push(super::notice_body(&entry.notice.message)),
+                    }
+                    let mut extra = Vec::new();
+                    if let Some(trailing) = &trailing {
+                        extra.push(super::notice_command(
+                            severity,
+                            trailing.command,
+                            widget::Id::new(notice_copy_id(entry.id)),
+                        ));
+                    }
                     if let Some(details) = &entry.notice.details {
-                        lines.push(super::notice_surface_details(severity, details));
+                        extra.push(super::notice_surface_details(severity, details));
                     }
                     if entry.repeats > 1 {
-                        lines.push(super::notice_surface_detail(
+                        extra.push(super::notice_surface_detail(
                             severity,
                             format!("Repeated {} times", entry.repeats),
                         ));
                     }
-                    let body: Element<'_, Message> = if lines.len() > 1 {
+                    let footer = if trailing.is_some() {
+                        Some(
+                            widget::column::with_children(std::mem::take(&mut extra))
+                                .spacing(space::XS)
+                                .into(),
+                        )
+                    } else {
+                        lines.append(&mut extra);
+                        None
+                    };
+                    let body: Element<'_, Message> = if lines.len() == 1 {
+                        lines.pop().expect("one line")
+                    } else {
                         widget::column::with_children(lines)
                             .spacing(space::XS)
+                            .width(Length::Fill)
                             .into()
-                    } else {
-                        lines.pop().expect("a notice has its message")
                     };
-                    notices.push(super::notice_surface(
+                    notices.push(super::notice_surface_with_footer(
                         entry.notice.severity,
                         body,
                         Some(super::notice_surface_action(
@@ -3402,6 +3464,7 @@ impl Cagents {
                             widget::Id::new(notice_dismiss_id(entry.id)),
                             Message::DismissNotice(entry.id),
                         )),
+                        footer,
                         false,
                     ));
                 }

@@ -337,19 +337,29 @@ impl cosmic::Application for Reconnect {
             Phase::Failed(reason) => {
                 retry = true;
                 rows.push(design::title(self.failed_title()).into());
-                rows.push(super::command_text::view(
-                    reason,
-                    |text| design::body(text).into(),
-                    |command| {
-                        crate::interaction::tooltip(
-                            crate::ui_controls::icon_button(Icon::Copy, "Copy command")
+                match super::command_text::trailing_command(reason) {
+                    Some(trailing) => {
+                        if let Some(prose) = trailing.prose {
+                            rows.push(design::body(prose).into());
+                        }
+                        rows.push(super::command_text::command_row(
+                            trailing.command,
+                            crate::interaction::tooltip(
+                                crate::ui_controls::icon_button(
+                                    Icon::Copy,
+                                    format!("Copy the command {}", trailing.command),
+                                )
                                 .compact()
-                                .on_press(ReconnectMessage::CopyCommand(command.to_owned())),
-                            "Copy command",
-                        )
-                    },
-                    design::base,
-                ));
+                                .on_press(
+                                    ReconnectMessage::CopyCommand(trailing.command.to_owned()),
+                                ),
+                                "Copy command",
+                            ),
+                            design::base,
+                        ));
+                    }
+                    None => rows.push(design::body(reason.clone()).into()),
+                }
             }
             Phase::Needs {
                 need,

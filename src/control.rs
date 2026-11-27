@@ -4944,10 +4944,10 @@ pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
             .map(|budget| budget + UI_LAUNCH_HANDSHAKE_TIMEOUT)
             .map_err(io::Error::other)
     };
+    // A launcher on a device can't read the handoff budget either way.
     let timeout = match (opens_device_window(command), crate::device::is_remote()) {
-        (true, true) => remote_ui_launch_timeout(),
+        (_, true) => remote_ui_launch_timeout(),
         (true, false) => local()?.max(remote_ui_launch_timeout()),
-        (false, true) => UI_LAUNCH_HANDSHAKE_TIMEOUT,
         (false, false) => local()?,
     };
     command
