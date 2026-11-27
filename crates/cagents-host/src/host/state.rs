@@ -4088,6 +4088,11 @@ struct RestoreFinalization {
 }
 
 impl RestoredUpgrade {
+    #[cfg(target_os = "macos")]
+    pub(super) fn claimed_checkpoint(&self) -> bool {
+        self.finalization.is_some()
+    }
+
     pub(super) fn finish(&mut self, host: &SharedHost) -> Result<(), String> {
         self.finish_locked(&mut host.lock().unwrap_or_else(|p| p.into_inner()))
     }
