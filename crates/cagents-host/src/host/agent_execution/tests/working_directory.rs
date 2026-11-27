@@ -130,8 +130,8 @@ fn a_window_reopens_an_agents_conversation_only_in_its_directory() {
         )
     };
 
-    // The prompt itself reopens nothing: this provider's conversation does
-    // not reopen by itself, whatever its directory has become.
+    // The prompt reopens nothing in a directory that changed, and says why
+    // before anything about the conversation is asked.
     let kept = swap_for_a_link_out(&root, &nested);
     let error = super::super::prompt(
         &host,
@@ -146,7 +146,10 @@ fn a_window_reopens_an_agents_conversation_only_in_its_directory() {
     )
     .unwrap_err()
     .to_string();
-    assert!(error.contains("Resume it from its pane"), "{error}");
+    assert!(
+        error.contains("symbolic link") && error.contains(nested.to_str().unwrap()),
+        "{error}"
+    );
 
     let error = reopen().unwrap_err().message;
     assert!(

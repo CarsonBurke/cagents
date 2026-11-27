@@ -62,6 +62,8 @@ mod linear;
 pub use linear::LinearCommand;
 mod providers;
 pub use providers::ProviderCommand;
+mod resume;
+pub use resume::ResumeArgs;
 mod work;
 pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
@@ -346,6 +348,11 @@ pub enum TopCommand {
         after_help = "Shows its messages, tool calls and compactions."
     )]
     Transcript(TranscriptArgs),
+    /// Reopen the conversations of sessions whose provider stopped.
+    #[command(
+        after_help = "Each reopens as its pane's Resume would in the app: the exact saved conversation, in its original directory and on its original account, once nothing else can still be writing it. It then waits idle for its next message. `cagents sessions --channel` lists stopped sessions. With --device, resumes that machine's sessions, as after a reboot with no one logged in."
+    )]
+    Resume(ResumeArgs),
     /// Inspect native resident capacity and explicitly release completed handles.
     Chat {
         #[command(subcommand)]
@@ -4466,6 +4473,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Whoami(_)
         | TopCommand::Sessions(_)
         | TopCommand::Transcript(_)
+        | TopCommand::Resume(_)
         | TopCommand::Send(_)
         | TopCommand::Ask(_)
         | TopCommand::Reply(_)
@@ -4597,6 +4605,7 @@ fn execute_with_model_context(
         TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
         TopCommand::Transcript(arguments) => transcript::read(arguments),
+        TopCommand::Resume(arguments) => resume::resume(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),
         TopCommand::Reply(arguments) => messages::reply(arguments),

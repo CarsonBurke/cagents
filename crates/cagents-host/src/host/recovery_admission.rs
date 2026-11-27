@@ -242,7 +242,8 @@ fn agent_access(operation: &AgentOperation) -> Access<'static> {
         | O::Transcript(_)
         | O::Members(_)
         | O::Sessions(_)
-        | O::Context { .. } => Access::Open,
+        | O::Context { .. }
+        | O::Stopped(_) => Access::Open,
         O::Submit(_)
         | O::Close(_)
         | O::Console { .. }
@@ -250,7 +251,8 @@ fn agent_access(operation: &AgentOperation) -> Access<'static> {
         | O::SendMessage(_)
         | O::Send(_)
         | O::Prompt { .. }
-        | O::Deliver(_) => Access::Held,
+        | O::Deliver(_)
+        | O::Resume(_) => Access::Held,
     }
 }
 

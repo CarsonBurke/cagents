@@ -2338,7 +2338,7 @@ impl Cagents {
             return Task::none();
         }
         let session = match result {
-            Ok(Some(session)) if prepared_resume_matches(&source, &session) => Ok(*session),
+            Ok(Some(session)) if chat::is_prepared_resume(&source, &session) => Ok(*session),
             Ok(Some(_)) => {
                 return self.fail_reopening(
                     card,
@@ -3231,28 +3231,6 @@ fn unstarted_successor(session: &chat::Session) -> bool {
         && session.launch.session_id.is_some()
 }
 
-/// Shape validation of the authenticated preparation reply. It grants no
-/// provider ownership; Start/Attach still runs normal HOST admission.
-fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> bool {
-    // An ended retained Claude actor resumes as a reconnect-only successor,
-    // on the conversation the daemon proved it confirmed.
-    if source == prepared || chat::is_retained_resume_successor(source, prepared) {
-        return true;
-    }
-    if !source.has_valid_native_continuity()
-        || source.launch.session_id.is_none()
-        || prepared.id == source.id
-    {
-        return false;
-    }
-    let mut expected = source.clone();
-    expected.reset_owned_codex_listener();
-    expected.id = prepared.id;
-    expected.proof = None;
-    expected.terminal = None;
-    &expected == prepared
-}
-
 /// Indices of the rows matching `query` within `scope`.
 /// The rows `query` matches, best first, among those `scope` admits, and how
 /// many it matches at each reach. Every word is looked for on its own: in
@@ -3793,7 +3771,7 @@ mod tests {
         let mut prepared = source.clone();
         prepared.id = TerminalId::new();
         prepared.proof = None;
-        assert!(prepared_resume_matches(&source, &prepared));
+        assert!(chat::is_prepared_resume(&source, &prepared));
         for mutation in 0..4 {
             let mut altered = prepared.clone();
             match mutation {
@@ -3808,7 +3786,7 @@ mod tests {
                 2 => altered.launch.recipe.arguments.push("--different".into()),
                 _ => altered.launch.provider = Provider::Codex,
             }
-            assert!(!prepared_resume_matches(&source, &altered));
+            assert!(!chat::is_prepared_resume(&source, &altered));
         }
     }
 

@@ -13,6 +13,7 @@ pub mod concurrency;
 pub mod directory;
 pub mod mailbox;
 pub mod permission;
+pub mod resume;
 pub mod transcript;
 
 use serde::{Deserialize, Serialize};
@@ -721,6 +722,12 @@ pub enum Operation {
         scope: directory::Scope,
         standing: bool,
     },
+    /// List the sessions in a scope whose provider stopped, which `Resume`
+    /// can reopen. Grants no control.
+    Stopped(resume::Scope),
+    /// Reopen the conversation of a session whose provider stopped, named by
+    /// session, lineage or agent ID or a prefix of one, as its pane would.
+    Resume(String),
 }
 
 /// What became of a prompt accepted for an existing agent.
@@ -809,6 +816,8 @@ pub enum Reply {
     },
     Handed(mailbox::Handed),
     Context(directory::Context),
+    Stopped(Vec<resume::Stopped>),
+    Resumed(resume::Resumed),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

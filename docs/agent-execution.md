@@ -117,9 +117,19 @@ turn in progress end, and the stopped provider can no longer act for the agent,
 but the agent stays open: `agent list` still shows it, and its card stays in its
 channel, where its saved conversation can be resumed. A turn the stop cut short
 ends with a note that it may be incomplete and is never resent, so inspect the
-conversation before sending more work. Until the conversation is resumed, a new
-prompt to the agent fails without being sent. `agent close` still retires a
-stopped agent.
+conversation before sending more work. A new prompt to a stopped agent reopens
+its conversation first when this daemon saw its provider exit, when an earlier
+kernel boot ran it, or when its provider's retained owner proves it ended, as
+for a retained Claude or Codex conversation. Otherwise, as after a daemon restart
+within one boot, the prompt fails without being sent and names the command that
+resumes it: `cagents resume SESSION`, which reopens the conversation as its
+pane's Resume does in the app. `cagents resume --channel`, `--project` and
+`--all` resume every stopped session in that scope; a session may resume only
+the agents it started. With `--json` it returns `data.sessions`, a row per
+session with its `session`, the `running` session that now carries the
+conversation, `provider`, `title`, `agent`, and `state` (`resumed`, `starting`,
+`already_running` or `failed`, with `error`), and `data.outcome`, `failed`
+when any did. `agent close` still retires a stopped agent.
 
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 

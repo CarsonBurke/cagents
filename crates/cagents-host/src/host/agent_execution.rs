@@ -23,6 +23,7 @@ pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
 mod ownership;
 pub(super) mod prompt_cache;
+mod resume;
 pub(super) mod terminals;
 mod transcript;
 pub(super) mod working_directory;
@@ -586,61 +587,13 @@ fn resume(
     agent: &Agent,
     source: &chat::Session,
 ) -> Result<(), String> {
-    if !matches!(
-        source.native_continuity,
-        chat::NativeContinuity::RetainedClaudeActor { .. }
-    ) {
-        return Err(
-            "This agent's provider stopped, and only a Claude conversation reopens by itself. Resume it from its pane"
-                .into(),
-        );
-    }
     // The start below opens the agent's directory and runs the provider only
     // there. Asking first refuses a directory that changed before anything
     // about the conversation is prepared, and says why.
     working_directory::open_for_start(registry, agent)
         .map_err(|error| format!("Cannot reopen the agent's conversation: {error}"))?;
-    let unavailable = |error: crate::terminal_ipc::ProtocolError| {
-        format!("Cannot reopen the agent's conversation: {}", error.message)
-    };
-    let response = super::chat::process(
-        host,
-        EXECUTION_CLIENT,
-        ClientRequest::ChatPrepareResume {
-            source: source.clone(),
-        },
-    )
-    .map_err(unavailable)?;
-    let ServerResponse::ChatResumePrepared { session: prepared } = response else {
-        return Err("Reopening the agent's conversation returned an unexpected response".into());
-    };
-    if prepared.id == source.id {
-        // The daemon found the conversation's provider still owned, as by a
-        // process restoring after a restart, and nothing replaces it.
-        return Err(
-            "The agent's earlier provider still holds its conversation. Wait for it to come back, or resume it from its pane"
-                .into(),
-        );
-    }
-    if !chat::is_retained_resume_successor(source, &prepared) {
-        return Err("Reopening the agent's conversation would not resume it exactly".into());
-    }
-    let response = super::chat::process(
-        host,
-        EXECUTION_CLIENT,
-        ClientRequest::ChatStart {
-            session: prepared,
-            source: None,
-            terminate_source: false,
-            // With no source terminal the daemon starts the provider with its
-            // own native environment, as for a new agent.
-            execution_environment: Default::default(),
-        },
-    )
-    .map_err(unavailable)?;
-    let ServerResponse::ChatAttached { session, .. } = response else {
-        return Err("Starting the agent's conversation returned an unexpected response".into());
-    };
+    let session = resume::reopen(host, source, resume::Basis::Prompt)
+        .map_err(|error| format!("Cannot reopen the agent's conversation: {error}"))?;
     let bound = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2132,6 +2085,8 @@ pub(super) fn process(
         Operation::Deliver(outgoing) => mailbox::hand(host, &authority, outgoing)
             .map(Reply::Handed)
             .map_err(|error| error.to_string()),
+        Operation::Stopped(scope) => resume::stopped(host, &authority, scope).map(Reply::Stopped),
+        Operation::Resume(handle) => resume::resume(host, &authority, &handle).map(Reply::Resumed),
     }
 }
 

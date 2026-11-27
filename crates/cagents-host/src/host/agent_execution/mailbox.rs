@@ -63,7 +63,7 @@ const PERSON_FIRST: Duration = Duration::from_secs(20);
 const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// The shortest handle a session can be named by, so a typo does not reach
 /// a stranger that happens to share one character.
-const MIN_HANDLE: usize = 4;
+pub(super) const MIN_HANDLE: usize = 4;
 
 /// Sends as an older CLI asks to, without reporting the recipient.
 pub(in crate::host) fn send(
@@ -578,9 +578,10 @@ fn stopped(listing: &directory::Listing, handle: &str) -> Option<String> {
     if let Some(failure) = &member.failure {
         reason.push_str(&format!(" ({failure})"));
     }
-    reason.push_str(
-        ". Resume its conversation first, or message another session from `cagents sessions --all`",
-    );
+    reason.push_str(&format!(
+        ". Resume its conversation first with `cagents resume {}`, or message another session from `cagents sessions --all`",
+        member.session.id
+    ));
     Some(reason)
 }
 
@@ -864,7 +865,7 @@ impl Handle {
 
     /// Keep unclaimed inputs durable during approved interruption. Follow the
     /// fence without holding daemon control or joining its waiter at shutdown.
-    fn defers_for_update(&self) -> bool {
+    pub(super) fn defers_for_update(&self) -> bool {
         let Some(runtime) = &self.0.update_runtime else {
             return false;
         };

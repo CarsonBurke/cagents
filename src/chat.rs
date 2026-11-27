@@ -1185,6 +1185,31 @@ pub fn is_retained_resume_commit(source: &Session, started: &Session) -> bool {
         && started.has_valid_native_continuity()
 }
 
+/// Whether `prepared` is an answer the daemon's resume preparation may give
+/// for `source`: the source itself, when a live owner keeps it or a shared
+/// Codex server may already serve it; the reconnect-only successor of an
+/// ended retained Claude actor; or a durable conversation under a new
+/// allocation with nothing changed but how it reaches its provider.
+/// Shape validation only: it grants no provider ownership, and the start
+/// that follows still runs the daemon's normal admission.
+pub fn is_prepared_resume(source: &Session, prepared: &Session) -> bool {
+    if source == prepared || is_retained_resume_successor(source, prepared) {
+        return true;
+    }
+    if !source.has_valid_native_continuity()
+        || source.launch.session_id.is_none()
+        || prepared.id == source.id
+    {
+        return false;
+    }
+    let mut expected = source.clone();
+    expected.reset_owned_codex_listener();
+    expected.id = prepared.id;
+    expected.proof = None;
+    expected.terminal = None;
+    &expected == prepared
+}
+
 /// An identity-only projection: `replacement` is `source` with nothing changed
 /// but the conversation ID and native continuity its provider confirmed. It
 /// covers retained Claude helpers and daemon-hosted Codex threads on their own
