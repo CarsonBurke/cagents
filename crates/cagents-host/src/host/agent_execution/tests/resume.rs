@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     agent_execution::directory::Scope as Sessions,
-    agent_execution::resume::{Resumed, Scope, Stopped},
+    agent_execution::resume::{Resumed, Scope, StoppedSessions},
     model::{BootId, CardKind},
 };
 
@@ -108,7 +108,7 @@ fn session_of(host: &SharedHost, agent: AgentId) -> chat::Session {
     }
 }
 
-fn stopped(host: &SharedHost, scope: Scope) -> Vec<Stopped> {
+fn stopped(host: &SharedHost, scope: Scope) -> StoppedSessions {
     match process(host, Authority::default(), Operation::Stopped(scope)).unwrap() {
         Reply::Stopped(stopped) => stopped,
         other => panic!("{other:?}"),
@@ -151,7 +151,9 @@ fn the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow() {
     }
     let (host, accepted, conversation) = stopped_agent(crate::daemon::read_boot_id().unwrap());
     let before = session_of(&host, accepted.agent.id);
-    let listed = stopped(&host, Scope::Sessions(Sessions::All));
+    let found = stopped(&host, Scope::Sessions(Sessions::All));
+    assert_eq!(found.in_app_only, 0, "{found:?}");
+    let listed = found.sessions;
     assert_eq!(
         listed.iter().map(|stopped| stopped.id).collect::<Vec<_>>(),
         [before.id],
@@ -179,7 +181,7 @@ fn the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow() {
         reason.contains(&format!("cagents resume {}", before.id)),
         "{reason}"
     );
-    assert!(stopped(&host, Scope::Sessions(Sessions::All)).len() == 1);
+    assert_eq!(stopped(&host, Scope::Sessions(Sessions::All)).sessions.len(), 1);
 
     // Too short a handle names nothing.
     assert!(resume(&host, before.id.to_string()[..3].into()).is_err());
@@ -219,7 +221,7 @@ fn the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow() {
         "the pane names the process that runs"
     );
     assert_eq!(pane.launch.session_id, Some(conversation.clone()));
-    assert!(stopped(&host, Scope::Sessions(Sessions::All)).is_empty());
+    assert!(stopped(&host, Scope::Sessions(Sessions::All)).sessions.is_empty());
 
     let again = resume(&host, before.id.to_string()).unwrap();
     assert!(again.already_running, "{again:?}");

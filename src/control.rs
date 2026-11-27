@@ -350,7 +350,7 @@ pub enum TopCommand {
     Transcript(TranscriptArgs),
     /// Reopen the conversations of sessions whose provider stopped.
     #[command(
-        after_help = "Each reopens as its pane's Resume would in the app: the exact saved conversation, in its original directory and on its original account, once nothing else can still be writing it. It then waits idle for its next message. `cagents sessions --channel` lists stopped sessions. With --device, resumes that machine's sessions, as after a reboot with no one logged in."
+        after_help = "With no sessions or scope, or with --list, lists what can be resumed and why each stopped, without resuming anything. Each resumes as its pane's Resume would in the app: the exact saved conversation, in its original directory and on its original account. It then waits idle for its next message. With --device, resumes that machine's sessions, as after a reboot with no one logged in."
     )]
     Resume(ResumeArgs),
     /// Inspect native resident capacity and explicitly release completed handles.

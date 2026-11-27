@@ -129,7 +129,11 @@ the agents it started. With `--json` it returns `data.sessions`, a row per
 session with its `session`, the `running` session that now carries the
 conversation, `provider`, `title`, `agent`, and `state` (`resumed`, `starting`,
 `already_running` or `failed`, with `error`), and `data.outcome`, `failed`
-when any did. `agent close` still retires a stopped agent.
+when any did. `cagents resume` with no sessions or scope, or with `--list`,
+resumes nothing and lists what it could: `data.stopped`, a row per session
+with its `session`, `provider`, `title`, `agent` and the `failure` that stopped
+it, and `data.in_app_only`, how many more only their panes in the app can
+reopen. `agent close` still retires a stopped agent.
 
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 

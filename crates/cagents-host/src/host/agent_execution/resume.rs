@@ -15,7 +15,7 @@ use crate::{
     agent_execution::{
         Agent, Authority, HostedSession, Origin,
         directory::{Member, Scope as Sessions, Surface},
-        resume::{Resumed, Scope, Stopped},
+        resume::{Resumed, Scope, Stopped, StoppedSessions},
     },
     chat::{self, Session},
     model::TerminalId,
@@ -45,13 +45,14 @@ pub(super) enum Basis {
     Prompt,
 }
 
-/// The stopped sessions in `scope` that the caller may resume: every one for
-/// the person, and a session's own agents for a session.
+/// The stopped sessions in `scope` that the caller may resume, one for each
+/// lineage: every one for the person, and a session's own agents for a
+/// session. Stopped chats only their pane can reopen are counted instead.
 pub(super) fn stopped(
     host: &SharedHost,
     authority: &Authority,
     scope: Scope,
-) -> Result<Vec<Stopped>, String> {
+) -> Result<StoppedSessions, String> {
     let (origin, _) = caller(host, authority)?;
     let everywhere = scope == Scope::Sessions(Sessions::All);
     let wanted = match scope {
@@ -59,7 +60,8 @@ pub(super) fn stopped(
         Scope::Channel(channel) => directory::Wanted::Channel(channel),
     };
     let listing = directory::list(host, authority, wanted, true, false)?;
-    let agents = registry(host)?
+    let registry = registry(host)?;
+    let agents = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agents(None)?;
@@ -70,31 +72,40 @@ pub(super) fn stopped(
         .filter(|member| !member.exited)
         .map(|member| member.session.lineage)
         .collect();
-    let registry = registry(host)?;
-    let mut stopped: Vec<Stopped> = listing
-        .members()
-        .filter(|member| {
-            member.exited
-                && member.session.surface == Surface::Chat
-                && !running.contains(&member.session.lineage)
-        })
-        .filter_map(|member| {
-            let provider = member.session.provider?;
+    // Members come most recently active first, so a lineage's first
+    // resumable member is the conversation it last continued.
+    let candidates = listing.members().filter(|member| {
+        member.exited
+            && member.session.surface == Surface::Chat
+            && !running.contains(&member.session.lineage)
+    });
+    let mut found = one_per_lineage(
+        candidates,
+        |member| member.session.lineage,
+        |member| {
+            let Some(provider) = member.session.provider else {
+                return Candidate::Skip;
+            };
             let agent = open_agent(&agents, member.session.id);
+            if !may_resume(&origin, agent) {
+                return Candidate::Skip;
+            }
             // Listed only when a resume could start it, so a scope's resume
             // fails only for what was worth trying.
-            let source = descriptor(host, &registry, member.session.id, agent).ok()??;
-            if !resumable(&source) {
-                return None;
+            match descriptor(host, &registry, member.session.id, agent) {
+                Ok(Some(source)) if resumable(&source) => Candidate::Resumable(Stopped {
+                    id: member.session.id,
+                    provider,
+                    title: member.session.title.clone(),
+                    agent: agent.map(|agent| agent.id),
+                    failure: member.failure.clone(),
+                }),
+                // This daemon runs it after all.
+                Ok(None) => Candidate::Skip,
+                Ok(Some(_)) | Err(_) => Candidate::InAppOnly,
             }
-            may_resume(&origin, agent).then(|| Stopped {
-                id: member.session.id,
-                provider,
-                title: member.session.title.clone(),
-                agent: agent.map(|agent| agent.id),
-            })
-        })
-        .collect();
+        },
+    );
     if everywhere {
         // An agent no pane shows, such as one started from a shell on a
         // machine no window opened, is listed by its agent alone.
@@ -105,7 +116,7 @@ pub(super) fn stopped(
             .keys()
             .copied()
             .collect();
-        stopped.extend(agents.iter().filter_map(|agent| {
+        found.sessions.extend(agents.iter().filter_map(|agent| {
             let Some(HostedSession::Chat(session)) = &agent.session else {
                 return None;
             };
@@ -118,10 +129,55 @@ pub(super) fn stopped(
                 provider: session.launch.provider,
                 title: agent.name.clone(),
                 agent: Some(agent.id),
+                failure: None,
             })
         }));
     }
-    Ok(stopped)
+    Ok(found)
+}
+
+/// What one stopped chat is to a listing of what may be resumed.
+enum Candidate {
+    Resumable(Stopped),
+    /// Stopped, but only its pane in the app can reopen it.
+    InAppOnly,
+    /// Not the caller's to resume, or not stopped after all.
+    Skip,
+}
+
+/// The first resumable candidate of each lineage, in the order lineages first
+/// appear, and how many lineages only the app can reopen.
+fn one_per_lineage<T, L: PartialEq>(
+    candidates: impl IntoIterator<Item = T>,
+    lineage: impl Fn(&T) -> L,
+    mut classify: impl FnMut(&T) -> Candidate,
+) -> StoppedSessions {
+    let mut lineages: Vec<(L, Vec<T>)> = Vec::new();
+    for candidate in candidates {
+        let key = lineage(&candidate);
+        match lineages.iter_mut().find(|(seen, _)| *seen == key) {
+            Some((_, members)) => members.push(candidate),
+            None => lineages.push((key, vec![candidate])),
+        }
+    }
+    let mut found = StoppedSessions::default();
+    for (_, members) in lineages {
+        let mut in_app_only = false;
+        let chosen = members.iter().find_map(|member| match classify(member) {
+            Candidate::Resumable(stopped) => Some(stopped),
+            Candidate::InAppOnly => {
+                in_app_only = true;
+                None
+            }
+            Candidate::Skip => None,
+        });
+        match chosen {
+            Some(stopped) => found.sessions.push(stopped),
+            None if in_app_only => found.in_app_only += 1,
+            None => {}
+        }
+    }
+    found
 }
 
 /// Reopens the stopped conversation `handle` names, a session, lineage or
@@ -511,7 +567,7 @@ fn resolve<'a>(
                 "More than one agent matches {handle}; give more of the ID"
             )),
             (None, _) => Err(format!(
-                "No session or agent matches {handle}; list stopped sessions with `cagents sessions --channel`"
+                "No session or agent matches {handle}; `cagents resume` lists the stopped sessions you can resume"
             )),
         };
     };
@@ -605,5 +661,45 @@ mod tests {
         let mut retained = session(None);
         retained.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         assert!(resumable(&retained));
+    }
+
+    #[test]
+    fn a_listing_offers_each_lineage_once_and_counts_what_only_the_app_reopens() {
+        let stopped = |id: TerminalId| Stopped {
+            id,
+            provider: crate::agent::Provider::Codex,
+            title: None,
+            agent: None,
+            failure: Some("Codex sign-in needs attention".into()),
+        };
+        let [newest, older, other, paired, foreign] = std::array::from_fn(|_| TerminalId::new());
+        // (session, lineage, what it is), most recently active first.
+        let members = [
+            (newest, 1, Some(true)),
+            (other, 2, None),
+            (older, 1, Some(true)),
+            (paired, 3, Some(false)),
+            (foreign, 4, None),
+        ];
+        let found = one_per_lineage(
+            members,
+            |(_, lineage, _)| *lineage,
+            |(id, _, resumable)| match resumable {
+                Some(true) => Candidate::Resumable(stopped(*id)),
+                Some(false) => Candidate::InAppOnly,
+                None if *id == other => Candidate::Resumable(stopped(*id)),
+                None => Candidate::Skip,
+            },
+        );
+        assert_eq!(
+            found.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [newest, other],
+            "the lineage's latest conversation, once"
+        );
+        assert_eq!(found.in_app_only, 1);
+        assert_eq!(
+            found.sessions[0].failure.as_deref(),
+            Some("Codex sign-in needs attention")
+        );
     }
 }

@@ -5,20 +5,19 @@ use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
     directory::Scope as Sessions,
-    resume::{Resumed, Scope, Stopped},
+    resume::{Resumed, Scope, Stopped, StoppedSessions},
 };
 
 #[derive(Debug, clap::Args)]
-#[command(group(
-    clap::ArgGroup::new("named")
-        .args(["sessions", "channel", "all", "project"])
-        .required(true)
-))]
 pub struct ResumeArgs {
     /// Sessions to resume: a session, lineage or agent ID, or at least four
     /// characters of one, as `cagents send` takes.
-    #[arg(value_name = "SESSION", conflicts_with_all = ["channel", "all", "project"])]
+    #[arg(value_name = "SESSION", conflicts_with_all = ["channel", "all", "project", "list"])]
     sessions: Vec<String>,
+    /// List the stopped sessions in scope that can be resumed, and why each
+    /// stopped, without resuming any. With no scope, lists every project's.
+    #[arg(long)]
+    list: bool,
     /// Resume every stopped session in this channel, or in yours when no
     /// UUID is given.
     #[arg(long, value_name = "CHANNEL", num_args = 0..=1, default_missing_value = "",
@@ -43,15 +42,26 @@ enum Outcome {
 pub(super) fn resume(arguments: ResumeArgs) -> Result<CommandOutput, AppError> {
     let mut client = control_daemon_client()?;
     let mut request = |operation| client.agent(Authority::from_environment(), operation);
+    let program = format::program();
     let named: Vec<String> = match scope(&arguments)? {
-        None => arguments.sessions,
-        Some(scope) => match request(Operation::Stopped(scope)).map_err(protocol_error)? {
-            Reply::Stopped(stopped) => stopped
+        None if !arguments.list && !arguments.sessions.is_empty() => arguments.sessions,
+        scope => {
+            // Nothing named, or --list, shows what a resume would try.
+            let listing = arguments.list || scope.is_none();
+            let scope = scope.unwrap_or(Scope::Sessions(Sessions::All));
+            let found = match request(Operation::Stopped(scope.clone())).map_err(protocol_error)? {
+                Reply::Stopped(found) => found,
+                _ => return Err(AppError::new("resume", "Unexpected reply from the daemon")),
+            };
+            if listing {
+                return Ok(listed(&found, &scope_flag(&arguments), &program));
+            }
+            found
+                .sessions
                 .into_iter()
                 .map(|Stopped { id, .. }| id.to_string())
-                .collect(),
-            _ => return Err(AppError::new("resume", "Unexpected reply from the daemon")),
-        },
+                .collect()
+        }
     };
     // One at a time, in order: each start is admitted against the daemon's
     // capacity as the one before it settles. A refusal fails only its own
@@ -63,7 +73,7 @@ pub(super) fn resume(arguments: ResumeArgs) -> Result<CommandOutput, AppError> {
         if let Some(reason) = &lost {
             results.push(Outcome::Failed {
                 session,
-                reason: format!("Not tried: {reason}"),
+                reason: format!("Not tried (connection lost): {reason}"),
             });
             continue;
         }
@@ -83,14 +93,96 @@ pub(super) fn resume(arguments: ResumeArgs) -> Result<CommandOutput, AppError> {
                 Outcome::Failed {
                     session,
                     reason: format!(
-                        "{}; the daemon may still be starting it, so check with `cagents ls --all` before trying again",
+                        "{}; the daemon may still be starting it, so check with `{program} resume --list` before trying again",
                         error.message
                     ),
                 }
             }
         });
     }
-    Ok(output(&results, &format::program()))
+    Ok(output(&results, &program))
+}
+
+/// The scope flag the person gave, as the command that resumes that scope
+/// spells it.
+fn scope_flag(arguments: &ResumeArgs) -> String {
+    if let Some(channel) = &arguments.channel {
+        return if channel.is_empty() {
+            "--channel".into()
+        } else {
+            format!("--channel {}", format::shell_word(channel))
+        };
+    }
+    match &arguments.project {
+        Some(project) => format!("--project {}", format::shell_word(&project.to_string_lossy())),
+        None => "--all".into(),
+    }
+}
+
+/// What a resume of the scope `flag` names would try, and what only the app
+/// can reopen.
+fn listed(found: &StoppedSessions, flag: &str, program: &str) -> CommandOutput {
+    let rows: Vec<Value> = found
+        .sessions
+        .iter()
+        .map(|stopped| {
+            json!({
+                "session": stopped.id,
+                "provider": stopped.provider.executable(),
+                "title": stopped.title,
+                "agent": stopped.agent,
+                "failure": stopped.failure,
+            })
+        })
+        .collect();
+    CommandOutput {
+        command: "resume",
+        human: if super::human_output() {
+            listed_human(found, flag, program)
+        } else {
+            String::new()
+        },
+        data: json!({
+            "stopped": rows,
+            "in_app_only": found.in_app_only,
+        }),
+    }
+}
+
+fn listed_human(found: &StoppedSessions, flag: &str, program: &str) -> String {
+    let mut lines = Vec::new();
+    match found.sessions.len() {
+        0 => lines.push("No stopped sessions to resume.".to_owned()),
+        1 => lines.push("1 stopped session can be resumed:".to_owned()),
+        count => lines.push(format!("{count} stopped sessions can be resumed:")),
+    }
+    for stopped in &found.sessions {
+        let mut line = format!("  {}  {}", stopped.id, stopped.provider.label());
+        if let Some(title) = &stopped.title {
+            line.push_str(", ");
+            line.push_str(&format::plain(title));
+        }
+        lines.push(line);
+        if let Some(failure) = &stopped.failure {
+            lines.push(format!("      Stopped: {}", format::plain(failure)));
+        }
+    }
+    match found.in_app_only {
+        0 => {}
+        1 => lines.push(
+            "1 more can be resumed only from its pane in the app, such as one paired with its provider's terminal."
+                .to_owned(),
+        ),
+        count => lines.push(format!(
+            "{count} more can be resumed only from their panes in the app, such as ones paired with their provider's terminal."
+        )),
+    }
+    if !found.sessions.is_empty() {
+        lines.push(format!(
+            "Resume one with `{program} resume SESSION`, or all of these with `{program} resume {flag}`."
+        ));
+    }
+    lines.join("\n")
 }
 
 /// The scope a flag names, or `None` when sessions are named one by one.
@@ -182,7 +274,7 @@ fn human(results: &[Outcome], program: &str) -> String {
                     format!("Already running: {name}")
                 } else if resumed.starting {
                     format!(
-                        "Resumed {name}; its provider is still starting, and `{program} ls --all` shows when it is ready or why it stopped"
+                        "Resumed {name}; its provider is still starting, and `{program} ls --all` shows it once it is ready, or `{program} resume --list` why it stopped"
                     )
                 } else {
                     format!("Resumed {name}")
@@ -239,15 +331,55 @@ mod tests {
     }
 
     #[test]
-    fn resume_takes_sessions_or_one_scope_and_never_nothing() {
+    fn resume_takes_sessions_or_one_scope_and_lists_otherwise() {
         assert!(parse(&["resume", "c4477d33", "4518d661"]).is_ok());
         assert!(parse(&["resume", "--channel"]).is_ok());
         assert!(parse(&["resume", "--all"]).is_ok());
         assert!(parse(&["resume", "--project", "cagents"]).is_ok());
-        // Nothing named resumes nothing rather than guessing a scope.
-        assert!(parse(&["resume"]).is_err());
+        // Nothing named lists what could be resumed rather than guessing a
+        // scope to start.
+        assert!(parse(&["resume"]).is_ok());
+        assert!(parse(&["resume", "--list"]).is_ok());
+        assert!(parse(&["resume", "--list", "--channel"]).is_ok());
+        assert!(parse(&["resume", "c4477d33", "--list"]).is_err());
         assert!(parse(&["resume", "c4477d33", "--all"]).is_err());
         assert!(parse(&["resume", "--channel", "--all"]).is_err());
+    }
+
+    #[test]
+    fn a_listing_says_why_each_stopped_and_how_to_resume_them() {
+        let id = TerminalId::new();
+        let found = StoppedSessions {
+            sessions: vec![Stopped {
+                id,
+                provider: Provider::Antigravity,
+                title: Some("Fix the build".into()),
+                agent: None,
+                failure: Some("Antigravity sign-in needs attention".into()),
+            }],
+            in_app_only: 2,
+        };
+        let output = listed(&found, "--all", "cagents --device desktop");
+        assert_eq!(output.exit_code(), ExitCode::SUCCESS);
+        assert_eq!(output.data["in_app_only"], 2);
+        assert_eq!(
+            output.data["stopped"][0]["failure"],
+            "Antigravity sign-in needs attention"
+        );
+        let text = listed_human(&found, "--all", "cagents --device desktop");
+        assert!(text.starts_with("1 stopped session can be resumed:"), "{text}");
+        assert!(text.contains(&format!("{id}  Antigravity, Fix the build")), "{text}");
+        assert!(
+            text.contains("Stopped: Antigravity sign-in needs attention"),
+            "{text}"
+        );
+        assert!(text.contains("2 more can be resumed only from their panes"), "{text}");
+        assert!(
+            text.contains("`cagents --device desktop resume --all`"),
+            "{text}"
+        );
+        let empty = listed_human(&StoppedSessions::default(), "--all", "cagents");
+        assert_eq!(empty, "No stopped sessions to resume.");
     }
 
     #[test]

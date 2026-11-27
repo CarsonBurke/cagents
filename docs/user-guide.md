@@ -1015,26 +1015,34 @@ conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
 
 Without a window, as on a headless machine after a reboot, resume them from the
-CLI. `cagents resume` takes sessions by session, lineage or agent ID, or a
-prefix of at least four characters, as `cagents send` does, or every stopped
-session in a scope:
+CLI. `cagents resume` on its own lists the stopped sessions that can be
+resumed, with the reason each one stopped, such as a provider whose sign-in
+needs attention, and how many more only their panes in the app can reopen. It
+resumes nothing. Then resume sessions by session, lineage or agent ID, or a
+prefix of at least four characters, as `cagents send` takes them, or every
+stopped session in a scope:
 
 ```sh
+cagents resume                      # list what can be resumed
 cagents resume 7c0fba49 4518d661
-cagents resume --channel            # your channel, or --channel CHANNEL
 cagents resume --project cagents
 cagents resume --all
+cagents --device desktop resume     # list another machine's
 cagents --device desktop resume --all
 ```
+
+`--list` lists a given scope instead of resuming it, as in
+`cagents resume --list --project cagents`. Inside an agent session's terminal,
+`--channel` names that session's channel, or `--channel CHANNEL` another.
 
 Each one reopens as its pane's Resume would: the same checks, the exact
 conversation, original account and working directory, and the pane then shows
 the running conversation, so a window opened later does not start it again. A
 conversation that is already running is reported and left alone. Each waits idle
 for its next message; nothing the stopped provider held is resent. A session
-that cannot resume says why, such as a provider whose sign-in needs attention,
-and the command exits with status 4 once the others have been tried. A chat
-paired with its provider's terminal still resumes from its pane in the app.
+that cannot resume says why, and the command exits with status 4 once the
+others have been tried. A chat paired with its provider's terminal still
+resumes from its pane in the app.
 
 ### Image references and local image storage
 
