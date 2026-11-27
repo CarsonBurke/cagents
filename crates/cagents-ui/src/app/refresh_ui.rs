@@ -79,6 +79,12 @@ impl SourceReload {
         self.due
     }
 
+    /// Owes a read at `at` with no change seen, unless one is owed already:
+    /// how a checkout with no watcher, on a device, is kept current.
+    pub(super) fn poll(&mut self, at: Instant) {
+        self.due.get_or_insert(at);
+    }
+
     /// A read began, after every change reported so far.
     pub(super) fn read_started(&mut self) {
         self.reading_untracked = self.due.is_some() && !self.tracked;

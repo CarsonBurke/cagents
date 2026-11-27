@@ -364,7 +364,10 @@ use crate::{
 /// Version 215 appends `WatchDeviceStats`, its `DeviceStats` answer and the
 /// `DeviceStats` readings that follow, for the status bar's view of the
 /// device's processors, memory and disk. An older client is never sent one.
-pub const PROTOCOL_VERSION: u16 = 215;
+///
+/// Version 216 appends the `Repository` device operation and reply, which
+/// carry a device window's source control as JSON.
+pub const PROTOCOL_VERSION: u16 = 216;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

@@ -97,9 +97,15 @@ impl Cagents {
             let worktree = key.canonical_path.clone();
             let revision = oid.clone();
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .commit_diff_entries(&worktree, &revision, parent.as_ref(), &cancellation)
-                    .map_err(|error| error.to_string())
+                crate::device_service::answer_repository(
+                    RepositoryRequest::CommitFiles {
+                        worktree,
+                        oid: revision,
+                        parent,
+                    },
+                    &cancellation,
+                )?
+                .into_files()
             })
             .await
             .map_err(|error| format!("Commit reader failed: {error}"))

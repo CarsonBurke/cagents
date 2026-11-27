@@ -118,7 +118,7 @@ mod markdown;
 mod markdown_source;
 mod monospace;
 mod opening_name;
-mod patch_view;
+pub(super) mod patch_view;
 mod pending_admission;
 #[cfg(test)]
 pub(in crate::app) use pending_admission::RETAINED_COPY_TITLE;

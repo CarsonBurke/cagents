@@ -188,9 +188,11 @@ impl Cagents {
             let worktree = identity.key.canonical_path.clone();
             let base_ref = identity.base_ref.clone();
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .branch_comparison(&worktree, &base_ref, &cancellation)
-                    .map_err(|error| error.to_string())
+                crate::device_service::answer_repository(
+                    RepositoryRequest::BranchComparison { worktree, base_ref },
+                    &cancellation,
+                )?
+                .into_branch_comparison()
             })
             .await
             .map_err(|error| format!("branch comparison reader join failed: {error}"))
@@ -297,6 +299,18 @@ impl Cagents {
         basis: DiffBasis,
         opener: Option<CardId>,
     ) -> Task<Message> {
+        if crate::device::is_remote() {
+            if self.modal_is_open() || !self.source_control_is_bound(&key) {
+                return Task::none();
+            }
+            let request = crate::repository::DiffRequest {
+                worktree: key.canonical_path.clone(),
+                basis,
+                path,
+                old_path,
+            };
+            return self.open_device_diff(key, request, None);
+        }
         // A pane derives a committed comparison's rename source only from a
         // committed selection, so a rename cannot be shown beside an open
         // buffer.
@@ -335,8 +349,14 @@ impl Cagents {
                 .group(area)
                 .and_then(|group| group.rows().iter().find(|row| row.entry.path == path))
         };
-        if find(area).is_none() {
+        let Some(row) = find(area) else {
             return Task::none();
+        };
+        // A device's change has no pane to open in here; the device dialog
+        // shows it, read by the device's Git.
+        if crate::device::is_remote() {
+            let request = device_ui::working_diff_request(&key, row, area);
+            return self.open_device_diff(key, request, Some(area));
         }
         let staged = find(ChangeArea::Staged);
         let unstaged = find(ChangeArea::Unstaged)

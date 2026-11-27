@@ -429,7 +429,7 @@ impl PatchModel {
     /// `theme` colours its syntax, read from `path`'s name as the repository
     /// diff reads it; without one the lines are drawn in the text colour, as
     /// a caller chooses for a patch too long to highlight.
-    pub(super) fn new(
+    pub(in crate::app) fn new(
         text: Arc<str>,
         path: &Path,
         origin: chat::LineOrigin,
@@ -494,16 +494,12 @@ impl PatchModel {
     }
 
     /// Whether the text is shown as it is, not as rows.
-    pub(super) fn is_raw(&self) -> bool {
+    pub(in crate::app) fn is_raw(&self) -> bool {
         self.rows.is_none()
     }
 
     /// The lines the patch adds and removes, if it has all of them.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the transcript's edit step (#3452) shows them")
-    )]
-    pub(super) fn counts(&self) -> Option<(u32, u32)> {
+    pub(in crate::app) fn counts(&self) -> Option<(u32, u32)> {
         self.rows
             .as_ref()
             .filter(|rows| rows.complete)
@@ -530,7 +526,7 @@ impl PatchModel {
 /// shown. A view keeps one per patch it shows, and starts it again for a
 /// different patch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct ViewState {
+pub(in crate::app) struct ViewState {
     unfolded: Vec<usize>,
     /// How many times the reader asked for more: each shows up to
     /// [`MORE_LINES`] lines in all, and the first opens every fold.
@@ -548,7 +544,7 @@ pub enum Event {
 }
 
 impl ViewState {
-    pub(super) fn apply(&mut self, event: Event) {
+    pub(in crate::app) fn apply(&mut self, event: Event) {
         match event {
             Event::Unfold(fold) => {
                 if !self.unfolded.contains(&fold) {
@@ -566,17 +562,17 @@ impl ViewState {
 
 /// What the drawn patch fits into.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Options {
+pub(in crate::app) struct Options {
     /// The width the patch is drawn in, which decides whether it keeps two
     /// gutters and scrolls sideways or keeps one and wraps.
-    pub(super) width: f32,
+    pub(in crate::app) width: f32,
     /// The syntax theme the view is drawn in. A model coloured in another
     /// is drawn in the text colour until it is built again.
-    pub(super) theme: crate::settings::EditorSyntaxTheme,
+    pub(in crate::app) theme: crate::settings::EditorSyntaxTheme,
 }
 
 /// One line of code to draw, for the caller's code-text builder.
-pub(super) struct Code<'a, Link> {
+pub(in crate::app) struct Code<'a, Link> {
     /// Its row's index in the model's rows.
     #[expect(
         dead_code,
@@ -590,21 +586,21 @@ pub(super) struct Code<'a, Link> {
     pub(super) line: &'a Line,
     /// The line, coloured and emphasised as it is drawn, in the monospace
     /// family.
-    pub(super) spans: Vec<Span<'a, Link>>,
+    pub(in crate::app) spans: Vec<Span<'a, Link>>,
     /// Whether the line wraps under its own text: the view is too narrow to
     /// scroll it sideways.
-    pub(super) wrap: bool,
+    pub(in crate::app) wrap: bool,
 }
 
-pub(super) type Span<'a, Link> = iced::widget::text::Span<'a, Link>;
+pub(in crate::app) type Span<'a, Link> = iced::widget::text::Span<'a, Link>;
 
 /// The code text for a view that only shows the patch.
-pub(super) fn plain<'a, M: 'a>(code: Code<'a, ()>) -> Element<'a, M> {
+pub(in crate::app) fn plain<'a, M: 'a>(code: Code<'a, ()>) -> Element<'a, M> {
     code_text(code.spans, code.wrap)
 }
 
 /// `spans` drawn at the patch's size and spacing.
-pub(super) fn code_text<'a, Link: Clone + 'static, M: 'a>(
+pub(in crate::app) fn code_text<'a, Link: Clone + 'static, M: 'a>(
     spans: Vec<Span<'a, Link>>,
     wrap: bool,
 ) -> Element<'a, M> {
@@ -720,7 +716,7 @@ impl PatchModel {
     ///
     /// `code` builds each line's text from its spans, so a caller can make
     /// it selectable or searchable; [`plain`] only draws it.
-    pub(super) fn view<'a, M: Clone + 'static, Link: Clone + 'static>(
+    pub(in crate::app) fn view<'a, M: Clone + 'static, Link: Clone + 'static>(
         &'a self,
         state: &ViewState,
         options: Options,

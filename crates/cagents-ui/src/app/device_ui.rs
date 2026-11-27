@@ -11,6 +11,9 @@ pub(super) fn device_label(name: &str) -> &str {
     if name == "local" { "This device" } else { name }
 }
 
+mod diff;
+pub(super) use diff::working_request as working_diff_request;
+
 pub(super) fn file_editor_id() -> widget::Id {
     widget::Id::new("device-file-editor")
 }
@@ -103,7 +106,47 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::DismissWorktreeOperation(_)
         | SidebarAction::CancelDiscard
         | SidebarAction::CancelGitConfirmation
-        | SidebarAction::CancelPublish => {
+        | SidebarAction::CancelPublish
+        // Source control asks the device's Git through the device's daemon,
+        // and a change's diff opens in the device dialog, so the Changes
+        // panel works as a local one does.
+        | SidebarAction::ChangeGroup { .. }
+        | SidebarAction::ChangePage { .. }
+        | SidebarAction::OpenCommit { .. }
+        | SidebarAction::CloseCommit { .. }
+        | SidebarAction::ShowMoreCommitFiles { .. }
+        | SidebarAction::OpenCommitFile { .. }
+        | SidebarAction::ToggleSection { .. }
+        | SidebarAction::ToggleSourceControlPanel { .. }
+        | SidebarAction::RefreshWorktree { .. }
+        | SidebarAction::SetChangeListMode { .. }
+        | SidebarAction::SetChangesTab { .. }
+        | SidebarAction::SetWorktreePanel { .. }
+        | SidebarAction::ToggleChangeDirectory { .. }
+        | SidebarAction::OpenChange { .. }
+        | SidebarAction::Stage { .. }
+        | SidebarAction::Unstage { .. }
+        | SidebarAction::RequestDiscard { .. }
+        | SidebarAction::ConfirmDiscard { .. }
+        | SidebarAction::CommitMessageChanged { .. }
+        | SidebarAction::CommitSubjectEditorCursor { .. }
+        | SidebarAction::CommitEditorCursor { .. }
+        | SidebarAction::CommitSubjectEditorAction { .. }
+        | SidebarAction::CommitEditorAction { .. }
+        | SidebarAction::AmendChanged { .. }
+        | SidebarAction::Commit { .. }
+        | SidebarAction::Push { .. }
+        | SidebarAction::OpenPublish { .. }
+        | SidebarAction::PublishRemoteChanged { .. }
+        | SidebarAction::PublishBranchChanged { .. }
+        | SidebarAction::LoadMoreHistory { .. }
+        | SidebarAction::RequestStageConflictMarkers { .. }
+        | SidebarAction::ConfirmStageConflictMarkers { .. }
+        | SidebarAction::RequestAbortOperation { .. }
+        | SidebarAction::ConfirmAbortOperation { .. }
+        | SidebarAction::ContinueOperation { .. }
+        | SidebarAction::SkipOperation { .. }
+        | SidebarAction::OpenBranchFile { .. } => {
             return None;
         }
         SidebarAction::ProjectCommand {
@@ -161,44 +204,7 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::FilesPage { .. }
         | SidebarAction::FilesQueryChanged { .. }
         | SidebarAction::ToggleDirectory { .. }
-        | SidebarAction::OpenFile { .. }
-        | SidebarAction::OpenBranchFile { .. } => SidebarRoute::DeviceTool(Panel::Files),
-        SidebarAction::ChangeGroup { .. }
-        | SidebarAction::ChangePage { .. }
-        | SidebarAction::OpenCommit { .. }
-        | SidebarAction::CloseCommit { .. }
-        | SidebarAction::ShowMoreCommitFiles { .. }
-        | SidebarAction::OpenCommitFile { .. }
-        | SidebarAction::ToggleSection { .. }
-        | SidebarAction::ToggleSourceControlPanel { .. }
-        | SidebarAction::RefreshWorktree { .. }
-        | SidebarAction::SetChangeListMode { .. }
-        | SidebarAction::SetChangesTab { .. }
-        | SidebarAction::SetWorktreePanel { .. }
-        | SidebarAction::ToggleChangeDirectory { .. }
-        | SidebarAction::OpenChange { .. }
-        | SidebarAction::Stage { .. }
-        | SidebarAction::Unstage { .. }
-        | SidebarAction::RequestDiscard { .. }
-        | SidebarAction::ConfirmDiscard { .. }
-        | SidebarAction::CommitMessageChanged { .. }
-        | SidebarAction::CommitSubjectEditorCursor { .. }
-        | SidebarAction::CommitEditorCursor { .. }
-        | SidebarAction::CommitSubjectEditorAction { .. }
-        | SidebarAction::CommitEditorAction { .. }
-        | SidebarAction::AmendChanged { .. }
-        | SidebarAction::Commit { .. }
-        | SidebarAction::Push { .. }
-        | SidebarAction::OpenPublish { .. }
-        | SidebarAction::PublishRemoteChanged { .. }
-        | SidebarAction::PublishBranchChanged { .. }
-        | SidebarAction::LoadMoreHistory { .. }
-        | SidebarAction::RequestStageConflictMarkers { .. }
-        | SidebarAction::ConfirmStageConflictMarkers { .. }
-        | SidebarAction::RequestAbortOperation { .. }
-        | SidebarAction::ConfirmAbortOperation { .. }
-        | SidebarAction::ContinueOperation { .. }
-        | SidebarAction::SkipOperation { .. } => SidebarRoute::DeviceTool(Panel::Changes),
+        | SidebarAction::OpenFile { .. } => SidebarRoute::DeviceTool(Panel::Files),
     })
 }
 
@@ -253,6 +259,8 @@ pub enum Action {
         generation: u64,
         result: Result<iced::widget::image::Handle, String>,
     },
+    /// The diff of a change opened from Changes.
+    Diff(diff::Action),
     Device(usize),
     OpenDeviceWindow(usize),
     DeviceOpened {
@@ -325,6 +333,8 @@ pub(super) struct State {
     generation: u64,
     pending: Option<Operation>,
     image: Option<ImageRequest>,
+    /// A Changes row's diff, shown in place of the dialog's tools.
+    diff: Option<diff::Diff>,
     linked_file: Option<PathBuf>,
     linked_fragment: Option<String>,
     notice: Option<String>,
@@ -372,6 +382,7 @@ impl Default for State {
             generation: 0,
             pending: None,
             image: None,
+            diff: None,
             linked_file: None,
             linked_fragment: None,
             notice: None,
@@ -656,6 +667,7 @@ impl Cagents {
                 &action,
                 Action::Loaded { .. }
                     | Action::ImageLoaded { .. }
+                    | Action::Diff(_)
                     | Action::Device(_)
                     | Action::OpenDeviceWindow(_)
                     | Action::DeviceOpened { .. }
@@ -685,8 +697,22 @@ impl Cagents {
             );
             return Task::none();
         }
+        // Closing the dialog, or showing anything else in it, closes a diff.
+        if matches!(
+            &action,
+            Action::Close
+                | Action::Open
+                | Action::OpenAt(_)
+                | Action::OpenIn { .. }
+                | Action::OpenFile { .. }
+                | Action::Configure
+                | Action::ChooseProject
+        ) {
+            self.device_ui.diff = None;
+        }
         let operation = match action {
             Action::Menu(_) => unreachable!("device menu handled above"),
+            Action::Diff(action) => return self.update_device_diff(action),
             Action::Configure => {
                 self.device_ui.open = true;
                 self.device_ui.configure = true;
@@ -1417,6 +1443,9 @@ impl Cagents {
 
     fn device_dialog_layout(&self, size: iced::Size) -> Element<'_, Message> {
         let state = &self.device_ui;
+        if let Some(diff) = self.device_diff_layout(size) {
+            return diff;
+        }
         if let Some(image) = &state.image {
             // However long the path, Cancel stays in reach.
             return dialog_ui::scrolling_surface_with_actions(
@@ -2390,8 +2419,15 @@ mod tests {
             path: path.clone(),
         })));
         assert!(!app.device_ui.open);
-        assert!(app.sidebar_model.source_control.is_none());
-        assert!(app.refresh_ui.source_cancel.is_none());
+        // Source control reads the device's Git at the daemon's path, never
+        // what that path resolves to on this computer.
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .map(|source| &source.key.canonical_path),
+            Some(&path)
+        );
         assert_eq!(app.active_workspace, Some(path));
         assert_ne!(app.active_workspace.as_ref(), Some(&local_target));
         drop(app.update(Message::Sidebar(SidebarAction::ClearRowSelection)));
@@ -2854,10 +2890,21 @@ mod tests {
             worktree_id,
             canonical_path: "/srv/demo".into(),
         };
-        assert_eq!(
-            sidebar_route(&SidebarAction::RefreshWorktree { key: key.clone() }),
-            Some(SidebarRoute::DeviceTool(Panel::Changes))
-        );
+        // Changes asks the device's Git as a local panel asks this computer's.
+        for action in [
+            SidebarAction::RefreshWorktree { key: key.clone() },
+            SidebarAction::OpenChange {
+                key: key.clone(),
+                path: crate::repository::RepoPath::parse("src/main.rs").unwrap(),
+                area: crate::repository::ChangeArea::Unstaged,
+            },
+            SidebarAction::Stage {
+                key: key.clone(),
+                selection: Vec::new(),
+            },
+        ] {
+            assert_eq!(sidebar_route(&action), None, "{action:?}");
+        }
         assert_eq!(
             sidebar_route(&SidebarAction::ToggleFilesFilter { key }),
             Some(SidebarRoute::DeviceTool(Panel::Files))

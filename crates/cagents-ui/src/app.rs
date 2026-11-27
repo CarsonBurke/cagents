@@ -171,8 +171,8 @@ use crate::{
         CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
         CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
         PathSelection, PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo,
-        RepositoryService, RepositorySnapshot, SnapshotRead, StageRequest, StatusSnapshot,
-        UnstageRequest, WorktreeCreationOutcome, WorktreeRecord,
+        RepositoryReply, RepositoryRequest, RepositoryService, RepositorySnapshot, SnapshotRead,
+        StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome, WorktreeRecord,
     },
     repository_widget::{self, HunkStaging, LspIntent, RepositoryAction, RepositoryRuntime},
     session::{
@@ -3260,10 +3260,7 @@ fn answers_discard_confirmation(action: &SidebarAction) -> bool {
 /// outcome is not a success: both are said out loud, because the alternative
 /// is a panel that refreshes and silently shows fewer paths staged than the
 /// user selected.
-fn mutation_report(
-    label: &str,
-    outcome: Result<MutationOutcome, crate::repository::RepositoryError>,
-) -> Option<String> {
+fn mutation_report(label: &str, outcome: Result<MutationOutcome, String>) -> Option<String> {
     match outcome {
         Ok(MutationOutcome::Applied { .. }) => None,
         Ok(MutationOutcome::PartiallyApplied { paths, failures }) => Some(format!(
@@ -3281,9 +3278,7 @@ fn mutation_report(
 
 /// The commit report, and whether a commit was actually created. Only a
 /// created commit may clear the message input.
-fn commit_report(
-    outcome: Result<CommitOutcome, crate::repository::RepositoryError>,
-) -> (Option<String>, bool) {
+fn commit_report(outcome: Result<CommitOutcome, String>) -> (Option<String>, bool) {
     match outcome {
         Ok(CommitOutcome::Created { warnings, .. }) if warnings.is_empty() => (None, true),
         Ok(CommitOutcome::Created { warnings, .. }) => (
@@ -3303,7 +3298,7 @@ fn commit_report(
     }
 }
 
-fn push_report(outcome: Result<PushOutcome, crate::repository::RepositoryError>) -> Option<String> {
+fn push_report(outcome: Result<PushOutcome, String>) -> Option<String> {
     match outcome {
         Ok(PushOutcome::Pushed { .. }) => None,
         Ok(PushOutcome::NotPushed { failure }) => Some(format!("Push failed: {failure}")),
@@ -13852,7 +13847,14 @@ impl Cagents {
         let changed = self
             .sidebar_state
             .sync_active_worktree(&self.sidebar_model, &focus);
-        if crate::device::is_remote() {
+        // A device's Git answers for its checkouts; a folder on a device has
+        // no listing here, since its files show through Device files.
+        if crate::device::is_remote()
+            && self
+                .sidebar_state
+                .active_worktree()
+                .is_none_or(|key| self.folder_scope(key))
+        {
             if changed
                 || self.sidebar_model.source_control.is_some()
                 || self.refresh_ui.source_cancel.is_some()
@@ -13891,9 +13893,6 @@ impl Cagents {
     /// tab is showing: a page is a `git log` walk, and a view nobody opened is
     /// not worth one.
     fn load_pending_history(&mut self) -> Task<Message> {
-        if crate::device::is_remote() {
-            return Task::none();
-        }
         if self.active_folder_scope() {
             return Task::none();
         }
@@ -14982,7 +14981,8 @@ impl Cagents {
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
-        if crate::device::is_remote() {
+        let remote = crate::device::is_remote();
+        if remote && self.folder_scope(&key) {
             return Task::none();
         }
         self.cancel_source_read();
@@ -15036,8 +15036,10 @@ impl Cagents {
             untracked_files: untracked_changes
                 || self.workspace_view_shown() == Some(context_sections::WorkspaceView::Files),
         };
+        // A device window's Files shows the device's own browser, so its
+        // reads leave the listing on the device.
         let browse_files =
-            self.workspace_view_shown() == Some(context_sections::WorkspaceView::Files);
+            !remote && self.workspace_view_shown() == Some(context_sections::WorkspaceView::Files);
         let bound = self
             .sidebar_model
             .source_control
@@ -15060,15 +15062,16 @@ impl Cagents {
         let key_for_read = key.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
-                let read = service
-                    .snapshot_if_changed(
-                        &worktree,
+                let read = crate::device_service::answer_repository(
+                    RepositoryRequest::Snapshot {
+                        worktree: worktree.clone(),
                         options,
-                        previous_digest.as_ref(),
-                        &cancellation,
-                    )
-                    .map_err(|error| error.to_string())?;
+                        previous: previous_digest,
+                        files: !remote,
+                    },
+                    &cancellation,
+                )?
+                .into_snapshot()?;
                 let (mut snapshot, digest) = match source_control_ui::snapshot_to_build(
                     read,
                     previous.as_deref(),
@@ -15079,6 +15082,7 @@ impl Cagents {
                     ControlFlow::Break(kept) => return Ok(kept),
                 };
                 if browse_files {
+                    let service = RepositoryService::system("git");
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
                         .map_err(|error| error.to_string())?;
@@ -15117,9 +15121,6 @@ impl Cagents {
         head: Option<crate::repository::Oid>,
         page: u32,
     ) -> Task<Message> {
-        if crate::device::is_remote() {
-            return Task::none();
-        }
         let Some(head) = head else {
             return Task::none();
         };
@@ -15131,9 +15132,11 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .history(&request, &CancellationToken::default())
-                    .map_err(|error| error.to_string())
+                crate::device_service::answer_repository(
+                    RepositoryRequest::History(request),
+                    &CancellationToken::default(),
+                )?
+                .into_history()
             })
             .await
             .map_err(|error| format!("history reader join failed: {error}"))
@@ -15208,9 +15211,13 @@ impl Cagents {
                 selection,
             };
             let joined = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
-                let outcome = service.stage(&request, &CancellationToken::default());
-                (request.selection, outcome)
+                let selection = request.selection.clone();
+                let outcome = crate::device_service::answer_repository(
+                    RepositoryRequest::Stage(request),
+                    &CancellationToken::default(),
+                )
+                .and_then(RepositoryReply::into_mutation);
+                (selection, outcome)
             })
             .await;
             let report = match joined {
@@ -15239,20 +15246,22 @@ impl Cagents {
         })
     }
 
-    /// The task one finished mutation turns into: report what Git did, then
-    /// re-read the worktree, because the index is the only authority on what
-    /// the mutation left behind.
+    /// The task one finished mutation turns into: run `request` where the
+    /// worktree is, report what Git did, then re-read the worktree, because
+    /// the index is the only authority on what the mutation left behind.
+    /// `report` words the answer and says whether a commit was made.
     fn mutation_task(
         key: ActiveWorktreeKey,
         operation: uuid::Uuid,
-        run: impl FnOnce(&RepositoryService, &CancellationToken) -> (Option<String>, bool)
-        + Send
-        + 'static,
+        request: RepositoryRequest,
+        report: impl FnOnce(Result<RepositoryReply, String>) -> (Option<String>, bool) + Send + 'static,
     ) -> Task<Message> {
         cosmic::task::future(async move {
             let joined = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
-                run(&service, &CancellationToken::default())
+                report(crate::device_service::answer_repository(
+                    request,
+                    &CancellationToken::default(),
+                ))
             })
             .await;
             let (report, committed) = match joined {
@@ -19145,13 +19154,18 @@ impl Cagents {
                         let Some(operation) = self.begin_mutation(&key, kind, None) else {
                             return Task::none();
                         };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            let label = if stage { "Stage" } else { "Unstage" };
-                            (
-                                mutation_report(label, service.apply_index_patch(&request, cancel)),
-                                false,
-                            )
-                        })
+                        let label = if stage { "Stage" } else { "Unstage" };
+                        Self::mutation_task(
+                            key,
+                            operation,
+                            RepositoryRequest::ApplyIndexPatch(request),
+                            move |reply| {
+                                (
+                                    mutation_report(label, reply.and_then(RepositoryReply::into_mutation)),
+                                    false,
+                                )
+                            },
+                        )
                     }
                     None => Task::none(),
                 }

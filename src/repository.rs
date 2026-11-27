@@ -30,8 +30,10 @@ use std::{
 mod branch_census;
 pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
+mod request;
 #[cfg(target_os = "macos")]
 pub(crate) use complete_inventory::resolved_git_executable;
+pub use request::{RepositoryReply, RepositoryRequest};
 mod pr_checkout;
 mod pr_creation;
 #[cfg(any(test, feature = "test-support"))]
@@ -624,7 +626,7 @@ pub struct DiffEntry {
 
 /// A branch comparison whose entries and endpoints belong to the same range,
 /// even if HEAD or the base ref moves while Git is reading it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchComparison {
     pub base_ref: ValidatedRefName,
     pub base_oid: Oid,
@@ -710,7 +712,7 @@ pub fn pull_request_refs(
 
 /// Independent source-control and file-browser demand. Neither collapsed changes
 /// nor background branch/HEAD checks need an untracked scan.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotOptions {
     pub untracked_changes: bool,
     pub untracked_files: bool,
@@ -981,7 +983,7 @@ pub enum FileInventoryRead {
 /// Identifies everything one [`RepositorySnapshot`] was read from; see
 /// [`RepositoryService::snapshot_if_changed`]. Opaque: it is only ever
 /// compared with the digest of a later read of the same worktree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SnapshotDigest([u8; 32]);
 
 #[cfg(any(test, feature = "test-support"))]
@@ -993,7 +995,7 @@ impl SnapshotDigest {
 }
 
 /// What one [`RepositoryService::snapshot_if_changed`] read found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotRead {
     /// The worktree reads exactly as the caller's digest describes, so the
     /// snapshot it holds still stands and nothing past the listing was read.
@@ -1340,7 +1342,7 @@ impl DiffBasis {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffRequest {
     pub worktree: PathBuf,
     pub basis: DiffBasis,
@@ -1354,7 +1356,7 @@ pub struct DiffRequest {
 /// Only [`DiffSide::Text`] is UTF-8 content. Bytes are never decoded lossily:
 /// a non-UTF-8 or binary side is reported as metadata so the UI shows what it
 /// is instead of an editable buffer full of replacement characters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffSide {
     /// The path does not exist on this side: added, deleted, or untracked.
     Absent,
@@ -1402,7 +1404,7 @@ impl DiffSide {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffContent {
     Comparison {
         old: DiffSide,
