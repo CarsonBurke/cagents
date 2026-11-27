@@ -25835,7 +25835,7 @@ fn a_draft_whose_provider_is_missing_names_one_to_choose_instead() {
     assert_eq!(
         runtime.error.as_deref(),
         Some(
-            "Codex isn't installed on this computer. Choose Claude Code in the model menu, or install Codex there."
+            "Codex isn't installed on this computer. Choose a model under Claude in the model menu, or install Codex there."
         )
     );
 

@@ -10035,8 +10035,8 @@ impl Cagents {
             .flatten();
         failure.message = match instead {
             Some(other) => format!(
-                "{name} isn't installed on {place}. Choose {} in the model menu, or install {name} there.",
-                other.label()
+                "{name} isn't installed on {place}. Choose a model under {} in the model menu, or install {name} there.",
+                view::family_label(other)
             ),
             None => format!("{name} isn't installed on {place}. Install it there, then try again."),
         };

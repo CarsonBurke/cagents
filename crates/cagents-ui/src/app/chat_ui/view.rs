@@ -1834,7 +1834,7 @@ struct Offer<'a> {
 }
 
 /// What a provider is called where its models are listed.
-fn family_label(provider: Provider) -> &'static str {
+pub(super) fn family_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Codex => "ChatGPT",
         Provider::Claude => "Claude",
