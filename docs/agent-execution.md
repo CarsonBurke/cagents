@@ -51,6 +51,7 @@ cagents agent requests 1a2b
 cagents agent answer 1a2b REQUEST_ID submit --field choice='review first'
 cagents agent interrupt 1a2b
 cagents agent close 1a2b
+cagents agent close --interrupted
 ```
 
 Agent commands name agents and runs by their shortest unique prefix, eight
@@ -134,7 +135,29 @@ A run moves from `Accepted` to `Running`, may enter `Waiting`, and finishes as `
 
 Acceptance and its dispatch claim commit to the daemon's SQLite registry with `synchronous=FULL` before spawning a provider or submitting a prompt. An identical request with the same caller and idempotency key returns the original IDs; it does not send the prompt again. Reusing a key for different content fails. Because each commit waits on the disk, the CLI allows the daemon 30 seconds to answer a submission, rather than the 5 seconds it allows ordinary requests. The CLI generates a key when `--idempotency-key` is omitted and retries once with it, on a new connection, when the daemon's answer is lost. A submission that still fails reports its key in the error; retry by hand with the identical request and that key.
 
-If a daemon restart loses proof of an accepted prompt's outcome, the run becomes `Interrupted`. Its external effects may already have happened. It is never resent automatically and retains its concurrency reservation until explicitly reconciled/closed. A private pending launch record preserves ownership if a process started but its final descriptor could not be committed. Such a record is not exposed as an adoptable UI session. A startup failure that retains a known hosted session reports that descriptor; inspect or close it before deciding how to proceed.
+If a daemon restart loses proof of an accepted prompt's outcome, the run becomes `Interrupted`. Its external effects may already have happened. It is never resent automatically and retains its concurrency reservation until explicitly reconciled/closed (see [Concurrent runs](#concurrent-runs)). A private pending launch record preserves ownership if a process started but its final descriptor could not be committed. Such a record is not exposed as an adoptable UI session. A startup failure that retains a known hosted session reports that descriptor; inspect or close it before deciding how to proceed.
+
+### Concurrent runs
+
+A run holds an agent slot while it is accepted, running or waiting. An interrupted run keeps its slot until its agent is closed, because its effects are unknown. Runs queued behind their agent's current run hold none until it finishes. Each caller may hold 8 slots at once, and all callers together 32. A caller is a session lineage, the user's shells together, or one automation. These are the daemon's own limits, separate from a provider's limit on its subagents.
+
+A submission past either limit is refused before anything is accepted, so the same command succeeds once a slot frees. The CLI reports it as `limit_reached`, retryable, listing the caller's own runs that hold slots; other callers' runs are only counted:
+
+```text
+cagents: Agent limit reached: you have 8 agent runs active or unconfirmed, and may have 8 at once. Nothing was started.
+Yours:
+  1a2b3c4d  reviewer  running
+  5e6f7a8b  interrupted
+  ...
+Retry once one finishes (`cagents agent wait AGENT`), or close one you no longer need (`cagents agent close AGENT`). An interrupted run keeps its slot until its agent is closed; `cagents agent close --interrupted` closes all of yours.
+A person can raise the limit with `cagents agent limits --per-caller N`.
+```
+
+With `--json`, `error.details` has `scope` (`caller` or `global`), `running`, `limit`, `retryable: true`, `yours` (how many of the runs are the caller's) and `holders`: up to 64 of the caller's own runs, each with its `agent`, `run` and `state`. The daemon sends the refusal as `QueueFull` with `retryable: true`, and its message carries the same fields, so an older client still sees a refusal it can retry.
+
+`cagents agent close --interrupted` closes every open agent of yours with an interrupted run, which `agent list` shows as its state, and so frees their slots.
+
+`cagents agent limits` shows the limits. A person changes them with `cagents agent limits --per-caller 16 --total 64`; each is 1 to 256, and the per-caller limit cannot exceed the total. The command refuses a change from a session's agents; that guards against an agent raising its own limit by accident, not against one that writes the file. The limits are kept in `agent-concurrency.toml` in the configuration directory, and the daemon reads the file again at its next submission after it changes. If the file is invalid or cannot be read, the defaults apply and the daemon logs a warning; giving both options replaces it. As with the other configuration files, the daemon does not follow a symbolic link in its path.
 
 ## Reading context and account budgets
 
@@ -298,7 +321,7 @@ Fresh hosted sessions receive a daemon-issued, session-bound capability in `CAGE
 A session's children belong to its lineage, not to its process. A successor joins the lineage and keeps control of the children when the session is relaunched in its card, recovered after a crash, reopened after its native owner's close was proved, recovered under another account, or converted between chat and terminal. It joins only if no other session of that lineage is still running, which account recovery, reopening and conversion prove for the session they replace by stopping it first; otherwise, as with a rival relaunch of a live session, it starts a lineage of its own, and the daemon logs a warning. Each successor joins the lineage of the exact session it replaces, so a rival's own agents pass to its successors in turn; a relaunch that failed to start passes on the lineage of the chain's first session. Resuming a closed conversation from history, branching a conversation, or cloning a pane starts a new lineage, except that a Codex conversation kept by its native server keeps its lineage. The lineage is recorded before the successor starts and never changes afterwards. Every live session of a lineage controls its children; the check above keeps that to one session at a time. A delegated agent's `owner` names its lineage, which is the ID of the session that began it and may no longer be live. Chats replaced before this release cannot be traced to their original lineage. The daemon registry records lineages from schema version 4, and the application state records each relaunched terminal's predecessor from schema version 11; an older cagents refuses to open either.
 
 
-The service limits each parent lineage and each automation to 64 open children. That child quota does not limit conversations started directly by the user. Every origin, including the user, is limited to 8 concurrent/uncertain runs, with 32 concurrent/uncertain runs globally and a maximum delegation depth of 8. Close finished conversations when they are no longer needed. Explicit retirement revokes the issuing capability; proof-changing adoption must validate the retained exact session lineage.
+The service limits each parent lineage and each automation to 64 open children. That child quota does not limit conversations started directly by the user. Delegation depth is limited to 8, and concurrent runs as [Concurrent runs](#concurrent-runs) describes. Close finished conversations when they are no longer needed. Explicit retirement revokes the issuing capability; proof-changing adoption must validate the retained exact session lineage.
 
 The packaged `cagents` skill teaches this CLI workflow, and when to prefer the provider's own subagents and tasks over a separate hosted session. Before a new provider/terminal process starts, cagents installs it without replacing user content and prepends the matched CLI directory to that child's PATH. Claude uses the selected `CLAUDE_CONFIG_DIR/skills` (or `HOME/.claude/skills`); Codex and OMP use `HOME/.agents/skills`. Installation occurs under the account launch lease and never recreates a removed selected home.
 

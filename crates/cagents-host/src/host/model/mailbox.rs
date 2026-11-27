@@ -724,7 +724,9 @@ impl Registry {
         request: &crate::agent_execution::Submit,
         now: u64,
     ) -> Result<MessageHandoff, String> {
-        use super::execution::{CONCURRENCY_REFUSAL, QUEUE_FULL};
+        use super::execution::QUEUE_FULL;
+        use crate::agent_execution::AcceptanceError;
+        let limits = self.concurrency();
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -745,11 +747,13 @@ impl Registry {
         }
         // Dropping the transaction returns a message that cannot become a run
         // yet to its queue.
-        let accepted = match Self::submit_agent_in(&tx, origin, request, now) {
+        let accepted = match Self::submit_agent_in(&tx, origin, request, now, limits) {
             Ok(accepted) => accepted,
-            Err(error) if error == CONCURRENCY_REFUSAL => return Ok(MessageHandoff::NoSlot),
-            Err(error) if error.starts_with(QUEUE_FULL) => return Ok(MessageHandoff::QueueFull),
-            Err(error) => return Err(error),
+            Err(AcceptanceError::LimitReached(_)) => return Ok(MessageHandoff::NoSlot),
+            Err(AcceptanceError::Invalid(error)) if error.starts_with(QUEUE_FULL) => {
+                return Ok(MessageHandoff::QueueFull);
+            }
+            Err(error) => return Err(error.into()),
         };
         tx.commit().map_err(|error| error.to_string())?;
         Ok(MessageHandoff::Accepted(Box::new(accepted)))

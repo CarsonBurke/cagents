@@ -142,6 +142,9 @@ pub(crate) struct DeltaApplied {
 pub(crate) struct Registry {
     db: Connection,
     path: PathBuf,
+    /// The agent concurrency limits, shared by every connection opened from
+    /// this one.
+    concurrency: std::sync::Arc<crate::agent_execution::concurrency::Setting>,
 }
 
 impl Registry {
@@ -164,7 +167,24 @@ impl Registry {
         Ok(Self {
             db,
             path: path.to_owned(),
+            concurrency: std::sync::Arc::new(crate::agent_execution::concurrency::Setting::fixed(
+                Default::default(),
+            )),
         })
+    }
+
+    /// Applies `setting`'s agent concurrency limits here and in every
+    /// connection opened from this one afterwards.
+    pub(crate) fn use_concurrency(
+        &mut self,
+        setting: crate::agent_execution::concurrency::Setting,
+    ) {
+        self.concurrency = std::sync::Arc::new(setting);
+    }
+
+    /// The agent concurrency limits in effect now.
+    pub(crate) fn concurrency(&self) -> crate::agent_execution::concurrency::Limits {
+        self.concurrency.current()
     }
 
     fn installed_path() -> Result<std::path::PathBuf, String> {
@@ -199,7 +219,9 @@ impl Registry {
     /// caller can hold its own mutex without stalling terminal delivery behind
     /// the global host lock while SQLite commits or waits for another writer.
     pub(crate) fn execution_connection(&self) -> Result<Self, String> {
-        Self::at(&self.path)
+        let mut connection = Self::at(&self.path)?;
+        connection.concurrency = self.concurrency.clone();
+        Ok(connection)
     }
 
     /// Open projects in registry order. A single query is a coherent read.

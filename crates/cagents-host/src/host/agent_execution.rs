@@ -211,7 +211,7 @@ pub(super) fn submit(
     host: &SharedHost,
     authority: &Authority,
     request: Submit,
-) -> Result<Accepted, String> {
+) -> Result<Accepted, crate::agent_execution::AcceptanceError> {
     // An older caller learns of a failed start from the run, as before.
     accept(host, authority, request).map(|(accepted, _)| accepted)
 }
@@ -224,7 +224,7 @@ pub(super) fn prompt(
     authority: &Authority,
     request: Submit,
     interrupt: bool,
-) -> Result<(Accepted, Start), String> {
+) -> Result<(Accepted, Start), crate::agent_execution::AcceptanceError> {
     let Destination::Existing(agent) = request.destination else {
         return Err("Only an existing agent takes a follow-up prompt".into());
     };
@@ -247,7 +247,7 @@ fn accept(
     host: &SharedHost,
     authority: &Authority,
     request: Submit,
-) -> Result<(Accepted, Result<Start, String>), String> {
+) -> Result<(Accepted, Result<Start, String>), crate::agent_execution::AcceptanceError> {
     request.validate_client()?;
     let origin = origin(host, authority)?;
     let registry = registry(host)?;
@@ -332,7 +332,9 @@ fn accept(
             .unwrap_or_else(|p| p.into_inner())
             .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())
         {
-            Err(error) if error == crate::host::model::EARLIER_MESSAGES && attempts < 3 => {
+            Err(crate::agent_execution::AcceptanceError::Invalid(error))
+                if error == crate::host::model::EARLIER_MESSAGES && attempts < 3 =>
+            {
                 attempts += 1;
             }
             accepted => break accepted?,
@@ -1972,8 +1974,9 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
-/// Preserve typed mailbox capacity and store contention at the service boundary.
-/// Other operations retain their original validation and String-returning API.
+/// Preserve typed mailbox capacity, agent concurrency limits and store
+/// contention at the service boundary. Other operations retain their original
+/// validation and String-returning API.
 pub(super) fn process_request(
     host: &SharedHost,
     authority: Authority,
@@ -1999,6 +2002,17 @@ pub(super) fn process_request(
             mailbox::acknowledge(host, &authority, receipt)
                 .map(|()| crate::agent_execution::Reply::InboxAcknowledged)
         }
+        crate::agent_execution::Operation::Console { agent, command } => {
+            console(host, &authority, agent, command)
+        }
+        crate::agent_execution::Operation::Submit(request) => {
+            submit(host, &authority, request).map(crate::agent_execution::Reply::Accepted)
+        }
+        crate::agent_execution::Operation::Prompt { request, interrupt } => {
+            prompt(host, &authority, request, interrupt).map(|(accepted, start)| {
+                crate::agent_execution::Reply::Prompted { accepted, start }
+            })
+        }
         other => process(host, authority, other).map_err(Into::into),
     }
 }
@@ -2010,8 +2024,13 @@ pub(super) fn process(
 ) -> Result<crate::agent_execution::Reply, String> {
     use crate::agent_execution::{Operation, Reply, Summary};
     match operation {
-        Operation::Console { agent, command } => console(host, &authority, agent, command),
-        Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),
+        // Their typed refusals reach the protocol through `process_request`;
+        // a caller of this one gets their sentences.
+        operation @ (Operation::Console { .. }
+        | Operation::Submit(_)
+        | Operation::Prompt { .. }) => {
+            process_request(host, authority, operation).map_err(String::from)
+        }
         Operation::Status(id) => {
             status(host, &authority, id).map(|(agent, run)| Reply::Status { agent, run })
         }
@@ -2034,7 +2053,7 @@ pub(super) fn process(
                 .agents(Some(&origin))?
                 .into_iter()
                 .map(|agent| {
-                    let run = registry.latest_agent_run(agent.id)?;
+                    let run = registry.standing_agent_run(agent.id)?;
                     Ok(Summary {
                         agent,
                         run: run.id,
@@ -2089,8 +2108,6 @@ pub(super) fn process(
         Operation::Deliver(outgoing) => mailbox::hand(host, &authority, outgoing)
             .map(Reply::Handed)
             .map_err(|error| error.to_string()),
-        Operation::Prompt { request, interrupt } => prompt(host, &authority, request, interrupt)
-            .map(|(accepted, start)| Reply::Prompted { accepted, start }),
     }
 }
 
@@ -2552,7 +2569,7 @@ fn console(
     authority: &Authority,
     id: AgentId,
     command: crate::agent_execution::ConsoleCommand,
-) -> Result<crate::agent_execution::Reply, String> {
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
     use crate::agent_execution::{ConsoleCommand, ConsoleView, Reply};
     let (_, caller) = caller(host, authority)?;
     let registry = registry(host)?;

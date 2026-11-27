@@ -4138,7 +4138,7 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
         spec.permission_mode = mode.map(str::to_owned);
         request.prompt = prompt.into();
         request.idempotency_key = key.into();
-        submit(&host, authority, request)
+        submit(&host, authority, request).map_err(String::from)
     };
     let mode = |accepted: &Accepted| accepted.agent.spec.permission_mode.clone();
     let launched = || std::fs::read_to_string(root.join("claude-arguments")).unwrap();
@@ -7704,7 +7704,9 @@ fn a_retried_follow_up_says_the_agent_received_it() {
         )
         .unwrap();
 
-    let error = super::prompt(&host, &Authority::default(), follow_up, false).unwrap_err();
+    let error = super::prompt(&host, &Authority::default(), follow_up, false)
+        .unwrap_err()
+        .to_string();
     assert_eq!(
         error,
         format!(
@@ -7784,11 +7786,13 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
         let error = super::prompt(&host, &Authority::default(), follow_up.clone(), false)
             .expect_err(attempt);
         assert!(
-            error.starts_with(crate::agent_execution::NOT_SENT),
+            error
+                .to_string()
+                .starts_with(crate::agent_execution::NOT_SENT),
             "{attempt}: {error}"
         );
         assert!(
-            error.contains("Resume it from its pane"),
+            error.to_string().contains("Resume it from its pane"),
             "{attempt}: {error}"
         );
     }
