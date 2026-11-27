@@ -85,6 +85,14 @@ impl SourceReload {
         self.due.get_or_insert(at);
     }
 
+    /// Brings a previously scheduled poll forward without starting an
+    /// extra read while a result or a mutation can supply the next one.
+    pub(super) fn expedite(&mut self, at: Instant) {
+        if let Some(due) = &mut self.due {
+            *due = (*due).min(at);
+        }
+    }
+
     /// A read began, after every change reported so far.
     pub(super) fn read_started(&mut self) {
         self.reading_untracked = self.due.is_some() && !self.tracked;
@@ -109,7 +117,7 @@ impl SourceReload {
     }
 
     /// The owed read is moot: the panel is hidden or a mutation will read.
-    fn forget(&mut self) {
+    pub(super) fn forget(&mut self) {
         self.due = None;
         self.tracked = false;
     }
@@ -123,6 +131,7 @@ pub(super) struct State {
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
     pub(super) source_reload: SourceReload,
+    pub(super) device_source_poll: source_control_ui::DeviceSourcePoll,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
     /// The next retry for consumers which have no completion-driven wake.
     /// This is state, rather than a fresh `now + interval` in
@@ -340,8 +349,8 @@ impl Drop for State {
 pub enum Action {
     Tick,
     Focused(window::Id, bool),
-    /// [`State::source_reload_due`] arrived.
-    SourceReload,
+    /// This Changes read's deadline arrived.
+    SourceReload(Instant),
 }
 
 /// The exact refresh deadline is the subscription identity, so replacing it
@@ -358,7 +367,7 @@ fn source_reload_stream(
     let deadline = tokio::time::Instant::from_std(deadline.0);
     cosmic::iced::futures::stream::once(async move {
         tokio::time::sleep_until(deadline).await;
-        Message::RefreshUi(Action::SourceReload)
+        Message::RefreshUi(Action::SourceReload(deadline.into_std()))
     })
 }
 
@@ -467,11 +476,16 @@ impl Cagents {
             || self.workspace_view_shown() == Some(super::context_sections::WorkspaceView::Files)
     }
 
-    fn source_reload_fired(&mut self) -> Task<Message> {
-        // Queued before a read began: that read leaves this owed.
-        if self.refresh_ui.source_cancel.is_some() {
+    fn source_reload_fired(&mut self, deadline: Instant) -> Task<Message> {
+        // A queued wake may be superseded by focus, a new binding, or a
+        // read in flight. Only the still-pending wake can start a read.
+        if self.refresh_ui.source_reload.due() != Some(deadline)
+            || self.refresh_ui.source_cancel.is_some()
+        {
             return Task::none();
         }
+        let remote = crate::device::is_remote();
+        let shown = self.workspace_view_shown();
         let key = self
             .sidebar_model
             .source_control
@@ -479,12 +493,23 @@ impl Cagents {
             // A mutation reads the worktree again when it finishes.
             .filter(|source| !source.busy())
             .map(|source| source.key.clone())
-            .filter(|_| self.workspace_view_shown().is_some());
+            .filter(|_| {
+                if remote {
+                    shown == Some(context_sections::WorkspaceView::SourceControl)
+                } else {
+                    shown.is_some()
+                }
+            });
         match key {
             // A background read: the rows stay as they are, without the
             // "Refreshing…" state or its stand-down of row actions, which a
             // stream of agent writes would otherwise keep on.
-            Some(key) => self.source_control_snapshot_task(key),
+            Some(key) => {
+                if remote {
+                    self.refresh_ui.device_source_poll.started();
+                }
+                self.source_control_snapshot_task(key)
+            }
             None => {
                 self.refresh_ui.source_reload.forget();
                 Task::none()
@@ -626,7 +651,7 @@ impl Cagents {
                 self.main_window_focus_changed(focused)
             }
             Action::Focused(..) => Task::none(),
-            Action::SourceReload => self.source_reload_fired(),
+            Action::SourceReload(deadline) => self.source_reload_fired(deadline),
         }
     }
 
@@ -649,6 +674,7 @@ impl Cagents {
             return Task::batch([dictation, self.accounts_focus_changed(focused, false)]);
         }
         self.pane_follow_focus_regained();
+        self.device_source_activity(true);
         Task::batch([
             // A request that arrived while away is offered on return.
             self.read_owed_automation_requests(),
@@ -1083,7 +1109,8 @@ mod tests {
             "an unfocused window still wakes for the panel"
         );
         let generation = app.refresh_ui.source_generation;
-        drop(app.update(Message::RefreshUi(Action::SourceReload)));
+        let deadline = app.refresh_ui.source_reload.due().unwrap();
+        drop(app.update(Message::RefreshUi(Action::SourceReload(deadline))));
         assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1));
         assert_eq!(app.refresh_ui.source_reload.due(), None);
         assert_eq!(
@@ -1101,7 +1128,8 @@ mod tests {
         app.refresh_ui.source_reload.owe(Instant::now(), false);
         assert_eq!(app.refresh_subscription().units(), 0);
         let generation = app.refresh_ui.source_generation;
-        drop(app.update(Message::RefreshUi(Action::SourceReload)));
+        let deadline = app.refresh_ui.source_reload.due().unwrap();
+        drop(app.update(Message::RefreshUi(Action::SourceReload(deadline))));
         assert_eq!(
             app.refresh_ui.source_generation, generation,
             "not cancelled"
@@ -1116,6 +1144,158 @@ mod tests {
                 .is_some_and(|due| due >= finished + SOURCE_RELOAD_DELAY)
         );
         assert_ne!(app.refresh_subscription().units(), 0);
+    }
+
+    #[test]
+    fn unchanged_device_polls_back_off_and_a_changed_answer_restores_the_pace() {
+        let mut poll = source_control_ui::DeviceSourcePoll::default();
+        assert_eq!(poll.delay(true), Duration::from_secs(3));
+        assert_eq!(poll.delay(false), Duration::from_secs(15));
+        for seconds in [3, 6, 12, 24, 30, 30] {
+            poll.started();
+            poll.finished(false);
+            assert_eq!(poll.delay(true), Duration::from_secs(seconds));
+        }
+        assert_eq!(poll.delay(false), Duration::from_secs(30));
+        poll.started();
+        poll.finished(true);
+        assert_eq!(poll.delay(true), Duration::from_secs(3));
+        assert_eq!(poll.delay(false), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn device_changes_activity_replaces_an_idle_deadline_without_double_reading() {
+        use super::super::context_sections::{Action as ContextAction, WorkspaceView};
+
+        const CHILD: &str = "CAGENTS_TEST_DEVICE_POLL";
+        const TEST: &str = "app::refresh_ui::tests::device_changes_activity_replaces_an_idle_deadline_without_double_reading";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        crate::device::save(crate::device::Device {
+            name: "poll-test".into(),
+            host: "fixture-device".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("poll-test")).unwrap();
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_model = sidebar::test_support::panel_model();
+        app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+        app.open_pane_inspector_now(card);
+        drop(app.handle_context_section(ContextAction::Show(WorkspaceView::SourceControl)));
+        let key = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .key
+            .clone();
+        let snapshot = Arc::new(RepositorySnapshot {
+            status: StatusSnapshot::default(),
+            files: crate::repository::WorkingFiles::default(),
+            remotes: Vec::new(),
+            local_refs: Vec::new(),
+            remote_refs: Vec::new(),
+            remote_heads: Vec::new(),
+            operation: None,
+        });
+        let digest = crate::repository::SnapshotDigest::fixture(1);
+        app.sidebar_model.source_control = Some(
+            SourceControlModel::ready(key.clone(), &snapshot).built_from(snapshot, Some(digest)),
+        );
+        let finish_with = |app: &mut Cagents, digest| {
+            let request = app.refresh_ui.source_generation;
+            drop(app.source_control_loaded(
+                key.clone(),
+                request,
+                Ok(SourceControlRead::Unchanged {
+                    digest: Some(digest),
+                }),
+            ));
+        };
+        let finish = |app: &mut Cagents| finish_with(app, digest);
+        app.refresh_ui.focused = false;
+        finish(&mut app);
+        let old = app.refresh_ui.source_reload.due().unwrap();
+        assert!(old > Instant::now() + Duration::from_secs(10));
+
+        drop(app.main_window_focus_changed(true));
+        let expedited = app.refresh_ui.source_reload.due().unwrap();
+        assert!(expedited <= Instant::now());
+        let generation = app.refresh_ui.source_generation;
+        drop(app.update_refresh(Action::SourceReload(old)));
+        assert_eq!(app.refresh_ui.source_generation, generation);
+        drop(app.update_refresh(Action::SourceReload(expedited)));
+        assert_eq!(app.refresh_ui.source_generation, generation + 1);
+        assert!(app.refresh_ui.source_cancel.is_some());
+
+        // Interacting during a poll resets its streak without cancelling it.
+        app.device_source_activity(false);
+        assert_eq!(app.refresh_ui.source_generation, generation + 1);
+        finish(&mut app);
+        for _ in 0..4 {
+            let due = app.refresh_ui.source_reload.due().unwrap();
+            drop(app.update_refresh(Action::SourceReload(due)));
+            finish(&mut app);
+        }
+        let idle = app.refresh_ui.source_reload.due().unwrap();
+        assert!(idle > Instant::now() + Duration::from_secs(20));
+
+        let start = Instant::now();
+        drop(app.update_sidebar(SidebarAction::SetChangesTab {
+            key: key.clone(),
+            tab: sidebar::ChangesTab::History,
+        }));
+        let after_action = app.refresh_ui.source_reload.due().unwrap();
+        assert!(after_action >= start + Duration::from_secs(3));
+        assert!(after_action <= Instant::now() + Duration::from_secs(3));
+
+        // The same rows with a new digest are an edit, so they reset the
+        // idle interval too. The next identical answer uses that new digest.
+        let newer = crate::repository::SnapshotDigest::fixture(2);
+        for _ in 0..4 {
+            let due = app.refresh_ui.source_reload.due().unwrap();
+            drop(app.update_refresh(Action::SourceReload(due)));
+            finish(&mut app);
+        }
+        let due = app.refresh_ui.source_reload.due().unwrap();
+        drop(app.update_refresh(Action::SourceReload(due)));
+        let start = Instant::now();
+        finish_with(&mut app, newer);
+        let after_edit = app.refresh_ui.source_reload.due().unwrap();
+        assert!(after_edit >= start + Duration::from_secs(3));
+        assert!(after_edit <= Instant::now() + Duration::from_secs(3));
+
+        // Hiding and reopening the same inspector discards its idle timer.
+        drop(app.set_pane_inspector_open(card, false));
+        app.settle_pane_inspectors();
+        drop(app.load_deferred_files());
+        assert_eq!(app.refresh_ui.source_reload.due(), None);
+        let start = Instant::now();
+        app.open_pane_inspector_now(card);
+        drop(app.load_deferred_files());
+        let after_reopen = app.refresh_ui.source_reload.due().unwrap();
+        assert!(after_reopen >= start + Duration::from_secs(3));
+        assert!(after_reopen <= Instant::now() + Duration::from_secs(3));
     }
 
     /// A path written over and over that no read finds anything new in, such

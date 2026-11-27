@@ -3437,7 +3437,7 @@ fn background_poll(message: &Message) -> bool {
             )
             // Starts a background read of the Changes panel and nothing
             // else; the read's answer is projected when it lands.
-            | Message::RefreshUi(refresh_ui::Action::SourceReload)
+            | Message::RefreshUi(refresh_ui::Action::SourceReload(_))
     )
 }
 
@@ -13874,6 +13874,7 @@ impl Cagents {
             return Task::batch([history, self.load_deferred_files()]);
         }
         self.cancel_source_read();
+        self.reset_device_source_poll();
         self.cancel_branch_changes();
         self.history_ui.cancel();
         self.history_ui.next_page_request();
@@ -14979,6 +14980,7 @@ impl Cagents {
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
             source.set_reloading(true);
         }
+        self.reset_device_source_poll();
         self.source_control_snapshot_task(key.clone())
     }
 

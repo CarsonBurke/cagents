@@ -4,12 +4,44 @@ use super::*;
 use crate::repository::SnapshotDigest;
 use std::ops::ControlFlow;
 
-/// How often a device window reads the Changes it shows while the window
-/// is focused, and while it is not.
+/// The initial interval while Changes is visible on a device.
 const DEVICE_SOURCE_READ_FOCUSED: Duration = Duration::from_secs(3);
 const DEVICE_SOURCE_READ_UNFOCUSED: Duration = Duration::from_secs(15);
+const DEVICE_SOURCE_READ_IDLE: Duration = Duration::from_secs(30);
 /// How often it tries again after a read failed.
 const DEVICE_SOURCE_READ_FAILED: Duration = Duration::from_secs(30);
+
+/// Only idle polls build up a streak. An explicit read or activity during a
+/// poll starts fresh even if the older answer arrives afterward.
+#[derive(Default)]
+pub(super) struct DeviceSourcePoll {
+    unchanged: u32,
+    observing: bool,
+}
+
+impl DeviceSourcePoll {
+    pub(super) fn started(&mut self) {
+        self.observing = true;
+    }
+
+    pub(super) fn finished(&mut self, changed: bool) {
+        if changed {
+            self.unchanged = 0;
+        } else if self.observing {
+            self.unchanged = (self.unchanged + 1).min(5);
+        }
+        self.observing = false;
+    }
+
+    pub(super) fn delay(&self, focused: bool) -> Duration {
+        let base = if focused {
+            DEVICE_SOURCE_READ_FOCUSED
+        } else {
+            DEVICE_SOURCE_READ_UNFOCUSED
+        };
+        (base * 2u32.pow(self.unchanged.saturating_sub(1))).min(DEVICE_SOURCE_READ_IDLE)
+    }
+}
 
 impl Cagents {
     pub(super) fn source_control_loaded(
@@ -32,6 +64,24 @@ impl Cagents {
         if !self.source_control_is_bound(&key) {
             return ControlFlow::Break(Task::none());
         }
+        // Identical rows can still carry a new digest, such as when a file
+        // that was already modified is edited again. Only a matching digest
+        // proves a device poll found the checkout unchanged.
+        let repository_changed = match &result {
+            Ok(SourceControlRead::Unchanged {
+                digest: Some(digest),
+            }) => {
+                self.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .and_then(SourceControlModel::source_digest)
+                    != Some(digest)
+            }
+            _ => true,
+        };
+        self.refresh_ui
+            .device_source_poll
+            .finished(repository_changed);
         let model = match result {
             Ok(SourceControlRead::Changed(model)) => *model,
             Ok(SourceControlRead::Unchanged { digest }) => {
@@ -114,13 +164,15 @@ impl Cagents {
     }
 
     /// Owes the shown Changes of a device's checkout another read, unless a
-    /// read or a change is under way that reads it anyway. An agent working
-    /// on the device shows up within [`DEVICE_SOURCE_READ_FOCUSED`] while the
-    /// window is in use; a device that cannot be read is tried less often.
+    /// read or a change is under way that reads it anyway. Quiet checkouts
+    /// gradually give the device more time between reads.
     fn schedule_device_source_read(&mut self) {
-        if self.refresh_ui.source_cancel.is_some()
-            || self.refresh_ui.source_reload.due().is_some()
-            || self.workspace_view_shown() != Some(context_sections::WorkspaceView::SourceControl)
+        if self.workspace_view_shown() != Some(context_sections::WorkspaceView::SourceControl) {
+            self.reset_device_source_poll();
+            self.refresh_ui.source_reload.forget();
+            return;
+        }
+        if self.refresh_ui.source_cancel.is_some() || self.refresh_ui.source_reload.due().is_some()
         {
             return;
         }
@@ -134,12 +186,37 @@ impl Cagents {
         };
         let wait = if matches!(source.data_state, sidebar::SidebarDataState::Error(_)) {
             DEVICE_SOURCE_READ_FAILED
-        } else if self.refresh_ui.focused {
-            DEVICE_SOURCE_READ_FOCUSED
         } else {
-            DEVICE_SOURCE_READ_UNFOCUSED
+            self.refresh_ui
+                .device_source_poll
+                .delay(self.refresh_ui.focused)
         };
         self.refresh_ui.source_reload.poll(Instant::now() + wait);
+    }
+
+    pub(super) fn reset_device_source_poll(&mut self) {
+        self.refresh_ui.device_source_poll = DeviceSourcePoll::default();
+    }
+
+    /// Returning to a device window catches up immediately. Actions in
+    /// Changes restore the normal interval, without delaying a sooner read
+    /// or interrupting one in flight.
+    pub(super) fn device_source_activity(&mut self, regained_focus: bool) {
+        if !crate::device::is_remote()
+            || self.workspace_view_shown() != Some(context_sections::WorkspaceView::SourceControl)
+        {
+            return;
+        }
+        self.reset_device_source_poll();
+        let now = Instant::now();
+        let delay = if regained_focus {
+            Duration::ZERO
+        } else {
+            self.refresh_ui
+                .device_source_poll
+                .delay(self.refresh_ui.focused)
+        };
+        self.refresh_ui.source_reload.expedite(now + delay);
     }
 
     /// Shows a read's status on the sidebar row of the worktree it read.

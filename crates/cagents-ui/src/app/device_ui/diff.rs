@@ -224,6 +224,7 @@ impl Cagents {
                 Task::none()
             }
             Action::Step { forward } => {
+                self.device_source_activity(false);
                 let Some((key, area, rows, index)) = self.device_diff_position() else {
                     return Task::none();
                 };
