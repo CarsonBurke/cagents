@@ -13104,6 +13104,7 @@ impl Cagents {
                 .view(
                     &self.sidebar_model.projects,
                     &self.sidebar_model.external_editors,
+                    self.sidebar_model.device.as_deref(),
                     self.worktrees_current(),
                     self.modal_is_open(),
                 )
@@ -17118,7 +17119,10 @@ impl Application for Cagents {
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
-            sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
+            sidebar_model: SidebarModel {
+                device: crate::device::selected().map(|device| device.name.clone()),
+                ..SidebarModel::ready(SidebarMode::Expanded, sidebar_projects)
+            },
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
