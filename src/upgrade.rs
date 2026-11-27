@@ -1968,7 +1968,9 @@ pub mod handoff {
             let directory = Self::directory()?;
             crate::secure_file::reject_symlink_components(&directory)
                 .map_err(|error| error.to_string())?;
-            let root = match fs_safety::Root::open(&directory) {
+            // A remote window still needs the launch fence and reservation
+            // for the Mac installation that owns its window state.
+            let root = match fs_safety::Root::open_local(&directory) {
                 Ok(root) => root,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.to_string()),
@@ -3209,6 +3211,55 @@ mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity, TerminalId};
     use handoff::{Carried, Checkpoint, Phase, Store, Terminal};
+
+    #[cfg(all(target_os = "macos", feature = "ui"))]
+    #[test]
+    fn a_macos_device_window_can_read_the_local_update_reservation() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_WINDOW_RESERVATION";
+        if std::env::var_os(CHILD).is_none() {
+            let root = crate::test_fixture::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "upgrade::tests::a_macos_device_window_can_read_the_local_update_reservation",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", root.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let dirs = crate::instance::project_dirs().unwrap();
+        let directory = dirs.data_local_dir().join("daemon-upgrade");
+        let store = Store::open(&directory).unwrap();
+        store
+            .create_installed_activation(b"local reservation")
+            .unwrap();
+        let config = crate::device::configuration_path().unwrap();
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            br#"{"devices":[{"name":"fixture","host":"fixture.invalid"}]}"#,
+        )
+        .unwrap();
+        crate::device::select(Some("fixture")).unwrap();
+        assert_eq!(
+            crate::fs_safety::Root::open(&directory).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        let observed = Store::observe_existing().unwrap().unwrap();
+        assert_eq!(
+            observed.installed_activation().unwrap().as_deref(),
+            Some(b"local reservation".as_slice())
+        );
+    }
 
     fn retained_claude_checkpoint(directory: &Path) -> Checkpoint {
         let mut checkpoint = checkpoint(directory);
