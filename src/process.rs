@@ -11,14 +11,14 @@ mod poll;
 pub mod table;
 
 pub use image::current_executable;
-#[cfg(target_os = "macos")]
-pub(crate) use image::mapped_region_identity;
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) use image::own_code_address;
 #[cfg(feature = "host")]
 pub use image::pin_own_image;
 #[cfg(feature = "host")]
 pub(crate) use image::{command_line, own_image};
+#[cfg(target_os = "macos")]
+pub(crate) use image::{mapped_executable_identity, mapped_region_identity};
 
 use crate::descriptor::set_nonblocking;
 #[cfg(all(target_os = "macos", feature = "host"))]

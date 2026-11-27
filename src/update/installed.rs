@@ -350,6 +350,8 @@ pub(super) fn perform(
     let mut startup_owned = false;
     let mut previous = None;
     let mut original_schema = None;
+    #[cfg(target_os = "macos")]
+    let mut original_image = None;
     let mut result = (|| {
         if let Some(daemon) = &confirmed.daemon {
             let paths = crate::daemon::RuntimePaths::discover()
@@ -367,6 +369,12 @@ pub(super) fn perform(
                 return Err(invalid(
                     "The census belongs to a different source; shutdown was not requested",
                 ));
+            }
+            #[cfg(target_os = "macos")]
+            if parks_successor {
+                original_image = Some(super::ready_plan::SourceImage::capture(
+                    &source, &owner, &selection,
+                )?);
             }
             previous = (owner.version_root != root).then_some(owner.version_root);
         }
@@ -430,10 +438,12 @@ pub(super) fn perform(
                         state,
                         job,
                         receipt,
-                        root,
                         &selection,
                         &before,
                         &staged.identity.digest,
+                        original_image.take().ok_or_else(|| {
+                            invalid("The update lost its original build identity")
+                        })?,
                     )
                 })
                 .transpose()?;

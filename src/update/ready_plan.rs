@@ -17,6 +17,86 @@ struct Plan<'a> {
     ready: ReadyPlanEvidence<'a>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundSourceImage {
+    reservation_digest: [u8; 32],
+    image: SourceImage,
+}
+
+/// Captured from the still-serving daemon and its privately owned matched set
+/// before sending its prepare request. A version path alone can be repaired
+/// in place while an updater is gone.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourceImage {
+    root: PathBuf,
+    version: String,
+    proof: crate::model::HostSessionProof,
+    stamp: installed::Stamp,
+    binaries: String,
+}
+
+impl SourceImage {
+    pub(super) fn capture(
+        source: &crate::daemon::lease_handoff::HandoffSource,
+        layout: &InstallLayout,
+        selection: &installed::Selection,
+    ) -> Result<Self, UpdateError> {
+        let executable = layout.version_root.join("bin/cagentsd");
+        let stamp = installed::stamp(&layout.version_root)?;
+        let (device, inode) = stamp.daemon_inode();
+        if source.executable()? != executable
+            || !selection.source_is_unchanged(layout)?
+            || served_version_root(layout)? != layout.version_root
+            || crate::process::mapped_executable_identity(source.pid, &executable)?
+                != (u64::from(device as u32), inode)
+        {
+            return Err(invalid(
+                "The serving daemon is not the exact selected build",
+            ));
+        }
+        let binaries = installed::Candidate::Local(&layout.version_root).digest()?;
+        if stamp != installed::stamp(&layout.version_root)?
+            || source.executable()? != executable
+            || !selection.source_is_unchanged(layout)?
+            || crate::process::mapped_executable_identity(source.pid, &executable)?
+                != (u64::from(device as u32), inode)
+            || source.exited()?
+        {
+            return Err(invalid(
+                "The selected build changed during source inspection",
+            ));
+        }
+        Ok(Self {
+            root: layout.version_root.clone(),
+            version: layout.version.clone(),
+            proof: source.proof.clone(),
+            stamp,
+            binaries,
+        })
+    }
+
+    fn verify_selected(
+        &self,
+        layout: &InstallLayout,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<(), UpdateError> {
+        if self.root != layout.version_root
+            || self.version != layout.version
+            || self.proof != *proof
+            || self.stamp != installed::stamp(&self.root)?
+            || self.binaries != installed::Candidate::Local(&self.root).digest()?
+            || self.stamp != installed::stamp(&self.root)?
+        {
+            return Err(invalid(
+                "The original selected build no longer matches the approved update",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One activation owns the saved workspace even when it has no live updater
 /// or daemon. The record includes the entire plan so no second pathname is
 /// needed to resume an already published reservation.
@@ -26,6 +106,8 @@ struct Reservation<'a> {
     job: String,
     prefix: PathBuf,
     plan: Plan<'a>,
+    #[serde(skip)]
+    stored_digest: [u8; 32],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,6 +139,26 @@ impl Reservation<'_> {
     fn return_binding(&self) -> Result<Vec<u8>, UpdateError> {
         let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(self)?).into();
         Ok(serde_json::to_vec(&digest)?)
+    }
+
+    fn original_image(&self) -> Result<Option<SourceImage>, UpdateError> {
+        let Some(bytes) = read(&source_path(&self.state(), &self.job))? else {
+            return Ok(None);
+        };
+        let original: BoundSourceImage = serde_json::from_slice(&bytes)?;
+        if original.reservation_digest != self.stored_digest {
+            return Err(invalid(
+                "The original build evidence belongs to a different update",
+            ));
+        }
+        Ok(Some(original.image))
+    }
+
+    fn verify_original_if_recorded(&self, source: &InstallLayout) -> Result<(), UpdateError> {
+        if let Some(original) = self.original_image()? {
+            original.verify_selected(source, self.plan.ready.source())?;
+        }
+        Ok(())
     }
 
     fn returning(&self) -> Result<bool, UpdateError> {
@@ -130,7 +232,7 @@ fn shared_reservation() -> Result<Option<Reservation<'static>>, UpdateError> {
     let Some(bytes) = store.installed_activation().map_err(invalid)? else {
         return Ok(None);
     };
-    let reservation: Reservation<'static> = serde_json::from_slice(&bytes)?;
+    let mut reservation: Reservation<'static> = serde_json::from_slice(&bytes)?;
     if reservation.plan.version != 1
         || !reservation.prefix.is_absolute()
         || !uuid::Uuid::parse_str(&reservation.job)
@@ -138,6 +240,7 @@ fn shared_reservation() -> Result<Option<Reservation<'static>>, UpdateError> {
     {
         return Err(invalid("Invalid saved-work update reservation"));
     }
+    reservation.stored_digest = Sha256::digest(&bytes).into();
     Ok(Some(reservation))
 }
 
@@ -230,7 +333,7 @@ fn refreshed_reservation(
 ) -> Result<Option<Reservation<'static>>, UpdateError> {
     let current = shared_reservation()?;
     if let Some(entry) = &current
-        && (entry.job != original.job || entry.prefix != original.prefix)
+        && entry.stored_digest != original.stored_digest
     {
         return Err(invalid(
             "The update changed before the application could reopen",
@@ -416,6 +519,7 @@ impl Reservation<'_> {
             .ready
             .verify_unclaimed_source(worker, &guard, &handoff)
             .map_err(invalid)?;
+        self.verify_original_if_recorded(source)?;
         eprintln!("The staged update could not be verified: {failure}");
         cutover::persist(state, &self.return_path(), &self.return_binding()?, true)?;
         Ok(None)
@@ -433,6 +537,7 @@ impl Reservation<'_> {
                 "This update can only reopen its original selected build",
             ));
         }
+        self.verify_original_if_recorded(source)?;
         guard.relaunch_missing_windows(slots, &executable)?;
 
         let guard = crate::instance::UiUpdateGuard::acquire()?;
@@ -443,6 +548,7 @@ impl Reservation<'_> {
             ));
         }
         guard.verify_cutover_windows(slots, &executable)?;
+        self.verify_original_if_recorded(source)?;
         let store = Store::observe_existing()
             .map_err(invalid)?
             .ok_or_else(|| invalid("The approved Ready checkpoint disappeared"))?;
@@ -599,22 +705,29 @@ pub(super) fn record(
     state: &Path,
     job: &UpdateJob,
     receipt: &Receipt,
-    target: &Path,
     selection: &installed::Selection,
     stamp: &installed::Stamp,
     binaries: &str,
+    original: SourceImage,
 ) -> Result<Recorded, UpdateError> {
     let prefix = state.parent().ok_or_else(unsupported_install)?;
+    let ready = receipt.ready_plan_evidence().map_err(invalid)?;
+    if ready.source() != &original.proof {
+        return Err(invalid(
+            "The acknowledged checkpoint belongs to another source",
+        ));
+    }
     let bytes = serde_json::to_vec(&Reservation {
         job: job.id.clone(),
         prefix: prefix.to_owned(),
+        stored_digest: [0; 32],
         plan: Plan {
             version: 1,
-            target: target.to_owned(),
+            target: prefix.join("versions").join(&job.version),
             selection: selection.clone(),
             stamp: stamp.clone(),
             binaries: binaries.into(),
-            ready: receipt.ready_plan_evidence().map_err(invalid)?,
+            ready,
         },
     })?;
     if bytes.len() as u64 > LIMIT {
@@ -624,11 +737,27 @@ pub(super) fn record(
         .map_err(invalid)?
         .ok_or_else(|| invalid("The acknowledged upgrade store disappeared"))?;
     begin_new_job()?;
+    let digest = Sha256::digest(&bytes).into();
+    // Old installed launchers strictly decode the shared reservation. Publish
+    // new evidence separately and make it durable before that reservation.
+    cutover::persist(
+        state,
+        &source_path(state, &job.id),
+        &serde_json::to_vec(&BoundSourceImage {
+            reservation_digest: digest,
+            image: original,
+        })?,
+        true,
+    )?;
     store.create_installed_activation(&bytes).map_err(invalid)?;
     Ok(Recorded {
         path: store.installed_activation_path(),
-        digest: Sha256::digest(&bytes).into(),
+        digest,
     })
+}
+
+fn source_path(state: &Path, job: &str) -> PathBuf {
+    state.join(format!("{job}.ready-source.json"))
 }
 
 fn path(state: &Path, job: &str) -> Result<PathBuf, UpdateError> {
@@ -842,6 +971,45 @@ fn acquire_unserved_runtime() -> Result<crate::daemon::lease_handoff::LeaseHando
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_source_refuses_same_version_binary_replacement() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("versions/0.2.4");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["cagents", "cagentsd", "cagents-ui"] {
+            fs::write(bin.join(name), name).unwrap();
+        }
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("source-session"),
+            host_incarnation: HostIncarnation::new("source-incarnation"),
+            boot_id: BootId::new("source-boot"),
+        };
+        let original = SourceImage {
+            root: root.clone(),
+            version: "0.2.4".into(),
+            proof: proof.clone(),
+            stamp: installed::stamp(&root).unwrap(),
+            binaries: installed::Candidate::Local(&root).digest().unwrap(),
+        };
+        let layout = InstallLayout {
+            prefix: directory.path().to_owned(),
+            version_root: root,
+            version: "0.2.4".into(),
+        };
+        original.verify_selected(&layout, &proof).unwrap();
+        let mut wrong = proof.clone();
+        wrong.host_incarnation = HostIncarnation::new("different-incarnation");
+        assert!(original.verify_selected(&layout, &wrong).is_err());
+
+        let replacement = bin.join("replacement");
+        fs::write(&replacement, "cagents-ui").unwrap();
+        fs::rename(replacement, bin.join("cagents-ui")).unwrap();
+        assert!(original.verify_selected(&layout, &proof).is_err());
+    }
 
     #[test]
     fn terminal_progress_reads_the_exact_job_even_if_its_worker_exits_before_notification() {
