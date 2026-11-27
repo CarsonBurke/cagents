@@ -132,6 +132,8 @@ enum Request {
         protocol: u32,
         #[serde(default)]
         recovery: Option<Recovery>,
+        #[serde(default)]
+        protect_replay: bool,
     },
 }
 
@@ -567,6 +569,15 @@ pub(super) fn attach(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Attachment, String> {
+    attach_with_replay_protection(socket, exits, recovery, cfg!(target_os = "macos"))
+}
+
+fn attach_with_replay_protection(
+    socket: &Path,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+    protect_replay: bool,
+) -> Result<Attachment, String> {
     let evidence = crate::daemon::holder_registry::recovery_candidate(
         socket,
         crate::daemon::holder_registry::Kind::Terminal,
@@ -639,6 +650,7 @@ pub(super) fn attach(
         &Request::Attach {
             protocol: PROTOCOL,
             recovery,
+            protect_replay: protect_replay && evidence.is_some(),
         },
         &[],
         deadline,
@@ -1657,7 +1669,7 @@ fn serve(control: UnixStream) -> i32 {
         private_tmp,
     };
     let mut cached_screen = None;
-    let mut pending_replay: Option<(String, Vec<u8>, bool)> = None;
+    let mut pending_replay: Option<Replay> = None;
     let mut control = control;
     let mut cleanup_proved = false;
     loop {
@@ -1666,7 +1678,7 @@ fn serve(control: UnixStream) -> i32 {
         } else {
             attend(&control, &mut root, &mut cached_screen, &mut pending_replay)
         };
-        let (socket, screen, output, screen_lost) = match disposition {
+        let (socket, replay) = match disposition {
             Attendance::Release => break,
             Attendance::ReleaseProved => {
                 cleanup_proved = true;
@@ -1674,26 +1686,28 @@ fn serve(control: UnixStream) -> i32 {
             }
             Attendance::Lost => match &residence {
                 Some(residence) => {
-                    let (screen, output, lost) = pending_replay.take().unwrap_or_else(|| {
-                        (
-                            cached_screen
-                                .as_ref()
-                                .map(|(screen, _)| screen.clone())
-                                .unwrap_or_default(),
-                            Vec::new(),
-                            cached_screen.as_ref().is_none_or(|(_, lost)| *lost),
-                        )
+                    let replay = pending_replay.take().unwrap_or_else(|| {
+                        let (screen, lost) = cached_screen.clone().unwrap_or_default();
+                        Replay {
+                            screen,
+                            screen_lost: cached_screen.is_none() || lost,
+                            ..Replay::default()
+                        }
                     });
                     (
                         registry::socket(&residence.directory, residence.record.terminal),
-                        screen,
-                        output,
-                        lost,
+                        replay,
                     )
                 }
                 None => break,
             },
-            Attendance::Detach { socket, screen } => (socket, screen, Vec::new(), false),
+            Attendance::Detach { socket, screen } => (
+                socket,
+                Replay {
+                    screen,
+                    ..Replay::default()
+                },
+            ),
         };
         let listener = match &residence {
             Some(residence)
@@ -1717,7 +1731,10 @@ fn serve(control: UnixStream) -> i32 {
                 continue;
             }
         };
-        if !screen_lost && send(&control, &Report::Detached, &[]).is_err() && residence.is_none() {
+        if !replay.screen_lost
+            && send(&control, &Report::Detached, &[]).is_err()
+            && residence.is_none()
+        {
             let _ = std::fs::remove_file(&socket);
             break;
         }
@@ -1726,20 +1743,18 @@ fn serve(control: UnixStream) -> i32 {
             &listener,
             master,
             &mut root,
-            &screen,
             residence.as_ref().map(|residence| &residence.record),
             &mut recovery,
-            screen_lost,
-            output,
+            replay,
             &launch_directory,
         );
         if residence.is_none() {
             let _ = std::fs::remove_file(&socket);
         }
         match successor {
-            Some((successor, output)) => {
+            Some((successor, replay)) => {
                 if residence.is_some() {
-                    pending_replay = Some((screen, output, screen_lost));
+                    pending_replay = Some(replay);
                 }
                 control = successor;
                 lost = false;
@@ -1772,6 +1787,16 @@ fn serve(control: UnixStream) -> i32 {
     0
 }
 
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
+struct Replay {
+    screen: String,
+    output: Vec<u8>,
+    screen_lost: bool,
+    acknowledged_prefix: usize,
+    protective: bool,
+}
+
 /// Serves an attached daemon until it releases the terminal, which answers
 /// `None`, or asks for it to be detached onto a socket, with its screen.
 enum Attendance {
@@ -1785,7 +1810,7 @@ fn attend(
     control: &UnixStream,
     root: &mut PtyRoot,
     cached_screen: &mut Option<(String, bool)>,
-    pending_replay: &mut Option<(String, Vec<u8>, bool)>,
+    pending_replay: &mut Option<Replay>,
 ) -> Attendance {
     loop {
         let mut targets = [
@@ -1820,7 +1845,13 @@ fn attend(
             let request = receive::<Request>(control);
             if matches!(&request, Ok(Some((Request::CommitAdoption, _)))) {
                 if send(control, &Report::AdoptionCommitted, &[]).is_ok() {
-                    *pending_replay = None;
+                    if let Some(replay) = pending_replay.as_mut().filter(|replay| replay.protective)
+                    {
+                        replay.acknowledged_prefix = replay.output.len();
+                        replay.screen_lost = true;
+                    } else {
+                        *pending_replay = None;
+                    }
                     continue;
                 }
                 return Attendance::Lost;
@@ -1835,6 +1866,7 @@ fn attend(
             {
                 if root.exit.is_some() && screen.len() <= MAX_SCREEN.div_ceil(3) * 4 {
                     *cached_screen = Some((screen.clone(), *screen_lost));
+                    *pending_replay = None;
                     if send(control, &Report::ScreenCached, &[]).is_ok() {
                         continue;
                     }
@@ -1870,13 +1902,11 @@ fn await_successor(
     listener: &UnixListener,
     master: RawFd,
     root: &mut PtyRoot,
-    screen: &str,
     record: Option<&Record>,
     recovery: &mut Option<Recovery>,
-    screen_lost: bool,
-    mut output: Vec<u8>,
+    mut replay: Replay,
     launch_directory: &LaunchDirectoryPin,
-) -> Option<(UnixStream, Vec<u8>)> {
+) -> Option<(UnixStream, Replay)> {
     let deadline = orphan_deadline(record.is_some(), Instant::now());
     let mut buffer = vec![0u8; 64 << 10];
     // The master reads EIO once the terminal's last process has closed it.
@@ -1886,7 +1916,7 @@ fn await_successor(
         if remaining.is_some_and(|remaining| remaining.is_zero()) {
             return None;
         }
-        let reading = open && output.len() < DETACHED_OUTPUT;
+        let reading = open && replay.output.len() < DETACHED_OUTPUT;
         let mut targets = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -1919,10 +1949,10 @@ fn await_successor(
             root.reap()?;
         }
         if targets[2].revents != 0 {
-            let room = (DETACHED_OUTPUT - output.len()).min(buffer.len());
+            let room = (DETACHED_OUTPUT - replay.output.len()).min(buffer.len());
             // SAFETY: `buffer` has at least `room` writable bytes.
             match unsafe { libc::read(master, buffer.as_mut_ptr().cast(), room) } {
-                read if read > 0 => output.extend_from_slice(&buffer[..read as usize]),
+                read if read > 0 => replay.output.extend_from_slice(&buffer[..read as usize]),
                 -1 if matches!(
                     io::Error::last_os_error().kind(),
                     io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
@@ -1932,22 +1962,20 @@ fn await_successor(
         }
         if targets[0].revents != 0
             && let Ok((successor, _)) = crate::descriptor::accept(listener)
-            && hand_over(
+            && let Ok(Some(protective)) = hand_over(
                 &successor,
                 master,
                 root.pid,
                 root.pin.process(),
                 root.exit,
-                screen,
-                &output,
+                &replay,
                 record,
                 recovery,
-                screen_lost,
                 launch_directory,
             )
-            .is_ok_and(|attached| attached)
         {
-            return Some((successor, output));
+            replay.protective = protective;
+            return Some((successor, replay));
         }
     }
 }
@@ -1964,13 +1992,11 @@ fn hand_over(
     pid: libc::pid_t,
     root: &PinnedProcess,
     exit: Option<libc::c_int>,
-    screen: &str,
-    output: &[u8],
+    replay: &Replay,
     record: Option<&Record>,
     recovery: &mut Option<Recovery>,
-    screen_lost: bool,
     launch_directory: &LaunchDirectoryPin,
-) -> io::Result<bool> {
+) -> io::Result<Option<bool>> {
     // SAFETY: getuid cannot fail.
     let peer = peer_credentials(successor)?;
     if peer.uid != unsafe { libc::getuid() } {
@@ -1985,7 +2011,7 @@ fn hand_over(
         crate::descriptor_frame::FrameByteOrder::LittleEndian,
     )
     .map_err(io::Error::other)?;
-    let proposed = match Some(request) {
+    let (proposed, protective) = match Some(request) {
         Some((Request::Inspect { proof }, _)) => {
             let (Some(record), Some(recovery)) = (record, recovery.as_ref()) else {
                 return Err(io::ErrorKind::InvalidData.into());
@@ -2013,7 +2039,7 @@ fn hand_over(
                 &Report::Inspected {
                     record: record.clone(),
                     recovery: Box::new(recovery),
-                    screen_lost,
+                    screen_lost: replay.screen_lost,
                 },
                 &[],
                 deadline,
@@ -2022,15 +2048,19 @@ fn hand_over(
                 crate::descriptor_frame::FrameByteOrder::LittleEndian,
             )
             .map_err(io::Error::other)?;
-            return Ok(false);
+            return Ok(None);
         }
         Some((
             Request::Attach {
                 protocol,
                 recovery: proposed,
+                protect_replay,
             },
             _,
-        )) if protocol >= PROTOCOL => proposed,
+        )) if protocol >= PROTOCOL => (
+            proposed,
+            record.is_some() && (protect_replay || replay.protective),
+        ),
         _ => return Err(io::ErrorKind::InvalidData.into()),
     };
     if let (Some(record), Some(current)) = (record, recovery.as_ref()) {
@@ -2065,13 +2095,26 @@ fn hand_over(
             ));
         }
     }
+    // Older clients already draw the screen without processing its PTY
+    // effects or transcript. Keep previously acknowledged output in that
+    // same presentation payload; only output observed since then is fresh.
+    let (presented, fresh) = replay.output.split_at(replay.acknowledged_prefix);
+    let screen = if presented.is_empty() {
+        replay.screen.clone()
+    } else {
+        let mut screen = STANDARD
+            .decode(&replay.screen)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        screen.extend_from_slice(presented);
+        STANDARD.encode(screen)
+    };
     let attached = Report::Attached {
         protocol: PROTOCOL,
         pid,
         exited: exit,
-        screen: screen.to_owned(),
-        output: STANDARD.encode(output),
-        screen_lost,
+        screen,
+        output: STANDARD.encode(fresh),
+        screen_lost: replay.screen_lost,
         launch_directory: Some(launch_directory.0),
         root_started: RootPin::started(root),
     };
@@ -2093,7 +2136,7 @@ fn hand_over(
     if proposed.is_some() {
         *recovery = proposed;
     }
-    Ok(true)
+    Ok(Some(protective))
 }
 
 /// Reads only the memory of a proven orphan holder; does not adopt or release it.
@@ -2356,7 +2399,11 @@ mod tests {
         assert_eq!(queued, frame.len() as isize);
         assert_eq!(frame[..4], (body.len() as u32).to_le_bytes());
         assert_eq!(frame[4..], body);
-        let mut replay = Some(("screen".to_owned(), b"orphan-output".to_vec(), false));
+        let mut replay = Some(Replay {
+            screen: "screen".into(),
+            output: b"orphan-output".to_vec(),
+            ..Replay::default()
+        });
         let expected = replay.clone();
         // An already reaped root is never polled; its pin is ignored.
         let mut root = PtyRoot {
@@ -2411,6 +2458,7 @@ mod tests {
             &Request::Attach {
                 protocol: PROTOCOL,
                 recovery: None,
+                protect_replay: false,
             },
             &[],
         )
@@ -2428,11 +2476,12 @@ mod tests {
                 1,
                 &root,
                 None,
-                "",
-                &vec![b'x'; DETACHED_OUTPUT],
+                &Replay {
+                    output: vec![b'x'; DETACHED_OUTPUT],
+                    ..Replay::default()
+                },
                 None,
                 &mut None,
-                false,
                 &directory,
             )
             .unwrap_err()
@@ -2856,7 +2905,8 @@ mod tests {
                 request,
                 Request::Attach {
                     protocol: PROTOCOL,
-                    recovery: None
+                    recovery: None,
+                    ..
                 }
             ));
             assert!(rights.is_empty());
@@ -3682,9 +3732,40 @@ mod tests {
         };
         assert_eq!(retry.0.output, replay);
         drop(retry);
-        let (exits, exited) = crossbeam_channel::bounded(1);
-        let mut adopted = adopt_recoverable(&socket, exits, Some(next)).unwrap();
-        assert_eq!(adopted.output, replay);
+        let (exits, _) = crossbeam_channel::bounded(1);
+        let mut protected = attach_with_replay_protection(&socket, exits, Some(next.clone()), true)
+            .unwrap()
+            .into_worker();
+        assert_eq!(protected.output, replay);
+        protected.held.holder.commit_adoption().unwrap();
+        let mut writer = File::from(protected.held.master.duplicate().unwrap());
+        protected.held.holder.leave_for_successor();
+        drop(protected);
+        std::io::Write::write_all(&mut writer, b"fresh-after-ack\n").unwrap();
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut adopted, exited) = loop {
+            let (exits, exited) = crossbeam_channel::bounded(1);
+            let adopted = attach_with_replay_protection(&socket, exits, Some(next.clone()), false)
+                .unwrap()
+                .into_worker();
+            if String::from_utf8_lossy(&adopted.output)
+                .lines()
+                .any(|line| line == "still-running:fresh-after-ack")
+            {
+                break (adopted, exited);
+            }
+            drop(adopted);
+            assert!(
+                Instant::now() < deadline,
+                "holder did not buffer the fresh tail"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(adopted.screen.ends_with(&replay));
+        assert!(!String::from_utf8_lossy(&adopted.output).contains("rollback-replay"));
+        assert!(!String::from_utf8_lossy(&adopted.screen).contains("fresh-after-ack"));
+        assert!(adopted.screen_lost);
         assert_eq!(adopted.held.child.pid(), record.root.pid);
         adopted.held.holder.commit_adoption().unwrap();
         let mut writer = File::from(adopted.held.master.duplicate().unwrap());
