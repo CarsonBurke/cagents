@@ -2,7 +2,7 @@ use super::*;
 use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
 use crate::workspace_model::ModelEdit;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::Entry};
 
 mod checkout;
 pub(in crate::app) mod missing_checkout;
@@ -383,7 +383,7 @@ pub enum Action {
     ConfirmDelete,
     Dismiss,
     SessionsClosed(ChannelId, uuid::Uuid, Result<(), String>),
-    RetryDelete(ChannelId),
+    RetryDelete(ChannelId, Instant),
     /// Runs a deletion that failed again, from the channel's row.
     RetryFailed(ChannelId),
     /// Keeps a channel whose deletion failed; its row stops asking.
@@ -408,7 +408,7 @@ impl Action {
             Self::ConfirmDelete
                 | Self::Dismiss
                 | Self::SessionsClosed(..)
-                | Self::RetryDelete(_)
+                | Self::RetryDelete(..)
                 | Self::ReopenTimedOut(..)
                 | Self::SettleRetirements
         )
@@ -445,7 +445,7 @@ pub struct State {
     resolving: Option<(ChannelId, Consent)>,
     /// Deletions under way. Each runs behind its channel's row rather than a
     /// dialog, so the rest of the window stays usable meanwhile.
-    deleting: HashSet<ChannelId>,
+    deleting: HashMap<ChannelId, Instant>,
     /// Exact local targets retained until the matching close worker completes.
     closing: HashMap<ChannelId, ChannelCloseAttempt>,
     /// Deletions that failed, with why, until retried or declined.
@@ -731,7 +731,7 @@ impl State {
     }
 
     fn row_deletion(&self, id: ChannelId) -> Option<crate::sidebar::RowDeletion> {
-        if self.deleting.contains(&id) {
+        if self.deleting.contains_key(&id) {
             return Some(crate::sidebar::RowDeletion::Deleting);
         }
         self.failed
@@ -748,7 +748,7 @@ impl State {
     }
 
     pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
-        self.deleting.contains(&id)
+        self.deleting.contains_key(&id)
     }
 
     /// Whether deleting channel `id` is closing its sessions, rather than
@@ -869,26 +869,8 @@ impl Cagents {
             }
             return Task::none();
         }
-        if let Action::RetryDelete(id) = action {
-            if self.channel_ui.closing.contains_key(&id) {
-                return Task::none();
-            }
-            self.channel_ui.deleting.remove(&id);
-            // Already under way, so a refusal here is a failed deletion the
-            // channel's row offers to retry, not a deletion never started.
-            if let Some(blocker) = self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.id == id)
-                .and_then(|channel| self.channel_deletion_blocker(&channel.cards))
-            {
-                self.status = Some(TransientNotice::warning(blocker));
-                self.channel_ui.failed.insert(id, blocker.into());
-                self.refresh_sidebar_channels();
-                return Task::none();
-            }
-            return self.delete_channel(id);
+        if let Action::RetryDelete(id, deadline) = action {
+            return self.poll_channel_deletion(id, deadline, Instant::now());
         }
         if let Action::SessionsClosed(id, operation, result) = action {
             if self
@@ -975,7 +957,7 @@ impl Cagents {
         }
         match action {
             Action::SessionsClosed(..)
-            | Action::RetryDelete(_)
+            | Action::RetryDelete(..)
             | Action::ReopenTimedOut(..)
             | Action::SettleRetirements => {
                 unreachable!()
@@ -2144,9 +2126,11 @@ impl Cagents {
                 self.status = Some(TransientNotice::warning(blocker));
                 continue;
             }
-            if !self.channel_ui.deleting.insert(id) {
+            let Entry::Vacant(deletion) = self.channel_ui.deleting.entry(id) else {
                 continue;
-            }
+            };
+            let deadline = Instant::now() + CHANNEL_DELETE_START_TIMEOUT;
+            deletion.insert(deadline);
             // A channel the user deleted stays deleted; reopening one of its
             // cards does not bring it back.
             self.fail_channel_reopen(
@@ -2155,7 +2139,7 @@ impl Cagents {
             );
             self.forget_channel_revival(id);
             self.channel_ui.failed.remove(&id);
-            started.push((id, cards));
+            started.push((id, cards, deadline));
         }
         if started.is_empty() {
             return Task::none();
@@ -2170,7 +2154,7 @@ impl Cagents {
         let successor = self
             .durable
             .active_channel
-            .filter(|active| started.iter().any(|(id, _)| id == active))
+            .filter(|active| started.iter().any(|(id, ..)| id == active))
             .and_then(|active| {
                 self.durable
                     .channels
@@ -2187,15 +2171,9 @@ impl Cagents {
         tasks.push(leave);
         let mut retired = Vec::new();
         let mut closing = Vec::new();
-        for (id, cards) in started {
-            if cards
-                .iter()
-                .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_in_flight(*card))
-            {
-                tasks.push(cosmic::task::future(async move {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    Message::ChannelUi(Action::RetryDelete(id))
-                }));
+        for (id, cards, deadline) in started {
+            if self.channel_has_starting_session(&cards) {
+                tasks.push(wait_for_channel_start(id, deadline));
             } else if self.channel_holds_sessions(&cards) {
                 closing.push(id);
             } else {
@@ -2210,6 +2188,56 @@ impl Cagents {
             tasks.push(self.close_deleted_channel_sessions(id));
         }
         Task::batch(tasks)
+    }
+
+    fn channel_has_starting_session(&self, cards: &[CardId]) -> bool {
+        cards
+            .iter()
+            .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_in_flight(*card))
+    }
+
+    fn poll_channel_deletion(
+        &mut self,
+        id: ChannelId,
+        deadline: Instant,
+        now: Instant,
+    ) -> Task<Message> {
+        if self.channel_ui.deleting.get(&id) != Some(&deadline)
+            || self.channel_ui.closing.contains_key(&id)
+        {
+            return Task::none();
+        }
+        let Some(cards) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| &channel.cards)
+        else {
+            self.channel_ui.deleting.remove(&id);
+            self.refresh_sidebar_channels();
+            return self.complete_closed_projects();
+        };
+        let blocker = self.channel_deletion_blocker(cards);
+        let starting = self.channel_has_starting_session(cards);
+        if let Some(reason) = blocker.or_else(|| {
+            (starting && now >= deadline).then_some(
+                "A session in this channel did not finish starting. Check its pane, then retry deletion.",
+            )
+        }) {
+            self.channel_ui.deleting.remove(&id);
+            self.channel_ui.failed.insert(id, reason.into());
+            self.status = Some(TransientNotice::warning(reason));
+            self.refresh_sidebar_channels();
+            Task::none()
+        } else if starting {
+            wait_for_channel_start(id, deadline)
+        } else if self.channel_holds_sessions(cards) {
+            self.close_deleted_channel_sessions(id)
+        } else {
+            self.channel_ui.deleting.remove(&id);
+            self.finish_delete_channel(id)
+        }
     }
 
     /// Asks the daemon to close the sessions of channel `id`, being deleted,
@@ -2375,13 +2403,23 @@ impl Cagents {
         self.retire_channel(id, true)
     }
 
+    /// A closing project has already lost its registry channels. Keep a
+    /// failed local deletion available to retry while the project waits for it.
+    pub(super) fn keeps_registry_removed_channel(&self, id: ChannelId) -> bool {
+        self.channel_ui.is_deleting(id)
+            || (self.channel_ui.failed.contains_key(&id)
+                && self.durable.channels.iter().any(|channel| {
+                    channel.id == id && self.project_ui.closing.contains_key(&channel.project_id)
+                }))
+    }
+
     /// Retires channel `id`, which the registry removed, unless this window
     /// is deleting it. Then the deletion finishes it, as this window's own:
     /// removing a project removes its channels there while the window is
     /// still closing their sessions, and retiring one as a peer's deletion
     /// would keep its unsaved work and say another client deleted it.
     pub(super) fn retire_registry_removed_channel(&mut self, id: ChannelId) -> Task<Message> {
-        if self.channel_ui.is_deleting(id) {
+        if self.keeps_registry_removed_channel(id) {
             return Task::none();
         }
         self.retire_peer_channel(id)
@@ -2986,6 +3024,20 @@ impl Cagents {
         self.sidebar_model
             .set_panes(&self.sidebar_state, &stale, |id| titles.remove(&id));
     }
+}
+
+const CHANNEL_DELETE_START_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn wait_for_channel_start(id: ChannelId, deadline: Instant) -> Task<Message> {
+    cosmic::task::future(async move {
+        tokio::time::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        )
+        .await;
+        Message::ChannelUi(Action::RetryDelete(id, deadline))
+    })
 }
 
 /// What the delete confirmation says about unsaved editors, naming each.
@@ -4091,7 +4143,9 @@ pub(in crate::app) mod tests {
             drop(app.delete_channel(doomed));
             assert!(channel_exists(&app, doomed) && !app.channel_ui.is_deleting(doomed));
             assert!(app.editor_holds_unsaved_work(editor));
-            drop(app.handle_channel_ui(Action::RetryDelete(doomed)));
+            let deadline = Instant::now() + CHANNEL_DELETE_START_TIMEOUT;
+            app.channel_ui.deleting.insert(doomed, deadline);
+            drop(app.handle_channel_ui(Action::RetryDelete(doomed, deadline)));
             assert!(channel_exists(&app, doomed) && app.editor_holds_unsaved_work(editor));
             assert!(
                 app.channel_ui.failed.contains_key(&doomed),
@@ -4425,6 +4479,68 @@ pub(in crate::app) mod tests {
         let one = close(0);
         assert_eq!(one.1, 2, "the rows show the deletion, then the retirement");
         assert_eq!(close(6), one, "eight channels cost what two do");
+    }
+
+    fn channel_with_starting_terminal() -> (Cagents, ChannelId, CardId) {
+        let (mut app, doomed, _survivor, card) = channel_with_a_conversation();
+        let mut terminal = *super::close_tests::paired_source().terminal.unwrap();
+        terminal.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: terminal.launch.clone(),
+            last_exit: None,
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(terminal);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.begin_terminal_start(card);
+        assert!(app.pending_terminal_spawn(card));
+
+        (app, doomed, card)
+    }
+
+    #[test]
+    fn channel_deletion_times_out_a_start_and_can_retry_after_it_settles() {
+        let (mut app, doomed, card) = channel_with_starting_terminal();
+        drop(app.delete_channel(doomed));
+        let deadline = app.channel_ui.deleting[&doomed];
+        drop(app.poll_channel_deletion(doomed, deadline, deadline - Duration::from_millis(1)));
+        assert!(app.channel_ui.is_deleting(doomed));
+        assert!(!app.channel_ui.closing_sessions(doomed));
+
+        drop(app.poll_channel_deletion(doomed, deadline, deadline));
+        assert!(channel_exists(&app, doomed));
+        assert!(!app.channel_ui.is_deleting(doomed));
+        assert!(app.channel_ui.failed[&doomed].contains("did not finish starting"));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+
+        drop(app.handle_channel_ui(Action::RetryFailed(doomed)));
+        let retry = app.channel_ui.deleting[&doomed];
+        assert!(!app.channel_ui.failed.contains_key(&doomed));
+        drop(app.poll_channel_deletion(doomed, deadline, retry));
+        assert!(
+            app.channel_ui.is_deleting(doomed),
+            "a callback for the expired attempt is ignored"
+        );
+
+        drop(app.finish_terminal_start(card));
+        drop(app.poll_channel_deletion(doomed, retry, Instant::now()));
+        assert!(app.channel_ui.closing_sessions(doomed));
+    }
+
+    #[test]
+    fn a_timed_out_channel_survives_reconciliation_during_project_removal() {
+        let (mut app, doomed, card) = channel_with_starting_terminal();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        drop(app.close_shared_project(Path::new("/repo")));
+        let deadline = app.channel_ui.deleting[&doomed];
+        drop(app.poll_channel_deletion(doomed, deadline, deadline));
+        drop(app.reconcile_workspace_model());
+        assert!(channel_exists(&app, doomed));
+        drop(app.retire_registry_removed_channel(doomed));
+        assert!(channel_exists(&app, doomed));
+        assert!(app.channel_ui.failed.contains_key(&doomed));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        drop(app.finish_terminal_start(card));
+        drop(app.handle_channel_ui(Action::RetryFailed(doomed)));
+        assert!(app.channel_ui.closing_sessions(doomed));
     }
 
     /// Each channel of a closing project that still has sessions waits for
@@ -5275,7 +5391,7 @@ pub(in crate::app) mod close_tests {
         }
     }
 
-    fn paired_source() -> crate::chat::Session {
+    pub(super) fn paired_source() -> crate::chat::Session {
         let mut source = captured_source();
         let host = proof();
         source.terminal = Some(Box::new(crate::model::TerminalSession {
