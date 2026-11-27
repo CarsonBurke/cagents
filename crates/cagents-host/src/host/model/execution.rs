@@ -3097,11 +3097,13 @@ fn concurrency_refusal(
     } else {
         return Ok(None);
     };
+    let yours = holders.len();
     holders.truncate(concurrency::MAX_NAMED_HOLDERS);
     Ok(Some(LimitReached {
         scope,
         running,
         limit,
+        yours,
         holders,
     }))
 }
@@ -7740,6 +7742,7 @@ mod tests {
                     scope: concurrency::Scope::Caller,
                     running: concurrency::DEFAULT_PER_CALLER,
                     limit: concurrency::DEFAULT_PER_CALLER,
+                    yours: concurrency::DEFAULT_PER_CALLER,
                     holders,
                 }
             );
@@ -7790,6 +7793,7 @@ mod tests {
         assert_eq!(refusal.running, concurrency::DEFAULT_TOTAL);
         assert_eq!(refusal.limit, concurrency::DEFAULT_TOTAL);
         // The other callers' runs are counted, not named.
+        assert_eq!(refusal.yours, 0);
         assert!(refusal.holders.is_empty());
         assert_eq!(registry.model().unwrap(), before);
         finish_capacity_run(&mut registry, &first.unwrap());

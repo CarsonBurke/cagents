@@ -1845,7 +1845,7 @@ fn limits(
         ));
     }
     let path = concurrency::path().map_err(|error| refused(error.to_string()))?;
-    let unreadable = |error: std::io::Error| refused(format!("{}: {error}", path.display()));
+    let unwritable = |error: std::io::Error| refused(format!("{}: {error}", path.display()));
     // Both given replace whatever the file holds, even a file that cannot be
     // read, which is how a person repairs it.
     let mut limits = match (per_caller, total) {
@@ -1864,7 +1864,7 @@ fn limits(
         }
         .validate()
         .map_err(refused)?;
-        concurrency::save(limits).map_err(unreadable)?;
+        concurrency::save(limits).map_err(unwritable)?;
     }
     Ok(CommandOutput {
         command: "agent.limits",
@@ -1967,21 +1967,20 @@ fn limit_message(
                 None => text.push_str(&format!("\n  {handle}  {state}")),
             }
         }
-        let others = running.saturating_sub(refusal.holders.len());
+        let named = refusal.holders.len();
+        let yours = refusal.yours.saturating_sub(named);
+        if yours > 0 {
+            text.push_str(&format!("\n  and {yours} more"));
+        }
+        let others = running.saturating_sub(refusal.yours.max(named));
         if others > 0 {
-            text.push_str(&format!(
-                "\n  and {others} {}",
-                match refusal.scope {
-                    Scope::Caller => "more",
-                    Scope::Global => "held by other callers",
-                }
-            ));
+            text.push_str(&format!("\n  and {others} held by other callers"));
         }
         text.push_str(&format!(
             "\nRetry once one finishes (`{program} agent wait AGENT`), or close one you no longer need (`{program} agent close AGENT`)."
         ));
     } else {
-        text.push_str("\nRetry once some of them finish.");
+        text.push_str("\nRetry once a run finishes.");
     }
     if refusal
         .holders
@@ -2736,6 +2735,7 @@ mod tests {
             scope: Scope::Caller,
             running: 3,
             limit: 3,
+            yours: 3,
             holders: vec![
                 Holder {
                     agent: mine,
@@ -2763,6 +2763,7 @@ mod tests {
         assert_eq!(details["scope"], "caller");
         assert_eq!(details["running"], 3);
         assert_eq!(details["limit"], 3);
+        assert_eq!(details["yours"], 3);
         assert_eq!(details["holders"][1]["agent"], theirs.to_string());
         assert_eq!(details["holders"][1]["state"], "interrupted");
         assert!(details.get("idempotency_key").is_none());
@@ -2787,6 +2788,7 @@ mod tests {
             scope: Scope::Global,
             running: 32,
             limit: 32,
+            yours: 0,
             holders: Vec::new(),
         };
         let text = limit_message(&global, Handles::default(), &names);

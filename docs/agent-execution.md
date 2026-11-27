@@ -153,7 +153,7 @@ Retry once one finishes (`cagents agent wait AGENT`), or close one you no longer
 A person can raise the limit with `cagents agent limits --per-caller N`.
 ```
 
-With `--json`, `error.details` has `scope` (`caller` or `global`), `running`, `limit`, `retryable: true` and `holders`: up to 64 of the caller's own runs, each with its `agent`, `run` and `state`. The daemon sends the refusal as `QueueFull` with `retryable: true`, and its message carries the same fields, so an older client still sees a refusal it can retry.
+With `--json`, `error.details` has `scope` (`caller` or `global`), `running`, `limit`, `retryable: true`, `yours` (how many of the runs are the caller's) and `holders`: up to 64 of the caller's own runs, each with its `agent`, `run` and `state`. The daemon sends the refusal as `QueueFull` with `retryable: true`, and its message carries the same fields, so an older client still sees a refusal it can retry.
 
 `cagents agent close --interrupted` closes every open agent of yours with an interrupted run, which `agent list` shows as its state, and so frees their slots.
 

@@ -5870,6 +5870,7 @@ fn limit_reached(
             "scope": refusal.scope,
             "running": refusal.running,
             "limit": refusal.limit,
+            "yours": refusal.yours,
             "holders": refusal.holders,
         })),
     }

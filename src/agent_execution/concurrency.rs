@@ -116,7 +116,10 @@ pub struct LimitReached {
     /// Runs holding a slot in this scope.
     pub running: usize,
     pub limit: usize,
-    /// Up to [`MAX_NAMED_HOLDERS`] of them, oldest first.
+    /// How many of them are the caller's: all of them for its own limit.
+    pub yours: usize,
+    /// Up to [`MAX_NAMED_HOLDERS`] of the caller's, oldest first. Other
+    /// callers' runs are only counted.
     pub holders: Vec<Holder>,
 }
 
@@ -124,17 +127,10 @@ pub struct LimitReached {
 pub const REFUSAL: &str = "Agent concurrency limit reached: ";
 const HELD_BY: &str = ". Yours: ";
 const MORE: &str = " and ";
-
-impl Scope {
-    /// How a refusal ends its list of holders it did not name: a global
-    /// refusal names only the caller's own.
-    const fn unnamed(self) -> &'static str {
-        match self {
-            Self::Caller => " more",
-            Self::Global => " held by other callers",
-        }
-    }
-}
+/// How the list ends with the caller's runs it did not name, and then with
+/// other callers' runs, which it never names.
+const MORE_YOURS: &str = " more";
+const MORE_OTHERS: &str = " held by other callers";
 const ADVICE: &str = ". Nothing was started; retry once a run finishes or an agent is closed. An interrupted run keeps its slot until its agent is closed.";
 
 impl fmt::Display for LimitReached {
@@ -161,9 +157,13 @@ impl fmt::Display for LimitReached {
                     holder.state.key()
                 )?;
             }
-            let unnamed = self.running.saturating_sub(named.len());
-            if unnamed > 0 {
-                write!(formatter, "{MORE}{unnamed}{}", self.scope.unnamed())?;
+            let yours = self.yours.saturating_sub(named.len());
+            if yours > 0 {
+                write!(formatter, "{MORE}{yours}{MORE_YOURS}")?;
+            }
+            let others = self.running.saturating_sub(self.yours.max(named.len()));
+            if others > 0 {
+                write!(formatter, "{MORE}{others}{MORE_OTHERS}")?;
             }
         }
         formatter.write_str(ADVICE)
@@ -188,18 +188,23 @@ impl LimitReached {
         let scope = [Scope::Caller, Scope::Global]
             .into_iter()
             .find(|scope| phrase == format!("{} are active or unconfirmed", scope.phrase()))?;
+        let running: usize = running.parse().ok()?;
         let mut holders = Vec::new();
-        if let Some(held) = held {
-            let held = match held.rsplit_once(MORE) {
-                Some((named, more))
-                    if more
-                        .strip_suffix(scope.unnamed())
-                        .is_some_and(|count| count.parse::<usize>().is_ok()) =>
+        let mut unnamed = 0;
+        if let Some(mut held) = held {
+            // Peel " and N held by other callers", then " and N more".
+            for suffix in [MORE_OTHERS, MORE_YOURS] {
+                if let Some((named, more)) = held.rsplit_once(MORE)
+                    && let Some(count) = more
+                        .strip_suffix(suffix)
+                        .and_then(|count| count.parse::<usize>().ok())
                 {
-                    named
+                    held = named;
+                    if suffix == MORE_YOURS {
+                        unnamed = count;
+                    }
                 }
-                _ => held,
-            };
+            }
             for item in held.split(", ") {
                 let mut words = item.split(' ');
                 let (Some("agent"), Some(agent), Some("run"), Some(run), Some(state), None) = (
@@ -221,8 +226,12 @@ impl LimitReached {
         }
         Some(Self {
             scope,
-            running: running.parse().ok()?,
+            running,
             limit: limit.parse().ok()?,
+            yours: match scope {
+                Scope::Caller => running,
+                Scope::Global => holders.len() + unnamed,
+            },
             holders,
         })
     }
@@ -438,6 +447,10 @@ mod tests {
             scope,
             running,
             limit,
+            yours: match scope {
+                Scope::Caller => running,
+                Scope::Global => named,
+            },
             holders: (0..named)
                 .map(|index| Holder {
                     agent: AgentId::new(),
@@ -478,16 +491,30 @@ mod tests {
 
     #[test]
     fn a_refusal_names_its_first_holders_and_counts_the_rest() {
-        let mut expected = refusal(Scope::Global, 100, 100, 100);
+        // The caller's own runs past the named ones, then other callers'.
+        let mut expected = refusal(Scope::Global, 200, 200, 80);
         let message = expected.to_string();
         assert!(
             message.contains(&format!(
-                " and {} held by other callers.",
-                100 - MAX_NAMED_HOLDERS
+                " and {} more and 120 held by other callers.",
+                80 - MAX_NAMED_HOLDERS
             )),
             "{message}"
         );
         expected.holders.truncate(MAX_NAMED_HOLDERS);
+        assert_eq!(LimitReached::recognize(&message, true), Some(expected));
+        let mut expected = refusal(Scope::Caller, 100, 100, 100);
+        let message = expected.to_string();
+        assert!(message.contains(" and 36 more."), "{message}");
+        assert!(!message.contains("other callers"), "{message}");
+        expected.holders.truncate(MAX_NAMED_HOLDERS);
+        assert_eq!(LimitReached::recognize(&message, true), Some(expected));
+        let expected = refusal(Scope::Global, 32, 32, 3);
+        let message = expected.to_string();
+        assert!(
+            message.contains("waiting and 29 held by other callers."),
+            "{message}"
+        );
         assert_eq!(LimitReached::recognize(&message, true), Some(expected));
     }
 
