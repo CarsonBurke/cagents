@@ -94,6 +94,7 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         // cancelling a confirmation changes nothing outside this window.
         | SidebarAction::DismissWorktreeOperation(_)
         | SidebarAction::CancelDiscard
+        | SidebarAction::CancelGitConfirmation
         | SidebarAction::CancelPublish => {
             return None;
         }
@@ -199,7 +200,13 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::OpenPublish { .. }
         | SidebarAction::PublishRemoteChanged { .. }
         | SidebarAction::PublishBranchChanged { .. }
-        | SidebarAction::LoadMoreHistory { .. } => SidebarRoute::DeviceTool(Panel::Changes),
+        | SidebarAction::LoadMoreHistory { .. }
+        | SidebarAction::RequestStageConflictMarkers { .. }
+        | SidebarAction::ConfirmStageConflictMarkers { .. }
+        | SidebarAction::RequestAbortOperation { .. }
+        | SidebarAction::ConfirmAbortOperation { .. }
+        | SidebarAction::ContinueOperation { .. }
+        | SidebarAction::SkipOperation { .. } => SidebarRoute::DeviceTool(Panel::Changes),
     })
 }
 
@@ -2323,6 +2330,7 @@ mod tests {
         for action in [
             SidebarAction::DismissWorktreeOperation(crate::model::OperationId::new()),
             SidebarAction::CancelDiscard,
+            SidebarAction::CancelGitConfirmation,
             SidebarAction::CancelPublish,
         ] {
             assert_eq!(sidebar_route(&action), None, "{action:?}");
