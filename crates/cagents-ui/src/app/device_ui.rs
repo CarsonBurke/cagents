@@ -2981,4 +2981,73 @@ mod tests {
         assert_eq!(app.device_ui.file, Some("first".into()));
         assert_eq!(app.device_ui.original, "first content");
     }
+
+    #[test]
+    fn device_windows_do_not_offer_to_resume_this_computers_conversations() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME";
+        const TEST: &str = "app::device_ui::tests::device_windows_do_not_offer_to_resume_this_computers_conversations";
+        let resume = |entries: &[(String, String, Message)]| {
+            entries
+                .iter()
+                .any(|(_, _, message)| matches!(message, Message::ResumeConversation(_)))
+        };
+        if std::env::var_os(CHILD).is_none() {
+            // A local window offers it everywhere.
+            let app = super::super::tests::context_inspector_test_app(false);
+            assert!(resume(&app.palette_entries()));
+            assert!(
+                chrome_ui::new_tab_choices()
+                    .any(|(_, _, kind, _)| matches!(kind, chrome_ui::NewTab::Resume))
+            );
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "resume-test".into(),
+            host: "build-host".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("resume-test")).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        assert!(!resume(&app.palette_entries()));
+        assert!(
+            !chrome_ui::new_tab_choices()
+                .any(|(_, _, kind, _)| matches!(kind, chrome_ui::NewTab::Resume))
+        );
+        // A shortcut or stale menu that still asks says why, by name.
+        for message in [
+            Message::ChromeUi(chrome_ui::Action::Launch(chrome_ui::NewTab::Resume)),
+            Message::ResumeConversation(resume_ui::Action::Open),
+        ] {
+            app.status = None;
+            let reported = app.notices.len();
+            drop(app.update(message));
+            assert!(!app.device_ui.open);
+            // Reported either still standing or already moved to the log.
+            let shown = app
+                .status
+                .as_ref()
+                .map(|notice| notice.message.clone())
+                .or_else(|| {
+                    (app.notices.len() > reported)
+                        .then(|| app.notices.recent().next().unwrap().notice.message.clone())
+                });
+            assert_eq!(shown.as_deref(), Some(resume_ui::UNAVAILABLE));
+        }
+    }
 }

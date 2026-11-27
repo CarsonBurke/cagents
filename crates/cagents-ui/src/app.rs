@@ -17973,12 +17973,6 @@ impl Application for Cagents {
                     ),
                 ),
                 quick(
-                    Icon::History,
-                    "Resume conversation".to_owned(),
-                    "empty.resume-conversation",
-                    Message::ResumeConversation(resume_ui::Action::Open),
-                ),
-                quick(
                     Icon::Terminal,
                     workspace_widget::shortcut_tooltip(
                         workspace_widget::GlobalShortcut::NewTerminal,
@@ -18005,6 +17999,19 @@ impl Application for Cagents {
                     Message::AccountUi(account_ui::Action::OpenPane),
                 ),
             ];
+            // A device window can't search this computer's saved
+            // conversations (#688), so it doesn't offer to.
+            if resume_ui::available() {
+                actions.insert(
+                    1,
+                    quick(
+                        Icon::History,
+                        "Resume conversation".to_owned(),
+                        "empty.resume-conversation",
+                        Message::ResumeConversation(resume_ui::Action::Open),
+                    ),
+                );
+            }
             if !scoped {
                 actions.pop();
             }
@@ -18337,10 +18344,11 @@ impl Cagents {
                 Message::PreviewLocalFile(_) => {
                     return ControlFlow::Break(self.update_device(device_ui::Action::Open));
                 }
-                Message::ResumeConversation(_)
-                | Message::Repository(_)
-                | Message::ProjectUi(_)
-                | Message::SubmitWorktree => {
+                Message::ResumeConversation(_) => {
+                    self.status = Some(TransientNotice::warning(resume_ui::UNAVAILABLE));
+                    return ControlFlow::Break(Task::none());
+                }
+                Message::Repository(_) | Message::ProjectUi(_) | Message::SubmitWorktree => {
                     self.status = Some(TransientNotice::warning(
                         "Use Device files for remote files and Git operations",
                     ));

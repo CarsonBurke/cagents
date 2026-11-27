@@ -14,6 +14,16 @@ mod catalog;
 mod scan;
 pub(super) use scan::{HEAD_BYTES, first_prompt};
 
+/// Why a device window can't resume a conversation.
+pub(super) const UNAVAILABLE: &str = "Resuming an earlier conversation isn't available in a \
+     device window yet. Start a new conversation, or resume it from a window on that computer.";
+
+/// Whether this window can search for saved conversations. The search reads
+/// this computer's provider histories, so a device window has none (#688).
+pub(super) fn available() -> bool {
+    !crate::device::is_remote()
+}
+
 /// Conversations read before the first found ones are listed, so the newest
 /// appear at once, and between later listings.
 const FIRST_BATCH: usize = 64;
@@ -1268,6 +1278,10 @@ impl Cagents {
 
     pub(super) fn update_resume(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::Open if !available() => {
+                self.status = Some(TransientNotice::warning(UNAVAILABLE));
+                Task::none()
+            }
             Action::Open => {
                 let scope = self.resume_scope_here();
                 self.open_resume(scope).unwrap_or_else(Task::none)
