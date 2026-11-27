@@ -10428,7 +10428,17 @@ impl Cagents {
     /// Shows that a new terminal didn't open, with `reason`, in its pane. Its
     /// start never ran, so there is no surface to retire.
     pub(super) fn fail_terminal_creation(&mut self, card: CardId, reason: &str) {
-        let reason = terminal_failure::creation_reason(reason);
+        // A sign-in's busy callback port keeps the fixed explanation the
+        // sign-in recovery recognizes.
+        let login_busy = matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Terminal(session)) if account::login::is_codex_browser(&session.launch)
+        ) && account::login::callback_failed(reason);
+        let reason = if login_busy {
+            account::login::PORT_BUSY.to_owned()
+        } else {
+            terminal_failure::creation_reason(reason)
+        };
         self.sidebar_state.clear_agent_activity(card);
         self.mark_runtime_failed(card, reason.clone());
         self.cards.insert(

@@ -8611,3 +8611,52 @@ fn a_later_move_read_during_a_move_in_flight_is_shown_once_it_is_answered() {
     drop(app.apply_workspace_model_update(ModelUpdate::ProjectMoveAnswered { refused: false }));
     assert_eq!(sidebar_names(&app), ["beta", "gamma", "alpha"]);
 }
+
+/// A retried identity Remove of a terminal whose start was pending is
+/// refused once a peer has started it, and retried otherwise (#4400).
+#[test]
+fn an_identity_remove_is_refused_once_its_pending_terminal_starts() {
+    use crate::workspace_model::views::{Pane, Scope, View};
+    let card = crate::model::CardId::new();
+    let view = |pending: Option<bool>| View {
+        scope: Scope::Channel(crate::model::ChannelId::new()),
+        revision: 1,
+        panes: pending
+            .map(|pending| Pane {
+                id: card,
+                title: "terminal".into(),
+                user_title: None,
+                pending_terminal_start: pending,
+                width_fraction: 0.5,
+                scope: None,
+                kind: crate::model::CardKind::Terminal(crate::app::fresh_terminal_session(
+                    crate::model::LaunchRecipe::shell(std::path::PathBuf::from("/repo")).unwrap(),
+                )),
+            })
+            .into_iter()
+            .collect(),
+        retired: vec![],
+    };
+    assert!(started_meanwhile(
+        Some(&view(Some(true))),
+        Some(&view(Some(false))),
+        card
+    ));
+    // Still pending, already gone, or never pending: the Remove is retried.
+    assert!(!started_meanwhile(
+        Some(&view(Some(true))),
+        Some(&view(Some(true))),
+        card
+    ));
+    assert!(!started_meanwhile(
+        Some(&view(Some(true))),
+        Some(&view(None)),
+        card
+    ));
+    assert!(!started_meanwhile(
+        Some(&view(Some(false))),
+        Some(&view(Some(false))),
+        card
+    ));
+    assert!(!started_meanwhile(None, Some(&view(Some(false))), card));
+}
