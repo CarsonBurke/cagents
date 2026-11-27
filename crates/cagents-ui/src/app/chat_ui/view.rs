@@ -6139,7 +6139,9 @@ impl Runtime {
         use std::hash::{Hash, Hasher};
         let items = &self.snapshot.items;
         let now = self.source_now_ms();
-        let common = self.turn_common_hasher(turn, dark);
+        let mut common = self.turn_common_hasher(turn, dark);
+        // The rows keep what they were built with, colours included.
+        prose::inks(&settings.style).hash(&mut common);
         // Find reaches an exchange through its first row, whether or not
         // that row is mounted, and so does anything drawn before it.
         // Room for the row's own item too, which is usually all it holds.
