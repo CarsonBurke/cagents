@@ -649,6 +649,13 @@ const REQUEST_CONTEXT_CEILING: f32 = 160.0;
 /// arrived at the oldest message they have should not have to nudge the wheel
 /// again to be believed.
 const PAGE_REACH: f32 = 24.0;
+/// The floating jump to the latest activity: its height, and the gap it
+/// keeps above the transcript's foot. Together they are the band it covers.
+const LATEST_JUMP_HEIGHT: f32 = 28.0;
+const LATEST_JUMP_GAP: f32 = space::S;
+pub(super) const LATEST_JUMP_BAND: f32 = LATEST_JUMP_HEIGHT + LATEST_JUMP_GAP;
+/// The control ID of the floating jump to the latest activity.
+pub(super) const LATEST_JUMP: &str = "chat-latest-jump";
 /// How many viewport heights before a loaded edge the next page is fetched.
 const PREFETCH_SCREENS: f32 = 2.0;
 
@@ -857,9 +864,9 @@ fn history_key(
 
 /// The lines of a waiting message its row shows.
 const QUEUE_PREVIEW_LINES: usize = 2;
-/// How much of a selected agent's task its summary shows, after the `· `
-/// that sets it off: a task can be a whole prompt.
-const TASK_CHARS: usize = 2 + 160;
+/// How much of a selected agent's task its summary shows: a task can be a
+/// whole prompt.
+const TASK_CHARS: usize = 160;
 
 /// How much of a waiting message is handed to its row to be laid out. Two
 /// lines never show more, and a hundred entries of sixteen kibibytes each
@@ -1478,6 +1485,14 @@ impl Scroll {
     /// and reaching the bottom asks for the next cached page toward its live end.
     pub(super) fn at_bottom(self) -> bool {
         self.travel() <= 0.0 || self.from_top >= self.travel() - self.page_reach()
+    }
+
+    /// Whether the floating jump to the latest activity may show: the reader
+    /// is further from the transcript's end than the band [`LATEST_JUMP_BAND`]
+    /// the jump covers at the viewport's foot. Nearer, the end is already in
+    /// view, and the jump would cover the very rows it points to.
+    pub(super) fn leaves_room_for_jump(self) -> bool {
+        !self.at_bottom() && self.travel() - self.from_top > LATEST_JUMP_BAND
     }
 
     /// The height of the loaded transcript, which is what tells the page the
@@ -2248,6 +2263,44 @@ impl Runtime {
         .then_some(detail)
     }
 
+    /// The task a selected child's heading shows: its first line, unless
+    /// the child goes by it and its tab already shows it whole.
+    pub(super) fn selected_task(agent: &chat::Subagent) -> Option<&str> {
+        Self::native_child_task(agent).filter(|task| {
+            !Self::named_by_task(agent)
+                || task.chars().nth(child_navigation::TAB_CHARS).is_some()
+        })
+    }
+
+    /// Where a child runs and on which model, as its heading says it:
+    /// `Claude subagent · haiku`. An unreported model is left out rather
+    /// than said to be missing.
+    pub(super) fn child_runtime(&self, agent: &chat::Subagent) -> String {
+        let provider = Self::provider_name(self.session.launch.provider);
+        match agent
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            Some(model) => format!(
+                "{provider} subagent · {}",
+                Self::short_description(model, 80)
+            ),
+            None => format!("{provider} subagent"),
+        }
+    }
+
+    fn provider_name(provider: Provider) -> &'static str {
+        match provider {
+            Provider::Codex => "Codex",
+            Provider::Claude => "Claude",
+            Provider::Omp => "OMP",
+            Provider::Antigravity => "Antigravity",
+            Provider::Muse => "Muse",
+        }
+    }
+
     pub(super) fn native_child_identity(&self, agent: &chat::Subagent) -> String {
         self.child_description(agent, &self.child_label(agent, 80))
     }
@@ -2255,29 +2308,13 @@ impl Runtime {
     /// What a child's tab and rows say beyond its name: its state, where it
     /// runs and the task it was given. `label` is its name as listed.
     pub(super) fn child_description(&self, agent: &chat::Subagent, label: &str) -> String {
-        let provider = match self.session.launch.provider {
-            Provider::Codex => "Codex",
-            Provider::Claude => "Claude",
-            Provider::Omp => "OMP",
-            Provider::Antigravity => "Antigravity",
-            Provider::Muse => "Muse",
-        };
-        // As the selected child's caption words it: an unreported model is
-        // left out rather than said to be missing.
+        // As the selected child's heading words where it runs.
         let mut identity = format!(
-            "{} · {} · {provider} subagent",
+            "{} · {} · {}",
             Self::short_description(label, 80),
             self.native_child_status(agent),
+            self.child_runtime(agent),
         );
-        if let Some(model) = agent
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        {
-            identity.push_str(" · ");
-            identity.push_str(&Self::short_description(model, 80));
-        }
         // A blocked or failed child's provider error keeps its raw diagnostic
         // for copying; the tab says what it means. A finished child's detail
         // is its own report, whose prose may merely mention such words.
@@ -2485,6 +2522,20 @@ impl Runtime {
         }
     }
 
+    /// The failed-subagents control's ID, which names the failures it
+    /// counts so that a new set of them is a new control.
+    pub(super) fn agent_failures_id(target: Target, failed: &[&chat::Subagent]) -> widget::Id {
+        use std::hash::{Hash, Hasher};
+        let mut identity = crate::fingerprint::hasher();
+        for agent in failed {
+            agent.id.hash(&mut identity);
+        }
+        card_control_id(
+            target.card,
+            &format!("chat-agent-failures-{:x}", identity.finish()),
+        )
+    }
+
     fn agent_failure_control(&self) -> Option<Element<'_, Message>> {
         let failed = self.snapshot.subagent_activity().failed;
         if failed.is_empty() {
@@ -2512,20 +2563,12 @@ impl Runtime {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        use std::hash::{Hash, Hasher};
-        let mut identity = crate::fingerprint::hasher();
-        for agent in &failed {
-            agent.id.hash(&mut identity);
-        }
         let button = widget::button::custom(
             design::caption(Self::agent_failure_label(&failed))
                 .wrapping(iced::widget::text::Wrapping::None),
         )
         .name(name)
-        .id(card_control_id(
-            self.target.card,
-            &format!("chat-agent-failures-{:x}", identity.finish()),
-        ))
+        .id(Self::agent_failures_id(self.target, &failed))
         .padding(0)
         .class(crate::ui_controls::control_style(false, None))
         .on_press(action(on_press));
@@ -2654,6 +2697,36 @@ impl Runtime {
                 || working
                     && matches!(item.content, ItemContent::Text { thinking: true, .. })
                     && !reasoning::contentless(&item.content))
+    }
+
+    /// The jump to the latest activity, floating centred over the foot of
+    /// the conversation's own transcript while something new arrived below
+    /// where the reader is. A subagent's transcript has none.
+    fn latest_jump<'a>(&self, child_shown: bool) -> Option<Element<'a, Message>> {
+        if child_shown || !self.unseen_activity || !self.active_scroll().leaves_room_for_jump() {
+            return None;
+        }
+        let target = self.target;
+        Some(
+            widget::container(
+                widget::button::custom(
+                    widget::container(design::caption("↓ New activity"))
+                        .center_y(Length::Fill),
+                )
+                .id(card_control_id(target.card, LATEST_JUMP))
+                .name("New activity: jump to the latest")
+                .height(LATEST_JUMP_HEIGHT)
+                .padding([0.0, space::M])
+                .class(crate::ui_controls::floating_control_style())
+                .on_press_maybe((!self.disconnected).then(|| action(Action::Latest(target)))),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(iced::Padding::ZERO.bottom(LATEST_JUMP_GAP))
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .into(),
+        )
     }
 
     /// The row that closes the transcript above the composer: what
@@ -3532,35 +3605,39 @@ impl Runtime {
         let mut transcript = VirtualRows::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
-            // The selected tab already names the agent. Beneath the tabs is
-            // what the tab cannot hold: how it stands, beside its mark, and
-            // the task it was given unless it goes by that task. Where it
-            // runs and on which model is on hover.
-            let mut summary = vec![
-                super::child_navigation::status_mark(agent),
-                design::caption(self.native_child_status(agent).to_owned())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
-            ];
-            match Self::native_child_task(agent).filter(|_| !Self::named_by_task(agent)) {
-                Some(task) => summary.push(
+            // The selected tab already names the agent and marks how it
+            // stands, and the line closing its transcript says what it is
+            // doing, so neither is said again here. Beneath the tabs is only
+            // what the tab cannot hold: the task it was given, unless the
+            // tab already shows it whole, and where it runs on which model.
+            let mut summary = Vec::with_capacity(2);
+            if let Some(task) = Self::selected_task(agent) {
+                summary.push(
                     // Only what the budget can show, and a character past
                     // it to say there is more, is copied on each frame.
-                    crate::ui_controls::FadeText::caption(format!(
-                        "· {}",
+                    crate::ui_controls::FadeText::caption(
                         task.char_indices()
-                            .nth(TASK_CHARS - 1)
-                            .map_or(task, |(end, _)| &task[..end])
-                    ))
+                            .nth(TASK_CHARS + 1)
+                            .map_or(task, |(end, _)| &task[..end]),
+                    )
+                    .class(cosmic::theme::Text::Default)
                     .limit(TASK_CHARS)
                     .width(Length::Fill)
                     .into(),
-                ),
-                None => summary.push(widget::Space::new().width(Length::Fill).into()),
+                );
             }
+            summary.push(
+                crate::ui_controls::FadeText::caption(self.child_runtime(agent))
+                    .width(if summary.is_empty() {
+                        Length::Fill
+                    } else {
+                        Length::Shrink
+                    })
+                    .into(),
+            );
             let summary = crate::interaction::tooltip(
                 widget::row::with_children(summary)
-                    .spacing(space::XS)
+                    .spacing(space::S)
                     .align_y(Alignment::Center)
                     .width(Length::Fill),
                 self.native_child_identity(agent),
@@ -3594,7 +3671,10 @@ impl Runtime {
                     .width(Length::Fill)
                     .into(),
             );
-            if let Some(placeholder) = child_placeholder(agent) {
+            if let Some(placeholder) = child_placeholder(
+                agent,
+                self.closing_activity(transitioning, Some(agent)).is_some(),
+            ) {
                 transcript.push(transcript_body(placeholder, target));
             }
             let mut gallery_rest = 0;
@@ -4188,6 +4268,15 @@ impl Runtime {
         };
         drop(transcript_part);
         let transcript_layer = crate::performance::ui_trace::region("transcript", transcript_layer);
+        // The jump to new activity floats over the transcript's foot rather
+        // than taking a row of its own, so neither the transcript nor the
+        // strip below it moves when it comes and goes. Its slot is always
+        // there, empty while it is not, so the transcript's tree never moves.
+        let transcript_layer = crate::interaction::layer(
+            transcript_layer,
+            self.latest_jump(selected.is_some())
+                .unwrap_or_else(|| widget::Space::new().into()),
+        );
         // Keep the transcript mounted in its original layer slot while the
         // chooser or the image viewer covers it, preserving its native scroll
         // and selection state, and what arrives meanwhile, such as a message
@@ -4212,14 +4301,6 @@ impl Runtime {
                     })
                 }),
         ));
-        if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
-            content.push(
-                widget::button::custom(design::caption("↓ New activity"))
-                    .class(crate::ui_controls::control_style(true, None))
-                    .on_press_maybe((!self.disconnected).then(|| action(Action::Latest(target))))
-                    .into(),
-            );
-        }
         // A draft starting for its first message says so on the message
         // itself.
         // A resume says so on its own control, beside what it is resuming.
@@ -8502,18 +8583,23 @@ impl Runtime {
 /// What a subagent's transcript says in place of rows it has none of yet.
 /// Thoughts with nothing to read draw no row, so a subagent with only those
 /// has shown nothing yet and says so as one with no items does. A failure
-/// with its own detail says it instead.
-fn child_placeholder(agent: &chat::Subagent) -> Option<&'static str> {
+/// with its own detail says it instead, and so does the line closing the
+/// transcript, `closing`, which already says a running child is at work:
+/// one fact, said once, rather than a wait above a spinning "Working".
+fn child_placeholder(agent: &chat::Subagent, closing: bool) -> Option<&'static str> {
     let shown = agent
         .items
         .iter()
         .any(|item| !reasoning::contentless(&item.content));
     let failure = agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty();
-    (!shown && !failure).then_some(if agent.is_running() {
-        "Waiting for subagent activity…"
-    } else {
-        "No recent subagent activity is available here."
-    })
+    if shown || failure {
+        return None;
+    }
+    match (agent.is_running(), closing) {
+        (true, true) => None,
+        (true, false) => Some("Nothing from this subagent yet."),
+        (false, _) => Some("No recent subagent activity is available here."),
+    }
 }
 
 /// A stretch of thinking with nothing to read, as an open strip lists it

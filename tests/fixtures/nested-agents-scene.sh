@@ -30,10 +30,19 @@
 #
 # Shots: agents-running after launch, agents-settled after settle, each with
 # the side's prefix as native-evidence adds it.
+#
+# With the argument `strip`, the scene stops halfway through settling, while
+# Trace and Rollback have finished and the rest still work, for the strip of
+# agent tabs above the composer (use --height 800, so the lead's transcript
+# scrolls): strip-main with the lead's tab shown, strip-selected with Migrate
+# open, and strip-jump, scrolled up as the rest of the turn arrives, with the
+# jump to the new activity. A narrow window (--width 760) shows how the strip
+# gives way.
 set -u
 . "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
 require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
 require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
+mode=${1:-}
 
 here=$(cd "$(dirname "$0")" && pwd)
 frames=$here/nested-agents-scene
@@ -92,6 +101,32 @@ if [ -z "$composer" ]; then
     exit 1
 fi
 shot agents-running
+
+if [ "$mode" = strip ]; then
+    # Settle up to Rollback's finishing, then wait for the scene's release.
+    rm -f "$config/fixture-release.rest"
+    { head -n 19 "$frames/settle.jsonl"; echo '{"_await": "rest"}'; tail -n +20 "$frames/settle.jsonl"; } \
+        >"$config/fixture-frames.jsonl"
+    "$ne" drive click "$composer" >/dev/null 2>&1
+    "$ne" drive type 'How are the reviews going?' >/dev/null 2>&1
+    "$ne" drive key Return >/dev/null 2>&1
+    sleep 4
+    shot strip-main
+    "$ne" drive click Migrate >/dev/null 2>&1 || log "no Migrate tab to open"
+    sleep 2
+    shot strip-selected
+    "$ne" drive click Main >/dev/null 2>&1 || log "no Main tab to return to"
+    sleep 2
+    # Scroll up over the transcript, then let the turn go on below.
+    transcript=$(printf '%s' "$composer" | awk -F, '{printf "%d,%d", $1, $2 / 3}')
+    "$ne" drive scroll --at "$transcript" v -15 >/dev/null 2>&1 || log "scroll failed"
+    sleep 1
+    : >"$config/fixture-release.rest"
+    sleep 4
+    shot strip-jump
+    log done
+    exit 0
+fi
 
 cp "$frames/settle.jsonl" "$config/fixture-frames.jsonl"
 "$ne" drive click "$composer" >/dev/null 2>&1

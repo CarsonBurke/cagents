@@ -250,6 +250,54 @@ fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic:
     }
 }
 
+/// A control floating over content that scrolls beneath it, such as the
+/// jump to a transcript's latest activity: an opaque raised pill with a
+/// hairline edge, so the rows passing under it never show through. Disabled,
+/// it keeps its surface and mutes its label, rather than turning into bare
+/// text over the content.
+pub fn floating_control_style() -> cosmic::theme::Button {
+    let appearance = |focused: bool, theme: &cosmic::Theme, fill: iced::Color| {
+        focus_ring(
+            widget::button::Style {
+                background: Some(iced::Background::Color(fill)),
+                border_radius: (design::COMPACT_CONTROL_SIZE).into(),
+                border_width: design::BORDER_WIDTH,
+                border_color: design::hairline(theme),
+                text_color: Some(theme.current_container().component.on.into()),
+                icon_color: Some(theme.current_container().component.on.into()),
+                ..design::button_style()
+            },
+            focused,
+            theme,
+        )
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |focused, theme| appearance(focused, theme, design::raised(theme))),
+        disabled: Box::new(move |theme| widget::button::Style {
+            text_color: Some(design::disabled_color(theme)),
+            ..appearance(false, theme, design::raised(theme))
+        }),
+        hovered: Box::new(move |focused, theme| {
+            appearance(
+                focused,
+                theme,
+                design::mix(design::raised(theme), hover_fill(theme), hover_fill(theme).a),
+            )
+        }),
+        pressed: Box::new(move |focused, theme| {
+            appearance(
+                focused,
+                theme,
+                design::mix(
+                    design::raised(theme),
+                    theme.current_container().component.pressed.into(),
+                    0.5,
+                ),
+            )
+        }),
+    }
+}
+
 /// The fill of the selected control in a group: the chosen tab or view, or
 /// a toggle that is on.
 pub fn selected_fill(theme: &cosmic::Theme) -> iced::Color {

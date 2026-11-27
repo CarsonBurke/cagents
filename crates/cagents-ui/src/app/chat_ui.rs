@@ -478,6 +478,8 @@ pub enum Action {
     SubagentType(Target, String),
     /// The chooser's list moved to this offset, in a viewport this tall.
     SubagentScroll(Target, f32, f32),
+    /// The pointer came over the strip of subagent tabs, or left it.
+    SubagentStripHover(Target, bool),
     ToggleFailure(Target, String),
     CopyFailure(Target, String),
     FailureCopied(
@@ -1028,6 +1030,7 @@ impl Action {
             Self::SubagentQuery(..) => "SubagentQuery",
             Self::SubagentType(..) => "SubagentType",
             Self::SubagentScroll(..) => "SubagentScroll",
+            Self::SubagentStripHover(..) => "SubagentStripHover",
             Self::ToggleFailure(..) => "ToggleFailure",
             Self::CopyFailure(..) => "CopyFailure",
             Self::FailureCopied(..) => "FailureCopied",
@@ -3802,6 +3805,10 @@ pub(super) struct Runtime {
     /// The child whose tab holds keyboard focus. The tab strip reports it, so
     /// the next frame keeps that tab mounted wherever its state sorts it.
     child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    /// The tabs the strip showed when the pointer came over it, in their
+    /// order, held until it leaves so no tab slides under the pointer as
+    /// subagents finish. See [`child_navigation::Hold`].
+    child_strip_hold: Option<child_navigation::Hold>,
     child_ordinals: child_navigation::Ordinals,
     /// What each waiting agent waits on, named once per publication.
     agent_work: view::AgentWork,
@@ -5554,6 +5561,7 @@ impl Runtime {
             child_picker: None,
             image_viewer: None,
             child_tab_focus: Default::default(),
+            child_strip_hold: None,
             child_ordinals: Default::default(),
             agent_work: Default::default(),
             asked_after: HashSet::new(),
@@ -5665,6 +5673,7 @@ impl Runtime {
         self.limit_refresh_pending = false;
         self.child_picker = None;
         self.child_tab_focus.borrow_mut().take();
+        self.child_strip_hold = None;
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
@@ -17745,23 +17754,23 @@ impl Cagents {
             }
             Action::SubagentPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.child_picker = open.then(|| runtime.child_picker_for_now());
                     if open {
+                        runtime.child_picker = Some(runtime.child_picker_for_now());
                         return widget::text_input::focus(card_control_id(
                             target.card,
                             "chat-subagent-search",
                         ))
                         .map(cosmic::Action::App);
                     }
-                    return iced::widget::operation::focus(card_control_id(
-                        target.card,
-                        if runtime.snapshot.subagents.is_empty() {
-                            "chat-composer"
-                        } else {
-                            "chat-subagent-picker"
-                        },
-                    ))
-                    .map(cosmic::Action::App);
+                    // Back to the control that opened the chooser, so a
+                    // keyboard reader keeps their place.
+                    let opener = if runtime.snapshot.subagents.is_empty() {
+                        card_control_id(target.card, "chat-composer")
+                    } else {
+                        runtime.child_picker_opener()
+                    };
+                    runtime.child_picker = None;
+                    return iced::widget::operation::focus(opener).map(cosmic::Action::App);
                 }
             }
             Action::SubagentQuery(target, query) => {
@@ -17792,6 +17801,11 @@ impl Cagents {
                         widget::text_input::focus(search.clone()).map(cosmic::Action::App),
                         widget::text_input::move_cursor_to_end(search).map(cosmic::Action::App),
                     ]);
+                }
+            }
+            Action::SubagentStripHover(target, over) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.child_strip_hold = over.then(|| runtime.child_strip_now());
                 }
             }
             Action::SubagentScroll(target, offset, height) => {
