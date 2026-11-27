@@ -70,6 +70,8 @@ class PrScreenshots(unittest.TestCase):
             "STUB_LOG": str(self.logs),
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
+            # No real account registry; a test that needs accounts names its own.
+            "CAGENTS_SCREENSHOT_CAGENTS": "/bin/false",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
         }
@@ -105,7 +107,7 @@ class PrScreenshots(unittest.TestCase):
         clean = self.image("before-account.webp", "Claude · fixture@example.test  codex@fixture.invalid")
         result = self.run_tool("scan", shown, clean)
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(f"{shown} shows an email address (s…e@example.com)", result.stderr)
+        self.assertIn(f"{shown} shows an email address (s…e@e…e.com)", result.stderr)
         self.assertNotIn("someone.else", result.stderr)
         self.assertNotIn(str(clean), result.stderr)
         result = self.run_tool("scan", clean)
@@ -127,6 +129,37 @@ class PrScreenshots(unittest.TestCase):
         extra = self.image("after-extra.webp", "Workspace of handle-42")
         self.assertEqual(self.run_tool("scan", "--identity", "handle-42", extra).returncode, 1)
 
+    def test_addresses_ocr_misreads_are_still_found(self):
+        for text in ("someone©example.com", "someone@®example.com", "someone ® example.com",
+                     "someone @ example . com", "someone(a)example.com", "someone@example.c0m"):
+            with self.subTest(text=text):
+                result = self.run_tool("scan", self.image("after-misread.webp", f"Claude · {text}  Opus"))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("shows an email address (s…e@e…e.", result.stderr)
+
+    def test_a_known_address_is_found_by_its_user_name_when_cut_off(self):
+        self.git(self.work, "config", "user.email", "jordan.dev@example.invalid")
+        result = self.run_tool("scan", self.image("after-cut.webp", "Signed in as jordan.dev@exam…"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("a private identity (j…v, from the Git email, before its @)", result.stderr)
+
+    def test_the_addresses_of_cagents_accounts_are_refused(self):
+        accounts = self.root / "cagents"
+        accounts.write_text(textwrap.dedent("""\
+            #!/bin/sh
+            [ "$*" = "account list --json --no-start" ] || exit 2
+            echo '{"command":"account.list","data":{"accounts":[{"id":"claude/system","name":"owner.account@example.invalid"},{"id":"agy/system","name":null},{"id":"x","name":"Work"}]}}'
+        """))
+        accounts.chmod(0o755)
+        shown = self.image("after-composer.webp", "Opus 5.5 · owner.account@example.invalid  Work")
+        result = self.run_tool("scan", shown, extra={"CAGENTS_SCREENSHOT_CAGENTS": str(accounts)})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("a private identity (o…d, from a cagents account)", result.stderr)
+        # A label that is no address is no identity.
+        self.assertNotIn("W…k", result.stderr)
+        # Without the registry, a fixture address is fine.
+        self.assertEqual(self.run_tool("scan", shown).returncode, 0)
+
     def test_an_allowed_address_or_domain_passes(self):
         shown = self.image("after-support.webp", "Contact help@example.com or ops@mail.example.org")
         self.assertEqual(self.run_tool("scan", shown).returncode, 1)
@@ -137,10 +170,13 @@ class PrScreenshots(unittest.TestCase):
         (self.config / "cagents").mkdir(parents=True)
         (self.config / "cagents" / "private-identities").write_text("Jordan Example\n")
         shown = self.image("after-name.webp", "Jordan Example")
+        # By default it reads on the evidence host, unreachable here.
         missing = self.run_tool("scan", shown, extra={"NO_LOCAL_OCR": "1"})
         self.assertEqual(missing.returncode, 3)
+        self.assertIn("tesseract on fw16 could not read", missing.stderr)
         self.assertIn("no tesseract with English data", missing.stderr)
-        self.assertFalse((self.logs / "ssh").exists())
+        (self.logs / "ssh").unlink()
+        (self.logs / "ssh-input").unlink(missing_ok=True)
         result = self.run_tool("scan", shown, extra={"NO_LOCAL_OCR": "1", "CAGENTS_EVIDENCE_REMOTE": "buildhost"})
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("shows a private identity", result.stderr)
@@ -211,6 +247,13 @@ class PrScreenshots(unittest.TestCase):
         self.assertIn("nothing was published", result.stderr)
         self.assertEqual(self.remote_branches(), "")
 
+    def test_publish_refuses_links_to_another_repository_than_it_pushes_to(self):
+        self.git(self.work, "remote", "add", "github", "git@github.com:owner/repo.git")
+        shot = self.image("after-home.webp", "Projects")
+        result = self.run_tool("publish", "--remote", "github", "-R", "someone/else", shot)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("-R someone/else is not github, which is owner/repo", result.stderr)
+
     def test_publish_refuses_raw_copies_other_formats_and_bad_names(self):
         raw = self.shots.parent / "raw"
         raw.mkdir()
@@ -218,11 +261,15 @@ class PrScreenshots(unittest.TestCase):
         png = self.shots / "after-home.png"
         png.write_bytes(b"\x89PNG\r\n\x1a\nProjects")
         spaced = self.image("after home.webp", "Projects")
-        result = self.run_tool("publish", "-R", "owner/repo", original, png, spaced)
+        result = self.run_tool("publish", "-R", "owner/repo", original, spaced)
         self.assertEqual(result.returncode, 2)
         self.assertIn(f"{original}: this is native-evidence's unedited copy; publish the one in shots/", result.stderr)
-        self.assertIn(f"{png}: not a WebP image", result.stderr)
         self.assertIn(f"{spaced}: name it NAME.webp", result.stderr)
+        disguised = self.shots / "after-home.webp"
+        disguised.write_bytes(png.read_bytes())
+        result = self.run_tool("publish", "-R", "owner/repo", disguised)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"{disguised}: not a WebP image", result.stderr)
         self.assertEqual(self.remote_branches(), "")
 
 

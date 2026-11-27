@@ -67,7 +67,8 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   HOST, as it does for both sides of a pair.
   shot NAME [--lossless]
                   Capture on HOST and bring back shots/SIDE-NAME.webp;
-                  --lossless keeps every pixel.
+                  --lossless keeps every pixel. Exits 4 when that shot was
+                  edited here and so kept; the capture is in raw/.
   fetch           Bring back every shot and the manifest. The host's copies
                   go to DIR/raw/; a shot in DIR/shots/ edited since it was
                   brought back is kept, never overwritten.
@@ -713,6 +714,8 @@ case $command in
         side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p') || side=
         if [ -n "$side" ]; then
             printf '%s\n' "$task/shots/$side-$1.webp"
+            # Status 4: the path holds a shot edited here, not this capture.
+            cmp -s -- "$task/shots/$side-$1.webp" "$task/raw/$side-$1.webp" || exit 4
         else
             printf '%s\n' "$task/shots"
         fi

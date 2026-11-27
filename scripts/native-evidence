@@ -117,7 +117,7 @@ both use the same fixture data and selected providers.
   shot NAME [--lossless]
                   Capture shots/SIDE-NAME.webp and record its source revision.
                   The capture also goes to raw/; a shot edited since the last
-                  capture is kept, and the new one waits in raw/.
+                  capture is kept, the new one waits in raw/, and shot exits 4.
                   --lossless keeps every pixel, for comparing edges, borders
                   and fades pixel by pixel; the default is smaller and lossy.
   open-window SLOT
@@ -1631,6 +1631,8 @@ if w > width + 2 or h > height + 2:
     # check that refuses it is the one before publishing.
     /usr/bin/python3 -I "$tool_root/scripts/pr-screenshots" scan --warn "$task/raw/$side-$name.webp" >&2 || true
     printf '%s\n' "$webp"
+    # Status 4: the path holds the edited shot, not this capture.
+    cmp -s -- "$webp" "$task/raw/$side-$name.webp" || return 4
 }
 
 cmd_stop() {

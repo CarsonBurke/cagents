@@ -337,6 +337,8 @@ class Evidence(unittest.TestCase):
             )]),
             "HOME": str(self.root / "real-home"),
             "STUB_LOG": str(self.logs),
+            # The shot-time identity check reads no real account registry.
+            "CAGENTS_SCREENSHOT_CAGENTS": "/bin/false",
             "STUB_BIN": str(self.bin),
             "STUB_TASK": str(self.task),
             "CLAUDE_CONFIG_DIR": "/must/not/reach/the/fixture",
@@ -1770,13 +1772,16 @@ class Evidence(unittest.TestCase):
         masked = self.task / "shots" / "after-empty-state.webp"
         masked.write_text("masked")
         (self.logs / "shot-text").write_text("Signed in as someone@example.com")
-        retake = self.run_tool("shot", "empty-state")
+        retake = self.run_tool("shot", "empty-state", check=False)
+        # The path it prints holds the edited shot, which its status says.
+        self.assertEqual(retake.returncode, 4, retake.stderr)
+        self.assertEqual(retake.stdout.strip(), str(masked))
         self.assertEqual(masked.read_text(), "masked")
         self.assertEqual((self.task / "raw" / "after-empty-state.webp").read_text(),
                          "Signed in as someone@example.com")
         self.assertIn(f"kept {masked}, which changed after it was delivered", retake.stderr)
         # This host's OCR gives early word of the address, masked in the report.
-        self.assertIn("shows an email address (s…e@example.com)", retake.stderr)
+        self.assertIn("shows an email address (s…e@e…e.com)", retake.stderr)
         self.assertNotIn("someone@", retake.stderr)
         # An unedited shot follows its retake, and a fixture address is no identity.
         (self.logs / "shot-text").write_text("Signed in as fixture@example.test")
@@ -3316,6 +3321,11 @@ class RemoteEvidence(unittest.TestCase):
             self.assertEqual(local.read_text(), "masked", fetch)
         self.assertIn(f"kept {local}, which changed after it was delivered", result.stderr)
         self.assertEqual((self.task / "shots" / "after-other.webp").read_text(), "webp")
+        # Retaken, the path printed holds the edited shot, which its status says.
+        retake = self.run_tool("shot", "home", check=False)
+        self.assertEqual(retake.returncode, 4, retake.stderr)
+        self.assertEqual(retake.stdout.strip(), str(local))
+        self.assertEqual(local.read_text(), "masked")
         # A retake on the host waits in raw/ beside the edited shot.
         (self.remote_task / "shots" / "after-home.webp").write_text("retaken")
         self.run_tool("fetch")
