@@ -701,14 +701,14 @@ pub(super) fn verify_completed_preselection(
     job: &UpdateJob,
     ready: &crate::upgrade::recovery::ReadyPlanEvidence<'_>,
     runtime: &crate::daemon::lease_handoff::LeaseHandoff,
-    standby_pid: u32,
+    standby_pid: Option<u32>,
 ) -> Result<bool, UpdateError> {
     let Some(intent) = read(state, &job.id)? else {
         return Ok(false);
     };
     if intent.stage != Stage::Pending
         || intent.witness.is_legacy()
-        || intent.process.pid as u32 != standby_pid
+        || standby_pid.is_some_and(|pid| intent.process.pid as u32 != pid)
         || !intent.names_target(layout)?
         || !intent.original_exited()?
     {
@@ -746,6 +746,19 @@ pub(super) fn verify_completed_preselection(
     Ok(true)
 }
 
+/// A receipt permits delegating to the staged worker. Only that worker
+/// may verify the full recorded restore and exchange the selector.
+pub(super) fn has_restored_checkpoint_receipt(
+    state: &Path,
+    job: &str,
+) -> Result<bool, UpdateError> {
+    match read_private(&restored_checkpoint_path(state, job), SMALL_ASSET_LIMIT) {
+        Ok(_) => Ok(true),
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) struct SelectedRestart {
     cli: PathBuf,
     intent: Intent,
@@ -756,7 +769,7 @@ pub(super) fn restart_after_worker(
     state: &Path,
     job: &UpdateJob,
 ) -> Result<Option<SelectedRestart>, UpdateError> {
-    if job.phase != UpdatePhase::Failed {
+    if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed) {
         return Ok(None);
     }
     let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
@@ -827,7 +840,7 @@ impl SelectedRestart {
         let _worker = crate::instance::owned_file_lock(open_worker_lock(state)?, libc::LOCK_EX)?;
         if let Some(job) = read_job(state)?
             && job.id == self.intent.job
-            && job.phase == UpdatePhase::Failed
+            && matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
             && let Some(current) = read(state, &job.id)?
             && current.stage == Stage::Pending
             && current.pending_digest()? == self.intent.pending_digest()?
@@ -844,6 +857,8 @@ impl SelectedRestart {
             )?;
             // Wake existing readers of status.json. The verdict and message
             // travel together in the receipt they read on the next snapshot.
+            let mut job = job;
+            job.phase = UpdatePhase::Failed;
             write_job(state, &job)?;
         }
         Err(invalid(failure))

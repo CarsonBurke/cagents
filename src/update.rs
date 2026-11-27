@@ -2448,6 +2448,10 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     #[cfg(target_os = "macos")]
     if job.id == job_id && matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed) {
         let recovered = ready_plan::recover_worker(&installation, &state, &mut job, &_lock);
+        if let Ok(Some(restart)) = recovered {
+            drop(_lock);
+            return restart.launch(&state);
+        }
         if let Err(error) = &recovered {
             job.phase = UpdatePhase::Failed;
             job.message = error.record_message();
@@ -2458,7 +2462,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
                 restart_selected_after_worker(&installation, &state, &job, _lock);
             }
         }
-        return recovered;
+        return recovered.map(drop);
     }
     let resume_stage = cfg!(target_os = "macos") && job.phase == UpdatePhase::Verifying;
     if job.id != job_id || (job.phase != UpdatePhase::Starting && !resume_stage) {

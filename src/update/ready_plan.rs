@@ -472,12 +472,16 @@ pub(crate) fn resume_selected(
                 reservation.finish_return(&source)?;
                 return Ok(None);
             }
-            Phase::Claimed => reservation
-                .plan
-                .ready
-                .require_pre_effects_retry()
-                .map_err(invalid)?,
-            Phase::AwaitingAdmission => (),
+            Phase::Claimed
+                if !cutover::has_restored_checkpoint_receipt(&state, &reservation.job)? =>
+            {
+                reservation
+                    .plan
+                    .ready
+                    .require_pre_effects_retry()
+                    .map_err(invalid)?;
+            }
+            Phase::Claimed | Phase::AwaitingAdmission => (),
         }
         let Some(job) = cutover::read_job(&state)? else {
             return Err(invalid("The reserved update job is missing"));
@@ -927,7 +931,8 @@ pub(super) fn select_completed_restore(
     job: &UpdateJob,
     guard: &crate::instance::UiUpdateGuard,
     runtime: &crate::daemon::lease_handoff::LeaseHandoff,
-    standby: &crate::daemon::standby::Parked,
+    publication: &File,
+    standby_pid: Option<u32>,
 ) -> Result<bool, UpdateError> {
     let Some(reservation) = shared_reservation()? else {
         return Ok(false);
@@ -945,7 +950,7 @@ pub(super) fn select_completed_restore(
     {
         return Ok(false);
     }
-    crate::install_guard::verify_darwin_publication(standby.publication())?;
+    crate::install_guard::verify_darwin_publication(publication)?;
     if !reservation.plan.selection_is_untouched(layout)?
         || !cutover::verify_completed_preselection(
             layout,
@@ -953,7 +958,7 @@ pub(super) fn select_completed_restore(
             job,
             &reservation.plan.ready,
             runtime,
-            standby.pid(),
+            standby_pid,
         )?
     {
         return Ok(false);
@@ -978,7 +983,7 @@ pub(super) fn recover_worker(
     state: &Path,
     job: &mut UpdateJob,
     worker: &File,
-) -> Result<(), UpdateError> {
+) -> Result<Option<cutover::SelectedRestart>, UpdateError> {
     let (plan, reserved) =
         load(state, job)?.ok_or_else(|| invalid("This update has no Ready activation plan"))?;
     let target = plan.target_layout(&installation.prefix, job)?;
@@ -1012,6 +1017,14 @@ pub(super) fn recover_worker(
         ));
     }
     let handoff = acquire_unserved_runtime()?;
+    if reserved
+        && cutover::has_restored_checkpoint_receipt(state, &job.id)?
+        && select_completed_restore(&target, state, job, &guard, &handoff, &publication, None)?
+    {
+        return cutover::restart_after_worker(installation, state, job)?
+            .map(Some)
+            .ok_or_else(|| invalid("No restart is available for the verified selected build"));
+    }
     let receipt = plan
         .ready
         .reopen(&daemon, worker, &guard, &handoff, reserved)
@@ -1037,7 +1050,8 @@ pub(super) fn recover_worker(
     // Its verified listener settles the transfer and its own launcher
     // completes the original job after our final fence copies close.
     installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout)?;
-    installed::selected_candidate(&installation.prefix, &target.version_root)
+    installed::selected_candidate(&installation.prefix, &target.version_root)?;
+    Ok(None)
 }
 
 fn acquire_unserved_runtime() -> Result<crate::daemon::lease_handoff::LeaseHandoff, UpdateError> {

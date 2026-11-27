@@ -547,8 +547,15 @@ pub(super) fn perform(
     if result.is_err()
         && let Some(runtime) = handoff.as_ref()
         && let Some(standby) = standby.as_ref()
-        && let Err(error) =
-            ready_plan::select_completed_restore(&layout, state, job, &guard, runtime, standby)
+        && let Err(error) = ready_plan::select_completed_restore(
+            &layout,
+            state,
+            job,
+            &guard,
+            runtime,
+            standby.publication(),
+            Some(standby.pid()),
+        )
     {
         eprintln!("Could not finish the verified selection: {error}");
     }
