@@ -388,6 +388,7 @@ mod tests {
                 .connection
                 .execute_batch(
                     "DROP TABLE review_cache_files; DROP TABLE review_cache;
+                 DROP TABLE returned_chat_queues;
                  ALTER TABLE terminal_recipes DROP COLUMN predecessor; PRAGMA user_version = 8;",
                 )
                 .unwrap();

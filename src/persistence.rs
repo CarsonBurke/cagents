@@ -11944,6 +11944,7 @@ mod tests {
                  ALTER TABLE terminal_recipes DROP COLUMN predecessor;
                  DROP TABLE review_cache_files;
                  DROP TABLE review_cache;
+                 DROP TABLE returned_chat_queues;
                  PRAGMA user_version = 7;",
             )
             .unwrap();
@@ -12637,6 +12638,7 @@ mod tests {
                  ALTER TABLE terminal_recipes DROP COLUMN predecessor;
                  DROP TABLE review_cache_files;
                  DROP TABLE review_cache;
+                 DROP TABLE returned_chat_queues;
                  PRAGMA user_version = 6;",
             )
             .unwrap();
