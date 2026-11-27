@@ -23,6 +23,8 @@ const NETWORK_PROBE: Duration = Duration::from_secs(10);
 const CLOSED_PROBE: Duration = Duration::from_secs(15);
 /// The popover's content width.
 const WIDTH: f32 = 312.0;
+/// The connection details' label column, wide enough for "Tailscale".
+const FACT_LABEL_WIDTH: f32 = 60.0;
 /// The QR code's side, quiet zone included.
 const CODE_SIZE: f32 = 232.0;
 
@@ -46,6 +48,8 @@ pub enum Action {
     ConfirmRemove,
     CancelRemove,
     Copy(String),
+    /// Shows or hides how a phone reaches this computer.
+    Details(bool),
 }
 
 /// A pairing that has begun: its one-time key is authorized.
@@ -79,6 +83,9 @@ pub(super) struct State {
     joining: Option<String>,
     /// Whether leftover pairings were cleaned up.
     swept: bool,
+    /// Whether the connection details are shown, once the person chose;
+    /// until then they show only while something keeps a phone out.
+    details: Option<bool>,
 }
 
 impl State {
@@ -409,6 +416,10 @@ impl Cagents {
                 self.phone_ui.notice = None;
                 Task::none()
             }
+            Action::Details(shown) => {
+                self.phone_ui.details = Some(shown);
+                Task::none()
+            }
             Action::CancelRemove => {
                 self.phone_ui.removing = None;
                 Task::none()
@@ -498,76 +509,93 @@ impl Cagents {
 
     fn phone_popover(&self) -> Element<'_, Message> {
         let state = &self.phone_ui;
-        let mut rows: Vec<Element<'_, Message>> = vec![design::heading("Phone").into()];
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            inset(design::heading("Phone"))
+                .padding(Padding::from([space::XXS, design::list::INSET]))
+                .into(),
+        ];
         let Some(status) = &state.status else {
-            rows.push(design::caption("Checking…").into());
+            rows.push(inset(design::caption("Checking…")).into());
             return column(rows);
         };
         if let Some(notice) = &state.notice {
-            rows.push(match notice {
-                Ok(message) => design::body(message.as_str())
-                    .class(cosmic::theme::Text::Custom(design::success_text))
-                    .into(),
-                Err(message) => design::body(message.as_str())
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .into(),
-            });
+            rows.push(
+                inset(match notice {
+                    Ok(message) => design::caption(message.as_str())
+                        .class(cosmic::theme::Text::Custom(design::success_text)),
+                    Err(message) => design::caption(message.as_str())
+                        .class(cosmic::theme::Text::Custom(design::warning_text)),
+                })
+                .into(),
+            );
         }
+        let blocker = pairing_blocker(status);
         match &state.pairing {
-            Some(pairing) => rows.push(self.phone_pairing(pairing)),
+            Some(pairing) => rows.push(inset(self.phone_pairing(pairing)).into()),
             None => {
-                rows.push(phones_section(state, status));
-                rows.push(self.phone_pair_action(status));
+                let paired = status
+                    .phones
+                    .as_ref()
+                    .is_ok_and(|phones| !phones.is_empty());
+                rows.extend(phones_section(state, status));
+                let enabled = blocker.is_none() && !state.busy;
+                if paired {
+                    rows.push(design::horizontal_rule());
+                    rows.push(
+                        crate::ui_controls::list_row(Some(Icon::Plus), "Pair another phone…")
+                            .dense()
+                            .on_press_maybe(enabled.then_some(Message::Phone(Action::Pair)))
+                            .into(),
+                    );
+                } else {
+                    rows.push(
+                        inset(
+                            crate::ui_controls::button::primary("Pair a phone")
+                                .width(Length::Fill)
+                                .on_press_maybe(enabled.then_some(Message::Phone(Action::Pair))),
+                        )
+                        .into(),
+                    );
+                }
+                if let Some(blocker) = blocker.clone() {
+                    rows.push(
+                        inset(
+                            design::caption(blocker)
+                                .class(cosmic::theme::Text::Custom(design::warning_text)),
+                        )
+                        .into(),
+                    );
+                }
             }
         }
         if let Some(network) = &status.network {
+            // Details are for when something is wrong, or for whoever asks.
+            let shown = state.details.unwrap_or(blocker.is_some());
             rows.push(design::horizontal_rule());
-            rows.push(connect_section(network));
+            rows.push(
+                crate::ui_controls::list_row(
+                    Some(if shown {
+                        Icon::ChevronDown
+                    } else {
+                        Icon::ChevronRight
+                    }),
+                    "Connection details",
+                )
+                .dense()
+                .trailing(reach(network))
+                .name(if shown {
+                    "Hide connection details"
+                } else {
+                    "Show connection details"
+                })
+                .on_press(Message::Phone(Action::Details(!shown)))
+                .into(),
+            );
+            if shown {
+                rows.push(inset(connect_section(network)).into());
+            }
         }
         column(rows)
-    }
-
-    fn phone_pair_action<'a>(&'a self, status: &'a host::Status) -> Element<'a, Message> {
-        let paired = status
-            .phones
-            .as_ref()
-            .is_ok_and(|phones| !phones.is_empty());
-        let label = if paired {
-            "Pair another phone"
-        } else {
-            "Pair a phone"
-        };
-        let blocker = match &status.network {
-            None => Some("Checking this computer…".to_owned()),
-            Some(network) if !network.listening => Some(format!(
-                "Turn on this computer's SSH server so a phone can connect. Nothing listens on port {}.",
-                network.port
-            )),
-            Some(network) if network.host_key.is_none() => Some(
-                "Couldn't read this computer's SSH host key, which a phone checks to be sure it reached this computer."
-                    .to_owned(),
-            ),
-            // The connect section below says which addresses and why.
-            Some(network) if network.hosts().is_empty() && network.only_tailscale => {
-                Some("Connect Tailscale to pair a phone.".to_owned())
-            }
-            Some(network) if network.hosts().is_empty() => {
-                Some("This computer has no network address a phone can reach.".to_owned())
-            }
-            Some(_) => status.unwritable.clone(),
-        };
-        let button = crate::ui_controls::button::primary(label)
-            .width(Length::Fill)
-            .on_press_maybe(
-                (blocker.is_none() && !self.phone_ui.busy).then_some(Message::Phone(Action::Pair)),
-            );
-        let mut rows: Vec<Element<'_, Message>> = vec![button.into()];
-        if let Some(blocker) = blocker {
-            rows.push(design::caption(blocker).into());
-        }
-        widget::column::with_children(rows)
-            .spacing(space::XS)
-            .into()
     }
 
     fn phone_pairing<'a>(&'a self, pairing: &'a Pairing) -> Element<'a, Message> {
@@ -664,11 +692,40 @@ impl Cagents {
     }
 }
 
+/// Why a phone can't pair now, if it can't.
+fn pairing_blocker(status: &host::Status) -> Option<String> {
+    match &status.network {
+        None => Some("Checking this computer…".to_owned()),
+        Some(network) if !network.listening => Some(format!(
+            "Turn on this computer's SSH server so a phone can connect. Nothing listens on port {}.",
+            network.port
+        )),
+        Some(network) if network.host_key.is_none() => Some(
+            "Couldn't read this computer's SSH host key, which a phone checks to be sure it reached this computer."
+                .to_owned(),
+        ),
+        Some(network) if network.hosts().is_empty() && network.only_tailscale => {
+            Some("Connect Tailscale to pair a phone.".to_owned())
+        }
+        Some(network) if network.hosts().is_empty() => {
+            Some("This computer has no network address a phone can reach.".to_owned())
+        }
+        Some(_) => status.unwritable.clone(),
+    }
+}
+
 fn column(rows: Vec<Element<'_, Message>>) -> Element<'_, Message> {
     widget::column::with_children(rows)
-        .spacing(space::S)
+        .spacing(space::XS)
         .width(WIDTH)
         .into()
+}
+
+/// Content that isn't a list row, set on the rows' text column edge.
+fn inset<'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> widget::Container<'a, Message, cosmic::Theme> {
+    widget::container(content).padding(Padding::from([0.0, design::list::INSET]))
 }
 
 /// An icon inked with `tone`.
@@ -683,68 +740,78 @@ fn toned(icon: Icon, tone: fn(&cosmic::Theme) -> iced::Color) -> Element<'static
         .into()
 }
 
-fn route_label(route: host::Route) -> &'static str {
-    match route {
-        host::Route::Tailscale => "over Tailscale",
-        host::Route::Lan => "on the local network",
-        host::Route::Other => "",
+fn muted<'a>(text: impl Into<std::borrow::Cow<'a, str>> + 'a) -> Element<'a, Message> {
+    design::caption(text)
+        .class(cosmic::theme::Text::Custom(design::muted_text))
+        .into()
+}
+
+/// How a phone would reach this computer, in a word or two: the summary
+/// beside "Connection details".
+fn reach(network: &host::Network) -> Element<'static, Message> {
+    let tailscale = matches!(network.tailscale, host::Tailscale::Connected { .. });
+    match (network.listening, tailscale, network.lan.is_empty()) {
+        (false, ..) | (true, false, true) => design::caption("Unreachable")
+            .class(cosmic::theme::Text::Custom(design::warning_text))
+            .into(),
+        (true, true, true) => muted("Tailscale"),
+        (true, false, false) => muted("Local network"),
+        (true, true, false) => muted("Tailscale · local network"),
     }
 }
 
-fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Element<'a, Message> {
+fn route_label(route: host::Route) -> &'static str {
+    match route {
+        host::Route::Tailscale => "Connected over Tailscale",
+        host::Route::Lan => "Connected on the local network",
+        host::Route::Other => "Connected",
+    }
+}
+
+/// The paired phones as list rows, with the phones connected now above.
+fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Vec<Element<'a, Message>> {
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    match &status.connections[..] {
-        [] => {}
-        connections => {
-            for connection in connections {
-                rows.push(
-                    widget::row::with_children(vec![
-                        toned(Icon::Check, design::success_color),
-                        design::body(
-                            format!("Connected {}", route_label(connection.route))
-                                .trim_end()
-                                .to_owned(),
-                        )
-                        .width(Length::Fill)
-                        .into(),
-                        design::caption(connection.from.as_str()).into(),
-                    ])
-                    .spacing(space::S)
-                    .align_y(Alignment::Center)
-                    .into(),
-                );
-            }
-        }
+    for connection in &status.connections {
+        rows.push(
+            crate::ui_controls::list_row(None, route_label(connection.route))
+                .icon_element(toned(Icon::Check, design::success_color))
+                .dense()
+                .trailing(muted(connection.from.as_str()))
+                .into(),
+        );
     }
     let phones = match &status.phones {
         Ok(phones) => phones,
         Err(error) => {
             rows.push(
-                design::body(error.as_str())
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .into(),
+                inset(
+                    design::caption(error.as_str())
+                        .class(cosmic::theme::Text::Custom(design::warning_text)),
+                )
+                .into(),
             );
-            return widget::column::with_children(rows).spacing(space::S).into();
+            return rows;
         }
     };
     if phones.is_empty() {
         rows.push(
-            widget::column::with_children(vec![
-                design::body("No phone is paired with this computer.").into(),
-                design::caption(
-                    "Pair one to follow your agents and answer them from the cagents app.",
-                )
-                .into(),
-            ])
-            .spacing(space::XXS)
+            inset(
+                widget::column::with_children(vec![
+                    design::body("No phone paired").into(),
+                    muted("Pair one to follow your agents and answer them from the cagents app."),
+                ])
+                .spacing(space::XXS),
+            )
             .into(),
         );
-    } else if status.connections.is_empty() {
+        return rows;
+    }
+    if status.connections.is_empty() {
         rows.push(
-            design::caption(match &state.joining {
+            inset(muted(match &state.joining {
                 Some(name) => format!("Waiting for {name} to connect…"),
                 None => "No phone is connected now.".to_owned(),
-            })
+            }))
             .into(),
         );
     }
@@ -752,31 +819,34 @@ fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Element<'a,
         let fingerprint = phone.key.fingerprint();
         if state.removing.as_deref() == Some(fingerprint.as_str()) {
             rows.push(
-                widget::column::with_children(vec![
-                    design::body(format!("Remove {}? It will no longer connect.", phone.name))
+                inset(
+                    widget::column::with_children(vec![
+                        design::body(format!("Remove {}? It will no longer connect.", phone.name))
+                            .into(),
+                        widget::container(
+                            widget::row::with_children(vec![
+                                crate::ui_controls::button::secondary("Cancel")
+                                    .on_press(Message::Phone(Action::CancelRemove))
+                                    .into(),
+                                crate::ui_controls::button::destructive("Remove")
+                                    .on_press_maybe(
+                                        (!state.busy)
+                                            .then_some(Message::Phone(Action::ConfirmRemove)),
+                                    )
+                                    .into(),
+                            ])
+                            .spacing(space::S),
+                        )
+                        .align_right(Length::Fill)
                         .into(),
-                    widget::container(
-                        widget::row::with_children(vec![
-                            crate::ui_controls::button::secondary("Cancel")
-                                .on_press(Message::Phone(Action::CancelRemove))
-                                .into(),
-                            crate::ui_controls::button::destructive("Remove")
-                                .on_press_maybe(
-                                    (!state.busy).then_some(Message::Phone(Action::ConfirmRemove)),
-                                )
-                                .into(),
-                        ])
-                        .spacing(space::S),
-                    )
-                    .align_right(Length::Fill)
-                    .into(),
-                ])
-                .spacing(space::S)
+                    ])
+                    .spacing(space::S),
+                )
                 .into(),
             );
             continue;
         }
-        let detail = if !phone.restricted {
+        let warning = if !phone.restricted {
             Some("Not restricted to cagents: this key can also open a shell.".to_owned())
         } else {
             phone
@@ -784,33 +854,28 @@ fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Element<'a,
                 .as_ref()
                 .map(|path| format!("Runs {path}, which no longer exists. Pair it again."))
         };
-        let mut text: Vec<Element<'_, Message>> = vec![design::body(phone.name.as_str()).into()];
-        match detail {
-            Some(detail) => text.push(
-                design::caption(detail)
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .into(),
+        let row = crate::ui_controls::list_row(Some(Icon::Phone), phone.name.as_str());
+        let row = match warning {
+            Some(warning) => row.caption_element(
+                design::caption(warning).class(cosmic::theme::Text::Custom(design::warning_text)),
             ),
-            None => text.push(design::caption(short_fingerprint(&fingerprint)).into()),
-        }
+            None => row.caption(short_fingerprint(&fingerprint)),
+        };
         rows.push(
             widget::row::with_children(vec![
-                toned(Icon::Phone, design::muted_icon_color),
-                widget::column::with_children(text)
-                    .width(Length::Fill)
-                    .into(),
+                row.into(),
                 crate::ui_controls::icon_button(Icon::Delete, format!("Remove {}", phone.name))
                     .on_press_maybe(
                         (!state.busy).then(|| Message::Phone(Action::Remove(fingerprint.clone()))),
                     )
                     .into(),
             ])
-            .spacing(space::S)
+            .spacing(space::XXS)
             .align_y(Alignment::Center)
             .into(),
         );
     }
-    widget::column::with_children(rows).spacing(space::S).into()
+    rows
 }
 
 /// A whole fingerprint, broken between characters where it doesn't fit:
@@ -831,102 +896,80 @@ fn short_fingerprint(fingerprint: &str) -> String {
     short
 }
 
+/// The addresses, server and key a phone uses, as a compact list of facts.
 fn connect_section(network: &host::Network) -> Element<'_, Message> {
-    let mut rows: Vec<Element<'_, Message>> =
-        vec![design::section_heading("How a phone connects").into()];
     let fact =
         |label: &'static str, value: Element<'static, Message>| -> Element<'static, Message> {
             widget::row::with_children(vec![
-                design::caption(label).width(Length::Fixed(72.0)).into(),
+                design::caption(label)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .width(Length::Fixed(FACT_LABEL_WIDTH))
+                    .into(),
                 widget::container(value).width(Length::Fill).into(),
             ])
             .spacing(space::S)
             .align_y(Alignment::Start)
             .into()
         };
-    let lines = |values: Vec<String>| -> Element<'static, Message> {
-        widget::column::with_children(
-            values
-                .into_iter()
-                .map(|value| -> Element<'static, Message> { design::body(value).into() })
-                .collect::<Vec<_>>(),
-        )
-        .into()
+    let lines = |values: Vec<Element<'static, Message>>| -> Element<'static, Message> {
+        widget::column::with_children(values).into()
     };
+    let value = |text: String| -> Element<'static, Message> {
+        design::caption(text)
+            .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+            .into()
+    };
+    let mut rows: Vec<Element<'static, Message>> = Vec::new();
     rows.push(fact(
         "Tailscale",
         match &network.tailscale {
-            host::Tailscale::Connected { name, addresses } => {
-                lines(name.iter().chain(addresses).cloned().collect())
-            }
-            host::Tailscale::NotConnected => design::body("Not connected")
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
-            host::Tailscale::NotInstalled => design::body("Not installed")
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
+            host::Tailscale::Connected { name, addresses } => lines(
+                name.iter()
+                    .map(|name| value(name.clone()))
+                    .chain((!addresses.is_empty()).then(|| muted(addresses.join(", "))))
+                    .collect(),
+            ),
+            host::Tailscale::NotConnected => muted("Not connected"),
+            host::Tailscale::NotInstalled => muted("Not installed"),
         },
     ));
-    let muted = |value: String| -> Element<'static, Message> {
-        design::body(value)
-            .class(cosmic::theme::Text::Custom(design::muted_text))
-            .into()
-    };
     rows.push(fact(
-        "Local network",
+        "Network",
         if network.lan.is_empty() && network.blocked.is_empty() {
-            muted("No local address".into())
+            muted("No local address")
         } else {
-            widget::column::with_children(
+            lines(
                 network
                     .lan
                     .iter()
-                    .map(|address| -> Element<'static, Message> {
-                        design::body(address.clone()).into()
-                    })
-                    .chain(network.blocked.iter().map(|address| muted(address.clone())))
-                    .collect::<Vec<_>>(),
+                    .map(|address| value(address.clone()))
+                    .chain(
+                        network
+                            .blocked
+                            .iter()
+                            .map(|address| muted(format!("{address} · firewall blocks SSH"))),
+                    )
+                    .collect(),
             )
-            .into()
         },
     ));
     rows.push(fact(
         "SSH",
         if network.listening {
-            design::body(format!("{} · port {}", network.user, network.port)).into()
+            value(format!("{} · port {}", network.user, network.port))
         } else {
-            design::body(format!("Not running on port {}", network.port))
+            design::caption(format!("Not running on port {}", network.port))
                 .class(cosmic::theme::Text::Custom(design::warning_text))
                 .into()
         },
     ));
-    if !network.blocked.is_empty() {
-        let addresses = network.blocked.join(", ");
-        let note = if network.only_tailscale {
-            format!(
-                "This computer's firewall allows SSH only over Tailscale, so a phone can't connect to {addresses}."
-            )
-        } else {
-            format!(
-                "This computer's firewall blocks SSH on {addresses}, so a phone can't connect there."
-            )
-        };
-        rows.push(
-            design::caption(note)
-                .class(cosmic::theme::Text::Custom(design::warning_text))
-                .into(),
-        );
-    }
-    if !matches!(network.tailscale, host::Tailscale::Connected { .. }) && !network.lan.is_empty() {
-        rows.push(
-            design::caption("Without Tailscale, a phone connects only on the same network.").into(),
-        );
-    }
     if let Some(host_key) = &network.host_key {
         rows.push(fact(
             "Host key",
             widget::row::with_children(vec![
-                fingerprint_text(host_key.clone()),
+                widget::container(value(short_fingerprint(host_key)))
+                    .width(Length::Fill)
+                    .into(),
                 crate::ui_controls::icon_button(Icon::Copy, "Copy host key fingerprint")
                     .compact()
                     .on_press(Message::Phone(Action::Copy(host_key.clone())))
@@ -937,5 +980,12 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
             .into(),
         ));
     }
-    widget::column::with_children(rows).spacing(space::S).into()
+    if !matches!(network.tailscale, host::Tailscale::Connected { .. }) && !network.lan.is_empty() {
+        rows.push(muted(
+            "Without Tailscale, a phone connects only on the same network.",
+        ));
+    }
+    widget::column::with_children(rows)
+        .spacing(space::XS)
+        .into()
 }
