@@ -21,9 +21,12 @@ impl std::fmt::Display for RateLimit {
             (self.retry_at / 3600) % 24,
             (self.retry_at / 60) % 60
         );
-        write!(f, "GitHub rate limit reached. Retrying at {time}")
+        write!(f, "{REACHED}{time}")
     }
 }
+
+/// How a [`RateLimit`]'s message begins, before the time it resets.
+const REACHED: &str = "GitHub rate limit reached. Retrying at ";
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -31,6 +34,16 @@ pub fn now() -> u64 {
         .as_secs()
 }
 impl RateLimit {
+    /// When a message this type displays says the limit resets, such as
+    /// `18:42 UTC`, for a reader that has only the message: the Work board
+    /// gets each project's error as text.
+    #[cfg(any(feature = "ui", test))]
+    pub fn reset_named_by(message: &str) -> Option<&str> {
+        message
+            .strip_prefix(REACHED)
+            .filter(|time| !time.is_empty())
+    }
+
     pub fn secondary(retry_at: u64) -> Self {
         Self {
             retry_at,
@@ -143,6 +156,15 @@ impl RateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_message_names_the_reset_it_displays() {
+        let limit = RateLimit::primary("graphql", 18 * 3600 + 42 * 60);
+        assert_eq!(
+            RateLimit::reset_named_by(&limit.to_string()),
+            Some("18:42 UTC")
+        );
+        assert_eq!(RateLimit::reset_named_by("gh: not signed in"), None);
+    }
     #[test]
     fn ambiguous_headerless_rate_errors_pause_only_the_request_resource() {
         for text in [
