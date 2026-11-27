@@ -4021,6 +4021,7 @@ impl Cagents {
                     self.account_ui.take_catalog(provider, catalog, now);
                 }
                 self.refresh_chat_drafts();
+                let drafts = self.move_drafts_off_missing_providers();
                 let changed = owners_before != self.account_ui.discovery_owners();
                 let follow_up = if (current_discovery && loaded.provisional) || changed {
                     self.locate_accounts()
@@ -4031,7 +4032,7 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                Task::batch([follow_up, migration])
+                Task::batch([follow_up, migration, drafts])
             }
             Action::Located {
                 generation,
@@ -4051,6 +4052,7 @@ impl Cagents {
                 }
                 self.account_ui.installed = installed;
                 self.account_ui.installed_provisional = false;
+                let drafts = self.move_drafts_off_missing_providers();
                 // Fresh detection owns current presence, independently of an
                 // older usage snapshot which remains useful history.
                 let installed = self.account_ui.installed.clone();
@@ -4077,7 +4079,7 @@ impl Cagents {
                 }
                 self.account_ui.restore(restored);
                 let manual = std::mem::take(&mut self.account_ui.discovery_manual);
-                if manual.is_empty() {
+                let probes = if manual.is_empty() {
                     self.probe_accounts(Trigger::Focus)
                 } else {
                     let now = now_ms();
@@ -4096,7 +4098,8 @@ impl Cagents {
                             .iter()
                             .filter_map(|id| self.probe_account(id, Trigger::Manual, now)),
                     )
-                }
+                };
+                Task::batch([probes, drafts])
             }
             Action::Probed {
                 owner,
