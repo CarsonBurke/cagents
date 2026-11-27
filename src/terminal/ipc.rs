@@ -356,7 +356,11 @@ use crate::{
 ///
 /// Version 213 adds the notice that a session did not resume when the computer
 /// started. An older client is never sent one.
-pub const PROTOCOL_VERSION: u16 = 213;
+///
+/// Version 214 appends the `CheckWorktreeRemoval` device Git operation, which
+/// says whether a worktree's removal would be refused without removing it. A
+/// daemon before it could not decode it.
+pub const PROTOCOL_VERSION: u16 = 214;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

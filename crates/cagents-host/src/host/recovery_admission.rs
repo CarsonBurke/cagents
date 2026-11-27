@@ -310,7 +310,8 @@ fn device_access(operation: &DeviceOperation) -> Access<'static> {
             | GitOperation::Diff { .. }
             | GitOperation::Stage { .. }
             | GitOperation::Unstage { .. }
-            | GitOperation::Commit { .. } => Access::Open,
+            | GitOperation::Commit { .. }
+            | GitOperation::CheckWorktreeRemoval { .. } => Access::Open,
         },
         O::RemoveMergedWorktree { .. } | O::AccountLifecycle { .. } | O::AccountsUpdate { .. } => {
             Access::Held
