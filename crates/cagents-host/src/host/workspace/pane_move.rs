@@ -402,7 +402,7 @@ fn unshown(
             .unwrap_or_else(|| source.launch.provider.chat_title().into()),
         user_title: None,
         pending_terminal_start: false,
-        width_fraction: crate::settings::DEFAULT_NATIVE_PANE_FRACTION,
+        width_fraction: default_pane_width(),
         // The checkout the conversation works in, as an agent's pane names
         // the directory it was started in.
         scope: Some(checkout.clone()),
@@ -416,6 +416,21 @@ fn unshown(
         },
         repository,
     }))
+}
+
+fn default_pane_width() -> f32 {
+    use crate::settings::{self, DEFAULT_NATIVE_PANE_FRACTION};
+
+    let Some(path) = crate::instance::settings_path() else {
+        return DEFAULT_NATIVE_PANE_FRACTION;
+    };
+    match settings::load(path) {
+        Ok(settings) => settings.default_native_pane_fraction,
+        Err(error) => {
+            tracing::warn!(%error, "Could not read the default native pane width");
+            DEFAULT_NATIVE_PANE_FRACTION
+        }
+    }
 }
 
 fn shows(pane: &Pane, session: crate::model::TerminalId) -> bool {

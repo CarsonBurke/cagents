@@ -522,6 +522,12 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
     }
     let (host, request, path) = fixture();
     let project = path.parent().unwrap().join("project");
+    let settings_path = crate::instance::settings_path().unwrap();
+    let settings = crate::settings::AppSettings {
+        default_native_pane_fraction: 0.75,
+        ..Default::default()
+    };
+    crate::settings::save(settings_path, &settings).unwrap();
     let elsewhere = path.parent().unwrap().join("elsewhere");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&elsewhere).unwrap();
@@ -645,6 +651,10 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
     );
     assert_eq!(opened.channel.id, other);
     assert!(!opened.created);
+    assert_eq!(
+        opened.pane.width_fraction,
+        settings.default_native_pane_fraction
+    );
     let CardKind::Chat(shown) = &opened.pane.kind else {
         panic!("not a chat pane: {:?}", opened.pane)
     };
