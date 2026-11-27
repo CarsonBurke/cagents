@@ -368,6 +368,7 @@ fn a_candidate_line_cli_is_answered_in_its_own_protocol() {
         command
             .env("PATH", "/usr/bin:/bin")
             .env("SHELL", "/bin/sh")
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log).unwrap())
