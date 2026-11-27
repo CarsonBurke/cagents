@@ -51,6 +51,7 @@ pub(crate) struct Original<'a> {
     pub(crate) source: &'a HostSessionProof,
     pub(crate) inventory: &'a crate::upgrade::recovery::Census,
     pub(crate) restored_checkpoint_digest: Option<&'a str>,
+    pub(crate) parked_ready: bool,
     pub(crate) retry_of: Option<(
         &'a HostSessionProof,
         &'a crate::daemon::holder_registry::Process,
@@ -62,49 +63,151 @@ pub enum StartupCheckpoint {
     Absent,
     AdoptionOnly {
         source: HostSessionProof,
-        restoring_digest: String,
+        saved_digest: String,
         ready_digest: String,
+    },
+    ParkedReady {
+        source: HostSessionProof,
+        digest: String,
     },
     Unsettled,
 }
 
 #[cfg(feature = "host")]
 impl StartupCheckpoint {
-    pub fn restoring_digest(&self) -> Option<&str> {
+    pub fn saved_digest(&self) -> Option<&str> {
         match self {
-            Self::AdoptionOnly {
-                restoring_digest, ..
-            } => Some(restoring_digest),
+            Self::AdoptionOnly { saved_digest, .. } => Some(saved_digest),
             _ => None,
         }
     }
 }
 
 #[cfg(feature = "host")]
-pub fn startup_checkpoint() -> StartupCheckpoint {
-    use crate::upgrade::handoff::Store;
+pub fn startup_checkpoint() -> Result<StartupCheckpoint, UpdateError> {
     let checkpoint = Store::existing()
         .and_then(|store| store.map_or(Ok(None), |store| store.load_with_digest()));
     match checkpoint {
-        Ok(None) => StartupCheckpoint::Absent,
-        Ok(Some((checkpoint, restoring_digest))) => {
+        Ok(None) => Ok(StartupCheckpoint::Absent),
+        Ok(Some((checkpoint, saved_digest))) => {
             let source = checkpoint.proof.clone();
-            match checkpoint.adoption_ready_digest() {
-                Ok(Some(ready_digest)) => StartupCheckpoint::AdoptionOnly {
+            if checkpoint.phase == Phase::Ready
+                && let Some(ready_digest) = selected_parked_checkpoint(&checkpoint, &saved_digest)?
+            {
+                return Ok(StartupCheckpoint::ParkedReady {
                     source,
-                    restoring_digest,
+                    digest: ready_digest,
+                });
+            }
+            match checkpoint.adoption_ready_digest() {
+                Ok(Some(ready_digest)) => Ok(StartupCheckpoint::AdoptionOnly {
+                    source,
+                    saved_digest,
                     ready_digest,
-                },
-                _ => StartupCheckpoint::Unsettled,
+                }),
+                _ => Ok(StartupCheckpoint::Unsettled),
             }
         }
-        Err(_) => StartupCheckpoint::Unsettled,
+        Err(_) => Ok(StartupCheckpoint::Unsettled),
     }
+}
+
+#[cfg(feature = "host")]
+fn selected_parked_checkpoint(
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
+    digest: &str,
+) -> Result<Option<String>, UpdateError> {
+    let executable = crate::process::current_executable()?;
+    let layout = match locate(&executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let state = layout.prefix.join(".update");
+    let Some(job) = read_job(&state)? else {
+        return Ok(None);
+    };
+    if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed) {
+        return Ok(None);
+    }
+    let Some(intent) = read(&state, &job.id)? else {
+        return Ok(None);
+    };
+    if intent.stage != Stage::Pending || !intent.names_selected(&layout)? {
+        return Ok(None);
+    }
+    if !intent.recorded_parked(&state)? {
+        return Err(invalid(
+            "A selected update cannot reopen an unverified Ready checkpoint",
+        ));
+    }
+    let ready = ready_plan::selected_evidence(&layout, &state, &job)?
+        .ok_or_else(|| invalid("The selected parked update has no Ready reservation"))?;
+    let retained = intent.read_witness(&state)?;
+    intent.verify_request(&state)?;
+    ready.verify_unmodified_checkpoint().map_err(invalid)?;
+    if intent.witness.is_legacy()
+        || crate::process::mapped_region_identity(
+            std::process::id(),
+            crate::process::own_code_address(),
+        )? != intent.target_image
+        || !intent.original_exited()?
+        || checkpoint.proof != intent.source
+        || digest != intent.checkpoint_digest
+        || !ready.matches_cutover_inventory(&retained.terminals, &retained.chats)
+        || !crate::upgrade::recovery::verified::ready::capture()
+            .map_err(invalid)?
+            .is_some_and(|capture| capture.covers_only_carried_terminals(checkpoint))
+    {
+        return Err(invalid(
+            "The selected parked update no longer has its exact carried checkpoint",
+        ));
+    }
+    intent.verify_exited_claim(&ready)?;
+    ready
+        .verify_parked_workspace_initialization()
+        .map_err(invalid)?;
+    Ok(Some(intent.checkpoint_digest))
+}
+
+/// Verify the exact carried inventory before retiring a parked checkpoint.
+#[cfg(feature = "host")]
+pub fn verify_selected_parked_inventory(
+    serving: &HostSessionProof,
+    terminals: &[crate::terminal_ipc::TerminalDescriptor],
+    completed: &std::collections::BTreeSet<crate::model::TerminalId>,
+) -> Result<(), UpdateError> {
+    let layout = locate(&crate::process::current_executable()?)?;
+    let state = layout.prefix.join(".update");
+    let job = read_job(&state)?.ok_or_else(|| invalid("The selected parked update has no job"))?;
+    let (intent, saved) = restart_intent(&layout, &state, &job)?
+        .filter(|(_, saved)| saved.chats.is_empty())
+        .ok_or_else(|| invalid("The selected parked update lost its witnessed terminal roster"))?;
+    if !intent.recorded_parked(&state)? {
+        return Err(invalid(
+            "The selected update has no parked checkpoint receipt",
+        ));
+    }
+    recovery::verify_ready_inventory(
+        &job.id,
+        &intent.source,
+        &crate::upgrade::recovery::Census {
+            terminals: saved.terminals,
+            ..Default::default()
+        },
+        serving,
+        terminals,
+        &[],
+        &Default::default(),
+        completed,
+    )
+    .map_err(invalid)
 }
 
 /// A single snapshot of actual running owners under the serving host's lock.
 #[cfg(feature = "host")]
 pub struct LiveInventory {
+    pub completed: std::collections::BTreeSet<crate::model::TerminalId>,
     pub terminals: Vec<crate::terminal_ipc::TerminalDescriptor>,
     pub chats: Vec<crate::chat::Session>,
     pub adopted_sources: std::collections::BTreeMap<
@@ -205,6 +308,20 @@ impl Intent {
         let mut pending = self.clone();
         pending.stage = Stage::Pending;
         hashed_json(&pending)
+    }
+
+    fn parked_path(&self, state: &Path) -> Result<PathBuf, UpdateError> {
+        let digest = self.pending_digest()?;
+        Ok(state.join(format!("{}.cutover-parked.{digest}.json", self.job)))
+    }
+
+    fn recorded_parked(&self, state: &Path) -> Result<bool, UpdateError> {
+        match read_private(&self.parked_path(state)?, SMALL_ASSET_LIMIT) {
+            Ok(bytes) if bytes == serde_json::to_vec(&self.pending_digest()?)? => Ok(true),
+            Ok(_) => Err(invalid("The installed parked checkpoint receipt changed")),
+            Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn witness_path(&self, state: &Path) -> Result<PathBuf, UpdateError> {
@@ -346,6 +463,14 @@ impl Intent {
         let Some(ready) = ready_plan::selected_evidence(layout, state, job)? else {
             return Ok(false);
         };
+        self.verify_exited_claim(&ready)?;
+        Ok(true)
+    }
+
+    fn verify_exited_claim(
+        &self,
+        ready: &crate::upgrade::recovery::ReadyPlanEvidence<'_>,
+    ) -> Result<(), UpdateError> {
         ready
             .verify_exited_cutover_claim(
                 &self.request_digest,
@@ -355,8 +480,7 @@ impl Intent {
                 &self.successor,
                 &self.process,
             )
-            .map_err(invalid)?;
-        Ok(true)
+            .map_err(invalid)
     }
 
     #[cfg(feature = "host")]
@@ -365,6 +489,7 @@ impl Intent {
         saved: OriginalInventory,
         serving: &HostSessionProof,
         mut inventory: LiveInventory,
+        state: &Path,
     ) -> Result<(), UpdateError> {
         let store = crate::upgrade::handoff::Store::discover().map_err(invalid)?;
         let mut lineage = store.recovered_chats().map_err(invalid)?;
@@ -384,6 +509,9 @@ impl Intent {
                 lineage.observe_live_adoption(chat, sources);
             }
         }
+        if !self.recorded_parked(state)? {
+            inventory.completed.clear();
+        }
         recovery::verify_ready_inventory(
             &self.job,
             &self.source,
@@ -396,6 +524,7 @@ impl Intent {
             &terminals,
             &chats,
             &lineage,
+            &inventory.completed,
         )
         .map_err(invalid)
     }
@@ -510,6 +639,9 @@ pub(crate) fn record(
     let layout = locate(target)?;
     // The admission also verified the original selector under the launch
     // fence. A selected attempt must never be replaced, even by that retry.
+    if original.parked_ready && original.restored_checkpoint_digest.is_some() {
+        return Err(invalid("A parked cutover has not restored its checkpoint"));
+    }
     if original.retry_of.is_some() && served_version_root(&layout)? == layout.version_root {
         return Err(invalid("The recorded cutover is already selected"));
     }
@@ -569,6 +701,17 @@ pub(crate) fn record(
         let path = restored_checkpoint_path(&state, &intent.job);
         intent.publish_with_witness(&state, inventory, original.retry_of)?;
         persist(&state, &path, &serde_json::to_vec(&record)?, true)
+    } else if original.parked_ready {
+        intent
+            .clone()
+            .publish_with_witness(&state, inventory, original.retry_of)?;
+        let path = intent.parked_path(&state)?;
+        persist(
+            &state,
+            &path,
+            &serde_json::to_vec(&intent.pending_digest()?)?,
+            true,
+        )
     } else {
         intent.publish_with_witness(&state, inventory, original.retry_of)
     }
@@ -708,6 +851,7 @@ pub(super) fn verify_completed_preselection(
     };
     if intent.stage != Stage::Pending
         || intent.witness.is_legacy()
+        || intent.recorded_parked(state)?
         || standby_pid.is_some_and(|pid| intent.process.pid as u32 != pid)
         || !intent.names_target(layout)?
         || !intent.original_exited()?
@@ -780,6 +924,10 @@ pub(super) fn restart_after_worker(
         return Ok(None);
     };
     if let Some(checkpoint) = store.checkpoint_status().map_err(invalid)?
+        && !(intent.recorded_parked(state)?
+            && checkpoint.proof == intent.source
+            && checkpoint.phase == Phase::Ready
+            && checkpoint.digest == intent.checkpoint_digest)
         && !checkpoint_retirement_matches(state, &intent, &checkpoint)?
     {
         return Ok(None);
@@ -971,6 +1119,11 @@ pub(super) fn finish(
                     ready_digest,
                     ..
                 } => source == intent.source && ready_digest == intent.checkpoint_digest,
+                StartupCheckpoint::ParkedReady { source, digest } => {
+                    intent.recorded_parked(state)?
+                        && source == intent.source
+                        && digest == intent.checkpoint_digest
+                }
                 StartupCheckpoint::Unsettled => false,
             };
             if !adoption_only || recovery::checkpoint_status()?.is_some() {
@@ -979,7 +1132,7 @@ pub(super) fn finish(
                 ));
             }
             let generation = client.inventory_generation()?;
-            intent.verify_resumed_inventory(saved, successor, observe_live())?;
+            intent.verify_resumed_inventory(saved, successor, observe_live(), state)?;
             if client.inventory_generation()? != generation {
                 return Err(invalid(
                     "The running work changed during update verification",
@@ -1003,9 +1156,22 @@ pub(super) fn finish(
         }
     }
     write_job(state, &job)?;
-    if finished.is_err() {
-        intent.stage = Stage::Deferred;
-        intent.persist(state)?;
+    if let Err(error) = &finished {
+        if intent.recorded_parked(state)? && recovery::checkpoint_status()?.is_some() {
+            let receipt = RestartFailure {
+                intent_digest: intent.pending_digest()?,
+                message: error.record_message(),
+            };
+            persist(
+                state,
+                &restart_failure_path(state, &job.id),
+                &serde_json::to_vec(&receipt)?,
+                false,
+            )?;
+        } else {
+            intent.stage = Stage::Deferred;
+            intent.persist(state)?;
+        }
     }
     retention::remember_success(state, &job.id, &job.phase);
     finished.map(|()| Some(job.id))
@@ -1371,6 +1537,7 @@ mod tests {
                     source: &intent.source,
                     inventory: &crate::upgrade::recovery::Census::default(),
                     restored_checkpoint_digest: None,
+                    parked_ready: false,
                     retry_of: Some((&intent.successor, &intent.process)),
                 },
                 &intent.successor,

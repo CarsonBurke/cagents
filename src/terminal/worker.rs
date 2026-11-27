@@ -588,9 +588,14 @@ struct PublishedState {
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     event_observer: Mutex<Option<Arc<ArchiveObserver>>>,
     completed: AtomicBool,
+    #[cfg(target_os = "macos")]
+    completed_screen_cached: AtomicBool,
     /// An adopted original has not proved its startup commit. Its raw prefix
     /// and parked reader remain on the original worker until explicit Close.
     startup_unresolved: AtomicBool,
+    /// An installed update still holds the promotion ticket. Even checked
+    /// Close cannot act on the original before the ticket is released.
+    startup_parked: AtomicBool,
     startup_diagnostic: Mutex<Option<String>>,
     #[cfg(any(test, feature = "test-support"))]
     test_fail_startup_commit: AtomicBool,
@@ -705,7 +710,10 @@ impl PublishedState {
             archive_observer: OnceLock::new(),
             event_observer: Mutex::new(None),
             completed: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            completed_screen_cached: AtomicBool::new(false),
             startup_unresolved: AtomicBool::new(false),
+            startup_parked: AtomicBool::new(false),
             startup_diagnostic: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             test_fail_startup_commit: AtomicBool::new(false),
@@ -828,6 +836,11 @@ impl PublishedState {
         // Wake the same select loop as capture credit. A full wake channel
         // already guarantees a pending event; shutdown cannot wait on input.
         let _ = self.capture_tx.try_send(());
+    }
+
+    fn settle_startup(&self) {
+        self.startup_parked.store(false, Ordering::Release);
+        self.startup_unresolved.store(false, Ordering::Release);
     }
 
     fn prepare_search(&self, owner: Option<u64>, request: u64) -> Arc<AtomicU64> {
@@ -1165,6 +1178,58 @@ pub struct TerminalHandle {
     inner: Arc<HandleInner>,
 }
 
+/// One-shot authority to activate an installed update's prepared terminal.
+/// Before granting it, dropping the ticket abandons the attachment without
+/// having acknowledged the original holder's replay.
+pub struct ParkedTerminalPromotion {
+    grant: Option<Sender<()>>,
+    outcome: Receiver<Result<(), String>>,
+}
+
+impl ParkedTerminalPromotion {
+    pub fn grant(&mut self) -> Result<(), String> {
+        self.grant
+            .take()
+            .ok_or("Terminal promotion was already granted")?
+            .try_send(())
+            .map_err(|_| "The parked terminal ended before promotion".into())
+    }
+
+    pub fn outcome(&self) -> Result<Option<()>, String> {
+        match self.outcome.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err("The terminal did not confirm promotion".into())
+            }
+        }
+    }
+}
+
+struct WorkerPromotion {
+    grant: Receiver<()>,
+    outcome: Option<Sender<Result<(), String>>>,
+}
+
+impl WorkerPromotion {
+    fn report(mut self, result: Result<(), String>) {
+        let _ = self
+            .outcome
+            .take()
+            .expect("promotion has one outcome")
+            .send(result);
+    }
+}
+
+impl Drop for WorkerPromotion {
+    fn drop(&mut self) {
+        // The startup publisher also needs an event for a disconnected
+        // outcome channel if this worker unwinds before reporting.
+        drop(self.outcome.take());
+        crate::daemon::wake();
+    }
+}
+
 /// Retirement observes actual join and the exact original holder's exit.
 /// Completion or transfer to the child reaper alone is not a release receipt.
 pub enum TerminalRetirement {
@@ -1414,6 +1479,53 @@ impl TerminalHandle {
         wake: impl Fn(TerminalWake) + Send + Sync + 'static,
         install: impl FnOnce(&TerminalHandle) -> Result<(), String>,
     ) -> Result<Self, TerminalStartError> {
+        Self::spawn_with_startup(session, config, execution_recipe, wake, install, None)
+    }
+
+    /// Install an original holder's worker without admitting PTY effects.
+    /// The installed update grants promotion after selecting its exact build.
+    pub fn spawn_parked_for_update(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+        install: impl FnOnce(&TerminalHandle) -> Result<(), String>,
+    ) -> Result<(Self, ParkedTerminalPromotion), TerminalStartError> {
+        if config.adoption.is_none() || config.holder_recovery.is_none() {
+            return Err(TerminalStartError::Worker(
+                "Parking a terminal requires an original registered holder".into(),
+            ));
+        }
+        let (grant, receive_grant) = crossbeam_channel::bounded(1);
+        let (report_outcome, outcome) = crossbeam_channel::bounded(1);
+        let handle = Self::spawn_with_startup(
+            session,
+            config,
+            execution_recipe,
+            wake,
+            install,
+            Some(WorkerPromotion {
+                grant: receive_grant,
+                outcome: Some(report_outcome),
+            }),
+        )?;
+        Ok((
+            handle,
+            ParkedTerminalPromotion {
+                grant: Some(grant),
+                outcome,
+            },
+        ))
+    }
+
+    fn spawn_with_startup(
+        session: TerminalSession,
+        config: TerminalConfig,
+        execution_recipe: Option<LaunchRecipe>,
+        wake: impl Fn(TerminalWake) + Send + Sync + 'static,
+        install: impl FnOnce(&TerminalHandle) -> Result<(), String>,
+        promotion: Option<WorkerPromotion>,
+    ) -> Result<Self, TerminalStartError> {
         // Acquire the shared monitor before starting any holder/provider.
         event_notifier().map_err(TerminalStartError::Worker)?;
         super::reactor::runtime().map_err(TerminalStartError::Worker)?;
@@ -1439,6 +1551,9 @@ impl TerminalHandle {
         published
             .startup_unresolved
             .store(config.adoption.is_some(), Ordering::Release);
+        published
+            .startup_parked
+            .store(promotion.is_some(), Ordering::Release);
         let handle = Self {
             inner: Arc::new(HandleInner {
                 commands: command_tx,
@@ -1448,7 +1563,7 @@ impl TerminalHandle {
             }),
         };
         if let Err(error) = install(&handle) {
-            published.startup_unresolved.store(false, Ordering::Release);
+            published.settle_startup();
             return Err(TerminalStartError::Worker(error));
         }
 
@@ -1458,21 +1573,29 @@ impl TerminalHandle {
                 let _body = joins::BodyCompletion(worker_owner);
                 let completion = Arc::clone(&worker_published);
                 if admitted.recv().is_err() {
-                    completion
-                        .startup_unresolved
-                        .store(false, Ordering::Release);
+                    completion.settle_startup();
                     completion.completed.store(true, Ordering::Release);
                     return;
                 }
                 let adopting = config.adoption.is_some();
+                let parked = promotion.is_some();
                 // Preparation has not sent CommitAdoption. A panic here can
                 // only release a provisional control whose holder still owns
                 // its replay backup; it never unwinds a committed local owner.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Worker::prepare(session, config, execution_recipe, command_rx, event_tx, worker_published)
+                    Worker::prepare(session, config, execution_recipe, command_rx, event_tx, worker_published, parked)
                 })).unwrap_or_else(|_| Err("Terminal preparation panicked before adoption commit".into()));
                 match result {
                     Ok(mut worker) => {
+                        if let Some(promotion) = &promotion
+                            && (startup_tx.send(Ok(None)).is_err() || promotion.grant.recv().is_err())
+                        {
+                            // No holder acknowledgement or PTY effect occurred.
+                            drop(worker);
+                            completion.completed.store(true, Ordering::Release);
+                            completion.settle_startup();
+                            return;
+                        }
                         // Crucially the COMPLETE Worker is outside the unwind
                         // closure. Even a commit/activation panic cannot drop
                         // the original raw queue, reader, master or control.
@@ -1480,7 +1603,7 @@ impl TerminalHandle {
                             worker.commit_start()
                         })).unwrap_or_else(|_| Some("Adoption commit/activation panicked; complete original Worker retained".into()));
                         if !adopting && let Some(message) = &retained {
-                            completion.startup_unresolved.store(false, Ordering::Release);
+                            completion.settle_startup();
                             completion.completed.store(true, Ordering::Release);
                             let _ = startup_tx.send(Err(message.clone()));
                             return;
@@ -1499,27 +1622,32 @@ impl TerminalHandle {
                                     message.clone(),
                                 );
                             }));
-                            let _ = startup_tx.send(Ok(Some(message)));
+                            if let Some(promotion) = promotion {
+                                completion.startup_parked.store(false, Ordering::Release);
+                                promotion.report(Err(message));
+                            } else {
+                                let _ = startup_tx.send(Ok(Some(message)));
+                            }
                             worker.run_retained_startup();
                         } else {
-                            completion
-                                .startup_unresolved
-                                .store(false, Ordering::Release);
-                            let _ = startup_tx.send(Ok(None));
+                            completion.settle_startup();
+                            if let Some(promotion) = promotion {
+                                promotion.report(Ok(()));
+                            } else {
+                                let _ = startup_tx.send(Ok(None));
+                            }
                             worker.run();
                         }
                     }
                     Err(error) => {
-                        completion
-                            .startup_unresolved
-                            .store(false, Ordering::Release);
+                        completion.settle_startup();
                         let _ = startup_tx.send(Err(error));
                         completion.completed.store(true, Ordering::Release);
                     }
                 }
             })
             .map_err(|error| {
-                published.startup_unresolved.store(false, Ordering::Release);
+                published.settle_startup();
                 TerminalStartError::Worker(error.to_string())
             })?;
         join_owner.install(worker);
@@ -2616,6 +2744,35 @@ impl TerminalHandle {
             .load(Ordering::Acquire)
     }
 
+    /// A completed registered worker still holds its exact holder and result
+    /// after the original PTY root has exited. Completion alone is not proof.
+    #[cfg(target_os = "macos")]
+    pub fn retained_original_result(&self) -> bool {
+        self.is_completed()
+            && self
+                .inner
+                .published
+                .completed_screen_cached
+                .load(Ordering::Acquire)
+            && self.inner.published.has_retained_holder()
+            && self
+                .holder_identity()
+                .is_some_and(|record| record.holder.is_current())
+            && self.original_root_exited().is_ok_and(|exited| exited)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn original_root_exited(&self) -> std::io::Result<bool> {
+        let record = self
+            .holder_identity()
+            .ok_or_else(|| std::io::Error::other("The original holder is missing"))?;
+        crate::pinned_process::exited_since(record.root.pid as u32, record.root.start)
+    }
+
+    pub fn is_parked_for_update(&self) -> bool {
+        self.inner.published.startup_parked.load(Ordering::Acquire)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_startup_commit_after_ack_for_test(&self) {
         self.inner
@@ -2651,7 +2808,9 @@ impl TerminalHandle {
     }
 
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
-        if self.startup_unresolved() && !matches!(command, Command::CloseChecked { .. }) {
+        if self.is_parked_for_update()
+            || (self.startup_unresolved() && !matches!(command, Command::CloseChecked { .. }))
+        {
             return Err(TerminalSendError::Closed);
         }
         // Stop closes admission even when an existing cached reader holds the
@@ -2876,6 +3035,9 @@ impl TerminalHandle {
     }
 
     fn send_command(&self, command: Command) -> Result<(), TerminalSendError> {
+        if self.is_parked_for_update() {
+            return Err(TerminalSendError::Closed);
+        }
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
         let permit = self
             .command_budget()
@@ -3054,6 +3216,9 @@ struct Worker {
     pty_rx: Receiver<PtyMessage>,
     events: Arc<Sender<TerminalEvent>>,
     transcript: Option<TranscriptWriter>,
+    /// Effects whose preparation changes the PTY or transcript. They remain
+    /// parked until the installed target owns selection.
+    startup_effects: Option<StartupEffects>,
     published: Arc<PublishedState>,
     master: holder::PtyMaster,
     writer: File,
@@ -3095,6 +3260,47 @@ struct Worker {
     /// this false and drains every byte already consumed from the PTY.
     reader_discard_pending: Arc<AtomicBool>,
     pty_capacity: usize,
+}
+
+struct StartupEffects {
+    redraw: bool,
+    transcript: Option<TranscriptOptions>,
+}
+
+struct TranscriptOptions {
+    path: PathBuf,
+    capacity: usize,
+    max_bytes: u64,
+}
+
+impl TranscriptOptions {
+    fn start(
+        self,
+        terminal: TerminalId,
+        published: &PublishedState,
+    ) -> Result<TranscriptWriter, String> {
+        let mut writer =
+            TranscriptWriter::start(self.path, terminal, self.capacity, self.max_bytes)?;
+        if let Some(location) = writer.location.take() {
+            let _ = published.transcript_location.set(location);
+        }
+        Ok(writer)
+    }
+}
+
+fn nonblocking_writer(writer: &File) -> Result<(), String> {
+    // Duplicated master descriptors share status flags. Existing reader and
+    // detached-holder paths already rearm on WouldBlock.
+    let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(format!(
+            "make PTY nonblocking: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// The thread that reads a terminal's PTY into its worker.
@@ -3196,6 +3402,7 @@ impl Worker {
         commands: Receiver<Command>,
         events: Sender<TerminalEvent>,
         published: Arc<PublishedState>,
+        parked: bool,
     ) -> Result<Self, String> {
         if config
             .holder_recovery
@@ -3345,17 +3552,21 @@ impl Worker {
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let (held, output) = match &config.adoption {
+        let (held, output, redraw_on_promotion) = match &config.adoption {
             Some(socket) => {
-                let adopted =
+                let adopted = if parked {
+                    holder::attach_parked(socket, child_exit_tx, config.holder_recovery.clone())?
+                        .prepare_worker()
+                } else {
                     holder::attach(socket, child_exit_tx, config.holder_recovery.clone())?
-                        .into_worker();
+                        .into_worker()
+                };
                 // Drawing the screen again is not news, except for the title
                 // it sets: whatever it provoked, a reply or a bell, happened
                 // when its predecessor drew it.
                 terminal.vt_write(&adopted.screen);
                 effects.borrow_mut().retain_title();
-                if adopted.screen_lost {
+                if adopted.screen_lost && !parked {
                     // A crash has no emulator snapshot. Nudge full-screen
                     // clients to redraw on their surviving controlling PTY.
                     adopted
@@ -3364,7 +3575,7 @@ impl Worker {
                         .request_redraw()
                         .map_err(|error| format!("request surviving terminal redraw: {error}"))?;
                 }
-                (adopted.held, adopted.output)
+                (adopted.held, adopted.output, adopted.screen_lost && parked)
             }
             None => {
                 let environment = crate::account::Account::PROVIDERS
@@ -3429,7 +3640,7 @@ impl Worker {
                     isolate_codex_tmp,
                     config.launch_directory.clone(),
                 )?;
-                (held, Vec::new())
+                (held, Vec::new(), false)
             }
         };
         // The holder reaps the root, so its pid identifies it only while the
@@ -3454,39 +3665,34 @@ impl Worker {
             }
         }
         let writer = File::from(duplicate("writing")?);
-        // Duplicated master descriptors share status flags. Existing reader
-        // and detached-holder paths already rearm on WouldBlock.
-        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0
-            || unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
-                < 0
-        {
-            return Err(format!(
-                "make PTY nonblocking: {}",
-                std::io::Error::last_os_error()
-            ));
+        if !parked {
+            nonblocking_writer(&writer)?;
         }
         // Output an adopted terminal produced between daemons comes first, as
         // any other output would.
         let mut reader = Reader::prepare(session.id, &held.master, config.pty_capacity, output)?;
 
-        let mut transcript = session
-            .transcript_path
-            .map(|path| {
-                TranscriptWriter::start(
-                    path,
-                    session.id,
-                    config.transcript_capacity.max(1),
-                    config.transcript_max_bytes.max(1),
-                )
-            })
-            .transpose()?;
-        if let Some(location) = transcript
-            .as_mut()
-            .and_then(|writer| writer.location.take())
-        {
-            let _ = published.transcript_location.set(location);
-        }
+        let transcript_options = session.transcript_path.map(|path| TranscriptOptions {
+            path,
+            capacity: config.transcript_capacity.max(1),
+            max_bytes: config.transcript_max_bytes.max(1),
+        });
+        let (transcript, startup_effects) = if parked {
+            (
+                None,
+                Some(StartupEffects {
+                    redraw: redraw_on_promotion,
+                    transcript: transcript_options,
+                }),
+            )
+        } else {
+            (
+                transcript_options
+                    .map(|options| options.start(session.id, &published))
+                    .transpose()?,
+                None,
+            )
+        };
         let visibility = if config.initially_visible {
             Visibility::Visible
         } else {
@@ -3570,6 +3776,7 @@ impl Worker {
             pty_rx: reader.output,
             events,
             transcript,
+            startup_effects,
             published,
             master: held.master,
             writer,
@@ -3606,6 +3813,22 @@ impl Worker {
     /// Called only with the entire original Worker owned OUTSIDE the caller's
     /// panic guard. No error/panic can unwind its replay prefix out of custody.
     fn commit_start(&mut self) -> Option<String> {
+        if let Some(effects) = self.startup_effects.take() {
+            if let Err(error) = nonblocking_writer(&self.writer) {
+                return Some(error);
+            }
+            if effects.redraw
+                && let Err(error) = self.master.request_redraw()
+            {
+                tracing::warn!(terminal = %self.terminal_id, %error, "surviving terminal could not be asked to redraw");
+            }
+            if let Some(options) = effects.transcript {
+                match options.start(self.terminal_id, &self.published) {
+                    Ok(transcript) => self.transcript = Some(transcript),
+                    Err(error) => self.error("open transcript", error),
+                }
+            }
+        }
         #[cfg(any(test, feature = "test-support"))]
         let retained = if self
             .published
@@ -3650,6 +3873,7 @@ impl Worker {
             commands,
             events,
             published,
+            false,
         )?;
         let retained =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.commit_start()))
@@ -3750,6 +3974,8 @@ impl Worker {
             .store(completion.ownership_released, Ordering::Release);
         if let Some(completion) = completion.event {
             published.emit_event(&events, completion);
+            #[cfg(target_os = "macos")]
+            crate::daemon::wake();
         }
         if let Some((close, drained)) = completion.natural_close {
             use super::ipc::TerminalCloseResult;
@@ -4120,10 +4346,16 @@ impl Worker {
             drop(self.holder);
         } else if !shutting_down && completion.is_some() && self.holder.registered() {
             self.holder.prove_cleanup();
-            if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
+            match carry::screen(&mut self.terminal, holder::MAX_SCREEN)
                 .and_then(|screen| self.holder.cache_screen(&screen))
             {
-                self.error("retain completed terminal screen", error);
+                Ok(()) => {
+                    #[cfg(target_os = "macos")]
+                    self.published
+                        .completed_screen_cached
+                        .store(true, Ordering::Release);
+                }
+                Err(error) => self.error("retain completed terminal screen", error),
             }
             *self
                 .published

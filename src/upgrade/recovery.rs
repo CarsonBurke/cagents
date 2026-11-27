@@ -81,6 +81,17 @@ pub struct Census {
     pub in_flight: Vec<crate::update::in_flight::InFlight>,
 }
 
+#[cfg(all(feature = "host", any(test, target_os = "macos")))]
+impl Census {
+    fn is_terminal_only(&self) -> bool {
+        !self.terminals.is_empty()
+            && self.chats.is_empty()
+            && self.snapshots.is_empty()
+            && self.aliases.is_empty()
+            && self.presentations.is_empty()
+    }
+}
+
 /// Transcript pages captured before preparation. [`Census::fit_pages`] fits
 /// their total to the evidence; a long conversation is never refused.
 #[derive(Default)]
@@ -1857,6 +1868,8 @@ impl ReadyPlanEvidence<'_> {
             "retry-effects",
             "init-start",
             "init-complete",
+            "retry-init-start",
+            "retry-init-complete",
             "restore",
             "return-claim",
             "return-effects",
@@ -2087,6 +2100,21 @@ impl ReadyPlanEvidence<'_> {
         // start restoring between this read and the process check.
         verify_ready_workspace_retry(&self.authority, &claim)?;
         Ok((claim, fingerprint))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn verify_unmodified_checkpoint(&self) -> Result<(), String> {
+        self.exact_checkpoint().map(drop)
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn verify_parked_workspace_initialization(&self) -> Result<(), String> {
+        let (first, _) = self.first_claim()?;
+        verify_ready_initialization(&self.authority, &first, false)?;
+        if ready_evidence_exists(&self.authority, "retry-claim")? {
+            verify_ready_initialization(&self.authority, &self.latest_claim()?, true)?;
+        }
+        Ok(())
     }
 
     fn exact_checkpoint(&self) -> Result<File, String> {
@@ -5015,21 +5043,23 @@ impl ReadyAdmission {
     }
 
     pub fn begin_workspace_initialization(&self) -> io::Result<()> {
-        if self.is_held_return() {
-            self.record_workspace_stage("return-init-start")?;
-        } else if self.retry_predecessor.is_none() {
-            self.record_workspace_stage("init-start")?;
-        }
-        Ok(())
+        self.record_workspace_stage(if self.is_held_return() {
+            "return-init-start"
+        } else if self.retry_predecessor.is_some() {
+            "retry-init-start"
+        } else {
+            "init-start"
+        })
     }
 
     pub fn finish_workspace_initialization(&self) -> io::Result<()> {
-        if self.is_held_return() {
-            self.record_workspace_stage("return-init-complete")?;
-        } else if self.retry_predecessor.is_none() {
-            self.record_workspace_stage("init-complete")?;
-        }
-        Ok(())
+        self.record_workspace_stage(if self.is_held_return() {
+            "return-init-complete"
+        } else if self.retry_predecessor.is_some() {
+            "retry-init-complete"
+        } else {
+            "init-complete"
+        })
     }
 
     pub fn begin_workspace_restore(&self) -> io::Result<()> {
@@ -5059,6 +5089,7 @@ impl ReadyAdmission {
         &self,
         successor: &HostSessionProof,
         restored_checkpoint_digest: Option<&str>,
+        parked_ready: bool,
     ) -> Result<(), String> {
         let authority = &self.authority;
         let retry_of = self
@@ -5074,6 +5105,7 @@ impl ReadyAdmission {
                 source: &authority.source,
                 inventory: &authority.census,
                 restored_checkpoint_digest,
+                parked_ready,
                 retry_of,
             },
             successor,
@@ -5087,16 +5119,9 @@ impl ReadyAdmission {
         serving: &HostSessionProof,
         terminals: &[crate::terminal_ipc::TerminalDescriptor],
         chats: &[Session],
+        completed: &std::collections::BTreeSet<TerminalId>,
     ) -> Result<(), String> {
-        for (file, path) in [
-            (&self.custody.worker, &self.authority.worker_path),
-            (&self.custody.fence, &self.authority.fence_path),
-            (&self.custody.daemon, &self.authority.daemon_path),
-        ] {
-            validate_lock(file, path).map_err(|error| error.to_string())?;
-        }
-        validate_lock_mode(&self.custody.legacy, &self.authority.legacy_path, "READ")
-            .map_err(|error| error.to_string())?;
+        self.verify_custody()?;
         let store = super::handoff::Store::discover()?;
         let lineage = store.recovered_chats()?;
         crate::update::recovery::verify_ready_inventory(
@@ -5107,7 +5132,50 @@ impl ReadyAdmission {
             terminals,
             chats,
             &lineage,
+            completed,
         )
+    }
+
+    /// The same fenced inventory proof without opening or repairing the
+    /// workspace stores. A terminal-only census does not use chat lineage.
+    pub fn verify_parked_terminals(
+        &self,
+        terminals: &[crate::terminal_ipc::TerminalDescriptor],
+    ) -> Result<(), String> {
+        if !self.has_terminal_only_census() {
+            return Err("Parked terminal admission requires a terminal-only census".into());
+        }
+        self.verify_custody()?;
+        crate::update::recovery::verify_ready_inventory(
+            &self.authority.job,
+            &self.authority.source,
+            &self.authority.census,
+            &self.successor,
+            terminals,
+            &[],
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    pub fn can_park_checkpoint(&self) -> Result<bool, String> {
+        crate::update::admits_parked(&self.authority).map_err(|error| error.to_string())
+    }
+
+    pub fn has_terminal_only_census(&self) -> bool {
+        self.authority.census.is_terminal_only()
+    }
+
+    fn verify_custody(&self) -> Result<(), String> {
+        for (file, path) in [
+            (&self.custody.worker, &self.authority.worker_path),
+            (&self.custody.fence, &self.authority.fence_path),
+            (&self.custody.daemon, &self.authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|error| error.to_string())?;
+        }
+        validate_lock_mode(&self.custody.legacy, &self.authority.legacy_path, "READ")
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -5155,6 +5223,8 @@ fn require_no_ready_effects_or_retry(authority: &Authority) -> Result<(), String
         "retry-effects",
         "init-start",
         "init-complete",
+        "retry-init-start",
+        "retry-init-complete",
         "restore",
     ] {
         if ready_evidence_exists(authority, marker)? {
@@ -5196,6 +5266,15 @@ fn verify_ready_workspace_retry(authority: &Authority, claim: &ReadyClaim) -> Re
     {
         return Err("The installed successor began restoring or already used its retry".into());
     }
+    verify_ready_initialization(authority, claim, false)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_ready_initialization(
+    authority: &Authority,
+    claim: &ReadyClaim,
+    retry: bool,
+) -> Result<(), String> {
     let claimant = claim
         .successor_proof
         .as_ref()
@@ -5214,9 +5293,14 @@ fn verify_ready_workspace_retry(authority: &Authority, claim: &ReadyClaim) -> Re
         }
         Ok(true)
     };
-    let effects = read("effects")?;
-    let start = read("init-start")?;
-    let complete = read("init-complete")?;
+    let (effects, start, complete) = if retry {
+        ("retry-effects", "retry-init-start", "retry-init-complete")
+    } else {
+        ("effects", "init-start", "init-complete")
+    };
+    let effects = read(effects)?;
+    let start = read(start)?;
+    let complete = read(complete)?;
     if start != complete || (!effects && start) {
         return Err("The installed successor did not finish workspace initialization".into());
     }

@@ -93,6 +93,8 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "ready-retry-effects.json"
             | "ready-init-start.json"
             | "ready-init-complete.json"
+            | "ready-retry-init-start.json"
+            | "ready-retry-init-complete.json"
             | "ready-restore.json"
             | "ready-retry-claim.json"
             | "ready-runtime-owner.json"
@@ -106,12 +108,14 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "ready-return-init-start.json"
             | "ready-return-init-complete.json"
             | "ready-return-restore.json"
+            | "ready-parked-support.json"
             | "ready-return.json"
             | "release-stage.json"
             | "cancel-nonce"
             | "decisions.lock"
     ) || suffix
         .strip_prefix("cutover-inventory.")
+        .or_else(|| suffix.strip_prefix("cutover-parked."))
         .and_then(|digest| digest.strip_suffix(".json"))
         .is_some_and(|digest| {
             digest.len() == 64
@@ -199,6 +203,7 @@ mod tests {
             "census.json",
             "recovery.json",
             "cutover-inventory.json",
+            "ready-parked-support.json",
             "cutover-start-failed.json",
             "cutover-restored.json",
             "cutover-inventory.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",

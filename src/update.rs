@@ -15,6 +15,7 @@ pub use cutover::{
     LiveInventory as CutoverLiveInventory, StartupCheckpoint as CutoverStartupCheckpoint,
     retire_completed_checkpoint as retire_completed_cutover_checkpoint,
     selected_reconnectable_codex, startup_checkpoint as cutover_startup_checkpoint,
+    verify_selected_parked_inventory,
 };
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) use cutover::{Original as ReadyCutoverOriginal, record as record_ready_cutover};
@@ -40,13 +41,13 @@ pub(crate) use ready_plan::HeldSourceReturn;
 pub(crate) use ready_plan::abandon_claimed as abandon_claimed_darwin_update;
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) use ready_plan::admit_held_source_return;
-#[cfg(all(target_os = "macos", feature = "host"))]
-pub(crate) use ready_plan::admit_ready as admit_shared_ready;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use ready_plan::admit_saved_state as admit_darwin_saved_state;
 #[cfg(target_os = "macos")]
 pub(crate) use ready_plan::resume_selected as resume_darwin_update;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use ready_plan::{admit_ready as admit_shared_ready, admits_parked};
 #[cfg(target_os = "macos")]
 pub(crate) use ready_plan::{begin_new_job as retire_completed_activation, require_no_activation};
 

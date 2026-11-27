@@ -182,6 +182,47 @@ fn refuse_at_capacity(host: &SharedHost, mut stream: UnixStream, capacity: &Clie
     let _ = stream.shutdown(Shutdown::Both);
 }
 
+fn accept_client(
+    listener: &UnixListener,
+    host: &SharedHost,
+    next_client_id: &AtomicU64,
+    capacity: &ClientCapacity,
+    clients: &mut Vec<JoinHandle<()>>,
+) -> io::Result<()> {
+    let (stream, _) = crate::descriptor::accept(listener)?;
+    match daemon::peer_uid(&stream) {
+        Ok(uid) if uid == daemon::current_uid() => {}
+        Ok(uid) => {
+            tracing::warn!(peer_uid = uid, "rejected cagents daemon peer");
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not authenticate cagents daemon peer");
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+    }
+    let Some(permit) = capacity.try_acquire() else {
+        refuse_at_capacity(host, stream, capacity);
+        return Ok(());
+    };
+    let client_id = next_client_id.fetch_add(1, Ordering::Relaxed);
+    let client_host = Arc::clone(host);
+    match thread::Builder::new()
+        .name(format!("cagentsd-client-{client_id}"))
+        .spawn(move || {
+            client::serve(stream, client_id, client_host);
+            // Free the slot before the wake, so its next peer can be admitted.
+            drop(permit);
+            daemon::wake();
+        }) {
+        Ok(client) => clients.push(client),
+        Err(error) => tracing::warn!(%error, "could not start cagents daemon client"),
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum HostError {
     #[error("cagents daemon platform setup failed: {0}")]
@@ -302,14 +343,19 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
                 }) {
                     return Err("An original conversation has not finished resuming".into());
                 }
-                admission.verify_live_inventory(state.proof(), &terminals, &chats)?;
+                admission.verify_live_inventory(
+                    state.proof(),
+                    &terminals,
+                    &chats,
+                    &Default::default(),
+                )?;
                 let digest = restored.checkpoint_digest_for_removal();
                 if admission.is_held_return() {
                     admission.finish_held_return(
                         digest.ok_or("The held return did not restore the exact checkpoint")?,
                     )
                 } else {
-                    admission.remember_cutover(state.proof(), digest)
+                    admission.remember_cutover(state.proof(), digest, false)
                 }
             }
         }?;
@@ -335,6 +381,85 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
         tracing::error!(%detail, "restored startup owners were kept");
     }
     state.publishing_startup = false;
+}
+
+#[cfg(target_os = "macos")]
+fn select_parked_terminals(
+    host: &SharedHost,
+    admission: &crate::upgrade::recovery::ReadyAdmission,
+    publication: crate::update::LocalPublication,
+) -> Result<(), String> {
+    let terminals = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .parked_update_inventory()?;
+    admission.verify_parked_terminals(&terminals)?;
+    if daemon::termination_requested() {
+        return Err("The daemon was stopped before selecting the installed update".into());
+    }
+    admission.remember_cutover(admission.successor(), None, true)?;
+    if daemon::termination_requested() {
+        return Err("The daemon was stopped before selecting the installed update".into());
+    }
+    publication.publish().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn activate_parked_terminals(
+    host: &SharedHost,
+    admission: Option<&crate::upgrade::recovery::ReadyAdmission>,
+    mut installed: update_recovery::ParkedInstalledReady,
+    mut serve_status: impl FnMut(std::time::Instant) -> io::Result<()>,
+) -> Result<(), String> {
+    if let Some(admission) = admission {
+        admission
+            .begin_workspace_restore()
+            .map_err(|error| error.to_string())?;
+    }
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .grant_parked_update()?;
+    let wait_budget = std::time::Duration::from_secs(10);
+    let mut await_receipt = |deadline| {
+        if daemon::termination_requested() || std::time::Instant::now() >= deadline {
+            return Err("Original terminal promotion or final screen remains unconfirmed".into());
+        }
+        // Promotion and completed-screen receipts wake the daemon.
+        serve_status(deadline).map_err(|error| error.to_string())
+    };
+    let deadline = std::time::Instant::now() + wait_budget;
+    loop {
+        let settled = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.parked_update_promotions_confirmed()?
+                && state.parked_terminal_results()?.is_some()
+        };
+        if settled {
+            break;
+        }
+        await_receipt(deadline)?;
+    }
+    update_recovery::finish_parked_ready(host, installed.capture)?;
+    save_abandoned_identities(host);
+    workspace::adopt_foreign_panes(host);
+    save_agent_pane_identities(host);
+    let deadline = std::time::Instant::now() + wait_budget;
+    let (mut state, terminals, completed) = loop {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let terminals = state.list(0);
+        if let Some(completed) = state.parked_terminal_results()? {
+            break (state, terminals, completed);
+        }
+        drop(state);
+        await_receipt(deadline)?;
+    };
+    if let Some(admission) = admission {
+        admission.verify_live_inventory(state.proof(), &terminals, &[], &completed)?;
+    } else {
+        crate::update::verify_selected_parked_inventory(state.proof(), &terminals, &completed)
+            .map_err(|error| error.to_string())?;
+    }
+    installed.restored.finish_locked(&mut state)
 }
 
 fn acknowledge_standby(standby: Option<daemon::standby::Activated>) {
@@ -988,26 +1113,73 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     };
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("daemon lease acquired", None);
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
     #[cfg(target_os = "macos")]
-    let reserved_listener = if let Some(ready) = &ready_admission {
-        // A bind failure leaves this attempt eligible for the pre-effects
-        // retry. The lease cleans up the socket if later admission fails.
-        let listener = reserve_serving_listener(&paths)?;
-        ready.begin_workspace_effects()?;
-        Some(listener)
+    let mut local_publication = standby
+        .as_mut()
+        .and_then(daemon::standby::Activated::take_local_publication);
+    // Inherited Ready custody must reserve its listener before selecting a
+    // staged build or claiming permission to change the workspace.
+    #[cfg(target_os = "macos")]
+    let reserved_listener = ready_admission
+        .as_ref()
+        .map(|_| reserve_serving_listener(&paths))
+        .transpose()?;
+    #[cfg(not(target_os = "macos"))]
+    let reserved_listener = None;
+    #[cfg(target_os = "macos")]
+    let mut parked_installed = if let Some(ready) = &ready_admission
+        && local_publication.is_some()
+        && let Some(parked) =
+            update_recovery::park_installed_ready(&host, ready).map_err(io::Error::other)?
+    {
+        select_parked_terminals(&host, ready, local_publication.take().unwrap())
+            .map_err(io::Error::other)?;
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publishing_startup = true;
+        Some(parked)
     } else {
         None
     };
-    #[cfg(not(target_os = "macos"))]
-    let reserved_listener = None;
-    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
+    #[cfg(target_os = "macos")]
+    let mut cutover_checkpoint = {
+        if standby.is_none()
+            && let Err(error) = crate::update::retire_completed_cutover_checkpoint()
+        {
+            tracing::warn!(%error, "could not retire the selected daemon's verified checkpoint");
+        }
+        Some(if parked_installed.is_some() {
+            crate::update::CutoverStartupCheckpoint::Unsettled
+        } else {
+            crate::update::cutover_startup_checkpoint().map_err(io::Error::other)?
+        })
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(crate::update::CutoverStartupCheckpoint::ParkedReady { digest, .. }) =
+        &cutover_checkpoint
+    {
+        let parked = update_recovery::park_carried_ready(&host, digest)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::other("The selected checkpoint lost its exact terminal roster")
+            })?;
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publishing_startup = true;
+        parked_installed = Some(parked);
+    }
     #[cfg(target_os = "macos")]
     let require_durable_workspace = match &ready_admission {
         Some(ready) => {
+            ready.begin_workspace_effects()?;
             ready.begin_workspace_initialization()?;
-            ready.requires_durable_workspace()
+            ready.requires_durable_workspace() || parked_installed.is_some()
         }
-        None => false,
+        None => matches!(
+            cutover_checkpoint,
+            Some(crate::update::CutoverStartupCheckpoint::ParkedReady { .. })
+        ),
     };
     #[cfg(not(target_os = "macos"))]
     let require_durable_workspace = false;
@@ -1020,16 +1192,11 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
-    #[cfg(target_os = "macos")]
-    let mut cutover_checkpoint = {
-        if standby.is_none()
-            && let Err(error) = crate::update::retire_completed_cutover_checkpoint()
-        {
-            tracing::warn!(%error, "could not retire the selected daemon's verified checkpoint");
-        }
-        Some(crate::update::cutover_startup_checkpoint())
-    };
     let listener = listener_before_restore(&paths, reserved_listener, || {
+        #[cfg(target_os = "macos")]
+        if parked_installed.is_some() {
+            return Ok(());
+        }
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
         let restored = (|| -> io::Result<()> {
@@ -1063,7 +1230,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             #[cfg(target_os = "macos")]
             let ordinary = cutover_checkpoint
                 .as_ref()
-                .and_then(|entry| entry.restoring_digest())
+                .and_then(|entry| entry.saved_digest())
                 .map_or_else(
                     || update_recovery::restore_ordinary(&host),
                     |digest| update_recovery::restore_observed_adoption(&host, digest),
@@ -1117,10 +1284,47 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             }
         }
     })?;
+    let next_client_id = AtomicU64::new(1);
+    let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
+    let mut clients = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Some(parked) = parked_installed {
+        let ready = ready_admission.take();
+        let activated = activate_parked_terminals(&host, ready.as_ref(), parked, |deadline| {
+            reap_finished(&mut clients);
+            match accept_client(
+                &listener,
+                &host,
+                &next_client_id,
+                &client_capacity,
+                &mut clients,
+            ) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    daemon::wait_for_activity_until(&listener, Some(deadline), &[])
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+                result => result,
+            }
+        });
+        let confirmed = activated.is_ok();
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(error) = activated {
+                let detail = format!("Could not finish activating the selected terminals: {error}");
+                state.retain_startup_recovery(detail.clone());
+                tracing::error!(%detail, "retained original terminal custody and checkpoint");
+            }
+            state.end_parked_update();
+            state.publishing_startup = false;
+        }
+        if confirmed {
+            update_recovery::publish_archived_proof(&host);
+        }
+    }
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("restore complete; release admission", None);
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let publication = standby
+    #[cfg(target_os = "linux")]
+    let local_publication = standby
         .as_mut()
         .and_then(daemon::standby::Activated::take_local_publication);
     #[cfg(target_os = "macos")]
@@ -1130,12 +1334,12 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(target_os = "linux")]
     let returning = false;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let mut pending_publication = if publication.is_some() || returning {
+    let mut pending_publication = if local_publication.is_some() || returning {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .publishing_startup = true;
         Some(StartupPublication {
-            publication,
+            publication: local_publication,
             _admission: admission,
             #[cfg(target_os = "macos")]
             recovered: installed_restoration,
@@ -1279,9 +1483,6 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         }
     };
 
-    let next_client_id = AtomicU64::new(1);
-    let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
-    let mut clients = Vec::new();
     let mut runtime_error = None;
     let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
     let mut ordinary_cleanup_started = false;
@@ -1336,6 +1537,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                         })
                     });
                     crate::update::CutoverLiveInventory {
+                        completed: state.retained_terminal_results(),
                         terminals: state.list(0),
                         chats,
                         adopted_sources: state.upgrade_chats.clone(),
@@ -1409,42 +1611,14 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             // A pending drain must keep accepting inspection and checked Close.
             continue;
         }
-        let fatal = match crate::descriptor::accept(&listener) {
-            Ok((stream, _address)) => {
-                match daemon::peer_uid(&stream) {
-                    Ok(uid) if uid == daemon::current_uid() => {}
-                    Ok(uid) => {
-                        tracing::warn!(peer_uid = uid, "rejected cagents daemon peer");
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "could not authenticate cagents daemon peer");
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    }
-                }
-                let Some(permit) = client_capacity.try_acquire() else {
-                    refuse_at_capacity(&host, stream, &client_capacity);
-                    continue;
-                };
-                let client_id = next_client_id.fetch_add(1, Ordering::Relaxed);
-                let client_host = Arc::clone(&host);
-                match thread::Builder::new()
-                    .name(format!("cagentsd-client-{client_id}"))
-                    .spawn(move || {
-                        client::serve(stream, client_id, client_host);
-                        // Free the slot before the wakeup byte, so the loop this
-                        // wakes cannot refuse the connection the wakeup exists to
-                        // admit, and can reap this thread without a timer.
-                        drop(permit);
-                        daemon::wake();
-                    }) {
-                    Ok(client) => clients.push(client),
-                    Err(error) => tracing::warn!(%error, "could not start cagents daemon client"),
-                }
-                None
-            }
+        let fatal = match accept_client(
+            &listener,
+            &host,
+            &next_client_id,
+            &client_capacity,
+            &mut clients,
+        ) {
+            Ok(()) => None,
             // Nothing is pending. Park until a peer connects, a client thread
             // exits, a holder exits, a signal arrives, or a real retention/development
             // idle deadline expires. There is no periodic polling timer.

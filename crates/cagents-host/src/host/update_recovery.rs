@@ -59,6 +59,42 @@ pub(super) fn restore_ordinary_with_process_fixture(
 }
 
 #[cfg(target_os = "macos")]
+pub(super) struct ParkedInstalledReady {
+    pub(super) restored: state::RestoredUpgrade,
+    pub(super) capture: ready::ReadyCapture,
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn park_installed_ready(
+    host: &SharedHost,
+    admission: &recovery::ReadyAdmission,
+) -> Result<Option<ParkedInstalledReady>, String> {
+    if !admission.has_terminal_only_census() || !admission.can_park_checkpoint()? {
+        return Ok(None);
+    }
+    park_carried_ready(host, admission.checkpoint_digest())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn park_carried_ready(
+    host: &SharedHost,
+    digest: &str,
+) -> Result<Option<ParkedInstalledReady>, String> {
+    let Some(ready::ObservedCarriedReady {
+        capture,
+        store,
+        checkpoint,
+    }) = ready::observe_carried(digest)?
+    else {
+        return Ok(None);
+    };
+    Ok(
+        state::stage_installed_carried_terminals(host, store, checkpoint)?
+            .map(|restored| ParkedInstalledReady { restored, capture }),
+    )
+}
+
+#[cfg(target_os = "macos")]
 pub(super) fn restore_installed_ready(
     host: &SharedHost,
     admission: &recovery::ReadyAdmission,
@@ -68,6 +104,16 @@ pub(super) fn restore_installed_ready(
         std::path::Path::new("/proc"),
         Admission::InstalledReady(admission.checkpoint_digest()),
     )
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn finish_parked_ready(
+    host: &SharedHost,
+    capture: ready::ReadyCapture,
+) -> Result<(), String> {
+    state::finish_installed_carried_terminals(host)?;
+    chat::retained_actor::reconcile_previous_boot_history(host)?;
+    publish_ready_effects(host, Some(capture))
 }
 
 #[cfg(target_os = "macos")]
@@ -141,6 +187,22 @@ fn restore_ordinary_with(
     {
         return Err(detail.to_owned());
     }
+    publish_ready_effects(host, ready_capture)?;
+    if matches!(admission, Admission::Ordinary { .. }) {
+        restored.finish(host)?;
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: optional archived proof", None);
+    publish_archived_proof(host);
+    #[cfg(all(test, target_os = "linux"))]
+    super::observe_fixture_startup("ordinary: complete", None);
+    Ok(restored)
+}
+
+fn publish_ready_effects(
+    host: &SharedHost,
+    ready_capture: Option<ready::ReadyCapture>,
+) -> Result<(), String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: reconcile retired actors", None);
     chat::retained_actor::reconcile_retired_actors(host)?;
@@ -171,16 +233,7 @@ fn restore_ordinary_with(
     let executable = crate::process::current_executable().map_err(|error| error.to_string())?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
-    ready::publish(ready_capture, &proof, &executable, &terminals, &chats)?;
-    if matches!(admission, Admission::Ordinary { .. }) {
-        restored.finish(host)?;
-    }
-    #[cfg(all(test, target_os = "linux"))]
-    super::observe_fixture_startup("ordinary: optional archived proof", None);
-    publish_archived_proof(host);
-    #[cfg(all(test, target_os = "linux"))]
-    super::observe_fixture_startup("ordinary: complete", None);
-    Ok(restored)
+    ready::publish(ready_capture, &proof, &executable, &terminals, &chats)
 }
 
 /// Ordinary recovery already settled unproved runs and adopted any live
@@ -284,7 +337,7 @@ fn settle_agents(
 /// Observe authenticated normal restoration without changing its adoption,
 /// stopped histories or presentations. Stale optional history cannot hold the
 /// current service in recovery-only mode.
-fn publish_archived_proof(host: &SharedHost) {
+pub(super) fn publish_archived_proof(host: &SharedHost) {
     let result = (|| -> Result<(), String> {
         let store = Store::discover()?;
         let daemon = crate::process::current_executable().map_err(|error| error.to_string())?;

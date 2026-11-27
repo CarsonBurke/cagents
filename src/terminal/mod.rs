@@ -48,6 +48,8 @@ pub use types::{
 pub use widget::ReviewInputBarrier;
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};
+#[cfg(feature = "host")]
+pub use worker::ParkedTerminalPromotion;
 #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
 pub use worker::RenderStreamFixture;
 #[cfg(feature = "host")]
@@ -62,3 +64,5 @@ pub use worker::WeakTerminalHandle;
 pub use worker::flush_archived_notices;
 #[cfg(feature = "host")]
 pub use worker::holder::inspect as inspect_holder;
+#[cfg(all(feature = "host", target_os = "macos"))]
+pub use worker::holder::protects_replay as holder_protects_replay;
