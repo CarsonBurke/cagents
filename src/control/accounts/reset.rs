@@ -280,8 +280,25 @@ fn select_reset<'a>(
     if let Some(id) = reset_id {
         // An explicit recovery never substitutes a new grant, even when the
         // first attempt already depleted the originally selected one.
-        return resets.iter().find(|reset| reset.id == id && (recovery || reset.is_available(now)))
-            .ok_or_else(|| AppError::new("account_reset", "The original reset is no longer listed. Its result remains unconfirmed; do not spend a different reset with this key"));
+        let reset = resets
+            .iter()
+            .find(|reset| reset.id == id && (recovery || reset.is_available(now)))
+            .ok_or_else(|| AppError::new("account_reset", "The original reset is no longer listed. Its result remains unconfirmed; do not spend a different reset with this key"))?;
+        if scope.is_some_and(|scope| {
+            !matches!(
+                scope_match(scope, reset),
+                Some(ScopeMatch::Exact | ScopeMatch::Broader)
+            )
+        }) {
+            return Err(AppError::new(
+                "account_reset",
+                format!(
+                    "The selected reset does not match --scope. It clears {}",
+                    reset.label()
+                ),
+            ));
+        }
+        return Ok(reset);
     }
     // A scope naming a reset exactly never falls through to a broader one,
     // and none falls through to a reset clearing an unnamed account-wide
@@ -609,6 +626,33 @@ mod tests {
                 .message
                 .contains("Choose --scope")
         );
+    }
+
+    #[test]
+    fn explicit_reset_id_must_match_the_confirmed_scope() {
+        let resets = vec![
+            grant(
+                "weekly",
+                vec![ResetScope::AccountWeekly, ResetScope::Model("Fable".into())],
+                1,
+            ),
+            grant("fable", vec![ResetScope::Model("Fable".into())], 1),
+        ];
+        let refusal = select_reset(&resets, Some("Fable"), Some("weekly"), false, 100).unwrap_err();
+        assert!(refusal.message.contains("Weekly + Fable"));
+        for scope in ["Weekly", "Weekly + Fable"] {
+            assert_eq!(
+                select_reset(&resets, Some(scope), Some("weekly"), false, 100)
+                    .unwrap()
+                    .id,
+                "weekly"
+            );
+        }
+        assert!(select_reset(&resets, Some("Weekly"), Some("fable"), false, 100).is_err());
+        let recovered =
+            prepare_selection(&resets, Some("Fable"), Some("original"), true, 100).unwrap();
+        assert_eq!(recovered.id, "original");
+        assert!(recovered.reset.is_none());
     }
 
     #[test]
