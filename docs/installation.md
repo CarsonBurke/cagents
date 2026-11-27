@@ -228,8 +228,11 @@ to somewhere else, and leaves it unchanged. If the installation then fails,
 the copy is restored.
 
 The standard installation starts its per-user `cagentsd` immediately and
-registers it for graphical-login autostart. See [Daemon and
-upgrades](daemon.md) for how the daemon, sessions, and upgrades interact.
+registers it for graphical-login autostart. On a machine without a graphical
+login, such as a server you reach over SSH, run `cagents daemon boot enable` so
+the daemon starts at boot (see [Starting at boot](daemon.md#starting-at-boot)).
+See [Daemon and upgrades](daemon.md) for how the daemon, sessions, and upgrades
+interact.
 
 ## Updating
 
@@ -430,4 +433,7 @@ sudo apt remove cagents             # full package
 sudo apt remove cagents-browserless # browserless package
 ```
 
-APT removal and purge do not delete files in users' XDG directories.
+APT removal and purge do not delete files in users' XDG directories,
+including the unit `cagents daemon boot enable` writes; systemd skips that unit
+once its program is gone, and `cagents daemon boot disable`, run before
+removal, removes it (see [Starting at boot](daemon.md#starting-at-boot)).

@@ -12,9 +12,11 @@
 
 Terminals and native agent chats are owned by `cagentsd`, a per-user daemon
 that runs independently of the UI so sessions survive window and UI-process
-restarts. There is no system daemon or service unit. The standard production
-installation starts the daemon immediately and registers it for
-graphical-login autostart. While the daemon runs, cagents shows a system-tray
+restarts. There is no system daemon. The standard production installation
+starts the daemon immediately and registers it for graphical-login autostart.
+That entry runs only when someone logs in to a desktop, so a machine you reach
+over SSH, or one that rebooted with no one at its screen, needs
+[the boot unit](#starting-at-boot). While the daemon runs, cagents shows a system-tray
 item that opens the UI and can stop the daemon. Its menu leads with the
 daemon's state, or an action's result for a few seconds, and how many hosted
 agents are working or waiting for you. Stopping a daemon that still hosts
@@ -25,6 +27,65 @@ whatever started it, so the terminals, provider CLIs and agents it launches
 find what your login startup files add, such as `~/.local/bin`, even when the
 window or autostart entry that started it carries a much shorter `PATH`; see
 [Devices](devices.md) for how the two are combined.
+
+### Starting at boot
+
+On Linux, `cagents daemon boot enable` installs and enables a systemd user unit,
+`dev.cagents.Cagents.Daemon.service`, that runs `cagents daemon start` when the
+user manager starts. The user manager starts at boot, before anyone logs in,
+only for a user with lingering enabled; `enable` and `status` say when it is
+off and how to turn it on:
+
+```sh
+cagents daemon boot enable
+sudo loginctl enable-linger "$USER"   # once, if enable reports linger is off
+cagents daemon boot status
+```
+
+The unit coexists with the autostart entry, a window's own start, and an
+update's handover: whichever starts first owns the daemon's lock, and the others
+find it running. Stopping the unit with `systemctl --user stop` stops nothing:
+systemd signals only the unit's start command, which has already exited, so
+`cagents daemon stop` remains the way to stop the daemon. After
+`cagents daemon stop`, the unit still reads "active (exited)", so start the
+daemon again with `cagents daemon start`, or through the unit with
+`systemctl --user restart dev.cagents.Cagents.Daemon.service`; `systemctl
+--user start` does nothing while the unit is active.
+
+A daemon started at boot has no graphical session's display or agents yet.
+When you later log in to a desktop that exports its environment to the systemd
+user manager, as GNOME, KDE Plasma and most Wayland compositors do, each
+terminal the daemon launches takes `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
+`SSH_AUTH_SOCK`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`,
+`XDG_SESSION_DESKTOP` and `DESKTOP_SESSION` from the user manager as they are
+at that moment. A variable the user manager doesn't have keeps the daemon's
+own value, and one a session's launch sets itself is never replaced. Terminals
+already running keep the environment they started with. Every daemon that
+replaces it does the same, such as one an update starts, even when
+`cagents daemon stop` and a new `daemon start` come between, until the user
+manager stops: the next boot with lingering, or your last logout without it.
+`cagents daemon boot disable` ends that for daemons started afterwards. A
+daemon already running when you run `enable` keeps its own environment; the
+unit takes effect from the next boot. A desktop that does not export these
+variables leaves terminals without them;
+`systemctl --user import-environment DISPLAY WAYLAND_DISPLAY SSH_AUTH_SOCK` in
+its startup exports them.
+
+The unit runs the installation's stable `cagents`: an `install.sh`
+installation's `current/bin/cagents`, whatever its `--prefix`, which every
+update repoints, or a package's own. `cagents daemon boot disable` removes the
+unit, and so does uninstalling an `install.sh` installation. Removing a Debian
+package leaves the unit in your user directory, since a package touches no
+user's files, but systemd skips it once the program it runs is gone; `cagents
+daemon boot disable` before removing the package, or deleting
+`~/.config/systemd/user/dev.cagents.Cagents.Daemon.service` afterwards, removes
+it. `enable` and `disable` leave alone a unit of that name that cagents did not
+write. To manage another machine, run the command there, for example
+`ssh HOST cagents daemon boot enable`.
+
+Starting the daemon does not reopen agent chats that exited when the machine
+went down; resume them with `cagents resume` (see the
+[user guide](user-guide.md)).
 
 Full and browserless production builds share one daemon socket
 (`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes
@@ -120,6 +181,7 @@ cagents daemon stop --confirm
 | `ui [--new-window \| --window NAME]` | Launch the UI, open another window, or open a named window |
 | `daemon start` | Start the daemon if it is not already running |
 | `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
+| `daemon boot enable`, `disable`, `status` | Start the daemon at boot through a systemd user unit (Linux; see [Starting at boot](#starting-at-boot)) |
 | `daemon upgrade [--yes] [--interrupt]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
 | `daemon stop` | Stop the daemon and wait for exit (see below) |
 | `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |

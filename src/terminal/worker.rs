@@ -9,6 +9,7 @@ mod event_dispatch_tests;
 pub(crate) mod holder;
 mod input_queue;
 mod joins;
+mod manager_environment;
 #[cfg(test)]
 mod pty_reader_tests;
 
@@ -3255,7 +3256,15 @@ impl Worker {
         let execution = execution_recipe.unwrap_or_else(|| session.launch.clone());
         let mut command = match &config.execution_environment {
             Some(environment) => command_from_execution(&execution, environment),
-            None => command_from_recipe(&execution),
+            None => {
+                let mut command = command_from_recipe(&execution);
+                // Read now, not at startup: a graphical login may have come
+                // since. An adopted terminal is already running.
+                if config.adoption.is_none() {
+                    manager_environment::refresh(&mut command, &execution);
+                }
+                command
+            }
         };
         for name in crate::account::launch_credential_overrides(&execution) {
             command.env_remove(name);

@@ -19,6 +19,8 @@ use thiserror::Error;
 
 mod accounts;
 pub use accounts::AccountCommand;
+mod boot;
+pub use boot::BootCommand;
 #[cfg(test)]
 mod agent_start_authority_tests;
 mod agents;
@@ -504,6 +506,14 @@ pub enum DaemonCommand {
     },
     /// Start the daemon if it is not already running.
     Start,
+    /// Start the daemon when this computer boots, before anyone logs in.
+    #[command(
+        after_help = "Installs a systemd user unit that runs `cagents daemon start` at boot, beside the graphical-login autostart; whichever runs first starts the daemon. The user manager starts at boot only with lingering on (`loginctl enable-linger`), which `status` reports."
+    )]
+    Boot {
+        #[command(subcommand)]
+        command: BootCommand,
+    },
     /// Report whether the daemon is running.
     Status,
     /// Validate inherited updater authority without probing daemon liveness.
@@ -5180,6 +5190,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             "run installation upgrades in a terminal on the selected device",
         ));
     }
+    if crate::device::is_remote() && matches!(command, DaemonCommand::Boot { .. }) {
+        return Err(AppError::new(
+            "device",
+            "Set up starting at boot in a shell on that device, such as `ssh HOST cagents daemon boot enable`",
+        ));
+    }
     match command {
         DaemonCommand::Bridge { .. } => Err(AppError::new(
             "bridge",
@@ -5202,6 +5218,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     .map_err(|error| AppError::new("serialization", error))?,
             })
         }
+        DaemonCommand::Boot { command } => boot::execute(command),
         DaemonCommand::Start => {
             let socket = if daemon_autostart_disabled() {
                 let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;

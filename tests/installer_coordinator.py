@@ -271,6 +271,10 @@ class InstallerCoordinator(unittest.TestCase):
         for name in ("curl", "wget", "gh"):
             self.executable(self.tools / name, '#!/bin/sh\nexit 97\n')
         self.executable(self.tools / "cagentsd", '#!/bin/sh\nexit 96\n')
+        # The real user manager must never see a fixture's boot unit.
+        self.systemctl_calls = self.directory / "systemctl-calls"
+        self.executable(self.tools / "systemctl",
+                        f'#!/bin/sh\nprintf "%s\\n" "$*" >> \'{self.systemctl_calls}\'\n')
         self.payload = self.directory / TOP
         self.python(self.payload / "bin/cagents", COORDINATOR)
         self.python(self.payload / "bin/cagentsd", "SOURCE = 'candidate'\n" + INSPECTOR)
@@ -1383,6 +1387,45 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
                 self.assertEqual((self.prefix / ".update").stat().st_mode & 0o777, 0o700)
                 self.assertEqual((self.prefix / ".update/lock").stat().st_mode & 0o777, 0o600)
                 self.assert_still_installed()
+
+    BOOT_UNIT = "dev.cagents.Cagents.Daemon.service"
+    BOOT_UNIT_HEADER = "# Installed by `cagents daemon boot enable`; `cagents daemon boot disable` removes it.\n"
+
+    def boot_unit(self, header):
+        units = self.home / "config/systemd/user"
+        self.write(units / self.BOOT_UNIT, header + "[Service]\nType=oneshot\n")
+        (units / "default.target.wants").mkdir(exist_ok=True)
+        wants = units / "default.target.wants" / self.BOOT_UNIT
+        wants.symlink_to(units / self.BOOT_UNIT)
+        return units / self.BOOT_UNIT, wants
+
+    def test_uninstall_disables_and_removes_the_boot_unit_cagents_installed(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                unit, wants = self.boot_unit(self.BOOT_UNIT_HEADER)
+                result = self.uninstall(uninstaller)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(unit.exists())
+                self.assertFalse(wants.is_symlink())
+                self.assertEqual(self.systemctl_calls.read_text().splitlines(),
+                                 [f"--user disable {self.BOOT_UNIT}", "--user daemon-reload"])
+                self.systemctl_calls.unlink()
+                self.calls.unlink()
+
+    def test_uninstall_keeps_a_boot_unit_someone_else_wrote(self):
+        for uninstaller in self.UNINSTALLERS:
+            with self.subTest(uninstaller=uninstaller):
+                self.install_serving()
+                unit, wants = self.boot_unit("# Mine.\n")
+                result = self.uninstall(uninstaller)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(unit.is_file())
+                self.assertTrue(wants.is_symlink())
+                self.assertFalse(self.systemctl_calls.exists())
+                unit.unlink()
+                wants.unlink()
+                self.calls.unlink()
 
     def test_uninstall_keeps_the_marker_while_unrecognized_files_remain(self):
         for uninstaller in self.UNINSTALLERS:
