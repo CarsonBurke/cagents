@@ -4367,7 +4367,7 @@ impl HostState {
 pub(super) fn stage_installed_carried_terminals(
     host: &SharedHost,
     store: crate::upgrade::handoff::Store,
-    checkpoint: crate::upgrade::handoff::Checkpoint,
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
 ) -> Result<Option<RestoredUpgrade>, String> {
     use crate::daemon::holder_registry::{self as registry, Kind};
     let holders = holder_directory()?;
@@ -4382,11 +4382,9 @@ pub(super) fn stage_installed_carried_terminals(
         .iter()
         .map(|record| record.terminal)
         .collect::<BTreeSet<_>>();
-    if expected != actual
-        || !registry::observe_update_roster(Kind::Native, &checkpoint.proof.boot_id)
-            .map_err(|error| error.to_string())?
-            .is_empty()
-    {
+    let native = registry::observe_update_roster(Kind::Native, &checkpoint.proof.boot_id)
+        .map_err(|error| error.to_string())?;
+    if expected != actual || native.len() != checkpoint.chats.len() {
         return Ok(None);
     }
     let proof = host
@@ -4394,6 +4392,25 @@ pub(super) fn stage_installed_carried_terminals(
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
+    for record in native {
+        let Some(chat) = checkpoint
+            .chats
+            .iter()
+            .find(|chat| chat.source.id == record.terminal)
+        else {
+            return Ok(None);
+        };
+        let (held, exited) = crate::chat::native_holder::inspect(&record, &proof)?;
+        if exited
+            || held.confirmed_thread != chat.source.launch.session_id
+            || !held
+                .server_process
+                .is_some_and(|server| server.is_current())
+            || (held.source != chat.source && !held.previous_sources.contains(&chat.source))
+        {
+            return Ok(None);
+        }
+    }
     for record in records {
         let socket = registry::socket(&holders, record.terminal);
         if !crate::terminal::holder_protects_replay(&socket, &record, &proof)? {

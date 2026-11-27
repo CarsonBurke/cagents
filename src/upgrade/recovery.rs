@@ -83,12 +83,13 @@ pub struct Census {
 
 #[cfg(all(feature = "host", any(test, target_os = "macos")))]
 impl Census {
-    fn is_terminal_only(&self) -> bool {
+    fn can_park_carried_work(&self) -> bool {
         !self.terminals.is_empty()
-            && self.chats.is_empty()
-            && self.snapshots.is_empty()
-            && self.aliases.is_empty()
-            && self.presentations.is_empty()
+            && self.chats.iter().all(|chat| {
+                chat.launch.provider == crate::agent::Provider::Codex
+                    && chat.terminal.is_none()
+                    && chat.native_continuity.retains_provider()
+            })
     }
 }
 
@@ -5136,20 +5137,25 @@ impl ReadyAdmission {
         )
     }
 
-    /// The same fenced inventory proof without opening or repairing the
-    /// workspace stores. A terminal-only census does not use chat lineage.
+    /// Verify the exact terminal portion of the acknowledged census before
+    /// selection. The native holders are still detached and checked separately.
     pub fn verify_parked_terminals(
         &self,
         terminals: &[crate::terminal_ipc::TerminalDescriptor],
     ) -> Result<(), String> {
-        if !self.has_terminal_only_census() {
-            return Err("Parked terminal admission requires a terminal-only census".into());
+        if !self.has_carried_work() {
+            return Err(
+                "Parked admission requires carried terminals and retained providers".into(),
+            );
         }
         self.verify_custody()?;
         crate::update::recovery::verify_ready_inventory(
             &self.authority.job,
             &self.authority.source,
-            &self.authority.census,
+            &Census {
+                terminals: self.authority.census.terminals.clone(),
+                ..Default::default()
+            },
             &self.successor,
             terminals,
             &[],
@@ -5162,8 +5168,8 @@ impl ReadyAdmission {
         crate::update::admits_parked(&self.authority).map_err(|error| error.to_string())
     }
 
-    pub fn has_terminal_only_census(&self) -> bool {
-        self.authority.census.is_terminal_only()
+    pub fn has_carried_work(&self) -> bool {
+        self.authority.census.can_park_carried_work()
     }
 
     fn verify_custody(&self) -> Result<(), String> {

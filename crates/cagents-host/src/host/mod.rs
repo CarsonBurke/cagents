@@ -439,7 +439,7 @@ fn activate_parked_terminals(
         }
         await_receipt(deadline)?;
     }
-    update_recovery::finish_parked_ready(host, installed.capture)?;
+    update_recovery::finish_parked_ready(host, installed.capture, &installed.checkpoint)?;
     save_abandoned_identities(host);
     workspace::adopt_foreign_panes(host);
     save_agent_pane_identities(host);
@@ -453,11 +453,25 @@ fn activate_parked_terminals(
         drop(state);
         await_receipt(deadline)?;
     };
+    let chats = chat::chat_list_inventory(&state);
+    if chats.iter().any(|session| {
+        state
+            .chats
+            .get(&session.id)
+            .is_none_or(|record| record.handle.is_completed() || !record.handle.owns_work())
+    }) {
+        return Err("An original retained conversation is not ready".into());
+    }
     if let Some(admission) = admission {
-        admission.verify_live_inventory(state.proof(), &terminals, &[], &completed)?;
+        admission.verify_live_inventory(state.proof(), &terminals, &chats, &completed)?;
     } else {
-        crate::update::verify_selected_parked_inventory(state.proof(), &terminals, &completed)
-            .map_err(|error| error.to_string())?;
+        crate::update::verify_selected_parked_inventory(
+            state.proof(),
+            &terminals,
+            &chats,
+            &completed,
+        )
+        .map_err(|error| error.to_string())?;
     }
     installed.restored.finish_locked(&mut state)
 }

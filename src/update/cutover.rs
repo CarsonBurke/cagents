@@ -157,7 +157,7 @@ fn selected_parked_checkpoint(
         || !ready.matches_cutover_inventory(&retained.terminals, &retained.chats)
         || !crate::upgrade::recovery::verified::ready::capture()
             .map_err(invalid)?
-            .is_some_and(|capture| capture.covers_only_carried_terminals(checkpoint))
+            .is_some_and(|capture| capture.covers_only_carried_work(checkpoint))
     {
         return Err(invalid(
             "The selected parked update no longer has its exact carried checkpoint",
@@ -175,13 +175,13 @@ fn selected_parked_checkpoint(
 pub fn verify_selected_parked_inventory(
     serving: &HostSessionProof,
     terminals: &[crate::terminal_ipc::TerminalDescriptor],
+    chats: &[crate::chat::Session],
     completed: &std::collections::BTreeSet<crate::model::TerminalId>,
 ) -> Result<(), UpdateError> {
     let layout = locate(&crate::process::current_executable()?)?;
     let state = layout.prefix.join(".update");
     let job = read_job(&state)?.ok_or_else(|| invalid("The selected parked update has no job"))?;
     let (intent, saved) = restart_intent(&layout, &state, &job)?
-        .filter(|(_, saved)| saved.chats.is_empty())
         .ok_or_else(|| invalid("The selected parked update lost its witnessed terminal roster"))?;
     if !intent.recorded_parked(&state)? {
         return Err(invalid(
@@ -193,12 +193,16 @@ pub fn verify_selected_parked_inventory(
         &intent.source,
         &crate::upgrade::recovery::Census {
             terminals: saved.terminals,
+            chats: saved.chats,
             ..Default::default()
         },
         serving,
         terminals,
-        &[],
-        &Default::default(),
+        chats,
+        &Store::discover()
+            .map_err(invalid)?
+            .recovered_chats()
+            .map_err(invalid)?,
         completed,
     )
     .map_err(invalid)

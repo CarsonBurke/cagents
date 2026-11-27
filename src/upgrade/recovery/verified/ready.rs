@@ -67,7 +67,7 @@ impl ReadyCapture {
     }
 
     #[cfg(any(test, target_os = "macos"))]
-    pub fn covers_only_carried_terminals(
+    pub fn covers_only_carried_work(
         &self,
         checkpoint: &crate::upgrade::handoff::Checkpoint,
     ) -> bool {
@@ -75,8 +75,12 @@ impl ReadyCapture {
         if !checkpoint.preserve_carried
             || checkpoint.carried.is_empty()
             || !checkpoint.terminals.is_empty()
-            || !checkpoint.chats.is_empty()
-            || !census.is_terminal_only()
+            || !census.can_park_carried_work()
+            || census.chats.len() != checkpoint.chats.len()
+            || checkpoint
+                .chats
+                .iter()
+                .any(|chat| !census.chats.contains(&chat.source))
             || census.terminals.len() != checkpoint.carried.len()
         {
             return false;
@@ -122,7 +126,7 @@ pub fn observe_carried(expected: &str) -> Result<Option<ObservedCarriedReady>, S
     let checkpoint = store
         .load_for_restore(Some(expected))?
         .ok_or("Installed startup lost its approved Ready checkpoint")?;
-    if !capture.covers_only_carried_terminals(&checkpoint) {
+    if !capture.covers_only_carried_work(&checkpoint) {
         return Ok(None);
     }
     Ok(Some(ObservedCarriedReady {
@@ -589,17 +593,17 @@ mod tests {
             }],
             Vec::new(),
         );
-        assert!(!ready.covers_only_carried_terminals(&checkpoint));
+        assert!(!ready.covers_only_carried_work(&checkpoint));
         checkpoint.preserve_carried = true;
-        assert!(ready.covers_only_carried_terminals(&checkpoint));
+        assert!(ready.covers_only_carried_work(&checkpoint));
         ready.capture.census.terminals[0].id = TerminalId::new();
-        assert!(!ready.covers_only_carried_terminals(&checkpoint));
+        assert!(!ready.covers_only_carried_work(&checkpoint));
         ready.capture.census.terminals[0].id = checkpoint.carried[0].source.id;
         ready.capture.census.chats.push(super::super::tests::source(
             crate::agent::Provider::Claude,
             std::path::Path::new("/"),
         ));
-        assert!(!ready.covers_only_carried_terminals(&checkpoint));
+        assert!(!ready.covers_only_carried_work(&checkpoint));
     }
 
     #[test]
