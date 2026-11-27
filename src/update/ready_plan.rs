@@ -31,6 +31,7 @@ struct Reservation<'a> {
 enum Phase {
     AwaitingAdmission,
     Claimed,
+    Returning,
     Selected,
     Released,
 }
@@ -48,6 +49,27 @@ impl Reservation<'_> {
             .then(|| self.plan.target.join("bin"))
     }
 
+    fn return_path(&self) -> PathBuf {
+        self.state().join(format!("{}.ready-return.json", self.job))
+    }
+
+    fn return_binding(&self) -> Result<Vec<u8>, UpdateError> {
+        let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(self)?).into();
+        Ok(serde_json::to_vec(&digest)?)
+    }
+
+    fn returning(&self) -> Result<bool, UpdateError> {
+        let Some(bytes) = read(&self.return_path())? else {
+            return Ok(false);
+        };
+        if bytes != self.return_binding()? {
+            return Err(invalid(
+                "The saved return plan belongs to a different update",
+            ));
+        }
+        Ok(true)
+    }
+
     fn phase(&self) -> Result<Phase, UpdateError> {
         if !self.plan.ready.same_boot()? {
             // Runtime custody expires at reboot. Keep the checkpoint for the
@@ -57,11 +79,14 @@ impl Reservation<'_> {
         let state = self.state();
         let job = cutover::read_job(&state)?
             .ok_or_else(|| invalid("The reserved update job is missing"))?;
-        let layout = locate(&self.plan.target.join("bin/cagents"))?;
+        let layout = InstallLayout {
+            prefix: self.prefix.clone(),
+            version: job.version.clone(),
+            version_root: self.plan.target.clone(),
+        };
         if job.id != self.job
-            || job.version != layout.version
-            || layout.prefix != self.prefix
-            || layout.version_root != self.plan.target
+            || Path::new(&job.version).file_name() != Some(std::ffi::OsStr::new(&job.version))
+            || self.prefix.join("versions").join(&job.version) != self.plan.target
             || !self.plan.ready.names_job(&state, &job.id)
         {
             return Err(invalid(
@@ -82,12 +107,14 @@ impl Reservation<'_> {
                 },
             );
         }
-        if !self.plan.selection_is_untouched(&layout)? {
+        if !self.plan.selection.source_is_unchanged(&layout)? {
             return Err(invalid(
                 "The installation changed while an update owns the saved work",
             ));
         }
-        if self.plan.ready.claim_exists().map_err(invalid)? {
+        if self.returning()? {
+            Ok(Phase::Returning)
+        } else if self.plan.ready.claim_exists().map_err(invalid)? {
             Ok(Phase::Claimed)
         } else {
             Ok(Phase::AwaitingAdmission)
@@ -103,7 +130,11 @@ fn shared_reservation() -> Result<Option<Reservation<'static>>, UpdateError> {
         return Ok(None);
     };
     let reservation: Reservation<'static> = serde_json::from_slice(&bytes)?;
-    if reservation.plan.version != 1 || !reservation.prefix.is_absolute() {
+    if reservation.plan.version != 1
+        || !reservation.prefix.is_absolute()
+        || !uuid::Uuid::parse_str(&reservation.job)
+            .is_ok_and(|id| id.to_string() == reservation.job)
+    {
         return Err(invalid("Invalid saved-work update reservation"));
     }
     Ok(Some(reservation))
@@ -147,10 +178,16 @@ pub fn admit_saved_state(executable: &Path) -> Result<(), UpdateError> {
     };
     match reservation.phase()? {
         Phase::Released => Ok(()),
-        Phase::Selected => {
+        phase @ (Phase::Selected | Phase::Returning) => {
             let layout = locate(executable)?;
+            let matched_version = if phase == Phase::Selected {
+                layout.version_root == reservation.plan.target
+            } else {
+                reservation.plan.selection.source_is_unchanged(&layout)?
+                    && served_version_root(&layout)? == layout.version_root
+            };
             if layout.prefix == reservation.prefix
-                && layout.version_root == reservation.plan.target
+                && matched_version
                 && reservation
                     .plan
                     .ready
@@ -171,11 +208,39 @@ pub(crate) fn admit_ready(
     authority: &crate::upgrade::recovery::Authority,
 ) -> Result<(), UpdateError> {
     if let Some(reservation) = shared_reservation()?
-        && !reservation.plan.ready.same_authority(authority)
+        && (reservation.returning()? || !reservation.plan.ready.same_authority(authority))
     {
         return Err(invalid("The saved work is reserved for a different update"));
     }
     Ok(())
+}
+
+fn refreshed_reservation(
+    original: &Reservation<'_>,
+) -> Result<Option<Reservation<'static>>, UpdateError> {
+    let current = shared_reservation()?;
+    if let Some(entry) = &current
+        && (entry.job != original.job || entry.prefix != original.prefix)
+    {
+        return Err(invalid(
+            "The update changed before the application could reopen",
+        ));
+    }
+    Ok(current)
+}
+
+fn settled_bin(
+    original: &Reservation<'_>,
+    source: &InstallLayout,
+) -> Result<Option<PathBuf>, UpdateError> {
+    if original.plan.selection.source_is_unchanged(source)? {
+        return Ok(None);
+    }
+    let bin = original
+        .selected_bin()
+        .ok_or_else(|| invalid("The installed application changed before it could reopen"))?;
+    installed::selected_candidate(&source.prefix, &original.plan.target)?;
+    Ok(Some(bin))
 }
 
 /// A launch through the original selector can continue this exact approval.
@@ -193,12 +258,11 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
         return Ok(None);
     }
     let state = original.state();
-    let job_id = original.job;
     let deadline = Instant::now() + crate::install_guard::daemon_start_timeout()?;
     loop {
-        let reservation = shared_reservation()?
-            .filter(|entry| entry.job == job_id && entry.state() == state)
-            .ok_or_else(|| invalid("The update changed before the application could reopen"))?;
+        let Some(reservation) = refreshed_reservation(&original)? else {
+            return settled_bin(&original, &source);
+        };
         let bin = reservation.plan.target.join("bin");
         let phase = reservation.phase()?;
         if phase == Phase::Released {
@@ -226,9 +290,16 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
             }
             Err(error) => return Err(error),
         };
+        let Some(reservation) = refreshed_reservation(&original)? else {
+            return settled_bin(&original, &source);
+        };
         match reservation.phase()? {
             Phase::Released => return Ok(reservation.selected_bin()),
-            Phase::Selected => return Ok(Some(bin)),
+            Phase::Selected => return Ok(Some(reservation.plan.target.join("bin"))),
+            Phase::Returning => {
+                reservation.finish_return(&source)?;
+                return Ok(None);
+            }
             Phase::Claimed => {
                 return Err(invalid("The update already took custody of the saved work"));
             }
@@ -237,7 +308,18 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
         let Some(job) = cutover::read_job(&state)? else {
             return Err(invalid("The reserved update job is missing"));
         };
-        let target = reservation.plan.target_layout(&source.prefix, &job)?;
+        let target = match reservation.plan.target_layout(&source.prefix, &job) {
+            Ok(target) => target,
+            Err(error) => {
+                let Some(target) = reservation
+                    .settle_unavailable_candidate(&source, &state, &job, &lock, &error)?
+                else {
+                    reservation.finish_return(&source)?;
+                    return Ok(None);
+                };
+                target
+            }
+        };
         let log = OpenOptions::new()
             .append(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -252,6 +334,77 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
         }
         installed::selected_candidate(&source.prefix, &target.version_root)?;
         return Ok(Some(bin));
+    }
+}
+
+impl Reservation<'_> {
+    fn settle_unavailable_candidate(
+        &self,
+        source: &InstallLayout,
+        state: &Path,
+        job: &UpdateJob,
+        worker: &File,
+        failure: &UpdateError,
+    ) -> Result<Option<InstallLayout>, UpdateError> {
+        let guard = crate::instance::UiUpdateGuard::acquire()?;
+        let publication = crate::install_guard::reserve_darwin_publication()?;
+        if let Ok(target) = self.plan.target_layout(&source.prefix, job) {
+            return Ok(Some(target));
+        }
+        let handoff = acquire_unserved_runtime()?;
+        if self.phase()? != Phase::AwaitingAdmission
+            || !self.plan.selection.source_is_unchanged(source)?
+            || served_version_root(source)? != source.version_root
+            || guard.has_running_windows()?
+        {
+            return Err(invalid(
+                "The selected application no longer owns the saved work",
+            ));
+        }
+        self.plan
+            .ready
+            .verify_unclaimed_source(worker, &guard, &handoff)
+            .map_err(invalid)?;
+        eprintln!("The staged update could not be verified: {failure}");
+        cutover::persist(state, &self.return_path(), &self.return_binding()?, true)?;
+        Ok(None)
+    }
+
+    fn finish_return(&self, source: &InstallLayout) -> Result<(), UpdateError> {
+        let slots = self.plan.ready.saved_windows();
+        let executable = source.version_root.join("bin/cagents-ui");
+        let guard = crate::instance::UiUpdateGuard::acquire()?;
+        if self.phase()? != Phase::Returning
+            || !self.plan.selection.source_is_unchanged(source)?
+            || served_version_root(source)? != source.version_root
+        {
+            return Err(invalid(
+                "This update can only reopen its original selected build",
+            ));
+        }
+        guard.relaunch_missing_windows(slots, &executable)?;
+
+        let guard = crate::instance::UiUpdateGuard::acquire()?;
+        let _publication = crate::install_guard::reserve_darwin_publication()?;
+        if self.phase()? != Phase::Returning {
+            return Err(invalid(
+                "The application changed while reopening its windows",
+            ));
+        }
+        guard.verify_cutover_windows(slots, &executable)?;
+        let store = Store::observe_existing()
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("The approved Ready checkpoint disappeared"))?;
+        let state = self.state();
+        let mut job = cutover::read_job(&state)?
+            .ok_or_else(|| invalid("The reserved update job is missing"))?;
+        job.phase = UpdatePhase::Failed;
+        job.message =
+            "The staged update changed. Your work is available in the current version.".into();
+        job.refusal = None;
+        write_job(&state, &job)?;
+        store.retire_installed_activation().map_err(invalid)?;
+        Ok(())
     }
 }
 
@@ -270,7 +423,7 @@ pub(crate) fn abandon_claimed() -> Result<Option<Abandonment>, UpdateError> {
     if phase == Phase::Released {
         return Ok(None);
     }
-    if phase == Phase::AwaitingAdmission
+    if !matches!(phase, Phase::Claimed | Phase::Selected)
         || !reservation
             .plan
             .ready
@@ -395,6 +548,11 @@ fn load(state: &Path, job: &UpdateJob) -> Result<Option<Plan<'static>>, UpdateEr
     }
     if let Some(reservation) = shared_reservation()? {
         if reservation.state() == state && reservation.job == job.id {
+            if reservation.returning()? {
+                return Err(invalid(
+                    "This update is already reopening the selected build",
+                ));
+            }
             return Ok(Some(reservation.plan));
         }
         if reservation.phase()? != Phase::Released {
@@ -508,20 +666,7 @@ pub(super) fn recover_worker(
             "The installed selector changed before the update could resume",
         ));
     }
-    let paths =
-        crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
-    let handoff = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
-        .map_err(|error| invalid(error.to_string()))?
-        .ok_or_else(|| invalid("The terminal service already has an owner"))?;
-    match crate::descriptor::connect_settled(&paths.socket) {
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) => {}
-        Err(error) => return Err(error.into()),
-        Ok(_) => return Err(invalid("The terminal service is already serving")),
-    }
+    let handoff = acquire_unserved_runtime()?;
     let receipt = plan
         .ready
         .reopen(&daemon, worker, &guard, &handoff)
@@ -553,6 +698,24 @@ pub(super) fn recover_worker(
     // completes the original job after our final fence copies close.
     installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout)?;
     installed::selected_candidate(&installation.prefix, &target.version_root)
+}
+
+fn acquire_unserved_runtime() -> Result<crate::daemon::lease_handoff::LeaseHandoff, UpdateError> {
+    let paths =
+        crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
+    let handoff = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
+        .map_err(|error| invalid(error.to_string()))?
+        .ok_or_else(|| invalid("The terminal service already has an owner"))?;
+    match crate::descriptor::connect_settled(&paths.socket) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => return Err(invalid("The terminal service is already serving")),
+    }
+    Ok(handoff)
 }
 
 #[cfg(test)]

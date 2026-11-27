@@ -1755,6 +1755,76 @@ impl ReadyPlanEvidence<'_> {
         &self.authority.source
     }
 
+    pub(crate) fn saved_windows(&self) -> &[String] {
+        &self.authority.windows
+    }
+
+    /// Keep the original saved work eligible for the selected source when the
+    /// candidate disappeared before obtaining permission to touch it.
+    pub(crate) fn verify_unclaimed_source(
+        &self,
+        worker: &File,
+        guard: &UiUpdateGuard,
+        handoff: &LeaseHandoff,
+    ) -> Result<(), String> {
+        let authority = &self.authority;
+        if authority.version != 1
+            || !matches!(authority.origin, Origin::AcknowledgedPrepare)
+            || !self.same_boot().map_err(|error| error.to_string())?
+            || !self.names_current_runtime()?
+            || self.claim_exists()?
+        {
+            return Err("The selected source no longer owns the untouched Ready checkpoint".into());
+        }
+        let (fence, legacy) = guard
+            .duplicate_for_recovery()
+            .map_err(|error| error.to_string())?;
+        let daemon = handoff
+            .duplicate_for_recovery()
+            .map_err(|error| error.to_string())?;
+        for (file, path) in [
+            (worker, &authority.worker_path),
+            (&fence, &authority.fence_path),
+            (&daemon, &authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|error| error.to_string())?;
+        }
+        validate_lock_mode(&legacy, &authority.legacy_path, "READ")
+            .map_err(|error| error.to_string())?;
+        if !handoff
+            .recorded_source_is(&authority.source)
+            .map_err(|error| error.to_string())?
+            || !crate::instance::state_claim::last_daemon_was(
+                &authority.daemon_path,
+                &authority.source,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            return Err("A different daemon has used the saved work".into());
+        }
+        validate_received_checkpoint(authority, Phase::Ready)?;
+        let original = open_checkpoint(&authority.checkpoint_path)?
+            .ok_or("The approved Ready checkpoint disappeared")?;
+        let metadata = original.metadata().map_err(|error| error.to_string())?;
+        if (metadata.dev(), metadata.ino()) != self.checkpoint
+            || digest(&read_checkpoint_input(&original)?) != authority.checkpoint_hash
+            || validate_acknowledged_capture(authority)?.as_deref() != Some(&self.capture_digest)
+        {
+            return Err("The original Ready checkpoint or inventory changed".into());
+        }
+        let state = authority
+            .worker_path
+            .parent()
+            .ok_or("The update directory disappeared")?;
+        let request = read_checkpoint(&state.join(format!("{}.request", authority.job)))?
+            .ok_or("Recovery update request disappeared")?;
+        if digest(&request) != authority.job_request_hash {
+            return Err("The recovery update request changed after preparation".into());
+        }
+        validate_request_origin(authority, &request)?;
+        Ok(())
+    }
+
     pub(crate) fn claimed_process_exited(&self) -> Result<bool, String> {
         #[derive(Deserialize)]
         struct Claim {

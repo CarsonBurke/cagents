@@ -116,7 +116,7 @@ fn inventory_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.cutover-inventory.json"))
 }
 
-#[cfg(any(feature = "host", test))]
+#[cfg(any(feature = "host", target_os = "macos", test))]
 pub(super) fn persist(
     state: &Path,
     target: &Path,

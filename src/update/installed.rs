@@ -18,6 +18,16 @@ impl Selection {
     pub(super) fn previous_link(&self) -> Option<&Path> {
         self.previous_link.as_deref()
     }
+    /// Test only the selected source. The staged candidate may no longer
+    /// exist, which must not prevent checking whether the source is intact.
+    #[cfg(target_os = "macos")]
+    pub(super) fn source_is_unchanged(&self, layout: &InstallLayout) -> Result<bool, UpdateError> {
+        Ok(
+            self.previous_link.as_ref() == Some(&fs::read_link(layout.prefix.join("current"))?)
+                && served_version_root(layout)? == self.current,
+        )
+    }
+
     pub(super) fn capture(candidate: &InstallLayout) -> Result<Self, UpdateError> {
         let current = served_version_root(candidate)?;
         if current == candidate.version_root {

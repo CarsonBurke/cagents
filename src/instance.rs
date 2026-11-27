@@ -3,7 +3,7 @@ use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
 #[cfg(target_os = "linux")]
 use crate::flock::process_owns_lock as process_owns_slot;
 use crate::pinned_process::PinnedProcess;
-#[cfg(all(target_os = "macos", feature = "host"))]
+#[cfg(target_os = "macos")]
 use std::time::Instant;
 use std::{
     env,
@@ -722,7 +722,7 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
-#[cfg(all(target_os = "macos", any(feature = "ui", feature = "host")))]
+#[cfg(target_os = "macos")]
 const CUTOVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(target_os = "macos", feature = "ui"))]
 static UI_RESTORATION_READY: (std::sync::Mutex<bool>, std::sync::Condvar) =
@@ -2362,7 +2362,7 @@ impl UiUpdateGuard {
         self.relaunch_windows(&missing, executable)
     }
 
-    #[cfg(all(target_os = "macos", feature = "host"))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
         let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
         let windows = self.verified_windows()?;
@@ -2434,7 +2434,7 @@ impl UiUpdateGuard {
 }
 
 /// A naturally opened window can take its lease before binding activation.
-#[cfg(all(target_os = "macos", feature = "host"))]
+#[cfg(target_os = "macos")]
 fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::Result<UnixStream> {
     use std::os::fd::AsFd;
 
