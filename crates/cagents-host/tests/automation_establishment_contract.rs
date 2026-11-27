@@ -199,6 +199,7 @@ impl Fixture {
                     format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
                 )
                 .env("SHELL", "/bin/sh")
+                .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
                 .env(EVIDENCE_ROOT, root.path())
                 .current_dir(root.path())
                 .stdin(Stdio::null())

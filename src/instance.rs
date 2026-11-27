@@ -75,13 +75,16 @@ pub const STARTUP_ERROR_MODE: &str = "--startup-error";
 pub const STARTUP_UPDATE_MODE: &str = "--startup-update";
 pub const STARTUP_WAIT_MODE: &str = "--startup-wait";
 pub const RENDER_PAGE_MODE: &str = "--internal-render-page";
+/// A device window that could not reopen explains why and tries again.
+pub const DEVICE_RECONNECT_MODE: &str = "--device-reconnect";
 #[cfg(target_os = "linux")]
-const HELPER_MODES: [&str; 5] = [
+const HELPER_MODES: [&str; 6] = [
     CONFIRM_DAEMON_STOP_MODE,
     STARTUP_ERROR_MODE,
     STARTUP_UPDATE_MODE,
     STARTUP_WAIT_MODE,
     RENDER_PAGE_MODE,
+    DEVICE_RECONNECT_MODE,
 ];
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` names the product that ships the embedded browser: it claims that
@@ -2419,15 +2422,34 @@ impl UiUpdateGuard {
         self.prepared.clear();
         self.release_launch_fence()?;
         self.closed.clear();
-        let mut errors = Vec::new();
         let mut notes = Vec::new();
+        let mut failures = Vec::new();
         for slot in slots {
             match launch_window_at(executable, false, Some(slot), None, self.restore_policy) {
-                Ok(Some(note)) => notes.push((slot.as_str(), note)),
+                Ok(Some(note)) => notes.push((slot.clone(), note)),
                 Ok(None) => {}
-                Err(error) => errors.push((slot.as_str(), error.to_string())),
+                Err(error) => failures.push((slot.clone(), error.to_string())),
             }
         }
+        let devices = || crate::device::list().unwrap_or_default();
+        let (errors, device_notes) = split_relaunch_failures(failures, |slot| {
+            window_device_identity(&self.runtime, slot, &devices())
+                .ok()
+                .flatten()
+                // A window that failed for its device's sake shows why on a
+                // screen of this build: proof the build opens windows. One
+                // that shows nothing may be this build's fault.
+                .filter(|_| device_reconnect_shown(slot))
+        });
+        notes.extend(device_notes);
+        let errors: Vec<_> = errors
+            .iter()
+            .map(|(slot, error)| (slot.as_str(), error.clone()))
+            .collect();
+        let notes: Vec<_> = notes
+            .iter()
+            .map(|(window, note)| (window.as_str(), note.clone()))
+            .collect();
         let notes = (!notes.is_empty()).then(|| relaunch_failure(slots.len(), &notes));
         if errors.is_empty() {
             Ok(notes)
@@ -2482,6 +2504,41 @@ fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::
             ));
         }
     }
+}
+
+/// Whether device window `slot`, which just failed to start, put up the
+/// screen that explains it. The window starts that screen as it exits.
+fn device_reconnect_shown(slot: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if device_reconnect_showing(slot) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Splits the windows that did not reopen into errors, which say this build
+/// cannot open a window, and notes. A device window that cannot reach its
+/// device, or must wait for the device's update, says so on its own screen;
+/// that is no reason to take the update back. `device_of` names the device a
+/// window shows, when it explained its failure itself.
+fn split_relaunch_failures(
+    failures: Vec<(String, String)>,
+    device_of: impl Fn(&str) -> Option<String>,
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut errors = Vec::new();
+    let mut notes = Vec::new();
+    for (slot, error) in failures {
+        match device_of(&slot) {
+            Some(device) => notes.push((format!("the window on {device}"), error)),
+            None => errors.push((slot, error)),
+        }
+    }
+    (errors, notes)
 }
 
 /// What the update reports when windows did not reopen cleanly. Someone reads
@@ -2642,6 +2699,70 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
         WindowRestorePolicy::Ordinary,
     )
     .map(|_| ())
+}
+
+fn device_reconnect_lock_path(slot: &str) -> io::Result<PathBuf> {
+    validate_window_slot(slot)?;
+    Ok(runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}-reconnect-{slot}")))
+}
+
+/// Claims the screen that explains why device window `slot` did not open,
+/// or `None` when one already does.
+pub fn hold_device_reconnect(slot: &str) -> io::Result<Option<OwnedLock>> {
+    let path = device_reconnect_lock_path(slot)?;
+    // `device_reconnect_showing` holds the lock for an instant to look; a
+    // screen holds it for as long as it shows.
+    for attempt in 0..5 {
+        match owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a screen explains why device window `slot` did not open, so that
+/// opening it again waits for that screen's own Try again.
+pub fn device_reconnect_showing(slot: &str) -> bool {
+    device_reconnect_lock_path(slot)
+        .and_then(|path| owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB))
+        .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+}
+
+/// Opens saved window `slot` of `device` with this computer's UI. A start
+/// that fails is returned, not shown in a startup dialog: the caller explains
+/// it. An open window is brought forward instead.
+pub fn launch_device_window(device: &str, slot: &str) -> io::Result<()> {
+    crate::device::validate_name(device)?;
+    validate_window_slot(slot)?;
+    let executable = crate::companion::Product::Ui.beside_current()?;
+    let mut command = process::Command::new(executable);
+    command.args([
+        "--device",
+        device,
+        "--device-window-scoped",
+        "--window",
+        slot,
+        CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT,
+    ]);
+    match crate::control::spawn_ui_process(&mut command) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string() == ApplicationLeaseError::AlreadyRunning.to_string() => {
+            if activate_window(slot)? {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "That window is still closing. Try again in a moment.",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local
@@ -3582,6 +3703,121 @@ fn runs_helper_mode(process: &Path) -> io::Result<bool> {
 fn current_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and no failure state.
     unsafe { libc::geteuid() }
+}
+
+/// Set by the systemd user unit `cagents daemon boot enable` installs, on the
+/// `cagents daemon start` it runs, and passed on to the daemon that starts.
+///
+/// A daemon started at boot holds the user manager's environment from before
+/// any login: no `DISPLAY`, `WAYLAND_DISPLAY` or desktop agent. A graphical
+/// login imports those into the user manager later, so such a daemon reads
+/// them from there each time it launches a terminal. The daemon consumes the
+/// marker at startup so its terminals never inherit it.
+pub const DAEMON_AT_BOOT_ENV: &str = "CAGENTS_DAEMON_AT_BOOT";
+
+/// In the instance's runtime directory, beside its socket, the record that
+/// the boot unit started a daemon of this instance since the user manager
+/// started. An update's replacement daemon is started by the updater, without
+/// the marker, and carries on from it. The runtime directory lasts as long as
+/// the user manager: until the next boot with lingering, or the last logout
+/// without it.
+const DAEMON_STARTED_AT_BOOT_FILE: &str = "daemon-started-at-boot";
+
+static DAEMON_AT_BOOT_MARKER: AtomicBool = AtomicBool::new(false);
+
+/// Records and clears [`DAEMON_AT_BOOT_ENV`].
+///
+/// # Safety
+/// Call from the daemon's single-threaded entry point: it changes the
+/// process environment.
+pub unsafe fn take_daemon_at_boot_marker() {
+    if env::var_os(DAEMON_AT_BOOT_ENV).is_some() {
+        DAEMON_AT_BOOT_MARKER.store(true, Ordering::Relaxed);
+        // SAFETY: the caller guarantees no other thread reads the environment.
+        unsafe { env::remove_var(DAEMON_AT_BOOT_ENV) };
+    }
+}
+
+/// The instance runtime directory the record is in, as the daemon's
+/// `RuntimePaths` names it.
+pub fn daemon_started_at_boot_directory() -> io::Result<PathBuf> {
+    let base = runtime_base()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR is not set to an absolute path",
+        )
+    })?;
+    Ok(base.join(runtime_subdirectory()))
+}
+
+/// The record in an instance runtime `directory`.
+pub fn daemon_started_at_boot_record(directory: &Path) -> PathBuf {
+    directory.join(DAEMON_STARTED_AT_BOOT_FILE)
+}
+
+/// Writes the record in `directory` when the boot unit started this daemon.
+/// The daemon calls it once it holds its lease and serves, so a start that
+/// fails leaves none behind, and `cagents daemon boot disable` removing it
+/// later stays removed.
+pub fn record_daemon_started_at_boot(directory: &Path) -> io::Result<bool> {
+    if !DAEMON_AT_BOOT_MARKER.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    write_started_at_boot(&daemon_started_at_boot_record(directory))?;
+    Ok(true)
+}
+
+fn write_started_at_boot(record: &Path) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(record)
+        .map(drop)
+}
+
+/// Whether the boot unit started this daemon, or one it replaced in this
+/// boot.
+pub fn daemon_started_at_boot() -> bool {
+    DAEMON_AT_BOOT_MARKER.load(Ordering::Relaxed)
+        || daemon_started_at_boot_directory().is_ok_and(|directory| started_at_boot_in(&directory))
+}
+
+/// Whether `directory` holds the record, as a file rather than a link.
+fn started_at_boot_in(directory: &Path) -> bool {
+    fs::symlink_metadata(daemon_started_at_boot_record(directory))
+        .is_ok_and(|metadata| metadata.is_file())
+}
+
+#[cfg(test)]
+#[test]
+fn a_daemon_replacing_one_started_at_boot_carries_on() {
+    // Not the real runtime directory: a development daemon there would take
+    // the record for its own.
+    let runtime = tempfile::tempdir().unwrap();
+    let directory = runtime.path();
+    assert!(!started_at_boot_in(directory));
+    // Without the marker, a daemon records nothing.
+    assert!(!record_daemon_started_at_boot(directory).unwrap());
+    assert!(!started_at_boot_in(directory));
+    // The daemon the unit started records it once it serves...
+    DAEMON_AT_BOOT_MARKER.store(true, Ordering::Relaxed);
+    let recorded = record_daemon_started_at_boot(directory);
+    DAEMON_AT_BOOT_MARKER.store(false, Ordering::Relaxed);
+    assert!(recorded.unwrap());
+    // ...for its replacement, started by an updater without the marker.
+    assert!(started_at_boot_in(directory));
+    // `daemon boot disable` removes it, and nothing writes it again.
+    let record = daemon_started_at_boot_record(directory);
+    fs::remove_file(&record).unwrap();
+    assert!(!started_at_boot_in(directory));
+    // A link there is not the record, and is not followed.
+    let elsewhere = directory.join("elsewhere");
+    std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+    assert!(!started_at_boot_in(directory));
+    assert!(write_started_at_boot(&record).is_err());
+    assert!(!elsewhere.exists());
 }
 
 // Source-tree debug builds are development instances by default. The explicit
@@ -4990,6 +5226,29 @@ mod tests {
         // It remains open, but must no longer hold the abandoned shared lock.
         assert!(inherited.is_some());
         assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    #[test]
+    fn a_device_window_that_cannot_reopen_does_not_take_the_update_back() {
+        let device_slot = crate::device::scoped_window_slot("build-host", "primary");
+        let (errors, notes) = split_relaunch_failures(
+            vec![
+                (
+                    device_slot.clone(),
+                    "build-host runs an older cagents".into(),
+                ),
+                ("window-2".into(), "no display".into()),
+            ],
+            |slot| (slot == device_slot).then(|| "build-host".to_owned()),
+        );
+        assert_eq!(errors, [("window-2".to_owned(), "no display".to_owned())]);
+        assert_eq!(
+            notes,
+            [(
+                "the window on build-host".to_owned(),
+                "build-host runs an older cagents".to_owned()
+            )]
+        );
     }
 
     #[test]

@@ -900,6 +900,22 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         207,
         "intermediate #4235 protocol; no released install was qualified as a live-update source",
     ),
+    (
+        210,
+        "intermediate #4258 protocol; superseded by 211 without a qualified installed update source",
+    ),
+    (
+        211,
+        "intermediate #4481 protocol; superseded by 212 without a qualified installed update source",
+    ),
+    (
+        212,
+        "intermediate #4451 protocol; superseded by 213 without a qualified installed update source",
+    ),
+    (
+        213,
+        "intermediate #4489 protocol; superseded by 214 without a qualified installed update source",
+    ),
 ];
 
 #[cfg(any(test, feature = "test-support"))]

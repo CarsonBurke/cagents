@@ -318,6 +318,7 @@ mod tests {
         for table in [
             "automation_attention_resolution",
             "session_lineage_predecessors",
+            "project_order",
         ] {
             assert_eq!(rows.remove(table), Some(Vec::new()), "{table}");
         }

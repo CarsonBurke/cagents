@@ -239,8 +239,7 @@ impl Cagents {
                 } else {
                     self.sidebar_model.projects.push(sidebar_project);
                 }
-                self.sidebar_model
-                    .apply_project_order(&self.durable.project_order);
+                self.order_sidebar_projects();
                 self.sync_worktree_operation_rows();
                 self.sidebar_model.data_state = SidebarDataState::Ready;
                 let pr_enrichment =

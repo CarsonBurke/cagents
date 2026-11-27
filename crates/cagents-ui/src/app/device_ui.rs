@@ -20,17 +20,12 @@ pub(super) enum SidebarRoute {
         project_id: ProjectId,
         worktree_id: Option<crate::model::WorktreeId>,
     },
-    /// The device's worktree tools stand in for the worktree dialogs, which
-    /// run Git on this computer (#688). `remove` names a worktree to delete.
-    DeviceWorktrees {
-        project_id: ProjectId,
-        remove: Option<crate::model::WorktreeId>,
-    },
+    /// The device's worktree tools stand in for the worktree creation
+    /// dialogs, which run Git on this computer (#688).
+    DeviceWorktrees { project_id: ProjectId },
     /// The device's Changes or Files panel stands in for the source control
     /// and file lists, which read this computer's checkout.
     DeviceTool(Panel),
-    /// Deleting the selected rows depends on what they are.
-    DeleteSelectedRows,
     /// A checkout's pull request opens on its forge; creating one needs `gh`.
     PullRequest {
         project_id: ProjectId,
@@ -48,7 +43,6 @@ pub(super) enum SidebarRoute {
 /// equivalent, or says why it can't.
 pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
     use crate::sidebar::ProjectCommand;
-    use sidebar::SelectionRow;
     // Exhaustive, so a new action has to be classified here.
     Some(match action {
         SidebarAction::ReorderMember { .. }
@@ -89,7 +83,15 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::MarkChannelRead(_)
         | SidebarAction::DeleteChannel { .. }
         | SidebarAction::RetryChannelDeletion { .. }
-        | SidebarAction::DeleteRow(SelectionRow::Channel(_) | SelectionRow::Card(_))
+        | SidebarAction::DismissChannelDeletion { .. }
+        // A project leaves the device daemon's registry as it leaves this
+        // computer's: its sessions close and its files stay on the device.
+        // A worktree is deleted through the same confirmation and cleanup as
+        // a local one, by the device's Git.
+        | SidebarAction::DeleteRow(_)
+        | SidebarAction::DeleteSelectedRows
+        | SidebarAction::RetryWorktreeDeletion { .. }
+        | SidebarAction::DismissWorktreeDeletion { .. }
         // Only a local worktree operation can be dismissed, and dismissing or
         // cancelling a confirmation changes nothing outside this window.
         | SidebarAction::DismissWorktreeOperation(_)
@@ -109,24 +111,20 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
             | ProjectCommand::CopyBranch
             | ProjectCommand::MoveUp
             | ProjectCommand::MoveDown
-            | ProjectCommand::ResetSidebarOrder => return None,
+            | ProjectCommand::ResetSidebarOrder
+            | ProjectCommand::Remove
+            | ProjectCommand::Delete => return None,
             ProjectCommand::Reveal => SidebarRoute::BrowseOnDevice {
                 project_id: *project_id,
                 worktree_id: *worktree_id,
             },
             ProjectCommand::NewWorktree => SidebarRoute::DeviceWorktrees {
                 project_id: *project_id,
-                remove: None,
-            },
-            ProjectCommand::Delete => SidebarRoute::DeviceWorktrees {
-                project_id: *project_id,
-                remove: *worktree_id,
             },
             ProjectCommand::NewWorktreeFromBranch => SidebarRoute::Unavailable(
                 "Starting a worktree from an existing branch isn't available in a device window \
                  yet. Use New worktree, or git worktree in a terminal on the device.",
             ),
-            ProjectCommand::Remove => SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE),
             ProjectCommand::PullRequest => SidebarRoute::PullRequest {
                 project_id: *project_id,
                 worktree_id: *worktree_id,
@@ -139,28 +137,16 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         },
         SidebarAction::NewWorktree { project_id, .. } => SidebarRoute::DeviceWorktrees {
             project_id: *project_id,
-            remove: None,
         },
-        SidebarAction::DeleteRow(SelectionRow::Worktree(project_id, worktree_id)) => {
-            SidebarRoute::DeviceWorktrees {
-                project_id: *project_id,
-                remove: Some(*worktree_id),
-            }
-        }
-        SidebarAction::DeleteRow(SelectionRow::Project(_)) => {
-            SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE)
-        }
-        SidebarAction::DeleteSelectedRows => SidebarRoute::DeleteSelectedRows,
         SidebarAction::OpenPullRequest { url, .. } => SidebarRoute::OpenLink(url.clone()),
         SidebarAction::BrowsePullRequests { .. } | SidebarAction::CreatePullRequest { .. } => {
             SidebarRoute::Unavailable(PULL_REQUESTS_UNAVAILABLE)
         }
-        // A device's worktrees are created and removed in Device worktrees,
-        // so there is no local operation to resume.
+        // A device's worktrees are created in Device worktrees, so there is
+        // no local creation to resume.
         SidebarAction::CancelWorktreeOperation(_)
         | SidebarAction::EditWorktreeOperation(_)
-        | SidebarAction::RetryWorktreeOperation(_)
-        | SidebarAction::RetryWorktreeDeletion { .. } => SidebarRoute::Unavailable(
+        | SidebarAction::RetryWorktreeOperation(_) => SidebarRoute::Unavailable(
             "A device's worktrees are managed in Device worktrees, in the device menu.",
         ),
         SidebarAction::OpenFileInEditor { .. }
@@ -210,8 +196,6 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
     })
 }
 
-const REMOVE_PROJECT_UNAVAILABLE: &str = "Removing a project from a device window isn't \
-     available yet. Remove it from a window on that computer instead.";
 const CHECKOUT_NOT_LOADED: &str =
     "That checkout hasn't loaded from the device yet. Try again in a moment.";
 const PULL_REQUESTS_UNAVAILABLE: &str =
@@ -543,6 +527,24 @@ impl Cagents {
         self.open_checkout(path, true, DurableChange::Content).1
     }
 
+    /// The sidebar checkout Device worktrees names `name` in the project
+    /// whose main checkout it is browsing, if the window shows one.
+    fn device_checkout_named(&self, name: &str) -> Option<(ProjectId, crate::model::WorktreeId)> {
+        let directory = &self.device_ui.directory;
+        self.sidebar_model.projects.iter().find_map(|project| {
+            if project.kind == ProjectKind::Folder
+                || worktree_ui::project_main_checkout(project) != *directory
+            {
+                return None;
+            }
+            project.worktrees.iter().find_map(|worktree| {
+                (project_ui::device_worktree_name(directory, &worktree.path).as_deref()
+                    == Some(name.trim()))
+                .then_some((project.id, worktree.id))
+            })
+        })
+    }
+
     /// Carries out a device window's [`SidebarRoute`] for a sidebar action.
     pub(super) fn route_device_sidebar_action(&mut self, route: SidebarRoute) -> Task<Message> {
         match route {
@@ -568,7 +570,7 @@ impl Cagents {
                     panel: Panel::Files,
                 })
             }
-            SidebarRoute::DeviceWorktrees { project_id, remove } => {
+            SidebarRoute::DeviceWorktrees { project_id } => {
                 let Some(project) = self.sidebar_model.project(project_id) else {
                     return Task::none();
                 };
@@ -580,84 +582,15 @@ impl Cagents {
                 }
                 // The main checkout, where the device creates `.worktrees/`.
                 let main = worktree_ui::project_main_checkout(project);
-                let name = match remove {
-                    None => String::new(),
-                    Some(id) => {
-                        let Some(worktree) =
-                            project.worktrees.iter().find(|worktree| worktree.id == id)
-                        else {
-                            self.status = Some(TransientNotice::warning(CHECKOUT_NOT_LOADED));
-                            return Task::none();
-                        };
-                        if worktree.path == main {
-                            self.status = Some(TransientNotice::warning(
-                                "The main checkout can't be deleted on its own. It goes when the project is removed.",
-                            ));
-                            return Task::none();
-                        }
-                        // The device removes only `.worktrees/<name>` checkouts.
-                        let Some(name) = worktree
-                            .path
-                            .strip_prefix(main.join(".worktrees"))
-                            .ok()
-                            .filter(|name| name.components().count() == 1)
-                            .map(|name| name.display().to_string())
-                        else {
-                            self.status = Some(TransientNotice::warning(
-                                "A device window can only delete worktrees in the project's \
-                                 .worktrees folder. Use git worktree remove in a terminal on \
-                                 the device.",
-                            ));
-                            return Task::none();
-                        };
-                        name
-                    }
-                };
-                let task = self.update_device(Action::OpenIn {
+                self.update_device(Action::OpenIn {
                     path: Some(main),
                     panel: Panel::Worktrees,
-                });
-                // A busy or unsaved device dialog stays as it was, name and all.
-                if self.device_ui.open && self.device_ui.panel == Panel::Worktrees {
-                    self.device_ui.worktree_name = name;
-                }
-                task
+                })
             }
             SidebarRoute::DeviceTool(panel) => self.update_device(Action::OpenIn {
                 path: self.active_workspace.clone(),
                 panel,
             }),
-            SidebarRoute::DeleteSelectedRows => {
-                let visible = self.visible_sidebar_rows();
-                let selected = self.sidebar_state.selected_rows(&visible);
-                let worktrees = selected
-                    .iter()
-                    .filter(|row| matches!(row, sidebar::SelectionRow::Worktree(..)))
-                    .count();
-                if selected
-                    .iter()
-                    .any(|row| matches!(row, sidebar::SelectionRow::Project(_)))
-                {
-                    self.status = Some(TransientNotice::warning(REMOVE_PROJECT_UNAVAILABLE));
-                    return Task::none();
-                }
-                match (worktrees, selected.as_slice()) {
-                    // Channels and panes delete as they do locally.
-                    (0, _) => self.begin_sidebar_group_delete(),
-                    (1, [sidebar::SelectionRow::Worktree(project_id, worktree_id)]) => self
-                        .route_device_sidebar_action(SidebarRoute::DeviceWorktrees {
-                            project_id: *project_id,
-                            remove: Some(*worktree_id),
-                        }),
-                    _ => {
-                        self.status = Some(TransientNotice::warning(
-                            "A device window deletes one worktree at a time. Select a single \
-                             worktree, or only channels.",
-                        ));
-                        Task::none()
-                    }
-                }
-            }
             SidebarRoute::PullRequest {
                 project_id,
                 worktree_id,
@@ -869,7 +802,12 @@ impl Cagents {
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            open_device_window(&name, source.as_deref())
+                            let target = if replace {
+                                Target::Switch(window_origin())
+                            } else {
+                                Target::NewWindow { source }
+                            };
+                            open_device_window(&name, target)
                         })
                         .await
                         .unwrap_or_else(|error| Err(OpenFailure::Other(error.to_string())))
@@ -1051,6 +989,25 @@ impl Cagents {
                 expected: self.device_ui.original.clone(),
                 content: self.device_ui.content.text(),
             }),
+            Action::Git(GitOperation::RemoveWorktree { ref name })
+                if self.device_checkout_named(name).is_some() =>
+            {
+                let (project_id, worktree_id) =
+                    self.device_checkout_named(name).expect("checked above");
+                // A checkout this window shows is deleted as its row's Delete
+                // does it, so its panes and sessions close with it.
+                if self.device_ui.dirty() {
+                    self.device_ui.notice =
+                        Some("Save or discard the open file before deleting a worktree.".into());
+                    return Task::none();
+                }
+                drop(self.update_device(Action::Close));
+                return self.handle_project_action(project_ui::Action::Command {
+                    project_id,
+                    worktree_id: Some(worktree_id),
+                    command: sidebar::ProjectCommand::Delete,
+                });
+            }
             Action::Git(operation) => Some(Operation::Git {
                 root: self.device_ui.directory.clone(),
                 operation,
@@ -2093,51 +2050,97 @@ impl State {
 /// failure to this one, which says what went wrong: when the reason is one the
 /// person can fix from here, another cagents version on the device or none,
 /// the offer to fix it, and otherwise what the new window reported.
-fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailure> {
-    let executable = crate::companion::Product::Cli
-        .beside_current()
-        .map_err(|error| OpenFailure::Other(error.to_string()))?;
-    let json = |arguments: &[&str]| {
-        std::process::Command::new(&executable)
-            .arg("--json")
-            .args(arguments)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|output| {
-                (
-                    output.status.success(),
-                    String::from_utf8_lossy(&output.stdout).into_owned(),
-                )
-            })
+/// Which window a device window opens as.
+enum Target {
+    /// Another window, copying navigation from `source` on the same device.
+    NewWindow { source: Option<String> },
+    /// This window, on the other device. Named by its slot on this computer,
+    /// when it has one, so it reopens there after a restart.
+    Switch(Option<String>),
+}
+
+/// This window's slot on this computer: its own on this computer, or the one
+/// a switch to the device it shows came from.
+fn window_origin() -> Option<String> {
+    let slot = crate::instance::window_slot();
+    let Some(device) = crate::device::selected() else {
+        return Some(slot.to_owned());
     };
+    crate::device::placement::origin(&device.name, slot)
+        .inspect_err(|error| tracing::warn!(%error, "could not read which window this is"))
+        .ok()
+        .flatten()
+}
+
+fn open_device_window(name: &str, target: Target) -> Result<(), OpenFailure> {
     let mut open = vec![
         "--device",
         name,
         "ui",
-        "--new-window",
         crate::instance::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT,
     ];
-    if let Some(source) = source {
-        open.extend(["--source", source]);
+    match &target {
+        Target::Switch(Some(origin)) => open.extend(["--window", origin]),
+        Target::Switch(None) => open.push("--new-window"),
+        Target::NewWindow { source } => {
+            open.push("--new-window");
+            if let Some(source) = source {
+                open.extend(["--source", source]);
+            }
+        }
     }
-    let (opened, output) = json(&open).map_err(|error| OpenFailure::Other(error.to_string()))?;
+    let (opened, output) =
+        cli_json(&open).map_err(|error| OpenFailure::Other(error.to_string()))?;
     if opened {
+        if let Target::Switch(Some(origin)) = &target
+            && let Err(error) = crate::device::placement::record(origin, Some(name))
+        {
+            // The switch happened; only where the window reopens is lost.
+            tracing::warn!(%error, "could not record which device this window shows");
+        }
         return Ok(());
     }
+    Err(diagnose(
+        name,
+        device_update_ui::error_message(&output).as_deref(),
+    ))
+}
+
+/// Why device `name` did not open, given the reason its window reported:
+/// what it needs from this computer, when that is the cause. Opening a
+/// device window, a switch and a window reopening on its device all ask this.
+pub(super) fn diagnose(name: &str, reason: Option<&str>) -> OpenFailure {
+    diagnose_with(name, reason, cli_json)
+}
+
+/// [`diagnose`], asking the CLI through `json`.
+fn diagnose_with(
+    name: &str,
+    reason: Option<&str>,
+    json: impl Fn(&[&str]) -> std::io::Result<(bool, String)>,
+) -> OpenFailure {
     let failed = || {
-        device_update_ui::error_message(&output).map_or_else(
+        reason.map_or_else(
             || format!("Could not connect to {name}. Check its SSH connection and cagents daemon."),
-            |reason| sentence(&reason),
+            sentence,
         )
     };
+    // SSH could not connect at all, or connected and then heard nothing back:
+    // the checks below would each wait out the same silence, only to say
+    // nothing more. It starts with the device's name, kept as the person
+    // wrote it.
+    if let Some(reason) = reason.filter(|reason| {
+        crate::device::reads_as_unreachable(reason) || crate::device::reads_as_unresponsive(reason)
+    }) {
+        return OpenFailure::Other(reason.to_owned());
+    }
     // The update's own inspection tells what the device lacks, a missing
     // install included, and what it would refuse.
     let check = json(&["device", "update", name, "--check"]);
     if let Ok((_, checked)) = &check
         && let Some(checked) = device_update_ui::checked(checked)
     {
-        return Err(match (checked.need, checked.note) {
+        return match (checked.need, checked.note) {
             (Some(need), _) => OpenFailure::Needs {
                 need,
                 blocked: None,
@@ -2146,7 +2149,7 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
             // SSH commands cannot find.
             (None, Some(note)) => OpenFailure::Other(format!("{} {note}", failed())),
             (None, None) => OpenFailure::Other(failed()),
-        });
+        };
     }
     // It would not inspect, so it would not update either: say why, and,
     // when the device's daemon tells, which side is older.
@@ -2157,7 +2160,7 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
     let status = json(&["--device", name, "daemon", "status"])
         .map(|(_, output)| output)
         .unwrap_or_default();
-    Err(match device_update_ui::mismatch(&status) {
+    match device_update_ui::mismatch(&status) {
         Some(actual) => OpenFailure::Needs {
             need: device_update_ui::Need::of_protocol(actual),
             blocked: Some(refusal.unwrap_or_else(|| {
@@ -2165,7 +2168,37 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
             })),
         },
         None => OpenFailure::Other(failed()),
-    })
+    }
+}
+
+/// Runs this computer's CLI with `--json`: whether it succeeded, and the
+/// JSON result it printed.
+fn cli_json(arguments: &[&str]) -> std::io::Result<(bool, String)> {
+    let executable = crate::companion::Product::Cli.beside_current()?;
+    let output = std::process::Command::new(executable)
+        .arg("--json")
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let success = output.status.success();
+    Ok((
+        success,
+        json_result(success, &output.stdout, &output.stderr),
+    ))
+}
+
+/// The CLI prints a success to stdout, but a failure's JSON to stderr, last,
+/// after anything it logged on the way.
+fn json_result(success: bool, stdout: &[u8], stderr: &[u8]) -> String {
+    if success {
+        return String::from_utf8_lossy(stdout).into_owned();
+    }
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|line| line.starts_with('{'))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// `reason`, a CLI message, as a sentence that starts with a capital.
@@ -2179,6 +2212,47 @@ fn sentence(reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::Provider;
+
+    #[test]
+    fn a_device_ssh_cannot_reach_is_reported_without_asking_it_more() {
+        let reason = "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that `ssh build-host` connects without asking for a password, then try again.";
+        // Each question would wait out another SSH connection timeout.
+        let failure = diagnose_with("build-host", Some(reason), |arguments| {
+            panic!("asked the device again: {arguments:?}")
+        });
+        assert!(matches!(failure, OpenFailure::Other(message) if message == reason));
+        // Nor is one SSH reached that then said nothing (#4486).
+        let slow = "build-host was reached over SSH, but its cagents daemon did not answer within 30 seconds. It may be busy or stuck: try again, or check it with `ssh build-host cagents daemon status`.";
+        let failure = diagnose_with("build-host", Some(slow), |arguments| {
+            panic!("asked the device again: {arguments:?}")
+        });
+        assert!(matches!(failure, OpenFailure::Other(message) if message == slow));
+        // Any other failure is still looked into.
+        let asked = std::cell::Cell::new(0);
+        let _ = diagnose_with("build-host", Some("the daemon stopped"), |_| {
+            asked.set(asked.get() + 1);
+            Ok((false, String::new()))
+        });
+        assert_eq!(asked.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_command_is_read_from_the_json_it_wrote_to_stderr() {
+        let refusal = r#"{"ok":false,"error":{"kind":"device_incompatible","message":"old runs an older cagents","details":{"device":"old","expected":210,"protocol":208}}}"#;
+        let stderr = format!("2026-11-26 WARN reconnecting\n{refusal}\n");
+        let printed = json_result(false, b"", stderr.as_bytes());
+        // A device that is older says so, so the window offers the update.
+        assert_eq!(device_update_ui::mismatch(&printed), Some(208));
+        assert_eq!(
+            device_update_ui::error_message(&printed).as_deref(),
+            Some("old runs an older cagents")
+        );
+        assert_eq!(
+            json_result(true, b"{\"ok\":true}\n", b"noise"),
+            "{\"ok\":true}\n"
+        );
+        assert_eq!(json_result(false, b"", b"ssh: no route\n"), "");
+    }
 
     #[test]
     fn devices_menu_and_keyboard_chat_picker_transfer_keyboard_ownership() {
@@ -2688,6 +2762,8 @@ mod tests {
                 channel_id: channel,
             },
             SidebarAction::DeleteRow(sidebar::SelectionRow::Channel(channel)),
+            SidebarAction::DeleteRow(sidebar::SelectionRow::Project(project_id)),
+            on(None, sidebar::ProjectCommand::Remove),
             command(sidebar::ProjectCommand::NewChannel),
             command(sidebar::ProjectCommand::NewTerminal),
             command(sidebar::ProjectCommand::CopyPath),
@@ -2705,31 +2781,35 @@ mod tests {
                 })
             );
         }
-        for (action, remove) in [
-            (command(sidebar::ProjectCommand::NewWorktree), None),
-            (
-                SidebarAction::NewWorktree {
-                    project_id,
-                    repository: "/srv/demo/.git".into(),
-                },
-                None,
-            ),
-            (command(sidebar::ProjectCommand::Delete), Some(worktree_id)),
-            (
-                SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, worktree_id)),
-                Some(worktree_id),
-            ),
+        for action in [
+            command(sidebar::ProjectCommand::NewWorktree),
+            SidebarAction::NewWorktree {
+                project_id,
+                repository: "/srv/demo/.git".into(),
+            },
         ] {
             assert_eq!(
                 sidebar_route(&action),
-                Some(SidebarRoute::DeviceWorktrees { project_id, remove }),
+                Some(SidebarRoute::DeviceWorktrees { project_id }),
                 "{action:?}"
             );
         }
-        assert_eq!(
-            sidebar_route(&SidebarAction::DeleteSelectedRows),
-            Some(SidebarRoute::DeleteSelectedRows)
-        );
+        // Deletion runs through the local confirmation, by the device's Git.
+        for action in [
+            command(sidebar::ProjectCommand::Delete),
+            SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, worktree_id)),
+            SidebarAction::DeleteSelectedRows,
+            SidebarAction::RetryWorktreeDeletion {
+                project_id,
+                worktree_id,
+            },
+            SidebarAction::DismissWorktreeDeletion {
+                project_id,
+                worktree_id,
+            },
+        ] {
+            assert_eq!(sidebar_route(&action), None, "{action:?}");
+        }
         assert_eq!(
             sidebar_route(&SidebarAction::OpenPullRequest {
                 project_id,
@@ -2767,18 +2847,34 @@ mod tests {
             assert_eq!(sidebar_route(&action), None, "{action:?}");
         }
         for action in [
-            command(sidebar::ProjectCommand::Remove),
             command(sidebar::ProjectCommand::RepositoryUrl),
             command(sidebar::ProjectCommand::NewWorktreeFromBranch),
             SidebarAction::RetryWorktreeOperation(crate::model::OperationId::new()),
             command(sidebar::ProjectCommand::OpenEditor("code".into())),
-            SidebarAction::DeleteRow(sidebar::SelectionRow::Project(project_id)),
             SidebarAction::BrowsePullRequests { project_id },
         ] {
             assert!(
                 matches!(sidebar_route(&action), Some(SidebarRoute::Unavailable(reason)) if !reason.is_empty()),
                 "{action:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_device_window_menu_offers_nothing_its_routing_refuses() {
+        let project_id = ProjectId::new();
+        for worktree_id in [None, Some(crate::model::WorktreeId::new())] {
+            for command in sidebar::device_menu_commands(project_id, worktree_id, "amd") {
+                let action = SidebarAction::ProjectCommand {
+                    project_id,
+                    worktree_id,
+                    command,
+                };
+                assert!(
+                    !matches!(sidebar_route(&action), Some(SidebarRoute::Unavailable(_))),
+                    "{action:?} is offered but refused"
+                );
+            }
         }
     }
 
@@ -2973,29 +3069,39 @@ mod tests {
         assert_eq!(app.device_ui.path, main.display().to_string());
         settle(&mut app);
 
-        // Deleting a linked worktree names it for the device's remove action.
-        drop(app.update(Message::Sidebar(SidebarAction::DeleteRow(
-            sidebar::SelectionRow::Worktree(project_id, linked_id),
-        ))));
-        assert!(app.device_ui.open);
-        assert_eq!(app.device_ui.panel, Panel::Worktrees);
-        assert_eq!(app.device_ui.worktree_name, "feature");
-        // While the listing is pending the dialog refuses another request,
-        // and a Delete aimed at it leaves the name it shows alone.
-        app.device_ui.worktree_name = "typed".into();
-        drop(app.update(Message::Sidebar(SidebarAction::DeleteRow(
-            sidebar::SelectionRow::Worktree(project_id, linked_id),
-        ))));
-        assert_eq!(app.device_ui.worktree_name, "typed");
-        settle(&mut app);
-        // New worktree starts with an empty name, not the last Delete's.
-        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
-            project_id,
-            worktree_id: Some(linked_id),
-            command: sidebar::ProjectCommand::Delete,
+        // Deleting a linked worktree asks first, in the same confirmation
+        // as a local one, rather than sending the user to the device tools.
+        let dismiss = |app: &mut Cagents| {
+            drop(app.update(Message::ProjectUi(project_ui::Action::Dismiss)));
+            assert!(!app.project_ui.modal_open());
+        };
+        for action in [
+            SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, linked_id)),
+            SidebarAction::ProjectCommand {
+                project_id,
+                worktree_id: Some(linked_id),
+                command: sidebar::ProjectCommand::Delete,
+            },
+        ] {
+            drop(app.update(Message::Sidebar(action.clone())));
+            assert!(!app.device_ui.open, "{action:?}");
+            assert!(app.project_ui.modal_open(), "{action:?}");
+            dismiss(&mut app);
+        }
+        // So does Device worktrees' own Remove, for a checkout the sidebar
+        // lists; the dialog gives way to the confirmation.
+        drop(app.update_device(Action::OpenIn {
+            path: Some(main.clone()),
+            panel: Panel::Worktrees,
+        }));
+        app.device_ui.busy = false;
+        app.device_ui.directory = main.clone();
+        drop(app.update_device(Action::Git(GitOperation::RemoveWorktree {
+            name: "feature".into(),
         })));
-        assert_eq!(app.device_ui.worktree_name, "feature");
-        settle(&mut app);
+        assert!(!app.device_ui.open);
+        assert!(app.project_ui.modal_open());
+        dismiss(&mut app);
         drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
             project_id,
             worktree_id: None,
@@ -3005,19 +3111,8 @@ mod tests {
         assert!(app.device_ui.worktree_name.is_empty());
         settle(&mut app);
 
-        // The main checkout is never offered for deletion.
+        // Several worktrees delete together, as they do locally.
         let main_id = app.sidebar_model.project(project_id).unwrap().worktrees[0].id;
-        drop(app.update(Message::Sidebar(SidebarAction::DeleteRow(
-            sidebar::SelectionRow::Worktree(project_id, main_id),
-        ))));
-        assert!(!app.device_ui.open);
-        assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message.contains("main checkout"))
-        );
-
-        // A selection of two worktrees says to delete one at a time.
         app.status = None;
         drop(
             app.update(Message::Sidebar(SidebarAction::SetWorktreeDisplay {
@@ -3026,39 +3121,22 @@ mod tests {
             })),
         );
         drop(app.update(Message::Sidebar(SidebarAction::ClearRowSelection)));
-        for (worktree, intent) in [
-            (main_id, sidebar::SelectionIntent::Toggle),
-            (linked_id, sidebar::SelectionIntent::Toggle),
-        ] {
+        for worktree in [main_id, linked_id] {
             drop(app.update(Message::Sidebar(SidebarAction::SelectRows {
                 row: sidebar::SelectionRow::Worktree(project_id, worktree),
-                intent,
+                intent: sidebar::SelectionIntent::Toggle,
             })));
         }
-        assert_eq!(
-            app.sidebar_state
-                .selected_rows(&app.visible_sidebar_rows())
-                .len(),
-            2
-        );
         drop(app.update(Message::Sidebar(SidebarAction::DeleteSelectedRows)));
         assert!(!app.device_ui.open);
         assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message.contains("one worktree at a time")),
+            app.sidebar_selection_ui.dialog.is_some(),
             "{:?}",
             app.status
         );
-        // One selected worktree goes to its device action.
-        drop(app.update(Message::Sidebar(SidebarAction::SelectRows {
-            row: sidebar::SelectionRow::Worktree(project_id, main_id),
-            intent: sidebar::SelectionIntent::Toggle,
-        })));
-        drop(app.update(Message::Sidebar(SidebarAction::DeleteSelectedRows)));
-        assert_eq!(app.device_ui.panel, Panel::Worktrees);
-        assert_eq!(app.device_ui.worktree_name, "feature");
-        settle(&mut app);
+        drop(app.update(Message::SidebarSelection(
+            sidebar_selection_ui::Action::Dismiss,
+        )));
         drop(app.update(Message::Sidebar(SidebarAction::ClearRowSelection)));
 
         // A routed command waits behind an open dialog, as it does locally.
@@ -3092,18 +3170,74 @@ mod tests {
         assert_eq!(app.device_ui.path, "/srv/device-only/other");
         settle(&mut app);
 
-        // What a device can't do yet says so instead of opening the tools.
+        // Confirming a worktree's deletion passes the device window's gate
+        // rather than being refused as local work. Here, without session
+        // storage, the dialog's own first check then declines it.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: Some(linked_id),
+            command: sidebar::ProjectCommand::Delete,
+        })));
+        assert!(app.project_ui.modal_open());
+        app.status = None;
+        drop(app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete)));
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(
+            format!("{:?}", app.project_ui).contains("Session storage is unavailable"),
+            "{:?}",
+            app.project_ui
+        );
+        dismiss(&mut app);
+
+        // Remove project asks first, as locally, and says the files stay
+        // on the device; nothing opens the device tools.
+        app.status = None;
         drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
             project_id,
             worktree_id: None,
             command: sidebar::ProjectCommand::Remove,
         })));
         assert!(!app.device_ui.open);
-        assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message == REMOVE_PROJECT_UNAVAILABLE)
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(app.project_ui.modal_open());
+        assert_eq!(
+            project_ui::files_stay(),
+            "on sidebar-test",
+            "the confirmation names where the files stay"
         );
+        // Its buttons answer it here rather than being refused as local work.
+        drop(app.update(Message::ProjectUi(project_ui::Action::Dismiss)));
+        assert!(!app.project_ui.modal_open());
+        assert!(app.status.is_none(), "{:?}", app.status);
+        // So does Delete on a selected project row.
+        drop(app.update(Message::Sidebar(SidebarAction::DeleteRow(
+            sidebar::SelectionRow::Project(project_id),
+        ))));
+        assert!(!app.device_ui.open);
+        assert!(app.project_ui.modal_open());
+        drop(app.update(Message::ProjectUi(project_ui::Action::Dismiss)));
+        assert!(!app.project_ui.modal_open());
+
+        // Confirming starts the removal rather than being refused as local
+        // work; the device's answer arrives later.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: None,
+            command: sidebar::ProjectCommand::Remove,
+        })));
+        drop(app.update(Message::ProjectUi(project_ui::Action::ConfirmRemove)));
+        assert!(!app.project_ui.modal_open());
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(app.project_ui.removing.contains_key(&main.join(".git")));
+
+        // Removing it compares the device's paths as the device reported
+        // them, never resolving one on this computer's disk.
+        let resolutions = project_ui::scope_resolutions();
+        assert!(
+            project_ui::device_aware_scope_contains(&[main.clone()], &linked),
+            "device paths compare as the device reported them"
+        );
+        assert_eq!(project_ui::scope_resolutions(), resolutions);
     }
 
     #[test]

@@ -94,12 +94,34 @@ pub enum Operation {
 pub enum GitOperation {
     Status,
     Worktrees,
-    CreateWorktree { name: String, branch: String },
-    RemoveWorktree { name: String },
-    Diff { staged: bool },
-    Stage { paths: Vec<PathBuf> },
-    Unstage { paths: Vec<PathBuf> },
-    Commit { message: String },
+    CreateWorktree {
+        name: String,
+        branch: String,
+    },
+    RemoveWorktree {
+        name: String,
+    },
+    Diff {
+        staged: bool,
+    },
+    Stage {
+        paths: Vec<PathBuf>,
+    },
+    Unstage {
+        paths: Vec<PathBuf>,
+    },
+    Commit {
+        message: String,
+    },
+    /// Answers whether [`GitOperation::RemoveWorktree`] would remove the
+    /// worktree `name`, changing nothing: empty text when it would, its
+    /// refusal as the text otherwise. A refusal is an answer, not an error,
+    /// so the window can tell it from a device it could not ask. A window
+    /// asks before closing the worktree's sessions, so a refusal leaves them
+    /// running.
+    CheckWorktreeRemoval {
+        name: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -604,27 +626,19 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
                 .arg(destination)
         }
         GitOperation::RemoveWorktree { name } => {
-            worktree_name(&name)?;
             let root = command
                 .current_dir
                 .as_ref()
                 .ok_or("repository directory unavailable")?;
-            let destination = root.join(".worktrees").join(name);
-            crate::secure_file::reject_symlink_components(&destination)
-                .map_err(|error| error.to_string())?;
-            // Git refuses a dirty worktree itself, but not one whose detached
-            // HEAD is the only thing holding its commits.
-            let service = crate::repository::RepositoryService::system("git");
-            let cancellation = CancellationToken::new();
-            let records = service
-                .list_worktrees(root, &cancellation)
-                .map_err(|error| error.to_string())?;
-            let record = records
-                .iter()
-                .find(|record| record.path == destination)
-                .ok_or("worktree is not registered with Git")?;
-            service.refuse_losing_detached_commits(root, record, &cancellation)?;
+            let destination = removable_worktree(root, &name)?;
             command.args(["worktree", "remove", "--"]).arg(destination)
+        }
+        GitOperation::CheckWorktreeRemoval { name } => {
+            let root = command
+                .current_dir
+                .as_ref()
+                .ok_or("repository directory unavailable")?;
+            return Ok(removable_worktree(root, &name).err().unwrap_or_default());
         }
         GitOperation::Diff { staged } => {
             let command = command.args(["diff", "--no-ext-diff", "--no-textconv"]);
@@ -669,6 +683,71 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
     String::from_utf8(output.stdout).map_err(|_| "Git output is not UTF-8".into())
+}
+/// Where worktree `name` of the repository at `root` is, when the device
+/// would remove it: checked without changing anything, for both the removal
+/// and the check a window runs before closing the worktree's sessions.
+///
+/// The removal runs without `--force`, so this refuses what Git would, and
+/// more: Git's own check follows `status.showUntrackedFiles`, which can hide
+/// untracked files it would then delete, while this counts every one.
+#[cfg(feature = "host")]
+fn removable_worktree(root: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    use crate::process::CancellationToken;
+    worktree_name(name)?;
+    let destination = root.join(".worktrees").join(name);
+    crate::secure_file::reject_symlink_components(&destination)
+        .map_err(|error| error.to_string())?;
+    let service = crate::repository::RepositoryService::system("git");
+    let cancellation = CancellationToken::new();
+    let records = service
+        .list_worktrees(root, &cancellation)
+        .map_err(|error| error.to_string())?;
+    let record = records
+        .iter()
+        .find(|record| record.path == destination)
+        .ok_or("worktree is not registered with Git")?;
+    if record.lock.locked {
+        return Err("the worktree is locked; unlock it in Git on the device first".into());
+    }
+    // Git refuses a dirty worktree itself, but not one whose detached HEAD is
+    // the only thing holding its commits.
+    service.refuse_losing_detached_commits(root, record, &cancellation)?;
+    // Git refuses a worktree with a checked-out submodule, one whose
+    // directory holds a `.git`; a submodule never checked out there is
+    // removed like any directory. Only a gitlink can hold one: every other
+    // index entry is a file.
+    let index = service
+        .index_paths(&destination, &cancellation)
+        .map_err(|error| error.to_string())?;
+    if index.gitlinks
+        && index.paths.iter().any(|path| {
+            // A tracked symlink is a file entry, even when it points at
+            // a directory holding a `.git`.
+            let entry = destination.join(path.as_os_str());
+            std::fs::symlink_metadata(&entry).is_ok_and(|metadata| metadata.is_dir())
+                && entry.join(".git").exists()
+        })
+    {
+        return Err(
+            "it has checked-out submodules, which Git removes only with --force. Use \
+             git worktree remove --force in a terminal on the device."
+                .into(),
+        );
+    }
+    if service
+        .status_for_removal(&destination, &cancellation)
+        .map_err(|error| error.to_string())?
+        .dirty
+        .is_dirty()
+    {
+        return Err(
+            "it has uncommitted or untracked changes. Commit or remove them on the \
+             device first, or use git worktree remove --force in a terminal there."
+                .into(),
+        );
+    }
+    Ok(destination)
 }
 /// Existing commits use the original restore operation. An unborn branch
 /// instead removes selected index entries, leaving even edited files intact.
@@ -1395,9 +1474,25 @@ mod tests {
                 .contains(".worktrees")
         );
         std::fs::write(root.join(".worktrees/dev/untracked"), "keep").unwrap();
+        let check =
+            |name: &str| match invoke(GitOperation::CheckWorktreeRemoval { name: name.into() }) {
+                Ok(Reply::Text(refusal)) => refusal,
+                other => panic!("{other:?}"),
+            };
+        let refusal = check("dev");
+        assert!(refusal.contains("uncommitted or untracked"), "{refusal}");
+        // Hiding untracked files from status hides them from Git's own check,
+        // which would then delete them; the device still counts them.
+        run(&["config", "status.showUntrackedFiles", "no"]);
+        assert!(!check("dev").is_empty());
         assert!(invoke(GitOperation::RemoveWorktree { name: "dev".into() }).is_err());
         assert!(root.join(".worktrees/dev/untracked").exists());
+        run(&["config", "--unset", "status.showUntrackedFiles"]);
         std::fs::remove_file(root.join(".worktrees/dev/untracked")).unwrap();
+        // The check changes nothing.
+        assert_eq!(check("dev"), "");
+        assert!(root.join(".worktrees/dev").is_dir());
+        assert!(check("missing").contains("not registered"));
         invoke(GitOperation::RemoveWorktree { name: "dev".into() }).unwrap();
         assert!(!root.join(".worktrees/dev").exists());
         // A detached worktree whose HEAD alone holds a commit is kept; once
@@ -1428,6 +1523,8 @@ mod tests {
         };
         run_in(&["switch", "--detach"]);
         run_in(&["commit", "--allow-empty", "-m", "detached only"]);
+        let refusal = check("detached");
+        assert!(refusal.contains("1 commit on no branch"), "{refusal}");
         let refusal = invoke(GitOperation::RemoveWorktree {
             name: "detached".into(),
         })
@@ -1440,6 +1537,63 @@ mod tests {
         })
         .unwrap();
         assert!(!detached.exists());
+        // Git removes a worktree with a checked-out submodule only with
+        // --force, so the device says so before anything closes; one never
+        // checked out there is removed as Git would remove it.
+        invoke(GitOperation::CreateWorktree {
+            name: "modules".into(),
+            branch: "feature/modules".into(),
+        })
+        .unwrap();
+        let modules = root.join(".worktrees/modules");
+        let head = String::from_utf8(git_output(&modules, &["rev-parse", "HEAD"])).unwrap();
+        git_output(
+            &modules,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},vendored", head.trim()),
+            ],
+        );
+        std::fs::write(
+            modules.join(".gitmodules"),
+            "[submodule \"vendored\"]\n\tpath = vendored\n\turl = ./vendored\n",
+        )
+        .unwrap();
+        git_output(&modules, &["add", ".gitmodules"]);
+        git_output(
+            &modules,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "gitlink",
+            ],
+        );
+        // Checking out a worktree leaves a submodule's directory empty.
+        std::fs::create_dir(modules.join("vendored")).unwrap();
+        assert_eq!(check("modules"), "");
+        git_output(&modules.join("vendored"), &["init", "-q"]);
+        let refusal = check("modules");
+        assert!(refusal.contains("checked-out submodules"), "{refusal}");
+        assert!(
+            invoke(GitOperation::RemoveWorktree {
+                name: "modules".into()
+            })
+            .is_err()
+        );
+        assert!(modules.join("vendored/.git").is_dir());
+        std::fs::remove_dir_all(modules.join("vendored/.git")).unwrap();
+        invoke(GitOperation::RemoveWorktree {
+            name: "modules".into(),
+        })
+        .unwrap();
+        assert!(!modules.exists());
         // The remote project can itself be an external linked checkout.
         // Remove the prior rule so this exercises its real policy write.
         let linked_directory = crate::repository::retained_managed_fixture_directory();
@@ -2135,18 +2289,9 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             registered.id() == account.id() && registered.resolved_home() == account.resolved_home()
         })
         .ok_or("account is not registered on this device")?;
-    let arguments = match account.provider {
-        Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
-        Provider::Codex => vec!["login".into(), "--device-auth".into()],
-        Provider::Muse => vec!["login".into()],
-        Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
-        Provider::Antigravity => {
-            return Err(format!(
-                "open {} in a terminal on this device to sign in",
-                account.provider.label()
-            ));
-        }
-    };
+    if account.provider == Provider::Omp {
+        return Err("open an Omp terminal on this device and use /login".into());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2159,33 +2304,11 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
                 account.provider.label()
             )
         })?;
-    let mut environment = std::collections::BTreeMap::new();
-    if let Some(path) = search_path.and_then(|path| path.into_string().ok()) {
-        environment.insert("PATH".into(), path);
-    }
-    let program = program
-        .into_os_string()
-        .into_string()
-        .map_err(|_| "provider executable is not UTF-8")?;
-    let mut recipe = crate::model::LaunchRecipe {
-        // Muse's `muse` may be a wrapper that cannot run `login`.
-        program: account.provider.subcommand_program(
-            &program,
-            std::path::Path::new("/"),
-            environment.get("PATH").map_or("", String::as_str),
-        ),
-        arguments,
-        working_directory: std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or("remote HOME is unavailable")?,
-        environment,
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect(),
-    };
-    account.bind_home(&mut recipe)?;
+    // The sign-in this device's own Accounts pane runs, so one made from
+    // another device, such as Antigravity's on a headless machine, is the
+    // same.
+    let recipe =
+        crate::account::remote::login_recipe_with_path(&account, program, search_path.as_deref())?;
     if account.provider == Provider::Claude
         && let (Some(cache), Some(key)) = (
             crate::account::cache::Cache::installation(),
@@ -2219,8 +2342,9 @@ fn mutation_lock(path: PathBuf) -> std::sync::Arc<std::sync::Mutex<()>> {
     lock
 }
 
-#[cfg(feature = "host")]
-fn worktree_name(name: &str) -> Result<(), String> {
+/// Checks a worktree name the device creates or removes under `.worktrees`.
+/// A device window applies it before asking, so it builds without `host`.
+pub fn worktree_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.len() > 80
         || name == "."

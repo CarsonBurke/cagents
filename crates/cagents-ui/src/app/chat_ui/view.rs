@@ -1730,6 +1730,7 @@ impl Cagents {
                         &runtime.session.launch.recipe,
                     ),
                     self.chat_offers_fresh_conversation(card),
+                    self.draft_provider_note(card),
                 );
                 if !runtime.closed_elsewhere
                     && let Some(recovery) = self.account_recovery_controls(card)
@@ -3429,6 +3430,7 @@ impl Runtime {
             offers,
             None,
             fresh_available,
+            None,
         )
     }
 
@@ -3447,6 +3449,7 @@ impl Runtime {
         offers: Vec<Offer<'a>>,
         reset_controls: Option<crate::app::account_ui::resets::Controls>,
         fresh_available: bool,
+        provider_note: Option<String>,
     ) -> Element<'a, Message> {
         let transition = transition.into();
         let transitioning = !matches!(transition, ViewTransition::Idle);
@@ -4770,7 +4773,7 @@ impl Runtime {
                             .into_iter()
                             .chain(self.restored_waiting_notice())
                             .chain(self.dictation_view())
-                            .chain(self.composer_note_view())
+                            .chain(self.composer_note_view(provider_note))
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.
                             .chain(self.stop_confirmation())
@@ -7012,23 +7015,35 @@ impl Runtime {
     /// Why something tried in this pane didn't happen, at the composer
     /// where it was tried. It is a note about that try rather than about the
     /// conversation, so it leaves the turn's outcome and the timeline alone.
-    fn composer_note_view(&self) -> Option<Element<'_, Message>> {
-        let note = self.composer_note.as_deref()?;
+    ///
+    /// Without one, a draft whose provider isn't installed says so, before
+    /// it is tried. That follows Accounts, so it has nothing to dismiss.
+    fn composer_note_view(&self, provider_note: Option<String>) -> Option<Element<'_, Message>> {
+        let (note, dismiss): (Cow<'_, str>, _) = match self.composer_note.as_deref() {
+            Some(note) => (note.into(), true),
+            None => (provider_note?.into(), false),
+        };
         Some(
             widget::container(
-                widget::row::with_children(vec![
-                    crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
-                    design::caption(note)
-                        .class(cosmic::theme::Text::Custom(design::warning_text))
-                        .wrapping(iced::widget::text::Wrapping::Word)
-                        .width(Length::Fill)
-                        .into(),
-                    small_icon(
-                        Icon::Close,
-                        "Dismiss",
-                        Action::DismissComposerNote(self.target),
-                    ),
-                ])
+                widget::row::with_children(
+                    [
+                        crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+                        design::caption(note)
+                            .class(cosmic::theme::Text::Custom(design::warning_text))
+                            .wrapping(iced::widget::text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .into(),
+                    ]
+                    .into_iter()
+                    .chain(dismiss.then(|| {
+                        small_icon(
+                            Icon::Close,
+                            "Dismiss",
+                            Action::DismissComposerNote(self.target),
+                        )
+                    }))
+                    .collect::<Vec<_>>(),
+                )
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center),
             )

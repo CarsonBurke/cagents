@@ -6,6 +6,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
 browserless=false
+dictation_product=
 debug=false
 fresh_daemon=false
 hot=false
@@ -26,6 +27,7 @@ while [ "$#" -gt 0 ]; do
         # Internal: the watcher an instance's launch leaves behind.
         __watch-instance) watch_instance=true; shift; break ;;
         --browserless) browserless=true ;;
+        --dictation) dictation_product=cagents-dictate ;;
         --debug) debug=true ;;
         --fresh-daemon) fresh_daemon=true ;;
         --hot) hot=true; browserless=true ;;
@@ -102,6 +104,7 @@ Usage: scripts/run-development [OPTIONS] [-- UI_ARGUMENTS...]
 
 Options:
   --browserless    Build without Servo and open saved browser URLs externally
+  --dictation      Also build the speech recognition helper (without hot reload)
   --debug          Enable cagents debug logs and Rust backtraces
   --fresh-daemon   Stop development sessions and background subagents after building
   --hot            Experimental browserless Linux hot reload (pinned cargo-hot/bwrap)
@@ -160,6 +163,11 @@ USAGE
     esac
     shift
 done
+
+if [ -n "$dictation_product" ] && [ "$hot" = true ]; then
+    printf '%s\n' "--dictation is unavailable with hot reload" >&2
+    exit 2
+fi
 
 if [ "$in_session" = true ]; then
     if [ -z "$instance" ] || [ "$stop_instance" = true ] || [ "$keep_instance" = true ] ||
@@ -1108,13 +1116,15 @@ build_products() {
         "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features --features development --bin cagents
         "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features -p cagents-host --features development --bin cagentsd
         "$lane" --allow-warnings build --locked --profile dev-runtime $1 --bin cagents-ui
-        "$lane" --allow-warnings build --locked --profile dev-runtime -p cagents-dictate --features engine --bin cagents-dictate
+        if [ -n "$4" ]; then
+            "$lane" --allow-warnings build --locked --profile dev-runtime -p cagents-dictate --features engine --bin "$4"
+        fi
         if [ -n "$2" ]; then
-            for executable in cagents cagentsd cagents-ui cagents-dictate; do
+            for executable in cagents cagentsd cagents-ui ${4:+"$4"}; do
                 stat -c "%n %i %s %.9Y" "$3/$executable"
             done >"$2"
         fi
-    ' build-products "$root/scripts/cargo-lane" "$ui_features" "${built:-}" "$products"
+    ' build-products "$root/scripts/cargo-lane" "$ui_features" "${built:-}" "$products" "$dictation_product"
 }
 
 # A launch with nothing to build skips the build gate, whose queue can be long
@@ -1171,7 +1181,7 @@ build_script_watches() {
 # metadata in the shared repository), and every Cargo configuration file
 # Cargo would load from this checkout.
 outside_inputs() {
-    for executable in cagents cagentsd cagents-ui cagents-dictate; do
+    for executable in cagents cagentsd cagents-ui ${dictation_product:+"$dictation_product"}; do
         dependencies=$products/$executable.d
         [ -f "$dependencies" ] || return 1
         # Escaped spaces would split a path; let Cargo decide instead.
@@ -1190,12 +1200,12 @@ outside_inputs() {
     printf 'optional %s/config.toml\noptional %s/config\n' "$cargo_home" "$cargo_home"
 }
 built_executables() {
-    for executable in cagents cagentsd cagents-ui cagents-dictate; do
+    for executable in cagents cagentsd cagents-ui ${dictation_product:+"$dictation_product"}; do
         stat -c '%n %i %s %.9Y' "$products/$executable" || return 1
     done
 }
 build_record() {
-    printf '%s/.run-development-%s' "$products" "$ui_feature"
+    printf '%s/.run-development-%s%s' "$products" "$ui_feature" "${dictation_product:+-dictation}"
 }
 # Whether the gate builds on this host, as it decides. Builds on the build
 # host leave Cargo's dependency lists and build-script outputs there, so only

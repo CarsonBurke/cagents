@@ -2103,6 +2103,7 @@ fn shared_channel_edges_leave_every_channel_id_naming_one_node() {
 
     draw_frames(&mut app, 4, |app, frame| {
         let model = |channels| crate::workspace_model::WorkspaceModel {
+            project_order: Vec::new(),
             navigation_orders: Vec::new(),
             identity,
             sequence: frame as u64 + 1,

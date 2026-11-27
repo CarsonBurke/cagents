@@ -5,11 +5,12 @@
 //! used, so their probes follow the schedule. Antigravity and Muse report
 //! none: their answer is whether the sign-in works, the plan and the models,
 //! which change when the CLI, its sign-in or its model list does. Each of
-//! those leaves a trace on this machine except Antigravity's sign-in, which
-//! it keeps in the system keyring. So a probe, which for Antigravity starts
-//! a whole `agy acp` server, is spent only when one of them changed, or once
-//! [`UNCHANGED_FOR`] has passed for what no file shows: a sign-in or plan
-//! changed elsewhere.
+//! those leaves a trace on this machine: Antigravity's sign-in is a file
+//! since cagents has it kept in one, though an Antigravity from before
+//! 1.5.18 still keeps it in the desktop keyring. So a probe, which for
+//! Antigravity starts a whole `agy acp` server, is spent only when one of
+//! them changed, or once [`UNCHANGED_FOR`] has passed for what no file
+//! shows: a plan changed elsewhere, or an older Antigravity's sign-in.
 //!
 //! The reader's own refreshes, sign-ins and a conversation's report that
 //! the account needs attention always probe.
@@ -40,12 +41,11 @@ pub(super) fn fingerprint(
     match account.provider {
         Provider::Claude | Provider::Codex | Provider::Omp => return None,
         Provider::Antigravity => {
-            // Its default model.
-            paths.push(
-                account
-                    .home_directory(environment)?
-                    .join("antigravity-cli/settings.json"),
-            );
+            // Its default model, then the sign-in the agents cagents starts
+            // keep in a file (see [`crate::account::credential_storage`]).
+            let home = account.home_directory(environment)?;
+            paths.push(home.join("antigravity-cli/settings.json"));
+            paths.push(antigravity_sign_in(&home));
         }
         Provider::Muse => {
             // Its sign-in, then the catalog its models are read from.
@@ -97,6 +97,19 @@ pub(super) fn fingerprint(
     )
 }
 
+/// Where Antigravity, kept to file storage, records its sign-in in `home`,
+/// its `~/.gemini`. Only the file's metadata is part of the fingerprint;
+/// its contents are never read.
+pub(super) fn antigravity_sign_in(home: &Path) -> PathBuf {
+    home.join("antigravity-cli").join(ANTIGRAVITY_SIGN_IN)
+}
+
+/// The name of the file in which Antigravity, kept to file storage, records
+/// its sign-in in its data directory: `antigravity-cli`, or whichever one
+/// `agy acp --app-data-dir` names. Checked against Antigravity 1.5.18, which
+/// reads it from that directory alone.
+pub(super) const ANTIGRAVITY_SIGN_IN: &str = "antigravity-oauth-token";
+
 /// Where Muse records its sign-in. Only the file's metadata is part of the
 /// fingerprint: cagents never opens it.
 pub(super) fn muse_sign_in(
@@ -110,9 +123,10 @@ pub(super) fn muse_sign_in(
 ///
 /// A working sign-in stands while nothing it depends on changed. A sign-in
 /// that does not work stands only where the fingerprint covers it: Muse's,
-/// in its sign-in file, but not Antigravity's, in the keyring, so a
-/// signed-out Antigravity is asked again on schedule, the moment it is most
-/// likely to be signed in from outside cagents. A login refused for having
+/// in its sign-in file, but not every Antigravity's - one from before
+/// 1.5.18 keeps it in the keyring - so a signed-out Antigravity is asked
+/// again on schedule, the moment it is most likely to be signed in from
+/// outside cagents. A login refused for having
 /// no allowance changes with a subscription bought elsewhere, and an answer
 /// that could not be had says nothing, so both are asked again.
 pub(super) fn vouches_for(provider: Provider, status: UsageStatus) -> bool {
@@ -165,7 +179,18 @@ mod tests {
         let before = fingerprint(&agy, &program, &environment).unwrap();
         std::fs::create_dir_all(root.join(".gemini/antigravity-cli")).unwrap();
         std::fs::write(root.join(".gemini/antigravity-cli/settings.json"), b"{}").unwrap();
-        assert_ne!(fingerprint(&agy, &program, &environment).unwrap(), before);
+        let configured = fingerprint(&agy, &program, &environment).unwrap();
+        assert_ne!(configured, before);
+        // A sign-in, which `agy` kept to file storage writes beside it.
+        std::fs::write(
+            root.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            b"{}",
+        )
+        .unwrap();
+        assert_ne!(
+            fingerprint(&agy, &program, &environment).unwrap(),
+            configured
+        );
     }
 
     #[test]

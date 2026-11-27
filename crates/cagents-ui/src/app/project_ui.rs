@@ -94,6 +94,8 @@ pub struct State {
     deletions: HashMap<WorktreeId, Deletion>,
     automatic_attempts: HashMap<WorktreeId, AutomaticAttempt>,
     next_automatic_attempt: u64,
+    /// Numbers each device check a deletion dialog asks, for its answer.
+    next_device_check: u64,
     editors: Vec<crate::external_editor::Editor>,
 }
 
@@ -216,6 +218,16 @@ struct Dialog {
     /// Why the last confirmed deletion of this worktree failed, when the
     /// dialog is opened again from its row. Confirming retries it.
     failure: Option<String>,
+    /// The device check a device window awaits, asking the device whether
+    /// it would remove the worktree; confirming waits for the answer, which
+    /// can be a blocker.
+    checking: Option<u64>,
+    /// The blocker is the device's refusal, which only reopening the dialog
+    /// asks again.
+    device_refusal: bool,
+    /// Why the device could not be asked. Confirming stays open: the
+    /// deletion asks again before anything closes.
+    unchecked: Option<String>,
 }
 
 impl Dialog {
@@ -252,6 +264,8 @@ pub enum Action {
     ProjectSessionsClosed(ProjectId, u64, Result<ProjectSessionClosure, String>),
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
+    /// Keeps a worktree whose deletion failed; its row stops asking.
+    DismissFailedDelete(WorktreeId),
     AwaitSessions(Target, WorktreeRemovalCapture),
     /// A merged worktree was inspected for its notice; it is always kept.
     /// `contents` is `None` when the inspection could not finish.
@@ -272,6 +286,22 @@ pub enum Action {
     },
     Finished(Result<(), String>),
     Dismiss,
+    /// The device's answer to device check `check`, asked when a deletion
+    /// dialog opened.
+    DeviceRemovalChecked {
+        check: u64,
+        answer: DeviceRemoval,
+    },
+}
+
+/// A device's answer to whether it would remove one of its worktrees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceRemoval {
+    Removable,
+    /// The device's refusal, worded to follow "Could not delete …:".
+    Refused(String),
+    /// The device could not be asked.
+    Unasked(String),
 }
 
 impl Cagents {
@@ -1309,13 +1339,24 @@ impl Cagents {
                             .worktree
                             .and_then(|id| self.project_ui.deletions.get(&id))
                             .and_then(|deletion| deletion.failure.clone());
+                        // A device says itself whether it would remove the
+                        // worktree, before the user is asked to confirm.
+                        let check = blocker
+                            .is_none()
+                            .then(|| self.check_device_worktree_removal(&target))
+                            .flatten();
+                        let (checking, check) = check.unzip();
                         self.project_ui.dialog = Some(Dialog {
                             target,
                             blocker,
                             failure,
+                            checking,
+                            device_refusal: false,
+                            unchecked: None,
                         });
-                        return iced::widget::operation::focus(self.project_ui.focus_target())
+                        let focus = iced::widget::operation::focus(self.project_ui.focus_target())
                             .map(cosmic::Action::App);
+                        return Task::batch([focus, check.unwrap_or_else(Task::none)]);
                     }
                     ProjectCommand::Remove => {
                         let Some(project) = self.sidebar_model.project(project_id) else {
@@ -1422,17 +1463,14 @@ impl Cagents {
                 let dismissed = self.project_ui.dialog.take();
                 // Declining to run a failed deletion again is the answer to
                 // it, so its row stops asking.
-                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
-                    && self
-                        .project_ui
-                        .deletions
-                        .get(&id)
-                        .is_some_and(|deletion| deletion.failure.is_some())
-                {
-                    self.project_ui.deletions.remove(&id);
-                    self.sync_worktree_operation_rows();
+                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree) {
+                    self.dismiss_failed_worktree_deletion(id);
                 }
                 return self.project_dialog_closed();
+            }
+            Action::DismissFailedDelete(id) => {
+                self.dismiss_failed_worktree_deletion(id);
+                return Task::none();
             }
             Action::ConfirmRemove => {
                 let Some(mut removal) = self.project_ui.remove_dialog.take() else {
@@ -1556,10 +1594,40 @@ impl Cagents {
                     )));
                 }
             },
+            Action::DeviceRemovalChecked { check, answer } => {
+                if let Some(dialog) = self.project_ui.dialog.as_mut()
+                    && dialog.checking == Some(check)
+                {
+                    dialog.checking = None;
+                    let device = device_label();
+                    match answer {
+                        DeviceRemoval::Removable => {}
+                        DeviceRemoval::Refused(refusal) => {
+                            dialog.blocker = Some(format!(
+                                "{device} won't delete this worktree. {}",
+                                sentence(&refusal)
+                            ));
+                            dialog.device_refusal = true;
+                        }
+                        DeviceRemoval::Unasked(error) => {
+                            dialog.unchecked = Some(format!(
+                                "Couldn't check the worktree on {device}: {}. Deleting \
+                                 asks {device} again before anything closes.",
+                                error.trim_end_matches('.')
+                            ));
+                        }
+                    }
+                }
+            }
             Action::ConfirmDelete => {
                 let Some(dialog) = &self.project_ui.dialog else {
                     return Task::none();
                 };
+                // The device's answer is not re-asked here: while it is due
+                // or refused, there is nothing to confirm.
+                if dialog.checking.is_some() || dialog.device_refusal {
+                    return Task::none();
+                }
                 let target = dialog.target.clone();
                 if let Some(blocker) = self.worktree_deletion_blocker(&target) {
                     let dialog = self.project_ui.dialog.as_mut().unwrap();
@@ -1798,6 +1866,20 @@ impl Cagents {
         Task::none()
     }
 
+    /// Forgets the failed deletion of `id`, keeping the worktree. A deletion
+    /// still under way is not the user's to dismiss.
+    fn dismiss_failed_worktree_deletion(&mut self, id: WorktreeId) {
+        if self
+            .project_ui
+            .deletions
+            .get(&id)
+            .is_some_and(|deletion| deletion.failure.is_some())
+        {
+            self.project_ui.deletions.remove(&id);
+            self.sync_worktree_operation_rows();
+        }
+    }
+
     /// Registers a confirmed deletion on its row and starts it.
     ///
     /// The workspace leaves the worktree now rather than once it is gone, so
@@ -1849,10 +1931,23 @@ impl Cagents {
             });
         }
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
+        // A device's worktree goes through the device's own Git. Its main
+        // checkout, where `.worktrees/` is, is known only from its rows.
+        let device_main = crate::device::is_remote().then(|| {
+            self.sidebar_model
+                .project(target.project)
+                .map(super::worktree_ui::project_main_checkout)
+        });
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let removed = delete_worktree(&request)?;
+                let removed = match device_main {
+                    Some(Some(main)) => delete_device_worktree(&request, &main).map(|()| None)?,
+                    Some(None) => {
+                        return Err("The project disappeared. Refresh before deleting.".into());
+                    }
+                    None => delete_worktree(&request)?,
+                };
                 if let Some(store) = store
                     && let Some(removed) = removed
                     && let Err(errors) =
@@ -1964,6 +2059,31 @@ impl Cagents {
         }
     }
 
+    /// In a device window, asks the device whether it would remove the
+    /// worktree `target`, for its deletion dialog to say before confirming.
+    /// Returns the check's number, which its answer carries, so an answer
+    /// meant for an earlier dialog is not taken for this one's.
+    fn check_device_worktree_removal(&mut self, target: &Target) -> Option<(u64, Task<Message>)> {
+        if !crate::device::is_remote() {
+            return None;
+        }
+        let main =
+            super::worktree_ui::project_main_checkout(self.sidebar_model.project(target.project)?);
+        let name = device_worktree_name(&main, &target.path)?;
+        self.project_ui.next_device_check += 1;
+        let check = self.project_ui.next_device_check;
+        Some((
+            check,
+            cosmic::task::future(async move {
+                let answer =
+                    tokio::task::spawn_blocking(move || device_worktree_removable(&main, &name))
+                        .await
+                        .unwrap_or_else(|error| DeviceRemoval::Unasked(error.to_string()));
+                Message::ProjectUi(Action::DeviceRemovalChecked { check, answer })
+            }),
+        ))
+    }
+
     fn worktree_deletion_blocker(&self, target: &Target) -> Option<String> {
         if self.session.is_none() {
             return Some(
@@ -1996,6 +2116,15 @@ impl Cagents {
         if worktree.locked {
             return Some("This worktree is locked. Unlock it explicitly in Git first.".into());
         }
+        if crate::device::is_remote()
+            && device_worktree_name(
+                &super::worktree_ui::project_main_checkout(project),
+                &target.path,
+            )
+            .is_none()
+        {
+            return Some(DEVICE_WORKTREE_OUTSIDE.into());
+        }
         if self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
             if runtime.descriptor.worktree.starts_with(&target.path) && runtime.is_saving())
@@ -2027,7 +2156,9 @@ impl Cagents {
         let dirty = self
             .deletion_target_row(target)
             .and_then(|worktree| worktree.dirty.as_ref())
-            .is_some_and(crate::repository::DirtyState::is_dirty);
+            .is_some_and(crate::repository::DirtyState::is_dirty)
+            // A device keeps a dirty worktree instead, as its note says.
+            && !crate::device::is_remote();
         let unsaved = self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
                 if runtime.descriptor.worktree.starts_with(&target.path) && runtime.is_dirty())
@@ -2103,8 +2234,8 @@ impl Cagents {
                     super::notice_detail(removal.repository.display().to_string()),
                     super::notice_body(detail),
                     super::notice_detail(match removal.kind {
-                        ProjectKind::Folder => "Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay on disk.",
-                        ProjectKind::Git => "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
+                        ProjectKind::Folder => format!("Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay {}.", files_stay()),
+                        ProjectKind::Git => format!("Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay {}.", files_stay()),
                     }),
                 ])
                 .spacing(space::M),
@@ -2125,10 +2256,7 @@ impl Cagents {
             design::title("Delete worktree?").into(),
             super::notice_body(&target.label),
             super::notice_detail(target.path.display().to_string()),
-            super::notice_detail(
-                "Git will remove this worktree directory, including uncommitted, untracked and ignored files such as .env. \
-                 Terminals and chats running in it, including detached ones, are closed first.",
-            ),
+            super::notice_detail(worktree_deletion_note(false)),
         ];
         if let Some(branch) = self.worktree_retained_branch(target) {
             rows.push(super::notice_detail(branch));
@@ -2136,18 +2264,28 @@ impl Cagents {
         if let Some(warning) = self.worktree_deletion_warning(target) {
             rows.push(super::notice_body(warning));
         }
-        if let Some(cascade) = self.worktree_cascade_summary(target) {
+        // What a deletion would close says nothing while it cannot run.
+        if dialog.blocker.is_none()
+            && let Some(cascade) = self.worktree_cascade_summary(target)
+        {
             rows.push(super::notice_body(cascade));
         }
         if let Some(message) = dialog.message() {
             rows.push(super::notice_body(message));
         }
+        if dialog.checking.is_some() {
+            rows.push(super::notice_detail(format!(
+                "Checking the worktree on {}…",
+                device_label()
+            )));
+        }
+        if let Some(unchecked) = &dialog.unchecked {
+            rows.push(super::notice_detail(unchecked.clone()));
+        }
         // Reopened from a row whose deletion failed, the dialog says why and
         // confirming runs it again; `ConfirmDelete` re-checks every
         // precondition first either way.
-        let confirm = dialog
-            .blocker
-            .is_none()
+        let confirm = (dialog.blocker.is_none() && dialog.checking.is_none())
             .then_some(Message::ProjectUi(Action::ConfirmDelete));
         let actions = super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
@@ -2592,11 +2730,57 @@ pub(super) fn scope_resolutions() -> usize {
     SCOPE_RESOLUTIONS.get()
 }
 
+#[cfg(test)]
+pub(super) fn device_aware_scope_contains(roots: &[PathBuf], directory: &Path) -> bool {
+    ProjectSessionScope::new(roots.to_vec(), Vec::new()).contains(directory)
+}
+
 /// Resolves `path` on disk, as every root and directory a scope compares is.
+/// A device window's paths are the device's, as its daemon reported them,
+/// and resolving them here would read this computer's files instead.
 fn resolve_scope_path(path: &Path) -> Option<PathBuf> {
+    if crate::device::is_remote() {
+        return None;
+    }
     #[cfg(test)]
     SCOPE_RESOLUTIONS.set(SCOPE_RESOLUTIONS.get() + 1);
     path.canonicalize().ok()
+}
+
+/// Where a removed project's files stay: on this computer's disk, or on the
+/// device a device window shows.
+pub(super) fn files_stay() -> String {
+    match crate::device::selected() {
+        Some(device) => format!("on {}", device.name),
+        None => "on disk".to_owned(),
+    }
+}
+
+/// Whether `action` works in a device window, which refuses the rest of
+/// this computer's project and Git work. Removing a project edits the
+/// device's registry and deleting a worktree runs the device's Git, so their
+/// confirmations and results run there.
+pub(super) fn runs_in_device_window(action: &Action) -> bool {
+    match action {
+        Action::ConfirmRemove
+        | Action::RemovedProject { .. }
+        | Action::AwaitClosedProject(..)
+        | Action::ProjectSessionsClosed(..)
+        | Action::ConfirmDelete
+        | Action::RetryDelete(_)
+        | Action::DismissFailedDelete(_)
+        | Action::AwaitSessions(..)
+        | Action::Deleted { .. }
+        | Action::DeviceRemovalChecked { .. }
+        | Action::Dismiss => true,
+        // Opening an editor or file manager and inspecting a merged
+        // worktree use this computer; commands arrive through the sidebar.
+        Action::Command { .. }
+        | Action::EditorsLoaded(_)
+        | Action::MergedWorktreeKept { .. }
+        | Action::AvatarLoaded { .. }
+        | Action::Finished(_) => false,
+    }
 }
 
 impl ProjectSessionScope {
@@ -2636,7 +2820,6 @@ fn shared_project_session_scope(
     projects: &[crate::workspace_model::ModelProject],
 ) -> Result<ProjectSessionScope, String> {
     let mut protected = Vec::new();
-    let service = RepositoryService::system("git");
     for project in projects {
         if project.repository == repository {
             continue;
@@ -2644,13 +2827,38 @@ fn shared_project_session_scope(
         match project.kind {
             ProjectKind::Folder => protected.push(project.repository.clone()),
             ProjectKind::Git => {
-                let records = service.list_worktrees(&project.repository, &CancellationToken::default())
+                let worktrees = list_worktree_paths(&project.repository)
                     .map_err(|error| format!("Could not verify worktrees owned by {} before removing this project: {error}", project.name))?;
-                protected.extend(records.into_iter().map(|record| record.path));
+                protected.extend(worktrees);
             }
         }
     }
     Ok(ProjectSessionScope::new(roots.to_vec(), protected))
+}
+
+/// The checkouts Git lists for `repository`, read where the repository is:
+/// on this computer, or through the device service in a device window,
+/// whose paths name nothing here.
+fn list_worktree_paths(repository: &Path) -> Result<Vec<PathBuf>, String> {
+    if crate::device::is_remote() {
+        return match crate::device_service::request(
+            crate::device_service::Operation::ProjectNavigation {
+                repository: repository.to_path_buf(),
+                kind: ProjectKind::Git,
+            },
+        )? {
+            crate::device_service::Reply::ProjectNavigation(navigation) => Ok(navigation
+                .worktrees
+                .into_iter()
+                .map(|worktree| worktree.path)
+                .collect()),
+            _ => Err("Unexpected project navigation reply".into()),
+        };
+    }
+    RepositoryService::system("git")
+        .list_worktrees(repository, &CancellationToken::default())
+        .map(|records| records.into_iter().map(|record| record.path).collect())
+        .map_err(|error| error.to_string())
 }
 
 fn project_session_roots(
@@ -2661,12 +2869,11 @@ fn project_session_roots(
     if kind == ProjectKind::Folder {
         return roots;
     }
-    let service = RepositoryService::system("git");
     // A missing checkout must still be removable using its saved roots.
-    if let Ok(records) = service.list_worktrees(repository, &CancellationToken::default()) {
-        for record in records {
-            if !roots.contains(&record.path) {
-                roots.push(record.path);
+    if let Ok(worktrees) = list_worktree_paths(repository) {
+        for path in worktrees {
+            if !roots.contains(&path) {
+                roots.push(path);
             }
         }
     }
@@ -2776,6 +2983,108 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     Ok(removed)
 }
 
+/// What a worktree's deletion removes, as its confirmation says it. A device
+/// removes only a clean worktree, so its window says that instead of
+/// promising to discard changes.
+pub(super) fn worktree_deletion_note(several: bool) -> String {
+    let (these, them) = if several {
+        ("these worktree directories", "them")
+    } else {
+        ("this worktree directory", "it")
+    };
+    match crate::device::selected() {
+        Some(device) => format!(
+            "Git on {} will remove {these}, including ignored files such as .env. A worktree \
+             with uncommitted or untracked changes is kept: commit or remove them first. \
+             Terminals and chats running in {them}, including detached ones, are closed first.",
+            device.name
+        ),
+        None => format!(
+            "Git will remove {these}, including uncommitted, untracked and ignored files such \
+             as .env. Terminals and chats running in {them}, including detached ones, are \
+             closed first."
+        ),
+    }
+}
+
+const DEVICE_WORKTREE_OUTSIDE: &str = "A device window can only delete a worktree directly in \
+     the project's .worktrees folder, named with letters, digits, dots, hyphens or underscores. \
+     Use git worktree remove in a terminal on the device.";
+
+/// The name a device knows a removable worktree by: its folder directly in
+/// the main checkout's `.worktrees`, the only place a device removes one,
+/// named as the device accepts.
+pub(super) fn device_worktree_name(main: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(main.join(".worktrees"))
+        .ok()
+        .filter(|name| name.components().count() == 1)
+        .and_then(|name| name.to_str())
+        .filter(|name| crate::device_service::worktree_name(name).is_ok())
+        .map(str::to_owned)
+}
+
+/// Deletes a device's worktree as [`delete_worktree`] does a local one, with
+/// the device's Git. The device checks first, changing nothing, that it
+/// would remove the worktree, so a refusal leaves its sessions running; it
+/// checks again as it removes it.
+fn delete_device_worktree(target: &Target, main: &Path) -> Result<(), String> {
+    use crate::device_service::{GitOperation, Operation, request};
+    let name = device_worktree_name(main, &target.path).ok_or(DEVICE_WORKTREE_OUTSIDE)?;
+    let listed = |worktrees: &[PathBuf]| worktrees.contains(&target.path);
+    if !listed(&list_worktree_paths(&target.repository)?) {
+        return Err("Worktree changed or disappeared; refresh before deleting.".into());
+    }
+    match device_worktree_removable(main, &name) {
+        DeviceRemoval::Removable => {}
+        DeviceRemoval::Refused(reason) | DeviceRemoval::Unasked(reason) => return Err(reason),
+    }
+    close_worktree_sessions(target)?;
+    if let Err(error) = request(Operation::Git {
+        root: main.to_path_buf(),
+        operation: GitOperation::RemoveWorktree { name },
+    }) {
+        // A lost reply may follow a removal. Reconcile before saying it
+        // failed, as a local deletion does.
+        if list_worktree_paths(&target.repository).is_ok_and(|worktrees| !listed(&worktrees)) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Asks the device whether it would remove its worktree `name` of the
+/// project whose main checkout is `main`, changing nothing. The refusal is
+/// the device's, worded for the person deleting.
+fn device_worktree_removable(main: &Path, name: &str) -> DeviceRemoval {
+    use crate::device_service::{GitOperation, Operation, Reply, request_for_reader};
+    match request_for_reader(Operation::Git {
+        root: main.to_path_buf(),
+        operation: GitOperation::CheckWorktreeRemoval {
+            name: name.to_owned(),
+        },
+    }) {
+        Ok(Reply::Text(refusal)) if refusal.is_empty() => DeviceRemoval::Removable,
+        Ok(Reply::Text(refusal)) => DeviceRemoval::Refused(refusal),
+        Ok(_) => DeviceRemoval::Unasked("the device gave an unexpected answer".into()),
+        Err(error) => DeviceRemoval::Unasked(error),
+    }
+}
+
+/// The device a device window shows, by name.
+fn device_label() -> &'static str {
+    crate::device::selected().map_or("the device", |device| device.name.as_str())
+}
+
+/// `reason` as a sentence of its own: refusals are worded to follow
+/// "Could not delete …:".
+fn sentence(reason: &str) -> String {
+    let mut characters = reason.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
 fn worktree_removal_command(target: &Target) -> CommandSpec {
     CommandSpec::new("git")
         .cwd(&target.repository)
@@ -2793,6 +3102,27 @@ mod close_edit_regression;
 pub(in crate::app) mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn a_device_worktree_is_named_by_its_folder() {
+        let main = Path::new("/srv/device-only/demo");
+        assert_eq!(
+            device_worktree_name(main, &main.join(".worktrees/feature")).as_deref(),
+            Some("feature")
+        );
+        for outside in [
+            main.to_path_buf(),
+            main.join(".worktrees"),
+            main.join(".worktrees/nested/deeper"),
+            PathBuf::from("/srv/device-only/elsewhere"),
+            // Names the device refuses are refused before any session closes.
+            main.join(".worktrees/my wt"),
+            main.join(".worktrees/-flag"),
+            main.join(format!(".worktrees/{}", "a".repeat(81))),
+        ] {
+            assert_eq!(device_worktree_name(main, &outside), None, "{outside:?}");
+        }
+    }
 
     fn removal_callback_test(case: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
@@ -4212,6 +4542,105 @@ pub(in crate::app) mod tests {
         }
     }
 
+    /// A device window asks the device whether it would remove a worktree
+    /// when its deletion dialog opens. Confirming waits for the answer, and
+    /// a refusal becomes the dialog's blocker, before any session closes.
+    #[test]
+    fn a_device_refusal_blocks_the_deletion_dialog() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join(".worktrees/feature"),
+            Some("feature".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = Target {
+            project,
+            worktree: Some(linked.id),
+            repository,
+            path: linked.path.clone(),
+            label: "feature".into(),
+        };
+        let open = |app: &mut Cagents, check: u64| {
+            app.project_ui.dialog = Some(Dialog {
+                target: target.clone(),
+                blocker: None,
+                failure: None,
+                checking: Some(check),
+                device_refusal: false,
+                unchecked: None,
+            });
+        };
+        let refused = || DeviceRemoval::Refused("it has uncommitted or untracked changes.".into());
+        open(&mut app, 2);
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        assert!(
+            app.project_ui.dialog.is_some(),
+            "confirming waits for the device"
+        );
+        assert!(!app.project_ui.is_deleting(linked.id));
+
+        // The answer to an earlier dialog's check, even about this same
+        // worktree, is not this one's.
+        drop(app.handle_project_action(Action::DeviceRemovalChecked {
+            check: 1,
+            answer: refused(),
+        }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert_eq!(dialog.checking, Some(2));
+        assert!(dialog.blocker.is_none());
+
+        drop(app.handle_project_action(Action::DeviceRemovalChecked {
+            check: 2,
+            answer: refused(),
+        }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert!(dialog.checking.is_none());
+        assert_eq!(
+            dialog.blocker.as_deref(),
+            Some("the device won't delete this worktree. It has uncommitted or untracked changes.")
+        );
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        assert!(!app.project_ui.is_deleting(linked.id));
+        assert!(app.project_ui.dialog.is_some());
+
+        // A device that could not be asked is not a refusal: the deletion
+        // asks again before anything closes, so confirming stays open.
+        open(&mut app, 3);
+        drop(app.handle_project_action(Action::DeviceRemovalChecked {
+            check: 3,
+            answer: DeviceRemoval::Unasked("the connection closed".into()),
+        }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert!(dialog.checking.is_none() && dialog.blocker.is_none());
+        assert!(!dialog.device_refusal);
+        assert!(
+            dialog.unchecked.as_deref().is_some_and(|text| text
+                .starts_with("Couldn't check the worktree on the device: the connection closed.")),
+            "{:?}",
+            dialog.unchecked
+        );
+
+        // A clear answer leaves confirming to the user.
+        open(&mut app, 4);
+        drop(app.handle_project_action(Action::DeviceRemovalChecked {
+            check: 4,
+            answer: DeviceRemoval::Removable,
+        }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert!(dialog.checking.is_none() && dialog.blocker.is_none());
+        assert!(dialog.unchecked.is_none());
+        assert!(runs_in_device_window(&Action::DeviceRemovalChecked {
+            check: 0,
+            answer: DeviceRemoval::Removable,
+        }));
+    }
+
     #[test]
     fn stalled_worktree_deletion_becomes_retryable() {
         let repository = PathBuf::from("/repo");
@@ -4439,6 +4868,50 @@ pub(in crate::app) mod tests {
         let _ = app.handle_project_action(Action::Dismiss);
         assert_eq!(row(&app, id).unwrap().deletion, None);
         assert!(app.project_ui.deletions.is_empty());
+    }
+
+    /// A failed deletion the user decides to live with is put away from its
+    /// row: the worktree stays, and its row stops asking. One still under
+    /// way is not the row's to dismiss.
+    #[test]
+    fn a_failed_worktree_deletion_is_dismissed_from_its_row() {
+        let repository = PathBuf::from("/repo");
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let id = linked.id;
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let _ = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(id),
+            command: ProjectCommand::Delete,
+        });
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::DismissFailedDelete(id));
+        assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
+
+        let target = app.project_ui.deletions[&id].target.clone();
+        let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
+            target,
+            result: Err("fatal: cannot remove".into()),
+        });
+        assert!(matches!(
+            row(&app, id).unwrap().deletion,
+            Some(RowDeletion::Failed(_))
+        ));
+
+        let _ = app.handle_project_action(Action::DismissFailedDelete(id));
+        assert_eq!(row(&app, id).unwrap().deletion, None);
+        assert!(app.project_ui.deletions.is_empty());
+        assert!(!app.modal_is_open());
     }
 
     /// The window moves off a worktree whose deletion it confirms and cannot

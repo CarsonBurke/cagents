@@ -19,6 +19,8 @@ use thiserror::Error;
 
 mod accounts;
 pub use accounts::AccountCommand;
+mod boot;
+pub use boot::BootCommand;
 #[cfg(test)]
 mod agent_start_authority_tests;
 mod agents;
@@ -60,6 +62,8 @@ mod linear;
 pub use linear::LinearCommand;
 mod providers;
 pub use providers::ProviderCommand;
+mod resume;
+pub use resume::ResumeArgs;
 mod work;
 pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
@@ -134,6 +138,9 @@ const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a handshake with a device's daemon waits for its first answer,
+/// which crosses SSH and may start the daemon.
+pub(crate) const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `cagents ui` waits for a window that has closed, and so refuses
 /// activations, to finish exiting and release its lease. An exiting UI waits
 /// for its language servers (bounded at 5s) and its window's removal (2s),
@@ -344,6 +351,11 @@ pub enum TopCommand {
         after_help = "Shows its messages, tool calls and compactions."
     )]
     Transcript(TranscriptArgs),
+    /// Reopen the conversations of sessions whose provider stopped.
+    #[command(
+        after_help = "With no sessions or scope, or with --list, lists what can be resumed and why each stopped, without resuming anything. Each resumes as its pane's Resume would in the app: the exact saved conversation, in its original directory and on its original account. It then waits idle for its next message. With --device, resumes that machine's sessions, as after a reboot with no one logged in."
+    )]
+    Resume(ResumeArgs),
     /// Inspect native resident capacity and explicitly release completed handles.
     Chat {
         #[command(subcommand)]
@@ -504,6 +516,14 @@ pub enum DaemonCommand {
     },
     /// Start the daemon if it is not already running.
     Start,
+    /// Start the daemon when this computer boots, before anyone logs in.
+    #[command(
+        after_help = "Installs a systemd user unit that runs `cagents daemon start` at boot, beside the graphical-login autostart; whichever runs first starts the daemon. The user manager starts at boot only with lingering on (`loginctl enable-linger`), which `status` reports."
+    )]
+    Boot {
+        #[command(subcommand)]
+        command: BootCommand,
+    },
     /// Report whether the daemon is running.
     Status,
     /// Validate inherited updater authority without probing daemon liveness.
@@ -721,7 +741,7 @@ pub enum ProjectCommand {
         /// A folder or path inside a Git repository (defaults to the current directory).
         path: Option<PathBuf>,
     },
-    /// List shared projects, newest first.
+    /// List shared projects in the order the sidebar shows them.
     List,
     /// Close a project and every channel in it.
     Close {
@@ -1195,7 +1215,7 @@ impl ControlClient {
 
     fn handshake_timeout() -> Duration {
         if crate::device::is_remote() {
-            Duration::from_secs(30)
+            REMOTE_HANDSHAKE_TIMEOUT
         } else {
             io_timeout()
         }
@@ -4371,6 +4391,9 @@ where
         let served = if mobile {
             crate::mobile::serve_bridge()
         } else {
+            // Before anything that can wait on the daemon, so the computer
+            // that started this knows SSH got this far.
+            crate::device::report_bridge_started();
             crate::device::serve_stdio()
         };
         return match served {
@@ -4401,29 +4424,7 @@ where
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
         }
-        // A mismatch names both protocols, so a caller can tell which side
-        // to update without reading the sentence.
-        let details = crate::device::incompatible(&error).map(|mismatch| {
-            json!({
-                "device": mismatch.device,
-                "protocol": mismatch.actual,
-                "expected": crate::terminal_ipc::PROTOCOL_VERSION,
-            })
-        });
-        let kind = if error.kind() == io::ErrorKind::PermissionDenied {
-            "permission_denied"
-        } else if details.is_some() {
-            "device_incompatible"
-        } else {
-            "device"
-        };
-        emit_error(
-            cli.global.json,
-            &AppError {
-                details,
-                ..AppError::new(kind, error)
-            },
-        );
+        emit_error(cli.global.json, &device_app_error(error));
         return ExitCode::FAILURE;
     }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
@@ -4456,6 +4457,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Whoami(_)
         | TopCommand::Sessions(_)
         | TopCommand::Transcript(_)
+        | TopCommand::Resume(_)
         | TopCommand::Send(_)
         | TopCommand::Ask(_)
         | TopCommand::Reply(_)
@@ -4587,6 +4589,7 @@ fn execute_with_model_context(
         TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
         TopCommand::Transcript(arguments) => transcript::read(arguments),
+        TopCommand::Resume(arguments) => resume::resume(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),
         TopCommand::Reply(arguments) => messages::reply(arguments),
@@ -4731,8 +4734,30 @@ fn launch_ui(
     } else {
         slot
     };
-    let scoped_slot =
-        crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?;
+    // A window switched to a device reopens there, unless this computer was
+    // asked for by name, as a switch back to it does. Any window already open
+    // comes forward first, as it always has.
+    let follow_placement =
+        !new_window && !crate::device::is_remote() && !crate::device::local_chosen();
+    if follow_placement
+        && slot.is_none()
+        && instance::activate_running_ui().map_err(|error| AppError::new("launch", error))?
+    {
+        return Ok(already_running_ui_output());
+    }
+    let placed = follow_placement
+        .then(|| placed_device(slot.unwrap_or(instance::PRIMARY_WINDOW)))
+        .flatten();
+    let device = placed
+        .clone()
+        .or_else(|| crate::device::selected().map(|device| device.name.clone()));
+    let scoped_slot = match &placed {
+        Some(placed) => Some(crate::device::scoped_window_slot(
+            placed,
+            slot.unwrap_or(instance::PRIMARY_WINDOW),
+        )),
+        None => crate::device::window_slot(slot).map_err(|error| AppError::new("device", error))?,
+    };
     let slot = scoped_slot.as_deref();
     let activate = || match slot {
         Some(slot) => instance::activate_window(slot),
@@ -4741,14 +4766,24 @@ fn launch_ui(
     if !new_window && activate().map_err(|error| AppError::new("launch", error))? {
         return Ok(already_running_ui_output());
     }
+    // A screen already says why this device window did not open, and offers
+    // to try again; another attempt beside it would only stack a second one.
+    // A caller that explains its own failure, such as the device menu, still
+    // tries: should the window open, that screen's Try again just raises it.
+    if device.is_some()
+        && !caller_reports_startup_failure
+        && slot.is_some_and(instance::device_reconnect_showing)
+    {
+        return Ok(already_running_ui_output());
+    }
     let executable = crate::companion::Product::Ui
         .beside_current()
         .map_err(|error| AppError::new("launch", error))?;
     let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
     loop {
         let mut command = Command::new(&executable);
-        if let Some(device) = crate::device::selected() {
-            command.args(["--device", &device.name, "--device-window-scoped"]);
+        if let Some(device) = &device {
+            command.args(["--device", device, "--device-window-scoped"]);
         }
         if new_window {
             command.arg("--new-window");
@@ -4767,7 +4802,7 @@ fn launch_ui(
             break;
         };
         if new_window || !handshake_reports_already_running(&error) {
-            return Err(AppError::new("launch", error));
+            return Err(launch_error(error));
         }
         if activate().map_err(|error| AppError::new("launch", error))? {
             return Ok(already_running_ui_output());
@@ -4788,17 +4823,132 @@ fn launch_ui(
     })
 }
 
-pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
+/// The saved device that window `slot` of this computer last switched to.
+/// A device no longer saved here leaves the window on this computer.
+fn placed_device(slot: &str) -> Option<String> {
+    let device = crate::device::placement::device(slot)
+        .inspect_err(|error| tracing::warn!(%error, "could not read which device a window shows"))
+        .ok()??;
+    let saved = crate::device::list()
+        .inspect_err(|error| tracing::warn!(%error, "could not read the saved devices"))
+        .ok()?;
+    if saved.iter().any(|saved| saved.name == device) {
+        Some(device)
+    } else {
+        tracing::warn!(
+            device,
+            slot,
+            "the device a window showed is no longer saved"
+        );
+        None
+    }
+}
+
+/// The error a command reports when the selected device could not be
+/// prepared, with what a caller needs to act on it without reading the
+/// sentence: both protocols for a mismatch, and the device for SSH that
+/// could not reach it.
+fn device_app_error(error: io::Error) -> AppError {
+    let mismatch = crate::device::incompatible(&error).map(|mismatch| {
+        json!({
+            "device": mismatch.device,
+            "protocol": mismatch.actual,
+            "expected": crate::terminal_ipc::PROTOCOL_VERSION,
+        })
+    });
+    let unreachable = crate::device::unreachable(&error).map(|unreachable| {
+        json!({
+            "device": unreachable.device,
+            "host": unreachable.host,
+            "reason": unreachable.reason,
+        })
+    });
+    let unresponsive = crate::device::unresponsive(&error).map(|unresponsive| {
+        json!({
+            "device": unresponsive.device,
+            "host": unresponsive.host,
+            "reached": match unresponsive.reached {
+                crate::device::Reached::LoggedIn => "logged_in",
+                crate::device::Reached::BridgeStarted => "bridge_started",
+            },
+        })
+    });
+    let kind = if error.kind() == io::ErrorKind::PermissionDenied {
+        "permission_denied"
+    } else if mismatch.is_some() {
+        "device_incompatible"
+    } else if unreachable.is_some() {
+        "device_unreachable"
+    } else if unresponsive.is_some() {
+        "device_unresponsive"
+    } else {
+        "device"
+    };
+    AppError {
+        details: mismatch.or(unreachable).or(unresponsive),
+        ..AppError::new(kind, error)
+    }
+}
+
+/// A window that did not start. One on a device that SSH could not reach,
+/// or reached without an answer, says so in its message, the only thing it
+/// passes back; its kind says so too, as for any other command on that
+/// device.
+fn launch_error(error: io::Error) -> AppError {
+    launch_error_on(crate::device::selected(), error)
+}
+
+fn launch_error_on(device: Option<&crate::device::Device>, error: io::Error) -> AppError {
+    let message = error.to_string();
+    let kind = if crate::device::reads_as_unreachable(&message) {
+        "device_unreachable"
+    } else if crate::device::reads_as_unresponsive(&message) {
+        "device_unresponsive"
+    } else {
+        "launch"
+    };
+    match device.filter(|_| kind != "launch") {
+        Some(device) => AppError {
+            details: Some(json!({ "device": device.name, "host": device.host })),
+            ..AppError::new(kind, error)
+        },
+        None => AppError::new("launch", error),
+    }
+}
+
+/// How long `cagents ui` waits for a device window to start. The window
+/// acknowledges only after reaching its device, which may take the whole
+/// remote handshake, and then starts as any window does. Giving up sooner
+/// would replace the window's own account of a slow or unreachable device
+/// with a bare timeout (#4486).
+fn remote_ui_launch_timeout() -> Duration {
+    REMOTE_HANDSHAKE_TIMEOUT + UI_LAUNCH_HANDSHAKE_TIMEOUT
+}
+
+/// Whether `command` starts a window on a device, which every launch of one
+/// names with `--device`.
+fn opens_device_window(command: &Command) -> bool {
+    command.get_args().any(|argument| argument == "--device")
+}
+
+pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
     // Remote windows attach to an already-running device daemon. Its handoff
     // budget is not stored on the client, whose repository filesystem is gated.
-    let timeout = if crate::device::is_remote() {
-        UI_LAUNCH_HANDSHAKE_TIMEOUT
-    } else {
-        crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
-            + UI_LAUNCH_HANDSHAKE_TIMEOUT
+    // What the child opens decides, not what this process selected: a device
+    // window opened from this computer reaches its device all the same.
+    let local = || {
+        crate::upgrade::handoff::startup_timeout()
+            .map(|budget| budget + UI_LAUNCH_HANDSHAKE_TIMEOUT)
+            .map_err(io::Error::other)
+    };
+    // A launcher on a device can't read the handoff budget either way.
+    let timeout = match (opens_device_window(command), crate::device::is_remote()) {
+        (_, true) => remote_ui_launch_timeout(),
+        (true, false) => local()?.max(remote_ui_launch_timeout()),
+        (false, false) => local()?,
     };
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
@@ -5127,6 +5277,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             "run installation upgrades in a terminal on the selected device",
         ));
     }
+    if crate::device::is_remote() && matches!(command, DaemonCommand::Boot { .. }) {
+        return Err(AppError::new(
+            "device",
+            "Set up starting at boot in a shell on that device, such as `ssh HOST cagents daemon boot enable`",
+        ));
+    }
     match command {
         DaemonCommand::Bridge { .. } => Err(AppError::new(
             "bridge",
@@ -5149,6 +5305,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     .map_err(|error| AppError::new("serialization", error))?,
             })
         }
+        DaemonCommand::Boot { command } => boot::execute(command),
         DaemonCommand::Start => {
             let socket = if daemon_autostart_disabled() {
                 let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;
@@ -6302,10 +6459,8 @@ fn project_output(
         }
         ResolvedProject::List => {
             let model = client.read_workspace_model().map_err(protocol_error)?;
-            // Newest first, the order `channel list` answers in and the order
-            // the sidebar renders.
-            let mut projects = model.projects.iter().collect::<Vec<_>>();
-            projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
+            // The order every window's sidebar lists them in.
+            let projects = model.projects_in_order();
             let human = projects
                 .iter()
                 .map(|project| project_line(project))
@@ -8208,6 +8363,99 @@ mod tests {
         ]);
         spawn_ui_process(&mut command).unwrap();
     }
+    #[test]
+    fn a_device_ssh_cannot_reach_is_reported_by_kind_with_what_ssh_said() {
+        let error = io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            crate::device::Unreachable {
+                device: "build-host".into(),
+                host: "me@build-host".into(),
+                reason: "connect to host build-host port 22: Connection timed out".into(),
+            },
+        );
+        let error = device_app_error(error);
+        assert_eq!(error.kind, "device_unreachable");
+        assert_eq!(
+            error.details,
+            Some(json!({
+                "device": "build-host",
+                "host": "me@build-host",
+                "reason": "connect to host build-host port 22: Connection timed out",
+            }))
+        );
+        assert_eq!(device_app_error(io::Error::other("lost")).kind, "device");
+    }
+
+    /// A device SSH reached that said nothing in time is reported as slow,
+    /// not unreachable, by a command and by a window that didn't start
+    /// (#4486).
+    #[test]
+    fn a_slow_device_is_reported_apart_from_an_unreachable_one() {
+        let slow = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                crate::device::Unresponsive {
+                    device: "build-host".into(),
+                    host: "me@build-host".into(),
+                    executable: "cagents".into(),
+                    reached: crate::device::Reached::BridgeStarted,
+                },
+            )
+        };
+        // The window reaches its device before it acknowledges, so its
+        // launcher outwaits that handshake rather than reporting a timeout
+        // of its own over the window's reason.
+        assert!(remote_ui_launch_timeout() > REMOTE_HANDSHAKE_TIMEOUT);
+        // Whichever device this launcher selected: the window it starts
+        // decides (#4505).
+        let mut window = Command::new("cagents-ui");
+        window.args(["--device", "build-host", "--device-window-scoped"]);
+        assert!(opens_device_window(&window));
+        let mut local = Command::new("cagents-ui");
+        local.args(["--new-window", "--window", "device-build-host"]);
+        assert!(!opens_device_window(&local));
+        let error = device_app_error(slow());
+        assert_eq!(error.kind, "device_unresponsive");
+        assert_eq!(
+            error.details,
+            Some(json!({
+                "device": "build-host",
+                "host": "me@build-host",
+                "reached": "bridge_started",
+            }))
+        );
+        let device = crate::device::Device {
+            name: "build-host".into(),
+            host: "me@build-host".into(),
+            executable: "cagents".into(),
+        };
+        // A window passes its failure back as text.
+        let window = |error: &io::Error| io::Error::other(format!("cagents: {error}"));
+        assert_eq!(
+            launch_error_on(Some(&device), window(&slow())).kind,
+            "device_unresponsive"
+        );
+        let unreachable = io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            crate::device::Unreachable {
+                device: "build-host".into(),
+                host: "me@build-host".into(),
+                reason: "it did not answer within 30 seconds".into(),
+            },
+        );
+        let launched = launch_error_on(Some(&device), window(&unreachable));
+        assert_eq!(launched.kind, "device_unreachable");
+        assert_eq!(
+            launched.details,
+            Some(json!({ "device": "build-host", "host": "me@build-host" }))
+        );
+        assert_eq!(launch_error_on(None, window(&unreachable)).kind, "launch");
+        assert_eq!(
+            launch_error_on(Some(&device), io::Error::other("no display")).kind,
+            "launch"
+        );
+    }
+
     use std::{os::unix::net::UnixStream, thread};
 
     use clap::CommandFactory;
@@ -8744,6 +8992,7 @@ mod tests {
             assert_eq!(asked, server_repository);
             assert_eq!(title, "probe");
             let model = WorkspaceModel {
+                project_order: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity: uuid::Uuid::new_v4(),
                 sequence: 2,
@@ -9006,6 +9255,7 @@ mod tests {
                 "the CLI opens a project exactly as a window publishes one"
             );
             let model = WorkspaceModel {
+                project_order: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity: uuid::Uuid::new_v4(),
                 sequence: 4,
@@ -9045,25 +9295,23 @@ mod tests {
     }
 
     /// A listing is of the registry, which records no source: a project a
-    /// window opened and one a shell opened are the same row, listed by the
-    /// same rule, newest first.
+    /// window opened and one a shell opened are the same row, listed in the
+    /// order every sidebar shows: the arranged projects first, then the rest
+    /// by path.
     #[test]
-    fn project_list_answers_newest_first_and_tells_no_source_apart() {
+    fn project_list_answers_in_sidebar_order_and_tells_no_source_apart() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let peer_proof = proof("session", "boot", "incarnation");
-        let window_opened = ModelProject {
+        let project = |repository: &str, name: &str, ordinal| ModelProject {
             kind: Default::default(),
-            repository: PathBuf::from("/window/.git"),
-            name: "window".into(),
-            ordinal: 1,
+            repository: PathBuf::from(repository),
+            name: name.into(),
+            ordinal,
         };
-        let cli_opened = ModelProject {
-            kind: Default::default(),
-            repository: PathBuf::from("/shell/.git"),
-            name: "shell".into(),
-            ordinal: 2,
-        };
-        let served = vec![window_opened.clone(), cli_opened.clone()];
+        let window_opened = project("/window/.git", "window", 1);
+        let cli_opened = project("/shell/.git", "shell", 2);
+        let newest = project("/alpha/.git", "alpha", 3);
+        let served = vec![window_opened.clone(), cli_opened.clone(), newest.clone()];
         let server = thread::spawn(move || {
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(
@@ -9082,6 +9330,7 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                project_order: vec![PathBuf::from("/window/.git")],
             };
             write_frame(
                 &mut server_stream,
@@ -9094,10 +9343,14 @@ mod tests {
         server.join().unwrap();
         assert_eq!(output.command, "project.list");
         assert_eq!(
-            output.human, "/shell/.git\tshell\n/window/.git\twindow",
-            "newest first, one tab-separated line each, whoever opened them"
+            output.human, "/window/.git\twindow\n/alpha/.git\talpha\n/shell/.git\tshell",
+            "the arranged project, then the rest by path, one tab-separated line each, whoever \
+             opened them"
         );
-        assert_eq!(output.data["projects"], json!([cli_opened, window_opened]));
+        assert_eq!(
+            output.data["projects"],
+            json!([window_opened, newest, cli_opened])
+        );
     }
 
     /// Closing a project deletes every channel in it, in every window, and the
@@ -9200,6 +9453,7 @@ mod tests {
                     edit.request_id,
                     peer_proof,
                     WorkspaceModel {
+                        project_order: Vec::new(),
                         navigation_orders: Vec::new(),
                         identity: uuid::Uuid::new_v4(),
                         sequence: 9,
@@ -9525,6 +9779,7 @@ mod tests {
         channels: &[(ChannelId, &str, u32)],
     ) -> WorkspaceModel {
         WorkspaceModel {
+            project_order: Vec::new(),
             navigation_orders: Vec::new(),
             identity: uuid::Uuid::new_v4(),
             sequence: 8,

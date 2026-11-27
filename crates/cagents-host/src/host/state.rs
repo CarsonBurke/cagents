@@ -2910,12 +2910,55 @@ fn validate_terminal_upgrade_environment(
     let mut restored = crate::model::agent_recovery::fresh_native_environment(provider, false);
     restored.extend(recipe.environment.clone());
     recipe.withhold_environment(&mut restored);
-    if execution.0 != restored {
+    if !crate::account::same_but_credential_storage(&execution.0, &restored) {
         return Err(upgrade_error(
             "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this terminal stopped after confirmation; no source was stopped",
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_upgrade_environment_tests {
+    use super::*;
+
+    fn antigravity() -> crate::model::LaunchRecipe {
+        crate::model::LaunchRecipe {
+            program: "agy".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: [("AGY_SETTING".to_owned(), "chosen".to_owned())].into(),
+            unset_environment: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_antigravity_chat_returned_to_its_terminal_survives_an_upgrade() {
+        let recipe = antigravity();
+        let mut fresh = crate::model::agent_recovery::fresh_native_environment(
+            crate::agent::Provider::Antigravity,
+            false,
+        );
+        fresh.extend(recipe.environment.clone());
+        // Returned before cagents pinned Antigravity's sign-in to a file.
+        let unpinned = crate::terminal_ipc::ChatExecutionEnvironment(fresh.clone());
+        validate_terminal_upgrade_environment(&recipe, &unpinned).unwrap();
+        // Returned from a chat that ran with it pinned.
+        let mut pinned = fresh.clone();
+        crate::account::pin_credential_storage(
+            crate::agent::Provider::Antigravity,
+            &mut pinned,
+            &mut Default::default(),
+        );
+        assert_ne!(pinned, fresh);
+        let pinned = crate::terminal_ipc::ChatExecutionEnvironment(pinned);
+        validate_terminal_upgrade_environment(&recipe, &pinned).unwrap();
+        // Anything else that differs still refuses the upgrade.
+        let mut changed = pinned.0.clone();
+        changed.insert("AGY_SETTING".into(), "other".into());
+        let changed = crate::terminal_ipc::ChatExecutionEnvironment(changed);
+        assert!(validate_terminal_upgrade_environment(&recipe, &changed).is_err());
+    }
 }
 
 #[cfg(test)]

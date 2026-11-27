@@ -361,6 +361,7 @@ pub unsafe fn prepare_daemon_admission(
     unsafe {
         std::env::remove_var(crate::instance::DAEMON_FENCE_ENV);
         std::env::remove_var(crate::instance::INSTALL_GUARD_ENV);
+        crate::instance::take_daemon_at_boot_marker();
     }
     // SAFETY: this is still the single-threaded entry point.
     let lease = unsafe { daemon::lease_handoff::take_inherited_lease()? };
@@ -1041,6 +1042,17 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("admission released", None);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
+    // Only once this daemon holds its lease and serves: a start that failed
+    // must not leave a later one from a login thinking it started at boot.
+    match crate::instance::record_daemon_started_at_boot(&paths.directory) {
+        Ok(true) => tracing::info!(
+            "started at boot; terminals take the session's variables from the user manager"
+        ),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not record that this daemon started at boot; a daemon replacing it will keep its own environment")
+        }
+    }
     // An older worker may record the update that started this daemon as
     // failed; once it finishes, this daemon's own receipt settles that.
     #[cfg(not(target_os = "macos"))]
@@ -1134,6 +1146,18 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         }
     };
 
+    // The first daemon of a boot, if the person opted in, resumes what an
+    // earlier boot ran beside the accept loop. A recovery-only daemon stays
+    // so for its life and leaves this to the next daemon of the boot.
+    if !recovery_only {
+        let resume_host = Arc::downgrade(&host);
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-resume-after-boot".into())
+            .spawn(move || agent_execution::resume_after_boot(resume_host))
+        {
+            tracing::warn!(%error, "sessions will not be resumed now that this computer started");
+        }
+    }
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("startup services started", None);
     // Restoring a checkpoint above may hold the host for as long as its

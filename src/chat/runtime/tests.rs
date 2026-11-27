@@ -5102,6 +5102,89 @@ fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
 }
 
 #[test]
+fn an_antigravity_resumed_from_an_old_recipe_signs_in_without_the_locked_keyring() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let agent = directory.path().join("agy");
+    std::fs::write(
+        &agent,
+        include_str!("../../../tests/fixtures/fake-acp-agent.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = directory.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // A boot with no graphical login left the desktop keyring locked.
+    std::fs::write(state.join("keyring-locked"), b"").unwrap();
+    let launch = super::super::Launch {
+        provider: crate::agent::Provider::Antigravity,
+        recipe: crate::model::LaunchRecipe {
+            program: agent.to_string_lossy().into_owned(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([(
+                "FAKE_ACP_STATE".into(),
+                state.to_string_lossy().into_owned(),
+            )]),
+            // As a recipe may have it, saved by an older daemon or a reader
+            // who set the variable aside.
+            unset_environment: [crate::agent::antigravity::FILE_TOKEN_STORAGE.to_owned()].into(),
+        },
+        session_id: None,
+        draft_model: None,
+    };
+    let start = |(spec, mut adapter): (
+        super::super::protocol::ProcessSpec,
+        Box<dyn super::super::protocol::Adapter>,
+    )| {
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap()
+    };
+    // The process cagents starts for it keeps its sign-in in a file.
+    let handle = start(super::super::protocol::create(&launch).unwrap());
+    let snapshot = until(&handle, |snapshot| snapshot.ready);
+    assert!(snapshot.session_id.is_some());
+    handle.close().unwrap();
+    assert!(handle.failure().is_none());
+    // Without it, the same agent finds its sign-in out of reach.
+    let handle = start(
+        super::super::protocol::acp::create(
+            &super::super::protocol::acp::antigravity::PROFILE,
+            &launch,
+        )
+        .unwrap(),
+    );
+    let signed_out = |snapshot: &Snapshot| {
+        handle
+            .failure()
+            .is_some_and(|failure| failure.contains(crate::chat::ACP_SIGN_IN_PREFIX))
+            || format!("{:?}", snapshot.items).contains(crate::chat::ACP_SIGN_IN_PREFIX)
+    };
+    let snapshot = until(&handle, |snapshot| signed_out(snapshot));
+    assert!(!snapshot.ready);
+    let _ = handle.close();
+    // A sign-in held only in the keyring, as every one was before cagents
+    // kept it in a file, is one the agents it starts don't have: it asks
+    // for a sign-in from cagents, and says why `agy` elsewhere has one.
+    std::fs::remove_file(state.join("keyring-locked")).unwrap();
+    std::fs::write(state.join("keyring-only"), b"").unwrap();
+    let handle = start(super::super::protocol::create(&launch).unwrap());
+    let advised = |snapshot: &Snapshot| {
+        let failure = handle.failure().unwrap_or_default();
+        let items = format!("{:?}", snapshot.items);
+        [failure.as_str(), items.as_str()].into_iter().any(|text| {
+            text.contains(crate::chat::ACP_SIGN_IN_PREFIX)
+                && text.contains("sign in to Antigravity from cagents")
+                && text.contains("not the desktop keyring")
+        })
+    };
+    let snapshot = until(&handle, |snapshot| advised(snapshot));
+    assert!(!snapshot.ready);
+    let _ = handle.close();
+}
+
+#[test]
 fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();

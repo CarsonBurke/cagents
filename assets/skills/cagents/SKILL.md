@@ -10,7 +10,7 @@ description: Use when working through the cagents CLI, for separate agent sessio
 - Listings show session, agent and run IDs by their shortest unique prefix, which `send`, `transcript` and `agent` accept. A `hint: …` line names the commands that usually come next: last in a listing, and for a run waiting for input or one that failed or stopped, before its result (after them all for several runs).
 - `cagents channel move --to CHANNEL` moves your own pane to another channel of this project (`cagents channel list --repository .` lists them); `--new TITLE` makes one for it.
 - `cagents work` lists this project's worktrees and branches in progress, with their pull requests and sessions.
-- `cagents ls --channel` lists the sessions in your channel, including those whose provider has exited, such as from a usage limit. `cagents transcript SESSION` reads one's conversation, newest last; follow its `--before` hint for earlier messages. When a session has exited, or you need what it already did, read its transcript.
+- `cagents ls --channel` lists the sessions in your channel, including those whose provider has exited, such as from a usage limit. `cagents transcript SESSION` reads one's conversation, newest last; follow its `--before` hint for earlier messages. When a session has exited, or you need what it already did, read its transcript; `cagents resume SESSION` reopens an exited agent you started.
 - A spawned agent knows only its prompt.
 - A timeout does not mean a submission failed, and submitting again runs the work twice. If you must retry, reuse the reported `--idempotency-key`.
 - Judge a run by its state, not by how idle it looks. `Waiting` means it asked something; see `cagents agent requests`.

@@ -57,6 +57,7 @@ pub(super) use native_actor::NativeActorEvent;
 pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
 pub(super) use pane_chat_starts::Binding as PaneChatBinding;
 mod navigation;
+mod project_order;
 #[cfg(test)]
 mod public_delta_tests;
 mod retired_channel_work;
@@ -71,7 +72,7 @@ mod views;
 mod workspace_snapshot_tests;
 mod worktree_repair;
 
-const SCHEMA_VERSION: u32 = 33;
+const SCHEMA_VERSION: u32 = 34;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -148,6 +149,11 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
+    #[cfg(test)]
+    pub(super) fn fixture_connection(&self) -> &Connection {
+        &self.db
+    }
+
     /// A confirmed close refused because the project's channels are no longer
     /// the ones the user confirmed.
     pub(crate) const PROJECT_CHANNELS_CONFLICT: &'static str =
@@ -401,6 +407,7 @@ impl Registry {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(WorkspaceModel {
             navigation_orders,
+            project_order: project_order::read(&self.db)?,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
             identity,
@@ -520,6 +527,7 @@ impl Registry {
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder, serving)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
+            ModelEdit::ReorderProjects { .. } | ModelEdit::SeedProjectOrder { .. } => project_order::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service"
                     .to_owned()
@@ -929,6 +937,9 @@ fn public_effects(
                 items,
             });
         }
+        ModelEdit::ReorderProjects { .. } | ModelEdit::SeedProjectOrder { .. } => {
+            effects.project_order = Some(project_order::read(db)?);
+        }
         ModelEdit::SeedView { .. }
         | ModelEdit::ChangeView { .. }
         | ModelEdit::AgentsChanged
@@ -1261,6 +1272,10 @@ fn migrate_through(
         lineage::migrate_predecessors(tx)?;
         schema::migration_checkpoint(33)?;
     }
+    if version < 34 && target >= 34 {
+        project_order::migrate(tx)?;
+        schema::migration_checkpoint(34)?;
+    }
     Ok(())
 }
 
@@ -1357,6 +1372,110 @@ mod tests {
             "SQLITE_REGISTRY_WAL_CONNECTIONS_VERIFIED schema={version} rows={} {}",
             expected.len(),
             directory.path().display()
+        );
+    }
+
+    /// #4450: the order of projects is the registry's, so every window on it,
+    /// a device window among them, lists the projects alike.
+    #[test]
+    fn project_order_is_shared_survives_restart_and_forgets_closed_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("project-order.sqlite3");
+        let mut registry = Registry::at(&database).unwrap();
+        for repository in ["/a", "/b", "/c"] {
+            registry.apply(&open(repository)).unwrap();
+        }
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let shown = paths(&["/a", "/b", "/c"]);
+        let to_end = ModelEdit::ReorderProjects {
+            source: "/c".into(),
+            before: None,
+            fallback: shown.clone(),
+        };
+        assert!(!registry.apply(&to_end).unwrap().changed);
+        assert!(registry.model().unwrap().project_order.is_empty());
+        // A stale window names a project closed meanwhile; it is left out.
+        let edit = ModelEdit::ReorderProjects {
+            source: "/c".into(),
+            before: Some("/a".into()),
+            fallback: paths(&["/a", "/gone", "/b", "/c"]),
+        };
+        let applied = registry.apply(&edit).unwrap();
+        assert!(applied.changed);
+        assert_eq!(applied.model.project_order, paths(&["/c", "/a", "/b"]));
+        assert!(!registry.apply(&edit).unwrap().changed, "idempotent");
+        let mut effects = Default::default();
+        public_effects(&registry.db, &edit, &mut effects).unwrap();
+        assert_eq!(effects.project_order, Some(paths(&["/c", "/a", "/b"])));
+        // A seed never replaces an arrangement.
+        let seed = ModelEdit::SeedProjectOrder {
+            order: paths(&["/b", "/a"]),
+        };
+        assert!(!registry.apply(&seed).unwrap().changed);
+        drop(registry);
+        let mut registry = Registry::at(&database).unwrap();
+        assert_eq!(
+            registry.model().unwrap().project_order,
+            paths(&["/c", "/a", "/b"])
+        );
+        assert!(
+            !registry
+                .apply(&ModelEdit::ReorderProjects {
+                    source: "/gone".into(),
+                    before: None,
+                    fallback: Vec::new(),
+                })
+                .unwrap()
+                .changed
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: "/a".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry.model().unwrap().project_order,
+            paths(&["/c", "/b"])
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: "/c".into(),
+            })
+            .unwrap();
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: "/b".into(),
+            })
+            .unwrap();
+        assert!(registry.model().unwrap().project_order.is_empty());
+        // With nothing arranged, a window's earlier order is taken, less what
+        // is not open.
+        for repository in ["/a", "/b"] {
+            registry
+                .apply(&ModelEdit::ReopenProject {
+                    repository: repository.into(),
+                    name: repository.into(),
+                    kind: Default::default(),
+                })
+                .unwrap();
+        }
+        let seed = ModelEdit::SeedProjectOrder {
+            order: paths(&["/b", "/gone", "/b", "/a"]),
+        };
+        assert!(registry.apply(&seed).unwrap().changed);
+        assert_eq!(
+            registry.model().unwrap().project_order,
+            paths(&["/b", "/a"])
+        );
+        assert!(
+            registry
+                .apply(&ModelEdit::SeedProjectOrder {
+                    order: vec![
+                        PathBuf::from("/a");
+                        crate::workspace_model::MAX_ORDERED_PROJECTS + 1
+                    ],
+                })
+                .is_err()
         );
     }
 

@@ -163,6 +163,27 @@ const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
 /// Retry would refuse to start anything, so the pane disables it. The disabled
 /// Retry's accessible description repeats this.
 pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent. Its saved command may reopen a conversation the agent has since left, and cagents can't open the agent's conversation picker instead. Open a new terminal to keep working.";
+/// The title of a new terminal's pane when the terminal didn't open, naming
+/// the device it was to run on.
+pub(super) fn creation_title() -> Cow<'static, str> {
+    match crate::device::selected() {
+        Some(device) => format!("Couldn't open a terminal on {}", device.name).into(),
+        None => "Couldn't open this terminal".into(),
+    }
+}
+/// Why a new terminal didn't open, as a sentence for its pane.
+pub(super) fn creation_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    let mut chars = reason.chars();
+    let mut sentence = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+        .unwrap_or_else(|| "The workspace didn't accept it".into());
+    if !sentence.ends_with(['.', '!', '?']) {
+        sentence.push('.');
+    }
+    sentence
+}
 /// What Retry launches in place of a terminal.
 enum NewTerminal {
     Resume,

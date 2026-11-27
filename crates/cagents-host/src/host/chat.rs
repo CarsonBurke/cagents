@@ -5956,7 +5956,7 @@ pub(super) fn validate_upgrade_environment(
         hosted_source,
         crate::model::agent_recovery::fresh_native_environment(launch.provider, false),
     )?;
-    if !handle.recovery_environment_matches(&restored) {
+    if !crate::account::same_but_credential_storage(&handle.recovery_environment(), &restored) {
         return Err(
             "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this conversation stopped after confirmation; no source was stopped."
                 .into(),

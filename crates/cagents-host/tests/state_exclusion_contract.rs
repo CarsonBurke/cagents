@@ -54,6 +54,7 @@ impl Instance {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cagentsd"));
         command
             .env_clear()
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.path("home"))
             .env("XDG_DATA_HOME", self.path("data"))

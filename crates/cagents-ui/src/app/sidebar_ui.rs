@@ -173,14 +173,7 @@ impl Cagents {
             SidebarAction::MaximizeWindow => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Maximize)),
             SidebarAction::WindowMenu => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ShowWindowMenu)),
             SidebarAction::ReorderMember { project, source, before } => self.reorder_sidebar_member(project, source, before),
-            SidebarAction::ReorderProject { project, before } => {
-                if self.sidebar_model.reorder_project(project, before) {
-                    Arc::make_mut(&mut self.durable).project_order =
-                        self.sidebar_model.projects.iter().map(|project| project.id).collect();
-                    self.persist();
-                }
-                Task::none()
-            }
+            SidebarAction::ReorderProject { project, before } => self.reorder_sidebar_project(project, before),
             SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
             SidebarAction::DismissWorktreeOperation(id) => self.dismiss_worktree_operation(id),
             SidebarAction::EditWorktreeOperation(id) => self.reopen_worktree_operation(id, false),
@@ -191,6 +184,22 @@ impl Cagents {
             SidebarAction::RetryChannelDeletion { channel_id } => {
                 self.handle_channel_ui(channel_ui::Action::RetryFailed(channel_id))
             }
+            // The dismiss control leaves with the failure; its row keeps the
+            // focus it had.
+            SidebarAction::DismissWorktreeDeletion { project_id, worktree_id } => Task::batch([
+                self.handle_project_action(project_ui::Action::DismissFailedDelete(worktree_id)),
+                sidebar::focus_and_reveal(sidebar::selection_row_focus_id(
+                    sidebar::SelectionRow::Worktree(project_id, worktree_id),
+                ))
+                .map(cosmic::Action::App),
+            ]),
+            SidebarAction::DismissChannelDeletion { channel_id } => Task::batch([
+                self.handle_channel_ui(channel_ui::Action::DismissFailed(channel_id)),
+                sidebar::focus_and_reveal(sidebar::selection_row_focus_id(
+                    sidebar::SelectionRow::Channel(channel_id),
+                ))
+                .map(cosmic::Action::App),
+            ]),
             SidebarAction::OpenRepositoryPicker => {
                 cosmic::task::message(Message::OpenRepository)
             }

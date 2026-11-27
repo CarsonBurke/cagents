@@ -884,6 +884,7 @@ pub enum NoticeKind {
     MessageReceived,
     AutomationPaused,
     AutomationBlocked,
+    NotResumed,
     #[serde(other)]
     Unknown,
 }

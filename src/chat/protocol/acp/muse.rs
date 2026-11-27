@@ -35,6 +35,8 @@ pub static PROFILE: Profile = Profile {
     ],
     offers_model: crate::agent::muse_offers_model,
     sign_in_required: auth_required,
+    sign_in_advice: None,
+    rereads_sign_in: false,
     // Not recorded: what Muse does with a prompt sent mid-turn, or with
     // background work when a turn is cancelled.
     steers: false,

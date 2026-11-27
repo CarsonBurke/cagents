@@ -651,10 +651,12 @@ impl Handle {
             Owner::Remote(remote) => remote.execution_environment(),
         }
     }
-    pub fn recovery_environment_matches(&self, environment: &BTreeMap<String, String>) -> bool {
+    /// The environment the provider was started with, before the daemon's
+    /// transient additions: what a successor would have to recreate.
+    pub fn recovery_environment(&self) -> BTreeMap<String, String> {
         match &self.0 {
-            Owner::Local(local) => local.recovery_environment_matches(environment),
-            Owner::Remote(remote) => remote.recovery_environment_matches(environment),
+            Owner::Local(local) => local.recovery_environment(),
+            Owner::Remote(remote) => remote.recovery_environment(),
         }
     }
     pub fn is_completed(&self) -> bool {

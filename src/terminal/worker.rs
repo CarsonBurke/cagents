@@ -9,6 +9,7 @@ mod event_dispatch_tests;
 pub(crate) mod holder;
 mod input_queue;
 mod joins;
+mod manager_environment;
 #[cfg(test)]
 mod pty_reader_tests;
 
@@ -3255,7 +3256,15 @@ impl Worker {
         let execution = execution_recipe.unwrap_or_else(|| session.launch.clone());
         let mut command = match &config.execution_environment {
             Some(environment) => command_from_execution(&execution, environment),
-            None => command_from_recipe(&execution),
+            None => {
+                let mut command = command_from_recipe(&execution);
+                // Read now, not at startup: a graphical login may have come
+                // since. An adopted terminal is already running.
+                if config.adoption.is_none() {
+                    manager_environment::refresh(&mut command, &execution);
+                }
+                command
+            }
         };
         for name in crate::account::launch_credential_overrides(&execution) {
             command.env_remove(name);
@@ -6794,6 +6803,7 @@ fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     for name in crate::account::launch_credential_overrides(recipe) {
         command.env_remove(name);
     }
+    pin_credential_storage(&mut command);
     command
 }
 
@@ -6814,7 +6824,19 @@ fn command_from_execution(
     }
     scrub_inherited_markers(&mut command);
     terminal_environment(&mut command);
+    pin_credential_storage(&mut command);
     command
+}
+
+/// An agent in any terminal cagents hosts, whether it runs a conversation, a
+/// sign-in or the reader's shell, keeps its login where the agents cagents
+/// starts read it, whatever the recipe, the returned environment or the
+/// shell would set. A sign-in from any of them is then the one every agent
+/// uses. See [`crate::account::credential_storage`].
+fn pin_credential_storage(command: &mut CommandBuilder) {
+    for (name, value) in crate::account::all_credential_storage() {
+        command.env(name, value);
+    }
 }
 
 fn terminal_environment(command: &mut CommandBuilder) {

@@ -19,22 +19,7 @@ use std::{os::unix::fs::MetadataExt, path::Path};
 /// A file that exists but cannot be read is an error rather than the default,
 /// because it may be the one saying no.
 pub fn relaunch_agents_by_default(settings: &Path) -> Result<bool, String> {
-    #[derive(serde::Deserialize)]
-    struct Preference {
-        #[serde(default = "relaunch_by_default")]
-        relaunch_agents_on_upgrade: bool,
-    }
-    fn relaunch_by_default() -> bool {
-        true
-    }
-    let document = match std::fs::read_to_string(settings) {
-        Ok(document) => document,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(format!("cannot read {}: {error}", settings.display())),
-    };
-    toml::from_str::<Preference>(&document)
-        .map(|preference| preference.relaunch_agents_on_upgrade)
-        .map_err(|error| format!("cannot read {}: {error}", settings.display()))
+    crate::settings::boolean_preference(settings, "relaunch_agents_on_upgrade", true)
 }
 
 /// How a terminal comes back after its daemon is gone, and why.

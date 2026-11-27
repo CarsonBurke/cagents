@@ -29,6 +29,7 @@ impl Fixture {
         let mut command = Command::new(program);
         command
             .env_clear()
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .envs(
                 std::env::var_os(cagents::agent_execution::AUTHORITY_ENV)
                     .map(|authority| (cagents::agent_execution::AUTHORITY_ENV, authority)),

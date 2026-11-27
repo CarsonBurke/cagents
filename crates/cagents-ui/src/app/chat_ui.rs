@@ -566,6 +566,9 @@ pub enum Action {
     DismissRestoredWaiting(Target),
     /// Puts away the composer's note of something that didn't happen.
     DismissComposerNote(Target),
+    /// Moves a draft just opened on a provider Accounts finds missing, if it
+    /// is still untouched.
+    MoveDraftOffMissingProvider(Target),
     /// The microphone or its shortcut: start dictating, or stop.
     Dictate(Target),
     /// Stop dictating and keep what was said.
@@ -1074,6 +1077,7 @@ impl Action {
             Self::SendQueuedNow(..) => "SendQueuedNow",
             Self::DismissRestoredWaiting(..) => "DismissRestoredWaiting",
             Self::DismissComposerNote(..) => "DismissComposerNote",
+            Self::MoveDraftOffMissingProvider(..) => "MoveDraftOffMissingProvider",
             Self::ComposerActions(..) => "ComposerActions",
             Self::ComposerActionsQuery(..) => "ComposerActionsQuery",
             Self::ComposerActionsSubmit(..) => "ComposerActionsSubmit",
@@ -9972,8 +9976,7 @@ impl Cagents {
     /// window's conversations run, as Accounts reports: a device window
     /// skips a provider its device doesn't have. `None` when none qualifies.
     pub(super) fn available_chat_provider(&self) -> Option<Provider> {
-        let available =
-            |provider| self.account_ui.uses(provider) && !self.account_ui.cli_missing(provider);
+        let available = |provider| self.chat_provider_available(provider);
         self.workspace
             .focused()
             .and_then(|card| self.card_state(card))
@@ -9991,11 +9994,130 @@ impl Cagents {
                 }
                 _ => None,
             })
-            .or_else(|| {
-                std::iter::once(Provider::Codex)
-                    .chain(crate::account::Account::REPORTED)
-                    .find(|provider| provider.has_native_chat() && available(*provider))
+            .or_else(|| self.default_chat_provider())
+    }
+
+    /// Whether `provider` is turned on and not known to lack its CLI where
+    /// this window's conversations run.
+    fn chat_provider_available(&self, provider: Provider) -> bool {
+        self.account_ui.uses(provider) && !self.account_ui.cli_missing(provider)
+    }
+
+    /// The provider a new conversation starts on when no open conversation
+    /// names one: Codex, else the first other available provider with native
+    /// chat. It depends only on Accounts, so every window of a device agrees.
+    fn default_chat_provider(&self) -> Option<Provider> {
+        std::iter::once(Provider::Codex)
+            .chain(crate::account::Account::REPORTED)
+            .find(|provider| provider.has_native_chat() && self.chat_provider_available(*provider))
+    }
+
+    /// Moves every untouched draft whose provider Accounts now finds missing
+    /// where this window's conversations run to the provider a new
+    /// conversation would start on, as if it had been opened there (#4413).
+    /// The provider is chosen alike in every window, so a shared draft moves
+    /// the same way in each, whichever moves it first; the others adopt that
+    /// move from the shared view. A draft kept on its provider says, at its
+    /// composer, that it isn't installed: see `draft_provider_note`.
+    pub(super) fn move_drafts_off_missing_providers(&mut self) -> Task<Message> {
+        let drafts = self
+            .cards
+            .iter()
+            .filter_map(|(card, runtime)| match runtime {
+                CardRuntime::Chat(runtime) if runtime.is_draft() => Some(*card),
+                _ => None,
             })
+            .collect::<Vec<_>>();
+        Task::batch(
+            drafts
+                .into_iter()
+                .map(|card| self.move_draft_off_missing_provider(card)),
+        )
+    }
+
+    /// Moves draft `card` off its provider when Accounts finds that
+    /// provider's CLI missing and the draft is untouched: nothing typed or
+    /// attached, no model picked in this window or another, and no start
+    /// under way.
+    fn move_draft_off_missing_provider(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let provider = runtime.session.launch.provider;
+        if !runtime.is_draft()
+            || draft_choice::get(&runtime.session).is_some()
+            || !self.account_ui.cli_missing(provider)
+            || !self.chat_is_unused(card)
+        {
+            return Task::none();
+        }
+        match self.default_chat_provider() {
+            Some(replacement) if replacement != provider => {
+                self.move_untouched_draft(card, replacement)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// What a draft's composer says while its provider isn't installed where
+    /// this window's conversations run, before anything is sent. It follows
+    /// Accounts rather than being stored, so typing doesn't put it away and
+    /// it goes once the provider is found or another is chosen.
+    pub(super) fn draft_provider_note(&self, card: CardId) -> Option<String> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
+        let provider = runtime.session.launch.provider;
+        // A failed start's error already says so, above the composer.
+        (runtime.is_draft()
+            && runtime.error.is_none()
+            && !self.chat_start_pending(card)
+            && self.account_ui.cli_missing(provider))
+        .then(|| self.missing_provider_note(provider, true, false))
+    }
+
+    /// Points the untouched draft `card` at `provider`'s default, as a new
+    /// draft of it would start, leaving no model picked for it.
+    fn move_untouched_draft(&mut self, card: CardId, provider: Provider) -> Task<Message> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let id = runtime.session.id;
+        let directory = runtime.session.launch.recipe.working_directory.clone();
+        let account = self.default_account_for_directory(provider, &directory);
+        let automatic = self.automatic_accounts_for_directory(provider, &directory);
+        let session = match fresh_chat_session(provider, id, directory, &account, automatic) {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::debug!(%card, %error, "kept a draft on a missing provider");
+                return Task::none();
+            }
+        };
+        let mut snapshot = self.chat_draft_snapshot(provider);
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        tracing::info!(
+            %card,
+            from = runtime.session.launch.provider.label(),
+            to = provider.label(),
+            "moved an untouched draft off a provider that isn't installed"
+        );
+        snapshot.permission_mode = runtime
+            .draft_permission
+            .get(&session.launch.recipe, provider);
+        runtime.snapshot = Arc::new(snapshot);
+        runtime.session = session.clone();
+        runtime.model_picker = None;
+        runtime.account_picker = false;
+        runtime.permission_picker = false;
+        runtime.error = None;
+        runtime.composer_note = None;
+        runtime.release_start_block();
+        runtime.completion.restart(true);
+        let target = runtime.target;
+        self.replace_chat_conversation(card, session);
+        Task::batch([self.load_draft_skills(target), self.save_snapshot_soon()])
     }
 
     /// What the start page says when no provider can start a conversation:
@@ -10033,8 +10155,6 @@ impl Cagents {
         let Some(provider) = chat::failure::not_installed_provider(&failure.message) else {
             return failure;
         };
-        let name = provider.label();
-        let place = conversation_place();
         if self.account_ui.cli_installed(provider) == Some(true) {
             return failure;
         }
@@ -10042,6 +10162,16 @@ impl Cagents {
             self.cards.get(&card),
             Some(CardRuntime::Chat(runtime)) if runtime.is_draft()
         );
+        failure.message = self.missing_provider_note(provider, draft, true);
+        failure
+    }
+
+    /// That `provider` isn't installed where this window's conversations
+    /// run, naming for a draft the provider the model menu can start instead.
+    /// `tried` when a start has just failed for it.
+    fn missing_provider_note(&self, provider: Provider, draft: bool, tried: bool) -> String {
+        let name = provider.label();
+        let place = conversation_place();
         let instead = draft
             .then(|| {
                 view::MODEL_FAMILIES.into_iter().find(|other| {
@@ -10049,14 +10179,18 @@ impl Cagents {
                 })
             })
             .flatten();
-        failure.message = match instead {
+        match instead {
             Some(other) => format!(
                 "{name} isn't installed on {place}. Choose a model under {} in the model menu, or install {name} there.",
                 view::family_label(other)
             ),
-            None => format!("{name} isn't installed on {place}. Install it there, then try again."),
-        };
-        failure
+            None if tried => {
+                format!("{name} isn't installed on {place}. Install it there, then try again.")
+            }
+            None => format!(
+                "{name} isn't installed on {place}. Install it there to start this conversation."
+            ),
+        }
     }
 
     pub(super) fn add_default_pane(
@@ -10777,6 +10911,7 @@ impl Cagents {
     /// Puts a draft of `session` in card `card`, on the model it was saved with,
     /// else the one last chosen for its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
+        let provider = session.launch.provider;
         self.chat_ui.capacity_offers.remove(&card);
         self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.blocked_details.remove(&card);
@@ -10818,7 +10953,16 @@ impl Cagents {
         self.card_chrome.remove(&card);
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
-        self.load_draft_skills(target)
+        // A draft restored or adopted on a provider Accounts already found
+        // missing moves once whatever opened it has finished (#4413).
+        let moved = if self.account_ui.cli_missing(provider) {
+            Task::done(cosmic::Action::App(Message::ChatUi(
+                Action::MoveDraftOffMissingProvider(target),
+            )))
+        } else {
+            Task::none()
+        };
+        Task::batch([self.load_draft_skills(target), moved])
     }
 
     /// Keep the warm hidden chats within [`warm`]'s budget, releasing the
@@ -17896,6 +18040,13 @@ impl Cagents {
             Action::DismissComposerNote(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_note = None;
+                }
+            }
+            Action::MoveDraftOffMissingProvider(target) => {
+                if matches!(self.cards.get(&target.card),
+                    Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
+                    return self.move_draft_off_missing_provider(target.card);
                 }
             }
             Action::CopyQueued(target, source) => {

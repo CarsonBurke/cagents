@@ -522,6 +522,12 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
     }
     let (host, request, path) = fixture();
     let project = path.parent().unwrap().join("project");
+    let settings_path = crate::instance::settings_path().unwrap();
+    let settings = crate::settings::AppSettings {
+        default_native_pane_fraction: 0.75,
+        ..Default::default()
+    };
+    crate::settings::save(settings_path, &settings).unwrap();
     let elsewhere = path.parent().unwrap().join("elsewhere");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&elsewhere).unwrap();
@@ -633,6 +639,63 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
     );
     assert!(showing(plain).is_empty());
 
+    // A window saves the same conversation first. The skipped insertion
+    // must leave the window's pane in place and retire the channel it never filled.
+    let raced = ChannelId::new();
+    let winner = pane(CardKind::Chat(
+        host.lock().unwrap().chats[&plain].current_session(),
+    ));
+    let source = winner.clone();
+    let shared = host.clone();
+    crate::host::workspace::before_transfer(Some(Box::new(move || {
+        process_request(
+            &shared,
+            USER,
+            ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::SeedView {
+                    scope: Scope::Channel(other),
+                    panes: vec![source.clone()],
+                    closed: vec![],
+                },
+            },
+        )
+        .unwrap();
+    })));
+    let lost = request_as(ClientRequest::MovePane {
+        pane: Some(CardId::from_uuid(plain.as_uuid())),
+        destination: PaneDestination::NewChannel {
+            id: raced,
+            title: "Lost race".into(),
+        },
+        operation: uuid::Uuid::new_v4(),
+    });
+    crate::host::workspace::before_transfer(None);
+    assert!(
+        lost.unwrap_err()
+            .message
+            .contains("A window showed this session")
+    );
+    assert_eq!(
+        showing(plain),
+        vec![(Scope::Channel(other), winner.clone())]
+    );
+    assert!(
+        model().channel(raced).is_none(),
+        "the skipped insert left an empty channel"
+    );
+    let scope = Scope::Channel(other);
+    edit(ModelEdit::ChangeView {
+        expected_revision: model()
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision,
+        scope,
+        operation: uuid::Uuid::new_v4(),
+        change: Change::Remove { id: winner.id },
+    });
+
     // Into its own project's: a new pane showing the same conversation.
     let canonical = std::fs::canonicalize(&project).unwrap();
     let opened = move_to(plain, other).unwrap();
@@ -645,6 +708,10 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
     );
     assert_eq!(opened.channel.id, other);
     assert!(!opened.created);
+    assert_eq!(
+        opened.pane.width_fraction,
+        settings.default_native_pane_fraction
+    );
     let CardKind::Chat(shown) = &opened.pane.kind else {
         panic!("not a chat pane: {:?}", opened.pane)
     };

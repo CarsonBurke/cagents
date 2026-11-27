@@ -11,10 +11,12 @@ mod channel_ui;
 mod chat_close;
 mod chat_ui;
 mod chrome_ui;
+mod command_text;
 mod context_sections;
 mod daemon_health_ui;
 mod daemon_recovery;
 mod daemon_stop;
+mod device_reconnect;
 mod device_ui;
 mod device_update_ui;
 pub(crate) mod dialog_ui;
@@ -90,6 +92,7 @@ mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
+pub use device_reconnect::{Request as DeviceReconnectRequest, run_device_reconnect};
 
 /// Fills the `slot` window's empty session store from a fixture plan and
 /// returns what it wrote as one JSON line. Refused by production builds and
@@ -756,35 +759,67 @@ fn notice_surface<'a>(
     action: Option<Element<'a, Message>>,
     compact: bool,
 ) -> Element<'a, Message> {
-    let mut children = vec![severity.icon().handle().icon().size(16).into(), body];
+    notice_surface_with_footer(severity, body, action, None, compact)
+}
+
+/// [`notice_surface`], with `footer` beneath the body and its action, as wide
+/// as both, for what the action beside the body would leave too little room.
+fn notice_surface_with_footer<'a>(
+    severity: NoticeSeverity,
+    body: Element<'a, Message>,
+    action: Option<Element<'a, Message>>,
+    footer: Option<Element<'a, Message>>,
+    compact: bool,
+) -> Element<'a, Message> {
+    const ICON_SIZE: u16 = 16;
+    let mut children = vec![severity.icon().handle().icon().size(ICON_SIZE).into(), body];
     if let Some(action) = action {
         children.push(action);
     }
-    let mut surface = widget::container(
-        widget::row::with_children(children)
-            .align_y(Alignment::Center)
-            .spacing(space::S),
-    )
-    .class(cosmic::theme::Container::custom(move |theme| {
-        let component = severity.component(theme.cosmic());
-        cosmic::iced::widget::container::Style {
-            icon_color: Some(component.on.into()),
-            text_color: Some(component.on.into()),
-            background: Some(iced::Background::Color(component.base.into())),
-            border: iced::Border {
-                width: 1.0,
-                color: component.border.into(),
+    let row: Element<'a, Message> = widget::row::with_children(children)
+        .align_y(Alignment::Center)
+        .spacing(space::S)
+        .into();
+    let content = match footer {
+        // Aligned with the body, past the severity icon. A row rather than
+        // a padded container, whose default style would replace the
+        // severity's text colour with the window's.
+        Some(footer) => widget::column::with_children(vec![
+            row,
+            widget::row::with_children(vec![
+                iced::widget::Space::new()
+                    .width(f32::from(ICON_SIZE) + space::S)
+                    .into(),
+                footer,
+            ])
+            .width(Length::Fill)
+            .into(),
+        ])
+        .spacing(space::XS)
+        .into(),
+        None => row,
+    };
+    let mut surface = widget::container(content)
+        .class(cosmic::theme::Container::custom(move |theme| {
+            let component = severity.component(theme.cosmic());
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(component.on.into()),
+                text_color: Some(component.on.into()),
+                background: Some(iced::Background::Color(component.base.into())),
+                border: iced::Border {
+                    width: 1.0,
+                    color: component.border.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        }
-    }))
-    .padding(if compact {
-        Padding::from([0.0, space::M])
-    } else {
-        Padding::from(space::M)
-    })
-    .width(Length::Fill);
+            }
+        }))
+        .padding(if compact {
+            Padding::from([0.0, space::M])
+        } else {
+            Padding::from(space::M)
+        })
+        .width(Length::Fill);
     if compact {
         surface = surface.height(Length::Fixed(NOTICE_ROW_HEIGHT));
     }
@@ -806,6 +841,31 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .into()
+}
+/// The command a notice ends with, on its own line across the notice's
+/// whole width, with a control, `copy_id`, that copies it (see
+/// [`command_text`]).
+fn notice_command<'a>(
+    severity: NoticeSeverity,
+    command: &'a str,
+    copy_id: widget::Id,
+) -> Element<'a, Message> {
+    command_text::command_row(
+        command,
+        crate::interaction::tooltip(
+            widget::button::icon(Icon::Copy)
+                .id(copy_id)
+                .name(format!("Copy the command {command}"))
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .class(notice_surface_button(severity))
+                .on_press(Message::ChromeUi(chrome_ui::Action::CopyCommand(
+                    command.to_owned(),
+                ))),
+            "Copy command",
+        ),
+        move |theme| severity.component(theme.cosmic()).base.into(),
+    )
 }
 /// Selectable equivalent of `design::caption`: diagnostic detail the user
 /// needs to copy into a bug report, a shell, or a search. For a plain dialog
@@ -3641,6 +3701,7 @@ pub enum SettingsField {
     InspectorShowWork,
     InspectorWidth,
     RelaunchAgentsOnUpgrade,
+    ResumeSessionsAfterReboot,
     CheckForUpdates,
     EditorSyntaxTheme,
     Confirm(settings::Confirmation),
@@ -3817,6 +3878,7 @@ impl SettingsField {
             Self::InspectorWidth => "Inspector width",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
+            Self::ResumeSessionsAfterReboot => "Resume sessions when this computer starts",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
             Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",
@@ -3868,7 +3930,8 @@ impl SettingsField {
             | Self::TerminalFontFamily
             | Self::TerminalScrollbackMib
             | Self::ConfirmMultilinePaste
-            | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
+            | Self::RelaunchAgentsOnUpgrade
+            | Self::ResumeSessionsAfterReboot => SettingsCategory::Terminal,
             Self::MaxHotCards
             | Self::HibernationDelayMs
             | Self::WorkStaleAfterDays
@@ -4106,6 +4169,7 @@ struct SettingsDraft {
     inspector_show_work: bool,
     inspector_width: String,
     relaunch_agents_on_upgrade: bool,
+    resume_sessions_after_reboot: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
@@ -4186,6 +4250,7 @@ impl SettingsDraft {
             inspector_show_work: settings.inspector_show_work,
             inspector_width: settings.inspector_width.to_string(),
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
+            resume_sessions_after_reboot: settings.resume_sessions_after_reboot,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
@@ -4279,6 +4344,9 @@ impl SettingsDraft {
             SettingsField::InspectorWidth => self.inspector_width = value,
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
+            }
+            SettingsField::ResumeSessionsAfterReboot => {
+                self.resume_sessions_after_reboot = value == "true"
             }
             SettingsField::CheckForUpdates => self.check_for_updates = value == "true",
             SettingsField::EditorSyntaxTheme => {
@@ -4591,6 +4659,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.relaunch_agents_on_upgrade = enabled)
             .map_err(|_| "Choose whether upgrades relaunch unresumable agents.".to_owned()),
+        SettingsField::ResumeSessionsAfterReboot => value
+            .parse::<bool>()
+            .map(|enabled| next.resume_sessions_after_reboot = enabled)
+            .map_err(|_| "Choose whether sessions resume when this computer starts.".to_owned()),
         SettingsField::CheckForUpdates => value
             .parse::<bool>()
             .map(|enabled| next.check_for_updates = enabled)
@@ -7310,6 +7382,17 @@ impl Cagents {
                     tasks.push(self.focus_pane_keyboard(card));
                 }
             }
+            Err(error) if self.terminal_never_started(card) => {
+                // Nothing ran, so there is nothing to restore or reconnect:
+                // the pane says the terminal didn't open, and why (#4400).
+                self.fail_terminal_creation(card, &error);
+                self.status = Some(
+                    TransientNotice::error(terminal_failure::creation_title())
+                        .with_details(error)
+                        .with_key(NoticeKey::TerminalStart(card)),
+                );
+                tasks.push(cosmic::task::message(Message::LifecycleSweep));
+            }
             Err(error) => {
                 self.fail_runtime(card, error.clone());
                 let notice = self.missing_terminal_notice(card);
@@ -8883,6 +8966,8 @@ impl Cagents {
                 .pending_terminal_creations
                 .retain(|id| open.contains(id));
         }
+        self.shared_views
+            .forget_settled_creations(&self.durable.pending_terminal_creations);
         #[cfg(test)]
         terminal_output_tests::record_persist();
         let mut phase = WorkspaceProjectionTiming::new(true);
@@ -10410,6 +10495,51 @@ impl Cagents {
             .register(card, exposure, residency.clone(), Instant::now());
         self.set_residency(card, residency);
     }
+    /// Shows that a new terminal didn't open, with `reason`, in its pane. Its
+    /// start never ran, so there is no surface to retire.
+    pub(super) fn fail_terminal_creation(&mut self, card: CardId, reason: &str) {
+        // A sign-in's busy callback port keeps the fixed explanation the
+        // sign-in recovery recognizes.
+        let login_busy = matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Terminal(session)) if account::login::is_codex_browser(&session.launch)
+        ) && account::login::callback_failed(reason);
+        let reason = if login_busy {
+            account::login::PORT_BUSY.to_owned()
+        } else {
+            terminal_failure::creation_reason(reason)
+        };
+        self.sidebar_state.clear_agent_activity(card);
+        self.mark_runtime_failed(card, reason.clone());
+        self.cards.insert(
+            card,
+            CardRuntime::Failed(terminal_failure::Failure::Generic(reason)),
+        );
+    }
+
+    /// Whether `card` is a new terminal whose first start hasn't succeeded:
+    /// one its view hasn't accepted yet, or one its view holds with that
+    /// start still pending. A saved terminal being restored is neither, so a
+    /// failed restore still reads as one to restore.
+    pub(super) fn terminal_never_started(&self, card: CardId) -> bool {
+        self.durable.pending_terminal_creations.contains(&card)
+            || self
+                .workspace_model
+                .views
+                .iter()
+                .flat_map(|view| &view.panes)
+                .any(|pane| pane.id == card && pane.pending_terminal_start)
+    }
+
+    /// Whether `card`'s pane says its terminal didn't open.
+    pub(super) fn terminal_creation_failed(&self, card: CardId) -> bool {
+        self.shared_views.refused_creations.contains_key(&card)
+            || (matches!(
+                self.cards.get(&card),
+                Some(CardRuntime::Failed(terminal_failure::Failure::Generic(_)))
+            ) && self.terminal_never_started(card))
+    }
+
     fn fail_runtime(&mut self, card: CardId, message: String) {
         let mut failure = self.terminal_failure_payload(card, message.clone());
         self.sidebar_state.clear_agent_activity(card);
@@ -10539,6 +10669,13 @@ impl Cagents {
         // service to prepare its conversation again.
         if self.reopen_failed(card) {
             return self.retry_reopening(card);
+        }
+        // A Close of the failed pane that didn't go through no longer removes
+        // what this retry starts.
+        self.shared_views.fenced_closes.remove(&card);
+        // Nor in a new terminal its view refused: it asks the view again.
+        if self.shared_views.refused_creations.contains_key(&card) {
+            return self.retry_refused_terminal_creation(card);
         }
         #[cfg(feature = "integrated-browser")]
         if matches!(
@@ -13088,6 +13225,7 @@ impl Cagents {
                 .view(
                     &self.sidebar_model.projects,
                     &self.sidebar_model.external_editors,
+                    self.sidebar_model.device.as_deref(),
                     self.worktrees_current(),
                     self.modal_is_open(),
                 )
@@ -13150,9 +13288,11 @@ impl Cagents {
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
                             design::title(if self.reopen_failed(id) {
-                                "Couldn't reopen this conversation"
+                                std::borrow::Cow::Borrowed("Couldn't reopen this conversation")
+                            } else if self.terminal_creation_failed(id) {
+                                terminal_failure::creation_title()
                             } else {
-                                labels.unavailable
+                                std::borrow::Cow::Borrowed(labels.unavailable)
                             })
                             .into(),
                         ])
@@ -17102,7 +17242,10 @@ impl Application for Cagents {
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
-            sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
+            sidebar_model: SidebarModel {
+                device: crate::device::selected().map(|device| device.name.clone()),
+                ..SidebarModel::ready(SidebarMode::Expanded, sidebar_projects)
+            },
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
@@ -18346,6 +18489,7 @@ impl Cagents {
                 | Message::ProjectUi(
                     project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
                 ) => return ControlFlow::Break(Task::none()),
+                Message::ProjectUi(action) if project_ui::runs_in_device_window(action) => {}
                 Message::ChatUi(
                     chat_ui::Action::Attach(_)
                     | chat_ui::Action::Attached(..)

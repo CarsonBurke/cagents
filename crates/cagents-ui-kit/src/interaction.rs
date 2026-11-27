@@ -432,6 +432,20 @@ pub fn overflow_fade_x<'a, Message: 'a>(
     })
 }
 
+/// As [`overflow_fade_x`], over a surface whose colour is `fill` rather
+/// than the window's.
+pub fn overflow_fade_x_over<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    fill: impl Fn(&Theme) -> cosmic::iced::Color + 'a,
+) -> Element<'a, Message> {
+    Element::new(OverflowFade {
+        content: content.into(),
+        axis: Axis::Horizontal,
+        fill: Box::new(fill),
+        headers: false,
+    })
+}
+
 /// Fade the top and bottom edges of a vertical scrollable while content
 /// continues past them.
 ///

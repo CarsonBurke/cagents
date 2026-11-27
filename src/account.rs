@@ -285,6 +285,70 @@ pub fn credential_overrides(provider: Provider) -> &'static [&'static str] {
     }
 }
 
+/// What every process cagents starts sets so that the provider keeps its
+/// sign-in where an unattended daemon can read it: a file in the account's
+/// home, readable only by its owner. These outrank whatever a launch recipe,
+/// the daemon or a terminal's shell would set, since a recipe saved before
+/// cagents set them, or the reader's own configuration, would otherwise
+/// decide where the sign-in is looked for.
+///
+/// Antigravity otherwise keeps its sign-in in the desktop keyring, which
+/// stays locked until someone logs in graphically, so every conversation a
+/// daemon resumed after a headless boot found itself signed out. With
+/// `AGY_CLI_FORCE_FILE_TOKEN_STORAGE` set (Antigravity 1.5.18 and later), it
+/// keeps the sign-in in `~/.gemini/antigravity-cli/antigravity-oauth-token`
+/// instead, as Claude Code and Codex keep theirs in files in their homes.
+/// See docs/account-configuration.md, "Antigravity's sign-in".
+pub fn credential_storage(provider: Provider) -> &'static [(&'static str, &'static str)] {
+    match provider {
+        Provider::Antigravity => &[(
+            crate::agent::antigravity::FILE_TOKEN_STORAGE,
+            crate::agent::antigravity::FILE_TOKEN_STORAGE_ON,
+        )],
+        Provider::Claude | Provider::Codex | Provider::Omp | Provider::Muse => &[],
+    }
+}
+
+/// Every provider's [`credential_storage`], for a process that may start any
+/// of them, such as a terminal's shell.
+pub fn all_credential_storage() -> impl Iterator<Item = (&'static str, &'static str)> {
+    Provider::ALL
+        .into_iter()
+        .flat_map(|provider| credential_storage(provider).iter().copied())
+}
+
+/// Sets `provider`'s [`credential_storage`] in a process's environment,
+/// replacing any value it had and any removal of it.
+pub fn pin_credential_storage(
+    provider: Provider,
+    environment: &mut std::collections::BTreeMap<String, String>,
+    unset_environment: &mut std::collections::BTreeSet<String>,
+) {
+    for (name, value) in credential_storage(provider) {
+        unset_environment.remove(*name);
+        environment.insert((*name).to_owned(), (*value).to_owned());
+    }
+}
+
+/// Whether two environments a process was or would be started with differ
+/// only in [`credential_storage`] variables. Every process cagents starts
+/// has its provider's pinned, and a terminal every provider's, so one a
+/// daemon started before cagents pinned them resumes the same as one
+/// started since.
+pub fn same_but_credential_storage(
+    left: &std::collections::BTreeMap<String, String>,
+    right: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let pinned = |environment: &std::collections::BTreeMap<String, String>| {
+        let mut environment = environment.clone();
+        for (name, value) in all_credential_storage() {
+            environment.insert(name.to_owned(), value.to_owned());
+        }
+        environment
+    };
+    pinned(left) == pinned(right)
+}
+
 /// Recognize only the canonical home namespace owned by this installation.
 /// Merely pointing a system account at an arbitrary directory is not isolation.
 pub fn managed_home_identity(root: &Path, path: &Path) -> Option<(Provider, uuid::Uuid)> {
@@ -1493,6 +1557,27 @@ pub fn format_local_moment(unix_seconds: i64, now_seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_started_before_its_sign_in_was_pinned_resumes_the_same() {
+        let recorded: std::collections::BTreeMap<String, String> =
+            [("AGY_SETTING".to_owned(), "chosen".to_owned())].into();
+        let mut pinned = recorded.clone();
+        pin_credential_storage(Provider::Antigravity, &mut pinned, &mut Default::default());
+        assert_ne!(pinned, recorded);
+        assert!(same_but_credential_storage(&recorded, &pinned));
+        // A recipe that turned it off is overruled, so it resumes pinned too.
+        let mut refused = recorded.clone();
+        refused.insert(
+            crate::agent::antigravity::FILE_TOKEN_STORAGE.into(),
+            "0".into(),
+        );
+        assert!(same_but_credential_storage(&refused, &pinned));
+        // Anything else still counts.
+        let mut changed = pinned.clone();
+        changed.insert("AGY_SETTING".into(), "other".into());
+        assert!(!same_but_credential_storage(&recorded, &changed));
+    }
 
     #[test]
     fn linked_home_expansion_keeps_destination_home_and_refuses_absolute_remainders() {

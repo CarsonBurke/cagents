@@ -62,7 +62,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   The tab's context menu also lists eligible channels; with many destinations,
   **Move to channel…** opens a searchable picker. The command palette lists
   the focused pane's channel destinations too.
-- Drag a project header to reorder projects; the order survives restarts.
+- Drag a project header to reorder projects; every window on the device, and a device window viewing it, shows the same order, and it survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
   or name.
@@ -1014,6 +1014,71 @@ After a confirmed close, or a kernel boot change, the picker resumes the exact
 conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
 
+Without a window, as on a headless machine after a reboot, resume them from the
+CLI. `cagents resume` on its own lists the stopped sessions that can be
+resumed, with the reason each one stopped, such as a provider whose sign-in
+needs attention, and how many more only their panes in the app can reopen. It
+resumes nothing. Then resume sessions by session, lineage or agent ID, or a
+prefix of at least four characters, as `cagents send` takes them, or every
+stopped session in a scope:
+
+```sh
+cagents resume                      # list what can be resumed
+cagents resume 7c0fba49 4518d661
+cagents resume --project cagents
+cagents resume --all
+cagents --device desktop resume     # list another machine's
+cagents --device desktop resume --all
+```
+
+`--list` lists a given scope instead of resuming it, as in
+`cagents resume --list --project cagents`. Inside an agent session's terminal,
+`--channel` names that session's channel, or `--channel CHANNEL` another.
+
+Each one reopens through the same checks as its pane's Resume: the exact
+conversation, original account and working directory, and proof that no
+earlier process still writes it. A conversation an earlier process still holds
+is reattached to that process rather than started a second time. The pane then
+shows the running conversation, so a window opened later does not start it
+again. A conversation that is already running is reported and left alone. Each
+waits idle for its next message; nothing the stopped provider held is resent.
+Unlike the pane's Resume, it does not put messages still queued when the
+provider stopped back into a draft, so send any that still matter again. A
+session that cannot resume says why, and the command exits with status 4 once
+the others have been tried. A chat paired with its provider's terminal still
+resumes from its pane in the app.
+
+To have this happen by itself, turn on **Resume sessions when this computer
+starts** under **Settings → Terminal → Restarts**
+(`resume_sessions_after_reboot = true` in `settings.toml`). It applies to the
+computer the window runs on. For another computer, such as one no one logs in
+to, run `cagents daemon boot enable --resume-sessions` there, for example over
+SSH: it also starts that computer's daemon when it starts.
+
+After a restart, the first daemon to run resumes every stopped chat and agent
+that an earlier boot ran, as `cagents resume --all` would, without waiting for
+a window. That includes ones that had already stopped before the restart, not
+only those running when it went down. With the daemon started at boot, that is
+as soon as the computer starts; otherwise it is the first time the daemon
+starts, such as when you open the app or run a `cagents` command. This covers
+more than a window restores when it opens: a window shows a Claude
+conversation's saved history until you send it a message, while this starts its
+provider. A pane that a window has already opened is left to that window.
+
+One that cannot resume gets a **Did not resume when this computer started**
+notification naming the `cagents resume` command for it, and the ones it leaves
+untried, such as chats paired with their provider's terminal, share one
+notification. They follow your **Failure or cancellation** notification
+setting. On a computer with no window, where no notification shows, run
+`cagents resume`: it lists everything still stopped, and counts the chats only
+the app can resume. Each can still be
+resumed from the app or, unless it is paired with a terminal, with
+`cagents resume`. Once that resume has run, a daemon restarted within the same
+boot, as by an update or after a crash, resumes nothing by itself. If the first
+daemon was held back for recovery, or an update or shutdown interrupted its
+resume, the next daemon of that boot runs it, and it never reopens a
+conversation that boot already ran.
+
 ### Image references and local image storage
 
 Pasted and selected images receive stable **Image N** labels. Their inline
@@ -1168,6 +1233,25 @@ the listed home, any path inside a cagents `accounts/<provider>/<id>`
 directory, or a `CLAUDE_CONFIG_DIR` naming `~/.claude` that an earlier version
 exported, when deciding the system default. A daemon started before this
 protection keeps its environment until it restarts.
+
+#### Antigravity's sign-in
+
+Every Antigravity process that cagents starts keeps its sign-in in a file,
+`~/.gemini/antigravity-cli/antigravity-oauth-token`, rather than in the desktop
+keyring. That covers conversations, resumed and upgraded conversations, account
+checks, sign-ins and every cagents terminal. Agents then keep working after a
+boot with no graphical login, which leaves the keyring locked. Cagents does
+this by setting `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`, which overrides whatever
+a saved conversation, the daemon or your shell sets. It needs Antigravity 1.5.18
+or later. With an older version, the sign-in prompt says to run `agy update`.
+
+A sign-in that `agy` keeps in the keyring, such as one from a terminal outside
+cagents, is not the file sign-in, so sign in once from cagents. An `agy` run
+outside cagents without the variable can move the file sign-in back into an
+unlocked keyring, which signs agents out, so set it wherever you run `agy`
+yourself. See
+[Antigravity's sign-in](account-configuration.md#antigravitys-sign-in) for
+details and the security tradeoff.
 
 The Accounts pane flags a row whose home is not a login of its own: **Login
 changed** when a managed or linked home reports a different login than the one

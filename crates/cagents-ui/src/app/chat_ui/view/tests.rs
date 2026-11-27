@@ -128,7 +128,7 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
     drop(element);
     // The full pane also publishes the editor's focus action on a click.
     // Mount the notice itself to pin its button's exact dispatch contract.
-    let mut element = runtime.composer_note_view().unwrap();
+    let mut element = runtime.composer_note_view(None).unwrap();
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,
@@ -188,7 +188,7 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
     let notice = "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.";
     runtime.composer_note = Some(notice.into());
     let renderer = crate::app::tests::headless_renderer();
-    let mut element = runtime.composer_note_view().unwrap();
+    let mut element = runtime.composer_note_view(None).unwrap();
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,

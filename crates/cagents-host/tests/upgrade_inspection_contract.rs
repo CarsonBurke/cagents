@@ -57,6 +57,7 @@ impl Drop for ChildOwner {
 }
 fn daemon(root: &Path, name: &str) -> Result<ChildOwner, String> {
     Command::new(env!("CARGO_BIN_EXE_cagentsd"))
+        .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(fs::File::create(root.join(name)).map_err(|e| e.to_string())?)
@@ -237,6 +238,7 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             .env("CAGENTS_UPGRADE_INSPECTION_ROOT", &root)
             .env("PATH", "/usr/bin:/bin")
             .env("SHELL", "/bin/sh")
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .timeout(Duration::from_secs(90))
             .output_limits(128 * 1024, 128 * 1024);
         for (key, name) in [

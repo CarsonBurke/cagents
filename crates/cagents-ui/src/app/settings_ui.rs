@@ -260,7 +260,7 @@ fn settings_category_controls<'a>(
                 (
                     Field::Failure,
                     "Failure or cancellation",
-                    "Notify when a turn fails or is cancelled.",
+                    "Notify when a turn fails or is cancelled, or a session does not resume when this computer starts.",
                 ),
                 (
                     Field::Waiting,
@@ -1004,6 +1004,20 @@ fn settings_category_controls<'a>(
                     },
                 )
                 .keywords("unresumable_agents")],
+            ),
+            settings_group(
+                "Restarts",
+                "What happens when this computer starts again after a shutdown or reboot.",
+                vec![crate::settings_widgets::toggle(
+                    "Resume sessions when this computer starts",
+                    "After this computer restarts, reopen its stopped chats and agents the first time the daemon starts, such as when you open the app or run a cagents command. They start idle; any that cannot resume are reported in notifications. For another computer, run cagents daemon boot enable --resume-sessions on it, for example over SSH; that also starts its daemon when it starts.",
+                    draft.resume_sessions_after_reboot,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::ResumeSessionsAfterReboot,
+                        value: enabled.to_string(),
+                    },
+                )
+                .keywords("reboot boot resume headless")],
             ),
         ],
         SettingsCategory::Links => vec![settings_group(

@@ -474,6 +474,7 @@ enum class NoticeKind(override val wire: String) : WireEnum {
     MessageReceived("message_received"),
     AutomationPaused("automation_paused"),
     AutomationBlocked("automation_blocked"),
+    NotResumed("not_resumed"),
     Unknown("");
 
     /** Classification for bridges that omit `asks`. */

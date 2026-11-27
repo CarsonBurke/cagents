@@ -13258,7 +13258,7 @@ fn view_refuses_removal_showing(
         view.panes = vec![pane];
         view.revision += 1;
     }
-    app.refuse_shared_view_edit(&Scope::Channel(channel), operation);
+    app.refuse_shared_view_edit(&Scope::Channel(channel), operation, "refused");
     drop(app.reconcile_shared_views());
 }
 
@@ -22210,6 +22210,65 @@ fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
     );
     assert!(app.chat_ui.attempt(card).is_none());
 }
+/// An Antigravity too old to keep its sign-in in a file can't be signed in
+/// for agents while the desktop keyring is locked, so its sign-in bar says to
+/// update it first. A current one is only asked to sign in.
+#[test]
+fn an_antigravity_too_old_for_a_file_sign_in_is_told_to_update_first() {
+    for (failure, update) in [
+        (
+            "sign in to Antigravity from cagents, then try again. Agents in cagents read this sign-in from a file, not the desktop keyring.",
+            false,
+        ),
+        (
+            "Antigravity 1.5.15 keeps its sign-in in the desktop keyring, which agents can't read while it's locked, as it stays until someone logs in to the desktop. Update it by running agy update, then sign in from cagents.",
+            true,
+        ),
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot::default());
+        answer_start(&mut app, target, Ok(handle.clone()));
+        let target = chat_runtime(&app, card).target;
+        let failure = format!(
+            "{}: {failure} (Authentication required)",
+            chat::ACP_SIGN_IN_PREFIX
+        );
+        handle.replace_snapshot_for_test(Snapshot {
+            error: Some(failure),
+            exited: true,
+            ..Snapshot::default()
+        });
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+        retired(&mut app, card);
+        assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_some());
+        let text = visible_text(&app, card).join("\n");
+        assert_eq!(
+            text.contains("Antigravity needs an update to sign in"),
+            update,
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("Run agy update in a terminal, then sign in and send your message."),
+            update,
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("Antigravity sign-in required"),
+            !update,
+            "{text}"
+        );
+        // Signing in stays offered: it is the step after updating.
+        let buttons = super::blocked_recovery_tests::buttons(&app, card);
+        assert!(
+            buttons
+                .iter()
+                .any(|(label, enabled)| label == "Sign in" && *enabled),
+            "{buttons:?}"
+        );
+    }
+}
 /// An ACP provider reports a missing sign-in when its conversation starts,
 /// not during a turn, so the card goes back to its draft. That draft offers
 /// the sign-in a started conversation gets, on the system account a provider
@@ -22307,6 +22366,43 @@ fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
         .environment
         .insert("HOME".into(), "/unknown/agy-recovery-home".into());
     assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+}
+
+/// A conversation that stopped for its sign-in while the daemon still holds it
+/// can't start again in its pane (#4482): reconnecting would attach to the
+/// same stopped view. Its sign-in bar offers no Resume chat and says to start
+/// a new chat; once the daemon connection is gone, resuming starts it again.
+#[test]
+fn a_stopped_conversation_the_daemon_still_holds_offers_no_resume_after_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Antigravity);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.error = Some(format!(
+        "{}: sign in to Antigravity from cagents, then try again.",
+        chat::ACP_SIGN_IN_PREFIX
+    ));
+    snapshot.exited = true;
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    assert!(!chat_runtime(&app, card).is_draft());
+    assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_some());
+    assert!(!app.chat_auth_resume_enabled(target));
+    let text = visible_text(&app, card).join("\n");
+    assert!(text.contains("Sign in, then start a new chat."), "{text}");
+    let buttons = super::blocked_recovery_tests::buttons(&app, card);
+    assert!(
+        buttons.iter().all(|(label, _)| label != "Resume chat"),
+        "{buttons:?}"
+    );
+    assert!(
+        buttons
+            .iter()
+            .any(|(label, enabled)| label == "Sign in" && *enabled),
+        "{buttons:?}"
+    );
+    app.chat_runtime_mut(target).unwrap().disconnected = true;
+    assert!(app.chat_auth_resume_enabled(target));
 }
 
 /// A start that stops for any other reason keeps its plain report.
@@ -25850,6 +25946,8 @@ fn a_draft_whose_provider_is_missing_names_one_to_choose_instead() {
             "Codex isn't installed on this computer. Choose a model under Claude in the model menu, or install Codex there."
         )
     );
+    // The composer doesn't say it a second time.
+    assert!(app.draft_provider_note(card).is_none());
 
     // Where Accounts found the CLI, only the PATH agents start with lacks
     // it, which the daemon's own words say.
@@ -25866,6 +25964,162 @@ fn a_draft_whose_provider_is_missing_names_one_to_choose_instead() {
         chat_runtime(&app, card).error.as_deref(),
         Some(report.as_str())
     );
+}
+
+/// A draft opened before Accounts found which CLIs a device has, untouched
+/// since, moves to the provider a new conversation would start on once its
+/// own turns out to be missing, picking no model for it (#4413).
+#[test]
+fn an_untouched_draft_moves_off_a_provider_found_missing() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Codex);
+    let id = chat_runtime(&app, card).session.id;
+    app.account_ui.set_cli_for_test(Provider::Codex, false);
+    app.account_ui.set_cli_for_test(Provider::Claude, true);
+    // Discovery's answer moves it.
+    app.settle_discovery_for_test();
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.is_draft());
+    assert_eq!(runtime.session.id, id);
+    assert_eq!(runtime.session.launch.provider, Provider::Claude);
+    assert!(!runtime.draft_model_chosen);
+    assert!(super::draft_choice::get(&runtime.session).is_none());
+    assert!(app.draft_provider_note(card).is_none());
+    assert!(matches!(
+        &app.card_state(card).unwrap().kind,
+        CardKind::Chat(session) if session.launch.provider == Provider::Claude
+    ));
+
+    // Another window showing the same draft adopts the move the same way,
+    // and finds nothing more to move.
+    let mut peer = crate::app::tests::context_inspector_test_app(false);
+    let peer_card = draft_chat_for_provider(&mut peer, Provider::Codex);
+    let original = {
+        let Some(CardRuntime::Chat(runtime)) = peer.cards.get_mut(&peer_card) else {
+            unreachable!()
+        };
+        runtime.session.id = id;
+        runtime.session.clone()
+    };
+    assert_eq!(original.launch.provider, Provider::Codex);
+    peer.account_ui.set_cli_for_test(Provider::Codex, false);
+    peer.account_ui.set_cli_for_test(Provider::Claude, true);
+    let moved = chat_runtime(&app, card).session.clone();
+    drop(peer.adopt_shared_draft_session(peer_card, &moved));
+    drop(peer.move_drafts_off_missing_providers());
+    let runtime = chat_runtime(&peer, peer_card);
+    assert_eq!(runtime.session, moved);
+    assert!(!runtime.draft_model_chosen);
+    assert!(peer.draft_provider_note(peer_card).is_none());
+}
+
+/// A draft with something in it, or a model picked, keeps its provider when
+/// that provider turns out to be missing; its composer says so before the
+/// first send, while it is typed in, until the provider is found (#4413).
+#[test]
+fn a_touched_draft_on_a_missing_provider_says_so_and_stays() {
+    let note = "Codex isn't installed on this computer. Choose a model under Claude in the model menu, or install Codex there.";
+    for typed in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat_for_provider(&mut app, Provider::Codex);
+        let target = chat_runtime(&app, card).target;
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        if typed {
+            runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+        } else {
+            runtime.draft_model_chosen = true;
+        }
+        assert!(app.draft_provider_note(card).is_none());
+        app.account_ui.set_cli_for_test(Provider::Codex, false);
+        app.account_ui.set_cli_for_test(Provider::Claude, true);
+        app.settle_discovery_for_test();
+        assert_eq!(
+            chat_runtime(&app, card).session.launch.provider,
+            Provider::Codex
+        );
+        assert_eq!(app.draft_provider_note(card).as_deref(), Some(note));
+        // Typing doesn't put it away.
+        drop(app.handle_chat_ui(Action::Composer(
+            target,
+            text_editor::Action::Edit(text_editor::Edit::Insert('y')),
+        )));
+        assert_eq!(app.draft_provider_note(card).as_deref(), Some(note));
+
+        app.account_ui.set_cli_for_test(Provider::Codex, true);
+        assert!(app.draft_provider_note(card).is_none());
+    }
+
+    // With nothing to move to, it says how to start the conversation.
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Codex);
+    for provider in Provider::ALL {
+        app.account_ui.set_cli_for_test(provider, false);
+    }
+    app.settle_discovery_for_test();
+    assert_eq!(
+        chat_runtime(&app, card).session.launch.provider,
+        Provider::Codex
+    );
+    assert_eq!(
+        app.draft_provider_note(card).as_deref(),
+        Some(
+            "Codex isn't installed on this computer. Install it there to start this conversation."
+        )
+    );
+}
+
+/// A draft opened on a provider Accounts already found missing, as one
+/// restored from a saved session or opened from another window's view,
+/// moves once it is open if untouched; one with a model chosen stays
+/// (#4413).
+#[test]
+fn a_draft_opened_on_a_missing_provider_moves_once_open() {
+    for chosen in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat_for_provider(&mut app, Provider::Codex);
+        let mut session = chat_runtime(&app, card).session.clone();
+        if chosen {
+            super::draft_choice::set(&mut session, &(Some("gpt-fixture".into()), None));
+        }
+        app.account_ui.set_cli_for_test(Provider::Codex, false);
+        app.account_ui.set_cli_for_test(Provider::Claude, true);
+        let opened = app.open_chat_draft(card, session);
+        let target = chat_runtime(&app, card).target;
+        // Opening leaves it where it was; the move follows.
+        assert_eq!(
+            chat_runtime(&app, card).session.launch.provider,
+            Provider::Codex
+        );
+        drop(opened);
+        drop(app.handle_chat_ui(Action::MoveDraftOffMissingProvider(target)));
+        let runtime = chat_runtime(&app, card);
+        let expected = if chosen {
+            Provider::Codex
+        } else {
+            Provider::Claude
+        };
+        assert_eq!(runtime.session.launch.provider, expected);
+        assert_eq!(runtime.draft_model_chosen, chosen);
+    }
+}
+
+/// A discovery still provisional, before the shell's `PATH` answers, moves
+/// nothing (#4413).
+#[test]
+fn a_provisional_discovery_moves_no_draft() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Codex);
+    app.account_ui.set_cli_for_test(Provider::Codex, false);
+    app.account_ui.set_cli_for_test(Provider::Claude, true);
+    app.account_ui.set_provisional_for_test();
+    drop(app.move_drafts_off_missing_providers());
+    assert_eq!(
+        chat_runtime(&app, card).session.launch.provider,
+        Provider::Codex
+    );
+    assert!(app.draft_provider_note(card).is_none());
 }
 
 /// An ACP conversation's current sign-in or no-allowance failure has the

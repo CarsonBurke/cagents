@@ -925,7 +925,7 @@ impl Cagents {
 
     /// The consequences of the whole group, in the terms each kind's own
     /// confirmation uses: what else closes, and what stays on disk.
-    fn group_cascade(&self, dialog: &Dialog) -> (Option<String>, &'static str) {
+    fn group_cascade(&self, dialog: &Dialog) -> (Option<String>, Cow<'static, str>) {
         match dialog.kind() {
             SelectionRow::Project(_) => {
                 let channels = dialog
@@ -950,8 +950,12 @@ impl Cagents {
                             if channels == 1 { "" } else { "s" }
                         )
                     }),
-                    "Terminals and chats in these projects, including detached sessions, will \
-                     close. Repositories, folders, worktrees, and branches stay on disk.",
+                    format!(
+                        "Terminals and chats in these projects, including detached sessions, \
+                         will close. Repositories, folders, worktrees, and branches stay {}.",
+                        project_ui::files_stay()
+                    )
+                    .into(),
                 )
             }
             SelectionRow::Worktree(..) => (
@@ -963,9 +967,11 @@ impl Cagents {
                         .collect::<Vec<_>>(),
                     "these worktrees",
                 ),
-                "Git will remove these worktree directories, including uncommitted, untracked and ignored files such as .env. \
-                 Unsaved editor changes are discarded. Their branches are retained. \
-                 Terminals and chats running in them, including detached ones, are closed first.",
+                format!(
+                    "{} Unsaved editor changes are discarded. Their branches are retained.",
+                    project_ui::worktree_deletion_note(true)
+                )
+                .into(),
             ),
             SelectionRow::Channel(_) => {
                 let conversations = dialog
@@ -982,11 +988,12 @@ impl Cagents {
                         )
                     }),
                     "The channels and the conversations they hold are removed from this \
-                     workspace. Nothing outside them is touched.",
+                     workspace. Nothing outside them is touched."
+                        .into(),
                 )
             }
             // Never selected, so never the kind of a group.
-            SelectionRow::Card(_) => (None, ""),
+            SelectionRow::Card(_) => (None, "".into()),
         }
     }
 

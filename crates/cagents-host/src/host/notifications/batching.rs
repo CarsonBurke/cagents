@@ -31,6 +31,7 @@ impl Schedule {
             kind,
             Kind::Waiting
                 | Kind::Failed
+                | Kind::NotResumed
                 | Kind::Interrupted
                 | Kind::AutomationPaused
                 | Kind::AutomationBlocked

@@ -93,6 +93,7 @@ fn private_default_preferences_persist_and_cli_respects_inherited_authority() {
         command
             .env("PATH", "/usr/bin:/bin")
             .env("SHELL", "/bin/sh")
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(root.join("daemon.log")).unwrap())
@@ -157,6 +158,7 @@ fn private_default_preferences_persist_and_cli_respects_inherited_authority() {
                 ])
                 .env("PATH", "/usr/bin:/bin")
                 .env("SHELL", "/bin/sh")
+                .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
                 .timeout(remaining.min(Duration::from_secs(5)))
                 .output_limits(64 * 1024, 64 * 1024);
             for (name, path) in &environment {

@@ -216,6 +216,9 @@ pub struct SidebarModel {
     pub external_editors: Vec<SidebarEditor>,
     /// Enables standalone editor file actions; other hosts keep editor-only menus.
     pub file_management: bool,
+    /// The device whose projects this window shows, or `None` for this
+    /// computer. Its menus offer only what runs there.
+    pub device: Option<String>,
     /// Revisioned so the navigation list can see in one comparison, on every
     /// frame, that no project changed; see [`NavigationCache`].
     pub projects: Revisioned<Vec<SidebarProject>>,
@@ -264,6 +267,31 @@ impl SidebarModel {
         });
     }
 
+    /// Lists projects in the shared order every window uses, by repository,
+    /// with a project it does not hold after every one it does, by path (see
+    /// [`crate::workspace_model::project_rank`]). Whether anything moved; an
+    /// order already in place leaves the list, and its revision, untouched.
+    pub fn apply_shared_project_order(&mut self, order: &[PathBuf]) -> bool {
+        fn key<'a>(
+            order: &[PathBuf],
+            project: &'a SidebarProject,
+        ) -> ((usize, &'a Path), ProjectId) {
+            (
+                crate::workspace_model::project_rank(order, &project.repository),
+                project.id,
+            )
+        }
+        if self
+            .projects
+            .is_sorted_by(|left, right| key(order, left) <= key(order, right))
+        {
+            return false;
+        }
+        self.projects
+            .sort_by(|left, right| key(order, left).cmp(&key(order, right)));
+        true
+    }
+
     pub fn reorder_project(&mut self, project: ProjectId, before: Option<ProjectId>) -> bool {
         let Some(from) = self.projects.iter().position(|entry| entry.id == project) else {
             return false;
@@ -292,6 +320,7 @@ impl SidebarModel {
             source_control: None,
             external_editors: Vec::new(),
             file_management: false,
+            device: None,
         }
     }
 
@@ -310,6 +339,14 @@ impl SidebarModel {
             source_control: None,
             external_editors: Vec::new(),
             file_management: false,
+            device: None,
+        }
+    }
+
+    fn project_menus(&self) -> ProjectMenus<'_> {
+        ProjectMenus {
+            editors: &self.external_editors,
+            device: self.device.as_deref(),
         }
     }
 
@@ -5334,6 +5371,8 @@ impl SidebarState {
             | SidebarAction::RetryWorktreeOperation(_)
             | SidebarAction::RetryWorktreeDeletion { .. }
             | SidebarAction::RetryChannelDeletion { .. }
+            | SidebarAction::DismissWorktreeDeletion { .. }
+            | SidebarAction::DismissChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
@@ -5465,6 +5504,17 @@ pub enum SidebarAction {
     },
     /// Runs a confirmed channel deletion again after it failed.
     RetryChannelDeletion {
+        channel_id: ChannelId,
+    },
+    /// Keeps a worktree whose deletion failed and clears the failure from its
+    /// row.
+    DismissWorktreeDeletion {
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+    },
+    /// Keeps a channel whose deletion failed and clears the failure from its
+    /// row.
+    DismissChannelDeletion {
         channel_id: ChannelId,
     },
     SearchChanged(String),
@@ -5861,6 +5911,7 @@ struct NavigationSnapshot {
     /// workspace, so an unchanged revision stands in for it.
     projects_revision: u64,
     editors: Vec<SidebarEditor>,
+    device: Option<String>,
     rows: selection::Selection,
     query: String,
     filter: SidebarFilter,
@@ -5892,6 +5943,7 @@ impl NavigationSnapshot {
             PROJECT_COMPARISONS.with(|count| count.set(count.get() + 1));
             self.projects == *model.projects
         }) && self.editors == model.external_editors
+            && self.device == model.device
             && self.rows == state.rows
             && self.query == state.query
             && self.filter == state.filter
@@ -5921,6 +5973,7 @@ impl NavigationSnapshot {
             projects: (*model.projects).clone(),
             projects_revision: Revisioned::revision(&model.projects),
             editors: model.external_editors.clone(),
+            device: model.device.clone(),
             rows: state.rows.clone(),
             query: state.query.clone(),
             filter: state.filter,
@@ -8097,7 +8150,7 @@ fn project_view<'a>(
         entity.kind == ProjectKind::Git,
         true,
         entity.github_ready,
-        project.editors,
+        project.menus,
         project
             .state
             .rows
@@ -8161,7 +8214,7 @@ fn project_view<'a>(
                         selection,
                         modal_open,
                         entity.github_ready,
-                        project.editors,
+                        project.menus,
                         project.state.worktree_row_state(project_id, worktree.id),
                         false,
                         project
@@ -8419,7 +8472,7 @@ fn compact_project<'a>(
                     selection,
                     modal_open,
                     entity.github_ready,
-                    project.editors,
+                    project.menus,
                     project.state.worktree_row_state(entity.id, worktree.id),
                     true,
                     project
@@ -8474,7 +8527,7 @@ fn compact_project<'a>(
         entity.kind == ProjectKind::Git,
         true,
         entity.github_ready,
-        project.editors,
+        project.menus,
         project
             .state
             .rows
@@ -8952,26 +9005,40 @@ fn deletion_ink(ink: RowInk, deletion: Option<&RowDeletion>) -> RowInk {
     }
 }
 
-/// Mounts a row with the trailing retry a failed deletion offers.
-fn with_deletion_retry(
+/// The answers a row's failed deletion offers: run it again, or keep the row
+/// and stop asking.
+struct FailedDeletionAnswers {
+    retry: Option<SidebarAction>,
+    retry_id: Id,
+    dismiss: Option<SidebarAction>,
+    dismiss_id: Id,
+}
+
+/// Mounts a row with the trailing answers a failed deletion offers.
+fn with_failed_deletion_answers(
     row: Element<'static, SidebarAction>,
     deletion: Option<&RowDeletion>,
     compact: bool,
     label: &str,
-    retry: Option<SidebarAction>,
-    id: Id,
+    answers: FailedDeletionAnswers,
 ) -> Element<'static, SidebarAction> {
     if compact || !matches!(deletion, Some(RowDeletion::Failed(_))) {
         return row;
     }
-    widget::row::with_capacity(2)
+    widget::row::with_capacity(3)
         .align_y(Alignment::Center)
         .push(row)
         .push(icon_action(
             Icon::Refresh,
             format!("Retry deleting {label}"),
-            retry,
-            id,
+            answers.retry,
+            answers.retry_id,
+        ))
+        .push(icon_action(
+            Icon::Close,
+            format!("Keep {label} and dismiss the failed deletion"),
+            answers.dismiss,
+            answers.dismiss_id,
         ))
         .into()
 }
@@ -9101,18 +9168,27 @@ fn channel_view(
         indicator_width,
     );
     crate::reorder::channel_target(
-        grid.mount(with_deletion_retry(
+        grid.mount(with_failed_deletion_answers(
             channel_context_controls(action, channel.id, inert, selection_count),
             deletion,
             compact,
             &channel.title,
-            gated(
-                SidebarAction::RetryChannelDeletion {
-                    channel_id: channel.id,
-                },
-                modal_open,
-            ),
-            entity_id("channel.retry-delete", channel.id),
+            FailedDeletionAnswers {
+                retry: gated(
+                    SidebarAction::RetryChannelDeletion {
+                        channel_id: channel.id,
+                    },
+                    modal_open,
+                ),
+                retry_id: entity_id("channel.retry-delete", channel.id),
+                dismiss: gated(
+                    SidebarAction::DismissChannelDeletion {
+                        channel_id: channel.id,
+                    },
+                    modal_open,
+                ),
+                dismiss_id: entity_id("channel.dismiss-delete", channel.id),
+            },
         )),
         channel.id,
         !inert,
@@ -9633,14 +9709,14 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
     }
 }
 
-fn worktree_view<'a>(
+fn worktree_view(
     project_id: ProjectId,
-    worktree: &'a SidebarWorktree,
+    worktree: &SidebarWorktree,
     primary: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
     github_ready: bool,
-    editors: &'a [SidebarEditor],
+    menus: ProjectMenus<'_>,
     row_state: WorktreeRowState,
     compact: bool,
     selection_count: Option<usize>,
@@ -9832,7 +9908,7 @@ fn worktree_view<'a>(
     } else {
         action
     };
-    grid.mount(with_deletion_retry(
+    grid.mount(with_failed_deletion_answers(
         context_controls(
             action,
             project_id,
@@ -9841,20 +9917,30 @@ fn worktree_view<'a>(
             true,
             worktree.branch.is_some(),
             github_ready,
-            editors,
+            menus,
             selection_count,
         ),
         deletion,
         compact,
         &chrome.label,
-        gated(
-            SidebarAction::RetryWorktreeDeletion {
-                project_id,
-                worktree_id: worktree.id,
-            },
-            modal_open,
-        ),
-        entity_id("worktree.retry-delete", worktree.id),
+        FailedDeletionAnswers {
+            retry: gated(
+                SidebarAction::RetryWorktreeDeletion {
+                    project_id,
+                    worktree_id: worktree.id,
+                },
+                modal_open,
+            ),
+            retry_id: entity_id("worktree.retry-delete", worktree.id),
+            dismiss: gated(
+                SidebarAction::DismissWorktreeDeletion {
+                    project_id,
+                    worktree_id: worktree.id,
+                },
+                modal_open,
+            ),
+            dismiss_id: entity_id("worktree.dismiss-delete", worktree.id),
+        },
     ))
 }
 
@@ -9988,6 +10074,140 @@ fn project_menu_icon(command: &ProjectCommand) -> Icon {
     }
 }
 
+/// What a window's project and checkout menus can offer beyond the row
+/// itself: this computer's external editors, and the device the window
+/// works on, if it isn't this computer.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProjectMenus<'a> {
+    editors: &'a [SidebarEditor],
+    device: Option<&'a str>,
+}
+
+/// The commands a device window's menu offers for a project row
+/// (`worktree_id` `None`) or a checkout row, alone or as one of several
+/// selected rows. The app checks that its device routing runs every one.
+pub fn device_menu_commands(
+    project_id: ProjectId,
+    worktree_id: Option<WorktreeId>,
+    device: &str,
+) -> Vec<ProjectCommand> {
+    [None, Some(2)]
+        .into_iter()
+        .flat_map(|selection_count| {
+            project_menu_commands(
+                project_id,
+                worktree_id,
+                true,
+                true,
+                ProjectMenus {
+                    editors: &[],
+                    device: Some(device),
+                },
+                selection_count,
+            )
+        })
+        .map(|(_, _, command)| command)
+        .collect()
+}
+
+/// The commands a project or checkout row's menu lists, before grouping.
+/// A device window lists only what runs on the device, and says where: its
+/// files open in cagents' own browser, and the commands that need this
+/// computer's Git or GitHub, which a device window can't run yet, are left
+/// out rather than offered as dead ends.
+fn project_menu_commands(
+    project_id: ProjectId,
+    worktree_id: Option<WorktreeId>,
+    git: bool,
+    github_ready: bool,
+    menus: ProjectMenus<'_>,
+    selection_count: Option<usize>,
+) -> Vec<(String, Option<icon::Handle>, ProjectCommand)> {
+    let local = menus.device.is_none();
+    let mut commands = vec![
+        (
+            match menus.device {
+                Some(device) => format!("Browse files on {device}"),
+                None => "Show in file manager".to_owned(),
+            },
+            None,
+            ProjectCommand::Reveal,
+        ),
+        ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
+        (
+            project_channel_command_label(worktree_id).to_owned(),
+            None,
+            ProjectCommand::NewChannel,
+        ),
+    ];
+    if git {
+        commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
+    }
+    commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
+    if worktree_id.is_some() {
+        if git {
+            commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
+            if local {
+                commands.push((
+                    "New worktree from this branch…".into(),
+                    None,
+                    ProjectCommand::NewWorktreeFromBranch,
+                ));
+            }
+            if github_ready && local {
+                commands.push((
+                    "Open or create pull request…".into(),
+                    None,
+                    ProjectCommand::PullRequest,
+                ));
+            }
+        }
+    } else {
+        commands.push(("Move project up".into(), None, ProjectCommand::MoveUp));
+        commands.push(("Move project down".into(), None, ProjectCommand::MoveDown));
+        commands.push((
+            "Reset sidebar order".into(),
+            None,
+            ProjectCommand::ResetSidebarOrder,
+        ));
+    }
+    // Editors run on this computer, so a device window has none to offer.
+    commands.extend(menus.editors.iter().filter(|_| local).map(|editor| {
+        (
+            editor.name.clone(),
+            Some(editor_icon(editor)),
+            ProjectCommand::OpenEditor(editor.id.clone()),
+        )
+    }));
+    if github_ready && local {
+        commands.push((
+            "Open repository on GitHub".to_owned(),
+            None,
+            ProjectCommand::RepositoryUrl,
+        ));
+    }
+    if selection_count != Some(1) {
+        commands.clear();
+    }
+    if let Some(count) = selection_count {
+        // Every row names its own kind, so one label covers both counts.
+        let (row, command) = match worktree_id {
+            Some(worktree_id) => (
+                SelectionRow::Worktree(project_id, worktree_id),
+                ProjectCommand::Delete,
+            ),
+            None => (SelectionRow::Project(project_id), ProjectCommand::Remove),
+        };
+        let label = if count > 1 {
+            row.deletion_label(count)
+        } else {
+            format!("{} {}", row.deletion_verb(), row.noun(1))
+        };
+        commands.push((format!("{label}…"), None, command));
+    }
+    commands
+}
+
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -9996,7 +10216,7 @@ fn context_controls<'a>(
     git: bool,
     has_branch: bool,
     github_ready: bool,
-    editors: &[SidebarEditor],
+    menus: ProjectMenus<'_>,
     selection_count: Option<usize>,
 ) -> Element<'a, SidebarAction> {
     context_controls_with_display(
@@ -10007,7 +10227,7 @@ fn context_controls<'a>(
         git,
         has_branch,
         github_ready,
-        editors,
+        menus,
         selection_count,
         None,
     )
@@ -10021,7 +10241,7 @@ fn context_controls_with_display<'a>(
     git: bool,
     has_branch: bool,
     github_ready: bool,
-    editors: &[SidebarEditor],
+    menus: ProjectMenus<'_>,
     selection_count: Option<usize>,
     display: Option<(
         crate::settings::SidebarWorktrees,
@@ -10029,86 +10249,23 @@ fn context_controls_with_display<'a>(
     )>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
-    let editors = editors.to_vec();
+    let editors = menus.editors.to_vec();
+    let device = menus.device.map(str::to_owned);
     if modal_open || selection_count.is_none() {
         return content.into();
     }
     crate::interaction::context_menu_lazy(content, move || {
-        let mut commands = vec![
-            (
-                "Show in file manager".to_owned(),
-                None,
-                ProjectCommand::Reveal,
-            ),
-            ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
-            (
-                project_channel_command_label(worktree_id).to_owned(),
-                None,
-                ProjectCommand::NewChannel,
-            ),
-        ];
-        if git {
-            commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
-        }
-        commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
-        if worktree_id.is_some() {
-            if git {
-                commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
-                commands.push((
-                    "New worktree from this branch…".into(),
-                    None,
-                    ProjectCommand::NewWorktreeFromBranch,
-                ));
-                if github_ready {
-                    commands.push((
-                        "Open or create pull request…".into(),
-                        None,
-                        ProjectCommand::PullRequest,
-                    ));
-                }
-            }
-        } else {
-            commands.push(("Move project up".into(), None, ProjectCommand::MoveUp));
-            commands.push(("Move project down".into(), None, ProjectCommand::MoveDown));
-            commands.push((
-                "Reset sidebar order".into(),
-                None,
-                ProjectCommand::ResetSidebarOrder,
-            ));
-        }
-        commands.extend(editors.iter().map(|editor| {
-            (
-                editor.name.clone(),
-                Some(editor_icon(editor)),
-                ProjectCommand::OpenEditor(editor.id.clone()),
-            )
-        }));
-        if github_ready {
-            commands.push((
-                "Open repository on GitHub".to_owned(),
-                None,
-                ProjectCommand::RepositoryUrl,
-            ));
-        }
-        if selection_count != Some(1) {
-            commands.clear();
-        }
-        if let Some(count) = selection_count {
-            // Every row names its own kind, so one label covers both counts.
-            let (row, command) = match worktree_id {
-                Some(worktree_id) => (
-                    SelectionRow::Worktree(project_id, worktree_id),
-                    ProjectCommand::Delete,
-                ),
-                None => (SelectionRow::Project(project_id), ProjectCommand::Remove),
-            };
-            let label = if count > 1 {
-                row.deletion_label(count)
-            } else {
-                format!("{} {}", row.deletion_verb(), row.noun(1))
-            };
-            commands.push((format!("{label}…"), None, command));
-        }
+        let mut commands = project_menu_commands(
+            project_id,
+            worktree_id,
+            git,
+            github_ready,
+            ProjectMenus {
+                editors: &editors,
+                device: device.as_deref(),
+            },
+            selection_count,
+        );
         commands.sort_by_key(|(_, _, command)| project_menu_group(command));
         let mut previous_group = None;
         let mut entries = Vec::new();
@@ -13843,7 +14000,7 @@ struct FilteredProject<'a> {
     /// Pane rows: the Attention list's, or every open pane's while the
     /// project's checkouts are hidden.
     cards: Vec<&'a SidebarCard>,
-    editors: &'a [SidebarEditor],
+    menus: ProjectMenus<'a>,
     state: &'a SidebarState,
 }
 
@@ -14072,7 +14229,7 @@ fn filtered_projects<'a>(
                         worktrees: Vec::new(),
                         channels: Vec::new(),
                         cards: Vec::new(),
-                        editors: &model.external_editors,
+                        menus: model.project_menus(),
                         state,
                     },
                 );
@@ -14138,7 +14295,7 @@ fn filtered_projects<'a>(
                 worktrees,
                 channels,
                 cards,
-                editors: &model.external_editors,
+                menus: model.project_menus(),
                 state,
             })
         })

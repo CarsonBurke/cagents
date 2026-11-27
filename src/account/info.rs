@@ -207,7 +207,18 @@ impl RemainingWindow {
 }
 
 impl AccountInfo {
-    pub fn set_usage(&mut self, usage: UsageSnapshot, now: u64) {
+    pub fn set_usage(&mut self, mut usage: UsageSnapshot, now: u64) {
+        // Both window lists in account info report the effective binding
+        // window, even if the provider did not mark one.
+        let binding = usage.binding_window().and_then(|binding| {
+            usage
+                .windows
+                .iter()
+                .position(|window| std::ptr::eq(window, binding))
+        });
+        for (index, window) in usage.windows.iter_mut().enumerate() {
+            window.binding = binding == Some(index);
+        }
         self.age_ms = now.checked_sub(usage.observed_at);
         self.remaining = RemainingWindow::of(&usage, now);
         self.stale = RemainingWindow::stale(self.age_ms, &self.remaining);
@@ -321,6 +332,63 @@ mod tests {
         info.set_usage(usage, 2000);
         assert_eq!(info.age_ms, None);
         assert!(info.stale);
+    }
+
+    #[test]
+    fn account_info_reports_the_binding_window_after_live_updates() {
+        use crate::account::{LiveReport, claude};
+        use serde_json::json;
+
+        let mut info = AccountInfo {
+            id: "claude/system".parse().unwrap(),
+            provider: Provider::Claude,
+            label: None,
+            registered_identity: None,
+            observed_identity: None,
+            identity_conflict: false,
+            selected_by_caller: false,
+            default_for_new_chats: true,
+            archived: false,
+            usage: None,
+            remaining: vec![],
+            credits: None,
+            credits_remaining_fraction: None,
+            credits_remaining: None,
+            age_ms: None,
+            stale: true,
+            detail: None,
+        };
+        let mut usage = claude::parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 30},
+                {"kind": "weekly_all", "percent": 90, "is_active": true},
+            ]}}),
+            1000,
+        );
+        for (now, session, weekly, provider_mark, expected) in [
+            (2000, 0.4, 0.99, true, [false, true]),
+            (3000, 0.6, 0.04, false, [true, false]),
+        ] {
+            let update = claude::parse_rate_limit_event(&json!({
+                "status": "allowed",
+                "unifiedWindows": {
+                    "five_hour": {"utilization": session},
+                    "seven_day": {"utilization": weekly},
+                },
+            }))
+            .unwrap();
+            assert!(LiveReport::Claude(update).apply(&mut usage, now, now));
+            assert_eq!(usage.windows[1].binding, provider_mark);
+            assert!(!usage.windows[0].binding);
+
+            info.set_usage(usage.clone(), now);
+            let json = serde_json::to_value(&info).unwrap();
+            assert_eq!(json["usage"]["source"], "Live");
+            for (index, binding) in expected.into_iter().enumerate() {
+                assert_eq!(json["usage"]["windows"][index]["binding"], binding);
+                assert_eq!(json["remaining"][index]["window"]["binding"], binding);
+            }
+        }
     }
 
     #[test]

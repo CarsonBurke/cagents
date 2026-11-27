@@ -380,6 +380,7 @@ directly.
 | Option | Effect |
 | --- | --- |
 | `--browserless` | Build without Servo and open saved browser URLs in the system browser |
+| `--dictation` | Build the speech recognition helper beside the UI. A launch without this option can still use a helper already built there. Hot reload does not support this option. |
 | `--hot` | Experimental browserless Linux body-only UI hot reload; requires the exact recorded cargo-hot installation and bubblewrap |
 | `--hot-integrated` | Explicitly select embedded-browser hot reload instead |
 | `--debug` | Opt into local raw stderr tracing/panic output and Rust backtraces (`CAGENTS_LOCAL_DEBUG=1`, `cagents=debug,cagentsd=debug,warn`); an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
@@ -445,8 +446,9 @@ How the runner works:
 Waiting for a build slot only to learn that nothing needs building can take
 minutes on a busy host, so the runner decides first whether the matched set is
 already current. After each successful build it writes a record,
-`.run-development-ui` or `.run-development-integrated-browser`, beside the
-executables in `target/dev-runtime/`. The next launch skips the gate only if
+`.run-development-ui` or `.run-development-integrated-browser` (with a
+`-dictation` suffix when requested), beside the executables in
+`target/dev-runtime/`. The next launch skips the gate only if
 all of these still hold:
 
 - The lane, `rustc -vV`, the checked-out commit and the Zig toolchain match the
@@ -454,7 +456,7 @@ all of these still hold:
 - The build environment matches: `RUST*`, `CARGO_*` (except `CARGO_BUILD_JOBS`
   and `CARGO_HOME`), the C toolchain and `pkg-config` variables, and every
   variable a build script asked Cargo to watch.
-- All three executables are the files that build produced.
+- The three required executables, plus the helper if requested, are the files that build produced.
 - No file changed after the build started: anything in the checkout outside
   `target/`, `.git/`, `website/`, `dist/` and nested worktrees; any file in
   the executables' Cargo dependency lists; any absolute path a build script

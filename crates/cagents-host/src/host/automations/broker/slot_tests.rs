@@ -74,8 +74,7 @@ impl SlotFixture {
         }
     }
 
-    /// Creates an automation and runs it now, which the held slot refuses.
-    fn waiting(&self, name: &str) -> (crate::automations::Automation, Firing) {
+    fn create(&self, name: &str) -> crate::automations::Automation {
         use crate::{
             agent_execution::Destination,
             automations::{Definition, Schedule, SchedulePattern},
@@ -83,7 +82,7 @@ impl SlotFixture {
         let Destination::New(spec) = self.request.destination.clone() else {
             unreachable!()
         };
-        let automation = service::create(
+        service::create(
             &self.host,
             Definition {
                 name: name.into(),
@@ -97,18 +96,38 @@ impl SlotFixture {
                 precheck: None,
             },
         )
-        .unwrap();
-        let firing = self
-            .handle
-            .run_now(
+        .unwrap()
+    }
+
+    fn claim(&self, automation: &crate::automations::Automation, now: u64) -> Claimed {
+        self.handle
+            .claim_manual(
                 automation.id,
                 automation.execution_revision,
                 Uuid::new_v4(),
+                automation.next.clone(),
                 true,
+                now,
             )
-            .unwrap();
+            .unwrap()
+            .0
+    }
+
+    /// Creates an automation whose manual claim is refused by the held slot.
+    fn waiting(&self, name: &str, now: u64) -> (crate::automations::Automation, Firing) {
+        let automation = self.create(name);
+        let firing = self.claim(&automation, now).firing;
         assert!(awaits_agent_slot(&firing), "{firing:?}");
         (automation, firing)
+    }
+
+    fn execute_sql(&self, sql: &str) {
+        self.registry
+            .lock()
+            .unwrap()
+            .fixture_connection()
+            .execute_batch(sql)
+            .unwrap();
     }
 
     fn saved(&self, firing: &Firing) -> Firing {
@@ -201,10 +220,9 @@ fn scheduler_starts_a_waiting_firing_on_the_wake_that_finds_a_slot_free() {
         return;
     }
     let fixture = SlotFixture::new();
-    let (_, firing) = fixture.waiting("Slot wait fixture");
-    // Firings are served oldest first, by the millisecond.
-    std::thread::sleep(Duration::from_millis(2));
-    let (_, later) = fixture.waiting("Later slot wait fixture");
+    let now = service::now().unwrap();
+    let (_, firing) = fixture.waiting("Slot wait fixture", now);
+    let (_, later) = fixture.waiting("Later slot wait fixture", now + 1);
     let tick = || fixture.handle.tick(&fixture.host).unwrap();
 
     // The wake after the refusal starts the firing's timer, and sleeps no
@@ -226,7 +244,7 @@ fn scheduler_starts_a_waiting_firing_on_the_wake_that_finds_a_slot_free() {
     assert_eq!(fixture.saved(&firing), firing);
 
     // The slot frees. The next wake starts the run without waiting out the
-    // timer and launches it; the firing behind it waits for the slot again.
+    // timer and launches it before the later firing.
     fixture.postpone(&firing);
     fixture.postpone(&later);
     fixture.release();
@@ -236,16 +254,27 @@ fn scheduler_starts_a_waiting_firing_on_the_wake_that_finds_a_slot_free() {
         fixture.saved(&firing).diagnostic.as_deref(),
         Some("Waited for an agent slot before starting.")
     );
-    assert!(awaits_agent_slot(&fixture.saved(&later)));
-    assert!(fixture.backoff(&later).is_some());
     let run = fixture.settled(&firing);
     assert_eq!(run.state, State::Succeeded, "{run:?}");
 
-    // That run's end frees the slot for the next.
+    // The launch can finish within the same tick. The insertion order
+    // records who received the slot first regardless of provider timing.
     tick();
     assert!(fixture.backoff(&later).is_none());
-    let run = fixture.settled(&later);
-    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    let second = fixture.settled(&later);
+    assert_eq!(second.state, State::Succeeded, "{second:?}");
+    let registry = fixture.registry.lock().unwrap();
+    let connection = registry.fixture_connection();
+    let rowid = |id: crate::model::RunId| -> i64 {
+        connection
+            .query_row(
+                "SELECT rowid FROM agent_runs WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(rowid(run.id) < rowid(second.id));
 }
 
 #[test]
@@ -259,16 +288,40 @@ fn scheduler_ends_a_wait_for_a_slot_on_the_wake_after_a_resume_or_a_cancel() {
         return;
     }
     let fixture = SlotFixture::new();
-    let (resumed, skipped) = fixture.waiting("Resumed while waiting");
-    let (cancelled_owner, cancelled) = fixture.waiting("Cancelled while waiting");
+    let now = service::now().unwrap();
+    let (resumed, skipped) = fixture.waiting("Resumed while waiting", now);
+    let (cancelled_owner, cancelled) = fixture.waiting("Cancelled while waiting", now + 1);
     let tick = || fixture.handle.tick(&fixture.host).unwrap();
     tick();
     fixture.postpone(&skipped);
     fixture.postpone(&cancelled);
+    fixture
+        .handle
+        .0
+        .slots
+        .lock()
+        .unwrap()
+        .get_mut(&skipped.id)
+        .unwrap()
+        .failed = true;
 
     // Resuming the schedule supersedes the run asked for before it: the next
     // wake ends the wait, with the slot still held and the timer not yet due.
-    service::enabled(&fixture.host, resumed.id, resumed.revision, true, true).unwrap();
+    fixture
+        .registry
+        .lock()
+        .unwrap()
+        .set_automation_enabled(
+            resumed.id,
+            resumed.revision,
+            Some(crate::automations::Occurrence {
+                due_ms: now + 86_400_000,
+                local: "fixture".into(),
+            }),
+            true,
+            now,
+        )
+        .unwrap();
     tick();
     let saved = fixture.saved(&skipped);
     assert_eq!(
@@ -297,4 +350,148 @@ fn scheduler_ends_a_wait_for_a_slot_on_the_wake_after_a_resume_or_a_cancel() {
         assert_eq!(registry.automation_firing(firing.id).unwrap().run, None);
     }
     assert!(registry.active_automation_firings().unwrap().is_empty());
+}
+
+#[test]
+fn claim_time_dispatch_refusal_fails_the_firing_and_frees_the_slot() {
+    use crate::{agent_execution::State, host::agent_execution::tests::isolated};
+    if isolated(
+        "host::automations::broker::slot_tests::claim_time_dispatch_refusal_fails_the_firing_and_frees_the_slot",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let fixture = SlotFixture::new();
+    fixture.release();
+    let automation = fixture.create("Dispatch refused");
+    fixture.execute_sql(
+        "CREATE TEMP TRIGGER refuse_dispatch BEFORE INSERT ON main.agent_dispatches
+         BEGIN SELECT RAISE(ABORT, 'fixture dispatch refusal'); END;",
+    );
+    let firing = fixture
+        .handle
+        .run_now(
+            automation.id,
+            automation.execution_revision,
+            Uuid::new_v4(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(firing.state, FiringState::Failed);
+    assert_eq!(
+        firing.diagnostic.as_deref(),
+        Some("fixture dispatch refusal")
+    );
+    let registry = fixture.registry.lock().unwrap();
+    let detail = registry.automation_run_detail(firing.id).unwrap();
+    assert_eq!(detail.run.unwrap().state, State::Failed);
+    assert!(detail.agent.unwrap().closed);
+    assert_eq!(
+        registry.automation(automation.id).unwrap().active_firing,
+        None
+    );
+    drop(registry);
+
+    fixture.execute_sql("DROP TRIGGER refuse_dispatch");
+    let later = fixture.claim(&automation, service::now().unwrap());
+    assert!(
+        later.accepted.is_some(),
+        "another firing can claim the freed slot"
+    );
+}
+
+#[test]
+fn dispatch_error_after_claim_leaves_the_run_to_execution() {
+    use crate::{agent_execution::State, host::agent_execution::tests::isolated};
+    if isolated(
+        "host::automations::broker::slot_tests::dispatch_error_after_claim_leaves_the_run_to_execution",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let fixture = SlotFixture::new();
+    fixture.release();
+    let automation = fixture.create("Dispatch claimed");
+    let now = service::now().unwrap();
+    let claim = fixture.claim(&automation, now);
+    let accepted = claim.accepted.unwrap();
+    assert!(
+        fixture
+            .registry
+            .lock()
+            .unwrap()
+            .claim_agent_dispatch(&accepted, now)
+            .unwrap()
+    );
+    let error = "fixture error after dispatch claim".to_owned();
+    assert_eq!(
+        fixture
+            .handle
+            .settle_dispatch(claim.firing.id, Err(error.clone()), now),
+        Err(error),
+    );
+    let registry = fixture.registry.lock().unwrap();
+    assert_eq!(
+        registry.agent_run(accepted.run.id).unwrap().state,
+        State::Accepted
+    );
+    assert_eq!(
+        registry.automation_firing(claim.firing.id).unwrap(),
+        claim.firing
+    );
+    assert_eq!(
+        registry.automation(automation.id).unwrap().active_firing,
+        Some(claim.firing.id),
+    );
+}
+
+#[test]
+fn slot_retry_error_backs_off_without_blocking_the_next_firing() {
+    use crate::{agent_execution::State, host::agent_execution::tests::isolated};
+    if isolated(
+        "host::automations::broker::slot_tests::slot_retry_error_backs_off_without_blocking_the_next_firing",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let fixture = SlotFixture::new();
+    let now = service::now().unwrap();
+    let (_, first) = fixture.waiting("Retry error", now);
+    let (_, later) = fixture.waiting("Healthy waiter", now + 1);
+    let retry = || fixture.handle.retry_slots(&fixture.host, now).unwrap();
+    retry();
+    fixture.postpone(&first);
+    fixture.postpone(&later);
+    fixture.execute_sql(&format!(
+        "CREATE TEMP TRIGGER fail_first_waiter BEFORE UPDATE ON main.automation_firings
+         WHEN OLD.id = '{}' AND NEW.run_id IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'fixture retry error'); END;",
+        first.id,
+    ));
+
+    fixture.release();
+    retry();
+    assert_eq!(fixture.saved(&first), first);
+    let backoff = fixture.backoff(&first).unwrap();
+    assert!(backoff.failed);
+    assert_eq!(
+        backoff.refusals, 2,
+        "an error on a capacity wake advances the timer"
+    );
+    assert_eq!(fixture.settled(&later).state, State::Succeeded);
+
+    fixture.postpone(&first);
+    let retry_at = fixture.backoff(&first).unwrap().retry;
+    retry();
+    assert_eq!(fixture.backoff(&first).unwrap().retry, retry_at);
+
+    // The timer can try again, even when no capacity wake arrives.
+    fixture.execute_sql("DROP TRIGGER fail_first_waiter");
+    fixture.elapse(&first);
+    retry();
+    assert!(fixture.backoff(&first).is_none());
+    assert_eq!(fixture.settled(&first).state, State::Succeeded);
 }
