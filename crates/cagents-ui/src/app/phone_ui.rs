@@ -772,12 +772,21 @@ fn route_label(route: host::Route) -> &'static str {
 fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Vec<Element<'a, Message>> {
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
     for connection in &status.connections {
+        // A status, not a choice, so not a list row, which would draw
+        // without an action as disabled.
         rows.push(
-            crate::ui_controls::list_row(None, route_label(connection.route))
-                .icon_element(toned(Icon::Check, design::success_color))
-                .dense()
-                .trailing(muted(connection.from.as_str()))
-                .into(),
+            inset(
+                widget::row::with_children(vec![
+                    toned(Icon::Check, design::success_color),
+                    design::body(route_label(connection.route))
+                        .width(Length::Fill)
+                        .into(),
+                    muted(connection.from.as_str()),
+                ])
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+            )
+            .into(),
         );
     }
     let phones = match &status.phones {
