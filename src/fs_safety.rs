@@ -138,6 +138,12 @@ impl Root {
                 "remote paths must be opened through the selected daemon",
             ));
         }
+        Self::open_local(root)
+    }
+
+    /// Opens a path derived from this installation's own local state. The
+    /// caller must establish that the path is independent of device input.
+    pub(crate) fn open_local(root: &Path) -> io::Result<Self> {
         let name = c_path(root)?;
         let flags = DIRECTORY_HANDLE | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // SAFETY: `name` is a NUL-terminated string that outlives the call, and
