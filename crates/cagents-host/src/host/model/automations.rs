@@ -17,6 +17,7 @@ use crate::automations::{
     Automation, Definition, Firing, FiringState, HistoryCursor, HistoryPage, MAX_HISTORY_PAGE,
     Occurrence, Summary,
 };
+use crate::host::automations::target::Identity as TargetIdentity;
 
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
@@ -77,6 +78,8 @@ pub(super) fn close_project(
     for record in records {
         let mut automation: Automation = decode(&record)?;
         let was_enabled = automation.enabled;
+        let target_identity =
+            read_target_identity(tx, automation.id, automation.execution_revision)?;
         automation.revision = automation
             .revision
             .checked_add(1)
@@ -86,7 +89,7 @@ pub(super) fn close_project(
         automation.next = None;
         automation.channel = None;
         automation.updated_ms = now_ms;
-        write_revision(tx, &automation)?;
+        write_revision(tx, &automation, &target_identity)?;
         write_automation(tx, &automation)?;
         automation_audit::record(tx, &automation, LifecycleCause::ProjectClosed, None)?;
         if was_enabled {
@@ -880,7 +883,7 @@ impl Registry {
         &mut self,
         definition: Definition,
         now_ms: u64,
-        target_identity: crate::automations::DirectoryIdentity,
+        target_identity: impl Into<TargetIdentity>,
     ) -> Result<Automation, String> {
         let tx = self
             .db
@@ -893,6 +896,15 @@ impl Registry {
 
     pub(crate) fn automation(&self, id: Uuid) -> Result<Automation, String> {
         read_automation(&self.db, id)
+    }
+
+    pub(crate) fn automation_for_start(
+        &self,
+        id: Uuid,
+    ) -> Result<(Automation, TargetIdentity), String> {
+        let automation = self.automation(id)?;
+        let identity = read_target_identity(&self.db, id, automation.execution_revision)?;
+        Ok((automation, identity))
     }
 
     pub(crate) fn automations(
@@ -951,8 +963,9 @@ impl Registry {
         expected_revision: u64,
         definition: Definition,
         now_ms: u64,
-        target_identity: crate::automations::DirectoryIdentity,
+        target_identity: impl Into<TargetIdentity>,
     ) -> Result<Automation, String> {
+        let target_identity = target_identity.into();
         definition.validate()?;
         let tx = self
             .db
@@ -961,17 +974,18 @@ impl Registry {
         let mut automation = read_automation(&tx, id)?;
         require_revision(&automation, expected_revision)?;
         require_project(&tx, &definition)?;
+        let previous_target = read_target_identity(&tx, id, automation.execution_revision)?;
+        let target_changed = !previous_target.matches(&target_identity);
         let mut without_name = definition.clone();
         without_name.name = automation.definition.name.clone();
         // Saving the unchanged target after its directory was replaced is an
         // explicit refresh of that definition; it must pause for new consent.
         // A presentation-only rename never refreshes filesystem authority.
         let material = without_name != automation.definition
-            || (definition == automation.definition
-                && target_identity != automation.target_identity);
+            || (definition == automation.definition && target_changed);
         let new_agent = definition.agent != automation.definition.agent
             || definition.session_mode != automation.definition.session_mode
-            || (material && target_identity != automation.target_identity);
+            || (material && target_changed);
         let new_target = definition.agent.target != automation.definition.agent.target;
         if material && (automation.active_firing.is_some() || automation.blocked.is_some()) {
             return Err(
@@ -986,10 +1000,16 @@ impl Registry {
             .revision
             .checked_add(1)
             .ok_or("Automation revision overflow")?;
+        // A legacy record can gain boot evidence while its exact device
+        // and inode still match. The execution revision and consent stay put.
+        let upgrade_identity = definition == automation.definition
+            && !target_changed
+            && !previous_target.has_fingerprint()
+            && target_identity.has_fingerprint();
         automation.definition = definition;
         automation.updated_ms = now_ms;
         if material {
-            automation.target_identity = target_identity;
+            automation.target_identity = target_identity.raw().clone();
             automation.execution_revision = automation.revision;
             automation.enabled = false;
             automation.next = None;
@@ -1002,7 +1022,22 @@ impl Registry {
                 automation.channel = automation.definition.agent.target.channel();
             }
         }
-        write_revision(&tx, &automation)?;
+        if upgrade_identity {
+            tx.execute(
+                "UPDATE automation_revisions SET target_identity=?3 WHERE automation=?1 AND revision=?2",
+                params![id.to_string(), automation.execution_revision, encode(&target_identity)?],
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(agent) = automation.reuse_agent {
+                super::execution::enrich_legacy_agent_directory(&tx, agent, &target_identity)?;
+            }
+        }
+        let saved_target = if material || upgrade_identity {
+            &target_identity
+        } else {
+            &previous_target
+        };
+        write_revision(&tx, &automation, saved_target)?;
         write_automation(&tx, &automation)?;
         automation_audit::record(&tx, &automation, LifecycleCause::Edited, None)?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -1036,13 +1071,15 @@ impl Registry {
         }
         automation.enabled = next.is_some();
         automation.next = next;
+        let target_identity =
+            read_target_identity(&tx, automation.id, automation.execution_revision)?;
         automation.revision = automation
             .revision
             .checked_add(1)
             .ok_or("Automation revision overflow")?;
         automation.execution_revision = automation.revision;
         automation.updated_ms = now_ms;
-        write_revision(&tx, &automation)?;
+        write_revision(&tx, &automation, &target_identity)?;
         write_automation(&tx, &automation)?;
         automation_audit::record(
             &tx,
@@ -1082,6 +1119,8 @@ impl Registry {
             return Err("Cancel and confirm the active or interrupted run has closed before removing this automation".into());
         }
         require_closed_reuse(&tx, &automation)?;
+        let target_identity =
+            read_target_identity(&tx, automation.id, automation.execution_revision)?;
         automation.revision = automation
             .revision
             .checked_add(1)
@@ -1090,7 +1129,7 @@ impl Registry {
         automation.enabled = false;
         automation.next = None;
         automation.updated_ms = now_ms;
-        write_revision(&tx, &automation)?;
+        write_revision(&tx, &automation, &target_identity)?;
         write_automation(&tx, &automation)?;
         automation_audit::record(&tx, &automation, LifecycleCause::Removed, None)?;
         tx.execute(
@@ -1216,9 +1255,10 @@ pub(super) fn create_automation_in(
     tx: &Transaction<'_>,
     definition: Definition,
     now_ms: u64,
-    target_identity: crate::automations::DirectoryIdentity,
+    target_identity: impl Into<TargetIdentity>,
     next: Option<Occurrence>,
 ) -> Result<Automation, String> {
+    let target_identity = target_identity.into();
     definition.validate()?;
     require_project(tx, &definition)?;
     let channel = definition.agent.target.channel();
@@ -1227,7 +1267,7 @@ pub(super) fn create_automation_in(
         revision: 1,
         execution_revision: 1,
         definition,
-        target_identity,
+        target_identity: target_identity.raw().clone(),
         enabled: next.is_some(),
         created_ms: now_ms,
         updated_ms: now_ms,
@@ -1245,7 +1285,7 @@ pub(super) fn create_automation_in(
             automation.next.as_ref().map(|next| next.due_ms), now_ms,
             super::repository_key(&automation.definition.agent.target.repository)?],
     ).map_err(|error| error.to_string())?;
-    write_revision(tx, &automation)?;
+    write_revision(tx, &automation, &target_identity)?;
     automation_audit::record(tx, &automation, LifecycleCause::Created, None)?;
     Ok(automation)
 }
@@ -1275,14 +1315,18 @@ fn write_automation(tx: &Transaction<'_>, automation: &Automation) -> Result<(),
     Ok(())
 }
 
-fn write_revision(tx: &Transaction<'_>, automation: &Automation) -> Result<(), String> {
+fn write_revision(
+    tx: &Transaction<'_>,
+    automation: &Automation,
+    target_identity: &TargetIdentity,
+) -> Result<(), String> {
     tx.execute(
         "INSERT INTO automation_revisions(automation,revision,definition,target_identity) VALUES(?1,?2,?3,?4)",
         params![
             automation.id.to_string(),
             automation.revision,
             encode(&automation.definition)?,
-            encode(&automation.target_identity)?
+            encode(target_identity)?
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1373,7 +1417,7 @@ fn decode<T: DeserializeOwned>(value: &str) -> Result<T, String> {
 pub(crate) struct Claimed {
     pub firing: Firing,
     pub definition: Definition,
-    pub target_identity: crate::automations::DirectoryIdentity,
+    pub target_identity: TargetIdentity,
     pub accepted: Option<crate::agent_execution::Accepted>,
     pub created: bool,
 }
@@ -1541,11 +1585,12 @@ impl Registry {
             now_ms,
             crate::automations::HISTORY_RETAINED_ROWS,
         )?;
+        let target_identity = read_target_identity(&tx, id, automation.execution_revision)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(Claimed {
             firing,
             definition,
-            target_identity: automation.target_identity,
+            target_identity,
             accepted,
             created: true,
         })
@@ -1987,7 +2032,7 @@ fn read_target_identity(
     db: &Connection,
     id: Uuid,
     revision: u64,
-) -> Result<crate::automations::DirectoryIdentity, String> {
+) -> Result<TargetIdentity, String> {
     let record: String = db
         .query_row(
             "SELECT target_identity FROM automation_revisions WHERE automation=?1 AND revision=?2",
@@ -2113,6 +2158,96 @@ mod tests {
             precheck: None,
         };
         (registry, directory, definition)
+    }
+
+    #[test]
+    fn boot_evidence_survives_revision_changes_and_repeated_agent_pins() {
+        let (mut registry, directory, definition) = fixture();
+        let identity = |device: u64, boot: &str| -> TargetIdentity {
+            decode(
+                &serde_json::json!({
+                    "device": device, "inode": 256,
+                    "fingerprint": {
+                        "boot": boot, "filesystem": [123, 456], "filesystem_type": 1,
+                        "created": {"secs": 42, "nanos": 0}
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let initial = identity(11, "boot-a");
+        let after_boot = identity(12, "boot-b");
+        let another_boot = identity(13, "boot-c");
+        let automation = registry
+            .create_automation(definition.clone(), 100, initial.raw().clone())
+            .unwrap();
+        let accepted = registry
+            .claim_automation(
+                automation.id,
+                automation.execution_revision,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        let agent = accepted.accepted.unwrap().agent.id;
+        registry
+            .pin_agent_directory(
+                agent,
+                crate::agent_execution::DirectoryIdentity {
+                    device: initial.raw().device,
+                    inode: initial.raw().inode,
+                },
+            )
+            .unwrap();
+        // An unchanged save can acquire evidence while the exact legacy
+        // identity still matches, even if the associated firing is active.
+        let saved = registry
+            .edit_automation(
+                automation.id,
+                automation.revision,
+                definition,
+                300,
+                initial.clone(),
+            )
+            .unwrap();
+        assert_eq!(saved.execution_revision, automation.execution_revision);
+        assert_eq!(saved.reuse_agent, Some(agent));
+        let resumed = registry
+            .set_automation_enabled(saved.id, saved.revision, None, true, 400)
+            .unwrap();
+        drop(registry);
+
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let (_, saved_target) = registry.automation_for_start(resumed.id).unwrap();
+        assert_eq!(saved_target, initial);
+        assert!(saved_target.matches(&after_boot));
+        assert!(saved_target.matches(&another_boot));
+        assert_eq!(
+            registry.automation_agent_directory(agent).unwrap(),
+            Some(initial)
+        );
+
+        registry
+            .pin_automation_agent_directory(agent, &after_boot)
+            .unwrap();
+        assert!(
+            registry
+                .pin_automation_agent_directory(agent, &identity(13, "boot-b"))
+                .is_err()
+        );
+        registry
+            .pin_automation_agent_directory(agent, &another_boot)
+            .unwrap();
+        assert_eq!(
+            registry.automation_agent_directory(agent).unwrap(),
+            Some(another_boot)
+        );
     }
 
     #[test]

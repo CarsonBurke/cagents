@@ -161,7 +161,7 @@ impl Registry {
     pub(crate) fn resolve_automation_proposal(
         &mut self,
         expected: &Proposal,
-        next: Option<Occurrence>,
+        approval: Option<(Occurrence, crate::host::automations::target::Identity)>,
         now_ms: u64,
     ) -> Result<Proposal, String> {
         let tx = self
@@ -181,12 +181,15 @@ impl Registry {
         if &current != expected {
             return Err("The automation proposal changed; review it again".into());
         }
-        current.state = if let Some(next) = next {
+        current.state = if let Some((next, identity)) = approval {
+            if identity.raw() != &current.target_identity {
+                return Err("The automation proposal target changed; review it again".into());
+            }
             let automation = create_automation_in(
                 &tx,
                 current.definition.clone(),
                 now_ms,
-                current.target_identity.clone(),
+                identity,
                 Some(next),
             )?;
             ProposalState::Approved {
@@ -411,11 +414,16 @@ mod tests {
         (root, registry, proposal)
     }
 
-    fn next() -> Occurrence {
-        Occurrence {
-            due_ms: 1000,
-            local: "2026-10-12T09:30".into(),
-        }
+    fn approval(
+        proposal: &Proposal,
+    ) -> Option<(Occurrence, crate::host::automations::target::Identity)> {
+        Some((
+            Occurrence {
+                due_ms: 1000,
+                local: "2026-10-12T09:30".into(),
+            },
+            proposal.target_identity.clone().into(),
+        ))
     }
 
     #[test]
@@ -478,7 +486,7 @@ mod tests {
     fn approval_commits_one_enabled_schedule_and_preserves_the_named_channel() {
         let (_root, mut registry, proposal) = fixture();
         let receipt = registry
-            .resolve_automation_proposal(&proposal, Some(next()), 200)
+            .resolve_automation_proposal(&proposal, approval(&proposal), 200)
             .unwrap();
         let ProposalState::Approved {
             automation,
@@ -520,7 +528,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .resolve_automation_proposal(&proposal, Some(next()), 400)
+                .resolve_automation_proposal(&proposal, approval(&proposal), 400)
                 .unwrap(),
             receipt
         );
@@ -555,7 +563,7 @@ mod tests {
             .unwrap();
         assert!(
             registry
-                .resolve_automation_proposal(&proposal, Some(next()), 200)
+                .resolve_automation_proposal(&proposal, approval(&proposal), 200)
                 .is_err()
         );
         assert!(registry.automations(None, 100).unwrap().is_empty());
@@ -569,7 +577,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             registry
-                .resolve_automation_proposal(&proposal, Some(next()), 300)
+                .resolve_automation_proposal(&proposal, approval(&proposal), 300)
                 .unwrap()
                 .state,
             ProposalState::Approved { .. }
@@ -583,7 +591,7 @@ mod tests {
         stale.definition.prompt = "Changed display".into();
         assert!(
             registry
-                .resolve_automation_proposal(&stale, Some(next()), 200)
+                .resolve_automation_proposal(&stale, approval(&stale), 200)
                 .is_err()
         );
         let other = proposal.definition.agent.target.repository.join("other");
@@ -613,7 +621,7 @@ mod tests {
             .unwrap();
         assert!(
             registry
-                .resolve_automation_proposal(&proposal, Some(next()), 200)
+                .resolve_automation_proposal(&proposal, approval(&proposal), 200)
                 .is_err()
         );
         assert!(registry.automations(None, 100).unwrap().is_empty());
@@ -636,7 +644,7 @@ mod tests {
         assert_eq!(receipt.state, ProposalState::Declined);
         assert_eq!(
             registry
-                .resolve_automation_proposal(&proposal, Some(next()), 300)
+                .resolve_automation_proposal(&proposal, approval(&proposal), 300)
                 .unwrap(),
             receipt
         );

@@ -570,7 +570,7 @@ pub(crate) fn entry() -> Option<Result<(), String>> {
                 return Err("Unexpected precheck arguments".into());
             }
             let outcome = (|| -> io::Result<Outcome> {
-                let held_directory = crate::host::automations::target::verify(
+                let held_directory = crate::host::automations::target::reopen(
                     &request.directory,
                     &request.target_identity,
                 )?;

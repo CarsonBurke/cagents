@@ -5,7 +5,7 @@ use std::{fs::File, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
-    automations::{Automation, Definition, DirectoryIdentity},
+    automations::{Automation, Definition},
     host::{agent_execution, state::SharedHost},
 };
 
@@ -127,26 +127,27 @@ fn process_user(
             if proposal.state != crate::automations::ProposalState::Pending {
                 return Ok(Response::Proposal(Box::new(proposal)));
             }
-            let _directory = if approved {
+            let verified = if approved {
                 Some(validate_target(
                     host,
                     &proposal.definition,
-                    &proposal.target_identity,
+                    &proposal.target_identity.clone().into(),
                 )?)
             } else {
                 None
             };
-            let next = if approved {
+            let approval = if let Some((_, identity)) = &verified {
                 handle()?;
                 agent_execution::selected_account(&proposal.definition.agent)?;
-                Some(Compiled::new(&proposal.definition.schedule)?.next_after(now()?)?)
+                let next = Compiled::new(&proposal.definition.schedule)?.next_after(now()?)?;
+                Some((next, identity.clone()))
             } else {
                 None
             };
             let resolved = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .resolve_automation_proposal(&proposal, next, now()?)?;
+                .resolve_automation_proposal(&proposal, approval, now()?)?;
             proposals_changed(host, &resolved.definition.agent.target.repository);
             Response::Proposal(Box::new(resolved))
         }
@@ -330,7 +331,7 @@ fn process_hosted(
                 Ok::<_, Error>(channel.title.clone())
             }).transpose()?;
             let proposal = registry.lock().unwrap_or_else(|p| p.into_inner())
-                .propose_automation(request, owner, requested, definition, identity, channel_title, now()?)?;
+                .propose_automation(request, owner, requested, definition, identity.raw().clone(), channel_title, now()?)?;
             proposals_changed(host, &proposal.definition.agent.target.repository);
             Ok(Response::Proposal(Box::new(proposal)))
         }
@@ -389,17 +390,18 @@ pub(super) fn edit(
 ) -> Result<Automation, String> {
     let (definition, identity) = prepare(host, definition)?;
     let registry = agent_execution::registry(host)?;
-    let previous = registry
+    let (previous, previous_target) = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .automation(id)?;
+        .automation_for_start(id)?;
+    let target_changed = !previous_target.matches(&identity);
     let mut without_name = definition.clone();
     without_name.name = previous.definition.name.clone();
     let material = without_name != previous.definition
-        || (definition == previous.definition && identity != previous.target_identity);
+        || (definition == previous.definition && target_changed);
     let new_agent = definition.agent != previous.definition.agent
         || definition.session_mode != previous.definition.session_mode
-        || (material && identity != previous.target_identity);
+        || (material && target_changed);
     if new_agent {
         retire_reuse_under_control(host, &previous, revision)?;
     }
@@ -467,10 +469,10 @@ pub(super) fn enabled(
     confirmed: bool,
 ) -> Result<Automation, String> {
     let registry = agent_execution::registry(host)?;
-    let automation = registry
+    let (automation, identity) = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .automation(id)?;
+        .automation_for_start(id)?;
     if automation.revision != revision {
         return Err(
             "The automation changed; review its current definition before enabling it".into(),
@@ -482,7 +484,7 @@ pub(super) fn enabled(
             return Err("Confirm unattended execution before enabling this automation".into());
         }
         automation.definition.startable()?;
-        validate_target(host, &automation.definition, &automation.target_identity)?;
+        validate_target(host, &automation.definition, &identity)?;
         // Resolving an explicit saved account fails if that account was removed;
         // enabling never silently substitutes a project's new default account.
         agent_execution::selected_account(&automation.definition.agent)?;
@@ -499,7 +501,7 @@ pub(super) fn enabled(
 fn prepare(
     host: &SharedHost,
     mut definition: Definition,
-) -> Result<(Definition, DirectoryIdentity), String> {
+) -> Result<(Definition, target::Identity), String> {
     definition.validate()?;
     Compiled::new(&definition.schedule)?.next_after(now()?)?;
     let model = agent_execution::registry(host)?
@@ -511,9 +513,9 @@ fn prepare(
     definition.agent.target.directory =
         std::fs::canonicalize(&definition.agent.target.directory)
             .map_err(|error| format!("Cannot open the automation directory: {error}"))?;
-    let identity =
-        target::capture(&definition.agent.target.directory).map_err(|e| e.to_string())?;
-    validate_target(host, &definition, &identity)?;
+    let directory = target::open(&definition.agent.target.directory).map_err(|e| e.to_string())?;
+    let identity = target::Identity::capture(&directory).map_err(|e| e.to_string())?;
+    validate_open_target(host, &definition, &directory, &identity)?;
     definition.agent.account = Some(agent_execution::selected_account(&definition.agent)?.id());
     Ok((definition, identity))
 }
@@ -523,10 +525,20 @@ fn prepare(
 pub(super) fn validate_target(
     host: &SharedHost,
     definition: &Definition,
-    identity: &DirectoryIdentity,
-) -> Result<Arc<File>, String> {
-    let directory =
+    identity: &target::Identity,
+) -> Result<(Arc<File>, target::Identity), String> {
+    let (directory, current) =
         target::verify(&definition.agent.target.directory, identity).map_err(|e| e.to_string())?;
+    validate_open_target(host, definition, &directory, &current)?;
+    Ok((directory, current))
+}
+
+fn validate_open_target(
+    host: &SharedHost,
+    definition: &Definition,
+    directory: &File,
+    identity: &target::Identity,
+) -> Result<(), String> {
     let projects = agent_execution::registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -537,11 +549,11 @@ pub(super) fn validate_target(
         &projects,
     )?;
     // Detect replacement during discovery too; retain the original descriptor.
-    target::verify(&definition.agent.target.directory, identity).map_err(|e| e.to_string())?;
+    target::reopen(&definition.agent.target.directory, identity.raw())
+        .map_err(|e| e.to_string())?;
     // Prechecks run here directly; accepted work is refused again at launch.
-    crate::host::worktree_removal::ensure_outside_directory(host, &directory)
-        .map_err(|error| error.message)?;
-    Ok(directory)
+    crate::host::worktree_removal::ensure_outside_directory(host, directory)
+        .map_err(|error| error.message)
 }
 
 pub(super) fn now() -> Result<u64, String> {
@@ -551,6 +563,7 @@ pub(super) fn now() -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automations::DirectoryIdentity;
     use crate::{
         agent_execution::Authority,
         automations::Request,

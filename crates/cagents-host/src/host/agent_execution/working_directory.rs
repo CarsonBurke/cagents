@@ -11,6 +11,7 @@
 use super::SharedRegistry;
 use crate::{
     agent_execution::{Agent, DirectoryIdentity, Origin},
+    host::automations::target::Identity as AutomationDirectoryIdentity,
     model::AgentId,
     workspace_model::ModelProject,
 };
@@ -138,11 +139,16 @@ fn judge(
 }
 
 /// An agent's directory, opened to start a provider in it.
+enum Judged {
+    Agent(DirectoryIdentity),
+    Automation(AutomationDirectoryIdentity),
+}
+
 pub(in crate::host) struct Opened {
     pub(in crate::host) directory: Arc<File>,
     /// What to record once a provider runs there: a directory judged now
     /// that is not the recorded one.
-    judged: Option<(AgentId, DirectoryIdentity)>,
+    judged: Option<(AgentId, Judged)>,
 }
 
 impl Opened {
@@ -150,13 +156,16 @@ impl Opened {
     /// it. Until then the record names where a running provider is, which a
     /// refused start must not change.
     pub(in crate::host) fn started(&self, registry: &SharedRegistry) -> Result<(), String> {
-        let Some((agent, judged)) = self.judged else {
+        let Some((agent, judged)) = &self.judged else {
             return Ok(());
         };
-        registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record_agent_directory(agent, judged)
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        match judged {
+            Judged::Agent(identity) => registry.record_agent_directory(*agent, *identity),
+            Judged::Automation(identity) => {
+                registry.record_automation_agent_directory(*agent, identity)
+            }
+        }
     }
 }
 
@@ -169,39 +178,60 @@ impl Opened {
 /// accepted before directories were recorded is judged the same way.
 ///
 /// An automation's agent runs unattended in the directory its automation was
-/// saved with, so it follows no replacement. A boot renumbers devices, though,
-/// and the same inode on another device is judged rather than refused.
+/// saved with. When available, its filesystem evidence distinguishes a
+/// boot that renumbered devices from a replaced target.
 pub(in crate::host) fn open_for_start(
     registry: &SharedRegistry,
     agent: &Agent,
 ) -> Result<Opened, String> {
     let path = &agent.spec.target.directory;
     let directory = open(path)?;
-    let found = identity(&directory)?;
-    let recorded = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .agent_directory(agent.id)?;
-    match recorded {
-        Some(recorded) if recorded == found => {
+    let judged = if matches!(agent.origin, Origin::Automation { .. }) {
+        let current =
+            AutomationDirectoryIdentity::capture(&directory).map_err(|error| error.to_string())?;
+        let recorded = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .automation_agent_directory(agent.id)?;
+        if let Some(recorded) = recorded {
+            let matches = if recorded.has_fingerprint() {
+                recorded.matches(&current)
+            } else {
+                // Older records had no boot evidence and re-judge on device
+                // changes. A successful start now records current evidence.
+                recorded.raw().inode == current.raw().inode
+            };
+            if !matches {
+                return Err(changed(path));
+            }
+            if recorded == current {
+                return Ok(Opened {
+                    directory,
+                    judged: None,
+                });
+            }
+        }
+        Judged::Automation(current)
+    } else {
+        let found = identity(&directory)?;
+        if registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_directory(agent.id)?
+            == Some(found)
+        {
             return Ok(Opened {
                 directory,
                 judged: None,
             });
         }
-        Some(recorded)
-            if matches!(agent.origin, Origin::Automation { .. })
-                && recorded.inode != found.inode =>
-        {
-            return Err(changed(path));
-        }
-        _ => {}
-    }
+        Judged::Agent(found)
+    };
     let projects = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .projects()?;
-    let judged = judge(path, &directory, &agent.spec.target.repository, &projects)?;
+    judge(path, &directory, &agent.spec.target.repository, &projects)?;
     Ok(Opened {
         directory,
         judged: Some((agent.id, judged)),

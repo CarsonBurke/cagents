@@ -273,16 +273,16 @@ impl Handle {
             return Ok(previous);
         }
         let host = self.0.host.upgrade().ok_or("The daemon is stopping")?;
-        let automation = self
+        let (automation, identity) = self
             .0
             .registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .automation(id)?;
+            .automation_for_start(id)?;
         if automation.execution_revision != revision {
             return Err("The automation changed before this run was confirmed".into());
         }
-        service::validate_target(&host, &automation.definition, &automation.target_identity)?;
+        service::validate_target(&host, &automation.definition, &identity)?;
         agent_execution::selected_account(&automation.definition.agent)?;
         let (claim, launching) = self.claim_manual(
             id,
@@ -365,7 +365,7 @@ impl Handle {
         }
         // A definition that can never start pauses before its precheck runs,
         // as accepting its firing would pause it without one.
-        let directory = match claim
+        let (directory, identity) = match claim
             .definition
             .startable()
             .and_then(|()| {
@@ -397,7 +397,7 @@ impl Handle {
                 firing: claim.firing.id,
                 revision: claim.firing.revision,
                 directory: claim.definition.agent.target.directory,
-                target_identity: claim.target_identity,
+                target_identity: identity.raw().clone(),
                 precheck,
             };
             match Worker::launch(&self.0.root, &request) {
@@ -878,12 +878,12 @@ impl Handle {
         accepted: crate::agent_execution::Accepted,
         now: u64,
     ) -> Result<(), String> {
-        let automation = self
+        let (automation, identity) = self
             .0
             .registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .automation(firing.automation)?;
+            .automation_for_start(firing.automation)?;
         let fail = |error: String, pause| {
             self.0
                 .registry
@@ -891,8 +891,8 @@ impl Handle {
                 .unwrap_or_else(|p| p.into_inner())
                 .fail_automation_start(firing.id, error, now, pause)
         };
-        match service::validate_target(host, &automation.definition, &automation.target_identity) {
-            Ok(directory) => {
+        match service::validate_target(host, &automation.definition, &identity) {
+            Ok((directory, _)) => {
                 agent_execution::dispatch_accepted_in_directory(host, accepted, directory).or_else(
                     |error| {
                         // Without a launch claim nothing else starts or ends
