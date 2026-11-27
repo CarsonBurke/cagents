@@ -290,19 +290,9 @@ fn ssh_reason(stderr: &str) -> Option<String> {
 }
 /// Whether the selected device's no-start bridge found no daemon running.
 pub(crate) fn existing_daemon_missing() -> bool {
-    SELECTED
-        .get()
-        .and_then(|context| {
-            context.bridges.lock().unwrap_or_else(|p| p.into_inner())[1]
-                .as_ref()
-                .map(|bridge| {
-                    bridge
-                        .transport
-                        .daemon_missing
-                        .load(std::sync::atomic::Ordering::Acquire)
-                })
-        })
-        .unwrap_or(false)
+    selected_transport(true)
+        .and_then(|transport| transport.newest_stream())
+        .is_some_and(|stream| stream.failure().daemon_missing)
 }
 // Best effort: `eprintln!` would panic, ending the bridge before it serves
 // anything, if SSH has already closed stderr.
@@ -323,7 +313,7 @@ fn answer_wait() -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Reached {
-    /// SSH logged in: the stream published its connection for others.
+    /// SSH logged in: this stream has a listening control connection.
     LoggedIn = 1,
     /// cagents started there and said so.
     BridgeStarted = 2,
@@ -339,11 +329,47 @@ struct StreamStatus {
     awaiting: std::sync::atomic::AtomicBool,
     /// A [`Reached`] as `u8`, or 0 for nothing known.
     reached: std::sync::atomic::AtomicU8,
-    /// What SSH said when it failed on its own (exit 255), rather than the
-    /// command it ran on the device.
-    unreachable: Mutex<Option<String>>,
+    /// The private master socket used by this stream, when multiplexing.
+    control: Option<String>,
+    failure: Mutex<StreamFailure>,
+}
+#[derive(Clone, Default)]
+struct StreamFailure {
+    /// What SSH said when it failed on its own (exit 255).
+    unreachable: Option<String>,
+    /// The remote bridge explicitly reported that its daemon was absent.
+    daemon_missing: bool,
+    /// SSH's diagnostic for any other failure of this stream.
+    diagnostic: Option<String>,
 }
 impl StreamStatus {
+    fn new(control: Option<&str>, logged_in: bool) -> Self {
+        Self {
+            awaiting: true.into(),
+            reached: (if logged_in {
+                Reached::LoggedIn as u8
+            } else {
+                0
+            })
+            .into(),
+            control: control.map(str::to_owned),
+            ..Self::default()
+        }
+    }
+
+    fn failure(&self) -> StreamFailure {
+        self.failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn observe_login(&self) {
+        if self.reached().is_none() && self.control.as_deref().is_some_and(master_listening) {
+            self.reach(Reached::LoggedIn);
+        }
+    }
+
     fn reach(&self, reached: Reached) {
         self.reached
             .fetch_max(reached as u8, std::sync::atomic::Ordering::AcqRel);
@@ -364,54 +390,27 @@ enum Silence {
     /// SSH reached it, but nothing came back before the caller gave up.
     Slow(Reached),
 }
-/// Why the selected device's bridge got nothing back on its newest stream.
-fn selected_silence() -> Option<Silence> {
+fn selected_transport(no_start: bool) -> Option<Arc<Transport>> {
     SELECTED.get().and_then(|context| {
-        context.bridges.lock().unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
+        context.bridges.lock().unwrap_or_else(|p| p.into_inner())[usize::from(no_start)]
             .as_ref()
-            .and_then(|bridge| silence(&bridge.transport))
+            .map(|bridge| bridge.transport.clone())
     })
 }
-fn silence(transport: &Transport) -> Option<Silence> {
-    let status = transport
-        .stream
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()?;
-    if let Some(reason) = status
-        .unreachable
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-    {
-        return Some(Silence::Unreachable(reason));
+
+fn silence(status: &StreamStatus, failure: &StreamFailure) -> Option<Silence> {
+    if let Some(reason) = &failure.unreachable {
+        return Some(Silence::Unreachable(reason.clone()));
     }
     if !status.awaiting.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }
+    // The master can publish after the shorter coordination wait expires.
+    status.observe_login();
     Some(match status.reached() {
         Some(reached) => Silence::Slow(reached),
         None => Silence::Unreachable(format!("it did not answer within {}", answer_wait())),
     })
-}
-fn selected_daemon_absent() -> bool {
-    SELECTED
-        .get()
-        .and_then(|context| {
-            context
-                .bridges
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                [usize::from(bridge_no_start())]
-                .as_ref()
-                .map(|bridge| {
-                    bridge
-                        .transport
-                        .daemon_missing
-                        .load(std::sync::atomic::Ordering::Acquire)
-                })
-        })
-        .unwrap_or(false)
 }
 
 pub fn selected() -> Option<&'static Device> {
@@ -618,13 +617,27 @@ struct Transport {
     directory: PathBuf,
     pool: Arc<Mutex<Vec<Master>>>,
     paused: Mutex<Option<Instant>>,
-    last_error: Mutex<Option<String>>,
+    accept_error: Mutex<Option<String>>,
     /// The newest stream's progress: the one a caller that just connected
     /// waits on.
     stream: Mutex<Option<Arc<StreamStatus>>>,
-    daemon_missing: std::sync::atomic::AtomicBool,
     cancelled: Cancellation,
 }
+impl Transport {
+    fn newest_stream(&self) -> Option<Arc<StreamStatus>> {
+        self.stream
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn begin_stream(&self, control: Option<&str>, logged_in: bool) -> Arc<StreamStatus> {
+        let status = Arc::new(StreamStatus::new(control, logged_in));
+        *self.stream.lock().unwrap_or_else(|p| p.into_inner()) = Some(status.clone());
+        status
+    }
+}
+
 impl Drop for Transport {
     fn drop(&mut self) {
         // Only streams of this transport can own these private masters.
@@ -876,9 +889,8 @@ impl ConnectionContext {
             directory,
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
-            last_error: Mutex::new(None),
+            accept_error: Mutex::new(None),
             stream: Mutex::new(None),
-            daemon_missing: std::sync::atomic::AtomicBool::new(false),
             cancelled,
         });
         fs::set_permissions(&transport.directory, fs::Permissions::from_mode(0o700))?;
@@ -921,7 +933,7 @@ fn transient_accept_error(error: &io::Error) -> bool {
 const ACCEPT_BACKOFF_LIMIT: Duration = Duration::from_secs(1);
 fn record_bridge_error(transport: &Transport, error: &io::Error) {
     *transport
-        .last_error
+        .accept_error
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some(format!(
         "the local bridge could not accept a connection: {error}"
@@ -998,6 +1010,10 @@ fn run_bridge_with(
 /// Killing a stream never stops the master, which OpenSSH detaches. Connecting
 /// to the control socket and hanging up is how liveness is read without a
 /// process per stream; the master discards such a client.
+fn master_listening(path: &str) -> bool {
+    crate::control::connect_control_socket(Path::new(path), Duration::from_millis(5)).is_ok()
+}
+
 fn spawn_stream(
     transport: &Arc<Transport>,
     control: Option<&str>,
@@ -1019,18 +1035,29 @@ fn spawn_stream(
     if transport.cancelled.is_cancelled() {
         return Err(io::Error::other("device connection is closed"));
     }
-    let listening =
-        || control.is_some_and(|control| crate::descriptor::connect_settled(control).is_ok());
-    let cold = control.is_some() && !listening();
-    let child = bridge_command(transport, control)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let listening = || control.is_some_and(master_listening);
+    let logged_in = listening();
+    let cold = control.is_some() && !logged_in;
+    let status = transport.begin_stream(control, logged_in);
     // Forward immediately, even while the first stream coordinates startup.
     // SSH can successfully run the bridge without publishing a master socket;
     // waiting here before forwarding would expire the daemon's handshake.
-    let mut forwarding = Forwarding::start(child, stream, Some(transport.clone()))?;
+    let mut forwarding = bridge_command(transport, control)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|child| Forwarding::start(child, stream, Some(transport.clone()), status.clone()))
+        .inspect_err(|error| {
+            status
+                .failure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .diagnostic = Some(format!("Could not start SSH to {}: {error}", device.host));
+            status
+                .awaiting
+                .store(false, std::sync::atomic::Ordering::Release);
+        })?;
     // A stream that waited through a failed start must not make the rest queue
     // behind its own attempt; they fail or connect in parallel as before.
     let deadline = Instant::now() + MASTER_START_TIMEOUT;
@@ -1104,17 +1131,8 @@ impl Forwarding {
         mut child: std::process::Child,
         stream: UnixStream,
         transport: Option<Arc<Transport>>,
+        status: Arc<StreamStatus>,
     ) -> io::Result<Self> {
-        let status = Arc::new(StreamStatus::default());
-        status
-            .awaiting
-            .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(transport) = &transport {
-            transport
-                .daemon_missing
-                .store(false, std::sync::atomic::Ordering::Release);
-            *transport.stream.lock().unwrap_or_else(|p| p.into_inner()) = Some(status.clone());
-        }
         let stop = match Cancellation::new() {
             Ok(stop) => Arc::new(stop),
             Err(error) => {
@@ -1225,9 +1243,6 @@ impl Forwarding {
             thread::sleep(Duration::from_millis(5));
         };
         self.settled = true;
-        self.status
-            .awaiting
-            .store(false, std::sync::atomic::Ordering::Release);
         self.stop_diagnostics.cancel();
         let detail = self
             .diagnostics
@@ -1239,19 +1254,10 @@ impl Forwarding {
             && let Some(transport) = &self.transport
             && !transport.cancelled.is_cancelled()
         {
-            transport.daemon_missing.store(
-                status.code() == Some(i32::from(BRIDGE_ABSENT_EXIT)) && detail.daemon_absent,
-                std::sync::atomic::Ordering::Release,
-            );
-            // SSH exits 255 for its own errors: no answer, no such host, a
-            // refused login. It does too when the command it ran died or the
-            // connection dropped later, but by then the device had answered
-            // or been reached, or SSH said nothing.
-            *self
-                .status
-                .unreachable
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = (status.code() == Some(255)
+            self.status.observe_login();
+            // Exit 255 is SSH's own failure only if the remote never answered
+            // and we have no evidence that SSH reached it.
+            let unreachable = (status.code() == Some(255)
                 && !detail.daemon_absent
                 && self.status.reached().is_none()
                 && !self
@@ -1260,14 +1266,25 @@ impl Forwarding {
                     .load(std::sync::atomic::Ordering::Acquire))
             .then(|| ssh_reason(&detail.tail))
             .flatten();
-            *transport
-                .last_error
+            let diagnostic = if detail.text.is_empty() {
+                format!("SSH to {} exited {status}", device.host)
+            } else {
+                format!("SSH to {} exited {status}: {}", device.host, detail.text)
+            };
+            *self
+                .status
+                .failure
                 .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(format!(
-                "SSH to {} exited {status}: {}",
-                device.host, detail.text
-            ));
+                .unwrap_or_else(|p| p.into_inner()) = StreamFailure {
+                unreachable,
+                daemon_missing: status.code() == Some(i32::from(BRIDGE_ABSENT_EXIT))
+                    && detail.daemon_absent,
+                diagnostic: Some(diagnostic),
+            };
         }
+        self.status
+            .awaiting
+            .store(false, std::sync::atomic::Ordering::Release);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         result.map(|_| ())
     }
@@ -1530,7 +1547,8 @@ fn forward(transport: &Arc<Transport>, stream: UnixStream) -> io::Result<()> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .is_some_and(|until| Instant::now() < until);
-    let control = control_path(&transport.directory, slot.index).filter(|_| !paused);
+    let control = control_path(&transport.directory, slot.index)
+        .filter(|path| !paused || master_listening(path));
     spawn_stream(transport, control.as_deref(), &starting, stream)?.finish(&transport.device)
 }
 /// What every daemon bridge does before it serves: refuse an agent's shell
@@ -1684,10 +1702,6 @@ pub fn prepare() -> io::Result<()> {
         Ok(_) => Err(io::Error::other(
             "remote daemon returned an unexpected device identity",
         )),
-        Err(_) if selected_daemon_absent() => Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            DaemonNotRunning,
-        )),
         // The device answered: SSH and the daemon are fine, and the reason
         // is the answer.
         Err(crate::device_service::Failure::Refused(message)) => {
@@ -1701,38 +1715,50 @@ pub fn prepare() -> io::Result<()> {
             },
         )),
         Err(crate::device_service::Failure::Failed(error)) => {
-            let last_error = SELECTED
-                .get()
-                .unwrap()
-                .bridges
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
-            .as_ref()
-            .and_then(|bridge| {
-                bridge
-                    .transport
-                    .last_error
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone()
-            });
+            let transport = selected_transport(bridge_no_start());
+            let stream = transport
+                .as_ref()
+                .and_then(|transport| transport.newest_stream());
+            let failure = stream
+                .as_ref()
+                .map(|stream| stream.failure())
+                .unwrap_or_default();
+            if failure.daemon_missing {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    DaemonNotRunning,
+                ));
+            }
+            let silence = stream.as_ref().and_then(|stream| silence(stream, &failure));
+            let diagnostic = match &stream {
+                Some(_) => failure.diagnostic,
+                // A listener that never handed the first connection to SSH
+                // can still report its own accept failure.
+                None => transport.and_then(|transport| {
+                    transport
+                        .accept_error
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone()
+                }),
+            };
             Err(failed_request_error(
                 selected().unwrap(),
-                selected_silence(),
+                silence,
                 &error,
-                last_error,
+                diagnostic,
             ))
         }
     }
 }
 /// What a first request to `device` that failed with `error` means: SSH
 /// never reached it, it was reached but said nothing in time, or the device
-/// answered and something else went wrong, as SSH's `last_error` may say.
+/// answered and something else went wrong, as that stream's SSH diagnostic may say.
 fn failed_request_error(
     device: &Device,
     silence: Option<Silence>,
     error: &str,
-    last_error: Option<String>,
+    diagnostic: Option<String>,
 ) -> io::Error {
     match silence {
         Some(Silence::Unreachable(reason)) => unreachable_error(device, reason),
@@ -1751,7 +1777,7 @@ fn failed_request_error(
                 device.name,
                 device.host,
                 ssh_command_hint(&device.host, &device.executable, "daemon start")
-            ) + &last_error
+            ) + &diagnostic
                 .map(|error| format!("; {error}"))
                 .unwrap_or_default(),
         ),
@@ -1863,11 +1889,25 @@ mod tests {
     /// What SSH said when the newest stream failed on its own.
     fn newest_unreachable(transport: &Transport) -> Option<String> {
         transport
-            .stream
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|status| status.unreachable.lock().unwrap().clone())
+            .newest_stream()
+            .and_then(|status| status.failure().unreachable)
+    }
+
+    fn newest_silence(transport: &Transport) -> Option<Silence> {
+        let status = transport.newest_stream()?;
+        silence(&status, &status.failure())
+    }
+
+    fn start_fixture(
+        child: std::process::Child,
+        stream: UnixStream,
+        transport: Option<Arc<Transport>>,
+    ) -> io::Result<Forwarding> {
+        let status = transport.as_ref().map_or_else(
+            || Arc::new(StreamStatus::new(None, false)),
+            |transport| transport.begin_stream(None, false),
+        );
+        Forwarding::start(child, stream, transport, status)
     }
 
     fn fixture_transport(device: Device, directory: PathBuf) -> Arc<Transport> {
@@ -1877,9 +1917,8 @@ mod tests {
             directory,
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
-            last_error: Mutex::new(None),
+            accept_error: Mutex::new(None),
             stream: Mutex::new(None),
-            daemon_missing: std::sync::atomic::AtomicBool::new(false),
             cancelled: Cancellation::new().unwrap(),
         })
     }
@@ -1983,7 +2022,7 @@ mod tests {
         accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!worker.is_finished());
         assert!(!transport.cancelled.is_cancelled());
-        let error = transport.last_error.lock().unwrap().clone().unwrap();
+        let error = transport.accept_error.lock().unwrap().clone().unwrap();
         assert!(error.contains(&emfile().to_string()), "{error}");
         transport.cancelled.cancel();
         worker.join().unwrap();
@@ -2014,7 +2053,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             assert!(transport.cancelled.is_cancelled());
-            assert!(transport.last_error.lock().unwrap().is_some());
+            assert!(transport.accept_error.lock().unwrap().is_some());
             context.bridges.lock().unwrap()[0] = Some(Bridge {
                 transport,
                 worker: Some(worker),
@@ -2228,6 +2267,13 @@ mod tests {
             (255, BRIDGE_ABSENT_MARKER, false, false, None),
             (69, "ordinary SSH failure", false, false, None),
             (69, BRIDGE_ABSENT_MARKER, true, true, None),
+            (
+                69,
+                "cagents daemon bridge: started\ncagents daemon bridge: daemon_not_running",
+                true,
+                false,
+                None,
+            ),
             // SSH's own failure names what stopped it.
             (
                 255,
@@ -2267,14 +2313,12 @@ mod tests {
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let forwarding = Forwarding::start(child, server, Some(transport.clone())).unwrap();
+            let forwarding = start_fixture(child, server, Some(transport.clone())).unwrap();
             let device = transport.device.clone();
             let worker = thread::spawn(move || forwarding.finish(&device));
             let mut output = Vec::new();
             let read = client.read_to_end(&mut output);
-            let observed = transport
-                .daemon_missing
-                .load(std::sync::atomic::Ordering::Acquire);
+            let observed = transport.newest_stream().unwrap().failure().daemon_missing;
             let settled = worker.join();
             read.unwrap();
             settled.unwrap().unwrap();
@@ -2315,7 +2359,7 @@ mod tests {
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let forwarding = Forwarding::start(child, server, Some(transport.clone())).unwrap();
+            let forwarding = start_fixture(child, server, Some(transport.clone())).unwrap();
             let device = transport.device.clone();
             let worker = thread::spawn(move || forwarding.finish(&device));
             let _ = client.read_to_end(&mut Vec::new());
@@ -2357,6 +2401,70 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_stream_recognizes_late_and_reused_control_connections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control");
+        let control = path.to_str();
+        let first = StreamStatus::new(control, false);
+        assert!(matches!(
+            silence(&first, &first.failure()),
+            Some(Silence::Unreachable(_))
+        ));
+
+        // SSH can publish the socket after the startup coordinator has finished.
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            silence(&first, &first.failure()),
+            Some(Silence::Slow(Reached::LoggedIn))
+        );
+
+        let reused = StreamStatus::new(control, master_listening(path.to_str().unwrap()));
+        drop(listener);
+        assert_eq!(
+            silence(&reused, &reused.failure()),
+            Some(Silence::Slow(Reached::LoggedIn))
+        );
+    }
+
+    #[test]
+    fn an_older_stream_cannot_supply_a_new_streams_failure_details() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(
+            Device {
+                name: "fixture".into(),
+                host: "unused-fixture".into(),
+                executable: "cagents".into(),
+            },
+            directory.path().to_path_buf(),
+        );
+        let old = transport.begin_stream(None, false);
+        let child = Command::new("/bin/sh")
+            .args(["-c", "printf 'older failure\n' >&2; exit 1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let forwarding =
+            Forwarding::start(child, server, Some(transport.clone()), old.clone()).unwrap();
+        let newer = transport.begin_stream(None, false);
+        let device = transport.device.clone();
+        let worker = thread::spawn(move || forwarding.finish(&device));
+        client.read_to_end(&mut Vec::new()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(old.failure().diagnostic.unwrap().contains("older failure"));
+        let selected = transport.newest_stream().unwrap();
+        assert!(Arc::ptr_eq(&newer, &selected));
+        assert!(selected.failure().diagnostic.is_none());
+        assert!(!selected.failure().daemon_missing);
+    }
+
+    #[test]
     fn a_device_still_silent_when_the_caller_gives_up_reads_as_unreachable() {
         let directory = tempfile::tempdir().unwrap();
         let transport = fixture_transport(
@@ -2379,19 +2487,19 @@ mod tests {
             let (client, server) = UnixStream::pair().unwrap();
             (
                 client,
-                Forwarding::start(child, server, Some(transport.clone())).unwrap(),
+                start_fixture(child, server, Some(transport.clone())).unwrap(),
             )
         };
         // SSH still connecting, as to a host that drops its packets.
         let (_client, silent) = start("exec sleep 30");
         assert_eq!(
-            silence(&transport),
+            newest_silence(&transport),
             Some(Silence::Unreachable(
                 "it did not answer within 30 seconds".into()
             ))
         );
         drop(silent);
-        assert_eq!(silence(&transport), None);
+        assert_eq!(newest_silence(&transport), None);
         // A device that has answered is reached, however slow what follows.
         let (mut client, answered) = start("printf answer; exec sleep 30");
         let mut first = [0u8; 6];
@@ -2399,7 +2507,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         std::io::Read::read_exact(&mut client, &mut first).unwrap();
-        assert_eq!(silence(&transport), None);
+        assert_eq!(newest_silence(&transport), None);
         drop(answered);
 
         // Each stream answers for itself: an older one ending says nothing
@@ -2407,7 +2515,10 @@ mod tests {
         let (_older_client, older) = start("exec sleep 30");
         let (_newest_client, newest) = start("exec sleep 30");
         drop(older);
-        assert!(matches!(silence(&transport), Some(Silence::Unreachable(_))));
+        assert!(matches!(
+            newest_silence(&transport),
+            Some(Silence::Unreachable(_))
+        ));
         drop(newest);
     }
 
@@ -2437,15 +2548,19 @@ mod tests {
             let (client, server) = UnixStream::pair().unwrap();
             (
                 client,
-                Forwarding::start(child, server, Some(transport.clone())).unwrap(),
+                start_fixture(child, server, Some(transport.clone())).unwrap(),
             )
         };
         let (_client, started) = start(&format!(
             "printf 'Welcome\\n{BRIDGE_STARTED_MARKER}\\n' >&2; exec sleep 30"
         ));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while silence(&transport) != Some(Silence::Slow(Reached::BridgeStarted)) {
-            assert!(Instant::now() < deadline, "{:?}", silence(&transport));
+        while newest_silence(&transport) != Some(Silence::Slow(Reached::BridgeStarted)) {
+            assert!(
+                Instant::now() < deadline,
+                "{:?}",
+                newest_silence(&transport)
+            );
             thread::sleep(Duration::from_millis(10));
         }
         drop(started);
@@ -2460,7 +2575,12 @@ mod tests {
         let _ = std::io::Read::read_to_end(&mut client, &mut Vec::new());
         let _ = worker.join().unwrap();
         assert_eq!(newest_unreachable(&transport), None);
-        let last_error = transport.last_error.lock().unwrap().clone().unwrap();
+        let last_error = transport
+            .newest_stream()
+            .unwrap()
+            .failure()
+            .diagnostic
+            .unwrap();
         assert!(!last_error.contains(BRIDGE_STARTED_MARKER), "{last_error}");
         assert!(last_error.contains("Connection closed by"), "{last_error}");
     }
@@ -2618,7 +2738,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let (_client, server) = UnixStream::pair().unwrap();
-        let forwarding = Forwarding::start(child, server, Some(transport.clone())).unwrap();
+        let forwarding = start_fixture(child, server, Some(transport.clone())).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let device = transport.device.clone();
         let worker = thread::spawn(move || {
@@ -2641,7 +2761,12 @@ mod tests {
             Some(libc::ECHILD)
         );
         assert!(
-            transport.last_error.lock().unwrap().is_none(),
+            transport
+                .newest_stream()
+                .unwrap()
+                .failure()
+                .diagnostic
+                .is_none(),
             "intentional closure is not a device connection error"
         );
     }
@@ -3018,7 +3143,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let forwarding = Forwarding::start(child, server, None).unwrap();
+        let forwarding = start_fixture(child, server, None).unwrap();
         let start = Instant::now();
         drop(forwarding);
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -3047,7 +3172,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let (_client, server) = UnixStream::pair().unwrap();
-        assert!(Forwarding::start(child, server, None).is_err());
+        assert!(start_fixture(child, server, None).is_err());
         // SAFETY: query only the child we created; no signal or blocking wait.
         assert_eq!(
             unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) },
