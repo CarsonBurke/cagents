@@ -506,7 +506,7 @@ impl State {
         };
         format!(
             "pending: {:?}\nblocked: {}\nquarantined: {}\nclosed: {}\nattached: {}\n\
-             retained: {}\nseeding: {}\nseed attempts: {}\nseed failures: {}\n\
+             sent creations: {}\nretained: {}\nseeding: {}\nseed attempts: {}\nseed failures: {}\n\
              requested transfers: {}\ndefaults: {}\nstrip detached: {}\n\
              closed chats: {}\nobserved chats: {}\nobserved terminals: {}\n\
              adoptions: {:?}\nchat adoptions: {}\nrestorations: {:?}\n\
@@ -516,6 +516,7 @@ impl State {
             set(&mut self.quarantined.iter().map(|id| format!("{id:?}"))),
             set(&mut self.closed.iter().map(|id| format!("{id:?}"))),
             set(&mut self.attached.iter().map(|id| format!("{id:?}"))),
+            set(&mut self.sent_creations.iter().map(|id| format!("{id:?}"))),
             set(&mut self.retained.iter().map(|id| format!("{id:?}"))),
             set(&mut self.seeding.iter().map(|scope| format!("{scope:?}"))),
             set(&mut self.seed_attempts.keys().map(|scope| format!("{scope:?}"))),

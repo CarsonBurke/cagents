@@ -186,3 +186,39 @@ fn a_terminal_opened_in_a_blocked_channel_survives_the_block() {
     assert_open(&window, card);
     assert_eq!(inserts(&window.rx, card), 1);
 }
+
+#[test]
+fn a_new_terminal_its_view_refuses_still_closes() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    assert_eq!(inserts(&window.rx, card), 1);
+
+    // Sent and refused, it has nothing to wait for: the view that does not
+    // list it closes it rather than inserting it again.
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewRefused {
+                scope: window.scope.clone(),
+                operation: card.as_uuid(),
+                error: "refused".into(),
+            }),
+    );
+    assert_eq!(inserts(&window.rx, card), 0);
+    assert!(
+        !window
+            .app
+            .card_state(card)
+            .is_some_and(|card| card.existence.is_open())
+    );
+    assert!(
+        !window
+            .app
+            .durable
+            .pending_terminal_creations
+            .contains(&card)
+    );
+    assert!(!window.app.shared_views.sent_creations.contains(&card));
+}
