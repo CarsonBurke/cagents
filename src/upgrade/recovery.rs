@@ -4707,7 +4707,7 @@ pub struct ReadyAdmission {
     successor: HostSessionProof,
     saved_predecessor: ReadyStatePredecessor,
     runtime_claim: Option<String>,
-    retry_predecessor: Option<ReadyClaim>,
+    retry_predecessor: Option<(HostSessionProof, crate::daemon::holder_registry::Process)>,
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
@@ -4763,12 +4763,10 @@ impl ReadyAdmission {
     /// Persist the work and window scope just verified by the startup publisher.
     pub fn remember_cutover(&self, successor: &HostSessionProof) -> Result<(), String> {
         let authority = &self.authority;
-        let retry_of = self.retry_predecessor.as_ref().and_then(|claim| {
-            claim
-                .successor_proof
-                .as_ref()
-                .map(|proof| (proof, &claim.successor))
-        });
+        let retry_of = self
+            .retry_predecessor
+            .as_ref()
+            .map(|(proof, process)| (proof, process));
         crate::update::record_ready_cutover(
             &authority.job,
             &authority.job_request_hash,
@@ -5007,7 +5005,10 @@ pub(crate) fn accept_ready_authority(
             let (claim, fingerprint) = original.retry_predecessor().map_err(io::Error::other)?;
             let predecessor = ready_state_predecessor(&authority, &custody.daemon, Some(&claim))
                 .map_err(io::Error::other)?;
-            (predecessor, Some((claim, fingerprint)))
+            let proof = claim.successor_proof.ok_or_else(|| {
+                io::Error::other("The Ready retry predecessor has no successor proof")
+            })?;
+            (predecessor, Some(((proof, claim.successor), fingerprint)))
         } else {
             require_no_ready_effects_or_retry(&authority).map_err(io::Error::other)?;
             ((authority.source.clone(), None), None)
