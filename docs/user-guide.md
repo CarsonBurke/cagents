@@ -1035,13 +1035,17 @@ cagents --device desktop resume --all
 `cagents resume --list --project cagents`. Inside an agent session's terminal,
 `--channel` names that session's channel, or `--channel CHANNEL` another.
 
-Each one reopens as its pane's Resume would: the same checks, the exact
-conversation, original account and working directory, and the pane then shows
-the running conversation, so a window opened later does not start it again. A
-conversation that is already running is reported and left alone. Each waits idle
-for its next message; nothing the stopped provider held is resent. A session
-that cannot resume says why, and the command exits with status 4 once the
-others have been tried. A chat paired with its provider's terminal still
+Each one reopens through the same checks as its pane's Resume: the exact
+conversation, original account and working directory, and proof that no
+earlier process still writes it. A conversation an earlier process still holds
+is reattached to that process rather than started a second time. The pane then
+shows the running conversation, so a window opened later does not start it
+again. A conversation that is already running is reported and left alone. Each
+waits idle for its next message; nothing the stopped provider held is resent.
+Unlike the pane's Resume, it does not put messages still queued when the
+provider stopped back into a draft, so send any that still matter again. A
+session that cannot resume says why, and the command exits with status 4 once
+the others have been tried. A chat paired with its provider's terminal still
 resumes from its pane in the app.
 
 ### Image references and local image storage

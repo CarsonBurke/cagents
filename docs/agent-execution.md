@@ -127,9 +127,11 @@ pane's Resume does in the app. `cagents resume --channel`, `--project` and
 `--all` resume every stopped session in that scope; a session may resume only
 the agents it started. With `--json` it returns `data.sessions`, a row per
 session with its `session`, the `running` session that now carries the
-conversation, `provider`, `title`, `agent`, and `state` (`resumed`, `starting`,
-`already_running` or `failed`, with `error`), and `data.outcome`, `failed`
-when any did. `cagents resume` with no sessions or scope, or with `--list`,
+conversation, `provider`, `title`, `agent`, `state` (`resumed`, `starting`,
+`already_running` or `failed`, whose row has only `session`, `state` and
+`error`), and `note`, which says when the session's agent did not take the reopened
+conversation over and is null otherwise; and `data.outcome`, `failed` when any
+did. `cagents resume` with no sessions or scope, or with `--list`,
 resumes nothing and lists what it could: `data.stopped`, a row per session
 with its `session`, `provider`, `title`, `agent` and the `failure` that stopped
 it, and `data.in_app_only`, how many more only their panes in the app can
