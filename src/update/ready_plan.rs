@@ -244,6 +244,36 @@ fn shared_reservation() -> Result<Option<Reservation<'static>>, UpdateError> {
     Ok(Some(reservation))
 }
 
+/// Recovery of an already selected attempt still needs the reservation's
+/// exact target and matched binaries. Older attempts may lack a reservation.
+#[cfg(feature = "host")]
+pub(super) fn selected_evidence(
+    layout: &InstallLayout,
+    state: &Path,
+    job: &UpdateJob,
+) -> Result<Option<ReadyPlanEvidence<'static>>, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(None);
+    };
+    if reservation.job != job.id
+        || reservation.prefix != layout.prefix
+        || reservation.plan.target != layout.version_root
+        || !reservation.plan.ready.names_job(state, &job.id)
+        || !reservation
+            .plan
+            .ready
+            .names_current_runtime()
+            .map_err(invalid)?
+        || reservation.phase()? != Phase::Selected
+    {
+        return Err(invalid(
+            "The installed cutover does not own the selected Ready reservation",
+        ));
+    }
+    reservation.plan.verify_binaries(state, job)?;
+    Ok(Some(reservation.plan.ready))
+}
+
 /// The account fence serializes this reservation check with publication.
 pub(crate) fn require_no_activation() -> Result<(), UpdateError> {
     if let Some(reservation) = shared_reservation()?

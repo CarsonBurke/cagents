@@ -239,9 +239,27 @@ fn ready_pre_effects_retry_requires_a_dead_exact_first_attempt_and_one_unused_sl
     let first_bytes = serde_json::to_vec(&first).unwrap();
     save(&first_path, &first_bytes);
     let while_live = plan.require_pre_effects_retry();
+    let verify_cutover = |proof: &HostSessionProof, process: &Process| {
+        plan.verify_exited_cutover_claim(
+            &preparation.authority.job_request_hash,
+            &preparation.authority.checkpoint_hash,
+            &preparation.authority.source,
+            &preparation.authority.windows,
+            proof,
+            process,
+        )
+    };
+    let first_proof = successor("first-successor");
+    let live_cutover = verify_cutover(&first_proof, &first.successor);
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(while_live.is_err());
+    assert!(live_cutover.is_err());
+    verify_cutover(&first_proof, &first.successor).unwrap();
+    let mut wrong_epoch = first.successor.clone();
+    wrong_epoch.start += 1;
+    assert!(verify_cutover(&first_proof, &wrong_epoch).is_err());
+    assert!(verify_cutover(&successor("wrong-proof"), &first.successor).is_err());
     let (_, fingerprint) = plan.retry_predecessor().unwrap();
     assert_eq!(fingerprint, digest(&first_bytes));
 
@@ -249,6 +267,7 @@ fn ready_pre_effects_retry_requires_a_dead_exact_first_attempt_and_one_unused_sl
     legacy.successor_proof = None;
     save(&first_path, &serde_json::to_vec(&legacy).unwrap());
     assert!(plan.require_pre_effects_retry().is_err());
+    assert!(verify_cutover(&first_proof, &legacy.successor).is_err());
     save(&first_path, &first_bytes);
 
     let effects = ready_evidence_path(&preparation.authority, "effects").unwrap();
@@ -256,17 +275,29 @@ fn ready_pre_effects_retry_requires_a_dead_exact_first_attempt_and_one_unused_sl
     assert!(plan.require_pre_effects_retry().is_err());
     fs::remove_file(effects).unwrap();
 
+    let mut retry_child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let retry_proof = successor("retry-successor");
     let retry = ready_claim_record(
         &preparation.authority,
         &capture_digest,
-        &successor("retry-successor"),
-        Process::read(std::process::id() as i32).unwrap(),
+        &retry_proof,
+        Process::read(retry_child.id() as i32).unwrap(),
         Some(fingerprint),
     );
     let retry_path = ready_evidence_path(&preparation.authority, "retry-claim").unwrap();
     save(&retry_path, &serde_json::to_vec(&retry).unwrap());
     assert!(plan.require_pre_effects_retry().is_err());
     assert!(!plan.claimed_process_exited().unwrap());
+    let retry_while_live = verify_cutover(&retry_proof, &retry.successor);
+    retry_child.kill().unwrap();
+    retry_child.wait().unwrap();
+    assert!(retry_while_live.is_err());
+    verify_cutover(&retry_proof, &retry.successor).unwrap();
+    assert!(verify_cutover(&first_proof, &legacy.successor).is_err());
     assert_eq!(fs::read(first_path).unwrap(), first_bytes);
 }
 
