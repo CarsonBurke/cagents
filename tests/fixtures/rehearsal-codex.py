@@ -20,6 +20,8 @@ import uuid
 
 sys.dont_write_bytecode = True
 
+FIXTURE_VERSION = "0.162.0"
+
 
 def private_directory(path):
     """Validate the named directory itself, rather than following a symlink."""
@@ -33,7 +35,7 @@ def configure_peer(root):
     """Restore fixture settings after native launches filter CAGENTS_* values."""
     path = root / "codex-fixture.json"
     if not path.exists() and not path.is_symlink():
-        return
+        return False
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(descriptor) as stream:
         settings = json.load(stream)
@@ -41,8 +43,11 @@ def configure_peer(root):
              "never_confirm_interrupt": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT",
              "never_confirm_close": "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE",
              "history": "CAGENTS_TOOL_ROWS_HISTORY"}
-    if not isinstance(settings, dict) or settings.keys() - names.keys():
+    if not isinstance(settings, dict) or settings.keys() - (names.keys() | {"retained"}):
         raise ValueError("unknown Codex fixture setting")
+    retained = settings.pop("retained", False)
+    if type(retained) is not bool:
+        raise ValueError("Codex fixture retained setting must be boolean")
     for key, value in settings.items():
         if key == "pause":
             if type(value) not in (int, float) or not 0 < value <= 300:
@@ -57,6 +62,7 @@ def configure_peer(root):
             if type(value) is not bool:
                 raise ValueError("Codex fixture confirmation settings must be boolean")
             os.environ[names[key]] = "1" if value else "0"
+    return retained
 
 
 def listener_path(args, runtime):
@@ -197,10 +203,10 @@ def serve_stdio(peer, home, record, incoming, outgoing):
 
 def main():
     if "--version" in sys.argv:
-        print("codex-cli 0.162.0 (offline update rehearsal fixture)")
+        print(f"codex-cli {FIXTURE_VERSION} (offline update rehearsal fixture)")
         return
     root = private_directory(Path(os.environ["CAGENTS_TOOL_ROWS_FIXTURE_ROOT"]))
-    configure_peer(root)
+    retained = configure_peer(root)
     logs = root / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)
     # The harness may create logs with its ordinary umask; ROOT itself is 0700.
@@ -249,6 +255,10 @@ def main():
 
             def request(self, frame, codex_home):
                 responses = super().request(frame, codex_home)
+                if retained and frame.get("method") == "initialize":
+                    for response in responses:
+                        if "result" in response:
+                            response["result"]["userAgent"] = f"cagents/{FIXTURE_VERSION} offline rehearsal"
                 params = frame.get("params") or {}
                 record("request", method=frame.get("method"), request_id=frame.get("id"),
                        socket=str(path), parent=params.get("threadId") == self.thread,

@@ -31,6 +31,15 @@ peer = module("rehearsal_peer", "codex-tool-rows.py")
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_retained_server_requires_an_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertFalse(adapter.configure_peer(root))
+            path = root / "codex-fixture.json"
+            for retained in (False, True):
+                path.write_text(json.dumps({"retained": retained}))
+                self.assertIs(adapter.configure_peer(root), retained)
+
     def test_private_configuration_restores_existing_peer_knobs(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
             root = Path(directory)
@@ -74,7 +83,8 @@ class ConfigurationTests(unittest.TestCase):
             path = root / "codex-fixture.json"
             for settings in ({"arbitrary_env": "value"}, {"pause": True}, {"pause": 0},
                              {"pause": 301}, {"never_confirm_close": "1"}, {"history": 5},
-                             {"history": [5]}, {"history": [5, -1]}, {"history": [5, True]}):
+                             {"history": [5]}, {"history": [5, -1]}, {"history": [5, True]},
+                             {"retained": "true"}):
                 path.write_text(json.dumps(settings))
                 with self.subTest(settings=settings), self.assertRaises(ValueError):
                     adapter.configure_peer(root)
@@ -292,6 +302,7 @@ class StdioProbeTests(unittest.TestCase):
             home, runtime = root / "home", root / "rt"
             home.mkdir(mode=0o700)
             runtime.mkdir(mode=0o700)
+            (root / "codex-fixture.json").write_text(json.dumps({"retained": True}))
             frames = [{"id": 1, "method": "initialize", "params": {}},
                       {"method": "initialized"},
                       {"id": 2, "method": "account/read", "params": {}},
@@ -308,6 +319,7 @@ class StdioProbeTests(unittest.TestCase):
             self.assertEqual(result.stderr, "")
             responses = {frame["id"]: frame["result"] for frame in map(json.loads, result.stdout.splitlines())}
             self.assertEqual(set(responses), {1, 2, 3, 4})
+            self.assertEqual(responses[1]["userAgent"], "cagents-offline-tool-rows")
             self.assertEqual(responses[2]["account"]["email"], "fixture@invalid")
             self.assertTrue(responses[3]["ordinaryUsageAllowed"])
             self.assertFalse((home / "rehearsal-app-server").exists())
