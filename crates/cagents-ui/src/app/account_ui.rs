@@ -3468,14 +3468,17 @@ impl Cagents {
             .then_some(state.inventory_observed_at)
             .flatten();
         let periodic = matches!(trigger, Trigger::Tick | Trigger::Focus);
+        let refresh_interval = schedule::refresh_interval(provider, state.snapshot.as_ref());
         let admitted = if periodic && state.usage_invalidated {
             // Explicit invalidation is stronger than either observation clock;
             // zero gives it no usable age while preserving focus/backoff gates.
-            state.schedule.should_probe_full(trigger, now, focused, 0)
+            state
+                .schedule
+                .should_probe_full(trigger, now, focused, 0, refresh_interval)
         } else if periodic && let Some(observed) = full_observed {
             state
                 .schedule
-                .should_probe_full(trigger, now, focused, observed)
+                .should_probe_full(trigger, now, focused, observed, refresh_interval)
         } else {
             state.schedule.should_probe(trigger, now, focused)
         };
@@ -3511,11 +3514,7 @@ impl Cagents {
         state.limit_wake = None;
         // The cache is only as fresh as the last probe, which is exactly
         // what a reader asking again, or signing in, is trying to get past.
-        let threshold = if trigger == Trigger::Focus {
-            schedule::STALE_AFTER
-        } else {
-            schedule::REFRESH_INTERVAL
-        };
+        let threshold = schedule::periodic_threshold(trigger, refresh_interval);
         let full_due = state.usage_invalidated
             || periodic
                 && full_observed.is_some_and(|at| {

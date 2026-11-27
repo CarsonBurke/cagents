@@ -50,7 +50,13 @@ if sys.argv[1:3]==['auth','status']:
  print(json.dumps({'loggedIn':True,'email':alternate.read_text() if alternate.exists() else 'fixture@example.test','subscriptionType':'max'}));sys.exit()
 for line in sys.stdin:
  frame=json.loads(line); request=frame['request']
- result={'models':[]} if request['subtype']=='initialize' else json.loads((home/'fixture-usage.json').read_text())
+ if request['subtype']=='initialize':
+  result={'models':[]}
+ else:
+  stale=home/'fixture-usage-once.json'
+  usage=stale if stale.exists() else home/'fixture-usage.json'
+  result=json.loads(usage.read_text())
+  stale.unlink(missing_ok=True)
  print(json.dumps({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':result}}),flush=True)
 "#).unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -157,6 +163,48 @@ for line in sys.stdin:
             .sum::<u64>(),
         4
     );
+    let original = state(&root, "claude");
+    for disappears in [false, true] {
+        let stale = root.join("home/.claude/fixture-usage-once.json");
+        std::fs::write(&stale, serde_json::to_vec(&original["usage"]).unwrap()).unwrap();
+        change_state(&root, "claude", |state| {
+            let limits = &mut state["usage"]["rate_limits"];
+            limits["seven_day"]["utilization"] = 0.into();
+            let grants = limits["cedar_ember"]["grants"].as_array_mut().unwrap();
+            if disappears {
+                grants.retain(|grant| grant["id"] != "account-fixture");
+            } else {
+                grants[1]["resets_left"] = 0.into();
+            }
+        });
+        let outcome = run(claude.clone(), cache.clone(), true).await;
+        let Outcome::Answered { snapshot, .. } = outcome else {
+            panic!("external reset probe failed: {outcome:?}");
+        };
+        assert_eq!(
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.key == "weekly_all")
+                .unwrap()
+                .used,
+            0.0,
+            "the grant change must cause a fresh usage read"
+        );
+        assert_eq!(state(&root, "claude")["consume_count"], 0);
+        let entry = cache
+            .as_ref()
+            .unwrap()
+            .load(now_ms())
+            .remove(&claude.cache_key().unwrap())
+            .unwrap();
+        assert_eq!(entry.snapshot, *snapshot);
+        change_state(&root, "claude", |state| *state = original.clone());
+        assert!(matches!(
+            run(claude.clone(), cache.clone(), true).await,
+            Outcome::Answered { .. }
+        ));
+    }
     change_state(&root, "claude", |state| {
         state["mode"] = "unconfirmed".into()
     });
