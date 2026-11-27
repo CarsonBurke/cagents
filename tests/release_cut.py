@@ -218,6 +218,10 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 if [[ -n ${REQUIRE_PINNED_ZIG:-} ]]; then
     [[ $(zig) == pinned-zig ]]
 fi
+if [[ -n ${REQUIRE_FRESH_MACOS_SOURCE:-} ]]; then
+    python3 -c 'import os, sys; assert os.stat(sys.argv[1]).st_mtime > int(os.environ["SOURCE_DATE_EPOCH"])' \
+        "$root/Cargo.toml"
+fi
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n1)
 echo "package-macos $version epoch=$SOURCE_DATE_EPOCH target=$CARGO_TARGET_DIR git=$([[ -e $root/.git ]] && echo yes || echo no)" \
     >> "$FIXTURE/calls.log"
@@ -1007,6 +1011,29 @@ printf '%s\n' '{pinned / "zig"}'
 
         result = self.release("prepare-macos", "--commit", macos, "--macos-host", "mac")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_prepare_macos_refreshes_checkout_timestamps_and_replaces_old_receipts(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        self.git("add", ".")
+        date = "2001-02-03T00:00:00Z"
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-qm", "feat(release): build the macOS release"],
+            env=os.environ | {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}, check=True,
+        )
+        macos = self.git("rev-parse", "HEAD")
+        self.git("push", "-q", "origin", "main")
+        self.env["REQUIRE_FRESH_MACOS_SOURCE"] = "1"
+        args = ("prepare-macos", "--commit", macos, "--macos-host", "mac")
+
+        result = self.release(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = self.root / f"bundles/.prepared-macos/mac/0.2.4/{macos}/receipt"
+        expected = receipt.read_text()
+        receipt.write_text(expected.replace("source-export-version=2\n", ""))
+        result = self.release(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(receipt.read_text(), expected)
+        self.assertEqual(sum(line.startswith("package-macos ") for line in self.log("calls.log")), 2)
 
     def test_cut_reuses_only_the_prepared_mac_bundle_for_the_selected_commit(self):
         self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
