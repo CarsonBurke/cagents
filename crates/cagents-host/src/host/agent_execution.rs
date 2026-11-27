@@ -298,7 +298,8 @@ fn accept(
                 "{} is not in the project {}; pass a directory inside it",
                 selected.target.directory.display(),
                 crate::workspace_model::primary_checkout(&selected.target.repository).display()
-            ));
+            )
+            .into());
         }
         // An agent never gives its child more than it has itself.
         if let Some(ceiling) = caller_ceiling(host, authority)? {
