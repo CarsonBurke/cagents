@@ -5013,14 +5013,18 @@ fn device_window_menus_offer_only_what_runs_on_the_device() {
             device.contains(&("Browse files on amd".into(), ProjectCommand::Reveal)),
             "{device:?}"
         );
-        // What needs this computer's Git, GitHub or applications is left
-        // out. The app's `device_ui` tests check the rest is routed.
+        assert_eq!(
+            device
+                .iter()
+                .any(|(_, command)| *command == ProjectCommand::NewWorktreeFromBranch),
+            row.is_some()
+        );
+        // The app's `device_ui` tests check the listed commands are routed.
         for (_, command) in &device {
             assert!(
                 !matches!(
                     command,
-                    ProjectCommand::NewWorktreeFromBranch
-                        | ProjectCommand::PullRequest
+                    ProjectCommand::PullRequest
                         | ProjectCommand::RepositoryUrl
                         | ProjectCommand::OpenEditor(_)
                 ),

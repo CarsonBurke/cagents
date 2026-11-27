@@ -367,7 +367,7 @@ use crate::{
 ///
 /// Version 216 appends the `Repository` device operation and reply, which
 /// carry a device window's source control as JSON.
-pub const PROTOCOL_VERSION: u16 = 217;
+pub const PROTOCOL_VERSION: u16 = 218;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

@@ -10156,13 +10156,11 @@ fn project_menu_commands(
     if worktree_id.is_some() {
         if git {
             commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
-            if local {
-                commands.push((
-                    "New worktree from this branch…".into(),
-                    None,
-                    ProjectCommand::NewWorktreeFromBranch,
-                ));
-            }
+            commands.push((
+                "New worktree from this branch…".into(),
+                None,
+                ProjectCommand::NewWorktreeFromBranch,
+            ));
             if github_ready && local {
                 commands.push((
                     "Open or create pull request…".into(),
