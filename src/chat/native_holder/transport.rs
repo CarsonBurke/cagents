@@ -2717,7 +2717,9 @@ exec /bin/sleep 60
             // A provider running one command, so its cgroup and release
             // cover the commands a provider starts.
             program: "/bin/sh".into(),
-            arguments: vec!["-c".into(), "/bin/sleep 60 & exec /bin/sleep 60".into()],
+            // Keep the provider shell in place while the test reads its
+            // environment. A second exec can race the procfs read.
+            arguments: vec!["-c".into(), "/bin/sleep 60 & wait".into()],
             working_directory: working.path().to_owned(),
             environment: BTreeMap::from([("TMPDIR".into(), "tmp-base".into())]),
             unset_environment: Default::default(),
