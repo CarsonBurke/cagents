@@ -388,7 +388,7 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
         restored.set(true);
         Ok(())
     };
-    let error = listener_before_restore(&paths, restore).unwrap_err();
+    let error = listener_before_restore(&paths, None, restore).unwrap_err();
     assert!(matches!(error, HostError::Io(ref error) if error.kind() == io::ErrorKind::AddrInUse));
     assert!(!restored.get());
     assert!(HostLease::is_held(&paths).unwrap());
@@ -417,7 +417,10 @@ fn listener_failure_precedes_real_holder_adoption_and_preserves_the_checkpoint()
     );
     assert!(named.file_type().is_socket());
     fs::remove_file(&paths.socket).unwrap();
-    let listener = listener_before_restore(&paths, restore).unwrap();
+    let reserved = reserve_serving_listener(&paths).unwrap();
+    let descriptor = reserved.as_raw_fd();
+    let listener = listener_before_restore(&paths, Some(reserved), restore).unwrap();
+    assert_eq!(listener.as_raw_fd(), descriptor);
     assert!(restored.get());
     assert!(store.load().unwrap().is_none());
     assert_eq!(fs::metadata(&paths.socket).unwrap().mode() & 0o777, 0o600);
