@@ -47,7 +47,10 @@ renamed "Work" appears as "Work". Folders the browser no longer lists are
 ignored. If `Local State` cannot be read, folders named `Default` and
 `Profile N` are used. Opera's single profile lives in the root itself. Chromium
 `Network/Cookies` takes precedence over the older `Cookies` location that
-Helium still uses. Firefox profiles come from `profiles.ini`.
+Helium still uses. Firefox profiles come from `profiles.ini`. When two profiles
+would show the same label, such as a Firefox profile left in both
+`~/.mozilla/firefox` and `~/.config/mozilla/firefox`, the profile folder is
+added: "Firefox / default-release (abcd.default-release)".
 
 Chromium encrypts cookie values on Linux with a key it keeps in the desktop
 keyring. That key is stored under the build's branding, not the product name. The

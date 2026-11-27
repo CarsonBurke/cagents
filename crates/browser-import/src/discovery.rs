@@ -247,7 +247,45 @@ pub fn discover(home: &Path, config: &Path) -> Vec<Profile> {
             fs::canonicalize(&profile.database).unwrap_or_else(|_| profile.database.clone()),
         )
     });
+    distinguish(&mut profiles);
     profiles
+}
+
+/// Profiles can share a title: two Chromium profiles named alike, or a
+/// Firefox profile left in both its old and its XDG root. Their folders
+/// tell them apart, and a number does when the folders match too.
+fn distinguish(profiles: &mut [Profile]) {
+    let mut titles = BTreeMap::<String, usize>::new();
+    for profile in profiles.iter() {
+        *titles.entry(profile.title()).or_default() += 1;
+    }
+    for profile in profiles.iter_mut() {
+        if titles[&profile.title()] > 1 {
+            profile.name = format!("{} ({})", profile.name, folder(&profile.database));
+        }
+    }
+    let mut seen = BTreeMap::<String, usize>::new();
+    for profile in profiles.iter_mut() {
+        let count = seen.entry(profile.title()).or_default();
+        *count += 1;
+        if *count > 1 {
+            profile.name = format!("{} {count}", profile.name);
+        }
+    }
+}
+
+/// The profile's folder name: the cookie database's directory, above
+/// Chromium's `Network` subdirectory.
+fn folder(database: &Path) -> String {
+    let directory = database.parent().unwrap_or(database);
+    let directory = match directory.file_name() {
+        Some(name) if name == "Network" => directory.parent().unwrap_or(directory),
+        _ => directory,
+    };
+    directory
+        .file_name()
+        .map(|name| name.to_string_lossy().chars().take(128).collect())
+        .unwrap_or_default()
 }
 
 /// A regular file's contents, if it is no larger than `limit`, even when it
@@ -275,31 +313,18 @@ fn chromium(root: &Root, directory: &Path, profiles: &mut Vec<Profile>) {
     if !directory.is_dir() {
         return;
     }
-    let mut found: Vec<(String, String, PathBuf)> = local_state(directory)
+    let mut found: Vec<(String, PathBuf)> = local_state(directory)
         .unwrap_or_else(|| scanned(directory))
         .into_iter()
-        .filter_map(|(folder, name)| {
-            let database = cookies(&directory.join(&folder))?;
-            Some((folder, name, database))
-        })
+        .filter_map(|(folder, name)| Some((name, cookies(&directory.join(folder))?)))
         .collect();
     // Opera keeps its only profile in the user data directory itself.
     if found.is_empty()
         && let Some(database) = cookies(directory)
     {
-        found.push((String::new(), "Default".into(), database));
+        found.push(("Default".into(), database));
     }
-    let mut names = BTreeMap::<String, usize>::new();
-    for (_, name, _) in &found {
-        *names.entry(name.clone()).or_default() += 1;
-    }
-    for (folder, name, database) in found {
-        // Two profiles may share a display name; their folders tell them apart.
-        let name = if names[&name] > 1 {
-            format!("{name} ({folder})")
-        } else {
-            name
-        };
+    for (name, database) in found {
         profiles.push(Profile {
             browser: root.browser,
             install: root.install,
@@ -500,6 +525,39 @@ mod tests {
             );
         }
         assert_eq!(profiles.len(), CHROMIUM.len() + FIREFOX.len());
+        // Several roots of one browser hold same-named profiles in
+        // same-named folders here; each still gets its own title.
+        let titles: BTreeSet<String> = profiles.iter().map(Profile::title).collect();
+        assert_eq!(titles.len(), profiles.len());
+        assert!(titles.contains("Firefox / default (fixture.default) 2"));
+    }
+
+    /// A Firefox profile left in the old root beside the XDG root, as after
+    /// Firefox 147 moves to `~/.config/mozilla`, is told apart by folder.
+    #[test]
+    fn same_named_profiles_across_roots_are_told_apart() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for (root, folder) in [
+            (".mozilla/firefox", "old.default-release"),
+            (".config/mozilla/firefox", "new.default-release"),
+        ] {
+            touch(&home.join(root), &format!("{folder}/cookies.sqlite"));
+            fs::write(
+                home.join(root).join("profiles.ini"),
+                format!("[Profile0]\nName=default-release\nIsRelative=1\nPath={folder}\n"),
+            )
+            .unwrap();
+        }
+        touch(home, ".config/chromium/Default/Cookies");
+        assert_eq!(
+            titles(home),
+            [
+                "Chromium / Default",
+                "Firefox / default-release (new.default-release)",
+                "Firefox / default-release (old.default-release)",
+            ]
+        );
     }
 
     /// Helium's layout: profile folders named by the browser, cookies beside
