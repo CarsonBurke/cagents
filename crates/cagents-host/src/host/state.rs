@@ -4241,9 +4241,10 @@ impl HostState {
                     .get(id)
                     .ok_or_else(|| format!("Terminal {id} was not parked"))?;
                 if !record.handle.is_parked_for_update()
-                    || !record.handle.holder_identity().is_some_and(|holder| {
-                        holder.holder.is_current() && holder.root.is_current()
-                    })
+                    || !record
+                        .handle
+                        .holder_identity()
+                        .is_some_and(|holder| holder.holder.is_current())
                 {
                     return Err(format!(
                         "Terminal {id} no longer has its original live holder"
@@ -4286,6 +4287,13 @@ impl HostState {
             update.promotions.remove(&id);
         }
         Ok(update.promotions.is_empty())
+    }
+
+    pub(super) fn retained_terminal_results(&self) -> BTreeSet<TerminalId> {
+        self.terminals
+            .iter()
+            .filter_map(|(id, record)| record.handle.retained_original_result().then_some(*id))
+            .collect()
     }
 
     pub(super) fn end_parked_update(&mut self) {
@@ -4398,11 +4406,12 @@ pub(super) fn finish_installed_carried_terminals(host: &SharedHost) -> Result<()
                     .terminals
                     .get(id)
                     .ok_or_else(|| format!("Terminal {id} disappeared after promotion"))?;
-                if record.handle.is_completed()
+                if (record.handle.is_completed() && !record.handle.retained_original_result())
                     || record.handle.startup_unresolved()
-                    || !record.handle.holder_identity().is_some_and(|holder| {
-                        holder.holder.is_current() && holder.root.is_current()
-                    })
+                    || !record
+                        .handle
+                        .holder_identity()
+                        .is_some_and(|holder| holder.holder.is_current())
                 {
                     return Err(format!(
                         "Terminal {id} did not prove live original custody after promotion"
@@ -4425,7 +4434,12 @@ pub(super) fn finish_installed_carried_terminals(host: &SharedHost) -> Result<()
     for (id, handle, options, source, previous) in publications {
         publish_installed_terminal(host, None, id, &handle, &options)
             .map_err(|error| error.message)?;
-        restore_terminal_execution_authority(host, &source, &previous)?;
+        if handle
+            .holder_identity()
+            .is_some_and(|record| record.root.is_current())
+        {
+            restore_terminal_execution_authority(host, &source, &previous)?;
+        }
     }
     Ok(())
 }

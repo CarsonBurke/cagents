@@ -343,7 +343,12 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
                 }) {
                     return Err("An original conversation has not finished resuming".into());
                 }
-                admission.verify_live_inventory(state.proof(), &terminals, &chats)?;
+                admission.verify_live_inventory(
+                    state.proof(),
+                    &terminals,
+                    &chats,
+                    &Default::default(),
+                )?;
                 let digest = restored.checkpoint_digest_for_removal();
                 if admission.is_held_return() {
                     admission.finish_held_return(
@@ -432,10 +437,11 @@ fn activate_parked_terminals(
     save_agent_pane_identities(host);
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let terminals = state.list(0);
+    let completed = state.retained_terminal_results();
     if let Some(admission) = admission {
-        admission.verify_live_inventory(state.proof(), &terminals, &[])?;
+        admission.verify_live_inventory(state.proof(), &terminals, &[], &completed)?;
     } else {
-        crate::update::verify_selected_parked_inventory(state.proof(), &terminals)
+        crate::update::verify_selected_parked_inventory(state.proof(), &terminals, &completed)
             .map_err(|error| error.to_string())?;
     }
     installed.restored.finish_locked(&mut state)
@@ -1139,7 +1145,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         Some(ready) => {
             ready.begin_workspace_effects()?;
             ready.begin_workspace_initialization()?;
-            ready.requires_durable_workspace()
+            ready.requires_durable_workspace() || parked_installed.is_some()
         }
         None => matches!(
             cutover_checkpoint,
@@ -1516,6 +1522,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                         })
                     });
                     crate::update::CutoverLiveInventory {
+                        completed: state.retained_terminal_results(),
                         terminals: state.list(0),
                         chats,
                         adopted_sources: state.upgrade_chats.clone(),

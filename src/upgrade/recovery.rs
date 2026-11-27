@@ -1868,6 +1868,8 @@ impl ReadyPlanEvidence<'_> {
             "retry-effects",
             "init-start",
             "init-complete",
+            "retry-init-start",
+            "retry-init-complete",
             "restore",
             "return-claim",
             "return-effects",
@@ -2108,12 +2110,9 @@ impl ReadyPlanEvidence<'_> {
     #[cfg(feature = "host")]
     pub(crate) fn verify_parked_workspace_initialization(&self) -> Result<(), String> {
         let (first, _) = self.first_claim()?;
-        verify_ready_initialization(&self.authority, &first)?;
-        if ready_evidence_exists(&self.authority, "retry-claim")?
-            && ready_evidence_exists(&self.authority, "retry-effects")?
-            && !ready_evidence_exists(&self.authority, "init-complete")?
-        {
-            return Err("The parked retry did not verify workspace initialization".into());
+        verify_ready_initialization(&self.authority, &first, false)?;
+        if ready_evidence_exists(&self.authority, "retry-claim")? {
+            verify_ready_initialization(&self.authority, &self.latest_claim()?, true)?;
         }
         Ok(())
     }
@@ -5044,21 +5043,23 @@ impl ReadyAdmission {
     }
 
     pub fn begin_workspace_initialization(&self) -> io::Result<()> {
-        if self.is_held_return() {
-            self.record_workspace_stage("return-init-start")?;
-        } else if self.retry_predecessor.is_none() {
-            self.record_workspace_stage("init-start")?;
-        }
-        Ok(())
+        self.record_workspace_stage(if self.is_held_return() {
+            "return-init-start"
+        } else if self.retry_predecessor.is_some() {
+            "retry-init-start"
+        } else {
+            "init-start"
+        })
     }
 
     pub fn finish_workspace_initialization(&self) -> io::Result<()> {
-        if self.is_held_return() {
-            self.record_workspace_stage("return-init-complete")?;
-        } else if self.retry_predecessor.is_none() {
-            self.record_workspace_stage("init-complete")?;
-        }
-        Ok(())
+        self.record_workspace_stage(if self.is_held_return() {
+            "return-init-complete"
+        } else if self.retry_predecessor.is_some() {
+            "retry-init-complete"
+        } else {
+            "init-complete"
+        })
     }
 
     pub fn begin_workspace_restore(&self) -> io::Result<()> {
@@ -5118,6 +5119,7 @@ impl ReadyAdmission {
         serving: &HostSessionProof,
         terminals: &[crate::terminal_ipc::TerminalDescriptor],
         chats: &[Session],
+        completed: &std::collections::BTreeSet<TerminalId>,
     ) -> Result<(), String> {
         self.verify_custody()?;
         let store = super::handoff::Store::discover()?;
@@ -5130,6 +5132,7 @@ impl ReadyAdmission {
             terminals,
             chats,
             &lineage,
+            completed,
         )
     }
 
@@ -5150,6 +5153,7 @@ impl ReadyAdmission {
             &self.successor,
             terminals,
             &[],
+            &Default::default(),
             &Default::default(),
         )
     }
@@ -5219,6 +5223,8 @@ fn require_no_ready_effects_or_retry(authority: &Authority) -> Result<(), String
         "retry-effects",
         "init-start",
         "init-complete",
+        "retry-init-start",
+        "retry-init-complete",
         "restore",
     ] {
         if ready_evidence_exists(authority, marker)? {
@@ -5260,11 +5266,15 @@ fn verify_ready_workspace_retry(authority: &Authority, claim: &ReadyClaim) -> Re
     {
         return Err("The installed successor began restoring or already used its retry".into());
     }
-    verify_ready_initialization(authority, claim)
+    verify_ready_initialization(authority, claim, false)
 }
 
 #[cfg(target_os = "macos")]
-fn verify_ready_initialization(authority: &Authority, claim: &ReadyClaim) -> Result<(), String> {
+fn verify_ready_initialization(
+    authority: &Authority,
+    claim: &ReadyClaim,
+    retry: bool,
+) -> Result<(), String> {
     let claimant = claim
         .successor_proof
         .as_ref()
@@ -5283,9 +5293,14 @@ fn verify_ready_initialization(authority: &Authority, claim: &ReadyClaim) -> Res
         }
         Ok(true)
     };
-    let effects = read("effects")?;
-    let start = read("init-start")?;
-    let complete = read("init-complete")?;
+    let (effects, start, complete) = if retry {
+        ("retry-effects", "retry-init-start", "retry-init-complete")
+    } else {
+        ("effects", "init-start", "init-complete")
+    };
+    let effects = read(effects)?;
+    let start = read(start)?;
+    let complete = read(complete)?;
     if start != complete || (!effects && start) {
         return Err("The installed successor did not finish workspace initialization".into());
     }

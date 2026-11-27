@@ -2740,6 +2740,22 @@ impl TerminalHandle {
             .load(Ordering::Acquire)
     }
 
+    /// A completed registered worker still holds its exact holder and result
+    /// after the original PTY root has exited. Completion alone is not proof.
+    #[cfg(target_os = "macos")]
+    pub fn retained_original_result(&self) -> bool {
+        self.is_completed()
+            && self.inner.published.has_retained_holder()
+            && self.holder_identity().is_some_and(|record| {
+                record.holder.is_current()
+                    && crate::pinned_process::exited_since(
+                        record.root.pid as u32,
+                        record.root.start,
+                    )
+                    .is_ok_and(|exited| exited)
+            })
+    }
+
     pub fn is_parked_for_update(&self) -> bool {
         self.inner.published.startup_parked.load(Ordering::Acquire)
     }

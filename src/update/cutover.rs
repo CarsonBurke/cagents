@@ -175,6 +175,7 @@ fn selected_parked_checkpoint(
 pub fn verify_selected_parked_inventory(
     serving: &HostSessionProof,
     terminals: &[crate::terminal_ipc::TerminalDescriptor],
+    completed: &std::collections::BTreeSet<crate::model::TerminalId>,
 ) -> Result<(), UpdateError> {
     let layout = locate(&crate::process::current_executable()?)?;
     let state = layout.prefix.join(".update");
@@ -198,6 +199,7 @@ pub fn verify_selected_parked_inventory(
         terminals,
         &[],
         &Default::default(),
+        completed,
     )
     .map_err(invalid)
 }
@@ -205,6 +207,7 @@ pub fn verify_selected_parked_inventory(
 /// A single snapshot of actual running owners under the serving host's lock.
 #[cfg(feature = "host")]
 pub struct LiveInventory {
+    pub completed: std::collections::BTreeSet<crate::model::TerminalId>,
     pub terminals: Vec<crate::terminal_ipc::TerminalDescriptor>,
     pub chats: Vec<crate::chat::Session>,
     pub adopted_sources: std::collections::BTreeMap<
@@ -486,6 +489,7 @@ impl Intent {
         saved: OriginalInventory,
         serving: &HostSessionProof,
         mut inventory: LiveInventory,
+        state: &Path,
     ) -> Result<(), UpdateError> {
         let store = crate::upgrade::handoff::Store::discover().map_err(invalid)?;
         let mut lineage = store.recovered_chats().map_err(invalid)?;
@@ -505,6 +509,9 @@ impl Intent {
                 lineage.observe_live_adoption(chat, sources);
             }
         }
+        if !self.recorded_parked(state)? {
+            inventory.completed.clear();
+        }
         recovery::verify_ready_inventory(
             &self.job,
             &self.source,
@@ -517,6 +524,7 @@ impl Intent {
             &terminals,
             &chats,
             &lineage,
+            &inventory.completed,
         )
         .map_err(invalid)
     }
@@ -1124,7 +1132,7 @@ pub(super) fn finish(
                 ));
             }
             let generation = client.inventory_generation()?;
-            intent.verify_resumed_inventory(saved, successor, observe_live())?;
+            intent.verify_resumed_inventory(saved, successor, observe_live(), state)?;
             if client.inventory_generation()? != generation {
                 return Err(invalid(
                     "The running work changed during update verification",

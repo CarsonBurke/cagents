@@ -850,6 +850,28 @@ pub(crate) fn compare_with_recovery(
     prepared: Option<&crate::upgrade::recovery::verified::VerifiedView>,
     paused_ready: Option<&crate::upgrade::recovery::verified::ready::ReadyView>,
 ) -> Outcome {
+    compare_with_retained_exits(
+        census,
+        proof,
+        terminals,
+        chats,
+        lineage,
+        prepared,
+        paused_ready,
+        &BTreeSet::new(),
+    )
+}
+
+fn compare_with_retained_exits(
+    census: &Census,
+    proof: &HostSessionProof,
+    terminals: &[TerminalDescriptor],
+    chats: &[crate::chat::Session],
+    lineage: &crate::upgrade::handoff::RecoveredChats,
+    prepared: Option<&crate::upgrade::recovery::verified::VerifiedView>,
+    paused_ready: Option<&crate::upgrade::recovery::verified::ready::ReadyView>,
+    completed: &BTreeSet<TerminalId>,
+) -> Outcome {
     let mut paused_terminals = vec![];
     let mut paused_chats = vec![];
     let mut missing = vec![];
@@ -896,6 +918,11 @@ pub(crate) fn compare_with_recovery(
                 .any(|r| issued_terminal_matches(expected, &r.source));
         let same_owner =
             expected.continuity.live_proof() == current.session.continuity.live_proof();
+        let original_completed = completed.contains(&current.session.id)
+            && expected.id == current.session.id
+            && expected.continuity.live_proof().is_some()
+            && matches!(&current.session.continuity, TerminalContinuity::RelaunchAvailable { recipe, .. }
+                if recipe == &expected.launch);
         if !used.insert(index)
             || (expected.continuity.live_proof().is_some() && !same_owner && !issued)
             || (current.session.launch != expected.launch
@@ -903,7 +930,8 @@ pub(crate) fn compare_with_recovery(
                     issued_terminal_matches(expected, &r.source)
                         && r.recipe == current.session.launch
                 }))
-            || !continuity_matches(&expected.continuity, &current.session.continuity, proof)
+            || !(original_completed
+                || continuity_matches(&expected.continuity, &current.session.continuity, proof))
         {
             changed.push(expected.id);
         } else {
@@ -976,6 +1004,7 @@ pub(crate) fn verify_ready_inventory(
     terminals: &[TerminalDescriptor],
     chats: &[crate::chat::Session],
     lineage: &crate::upgrade::handoff::RecoveredChats,
+    completed: &BTreeSet<TerminalId>,
 ) -> Result<(), String> {
     if source == serving || source.boot_id != serving.boot_id {
         return Err("The replacement does not identify an exact new same-boot daemon".into());
@@ -989,7 +1018,9 @@ pub(crate) fn verify_ready_inventory(
         checkpoint_before: None,
     };
     census.validate().map_err(|error| error.to_string())?;
-    match compare_with_recovery(&census, serving, terminals, chats, lineage, None, None) {
+    match compare_with_retained_exits(
+        &census, serving, terminals, chats, lineage, None, None, completed,
+    ) {
         Outcome::Usable { .. } => Ok(()),
         Outcome::Unverified { detail, .. } => Err(detail),
         _ => Err("The Ready replacement did not verify its original inventory".into()),
@@ -2003,6 +2034,7 @@ mod tests {
                 terminals,
                 &[],
                 &Default::default(),
+                &Default::default(),
             )
         };
         assert!(verify(&source, std::slice::from_ref(&original)).is_err());
@@ -2010,6 +2042,28 @@ mod tests {
         assert!(verify(&serving, std::slice::from_ref(&live)).is_err());
         live.upgrade_sources.push(original.session);
         assert!(verify(&serving, std::slice::from_ref(&live)).is_ok());
+        let mut completed = live.clone();
+        completed.session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: completed.session.launch.clone(),
+            last_exit: None,
+        };
+        assert!(verify(&serving, std::slice::from_ref(&completed)).is_err());
+        let retained = BTreeSet::from([completed.session.id]);
+        let verify_retained = |terminal: &TerminalDescriptor| {
+            verify_ready_inventory(
+                &transaction,
+                &source,
+                &captured,
+                &serving,
+                std::slice::from_ref(terminal),
+                &[],
+                &Default::default(),
+                &retained,
+            )
+        };
+        assert!(verify_retained(&completed).is_ok());
+        completed.upgrade_sources.clear();
+        assert!(verify_retained(&completed).is_err());
         serving.boot_id = crate::model::BootId::new("another boot");
         assert!(verify(&serving, &[live]).is_err());
     }

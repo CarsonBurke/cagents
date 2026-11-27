@@ -93,6 +93,8 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "ready-retry-effects.json"
             | "ready-init-start.json"
             | "ready-init-complete.json"
+            | "ready-retry-init-start.json"
+            | "ready-retry-init-complete.json"
             | "ready-restore.json"
             | "ready-retry-claim.json"
             | "ready-runtime-owner.json"
