@@ -214,6 +214,10 @@ PACKAGE_MACOS = r"""#!/bin/bash
 set -euo pipefail
 [[ $1 == --output ]] || exit 98
 root=$(cd "$(dirname "$0")/.." && pwd)
+[[ $(pwd -P) == "$root" ]] || { echo "package-macos ran outside the source tree" >&2; exit 97; }
+if [[ -n ${REQUIRE_PINNED_ZIG:-} ]]; then
+    [[ $(zig) == pinned-zig ]]
+fi
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -n1)
 echo "package-macos $version epoch=$SOURCE_DATE_EPOCH target=$CARGO_TARGET_DIR git=$([[ -e $root/.git ]] && echo yes || echo no)" \
     >> "$FIXTURE/calls.log"
@@ -981,6 +985,28 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(signature.read_text(), "existing signature")
         self.assertEqual(list(bundle.parent.glob(".dry-run-*")), [])
         self.assertFalse(any(line.startswith(("sign ", "publish ")) for line in self.log("calls.log")))
+
+    def test_prepare_macos_resolves_the_zig_shim_before_packaging(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        (self.repo / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
+        shims = self.root / "shims"
+        shims.mkdir()
+        self.tool(shims / "zig", "#!/bin/sh\nexit 1\n")
+        self.tool(self.bin / "pinned-zig", "#!/bin/sh\necho pinned-zig\n")
+        pinned = self.root / "pinned"
+        pinned.mkdir()
+        (pinned / "zig").symlink_to(self.bin / "pinned-zig")
+        self.tool(self.bin / "mise", f"""#!/bin/bash
+[[ "$*" == 'exec zig@0.15.2 -- which zig' ]] || exit 1
+printf '%s\n' '{pinned / "zig"}'
+""")
+        self.env["PATH"] = f"{shims}:{self.env['PATH']}"
+        self.env["REQUIRE_PINNED_ZIG"] = "1"
+        macos = self.commit("feat(release): build the macOS release")
+        self.git("push", "-q", "origin", "main")
+
+        result = self.release("prepare-macos", "--commit", macos, "--macos-host", "mac")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_cut_reuses_only_the_prepared_mac_bundle_for_the_selected_commit(self):
         self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
