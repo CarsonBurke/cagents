@@ -673,7 +673,7 @@ pub fn tooltip_beside<'a, Message: 'a>(
 }
 
 /// A tooltip that says why its disabled control can't be used, such as
-/// "Preserve case applies only to plain-text search".
+/// "Turn off regular expressions (.*) to preserve case".
 ///
 /// [`tooltip`] names a control and hides on a disabled one, whose name is no
 /// longer an offer. This one shows on a disabled control, so wrap a control

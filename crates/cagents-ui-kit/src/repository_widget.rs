@@ -2396,7 +2396,7 @@ const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
 /// either side of it do not move when the step changes.
 const ZOOM_LABEL_WIDTH: f32 = 48.0;
 /// Why the find bar's Selection option is unavailable: there is no
-/// selection to search, which selecting text while Find is open supplies.
+/// selection to search, which a selection in the file supplies.
 const FIND_SELECTION_UNAVAILABLE: &str = "Select text in the file to search only within it";
 /// Why Replace's Preserve case option is unavailable while Regex is on.
 const PRESERVE_CASE_UNAVAILABLE: &str = "Turn off regular expressions (.*) to preserve case";
