@@ -4,6 +4,7 @@ mod owned_late_decision;
 mod pane_move;
 mod retained_automation;
 mod transcript;
+mod working_directory;
 
 use super::*;
 use crate::{
@@ -163,6 +164,7 @@ fn install_claude(path: &Path) {
     std::fs::write(path, r#"#!/bin/sh
 set -eu
 printf 'spawn\n' >> "$HOME/../spawns"
+pwd -P >> "$HOME/../directories"
 printf '%s\n' "$@" > "$HOME/../claude-arguments"
 n=0
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa

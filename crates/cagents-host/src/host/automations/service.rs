@@ -7,7 +7,6 @@ use uuid::Uuid;
 use crate::{
     automations::{Automation, Definition, DirectoryIdentity},
     host::{agent_execution, state::SharedHost},
-    process::SystemProcessExecutor,
 };
 
 use super::{schedule::Compiled, target};
@@ -528,22 +527,21 @@ pub(super) fn validate_target(
 ) -> Result<Arc<File>, String> {
     let directory =
         target::verify(&definition.agent.target.directory, identity).map_err(|e| e.to_string())?;
-    let kind = agent_execution::registry(host)?
+    let projects = agent_execution::registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .automation_project_kind(&definition.agent.target.repository)?;
-    target::project(
+        .projects()?;
+    agent_execution::working_directory::ensure_in_project(
         &definition.agent.target.directory,
         &definition.agent.target.repository,
-        kind,
-        &SystemProcessExecutor,
+        &projects,
     )?;
     // Detect replacement during discovery too; retain the original descriptor.
     target::verify(&definition.agent.target.directory, identity).map_err(|e| e.to_string())?;
     // Prechecks run here directly; accepted work is refused again at launch.
     crate::host::worktree_removal::ensure_outside_directory(host, &directory)
         .map_err(|error| error.message)?;
-    Ok(Arc::new(directory))
+    Ok(directory)
 }
 
 pub(super) fn now() -> Result<u64, String> {

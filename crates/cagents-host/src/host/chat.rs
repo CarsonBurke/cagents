@@ -2759,13 +2759,35 @@ fn start_publishing(
             .unwrap_or_else(|| setup_error(message))
     })?;
     let remote = retained_actor::enabled(session.launch.provider, &spec.transport);
-    let execution = if remote && execution.is_none() {
-        Some(Arc::new(
+    // An agent's conversation runs in the agent's directory whoever starts
+    // it. A handoff from a terminal continues that terminal's process where it
+    // runs, and reading history or joining a provider's own socket starts
+    // nothing.
+    let agent_directory = if execution.is_none()
+        && source.is_none()
+        && !matches!(
+            spec.transport,
+            chat::protocol::TransportSpec::History
+                | chat::protocol::TransportSpec::UnixWebSocket { .. }
+        )
+        && let Ok(registry) = super::agent_execution::registry(host)
+    {
+        super::agent_execution::working_directory::for_conversation(&registry, &session)
+            .map_err(unavailable)?
+            .map(|opened| (registry, opened))
+    } else {
+        None
+    };
+    let execution = match (execution, &agent_directory) {
+        (Some(context), _) => Some(context),
+        (None, Some((_, opened))) => Some(Arc::new(chat::protocol::ExecutionContext::new(Some(
+            opened.directory.clone(),
+        )))),
+        (None, None) if remote => Some(Arc::new(
             chat::protocol::ExecutionContext::capture_for_start(&spec.working_directory)
                 .map_err(setup_error)?,
-        ))
-    } else {
-        execution
+        )),
+        (None, None) => None,
     };
     if matches!(spec.transport, chat::protocol::TransportSpec::History)
         && (source.is_some()
@@ -3183,6 +3205,21 @@ fn start_publishing(
             )
         }
         .map_err(|message| {
+            // A start in an agent's directory owns its launch as an agent's
+            // run does: a provider it left starting is ended here, since no
+            // run holds it to end later.
+            let message = match (&agent_directory, &execution) {
+                (Some(_), Some(context)) if !remote => match context.reconcile_cleanup() {
+                    Ok(
+                        chat::protocol::LaunchOutcome::NoProvider
+                        | chat::protocol::LaunchOutcome::TeardownProved,
+                    ) => message,
+                    cleanup => format!(
+                        "{message}. The provider may still be starting ({cleanup:?}); close the conversation before starting it again"
+                    ),
+                },
+                _ => message,
+            };
             check_launch_account(&session.launch)
                 .err()
                 .unwrap_or_else(|| retryable_unavailable(message))
@@ -3343,6 +3380,12 @@ fn start_publishing(
         state.inventory_changed();
         drop(state);
         drop(retired);
+        // The agent's provider now runs in the directory judged for it.
+        if let Some((registry, opened)) = &agent_directory
+            && let Err(error) = opened.started(registry)
+        {
+            tracing::warn!(chat=%id, %error, "The agent's directory was not recorded");
+        }
         if remote {
             installed_handle.wake_retained_outcomes();
             retained_actor::wake(host, id);
@@ -5088,6 +5131,14 @@ fn process_inner(
                 return Err(error(
                     "A shared Codex source must be reattached, not replaced",
                 ));
+            }
+            // The terminal starts the provider's own program at this path. An
+            // agent's is judged as any start of its provider is. A terminal
+            // takes no descriptor, so this refuses a link that stands there
+            // and not one put there after the check.
+            if let Ok(registry) = super::agent_execution::registry(host) {
+                super::agent_execution::working_directory::for_conversation(&registry, &session)
+                    .map_err(unavailable)?;
             }
             let terminal_id = crate::model::TerminalId::new();
             let mut terminal = crate::model::TerminalSession {

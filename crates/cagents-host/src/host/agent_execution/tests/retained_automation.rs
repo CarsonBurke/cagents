@@ -300,3 +300,202 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
         2
     );
 }
+
+/// #4327, end to end: a retained Claude conversation whose provider stopped
+/// reopens by itself for the next prompt. It reopens in the directory the
+/// agent was accepted in, and not at all while a link stands at that path.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
+fn a_stopped_agent_reopens_only_in_the_directory_it_was_accepted_in() {
+    if isolated_retained() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap().to_path_buf();
+    let nested = root.join("project").join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.target.directory = nested.clone();
+    let proof = host.lock().unwrap().proof().clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = crate::host::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let session = || {
+        let HostedSession::Chat(session) = registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .session
+            .unwrap()
+        else {
+            panic!("the agent did not bind a native conversation");
+        };
+        session
+    };
+    struct Cleanup(SharedHost);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let chats: Vec<_> = self.0.lock().unwrap().chats.keys().copied().collect();
+            for chat_id in chats {
+                let _ = crate::host::chat::process(
+                    &self.0,
+                    EXECUTION_CLIENT,
+                    ClientRequest::ChatClose { chat_id },
+                );
+            }
+        }
+    }
+    let _cleanup = Cleanup(host.clone());
+    let source = session();
+    let directories = || {
+        std::fs::read_to_string(root.join("directories"))
+            .unwrap()
+            .lines()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(directories(), [nested.as_path()]);
+
+    // Its provider stops while the agent stays open.
+    let handle = host.lock().unwrap().chats[&source.id].handle.clone();
+    handle
+        .actor_identity()
+        .expect("this regression must execute the real retained helper");
+    // The fixture provider keeps no history, which a reopening reads. Claude
+    // keys it by the resolved directory, so the place a link will lead to
+    // gets the transcript too: the refusal below is then the daemon's own.
+    let outside = root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    for directory in [&nested, &outside] {
+        let project: String = directory
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history = root.join("home/.claude/projects").join(project);
+        std::fs::create_dir_all(&history).unwrap();
+        std::fs::write(
+            history.join(format!("{}.jsonl", handle.confirmed_session_id().unwrap())),
+            b"",
+        )
+        .unwrap();
+    }
+    wait_until(
+        || {
+            handle.snapshot(None).is_some_and(|idle| {
+                idle.ready
+                    && !idle.busy
+                    && !idle.waiting
+                    && idle.requests.is_empty()
+                    && handle.try_close_if_idle(idle.generation).unwrap_or(false)
+            })
+        },
+        "the idle provider did not stop",
+    );
+    assert!(handle.is_completed());
+
+    let follow_up = |key: &str| Submit {
+        name: None,
+        destination: Destination::Existing(accepted.agent.id),
+        prompt: "Carry on".into(),
+        idempotency_key: key.into(),
+    };
+    // A link out of the project now stands where the directory was.
+    let kept = root.join("kept");
+    std::fs::rename(&nested, &kept).unwrap();
+    std::os::unix::fs::symlink(&outside, &nested).unwrap();
+    let error = super::super::prompt(&host, &Authority::default(), follow_up("swapped"), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Cannot reopen the agent's conversation")
+            && error.contains(nested.to_str().unwrap()),
+        "{error}"
+    );
+    assert_eq!(directories().len(), 1, "nothing started: {error}");
+    assert_eq!(session().id, source.id, "the agent keeps its conversation");
+
+    // A window that resumes the conversation starts the agent's provider
+    // too, under a new ID in the conversation's lineage. Prepared while the
+    // directory was itself, its start meets the link and is refused as the
+    // agent's.
+    std::fs::remove_file(&nested).unwrap();
+    std::fs::rename(&kept, &nested).unwrap();
+    let ServerResponse::ChatResumePrepared { session: prepared } = crate::host::chat::process(
+        &host,
+        7,
+        ClientRequest::ChatPrepareResume {
+            source: source.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("the conversation's resume was not prepared");
+    };
+    assert_ne!(prepared.id, source.id);
+    std::fs::rename(&nested, &kept).unwrap();
+    std::os::unix::fs::symlink(&outside, &nested).unwrap();
+    let error = crate::host::chat::process(
+        &host,
+        7,
+        ClientRequest::ChatStart {
+            session: prepared,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap_err()
+    .message;
+    assert!(error.contains("is a symbolic link"), "{error}");
+    assert_eq!(directories().len(), 1, "nothing started: {error}");
+
+    // With its directory back, the next prompt reopens the conversation
+    // there. The record may name another device, as after a boot: the start
+    // judges the directory again and records it once the provider runs.
+    std::fs::remove_file(&nested).unwrap();
+    std::fs::rename(&kept, &nested).unwrap();
+    let recorded = || {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_directory(accepted.agent.id)
+            .unwrap()
+            .unwrap()
+    };
+    let actual = recorded();
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .record_agent_directory(
+            accepted.agent.id,
+            crate::agent_execution::DirectoryIdentity {
+                device: actual.device.wrapping_add(1),
+                ..actual
+            },
+        )
+        .unwrap();
+    let (resumed, start) =
+        super::super::prompt(&host, &Authority::default(), follow_up("restored"), false).unwrap();
+    assert_eq!(start, Start::Sent { resumed: true });
+    assert_eq!(settled(&host, resumed.run.id).state, State::Succeeded);
+    assert_ne!(session().id, source.id, "a new process took the agent over");
+    assert_eq!(directories(), [nested.as_path(), nested.as_path()]);
+    assert_eq!(recorded(), actual);
+}
