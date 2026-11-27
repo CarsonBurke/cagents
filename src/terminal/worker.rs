@@ -3333,11 +3333,9 @@ impl Worker {
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
         let (held, output) = match &config.adoption {
             Some(socket) => {
-                let adopted = holder::adopt_recoverable(
-                    socket,
-                    child_exit_tx,
-                    config.holder_recovery.clone(),
-                )?;
+                let adopted =
+                    holder::attach(socket, child_exit_tx, config.holder_recovery.clone())?
+                        .into_worker();
                 // Drawing the screen again is not news, except for the title
                 // it sets: whatever it provoked, a reply or a bell, happened
                 // when its predecessor drew it.

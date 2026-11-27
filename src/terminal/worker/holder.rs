@@ -63,6 +63,9 @@ const ARGUMENT: &str = "--cagents-terminal-holder";
 const PROTOCOL: u32 = 5;
 /// The holders a daemon can adopt: any that speak detaching.
 const ADOPTABLE: std::ops::RangeInclusive<u32> = 2..=PROTOCOL;
+/// Minimum qualified protocol for a registered holder to retain replay on
+/// disconnect before the adopter sends CommitAdoption.
+const PARKABLE: u32 = 5;
 /// A spawn request carries the root's whole environment; nothing legitimate
 /// comes near this.
 const MAX_FRAME: u32 = 16 << 20;
@@ -492,7 +495,7 @@ pub(super) fn spawn_reserved(
     )
 }
 
-/// A terminal taken over from a detached holder.
+/// Resources prepared for a terminal worker after attaching to a holder.
 pub(super) struct Adopted {
     pub(super) held: Held,
     /// The screen its previous daemon detached with.
@@ -503,7 +506,26 @@ pub(super) struct Adopted {
     pub(super) screen_lost: bool,
 }
 
-/// Takes over the terminal of a holder a previous daemon
+/// An authenticated registered terminal whose holder still owns the replay.
+/// Dropping this attachment closes control without acknowledging adoption or
+/// releasing the original process. The PTY descriptors stay private while
+/// parked, so a caller cannot drain output or write to the terminal.
+pub(super) struct ParkedAdoption(Adopted);
+
+pub(super) enum Attachment {
+    Parked(ParkedAdoption),
+    Legacy(Adopted),
+}
+
+impl Attachment {
+    pub(super) fn into_worker(self) -> Adopted {
+        match self {
+            Self::Parked(ParkedAdoption(adopted)) | Self::Legacy(adopted) => adopted,
+        }
+    }
+}
+
+/// Attaches to a terminal a previous daemon
 /// [detached](Holder::detach) onto `socket`. A root that exited meanwhile
 /// has its exit delivered to `exits` straight away.
 #[cfg(test)]
@@ -511,11 +533,20 @@ fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, String> {
     adopt_recoverable(socket, exits, None)
 }
 
-pub(super) fn adopt_recoverable(
+#[cfg(test)]
+fn adopt_recoverable(
     socket: &Path,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
 ) -> Result<Adopted, String> {
+    attach(socket, exits, recovery).map(Attachment::into_worker)
+}
+
+pub(super) fn attach(
+    socket: &Path,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+) -> Result<Attachment, String> {
     let evidence = crate::daemon::holder_registry::recovery_candidate(
         socket,
         crate::daemon::holder_registry::Kind::Terminal,
@@ -657,11 +688,17 @@ pub(super) fn adopt_recoverable(
         launch_directory,
     )?;
     held.holder.detached = false;
-    Ok(Adopted {
+    let parkable = held.holder.registered && protocol >= PARKABLE;
+    let adopted = Adopted {
         held,
         screen,
         output,
         screen_lost,
+    };
+    Ok(if parkable {
+        Attachment::Parked(ParkedAdoption(adopted))
+    } else {
+        Attachment::Legacy(adopted)
     })
 }
 
@@ -3519,7 +3556,7 @@ mod tests {
         holder.detached = true;
         holder.control.shutdown(std::net::Shutdown::Both).unwrap();
         drop(holder);
-        std::io::Write::write_all(&mut writer, b"rollback-replay\n").unwrap();
+        std::io::Write::write_all(&mut writer, b"rollback-replay\nrollback-replay\n").unwrap();
         drop(writer);
         drop(lease);
         let third = crate::model::HostSessionProof {
@@ -3540,13 +3577,15 @@ mod tests {
         // existing lease, without fabricating a self-alias after a lost ACK.
         let retry_source = next.source.clone();
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        let replay = loop {
             let (exits, _) = crossbeam_channel::bounded(1);
-            let attempt = adopt_recoverable(&socket, exits, Some(next.clone())).unwrap();
-            let replayed =
-                String::from_utf8_lossy(&attempt.output).contains("still-running:rollback-replay");
-            // No commit: dropping failed parser setup must preserve every byte
-            // already returned in Attached as well as the surviving process.
+            let Attachment::Parked(attempt) = attach(&socket, exits, Some(next.clone())).unwrap()
+            else {
+                panic!("the registered v5 holder must be parkable");
+            };
+            let output = attempt.0.output.clone();
+            // Drop the parked custody as an abandoned successor would. No
+            // acknowledgement or read of the PTY can consume its replay.
             drop(attempt);
             assert_eq!(next.source, retry_source);
             assert_eq!(
@@ -3558,18 +3597,30 @@ mod tests {
                 Some(record.clone()),
                 "adoption rewrote the original holder role/identity"
             );
-            if replayed {
-                break;
+            if output.ends_with(b"\n")
+                && String::from_utf8_lossy(&output)
+                    .lines()
+                    .filter(|line| *line == "still-running:rollback-replay")
+                    .count()
+                    == 2
+            {
+                break output;
             }
             assert!(
                 Instant::now() < deadline,
                 "orphan never buffered the fixture output"
             );
             thread::sleep(Duration::from_millis(10));
-        }
+        };
+        let (exits, _) = crossbeam_channel::bounded(1);
+        let Attachment::Parked(retry) = attach(&socket, exits, Some(next.clone())).unwrap() else {
+            panic!("the next candidate must be able to park the same terminal");
+        };
+        assert_eq!(retry.0.output, replay);
+        drop(retry);
         let (exits, exited) = crossbeam_channel::bounded(1);
         let mut adopted = adopt_recoverable(&socket, exits, Some(next)).unwrap();
-        assert!(String::from_utf8_lossy(&adopted.output).contains("still-running:rollback-replay"));
+        assert_eq!(adopted.output, replay);
         assert_eq!(adopted.held.child.pid(), record.root.pid);
         adopted.held.holder.commit_adoption().unwrap();
         let mut writer = File::from(adopted.held.master.duplicate().unwrap());
