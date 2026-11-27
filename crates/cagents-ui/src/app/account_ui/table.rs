@@ -535,9 +535,19 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                 action(Action::AddMenu(false)),
             )
         });
+    let (title, caption) = match crate::device::selected() {
+        Some(device) => (
+            format!("Accounts on {}", device.name).into(),
+            "Showing or hiding providers applies to this computer.",
+        ),
+        None => (
+            Cow::Borrowed("Accounts"),
+            "Compare usage limits and available resets across your accounts.",
+        ),
+    };
     let description = widget::column::with_children(vec![
-        design::heading("Accounts").into(),
-        design::caption("Compare usage limits and available resets across your accounts.")
+        design::heading(title).into(),
+        design::caption(caption)
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into(),
     ])
@@ -622,6 +632,22 @@ fn use_provider(provider: Provider, used: bool) -> Message {
 fn add_menu<'a>(state: &'a State, browser_busy: bool) -> Element<'a, Message> {
     let action = |action| Message::AccountUi(action);
     let missing = |provider| state.installed.get(&provider) == Some(&false);
+    let device = crate::device::selected();
+    let existing_home = |provider: Provider| -> Cow<'static, str> {
+        match device {
+            Some(device) => format!(
+                "Use a {} login and history already on {}",
+                provider.label(),
+                device.name
+            )
+            .into(),
+            None => format!(
+                "Use a {} login and history already on this computer",
+                provider.label()
+            )
+            .into(),
+        }
+    };
     let claude = state.uses(Provider::Claude);
     let codex = state.uses(Provider::Codex);
     let mut items: Vec<Element<'a, Message>> = Vec::new();
@@ -635,9 +661,9 @@ fn add_menu<'a>(state: &'a State, browser_busy: bool) -> Element<'a, Message> {
                     "Claude"
                 },
                 if missing(Provider::Claude) {
-                    "CLI not found on PATH"
+                    state.provider_settings_status(Provider::Claude)
                 } else {
-                    "Sign in with a Claude subscription"
+                    "Sign in with a Claude subscription".into()
                 },
                 action(if missing(Provider::Claude) {
                     Action::Install(Provider::Claude)
@@ -660,12 +686,14 @@ fn add_menu<'a>(state: &'a State, browser_busy: bool) -> Element<'a, Message> {
                 } else {
                     "ChatGPT (Codex)"
                 },
-                if crate::device::is_remote() {
-                    "Sign in on another device with a one-time code"
+                if device.is_some() && missing(Provider::Codex) {
+                    state.provider_settings_status(Provider::Codex)
+                } else if device.is_some() {
+                    "Sign in on another device with a one-time code".into()
                 } else if browser_busy {
-                    "A browser sign-in is pending; finish it or use a code"
+                    "A browser sign-in is pending; finish it or use a code".into()
                 } else {
-                    "Sign in through your browser"
+                    "Sign in through your browser".into()
                 },
                 action(Action::Add {
                     provider: Provider::Codex,
@@ -684,29 +712,31 @@ fn add_menu<'a>(state: &'a State, browser_busy: bool) -> Element<'a, Message> {
             }))
             .into(),
         );
-        items.push(
-            crate::ui_controls::popover_item(
-                crate::ui_controls::provider_icon(Provider::Codex),
-                "ChatGPT (Codex) with a code",
-                "Sign in on another device with a one-time code",
-                action(if missing(Provider::Codex) {
-                    Action::Install(Provider::Codex)
-                } else {
-                    Action::Add {
-                        provider: Provider::Codex,
-                        device: true,
-                    }
-                }),
-            )
-            .into(),
-        );
+        if device.is_none() || !missing(Provider::Codex) {
+            items.push(
+                crate::ui_controls::popover_item(
+                    crate::ui_controls::provider_icon(Provider::Codex),
+                    "ChatGPT (Codex) with a code",
+                    "Sign in on another device with a one-time code",
+                    action(if missing(Provider::Codex) {
+                        Action::Install(Provider::Codex)
+                    } else {
+                        Action::Add {
+                            provider: Provider::Codex,
+                            device: true,
+                        }
+                    }),
+                )
+                .into(),
+            );
+        }
     }
     if claude {
         items.push(
             crate::ui_controls::popover_item(
                 crate::ui_controls::provider_icon(Provider::Claude),
                 "Existing Claude home",
-                "Use a Claude login and history already on this computer",
+                existing_home(Provider::Claude),
                 action(Action::LinkStart(Provider::Claude)),
             )
             .into(),
@@ -717,7 +747,7 @@ fn add_menu<'a>(state: &'a State, browser_busy: bool) -> Element<'a, Message> {
             crate::ui_controls::popover_item(
                 crate::ui_controls::provider_icon(Provider::Codex),
                 "Existing Codex home",
-                "Use a Codex login and history already on this computer",
+                existing_home(Provider::Codex),
                 action(Action::LinkStart(Provider::Codex)),
             )
             .into(),
@@ -748,9 +778,13 @@ fn add_menu<'a>(state: &'a State, browser_busy: bool) -> Element<'a, Message> {
 
 fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element<'a, Message> {
     let name = provider.label();
+    let title = match crate::device::selected() {
+        Some(device) => format!("Use an existing {name} home on {}", device.name),
+        None => format!("Use an existing {name} home"),
+    };
     widget::container(
         widget::column::with_children(vec![
-            design::heading(format!("Use an existing {name} home")).into(),
+            design::heading(title).into(),
             design::caption("Choose the provider's home directory. Its login and session history stay where they are; removing this link will leave its files untouched.")
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
@@ -853,10 +887,16 @@ fn group<'a>(
                 "{problem}, so the accounts {} keeps cannot be listed.",
                 probe::cli_name(provider)
             ),
-            None if missing => format!(
-                "{} CLI not found on PATH. Install it, then refresh Accounts.",
-                probe::cli_name(provider)
-            ),
+            None if missing => match crate::device::selected() {
+                Some(device) => format!(
+                    "{}. Install it there, then refresh Accounts.",
+                    super::missing_device_cli(provider, &device.name)
+                ),
+                None => format!(
+                    "{} CLI not found on PATH. Install it, then refresh Accounts.",
+                    probe::cli_name(provider)
+                ),
+            },
             None => format!(
                 "No {} account yet. {} signs in with its own login, in a terminal here.",
                 provider.label(),
