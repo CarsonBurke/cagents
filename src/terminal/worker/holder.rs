@@ -626,7 +626,7 @@ pub(super) fn attach(
         // recorded: a later one holding that pid pins as gone.
         #[cfg(target_os = "macos")]
         Some(record) => PinnedProcess::open_started(peer.pid, record.holder.start),
-        _ => pin_peer(&control, peer.pid),
+        _ => PinnedProcess::socket_peer(&control, peer.pid),
     }
     .map_err(failed)?;
     let mut holder = Holder::new(control, None);
@@ -1290,49 +1290,6 @@ impl HeldChild {
     pub(super) fn force_kill(&self) -> io::Result<()> {
         self.pin.signal(libc::SIGKILL).map(drop)
     }
-}
-
-/// A pin of the process at the other end of `socket`, whose pid is `pid`.
-/// The kernel names that very process where it can; otherwise the pid names
-/// it only while the holder lives, which it does until it has handed over.
-#[cfg(target_os = "linux")]
-fn pin_peer(socket: &UnixStream, pid: u32) -> io::Result<PinnedProcess> {
-    let mut fd: libc::c_int = -1;
-    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `fd` and `length` describe a live c_int buffer.
-    let result = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERPIDFD,
-            (&raw mut fd).cast(),
-            &mut length,
-        )
-    };
-    if result == 0 {
-        // SAFETY: a successful SO_PEERPIDFD returns a fresh owned descriptor.
-        return Ok(PinnedProcess::from_pidfd(pid, unsafe {
-            OwnedFd::from_raw_fd(fd)
-        }));
-    }
-    match io::Error::last_os_error() {
-        // Before Linux 6.5.
-        error if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {
-            PinnedProcess::open_unreaped(pid)
-        }
-        error => Err(error),
-    }
-}
-
-/// Darwin names only a candidate pid for the peer. Pinned without recorded
-/// evidence, it names the holder only once the holder answers through this
-/// socket, which no other process holds: a holder alive after the pin was
-/// alive when it was taken, so its pid had no successor yet. Until then the
-/// pin grants nothing, since a holder adopted without a handshake stays
-/// detached and is never signalled.
-#[cfg(target_os = "macos")]
-fn pin_peer(_socket: &UnixStream, pid: u32) -> io::Result<PinnedProcess> {
-    PinnedProcess::open_unreaped(pid)
 }
 
 /// Serves as a holder when this image was executed as one.

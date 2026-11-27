@@ -371,6 +371,20 @@ fn terminal(root: &Path, name: &str) -> TerminalSession {
     }
 }
 
+fn full_caller(root: &Path) -> TerminalSession {
+    let mut caller = terminal(root, "caller");
+    let executable = caller.launch.working_directory.join("claude");
+    fs::write(&executable, "#!/bin/sh\nexec cat\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    caller.launch.program = executable.to_str().unwrap().into();
+    caller.launch.arguments = vec!["--permission-mode".into(), "bypassPermissions".into()];
+    caller.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: caller.launch.clone(),
+        last_exit: None,
+    };
+    caller
+}
+
 fn adapter(
     server: &PrivateServer,
     session: TerminalSession,
@@ -470,7 +484,7 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
     };
     let mut server = PrivateServer::new(&root, true);
     let mut bootstrap = server.fixture_user();
-    let caller = terminal(&root, "caller");
+    let caller = full_caller(&root);
     bootstrap.spawn(caller.clone(), Default::default()).unwrap();
     let authority = server.issued_authority(caller.id);
     assert!(authority != Authority::default());
@@ -717,6 +731,77 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
     );
     handle.stop_for_test();
     drop(handle);
+    drop(bootstrap);
+    server.finish();
+}
+
+#[test]
+fn hosted_socket_peer_needs_session_authority_for_user_scoped_requests() {
+    use crate::agent_execution::Operation;
+    use crate::control::ControlError;
+
+    const SOCKET: &str = "CAGENTS_TEST_HOSTED_PEER_SOCKET";
+    let name = thread::current().name().unwrap().to_owned();
+    if let Some(socket) = std::env::var_os(SOCKET) {
+        let mut client = ControlClient::connect(Path::new(&socket)).unwrap();
+        client.list().unwrap();
+
+        let denied = |error| {
+            assert!(matches!(
+                error,
+                ControlError::Remote {
+                    code: ProtocolErrorCode::PermissionDenied,
+                    ..
+                }
+            ));
+        };
+        denied(client.authenticate(Authority::default()).unwrap_err());
+        denied(
+            client
+                .agent(Authority::default(), Operation::List)
+                .unwrap_err(),
+        );
+
+        let root = std::env::current_dir().unwrap();
+        let mut inert = terminal(&root, "inert");
+        inert.launch.program = "/bin/true".into();
+        inert.launch.arguments.clear();
+        inert.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: inert.launch.clone(),
+            last_exit: None,
+        };
+        denied(client.spawn(inert, Default::default()).unwrap_err());
+        fs::write(root.join("peer-checked"), b"ok").unwrap();
+        return;
+    }
+
+    let Some(root) = crate::host::exit_drain_tests::private_runtime_case(&name, None) else {
+        return;
+    };
+    let mut server = PrivateServer::new(&root, false);
+    let mut bootstrap = server.fixture_user();
+    let mut caller = terminal(&root, "hosted-peer");
+    caller.launch.program = std::env::current_exe().unwrap().to_str().unwrap().into();
+    caller.launch.arguments = vec!["--exact".into(), name, "--nocapture".into()];
+    caller
+        .launch
+        .environment
+        .insert(SOCKET.into(), server.socket.to_str().unwrap().into());
+    caller.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: caller.launch.clone(),
+        last_exit: None,
+    };
+    bootstrap.spawn(caller.clone(), Default::default()).unwrap();
+    let marker = caller.launch.working_directory.join("peer-checked");
+    wait_until("hosted peer finishes its admission assertions", || {
+        marker.exists()
+    });
+    assert_eq!(bootstrap.list().unwrap().len(), 1);
+    assert!(
+        bootstrap
+            .agent(Authority::default(), Operation::List)
+            .is_ok()
+    );
     drop(bootstrap);
     server.finish();
 }

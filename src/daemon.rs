@@ -15,6 +15,8 @@ pub use crate::pinned_process::{PeerCredentials, peer_credentials};
 pub mod codex_temp;
 pub mod holder_registry;
 pub(crate) mod hosting;
+#[cfg(feature = "host")]
+pub use hosting::peer_requires_session_authority;
 pub mod lease_handoff;
 #[cfg(feature = "host")]
 pub mod lost_processes;

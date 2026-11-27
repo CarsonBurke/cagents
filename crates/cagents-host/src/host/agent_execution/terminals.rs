@@ -1,16 +1,9 @@
 //! What a connection that authenticated as an agent session may do. It reads
 //! every terminal, but changes only those its lineage controls: its own
 //! session, the terminals it started and the sessions of the agents it
-//! delegated to. Typing into a delegated agent's session, an agent console or
-//! a provider CLI acts as the person at it, who can approve tool requests, so
-//! only an agent whose own approvals are not limited may do it. By the same
-//! rule it may move the panes of the sessions it controls into another
-//! channel of their project, making that channel for the move if it asks.
-//! Anything else outside the terminal surface stays with the user.
-//!
-//! The boundary is the `cagents` CLI, which authenticates before it changes a
-//! terminal from inside a hosted session. A process that reaches the socket
-//! without doing so acts for the user, as everywhere else.
+//! delegated to. Launching or sending input to a terminal grants access to
+//! execution outside the caller's provider controls, so it requires Full.
+//! Hosted peers must authenticate before doing anything that needs a caller.
 use super::registry;
 use crate::{
     agent_execution::{Authority, Lineage, Origin},
@@ -32,7 +25,9 @@ enum Access<'a> {
     /// reads, at the view revision it moves it at, with [`authorize_move`].
     Place,
     AccountReset,
-    /// Belongs to the user alone, or carries an authority of its own.
+    /// The service handler authenticates this request's own credential.
+    Scoped(&'a Authority),
+    /// Belongs to the user alone.
     Refused,
 }
 
@@ -87,9 +82,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::Input { terminal_id, .. }
         | R::Paste { terminal_id, .. }
         | R::Key { terminal_id, .. }
-        | R::Mouse { terminal_id, .. } => Access::Input(*terminal_id),
-        R::Focus { terminal_id, .. }
-        | R::Scroll { terminal_id, .. }
+        | R::Mouse { terminal_id, .. }
+        | R::Focus { terminal_id, .. } => Access::Input(*terminal_id),
+        R::Scroll { terminal_id, .. }
         | R::Resize { terminal_id, .. }
         | R::SetTheme { terminal_id, .. }
         | R::ClearTerminalScrollback { terminal_id }
@@ -103,13 +98,13 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::DeviceOperation {
             operation: crate::device_service::Operation::AccountReset { .. },
         } => Access::AccountReset,
+        R::Agent { authority, .. }
+        | R::Automation { authority, .. }
+        | R::SignDeviceChallenge { authority, .. } => Access::Scoped(authority),
         R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
         | R::DeviceTrust { .. }
-        | R::SignDeviceChallenge { .. }
-        | R::Agent { .. }
-        | R::Automation { .. }
         | R::Shutdown
         | R::ShutdownV1 { .. }
         | R::PrepareUpgrade { .. }
@@ -167,16 +162,19 @@ fn access(request: &ClientRequest) -> Access<'_> {
     }
 }
 
-/// Binds the lineage `authority` was issued to to the connection. Without a
-/// token the connection goes on acting for the user; a connection that acts
-/// for an agent never acts for anyone else.
+/// Binds the credential's lineage to the connection. A missing credential
+/// cannot change the connection's scope.
 pub(in crate::host) fn authenticate(
     host: &SharedHost,
     client_id: ClientId,
     authority: &Authority,
 ) -> Result<(), ProtocolError> {
     if authority.token().is_none() {
-        return Ok(());
+        let requires_authority = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .client_requires_session_authority(client_id);
+        return require_external_peer(requires_authority);
     }
     // A peer capability acts only on the connection whose proof it answered.
     if super::super::device_trust::is_peer_capability(authority)
@@ -213,7 +211,17 @@ pub(in crate::host) fn authenticate(
     }
 }
 
-/// Refuses what the agent session a connection acts for may not do.
+fn require_external_peer(requires_authority: bool) -> Result<(), ProtocolError> {
+    if requires_authority {
+        Err(denied(
+            "This connection requires its hosted session's authority",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Refuses requests outside the connection's authority.
 pub(in crate::host) fn admit(
     host: &SharedHost,
     client_id: ClientId,
@@ -221,29 +229,41 @@ pub(in crate::host) fn admit(
 ) -> Result<(), ProtocolError> {
     // A linked computer's connection whose capability lapsed or was revoked
     // is closing; until it has, it may do nothing, not even prove itself.
-    if host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .peers
-        .ended(client_id)
-    {
-        return Err(denied(super::super::device_trust::ended()));
-    }
+    let (lineage, requires_authority) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.peers.ended(client_id) {
+            return Err(denied(super::super::device_trust::ended()));
+        }
+        (
+            state.agent_clients.get(&client_id).copied(),
+            state.client_requires_session_authority(client_id),
+        )
+    };
     if carries_foreign_peer_capability(host, client_id, request) {
         return Err(denied(
             "A device capability acts only on the connection that proved it",
         ));
     }
-    let Some(lineage) = acting_for(host, client_id) else {
-        return Ok(());
+    let access = access(request);
+    let Some(lineage) = lineage else {
+        return match access {
+            Access::Open => Ok(()),
+            Access::Scoped(authority) if authority.token().is_some() => Ok(()),
+            _ => require_external_peer(requires_authority),
+        };
     };
-    match access(request) {
+    match access {
         Access::Open => Ok(()),
-        Access::Refused if own_peer_request(host, client_id, request) => Ok(()),
-        Access::Refused => Err(denied(
+        Access::Scoped(_) if own_peer_request(host, client_id, request) => Ok(()),
+        Access::Scoped(_) | Access::Refused => Err(denied(
             "An agent session's connection may only read terminals and change its own",
         )),
-        Access::Spawn(session) => fresh(host, session),
+        Access::Spawn(session) => {
+            fresh(host, session)?;
+            require_full_terminal_access(host, client_id, || {
+                "This agent can't start a terminal because its approvals are limited. Use `cagents agent spawn` for a task within its permission mode.".into()
+            })
+        }
         Access::Place | Access::AccountReset => Ok(()),
         Access::Control(terminal) | Access::Input(terminal) => {
             let control = controls(host, lineage, terminal).map_err(internal)?;
@@ -252,7 +272,7 @@ pub(in crate::host) fn admit(
                     "Terminal {terminal} belongs to another session; message it with `cagents send` instead"
                 )));
             };
-            match access(request) {
+            match access {
                 Access::Input(terminal) => typing_into(host, client_id, terminal, control),
                 _ => Ok(()),
             }
@@ -285,67 +305,68 @@ pub(in crate::host) fn reset_actor(
     }))
 }
 
-/// Refuses input from an agent whose own approvals are limited into a
-/// terminal that reads it as its person's, where whatever it types, such as
-/// an `/answer` or a key approving a tool request, could approve work the
-/// agent may not approve itself: a delegated agent's session or console, any
-/// agent's console, or a provider CLI's terminal, its own included.
+/// A terminal can execute any program it receives from a launch or from
+/// input. Use the caller's current ceiling for both, including plain shells.
+fn require_full_terminal_access(
+    host: &SharedHost,
+    client_id: ClientId,
+    refusal: impl FnOnce() -> String,
+) -> Result<(), ProtocolError> {
+    let authority = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_client_authorities
+        .get(&client_id)
+        .cloned()
+        .ok_or_else(|| denied("This connection's agent authority is no longer recorded"))?;
+    super::caller(host, &authority).map_err(denied)?;
+    if super::caller_ceiling(host, &authority)
+        .map_err(denied)?
+        .is_some_and(|ceiling| ceiling.may_approve())
+    {
+        Ok(())
+    } else {
+        Err(denied(refusal()))
+    }
+}
+
 fn typing_into(
     host: &SharedHost,
     client_id: ClientId,
     terminal: TerminalId,
     control: Control,
 ) -> Result<(), ProtocolError> {
-    // What it types there, and what it may do instead.
-    let (target, instead) = match control {
-        Control::Delegated { agent, console } => {
-            let name = agent
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("agent {}", agent.id));
-            let surface = if console { "console" } else { "session" };
-            (
-                format!("{name}'s {surface}"),
-                "Use `cagents agent message` instead.",
-            )
-        }
-        Control::Own => {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(launch) = state
-                .terminals
-                .get(&terminal)
-                .map(|record| record.execution_launch())
-            else {
-                return Ok(());
-            };
-            let target = if crate::agent_execution::console_agent(launch).is_some() {
-                "its own console".to_owned()
-            } else if let Some((provider, _)) = crate::agent::Provider::launched(launch) {
-                format!("{}'s terminal {terminal}", provider.label())
-            } else {
-                return Ok(());
-            };
-            (target, "A person can type there in cagents.")
-        }
-    };
-    let authority = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .agent_client_authorities
-        .get(&client_id)
-        .cloned();
-    // A connection acting for an agent without its authority recorded counts
-    // as limited, never as a person.
-    let ceiling = match authority {
-        Some(authority) => super::caller_ceiling(host, &authority).map_err(denied)?,
-        None => Some(crate::agent_execution::permission::Ceiling::unknown()),
-    };
-    if ceiling.as_ref().is_none_or(|ceiling| ceiling.may_approve()) {
-        return Ok(());
-    }
-    Err(denied(format!(
-        "This agent can't type into {target} because its approvals are limited. {instead}"
-    )))
+    require_full_terminal_access(host, client_id, || {
+        let (target, instead) = match control {
+            Control::Delegated { agent, console } => {
+                let name = agent.name.unwrap_or_else(|| format!("agent {}", agent.id));
+                let surface = if console { "console" } else { "session" };
+                (
+                    format!("{name}'s {surface}"),
+                    "Use `cagents agent message` instead.",
+                )
+            }
+            Control::Own => {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let target = state
+                    .terminals
+                    .get(&terminal)
+                    .map(|record| record.execution_launch())
+                    .and_then(|launch| {
+                        if crate::agent_execution::console_agent(launch).is_some() {
+                            Some("its own console".to_owned())
+                        } else {
+                            crate::agent::Provider::launched(launch).map(|(provider, _)| {
+                                format!("{}'s terminal {terminal}", provider.label())
+                            })
+                        }
+                    })
+                    .unwrap_or_else(|| format!("terminal {terminal}"));
+                (target, "A person can type there in cagents.")
+            }
+        };
+        format!("This agent can't type into {target} because its approvals are limited. {instead}")
+    })
 }
 
 /// Records that the agent session a connection acts for starts `terminal`,

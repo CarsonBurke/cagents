@@ -139,16 +139,6 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     serve_with(stream, client_id, host, process_wire_request);
 }
 
-/// The connecting process, when it runs as this account. On Darwin the pid
-/// names the last process to use the client's socket, which for a client
-/// that connected itself is the client; see `daemon::peer_credentials`.
-fn peer_pid(stream: &UnixStream) -> Option<u32> {
-    crate::daemon::peer_credentials(stream)
-        .ok()
-        .filter(|peer| peer.uid == crate::daemon::current_uid() && peer.pid > 0)
-        .map(|peer| peer.pid)
-}
-
 /// Lifecycle parks without a timer, so a request that removes a retention
 /// exclusion (final Detach, handoff commit, failed startup, unpinned pane) must
 /// wake it. Only terminal data and read traffic is exempt: a request missing
@@ -209,12 +199,6 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
     handle: RequestHandler<R>,
 ) {
     let registration = Registration::new(Arc::clone(&host), client_id);
-    let peer = peer_pid(&stream);
-    if let Some(pid) = peer {
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record_client_pid(client_id, pid);
-    }
     let delivery = Arc::clone(&registration.delivery);
     let Ok(writer_stream) = stream.try_clone() else {
         return;
@@ -260,7 +244,19 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
             break;
         };
         if protocol.is_none() {
-            older = older_client(envelope.version).filter(|_| peer.is_some_and(peer_runs_cli));
+            // After the first frame, Darwin's peer PID names the process that
+            // actually used the socket. Keep the connection's restriction
+            // through every subsequent request, even if its peer reparents.
+            let peer = crate::daemon::peer_credentials(&reader)
+                .ok()
+                .filter(|peer| peer.uid == crate::daemon::current_uid() && peer.pid > 0);
+            let requires_session_authority = peer
+                .is_none_or(|peer| crate::daemon::peer_requires_session_authority(&reader, peer));
+            let pid = peer.map(|peer| peer.pid);
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_client_peer(client_id, pid, requires_session_authority);
+            older = older_client(envelope.version).filter(|_| pid.is_some_and(peer_runs_cli));
             if let Some(client) = older {
                 delivery.speak_older(client);
             }
