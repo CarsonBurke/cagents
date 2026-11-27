@@ -6,7 +6,7 @@ use crate::model::HostSessionProof;
 #[cfg(feature = "host")]
 use crate::terminal_ipc::StartupState;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Intent {
     job: String,
@@ -20,13 +20,29 @@ struct Intent {
     process: crate::daemon::holder_registry::Process,
     windows: Vec<String>,
     stage: Stage,
+    #[serde(default, skip_serializing_if = "WitnessLocation::is_legacy")]
+    witness: WitnessLocation,
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Stage {
     Pending,
     Deferred,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WitnessLocation {
+    #[default]
+    Legacy,
+    Attempt,
+}
+
+impl WitnessLocation {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
 }
 
 #[cfg(feature = "host")]
@@ -91,7 +107,6 @@ pub struct LiveInventory {
     >,
 }
 
-#[cfg(feature = "host")]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OriginalInventory {
@@ -99,7 +114,6 @@ struct OriginalInventory {
     chats: Vec<crate::chat::Session>,
 }
 
-#[cfg(feature = "host")]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Witness {
@@ -109,12 +123,7 @@ struct Witness {
     inventory: OriginalInventory,
 }
 
-#[cfg(feature = "host")]
 const INVENTORY_LIMIT: u64 = crate::upgrade::recovery::STANDBY_RECEIPT_LIMIT as u64;
-
-fn inventory_path(state: &Path, job: &str) -> PathBuf {
-    state.join(format!("{job}.cutover-inventory.json"))
-}
 
 #[cfg(any(feature = "host", target_os = "macos", test))]
 pub(super) fn persist(
@@ -156,14 +165,6 @@ pub(crate) fn persist_ready_evidence(path: &Path, bytes: &[u8]) -> Result<(), Up
     persist(state, path, bytes, true)
 }
 
-fn has_witness(state: &Path, job: &str) -> Result<bool, UpdateError> {
-    match fs::symlink_metadata(inventory_path(state, job)) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.cutover.json"))
 }
@@ -195,6 +196,31 @@ fn read(state: &Path, job: &str) -> Result<Option<Intent>, UpdateError> {
 }
 
 impl Intent {
+    fn pending_digest(&self) -> Result<String, UpdateError> {
+        let mut pending = self.clone();
+        pending.stage = Stage::Pending;
+        hashed_json(&pending)
+    }
+
+    fn witness_path(&self, state: &Path) -> Result<PathBuf, UpdateError> {
+        let job = &self.job;
+        Ok(match self.witness {
+            WitnessLocation::Legacy => state.join(format!("{job}.cutover-inventory.json")),
+            WitnessLocation::Attempt => {
+                let digest = self.pending_digest()?;
+                state.join(format!("{job}.cutover-inventory.{digest}.json"))
+            }
+        })
+    }
+
+    fn witness_present(&self, state: &Path) -> Result<bool, UpdateError> {
+        match fs::symlink_metadata(self.witness_path(state)?) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn validate(&self) -> Result<(), UpdateError> {
         let hash = |text: &str| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit());
         if uuid::Uuid::parse_str(&self.job).is_err()
@@ -299,19 +325,10 @@ impl Intent {
     #[cfg(feature = "host")]
     fn verify_resumed_inventory(
         &self,
-        state: &Path,
+        saved: OriginalInventory,
         serving: &HostSessionProof,
         mut inventory: LiveInventory,
     ) -> Result<(), UpdateError> {
-        let bytes = read_private(&inventory_path(state, &self.job), INVENTORY_LIMIT)?;
-        let witness: Witness = serde_json::from_slice(&bytes)?;
-        if witness.version != 1
-            || witness.intent_digest != self.digest()?
-            || witness.inventory_digest != hashed_json(&witness.inventory)?
-        {
-            return Err(invalid("The original cutover inventory changed"));
-        }
-        let saved = witness.inventory;
         let store = crate::upgrade::handoff::Store::discover().map_err(invalid)?;
         let mut lineage = store.recovered_chats().map_err(invalid)?;
         let mut terminals = inventory.terminals;
@@ -346,7 +363,7 @@ impl Intent {
         .map_err(invalid)
     }
 
-    #[cfg(feature = "host")]
+    #[cfg(any(feature = "host", test))]
     fn persist(&self, state: &Path) -> Result<(), UpdateError> {
         persist(
             state,
@@ -356,13 +373,70 @@ impl Intent {
         )
     }
 
-    #[cfg(feature = "host")]
-    fn digest(&self) -> Result<String, UpdateError> {
-        hashed_json(self)
+    fn read_witness(&self, state: &Path) -> Result<OriginalInventory, UpdateError> {
+        let bytes = read_private(&self.witness_path(state)?, INVENTORY_LIMIT)?;
+        let witness: Witness = serde_json::from_slice(&bytes)?;
+        if witness.version != 1
+            || witness.intent_digest != self.pending_digest()?
+            || witness.inventory_digest != hashed_json(&witness.inventory)?
+        {
+            return Err(invalid("The original cutover inventory changed"));
+        }
+        Ok(witness.inventory)
+    }
+
+    #[cfg(any(feature = "host", test))]
+    fn publish_with_witness(
+        mut self,
+        state: &Path,
+        inventory: OriginalInventory,
+    ) -> Result<(), UpdateError> {
+        let recorded = read(state, &self.job)?;
+        if let Some(recorded) = &recorded {
+            self.witness = recorded.witness;
+            if self.pending_digest()? != recorded.pending_digest()? {
+                return Err(invalid("An exact cutover intent is already recorded"));
+            }
+        }
+        let witness = self.encode_witness(inventory)?;
+        let witness_path = self.witness_path(state)?;
+        if self.witness_present(state)? {
+            if read_private(&witness_path, INVENTORY_LIMIT)? != witness {
+                return Err(invalid("An exact cutover inventory is already recorded"));
+            }
+        } else {
+            persist(state, &witness_path, &witness, true)?;
+        }
+        if recorded.is_none() {
+            // The intent is the reference to a complete immutable witness.
+            // A crash before publishing it leaves no reference to this attempt.
+            persist(
+                state,
+                &path(state, &self.job),
+                &serde_json::to_vec(&self)?,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "host", test))]
+    fn encode_witness(&self, inventory: OriginalInventory) -> Result<Vec<u8>, UpdateError> {
+        let bytes = serde_json::to_vec(&Witness {
+            version: 1,
+            intent_digest: self.pending_digest()?,
+            inventory_digest: hashed_json(&inventory)?,
+            inventory,
+        })?;
+        if bytes.len() as u64 > INVENTORY_LIMIT {
+            return Err(invalid(
+                "The original cutover inventory exceeds the evidence limit",
+            ));
+        }
+        Ok(bytes)
     }
 }
 
-#[cfg(feature = "host")]
 fn hashed_json(value: &impl Serialize) -> Result<String, UpdateError> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
@@ -407,6 +481,7 @@ pub(crate) fn record(
         process: crate::daemon::holder_registry::Process::read(std::process::id() as i32)?,
         windows: windows.to_vec(),
         stage: Stage::Pending,
+        witness: WitnessLocation::Attempt,
     };
     intent.validate()?;
     intent.verify_request(&state)?;
@@ -414,26 +489,7 @@ pub(crate) fn record(
         terminals: original.inventory.terminals.clone(),
         chats: original.inventory.chats.clone(),
     };
-    let witness = serde_json::to_vec(&Witness {
-        version: 1,
-        intent_digest: intent.digest()?,
-        inventory_digest: hashed_json(&inventory)?,
-        inventory,
-    })?;
-    if witness.len() as u64 > INVENTORY_LIMIT {
-        return Err(invalid(
-            "The original cutover inventory exceeds the evidence limit",
-        ));
-    }
-    let witness_path = inventory_path(&state, job);
-    if has_witness(&state, job)? {
-        if read_private(&witness_path, INVENTORY_LIMIT)? != witness {
-            return Err(invalid("An exact cutover inventory is already recorded"));
-        }
-    } else {
-        persist(&state, &witness_path, &witness, true)?;
-    }
-    intent.persist(&state)
+    intent.publish_with_witness(&state, inventory)
 }
 
 pub(super) fn recorded_selection(
@@ -444,7 +500,11 @@ pub(super) fn recorded_selection(
     let Some(intent) = read(state, &job.id)? else {
         return Ok(None);
     };
-    Ok((intent.names_selected(layout)? && has_witness(state, &job.id)?).then_some(intent.stage))
+    if !intent.names_selected(layout)? || !intent.witness_present(state)? {
+        return Ok(None);
+    }
+    intent.read_witness(state)?;
+    Ok(Some(intent.stage))
 }
 
 /// An unrelated job must not replace the unfinished status between the
@@ -470,7 +530,7 @@ pub(super) fn pending_selected(
     }
     // Keep a recoverable job reserved until another exact selected daemon
     // can finish it, even if the first successor no longer exists.
-    if has_witness(state, &job.id)? {
+    if intent.witness_present(state)? {
         return Ok(true);
     }
     intent.original_alive()
@@ -500,12 +560,13 @@ pub(super) fn finish(
         return Ok(None);
     }
     let reentered = &intent.successor != successor;
-    if reentered && (!has_witness(state, &job.id)? || !intent.original_exited()?) {
+    if reentered && (!intent.witness_present(state)? || !intent.original_exited()?) {
         return Ok(None);
     }
     if !reentered && intent.process.pid != std::process::id() as i32 {
         return Ok(None);
     }
+    let saved = intent.read_witness(state)?;
     let finished = (|| {
         intent.verify_request(state)?;
         let mut client = intent.verify_serving(layout, successor)?;
@@ -525,7 +586,7 @@ pub(super) fn finish(
                 ));
             }
             let generation = client.inventory_generation()?;
-            intent.verify_resumed_inventory(state, successor, observe_live())?;
+            intent.verify_resumed_inventory(saved, successor, observe_live())?;
             if client.inventory_generation()? != generation {
                 return Err(invalid(
                     "The running work changed during update verification",
@@ -584,6 +645,13 @@ fn finish_windows(
 mod tests {
     use super::*;
 
+    fn empty_inventory() -> OriginalInventory {
+        OriginalInventory {
+            terminals: Vec::new(),
+            chats: Vec::new(),
+        }
+    }
+
     fn intent() -> Intent {
         let source = HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("original-ready"),
@@ -605,6 +673,7 @@ mod tests {
             process: crate::daemon::holder_registry::Process { pid: 42, start: 17 },
             windows: vec!["main".into()],
             stage: Stage::Pending,
+            witness: WitnessLocation::Legacy,
         }
     }
 
@@ -621,6 +690,101 @@ mod tests {
         assert!(intent.validate().is_err());
         intent.successor.boot_id = crate::model::BootId::new("another-boot");
         assert!(intent.validate().is_err());
+    }
+
+    #[test]
+    fn an_unreferenced_witness_never_blocks_another_authorized_attempt() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let mut first = intent();
+        first.witness = WitnessLocation::Attempt;
+        let unreferenced = first.witness_path(state).unwrap();
+        let first_witness = first.encode_witness(empty_inventory()).unwrap();
+        persist(state, &unreferenced, &first_witness, true).unwrap();
+        assert!(read(state, &first.job).unwrap().is_none());
+
+        let mut next = first.clone();
+        next.successor.host_incarnation = crate::model::HostIncarnation::new("next");
+        next.process.start += 1;
+        let path = next.witness_path(state).unwrap();
+        assert_ne!(unreferenced, path);
+        assert!(!next.witness_present(state).unwrap());
+        next.clone()
+            .publish_with_witness(state, empty_inventory())
+            .unwrap();
+        let recorded = read(state, &next.job).unwrap().unwrap();
+        assert_eq!(recorded.witness_path(state).unwrap(), path);
+        recorded.read_witness(state).unwrap();
+        assert_eq!(fs::read(&unreferenced).unwrap(), first_witness);
+
+        let third = first.clone();
+        assert!(
+            third
+                .publish_with_witness(state, empty_inventory())
+                .is_err()
+        );
+        assert_eq!(
+            read(state, &next.job)
+                .unwrap()
+                .unwrap()
+                .witness_path(state)
+                .unwrap(),
+            path
+        );
+    }
+
+    #[test]
+    fn a_legacy_witness_authenticates_both_stages_and_publication_keeps_the_latest() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let mut legacy = intent();
+        let original = serde_json::to_vec(&legacy).unwrap();
+        assert!(
+            !serde_json::from_slice::<serde_json::Value>(&original)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("witness")
+        );
+        let witness = legacy.witness_path(state).unwrap();
+        assert_eq!(
+            witness.file_name().unwrap().to_str().unwrap(),
+            format!("{}.cutover-inventory.json", legacy.job)
+        );
+        let inventory = empty_inventory();
+        let bytes = serde_json::to_vec(&Witness {
+            version: 1,
+            intent_digest: format!("{:x}", Sha256::digest(&original)),
+            inventory_digest: hashed_json(&inventory).unwrap(),
+            inventory,
+        })
+        .unwrap();
+        persist(state, &witness, &bytes, true).unwrap();
+        persist(state, &path(state, &legacy.job), &original, true).unwrap();
+        read(state, &legacy.job)
+            .unwrap()
+            .unwrap()
+            .read_witness(state)
+            .unwrap();
+
+        legacy.stage = Stage::Deferred;
+        legacy.persist(state).unwrap();
+        let mut repeated = legacy.clone();
+        repeated.stage = Stage::Pending;
+        repeated.witness = WitnessLocation::Attempt;
+        repeated
+            .publish_with_witness(state, empty_inventory())
+            .unwrap();
+        let latest = read(state, &legacy.job).unwrap().unwrap();
+        assert!(latest.stage == Stage::Deferred);
+        assert_eq!(latest.witness_path(state).unwrap(), witness);
+        latest.read_witness(state).unwrap();
+        assert_eq!(fs::read(&witness).unwrap(), bytes);
+
+        let mut changed: Witness = serde_json::from_slice(&bytes).unwrap();
+        changed.inventory_digest = "0".repeat(64);
+        fs::write(&witness, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(latest.read_witness(state).is_err());
     }
 
     #[test]
@@ -643,6 +807,7 @@ mod tests {
         let layout = locate(&version_root.join("bin/cagentsd")).unwrap();
         let state = state_dir(&prefix).unwrap();
         let mut intent = intent();
+        intent.witness = WitnessLocation::Attempt;
         intent.target = version_root.join("bin/cagentsd");
         let daemon = fs::metadata(&intent.target).unwrap();
         intent.target_image = (daemon.dev(), daemon.ino());
@@ -677,7 +842,16 @@ mod tests {
         intent.process.start += 1;
         save(&intent);
         assert!(!pending_selected(&layout, &state, &job).unwrap());
-        private_create(&inventory_path(&state, &job.id)).unwrap();
+        assert!(recorded_selection(&layout, &state, &job).unwrap().is_none());
+        let witness = intent.witness_path(&state).unwrap();
+        private_create(&witness).unwrap();
         assert!(pending_selected(&layout, &state, &job).unwrap());
+        assert!(recorded_selection(&layout, &state, &job).is_err());
+        let bytes = intent.encode_witness(empty_inventory()).unwrap();
+        fs::write(&witness, bytes).unwrap();
+        assert!(matches!(
+            recorded_selection(&layout, &state, &job).unwrap(),
+            Some(Stage::Pending)
+        ));
     }
 }
