@@ -283,6 +283,11 @@ impl Cagents {
         Some(Task::none())
     }
     pub(super) fn daemon_health_banner(&self) -> Element<'_, Message> {
+        // A device that speaks another protocol says which side to update,
+        // and offers to, in place of the protocol numbers.
+        if let Some(banner) = self.device_update_banner() {
+            return banner;
+        }
         let Some(detail) = health_detail(&self.daemon_health_ui.health) else {
             return iced::widget::Space::new().height(Length::Shrink).into();
         };

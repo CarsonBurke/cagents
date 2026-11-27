@@ -263,9 +263,25 @@ pub enum Action {
     Device(usize),
     OpenDeviceWindow(usize),
     DeviceOpened {
-        result: Result<(), String>,
+        device: String,
+        result: Result<(), OpenFailure>,
         replace: bool,
     },
+}
+
+/// Where the installer links the CLI on a device, read by the device's own
+/// shell. SSH commands often run without the PATH a login shell has, so a
+/// bare `cagents` can miss it.
+const DEFAULT_EXECUTABLE: &str = "~/.local/bin/cagents";
+
+/// Why a device window did not open.
+#[derive(Debug, Clone)]
+pub enum OpenFailure {
+    /// It has a cagents of this protocol, not this computer's.
+    Incompatible(u16),
+    /// It has no cagents.
+    Missing,
+    Other(String),
 }
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -332,7 +348,7 @@ impl Default for State {
             configure: false,
             config_name: String::new(),
             config_host: String::new(),
-            config_executable: "cagents".into(),
+            config_executable: DEFAULT_EXECUTABLE.into(),
             path: String::new(),
             directory: PathBuf::new(),
             entries: Vec::new(),
@@ -688,7 +704,7 @@ impl Cagents {
                 self.device_ui.notice = None;
                 self.device_ui.config_name.clear();
                 self.device_ui.config_host.clear();
-                self.device_ui.config_executable = "cagents".into();
+                self.device_ui.config_executable = DEFAULT_EXECUTABLE.into();
                 return Task::none();
             }
             Action::ConfigName(value) => {
@@ -754,12 +770,32 @@ impl Cagents {
                 }
                 return Task::none();
             }
-            Action::DeviceOpened { result, replace } => {
+            Action::DeviceOpened {
+                device,
+                result,
+                replace,
+            } => {
                 self.device_ui.busy = false;
                 match result {
                     Ok(()) if replace => return self.exit_after_language_servers(),
                     Ok(()) => {}
-                    Err(error) => self.status = Some(TransientNotice::warning(error)),
+                    Err(OpenFailure::Incompatible(actual)) => {
+                        return self.update_device_update(device_update_ui::Action::Offer {
+                            device,
+                            actual: Some(actual),
+                            replace,
+                        });
+                    }
+                    Err(OpenFailure::Missing) => {
+                        return self.update_device_update(device_update_ui::Action::Offer {
+                            device,
+                            actual: None,
+                            replace,
+                        });
+                    }
+                    Err(OpenFailure::Other(error)) => {
+                        self.status = Some(TransientNotice::warning(error))
+                    }
                 }
                 return Task::none();
             }
@@ -791,16 +827,18 @@ impl Cagents {
                 }
                 self.persist();
                 self.device_ui.busy = true;
+                let device = name.clone();
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            let executable = crate::companion::Product::Cli.beside_current().map_err(|error| error.to_string())?;
-                            let status = std::process::Command::new(executable).args(["--device", &name, "ui", "--new-window"]).args(source.as_ref().map(|source| ["--source", source.as_str()]).into_iter().flatten()).status().map_err(|error| error.to_string())?;
-                            if status.success() { Ok(()) } else { Err(format!("Could not connect to {name}. Check its SSH connection and cagents daemon.")) }
-                        }).await.unwrap_or_else(|error| Err(error.to_string()))
+                            open_device_window(&name, source.as_deref())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(OpenFailure::Other(error.to_string())))
                     },
                     move |result| {
                         cosmic::Action::App(Message::Device(Action::DeviceOpened {
+                            device: device.clone(),
                             result,
                             replace,
                         }))
@@ -1346,7 +1384,7 @@ impl Cagents {
         if state.configure {
             let mut rows = vec![
                 design::title("Connect to a device").into(),
-                design::body("Use an SSH host alias already configured on this computer. Install matching cagents and cagentsd on the device.").into(),
+                design::body("Use an SSH host alias already configured on this computer. If the device doesn't have this computer's cagents, connecting offers to install or update it there.").into(),
                 crate::ui_controls::field::text("Device name", &state.config_name)
                     .on_input(|value| Message::Device(Action::ConfigName(value)))
                     .into(),
@@ -1777,6 +1815,50 @@ impl State {
     }
 }
 
+/// Opens a window on `name` through the CLI. When that fails, asks whether
+/// the reason is one the person can fix from here: another cagents version
+/// on the device, or none.
+fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailure> {
+    let executable = crate::companion::Product::Cli
+        .beside_current()
+        .map_err(|error| OpenFailure::Other(error.to_string()))?;
+    let status = std::process::Command::new(&executable)
+        .args(["--device", name, "ui", "--new-window"])
+        .args(
+            source
+                .map(|source| ["--source", source])
+                .into_iter()
+                .flatten(),
+        )
+        .status()
+        .map_err(|error| OpenFailure::Other(error.to_string()))?;
+    if status.success() {
+        return Ok(());
+    }
+    let json = |arguments: &[&str]| {
+        std::process::Command::new(&executable)
+            .arg("--json")
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    // The update's own inspection knows a missing install too. A development
+    // build has no installed tree to inspect from, so it refuses at once, and
+    // the device's daemon status still tells a protocol mismatch.
+    let reason =
+        device_update_ui::checked(&json(&["device", "update", name, "--check"])).or_else(|| {
+            device_update_ui::mismatch(&json(&["--device", name, "daemon", "status"]))
+                .map(OpenFailure::Incompatible)
+        });
+    Err(reason.unwrap_or_else(|| {
+        OpenFailure::Other(format!(
+            "Could not connect to {name}. Check its SSH connection and cagents daemon."
+        ))
+    }))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

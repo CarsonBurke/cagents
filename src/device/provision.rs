@@ -24,7 +24,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::{Device, control_path, quote, ssh};
+use super::{Device, control_path, quote, remote_executable, ssh};
 use crate::terminal_ipc::PROTOCOL_VERSION;
 
 /// The installer of this very build, which knows its own archive layout.
@@ -86,6 +86,44 @@ enum Daemon {
     Unknown(String),
 }
 
+/// What [`update`] would do, found the same way and without changing the
+/// device.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Check {
+    Compatible,
+    /// It has an older cagents; its daemon, if it answered, speaks `protocol`.
+    Update {
+        protocol: Option<u16>,
+    },
+    /// It has no cagents.
+    Install,
+    /// It has a newer cagents, which is never replaced.
+    Newer {
+        protocol: u16,
+    },
+}
+
+/// Like [`update`], `device` must be the selected device.
+pub fn check(device: &Device) -> io::Result<Check> {
+    let local = Local::current()?;
+    let session = Session::open(device)?;
+    let remote = Remote::probe(&session, device, &local.version)?;
+    let daemon = daemon_state();
+    if let Some(protocol) = newer(&remote, &daemon) {
+        return Ok(Check::Newer { protocol });
+    }
+    Ok(match plan(device, &local, &remote, &daemon)?.action {
+        Action::Nothing => Check::Compatible,
+        Action::Install { upgrade: false, .. } => Check::Install,
+        Action::Install { .. } | Action::Upgrade { .. } => Check::Update {
+            protocol: match daemon {
+                Daemon::Speaks(protocol) => Some(protocol),
+                _ => remote.protocol,
+            },
+        },
+    })
+}
+
 /// Brings `device` to the build this executable belongs to. `device` must be
 /// the selected device ([`super::select`]).
 pub fn update(
@@ -93,16 +131,6 @@ pub fn update(
     options: Options,
     progress: &mut dyn FnMut(Step),
 ) -> io::Result<Outcome> {
-    if !cfg!(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "gnu"
-    )) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Updating a device is supported from Linux x86_64 installations",
-        ));
-    }
     let local = Local::current()?;
     progress(Step::Inspecting);
     let session = Session::open(device)?;
@@ -171,6 +199,16 @@ struct Local {
 
 impl Local {
     fn current() -> io::Result<Self> {
+        if !cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu"
+        )) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Updating a device is supported from Linux x86_64 installations",
+            ));
+        }
         let executable = crate::process::current_executable()?;
         let layout = crate::update::locate(&executable).map_err(|_| {
             io::Error::new(
@@ -335,7 +373,7 @@ impl Remote {
     fn probe(session: &Session, device: &Device, wanted: &str) -> io::Result<Self> {
         let script = format!(
             "exe={}\nwanted={}\nmarker={STAGED_MARKER}\n{PROBE}",
-            quote(&device.executable),
+            remote_executable(&device.executable),
             quote(wanted)
         );
         let output = session.script(&script)?;
@@ -464,19 +502,7 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
         }
         _ => {}
     }
-    // The daemon or the installed CLI, whichever is newer: a stopped daemon
-    // or a deferred install must not hide a newer build.
-    let newest = [
-        match daemon {
-            Daemon::Speaks(actual) => Some(*actual),
-            _ => None,
-        },
-        remote.protocol,
-    ]
-    .into_iter()
-    .flatten()
-    .max();
-    if let Some(actual) = newest.filter(|actual| *actual > PROTOCOL_VERSION) {
+    if let Some(actual) = newer(remote, daemon) {
         return refuse(format!(
             "{name} has a newer cagents (protocol {actual}) than this computer (protocol {PROTOCOL_VERSION}). A device is never downgraded; update cagents on this computer, then connect again."
         ));
@@ -512,7 +538,7 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
                 prefix: remote.default_prefix.clone(),
                 upgrade: false,
             },
-            note: (device.executable != installed_link)
+            note: (!leads_to(device, &installed_link))
                 .then(|| unreachable_note(device, &installed_link)),
         });
     };
@@ -548,6 +574,12 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
     })
 }
 
+/// Whether the device's configured executable is the installer's link,
+/// written out or as `~/.local/bin/cagents`.
+fn leads_to(device: &Device, installed_link: &str) -> bool {
+    device.executable == installed_link || device.executable == "~/.local/bin/cagents"
+}
+
 /// What to do when the device's configured executable does not lead to the
 /// CLI this command installs or found.
 fn unreachable_note(device: &Device, installed: &str) -> String {
@@ -562,6 +594,23 @@ fn unreachable_note(device: &Device, installed: &str) -> String {
             device.executable
         )
     }
+}
+
+/// The device's protocol when its daemon or its installed CLI, whichever is
+/// newer, is newer than this computer's: a stopped daemon or a deferred
+/// install must not hide a newer build.
+fn newer(remote: &Remote, daemon: &Daemon) -> Option<u16> {
+    [
+        match daemon {
+            Daemon::Speaks(actual) => Some(*actual),
+            _ => None,
+        },
+        remote.protocol,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .filter(|actual| *actual > PROTOCOL_VERSION)
 }
 
 fn daemon_state() -> Daemon {

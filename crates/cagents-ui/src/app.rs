@@ -16,6 +16,7 @@ mod daemon_health_ui;
 mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
+mod device_update_ui;
 pub(crate) mod dialog_ui;
 #[cfg(test)]
 mod dispatch_tests;
@@ -5003,6 +5004,7 @@ fn grouped_digits(value: usize) -> String {
 #[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
+    DeviceUpdate(device_update_ui::Action),
     Phone(phone_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -6008,6 +6010,7 @@ struct HoverFocus {
 pub struct Cagents {
     startup_gate: startup_gate::State,
     device_ui: device_ui::State,
+    device_update_ui: device_update_ui::State,
     phone_ui: phone_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
@@ -17097,6 +17100,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
+            device_update_ui: device_update_ui::State::default(),
             phone_ui: phone_ui::State::default(),
             account_ui: account_ui::State::installation().into(),
             sign_ins: account_ui::SignIns::default(),
@@ -18525,6 +18529,7 @@ impl Cagents {
             Message::TerminalSave(action) => self.update_terminal_save(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
+            Message::DeviceUpdate(action) => self.update_device_update(action),
             Message::Phone(action) => self.update_phone(action),
             Message::Palette(action) => {
                 // Typing a query narrows the palette's own list, which only

@@ -4384,14 +4384,29 @@ where
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
         }
+        // A mismatch names both protocols, so a caller can tell which side
+        // to update without reading the sentence.
+        let details = crate::device::incompatible(&error).map(|mismatch| {
+            json!({
+                "device": mismatch.device,
+                "protocol": mismatch.actual,
+                "expected": crate::terminal_ipc::PROTOCOL_VERSION,
+            })
+        });
         let kind = if error.kind() == io::ErrorKind::PermissionDenied {
             "permission_denied"
-        } else if crate::device::incompatible(&error).is_some() {
+        } else if details.is_some() {
             "device_incompatible"
         } else {
             "device"
         };
-        emit_error(cli.global.json, &AppError::new(kind, error));
+        emit_error(
+            cli.global.json,
+            &AppError {
+                details,
+                ..AppError::new(kind, error)
+            },
+        );
         return ExitCode::FAILURE;
     }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {

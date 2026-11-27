@@ -24,7 +24,8 @@ pub struct Device {
     pub name: String,
     /// An SSH config Host alias, optionally user@host. Options are forbidden.
     pub host: String,
-    /// Absolute path or shell command name of the matching remote CLI.
+    /// Absolute path, `~/` path in the device user's home, or shell command
+    /// name of the remote CLI.
     #[serde(default = "default_executable")]
     pub executable: String,
 }
@@ -453,6 +454,15 @@ fn join_bounded(worker: thread::JoinHandle<()>, timeout: Duration) {
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+/// The device's executable as its shell should read it: `~/` names the
+/// device user's home, which this computer cannot know, so the device's own
+/// shell supplies it. A POSIX shell, fish and csh all read this form.
+fn remote_executable(executable: &str) -> String {
+    match executable.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
+        None => quote(executable),
+    }
+}
 /// Streams share an authenticated transport through OpenSSH multiplexing.
 /// These options deliberately override the user's own ControlMaster settings:
 /// a master cagents starts carries its keepalives, is counted against
@@ -497,7 +507,7 @@ fn bridge_command(transport: &Transport, control: Option<&str>) -> Command {
     };
     command.arg(format!(
         "{}{policy} daemon bridge",
-        quote(&transport.device.executable)
+        remote_executable(&transport.device.executable)
     ));
     command
 }
@@ -2348,6 +2358,25 @@ mod tests {
             io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+
+    #[test]
+    fn a_home_relative_executable_is_expanded_by_the_devices_shell() {
+        let read = |executable: &str| {
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("printf %s {}", remote_executable(executable)),
+                ])
+                .env("HOME", "/home/a b")
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(read("~/.local/bin/it's"), "/home/a b/.local/bin/it's");
+        // Only a leading `~/` is the device's home; anything else is literal.
+        assert_eq!(read("/opt/~/$HOME"), "/opt/~/$HOME");
+        assert_eq!(read("~user/cagents"), "~user/cagents");
     }
 
     #[test]

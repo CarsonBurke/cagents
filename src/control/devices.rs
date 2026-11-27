@@ -53,6 +53,9 @@ pub enum DeviceCommand {
         /// Also permit active native turns on the device to stop.
         #[arg(long)]
         interrupt: bool,
+        /// Only report what an update would do, changing nothing.
+        #[arg(long, conflicts_with_all = ["yes", "interrupt"])]
+        check: bool,
     },
 }
 
@@ -68,8 +71,12 @@ pub(super) fn execute(command: DeviceCommand) -> Result<CommandOutput, AppError>
         name,
         yes,
         interrupt,
+        check,
     } = command
     {
+        if check {
+            return check_update(&name);
+        }
         return update(&name, crate::device::provision::Options { yes, interrupt });
     }
     // This computer's daemon first: selecting the device routes every later
@@ -144,6 +151,56 @@ pub(super) fn execute(command: DeviceCommand) -> Result<CommandOutput, AppError>
     }
 }
 
+/// `cagents device update --check`: what an update would do, from the same
+/// inspection, with nothing sent.
+fn check_update(name: &str) -> Result<CommandOutput, AppError> {
+    use crate::device::provision::Check;
+    let device = saved(name)?;
+    crate::device::select(Some(name)).map_err(|error| AppError::new("device", error))?;
+    let check =
+        crate::device::provision::check(&device).map_err(|error| AppError::new("device", error))?;
+    let ours = crate::terminal_ipc::PROTOCOL_VERSION;
+    let (state, protocol, human) = match check {
+        Check::Compatible => (
+            "compatible",
+            None,
+            format!("{name} can already be used from this computer (protocol {ours})."),
+        ),
+        Check::Update { protocol } => (
+            "update",
+            protocol,
+            format!(
+                "{name} runs an older cagents{}; `cagents device update {name}` installs this computer's version there.",
+                protocol.map_or_else(String::new, |protocol| format!(" (protocol {protocol})"))
+            ),
+        ),
+        Check::Install => (
+            "install",
+            None,
+            format!(
+                "{name} has no cagents; `cagents device update {name}` installs this computer's version there."
+            ),
+        ),
+        Check::Newer { protocol } => (
+            "newer",
+            Some(protocol),
+            format!(
+                "{name} runs a newer cagents (protocol {protocol}) than this computer (protocol {ours}); update cagents on this computer."
+            ),
+        ),
+    };
+    Ok(CommandOutput {
+        command: "device.update.check",
+        data: json!({
+            "device": name,
+            "state": state,
+            "protocol": protocol,
+            "expected": ours,
+        }),
+        human,
+    })
+}
+
 /// `cagents device update`: needs no daemon on this computer, only the
 /// device's SSH connection and this computer's installed build.
 fn update(
@@ -155,20 +212,20 @@ fn update(
     crate::device::select(Some(name)).map_err(|error| AppError::new("device", error))?;
     let version = crate::version();
     let terminal = io::stderr().is_terminal();
-    let mut sending = false;
+    // Without a terminal, such as under the app, each tenth is a line of its own.
+    let mut reported_tenth = None;
     let mut progress = |step: Step| {
         let line = match step {
             Step::Inspecting => format!("Checking {name}…"),
             Step::Sending { read, total } => {
                 let percent = read.saturating_mul(100) / total.max(1);
-                let first = !std::mem::replace(&mut sending, true);
                 if terminal {
                     eprint!("\rSending cagents {version} to {name}: {percent}%");
                     if percent >= 100 {
                         eprintln!();
                     }
-                } else if first {
-                    eprintln!("Sending cagents {version} to {name}…");
+                } else if reported_tenth.replace(percent / 10) != Some(percent / 10) {
+                    eprintln!("Sending cagents {version} to {name}: {percent}%");
                 }
                 return;
             }

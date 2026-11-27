@@ -438,7 +438,7 @@ fn file_bytes_with_request(
         .and_then(|reply| match reply {
             crate::device_service::Reply::Image(bytes)
                 if bytes.len() <= crate::device_service::MAX_DEVICE_IMAGE_BYTES => Ok(bytes),
-            _ => Err("the selected device did not return a supported image preview; use matching cagents executables".into()),
+            _ => Err("the selected device did not return a supported image preview; if it runs another cagents version, update it from the device banner or with `cagents device update`".into()),
         })
     } else {
         crate::device_service::read_image_file(&origin.root, path, chat::MAX_INLINE_IMAGE_BYTES)
@@ -513,7 +513,7 @@ fn managed_with_request(
         request(crate::device_service::Operation::ReadImageAsset { reference: reference.clone() })
             .and_then(|reply| match reply {
                 crate::device_service::Reply::Image(bytes) if bytes.len() <= crate::device_service::MAX_DEVICE_IMAGE_BYTES => Ok(bytes),
-                _ => Err("The selected device did not return a supported image preview; use matching cagents executables.".into()),
+                _ => Err("The selected device did not return a supported image preview. If it runs another cagents version, update it from the device banner or with `cagents device update`.".into()),
             })
     } else {
         chat::attachment_assets::read(reference, crate::device_service::MAX_DEVICE_IMAGE_BYTES)
@@ -2118,7 +2118,7 @@ mod tests {
         // unable to authorize pixels from this computer's identically named file.
         assert!(
             matches!(load_with_request(&item, &origin, |_| Ok(crate::device_service::Reply::Saved)),
-            Loaded::Failed(error) if error.contains("matching cagents executables"))
+            Loaded::Failed(error) if error.contains("cagents device update"))
         );
         let invalid_remote = load_with_request(&item, &origin, |_| {
             Ok(crate::device_service::Reply::Image(
