@@ -755,10 +755,14 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-    let _lease = match admission.lease.take() {
-        Some(lease) => HostLease::acquire_with_handoff(&paths, &proof, Some(lease))?,
-        None => HostLease::acquire(&paths, &proof)?,
+    let acquire_runtime = |inherited| {
+        #[cfg(target_os = "macos")]
+        if let Some(ready) = &ready_admission {
+            return ready.acquire_runtime(&paths, inherited);
+        }
+        HostLease::acquire_with_handoff(&paths, &proof, inherited)
     };
+    let _lease = acquire_runtime(admission.lease.take())?;
     // The lease excludes daemons only in this runtime directory. Before this
     // daemon restores, publishes or saves anything, it also claims the saved
     // data, which a daemon in another runtime directory may already serve.

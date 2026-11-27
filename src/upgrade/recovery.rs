@@ -5,6 +5,8 @@
 //! fences remain held. Its only startup action is adopting existing owners.
 #[cfg(any(feature = "host", test))]
 mod retention;
+#[cfg(target_os = "macos")]
+mod runtime_journal;
 pub mod verified;
 #[cfg(feature = "host")]
 pub use retention::collect_superseded;
@@ -2021,20 +2023,24 @@ impl Receipt {
         self.acknowledged_ready_plan()
     }
 
-    /// The continuing worker already holds the original publication and
-    /// runtime fences. Apply the same one-retry proof as a restarted worker.
+    /// Only the original installed worker calls this after settling its child.
+    /// It still holds the exact OFD offered to the claimant at activation.
     #[cfg(target_os = "macos")]
-    pub(crate) fn can_retry_standby(&self) -> Result<bool, String> {
+    pub(crate) fn can_retry_continuously(&self, exited_pid: u32) -> Result<bool, String> {
         if !ready_evidence_exists(&self.authority, "claim")? {
             return self.ready_before_restore();
         }
         let plan = self.acknowledged_ready_plan()?;
-        let (prior, _) = plan.retry_predecessor()?;
+        let (prior, fingerprint) = plan.retry_predecessor()?;
+        if prior.successor.pid as u32 != exited_pid {
+            return Err("The Ready claim belongs to a different standby".into());
+        }
         plan.exact_checkpoint()?;
         let daemon = self
             .daemon
             .as_ref()
             .ok_or("The runtime lease was released")?;
+        runtime_journal::finish_interrupted_write(&self.authority, &prior, &fingerprint, daemon)?;
         ready_state_predecessor(&self.authority, daemon, Some(&prior))?;
         Ok(true)
     }
@@ -4700,10 +4706,29 @@ pub struct ReadyAdmission {
     custody: Inherited,
     successor: HostSessionProof,
     saved_predecessor: ReadyStatePredecessor,
+    runtime_claim: Option<String>,
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
 impl ReadyAdmission {
+    pub fn acquire_runtime(
+        &self,
+        paths: &crate::daemon::RuntimePaths,
+        inherited: Option<File>,
+    ) -> Result<crate::daemon::HostLease, crate::daemon::PlatformError> {
+        let lease =
+            inherited.ok_or_else(|| io::Error::other("Ready admission has no runtime lease"))?;
+        crate::daemon::HostLease::acquire_before_owner_write(
+            paths,
+            &self.successor,
+            Some(lease),
+            |lock, record| match &self.runtime_claim {
+                Some(claim) => runtime_journal::record(&self.authority, claim, lock, record),
+                None => Ok(()),
+            },
+        )
+    }
+
     pub fn claim_saved_state(
         &self,
         lock: &Path,
@@ -4895,7 +4920,7 @@ fn claim_ready_activation(
     capture_digest: &str,
     successor: &HostSessionProof,
     retry_of: Option<String>,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let name = if retry_of.is_some() {
         "retry-claim"
     } else {
@@ -4904,8 +4929,9 @@ fn claim_ready_activation(
     let path = ready_evidence_path(authority, name).map_err(io::Error::other)?;
     let process = crate::daemon::holder_registry::Process::read(std::process::id() as i32)?;
     let claim = ready_claim_record(authority, capture_digest, successor, process, retry_of);
-    crate::update::persist_ready_evidence(&path, &serde_json::to_vec(&claim)?)
-        .map_err(io::Error::other)
+    let bytes = serde_json::to_vec(&claim)?;
+    crate::update::persist_ready_evidence(&path, &bytes).map_err(io::Error::other)?;
+    Ok(digest(&bytes))
 }
 
 #[cfg(all(target_os = "macos", any(feature = "host", test)))]
@@ -4959,6 +4985,7 @@ pub(crate) fn accept_ready_authority(
     // This precedes runtime publication, saved-state admission and every
     // startup path that can act on the original provider or its database.
     let reserved = crate::update::admit_shared_ready(&authority).map_err(io::Error::other)?;
+    let record_runtime = reserved.is_some();
     let (saved_predecessor, retry_of) =
         if ready_evidence_exists(&authority, "claim").map_err(io::Error::other)? {
             let original = reserved
@@ -4983,12 +5010,14 @@ pub(crate) fn accept_ready_authority(
             "Ready activation belongs to a previous boot",
         ));
     }
-    claim_ready_activation(&authority, &capture_digest, &successor, retry_of)?;
+    let record_runtime = record_runtime && retry_of.is_none();
+    let claim = claim_ready_activation(&authority, &capture_digest, &successor, retry_of)?;
     Ok(ReadyAdmission {
         authority,
         custody,
         successor,
         saved_predecessor,
+        runtime_claim: record_runtime.then_some(claim),
     })
 }
 

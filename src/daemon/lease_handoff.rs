@@ -28,13 +28,23 @@ pub(crate) struct LeaseHandoff {
 /// Read the last owner without disturbing the cursor shared with the standby.
 #[cfg(target_os = "macos")]
 pub(crate) fn recorded_owner(lock: &File) -> io::Result<(HostSessionProof, u32)> {
-    use std::os::unix::fs::FileExt;
+    decode_owner(&read_owner_bytes(lock)?)
+}
 
+#[cfg(target_os = "macos")]
+pub(crate) fn decode_owner(bytes: &[u8]) -> io::Result<(HostSessionProof, u32)> {
     #[derive(serde::Deserialize)]
     struct Owner {
         proof: HostSessionProof,
         pid: u32,
     }
+    let owner: Owner = serde_json::from_slice(bytes)?;
+    Ok((owner.proof, owner.pid))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn read_owner_bytes(lock: &File) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
 
     const LIMIT: u64 = 16 * 1024;
     let len = lock.metadata()?.len();
@@ -46,8 +56,7 @@ pub(crate) fn recorded_owner(lock: &File) -> io::Result<(HostSessionProof, u32)>
     }
     let mut bytes = vec![0; len as usize];
     lock.read_exact_at(&mut bytes, 0)?;
-    let owner: Owner = serde_json::from_slice(&bytes)?;
-    Ok((owner.proof, owner.pid))
+    Ok(bytes)
 }
 
 pub(crate) struct HandoffSource {

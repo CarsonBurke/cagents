@@ -450,11 +450,12 @@ pub(super) fn perform(
                         && ready_plan.as_ref().is_some_and(|plan| {
                             plan.unchanged().is_ok_and(|unchanged| unchanged)
                         })
-                        && receipt
-                            .is_some_and(|receipt| receipt.can_retry_standby() == Ok(true))
                         && Selection::capture(&layout)
                             .is_ok_and(|current| current == selection)
-                        && stamp(root).is_ok_and(|current| current == before) =>
+                        && stamp(root).is_ok_and(|current| current == before)
+                        && receipt.is_some_and(|receipt| {
+                            receipt.can_retry_continuously(standby.pid()) == Ok(true)
+                        }) =>
                 {
                     tracing::warn!(%error, "retrying the exact installed successor before restoration began");
                     standby
