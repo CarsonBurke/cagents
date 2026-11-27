@@ -1167,7 +1167,7 @@ impl AccountState {
         if ticket.limit_identity.as_ref().is_some_and(|expected| {
             expected
                 .as_ref()
-                .is_some_and(|identity| Some(identity) != self.identity.as_ref())
+                .is_some_and(|identity| !same_usage_login(Some(identity), self.identity.as_ref()))
         }) {
             self.schedule.abandon();
             return false;
@@ -1649,6 +1649,14 @@ fn merge_complete_inventory(
     {
         current.status = UsageStatus::Limited;
     }
+}
+
+/// Whether two observations may share usage and reset inventory. Plan
+/// metadata can change between them. A reported organization must agree on
+/// both sides because its limits and resets are scoped to that organization.
+fn same_usage_login(left: Option<&Identity>, right: Option<&Identity>) -> bool {
+    left == right
+        || (account::resets::may_act_for(left, right) && account::resets::may_act_for(right, left))
 }
 
 fn is_stale(snapshot: &UsageSnapshot, now: Millis) -> bool {
@@ -3430,9 +3438,9 @@ impl Cagents {
                 .limit_refresh_identity
                 .as_ref()
                 .is_some_and(|expected| {
-                    expected
-                        .as_ref()
-                        .is_none_or(|identity| Some(identity) == state.identity.as_ref())
+                    expected.as_ref().is_none_or(|identity| {
+                        same_usage_login(Some(identity), state.identity.as_ref())
+                    })
                 })
             {
                 state.limit_refresh_identity = None;
@@ -3877,7 +3885,7 @@ impl Cagents {
                 self.start_usage_reset(id, reset, surface, choose_scope)
             }
             Action::ResetConfirm(id) => self.confirm_usage_reset(id),
-            Action::ResetRecover(id, reset) => self.recover_usage_reset(id, reset),
+            Action::ResetRecover(id, key) => self.recover_usage_reset(id, key),
             Action::ResetCancel(id) => {
                 let asked = self
                     .account_ui
@@ -4892,7 +4900,7 @@ impl Cagents {
                 if ticket.force
                     && ticket.usage_generation == state.usage_generation
                     && matches!(provider, Provider::Claude | Provider::Codex)
-                    && identity == state.identity
+                    && same_usage_login(identity.as_ref(), state.identity.as_ref())
                     && state.inventory_observed_at.is_none_or(|observed| {
                         snapshot.observed_at >= observed
                             || observed > now.saturating_add(schedule::CLOCK_SLACK)
@@ -4915,7 +4923,7 @@ impl Cagents {
             } => {
                 if provider == Provider::Claude
                     && ticket.usage_generation == state.usage_generation
-                    && identity == state.identity
+                    && same_usage_login(identity.as_ref(), state.identity.as_ref())
                     && let Some(current) = state.snapshot.as_ref()
                 {
                     merged_inventory =
@@ -15927,6 +15935,66 @@ mod app_tests {
         drop(app.probe_queued(Provider::Codex));
         assert!(app.account_ui.pending_probe_for_test(&id).is_none());
         assert!(app.account_ui.account(&id).unwrap().queued.is_none());
+    }
+    #[test]
+    fn plan_refreshes_keep_queued_and_in_flight_limit_probes() {
+        let mut app = context_inspector_test_app(false);
+        let id = Account::system(Provider::Codex).id();
+        let recipe = recipe_on(&app, &id);
+        let now = now_ms();
+        app.refresh_ui.focused = true;
+        app.account_ui.registry_ready = true;
+        let mut identity = Identity {
+            email: Some("fixture@example.test".into()),
+            organization: Some("fixture-org".into()),
+            ..Identity::default()
+        };
+        app.account_ui.account_mut(&id).unwrap().identity = Some(identity.clone());
+        let (owner, older) = app.account_ui.begin_probe_for_test(&id, Trigger::Tick, now);
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().queued,
+            Some(Trigger::Limit)
+        );
+
+        identity.plan = Some("plus".into());
+        drop(app.account_probed(
+            id.clone(),
+            owner,
+            older,
+            Outcome::Answered {
+                identity: Some(identity.clone()),
+                catalog: None,
+                snapshot: Box::new(UsageSnapshot::state(UsageStatus::Ok, "older probe", now)),
+            },
+        ));
+        let limit = app
+            .account_ui
+            .pending_probe_for_test(&id)
+            .expect("queued limit probe");
+        assert!(limit.force);
+        identity.plan = Some("pro".into());
+        app.account_ui.account_mut(&id).unwrap().identity = Some(identity.clone());
+        drop(app.account_probed(
+            id.clone(),
+            owner,
+            limit,
+            Outcome::Answered {
+                identity: Some(identity),
+                catalog: None,
+                snapshot: Box::new(UsageSnapshot::state(
+                    UsageStatus::Limited,
+                    "forced limit probe",
+                    now + 1,
+                )),
+            },
+        ));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().detail.as_deref(),
+            Some("forced limit probe")
+        );
+        assert!(state.pending_probe.is_none() && state.queued.is_none());
     }
     #[test]
     fn a_limit_intent_survives_unknown_policy_and_deadline_wakes_are_owned_and_coalesced() {
