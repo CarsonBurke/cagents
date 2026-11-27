@@ -77,6 +77,22 @@ pub enum AccountCommand {
     },
 }
 
+pub(super) fn hosted_refusal(command: &AccountCommand) -> Option<AppError> {
+    match command {
+        AccountCommand::Reset { yes: false, .. } => Some(AppError::new(
+            "confirmation",
+            "Using a reset from a hosted session requires --yes after the person asks you to spend it",
+        )),
+        AccountCommand::Link { .. }
+        | AccountCommand::Default { .. }
+        | AccountCommand::Remove { .. } => Some(AppError::new(
+            "permission_denied",
+            "Account changes require your own terminal. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents.",
+        )),
+        _ => None,
+    }
+}
+
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
         AccountCommand::Reset {
@@ -318,5 +334,37 @@ mod tests {
         let json = serde_json::to_value(report).unwrap();
         assert!(json["caller"]["context_limit"].is_null());
         assert!(json["caller"]["account"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod hosted_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_account_reset_requires_yes_without_allowing_lifecycle_changes() {
+        use clap::Parser;
+        for (args, expected) in [
+            (vec!["reset", "claude/system", "--yes"], None),
+            (vec!["reset", "claude/system"], Some("confirmation")),
+            (
+                vec!["link", "claude", "/fixture/home"],
+                Some("permission_denied"),
+            ),
+            (
+                vec!["default", "claude", "automatic"],
+                Some("permission_denied"),
+            ),
+            (
+                vec!["remove", "claude/system", "--yes"],
+                Some("permission_denied"),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["cagents", "account"].into_iter().chain(args)).unwrap();
+            let TopCommand::Account { command } = cli.command else {
+                panic!("expected account command");
+            };
+            assert_eq!(hosted_refusal(&command).map(|error| error.kind), expected);
+        }
     }
 }
