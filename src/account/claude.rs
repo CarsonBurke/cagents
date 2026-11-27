@@ -385,8 +385,7 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
                         .is_none_or(|used| used != 0.0)
                 })
         });
-        let usable = valid_times
-            && refills_usage
+        let offered = valid_times
             && program["eligible"].as_bool() == Some(true)
             && grant["usable_now"].as_bool() == Some(true)
             && grant["paused"].as_bool() != Some(true)
@@ -399,7 +398,8 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
             scopes,
             available_count,
             expires_at,
-            usable,
+            usable: offered && refills_usage,
+            held_for_unused_limits: offered && !refills_usage,
         });
     }
     let session = &body["juniper_tide"];
@@ -412,6 +412,7 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
             available_count: u64::from(available),
             expires_at: session["weekly_resets_at"].as_str().and_then(parse_rfc3339),
             usable: available && session["eligible"].as_bool() == Some(true),
+            held_for_unused_limits: false,
         });
     }
     resets
@@ -865,6 +866,14 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
         .windows
         .retain(|window| window.key != RETIRED_FABLE);
     for window in update.windows {
+        if window.used > 0.0 {
+            for reset in &mut snapshot.resets {
+                if reset.held_for_unused_limits && reset.clears(&window) {
+                    reset.held_for_unused_limits = false;
+                    reset.usable = true;
+                }
+            }
+        }
         let fable = window.key == FABLE;
         match snapshot
             .windows
@@ -1936,6 +1945,50 @@ mod reset_tests {
             );
             assert_eq!(resets[0].is_available(1), usable, "{percent_used}");
         }
+    }
+
+    #[test]
+    fn live_usage_lifts_only_the_hold_for_unused_limits_it_updates() {
+        use super::super::LiveReport;
+
+        let now = 1_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits":{
+            "limits":[
+                {"kind":"weekly_all","percent":20},
+                {"kind":"weekly_scoped","scope":"Fable 5.1","percent":0}
+            ],
+            "cedar_ember":{"eligible":true,"at_limit":false,"grants":[
+                {"id":"fable","resets_left":1,"clears":["seven_day_overage_included"],
+                 "usable_now":true,"use_requires_limit":false,
+                 "percent_used":{"seven_day_overage_included":0}},
+                {"id":"paused","resets_left":1,"clears":["seven_day_overage_included"],
+                 "usable_now":true,"paused":true,"use_requires_limit":false,
+                 "percent_used":{"seven_day_overage_included":0}},
+                {"id":"limit-required","resets_left":1,"clears":["seven_day_overage_included"],
+                 "usable_now":true,"use_requires_limit":true,
+                 "percent_used":{"seven_day_overage_included":0}}
+            ]}}}),
+            now,
+        );
+        assert_eq!(usage.resets.len(), 3);
+        assert!(usage.resets.iter().all(|reset| !reset.is_available(1)));
+        let stored = serde_json::to_value(&usage).unwrap();
+        usage = serde_json::from_value(stored).unwrap();
+
+        let update = |kind, used| {
+            LiveReport::Claude(
+                parse_rate_limit_event(&json!({"rateLimitType":kind,"utilization":used})).unwrap(),
+            )
+        };
+        assert!(update("seven_day", 1.0).apply(&mut usage, now + 1, now + 1));
+        assert!(!update("seven_day_overage_included", 1.0).apply(&mut usage, now, now + 1));
+        assert!(update("seven_day_overage_included", 0.0).apply(&mut usage, now + 2, now + 2));
+        assert!(usage.resets.iter().all(|reset| !reset.is_available(1)));
+
+        assert!(update("seven_day_overage_included", 0.01).apply(&mut usage, now + 3, now + 3));
+        assert!(usage.resets[0].is_available(1));
+        assert!(usage.resets[1..].iter().all(|reset| !reset.is_available(1)));
     }
 
     #[test]

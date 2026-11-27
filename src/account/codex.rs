@@ -153,6 +153,7 @@ pub fn parse_resets(result: &Value) -> Vec<super::UsageReset> {
                 && credit
                     .get("expiresAt")
                     .is_none_or(|value| value.is_null() || value.as_i64().is_some()),
+            held_for_unused_limits: false,
         });
     }
     if count > available_details {
@@ -163,6 +164,7 @@ pub fn parse_resets(result: &Value) -> Vec<super::UsageReset> {
             available_count: count - available_details,
             expires_at: None,
             usable: true,
+            held_for_unused_limits: false,
         });
     }
     resets

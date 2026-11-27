@@ -8582,6 +8582,7 @@ mod tests {
             available_count: 2,
             expires_at: None,
             usable: true,
+            held_for_unused_limits: false,
         }];
         let gauge =
             account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();

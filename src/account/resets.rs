@@ -100,6 +100,7 @@ impl ResetScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct UsageReset {
     /// Opaque provider selection, never a credential.
     pub id: String,
@@ -110,6 +111,58 @@ pub struct UsageReset {
     /// Inventory can include grants that are paused or have nothing to
     /// refill.
     pub usable: bool,
+    /// The provider offered this grant, but reported zero use on every
+    /// cleared limit. Only this local hold can be lifted by a live report.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_for_unused_limits: bool,
+}
+
+/// Account-info RPC retains its fixed postcard fields. The local hold is
+/// needed only in snapshots, which the cache and probe RPC encode as JSON.
+#[derive(Serialize, Deserialize)]
+#[serde(rename = "UsageReset")]
+struct UsageResetWire<Id, Scopes> {
+    id: Id,
+    kind: ResetKind,
+    scopes: Scopes,
+    available_count: u64,
+    expires_at: Option<i64>,
+    usable: bool,
+}
+
+impl Serialize for UsageReset {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            return Self::serialize(self, serializer);
+        }
+        UsageResetWire {
+            id: self.id.as_str(),
+            kind: self.kind,
+            scopes: self.scopes.as_slice(),
+            available_count: self.available_count,
+            expires_at: self.expires_at,
+            usable: self.usable,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UsageReset {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            return Self::deserialize(deserializer);
+        }
+        let wire = UsageResetWire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id,
+            kind: wire.kind,
+            scopes: wire.scopes,
+            available_count: wire.available_count,
+            expires_at: wire.expires_at,
+            usable: wire.usable,
+            held_for_unused_limits: false,
+        })
+    }
 }
 
 impl UsageReset {
@@ -346,6 +399,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mixed_reset_holds_preserve_the_previous_postcard_inventory_shape() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct PreviousReset {
+            id: String,
+            kind: ResetKind,
+            scopes: Vec<ResetScope>,
+            available_count: u64,
+            expires_at: Option<i64>,
+            usable: bool,
+        }
+        let offered = UsageReset {
+            id: "weekly".into(),
+            kind: ResetKind::Granted,
+            scopes: vec![ResetScope::AccountWeekly],
+            available_count: 2,
+            expires_at: Some(100),
+            usable: true,
+            held_for_unused_limits: false,
+        };
+        let held = UsageReset {
+            id: "fable".into(),
+            scopes: vec![ResetScope::Model("Fable".into())],
+            usable: false,
+            held_for_unused_limits: true,
+            ..offered.clone()
+        };
+        let current = vec![held, offered];
+        let previous: Vec<_> = current
+            .iter()
+            .map(|reset| PreviousReset {
+                id: reset.id.clone(),
+                kind: reset.kind,
+                scopes: reset.scopes.clone(),
+                available_count: reset.available_count,
+                expires_at: reset.expires_at,
+                usable: reset.usable,
+            })
+            .collect();
+        let encoded = postcard::to_stdvec(&current).unwrap();
+        assert_eq!(encoded, postcard::to_stdvec(&previous).unwrap());
+        let decoded = postcard::from_bytes::<Vec<UsageReset>>(&encoded).unwrap();
+        assert_eq!(
+            decoded,
+            current
+                .into_iter()
+                .map(|reset| UsageReset {
+                    held_for_unused_limits: false,
+                    ..reset
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn reset_login_eligibility_preserves_backend_identity_rules() {
         for (actual_email, expected_email, actual_org, expected_org, eligible) in [
             (
@@ -482,6 +589,7 @@ mod tests {
             available_count: 2,
             expires_at: Some(200),
             usable: true,
+            held_for_unused_limits: false,
         };
         assert!(reset.is_available(199));
         assert!(!reset.is_available(200));
@@ -529,6 +637,7 @@ mod tests {
                 available_count: 2,
                 expires_at: None,
                 usable: true,
+                held_for_unused_limits: false,
             };
             assert_eq!(
                 reset.confirmation_question("fixture@example.test"),

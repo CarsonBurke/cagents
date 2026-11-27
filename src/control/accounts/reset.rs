@@ -477,6 +477,7 @@ mod tests {
             available_count: count,
             expires_at: Some(200),
             usable: true,
+            held_for_unused_limits: false,
         }
     }
 

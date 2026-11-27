@@ -1255,6 +1255,7 @@ pub(in crate::app) mod tests {
             available_count: 2,
             expires_at: None,
             usable: true,
+            held_for_unused_limits: false,
         }
     }
 
@@ -2094,6 +2095,42 @@ pub(in crate::app) mod tests {
             ["Fable · 2 available", "Weekly + Fable · 2 available"]
         );
         assert_eq!(weekly.action_label(), "Use Weekly + Fable reset");
+    }
+
+    #[test]
+    fn live_fable_usage_offers_the_narrower_reset_held_when_fable_was_unused() {
+        let now = now_ms();
+        let mut snapshot = account::claude::parse_usage(
+            &serde_json::json!({"rate_limits":{
+            "seven_day":{"utilization":50},
+            "model_scoped":[{"display_name":"Fable","utilization":0}],
+            "cedar_ember":{"eligible":true,"grants":[
+                {"id":"weekly","resets_left":1,"clears":["seven_day","seven_day_overage_included"],
+                 "usable_now":true,"use_requires_limit":false,
+                 "percent_used":{"seven_day":50,"seven_day_overage_included":0}},
+                {"id":"fable","resets_left":1,"clears":["seven_day_overage_included"],
+                 "usable_now":true,"use_requires_limit":false,
+                 "percent_used":{"seven_day_overage_included":0}}
+            ]}}}),
+            now,
+        );
+        let state = State::default();
+        assert!(!snapshot.resets[1].is_available(unix_seconds(now)));
+        assert!(next_reset(&snapshot, &state, now).is_none());
+
+        let update = account::claude::parse_rate_limit_event(&serde_json::json!({
+            "rateLimitType":"seven_day_overage_included",
+            "utilization":1.0,
+            "status":"rejected"
+        }))
+        .unwrap();
+        assert!(account::LiveReport::Claude(update).apply(&mut snapshot, now + 1, now + 1));
+        assert_eq!(
+            next_reset(&snapshot, &state, now + 1)
+                .unwrap()
+                .action_label(),
+            "Use Fable reset"
+        );
     }
 
     /// A Session reset doesn't help a nearly spent weekly limit, so the reset

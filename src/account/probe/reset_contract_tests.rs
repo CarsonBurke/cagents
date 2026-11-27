@@ -405,6 +405,13 @@ for line in sys.stdin:
         available_count: 9,
         expires_at: None,
         usable: true,
+        held_for_unused_limits: false,
+    });
+    previous.resets.push(super::super::UsageReset {
+        id: "held-for-unused-limits".into(),
+        usable: false,
+        held_for_unused_limits: true,
+        ..previous.resets[0].clone()
     });
     for (cache_name, switched) in [("same-login-cache", false), ("changed-login-cache", true)] {
         let cache = Cache::at(root.join(cache_name));
@@ -426,22 +433,32 @@ for line in sys.stdin:
             .unwrap();
         }
         let response = run(claude.clone(), Some(cache), true).await;
-        let Outcome::Answered { snapshot, .. } = response else {
+        let Outcome::Answered { mut snapshot, .. } = response else {
             panic!("failed cache contract: {response:?}")
         };
-        let retained = snapshot
-            .resets
-            .iter()
-            .find(|reset| reset.id == "previous-login");
         if switched {
             assert!(
-                retained.is_none(),
+                snapshot.resets.iter().all(|reset| !matches!(
+                    reset.id.as_str(),
+                    "previous-login" | "held-for-unused-limits"
+                )),
                 "another login's reset counts must not be attributed to this login"
             );
         } else {
+            assert_eq!(snapshot.resets.len(), 2);
             assert!(
-                !retained.unwrap().usable,
+                snapshot.resets.iter().all(|reset| !reset.usable),
                 "failed inventory must disable the old action"
+            );
+            let update = super::super::claude::parse_rate_limit_event(
+                &json!({"rateLimitType":"seven_day","utilization":1.0}),
+            )
+            .unwrap();
+            let later = snapshot.observed_at + 1;
+            assert!(super::super::LiveReport::Claude(update).apply(&mut snapshot, later, later));
+            assert!(
+                snapshot.resets.iter().all(|reset| !reset.usable),
+                "live usage cannot re-enable a grant after the provider inventory failed"
             );
         }
     }
