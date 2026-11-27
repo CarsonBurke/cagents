@@ -955,6 +955,9 @@ impl Cagents {
                     self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
                     self.device_ui.pending = None;
                     self.device_ui.busy = false;
+                    // Nor does the file a link was opening.
+                    self.device_ui.linked_file = None;
+                    self.device_ui.linked_fragment = None;
                 }
                 if !self.device_ui.busy {
                     self.device_ui.open = false;
@@ -2501,6 +2504,32 @@ mod tests {
         assert!(app.device_ui.busy && app.device_ui.can_close());
         drop(app.update_device(Action::Close));
         assert!(!app.device_ui.busy && !app.device_ui.open);
+        // A linked file abandoned while its folder lists isn't read later,
+        // into whatever folder the dialog lists next.
+        drop(app.update_device(Action::OpenFile {
+            path: "/remote/notes.md".into(),
+            fragment: None,
+        }));
+        assert!(matches!(
+            app.device_ui.pending,
+            Some(Operation::List { .. })
+        ));
+        drop(app.update_device(Action::Close));
+        assert!(!app.device_ui.open);
+        drop(app.update_device(Action::Open));
+        drop(app.update_device(Action::Loaded {
+            generation: app.device_ui.generation,
+            result: Ok(Reply::Directory {
+                path: "/elsewhere".into(),
+                entries: Vec::new(),
+            }),
+        }));
+        assert!(
+            app.device_ui.pending.is_none(),
+            "{:?}",
+            app.device_ui.pending
+        );
+        assert!(app.device_ui.notice.is_none());
     }
 
     #[test]
