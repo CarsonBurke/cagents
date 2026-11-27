@@ -108,6 +108,11 @@ const MASTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) const BRIDGE_ABSENT_EXIT: u8 = 69;
 const BRIDGE_ABSENT_MARKER: &str = "cagents daemon bridge: daemon_not_running";
+/// What a device bridge writes to stderr as it starts, before it looks for
+/// its daemon: SSH logged in and ran cagents there, so a device that then
+/// says nothing is slow rather than unreachable. An older bridge never says
+/// it, and its silence reads as before.
+const BRIDGE_STARTED_MARKER: &str = "cagents daemon bridge: started";
 #[derive(Debug)]
 struct DaemonNotRunning;
 impl std::fmt::Display for DaemonNotRunning {
@@ -189,6 +194,48 @@ impl std::error::Error for Unreachable {}
 pub fn unreachable(error: &io::Error) -> Option<&Unreachable> {
     error.get_ref().and_then(|error| error.downcast_ref())
 }
+/// Joins the device's name to what it did not do; [`reads_as_unresponsive`]
+/// finds it.
+const UNRESPONSIVE_INFIX: &str = " was reached over SSH, but ";
+/// SSH reached the device, but nothing came back from cagents there before
+/// the caller stopped waiting: a slow login, or a daemon that accepted and
+/// then hung. Unlike [`Unreachable`], asking the device again may work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unresponsive {
+    pub device: String,
+    pub host: String,
+    pub reached: Reached,
+}
+impl std::fmt::Display for Unresponsive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            device,
+            host,
+            reached,
+        } = self;
+        let wait = answer_wait();
+        match reached {
+            Reached::BridgeStarted => write!(
+                f,
+                "{device}{UNRESPONSIVE_INFIX}its cagents daemon did not answer within {wait}. It may be busy or stuck: try again, or check it with `ssh {host} cagents daemon status`."
+            ),
+            Reached::LoggedIn => write!(
+                f,
+                "{device}{UNRESPONSIVE_INFIX}cagents did not start there within {wait}. A slow login, such as a shell profile or home directory that hangs, can cause this: check that `ssh {host} true` returns quickly, then try again."
+            ),
+        }
+    }
+}
+impl std::error::Error for Unresponsive {}
+/// The slow device `error` reports, if it is one.
+pub fn unresponsive(error: &io::Error) -> Option<&Unresponsive> {
+    error.get_ref().and_then(|error| error.downcast_ref())
+}
+/// Whether `message`, an error passed along as text, as a window's failed
+/// start is, says SSH reached the device but cagents there said nothing.
+pub fn reads_as_unresponsive(message: &str) -> bool {
+    message.contains(UNRESPONSIVE_INFIX)
+}
 /// Whether `message`, an error passed along as text, as a window's failed
 /// start is, says the device could not be reached.
 pub fn reads_as_unreachable(message: &str) -> bool {
@@ -254,28 +301,88 @@ pub(crate) fn existing_daemon_missing() -> bool {
 pub(crate) fn report_absent_bridge() {
     eprintln!("{BRIDGE_ABSENT_MARKER}");
 }
-/// Why SSH could not reach the selected device on its bridge's last
-/// connection: what SSH said when it gave up, or that it was still trying
-/// with nothing back from the device when the caller stopped waiting.
-fn selected_unreachable() -> Option<String> {
+pub(crate) fn report_bridge_started() {
+    eprintln!("{BRIDGE_STARTED_MARKER}");
+}
+/// How long a command or window waits for a device's first answer.
+fn answer_wait() -> String {
+    let seconds = crate::control::REMOTE_HANDSHAKE_TIMEOUT.as_secs();
+    format!("{seconds} seconds")
+}
+/// How far one SSH stream got on the device before anything came back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Reached {
+    /// SSH logged in: the stream published its connection for others.
+    LoggedIn = 1,
+    /// cagents started there and said so.
+    BridgeStarted = 2,
+}
+/// One SSH stream's progress, which only that stream writes. A device's
+/// state is the newest stream's, so another stream starting or ending does
+/// not answer for the one a caller waited on.
+#[derive(Default)]
+struct StreamStatus {
+    /// The device has sent something back on this stream.
+    answered: std::sync::atomic::AtomicBool,
+    /// SSH is still running and nothing has come back on this stream yet.
+    awaiting: std::sync::atomic::AtomicBool,
+    /// A [`Reached`] as `u8`, or 0 for nothing known.
+    reached: std::sync::atomic::AtomicU8,
+    /// What SSH said when it failed on its own (exit 255), rather than the
+    /// command it ran on the device.
+    unreachable: Mutex<Option<String>>,
+}
+impl StreamStatus {
+    fn reach(&self, reached: Reached) {
+        self.reached
+            .fetch_max(reached as u8, std::sync::atomic::Ordering::AcqRel);
+    }
+    fn reached(&self) -> Option<Reached> {
+        match self.reached.load(std::sync::atomic::Ordering::Acquire) {
+            1 => Some(Reached::LoggedIn),
+            2 => Some(Reached::BridgeStarted),
+            _ => None,
+        }
+    }
+}
+/// Why the newest stream to a device gave nothing back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Silence {
+    /// SSH never reached the device, saying why.
+    Unreachable(String),
+    /// SSH reached it, but nothing came back before the caller gave up.
+    Slow(Reached),
+}
+/// Why the selected device's bridge got nothing back on its newest stream.
+fn selected_silence() -> Option<Silence> {
     SELECTED.get().and_then(|context| {
         context.bridges.lock().unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
             .as_ref()
-            .and_then(|bridge| unreachable_reason(&bridge.transport))
+            .and_then(|bridge| silence(&bridge.transport))
     })
 }
-fn unreachable_reason(transport: &Transport) -> Option<String> {
-    transport
+fn silence(transport: &Transport) -> Option<Silence> {
+    let status = transport
+        .stream
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()?;
+    if let Some(reason) = status
         .unreachable
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
-        .or_else(|| {
-            transport
-                .awaiting_answer
-                .load(std::sync::atomic::Ordering::Acquire)
-                .then(|| "it did not answer in time".to_owned())
-        })
+    {
+        return Some(Silence::Unreachable(reason));
+    }
+    if !status.awaiting.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    Some(match status.reached() {
+        Some(reached) => Silence::Slow(reached),
+        None => Silence::Unreachable(format!("it did not answer within {}", answer_wait())),
+    })
 }
 fn selected_daemon_absent() -> bool {
     SELECTED
@@ -502,11 +609,9 @@ struct Transport {
     pool: Arc<Mutex<Vec<Master>>>,
     paused: Mutex<Option<Instant>>,
     last_error: Mutex<Option<String>>,
-    /// What SSH said when it last failed on its own (exit 255), rather than
-    /// the command it ran on the device.
-    unreachable: Mutex<Option<String>>,
-    /// SSH is still running and nothing has come back from the device yet.
-    awaiting_answer: std::sync::atomic::AtomicBool,
+    /// The newest stream's progress: the one a caller that just connected
+    /// waits on.
+    stream: Mutex<Option<Arc<StreamStatus>>>,
     daemon_missing: std::sync::atomic::AtomicBool,
     cancelled: Cancellation,
 }
@@ -741,8 +846,7 @@ impl ConnectionContext {
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
             last_error: Mutex::new(None),
-            unreachable: Mutex::new(None),
-            awaiting_answer: std::sync::atomic::AtomicBool::new(false),
+            stream: Mutex::new(None),
             daemon_missing: std::sync::atomic::AtomicBool::new(false),
             cancelled,
         });
@@ -904,7 +1008,8 @@ fn spawn_stream(
         && !waited
         && !listening()
         && !forwarding
-            .received_output
+            .status
+            .answered
             .load(std::sync::atomic::Ordering::Acquire)
         && !forwarding
             .downstream
@@ -926,10 +1031,16 @@ fn spawn_stream(
         }
         thread::sleep(Duration::from_millis(5));
     }
+    // A master this stream started listens once SSH has logged in, so the
+    // device was reached even if a slow login keeps cagents from starting.
+    if cold && listening() {
+        forwarding.status.reach(Reached::LoggedIn);
+    }
     if cold
         && !listening()
         && forwarding
-            .received_output
+            .status
+            .answered
             .load(std::sync::atomic::Ordering::Acquire)
     {
         // Successful remote output proves authentication and remote startup
@@ -953,7 +1064,7 @@ struct Forwarding {
     downstream: Option<thread::JoinHandle<io::Result<u64>>>,
     diagnostics: Option<thread::JoinHandle<ForwardingDiagnostics>>,
     stop_diagnostics: Arc<Cancellation>,
-    received_output: Arc<std::sync::atomic::AtomicBool>,
+    status: Arc<StreamStatus>,
     settled: bool,
     transport: Option<Arc<Transport>>,
 }
@@ -963,17 +1074,15 @@ impl Forwarding {
         stream: UnixStream,
         transport: Option<Arc<Transport>>,
     ) -> io::Result<Self> {
+        let status = Arc::new(StreamStatus::default());
+        status
+            .awaiting
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(transport) = &transport {
             transport
                 .daemon_missing
                 .store(false, std::sync::atomic::Ordering::Release);
-            *transport
-                .unreachable
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = None;
-            transport
-                .awaiting_answer
-                .store(true, std::sync::atomic::Ordering::Release);
+            *transport.stream.lock().unwrap_or_else(|p| p.into_inner()) = Some(status.clone());
         }
         let stop = match Cancellation::new() {
             Ok(stop) => Arc::new(stop),
@@ -990,7 +1099,7 @@ impl Forwarding {
             downstream: None,
             diagnostics: None,
             stop_diagnostics: stop,
-            received_output: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            status,
             settled: false,
             transport,
         };
@@ -1026,7 +1135,7 @@ impl Forwarding {
                     copy_transport(&mut reader, &mut input, &stop, transport.as_deref(), None)
                 })?,
         );
-        let received_output = forwarding.received_output.clone();
+        let status = forwarding.status.clone();
         let stop = forwarding.stop_diagnostics.clone();
         let transport = forwarding.transport.clone();
         forwarding.downstream = Some(
@@ -1038,15 +1147,16 @@ impl Forwarding {
                         &mut writer,
                         &stop,
                         transport.as_deref(),
-                        Some(&received_output),
+                        Some(&status),
                     )
                 })?,
         );
         let stop = forwarding.stop_diagnostics.clone();
+        let status = forwarding.status.clone();
         forwarding.diagnostics = Some(
             thread::Builder::new()
                 .name("cagents-device-stderr".into())
-                .spawn(move || capture_diagnostics(stderr, &stop))?,
+                .spawn(move || capture_diagnostics(stderr, &stop, &status))?,
         );
         Ok(forwarding)
     }
@@ -1084,11 +1194,9 @@ impl Forwarding {
             thread::sleep(Duration::from_millis(5));
         };
         self.settled = true;
-        if let Some(transport) = &self.transport {
-            transport
-                .awaiting_answer
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
+        self.status
+            .awaiting
+            .store(false, std::sync::atomic::Ordering::Release);
         self.stop_diagnostics.cancel();
         let detail = self
             .diagnostics
@@ -1106,15 +1214,18 @@ impl Forwarding {
             );
             // SSH exits 255 for its own errors: no answer, no such host, a
             // refused login. It does too when the command it ran died or the
-            // connection dropped later, but by then the device had answered,
-            // or SSH said nothing.
-            *transport
+            // connection dropped later, but by then the device had answered
+            // or been reached, or SSH said nothing.
+            *self
+                .status
                 .unreachable
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = (status.code() == Some(255)
                 && !detail.daemon_absent
+                && self.status.reached().is_none()
                 && !self
-                    .received_output
+                    .status
+                    .answered
                     .load(std::sync::atomic::Ordering::Acquire))
             .then(|| ssh_reason(&detail.tail))
             .flatten();
@@ -1132,11 +1243,9 @@ impl Forwarding {
 }
 impl Drop for Forwarding {
     fn drop(&mut self) {
-        if let Some(transport) = &self.transport {
-            transport
-                .awaiting_answer
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
+        self.status
+            .awaiting
+            .store(false, std::sync::atomic::Ordering::Release);
         self.stop_diagnostics.cancel();
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         if !self.settled {
@@ -1223,7 +1332,7 @@ fn copy_transport(
     writer: &mut (impl io::Write + std::os::fd::AsRawFd),
     stop: &Cancellation,
     transport: Option<&Transport>,
-    received_output: Option<&std::sync::atomic::AtomicBool>,
+    answered: Option<&StreamStatus>,
 ) -> io::Result<u64> {
     use std::sync::atomic::Ordering;
     let cancelled = || {
@@ -1259,11 +1368,9 @@ fn copy_transport(
             break;
         }
         writer.flush()?;
-        if let Some(received_output) = received_output {
-            received_output.store(true, Ordering::Release);
-            if let Some(transport) = transport {
-                transport.awaiting_answer.store(false, Ordering::Release);
-            }
+        if let Some(status) = answered {
+            status.answered.store(true, Ordering::Release);
+            status.awaiting.store(false, Ordering::Release);
         }
     }
     Ok(total)
@@ -1282,6 +1389,7 @@ const DIAGNOSTIC_TAIL: usize = 512;
 fn capture_diagnostics(
     mut stderr: std::process::ChildStderr,
     stop: &Cancellation,
+    status: &StreamStatus,
 ) -> ForwardingDiagnostics {
     use std::io::Read;
     let mut captured = Vec::new();
@@ -1289,6 +1397,8 @@ fn capture_diagnostics(
     let mut chunk = [0u8; 1024];
     let marker = BRIDGE_ABSENT_MARKER.as_bytes();
     let mut marker_progress = Some(0usize);
+    let started = BRIDGE_STARTED_MARKER.as_bytes();
+    let mut started_progress = Some(0usize);
     let mut daemon_absent = false;
     let mut cancelled_bytes = 0usize;
     loop {
@@ -1307,9 +1417,16 @@ fn capture_diagnostics(
                     if *byte == b'\n' {
                         daemon_absent |= marker_progress == Some(marker.len());
                         marker_progress = Some(0);
+                        if started_progress == Some(started.len()) {
+                            status.reach(Reached::BridgeStarted);
+                        }
+                        started_progress = Some(0);
                     } else {
                         marker_progress = marker_progress.and_then(|index| {
                             (index < marker.len() && marker[index] == *byte).then_some(index + 1)
+                        });
+                        started_progress = started_progress.and_then(|index| {
+                            (index < started.len() && started[index] == *byte).then_some(index + 1)
                         });
                     }
                 }
@@ -1339,11 +1456,21 @@ fn capture_diagnostics(
         }
     }
     daemon_absent |= marker_progress == Some(marker.len());
-    ForwardingDiagnostics {
-        text: String::from_utf8_lossy(&captured).trim().to_owned(),
-        tail: String::from_utf8_lossy(tail.make_contiguous())
+    if started_progress == Some(started.len()) {
+        status.reach(Reached::BridgeStarted);
+    }
+    // The start receipt is for this computer, not part of what went wrong.
+    let without_receipt = |text: std::borrow::Cow<'_, str>| {
+        text.lines()
+            .filter(|line| line.trim() != BRIDGE_STARTED_MARKER)
+            .collect::<Vec<_>>()
+            .join("\n")
             .trim()
-            .to_owned(),
+            .to_owned()
+    };
+    ForwardingDiagnostics {
+        text: without_receipt(String::from_utf8_lossy(&captured)),
+        tail: without_receipt(String::from_utf8_lossy(tail.make_contiguous())),
         daemon_absent,
     }
 }
@@ -1540,33 +1667,58 @@ pub fn prepare() -> io::Result<()> {
                 actual,
             },
         )),
-        Err(crate::device_service::Failure::Failed(error)) => Err(match selected_unreachable() {
-            Some(reason) => unreachable_error(selected().unwrap(), reason),
-            None => io::Error::other(
-                format!(
-                    "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start`",
-                    selected().unwrap().name,
-                    selected().unwrap().host,
-                    selected().unwrap().host
-                ) + &SELECTED
-                    .get()
-                    .unwrap()
-                    .bridges
+        Err(crate::device_service::Failure::Failed(error)) => {
+            let last_error = SELECTED
+                .get()
+                .unwrap()
+                .bridges
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
+            .as_ref()
+            .and_then(|bridge| {
+                bridge
+                    .transport
+                    .last_error
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
-                .as_ref()
-                .and_then(|bridge| {
-                    bridge
-                        .transport
-                        .last_error
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone()
-                })
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            });
+            Err(failed_request_error(
+                selected().unwrap(),
+                selected_silence(),
+                &error,
+                last_error,
+            ))
+        }
+    }
+}
+/// What a first request to `device` that failed with `error` means: SSH
+/// never reached it, it was reached but said nothing in time, or the device
+/// answered and something else went wrong, as SSH's `last_error` may say.
+fn failed_request_error(
+    device: &Device,
+    silence: Option<Silence>,
+    error: &str,
+    last_error: Option<String>,
+) -> io::Error {
+    match silence {
+        Some(Silence::Unreachable(reason)) => unreachable_error(device, reason),
+        Some(Silence::Slow(reached)) => io::Error::new(
+            io::ErrorKind::TimedOut,
+            Unresponsive {
+                device: device.name.clone(),
+                host: device.host.clone(),
+                reached,
+            },
+        ),
+        None => io::Error::other(
+            format!(
+                "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start`",
+                device.name, device.host, device.host
+            ) + &last_error
                 .map(|error| format!("; {error}"))
                 .unwrap_or_default(),
-            ),
-        }),
+        ),
     }
 }
 /// The error for `device`, which SSH could not reach, saying `reason`.
@@ -1672,6 +1824,16 @@ fn save_to_path(path: &Path, device: Device) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// What SSH said when the newest stream failed on its own.
+    fn newest_unreachable(transport: &Transport) -> Option<String> {
+        transport
+            .stream
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|status| status.unreachable.lock().unwrap().clone())
+    }
+
     fn fixture_transport(device: Device, directory: PathBuf) -> Arc<Transport> {
         Arc::new(Transport {
             device,
@@ -1680,8 +1842,7 @@ mod tests {
             pool: Arc::new(Mutex::new(Vec::new())),
             paused: Mutex::new(None),
             last_error: Mutex::new(None),
-            unreachable: Mutex::new(None),
-            awaiting_answer: std::sync::atomic::AtomicBool::new(false),
+            stream: Mutex::new(None),
             daemon_missing: std::sync::atomic::AtomicBool::new(false),
             cancelled: Cancellation::new().unwrap(),
         })
@@ -2086,7 +2247,7 @@ mod tests {
                 "EOF must observe the settled remote receipt"
             );
             assert_eq!(
-                transport.unreachable.lock().unwrap().as_deref(),
+                newest_unreachable(&transport).as_deref(),
                 unreachable,
                 "{diagnostic}"
             );
@@ -2123,7 +2284,7 @@ mod tests {
             let worker = thread::spawn(move || forwarding.finish(&device));
             let _ = client.read_to_end(&mut Vec::new());
             let _ = worker.join().unwrap();
-            transport.unreachable.lock().unwrap().clone()
+            newest_unreachable(&transport)
         };
         let refused =
             "printf 'ssh: connect to host fixture port 22: Connection refused\\n' >&2; exit 255";
@@ -2188,11 +2349,13 @@ mod tests {
         // SSH still connecting, as to a host that drops its packets.
         let (_client, silent) = start("exec sleep 30");
         assert_eq!(
-            unreachable_reason(&transport).as_deref(),
-            Some("it did not answer in time")
+            silence(&transport),
+            Some(Silence::Unreachable(
+                "it did not answer within 30 seconds".into()
+            ))
         );
         drop(silent);
-        assert_eq!(unreachable_reason(&transport), None);
+        assert_eq!(silence(&transport), None);
         // A device that has answered is reached, however slow what follows.
         let (mut client, answered) = start("printf answer; exec sleep 30");
         let mut first = [0u8; 6];
@@ -2200,8 +2363,139 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         std::io::Read::read_exact(&mut client, &mut first).unwrap();
-        assert_eq!(unreachable_reason(&transport), None);
+        assert_eq!(silence(&transport), None);
         drop(answered);
+
+        // Each stream answers for itself: an older one ending says nothing
+        // about the newest, which a caller that just connected waits on.
+        let (_older_client, older) = start("exec sleep 30");
+        let (_newest_client, newest) = start("exec sleep 30");
+        drop(older);
+        assert!(matches!(silence(&transport), Some(Silence::Unreachable(_))));
+        drop(newest);
+    }
+
+    /// A device whose bridge said it started, then nothing more, was reached:
+    /// it is slow, not unreachable, and the receipt is no part of what went
+    /// wrong (#4486).
+    #[test]
+    fn a_device_whose_bridge_started_and_then_said_nothing_is_slow() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(
+            Device {
+                name: "fixture".into(),
+                host: "unused-fixture".into(),
+                executable: "cagents".into(),
+            },
+            directory.path().to_path_buf(),
+        );
+        let start = |script: &str| {
+            let child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (client, server) = UnixStream::pair().unwrap();
+            (
+                client,
+                Forwarding::start(child, server, Some(transport.clone())).unwrap(),
+            )
+        };
+        let (_client, started) = start(&format!(
+            "printf 'Welcome\\n{BRIDGE_STARTED_MARKER}\\n' >&2; exec sleep 30"
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while silence(&transport) != Some(Silence::Slow(Reached::BridgeStarted)) {
+            assert!(Instant::now() < deadline, "{:?}", silence(&transport));
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(started);
+
+        // SSH failing after the bridge started is the connection dropping,
+        // not the device being out of reach.
+        let (mut client, dropped) = start(&format!(
+            "printf '{BRIDGE_STARTED_MARKER}\\nConnection closed by 192.0.2.1 port 22\\n' >&2; exit 255"
+        ));
+        let device = transport.device.clone();
+        let worker = thread::spawn(move || dropped.finish(&device));
+        let _ = std::io::Read::read_to_end(&mut client, &mut Vec::new());
+        let _ = worker.join().unwrap();
+        assert_eq!(newest_unreachable(&transport), None);
+        let last_error = transport.last_error.lock().unwrap().clone().unwrap();
+        assert!(!last_error.contains(BRIDGE_STARTED_MARKER), "{last_error}");
+        assert!(last_error.contains("Connection closed by"), "{last_error}");
+    }
+
+    /// prepare() reports a device SSH never reached as unreachable, one it
+    /// reached that said nothing as slow, with what to try for each, and
+    /// anything else as the failure it was (#4486).
+    #[test]
+    fn a_failed_first_request_names_how_far_it_got() {
+        let device = Device {
+            name: "build-host".into(),
+            host: "me@build-host".into(),
+            executable: "cagents".into(),
+        };
+        let never = failed_request_error(
+            &device,
+            Some(Silence::Unreachable(
+                "it did not answer within 30 seconds".into(),
+            )),
+            "timed out",
+            None,
+        );
+        assert_eq!(
+            never.to_string(),
+            "build-host could not be reached over SSH: it did not answer within 30 seconds. Check that `ssh me@build-host` connects without asking for a password, then try again."
+        );
+        assert!(unreachable(&never).is_some());
+        assert!(unresponsive(&never).is_none());
+
+        let busy = failed_request_error(
+            &device,
+            Some(Silence::Slow(Reached::BridgeStarted)),
+            "timed out",
+            None,
+        );
+        assert_eq!(busy.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            busy.to_string(),
+            "build-host was reached over SSH, but its cagents daemon did not answer within 30 seconds. It may be busy or stuck: try again, or check it with `ssh me@build-host cagents daemon status`."
+        );
+        assert!(unreachable(&busy).is_none());
+        assert!(!reads_as_unreachable(&busy.to_string()));
+        assert!(reads_as_unresponsive(&format!("cagents: {busy}")));
+
+        let login = failed_request_error(
+            &device,
+            Some(Silence::Slow(Reached::LoggedIn)),
+            "timed out",
+            None,
+        );
+        assert_eq!(
+            unresponsive(&login).map(|slow| slow.reached),
+            Some(Reached::LoggedIn)
+        );
+        assert!(
+            login
+                .to_string()
+                .contains("cagents did not start there within 30 seconds")
+        );
+
+        let other = failed_request_error(
+            &device,
+            None,
+            "handshake refused",
+            Some("SSH to me@build-host exited 1: no such file".into()),
+        );
+        assert!(unreachable(&other).is_none() && unresponsive(&other).is_none());
+        assert_eq!(
+            other.to_string(),
+            "could not connect to device build-host (SSH host me@build-host): handshake refused; verify `ssh me@build-host cagents daemon start`; SSH to me@build-host exited 1: no such file"
+        );
     }
 
     #[test]
