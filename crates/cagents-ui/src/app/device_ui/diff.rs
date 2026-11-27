@@ -247,6 +247,7 @@ impl Cagents {
                     return Task::none();
                 };
                 let key = key.clone();
+                let path = rows[index].entry.path.clone();
                 let selection = vec![rows[index].selection()];
                 // What it moves on to once this change leaves the group.
                 let after = rows
@@ -286,6 +287,16 @@ impl Cagents {
                 } else {
                     Self::stage_task(key.clone(), operation, selection)
                 };
+                let change = change.map(move |mut action| {
+                    if let cosmic::Action::App(Message::SourceControlMutated {
+                        report: Some(report),
+                        ..
+                    }) = &mut action
+                    {
+                        *report = format!("{path}\n{report}");
+                    }
+                    action
+                });
                 let next = match after {
                     Some(request) => self.open_device_diff(key, request, Some(area)),
                     None => self.update_device(super::Action::Close),
@@ -363,6 +374,16 @@ impl Cagents {
             .iter()
             .position(|row| row.entry.path == diff.request.path);
         Some((&diff.key, area, rows, index))
+    }
+
+    fn device_diff_notice(&self, key: &ActiveWorktreeKey) -> Option<&str> {
+        self.device_ui.notice.as_deref().or_else(|| {
+            self.sidebar_model
+                .source_control
+                .as_ref()
+                .filter(|source| source.key == *key)
+                .and_then(|source| source.error.as_deref())
+        })
     }
 
     pub(super) fn device_diff_layout(&self, size: iced::Size) -> Option<Element<'_, Message>> {
@@ -490,26 +511,37 @@ impl Cagents {
                     .into(),
             );
         }
-        // The name, the way through the group and the actions stay in
-        // place; only the change scrolls.
-        let height = (size.height - CHROME_HEIGHT).max(120.0);
+        // A stage can finish after the dialog advances. Keep its result
+        // above the patch so it remains visible while reading the next file.
+        let mut rows = vec![
+            widget::row::with_children(header)
+                .spacing(space::XS)
+                .align_y(Alignment::Start)
+                .into(),
+        ];
+        let mut chrome_height = CHROME_HEIGHT;
+        if let Some(notice) = self.device_diff_notice(&diff.key) {
+            const NOTICE_HEIGHT: f32 = 64.0;
+            rows.push(dialog_ui::scrolled_region(
+                design::body(notice)
+                    .class(cosmic::theme::Text::Custom(design::destructive_text))
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                NOTICE_HEIGHT,
+            ));
+            chrome_height += NOTICE_HEIGHT + space::M;
+        }
+        let height = (size.height - chrome_height).max(120.0);
+        rows.extend([
+            widget::container(dialog_ui::scrolled_region(body, height))
+                .height(height)
+                .into(),
+            widget::row::with_children(actions)
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+        ]);
         Some(dialog_ui::surface(
-            widget::column::with_children(vec![
-                widget::row::with_children(header)
-                    .spacing(space::XS)
-                    .align_y(Alignment::Start)
-                    .into(),
-                // One height whatever the change, so stepping through a
-                // group leaves Previous, Next and Stage where they were.
-                widget::container(dialog_ui::scrolled_region(body, height))
-                    .height(height)
-                    .into(),
-                widget::row::with_children(actions)
-                    .spacing(space::S)
-                    .align_y(Alignment::Center)
-                    .into(),
-            ])
-            .spacing(space::M),
+            widget::column::with_children(rows).spacing(space::M),
             width,
         ))
     }
@@ -525,7 +557,35 @@ fn opened_view() -> patch_view::ViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::WorktreeId;
     use crate::repository::DiffSide;
+
+    #[test]
+    fn the_next_device_diff_shows_the_worktrees_stage_failure() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: WorktreeId::new(),
+            canonical_path: "/repo".into(),
+        };
+        let mut source = sidebar::SourceControlModel::loading(key.clone());
+        source.set_error(Some("Stage could not update the Git index.".into()));
+        app.sidebar_model.source_control = Some(source);
+        assert_eq!(
+            app.device_diff_notice(&key),
+            Some("Stage could not update the Git index.")
+        );
+        let another = ActiveWorktreeKey {
+            worktree_id: WorktreeId::new(),
+            ..key.clone()
+        };
+        assert_eq!(app.device_diff_notice(&another), None);
+        app.device_ui.notice = Some("Another change to this worktree is still running.".into());
+        assert_eq!(
+            app.device_diff_notice(&key),
+            Some("Another change to this worktree is still running.")
+        );
+    }
 
     fn text(text: &str) -> DiffSide {
         DiffSide::Text {
