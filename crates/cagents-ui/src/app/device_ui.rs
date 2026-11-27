@@ -3155,9 +3155,9 @@ mod tests {
         assert_eq!(app.device_ui.path, "/srv/device-only/other");
         settle(&mut app);
 
-        // Confirming a worktree's deletion reaches the deletion rather than
-        // being refused as local work. Without session storage here, the
-        // deletion itself declines, in the dialog.
+        // Confirming a worktree's deletion passes the device window's gate
+        // rather than being refused as local work. Here, without session
+        // storage, the dialog's own first check then declines it.
         drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
             project_id,
             worktree_id: Some(linked_id),
