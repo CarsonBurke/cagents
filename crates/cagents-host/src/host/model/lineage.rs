@@ -383,28 +383,62 @@ impl Registry {
         lineage_members_in(&self.db, lineage)
     }
 
-    /// The sessions of `lineage`, the latest registered first, ending with
-    /// its root. Rows are written once, before their session starts, so
-    /// their order is the order the sessions succeeded one another.
+    /// The sessions of `lineage`, the latest first, ending with its root.
+    ///
+    /// A session that succeeded another records its predecessor when it is
+    /// registered, before it starts, so those sessions are newer than every
+    /// session without one and their rows are in the order they succeeded one
+    /// another. The schema-4 migration seeded a lineage's earlier sessions
+    /// without predecessors and in UUID order, which says nothing about when
+    /// each ran; of those, one a later session names as its predecessor is
+    /// the latest, and the rest keep row order only for want of better.
     pub(crate) fn lineage_succession(&self, lineage: Lineage) -> Result<Vec<TerminalId>, String> {
         let mut statement = self
             .db
             .prepare_cached(
-                "SELECT session_id FROM session_lineages WHERE lineage = ?1 ORDER BY rowid DESC",
+                "SELECT l.session_id, p.predecessor FROM session_lineages l
+                 LEFT JOIN session_lineage_predecessors p ON p.successor = l.session_id
+                 WHERE l.lineage = ?1 ORDER BY l.rowid DESC",
             )
             .map_err(|error| error.to_string())?;
-        let mut sessions = statement
-            .query_map([lineage.to_string()], |row| row.get::<_, String>(0))
+        let parse = |id: String| {
+            id.parse::<TerminalId>()
+                .map_err(|_| "Stored session lineage is invalid".to_owned())
+        };
+        let rows = statement
+            .query_map([lineage.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
             .map_err(|error| error.to_string())?
             .map(|row| {
-                row.map_err(|error| error.to_string())?
-                    .parse()
-                    .map_err(|_| "Stored session lineage is invalid".to_owned())
+                let (session, predecessor) = row.map_err(|error| error.to_string())?;
+                Ok((parse(session)?, predecessor.map(parse).transpose()?))
             })
-            .collect::<Result<Vec<TerminalId>, String>>()?;
-        if !sessions.contains(&lineage.0) {
-            sessions.push(lineage.0);
-        }
+            .collect::<Result<Vec<(TerminalId, Option<TerminalId>)>, String>>()?;
+        let continued: std::collections::HashSet<TerminalId> = rows
+            .iter()
+            .filter_map(|(_, predecessor)| *predecessor)
+            .collect();
+        // Successors in row order, then a seeded session a successor
+        // continued, then the other seeded sessions, then the root.
+        let mut ranked: Vec<(u8, TerminalId)> = rows
+            .into_iter()
+            .filter(|(session, _)| *session != lineage.0)
+            .map(|(session, predecessor)| {
+                let rank = if predecessor.is_some() {
+                    0
+                } else if continued.contains(&session) {
+                    1
+                } else {
+                    2
+                };
+                (rank, session)
+            })
+            .collect();
+        ranked.sort_by_key(|(rank, _)| *rank);
+        let mut sessions: Vec<TerminalId> =
+            ranked.into_iter().map(|(_, session)| session).collect();
+        sessions.push(lineage.0);
         Ok(sessions)
     }
 
@@ -685,6 +719,12 @@ mod tests {
         assert_eq!(
             registry.notice_predecessors(exact).unwrap(),
             [newer, root].into()
+        );
+        // The session a successor continued is the latest seeded one, though
+        // its row and its UUID put it below an older one.
+        assert_eq!(
+            registry.lineage_succession(Lineage(root)).unwrap(),
+            [exact, newer, older, root]
         );
     }
 
