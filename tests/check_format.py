@@ -133,7 +133,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate"],
+                        [str(self.root), "cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate", "-p", "cagents-browser-import"],
                         [str(self.root), "rustfmt", "--edition", "2024", "--check", *INCLUDED],
                     ],
                 )
@@ -154,7 +154,7 @@ sys.exit({status})
                 self.assertEqual(
                     [json.loads(line) for line in log.read_text().splitlines()],
                     [
-                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate"],
+                        [str(self.root), "cargo", "fmt", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate", "-p", "cagents-browser-import"],
                         [str(self.root), "rustfmt", "--edition", "2024", *INCLUDED],
                     ],
                 )
@@ -634,17 +634,21 @@ sys.exit({status})
         env = cargo_fixture.private_cargo_environment(home.name)
         self.exercise_included_sources(env)
 
-        dictate = "crates/cagents-dictate/src/main.rs"
-        malformed = "fn   main( ) { }\n"
-        self.write(dictate, malformed)
-        checked = self.run_checker(env)
-        self.assertNotEqual(checked.returncode, 0)
-        self.assertIn(dictate, checked.stdout + checked.stderr)
-        self.assertEqual((self.root / dictate).read_text(), malformed)
+        # Workspace members outside the default set are checked by name.
+        for member in ("crates/cagents-dictate/src/main.rs", "crates/browser-import/src/lib.rs"):
+            with self.subTest(member=member):
+                original = (self.root / member).read_text()
+                malformed = "fn   main( ) { }\n"
+                self.write(member, malformed)
+                checked = self.run_checker(env)
+                self.assertNotEqual(checked.returncode, 0)
+                self.assertIn(member, checked.stdout + checked.stderr)
+                self.assertEqual((self.root / member).read_text(), malformed)
+                self.write(member, original)
 
     def exercise_included_sources(self, env):
         self.write("Cargo.toml", """[workspace]
-members = [".", "crates/cagents-host", "crates/cagents-ui", "crates/cagents-ui-kit", "crates/cagents-dictate"]
+members = [".", "crates/cagents-host", "crates/cagents-ui", "crates/cagents-ui-kit", "crates/cagents-dictate", "crates/browser-import"]
 [package]
 name = "cagents"
 version = "0.0.0"
@@ -666,6 +670,12 @@ version = "0.0.0"
 edition = "2024"
 """)
         self.write("crates/cagents-dictate/src/main.rs", "fn main() {}\n")
+        self.write("crates/browser-import/Cargo.toml", """[package]
+name = "cagents-browser-import"
+version = "0.0.0"
+edition = "2024"
+""")
+        self.write("crates/browser-import/src/lib.rs", "pub fn import() {}\n")
         self.write("crates/cagents-ui-kit/src/lib.rs", "pub fn kit() {}\n")
         self.write("crates/cagents-host/Cargo.toml", """[package]
 name = "cagents-host"
@@ -694,7 +704,7 @@ include!("../tests/support/repository_scale.rs");
                 path.write_text(original + "fn   malformed( ) { }\n")
                 before = {path: path.read_bytes() for path in self.root.rglob("*.rs")}
                 cargo = subprocess.run(
-                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate"],
+                    ["cargo", "fmt", "--check", "-p", "cagents", "-p", "cagents-host", "-p", "cagents-ui", "-p", "cagents-ui-kit", "-p", "cagents-dictate", "-p", "cagents-browser-import"],
                     cwd=self.root, env=env,
                     capture_output=True, text=True, timeout=HANG_GUARD,
                 )

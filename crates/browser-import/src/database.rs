@@ -1,6 +1,6 @@
-use crate::{Batch, Cookie, Error, Keys, Profile, SameSite, Site, cancelled};
+use crate::{Batch, Cookie, Error, Keys, Profile, SameSite, Site, cancelled, chromium::Decryptor};
 use rusqlite::{
-    Connection, OpenFlags,
+    Connection, MAIN_DB, OpenFlags,
     backup::{Backup, StepResult},
     config::DbConfig,
 };
@@ -19,11 +19,33 @@ fn sql(error: rusqlite::Error) -> Error {
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
             Error::Busy
         }
+        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => {
+            Error::Damaged
+        }
         _ => Error::Unreadable,
     }
 }
 
+/// A private in-memory copy of the profile's database, so reading never
+/// writes to the browser's files or holds their locks while records are read.
 fn snapshot(profile: &Profile, cancel: &AtomicBool) -> Result<Connection, Error> {
+    match backup(profile, cancel) {
+        // A running Firefox holds its cookie database under an exclusive lock
+        // that SQLite readers cannot pass, but the files remain readable.
+        Err(Error::Busy) => {
+            let image = crate::locked::image(&profile.database, MAX_DATABASE, cancel)?;
+            let mut connection = Connection::open_in_memory().map_err(sql)?;
+            harden(&connection)?;
+            connection
+                .deserialize_read_exact(MAIN_DB, &image[..], image.len(), true)
+                .map_err(sql)?;
+            Ok(connection)
+        }
+        result => result,
+    }
+}
+
+fn backup(profile: &Profile, cancel: &AtomicBool) -> Result<Connection, Error> {
     cancelled(cancel)?;
     let metadata = std::fs::metadata(&profile.database).map_err(|_| Error::Unreadable)?;
     if !metadata.is_file() {
@@ -140,7 +162,7 @@ fn firefox_version(profile: &Profile, connection: &Connection) -> Result<i64, Er
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(sql)?;
     if !(1..=17).contains(&version) {
-        return Err(Error::Unsupported);
+        return Err(Error::UnsupportedSchema);
     }
     Ok(version)
 }
@@ -166,7 +188,7 @@ fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String
             .next()
             .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
     {
-        return Err(Error::Unsupported);
+        return Err(Error::UnsupportedSchema);
     }
     // These static identifiers name ordinary browser tables. `table_info`
     // omits generated columns; `table_xinfo` lets us reject those too, before
@@ -178,7 +200,7 @@ fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String
     let mut columns = BTreeSet::new();
     while let Some(row) = rows.next().map_err(sql)? {
         if row.get::<_, i64>(6).map_err(sql)? != 0 {
-            return Err(Error::Unsupported);
+            return Err(Error::UnsupportedSchema);
         }
         columns.insert(row.get(1).map_err(sql)?);
     }
@@ -196,6 +218,7 @@ pub(super) fn extract(
         return Ok(Batch {
             cookies: Vec::new(),
             skipped: 0,
+            undecryptable: 0,
         });
     }
     let connection = snapshot(profile, cancel)?;
@@ -213,7 +236,7 @@ pub(super) fn extract(
             })
             .map_err(sql)?
             .parse()
-            .map_err(|_| Error::Unsupported)?
+            .map_err(|_| Error::UnsupportedSchema)?
     } else {
         0
     };
@@ -256,8 +279,10 @@ pub(super) fn extract(
     let mut batch = Batch {
         cookies: Vec::new(),
         skipped: 0,
+        undecryptable: 0,
     };
-    let mut cached = None;
+    let mut decryptor = profile.browser.keyring().map(Decryptor::new);
+    let mut unsupported = 0;
     let mut count = 0;
     let mut imported_bytes = 0usize;
     while let Some(row) = rows.next().map_err(sql)? {
@@ -307,14 +332,20 @@ pub(super) fn extract(
         let value = if encrypted.is_empty() {
             Zeroizing::new(row.get::<_, String>(3).map_err(sql)?)
         } else {
-            crate::chromium::decrypt(
-                &encrypted,
-                &raw_host,
-                version,
-                profile.browser,
-                keys,
-                &mut cached,
-            )?
+            let Some(decryptor) = decryptor.as_mut() else {
+                return Err(Error::UnsupportedSchema);
+            };
+            match decryptor.decrypt(&encrypted, &raw_host, version, keys) {
+                Ok(value) => value,
+                // One value written under an older key, or in a scheme this
+                // importer can't read, must not cost the rest of the profile.
+                Err(error @ (Error::Decryption | Error::UnsupportedEncryption)) => {
+                    batch.undecryptable += 1;
+                    unsupported += usize::from(error == Error::UnsupportedEncryption);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         };
         if !path.starts_with('/')
             || path.len() > 4096
@@ -330,7 +361,7 @@ pub(super) fn extract(
         }
         imported_bytes = imported_bytes.saturating_add(value.len() + name.len() + path.len());
         if imported_bytes > 16 * 1024 * 1024 || batch.cookies.len() >= 20_000 {
-            return Err(Error::TooLarge);
+            return Err(Error::TooManySelected);
         }
         let same_site = match site {
             0 => SameSite::None,
@@ -350,6 +381,15 @@ pub(super) fn extract(
             expires_unix,
         });
     }
+    // If nothing selected could be decrypted, the key is wrong for the whole
+    // profile: say so instead of reporting an empty import.
+    if batch.cookies.is_empty() && batch.undecryptable > 0 {
+        return Err(if unsupported == batch.undecryptable {
+            Error::UnsupportedEncryption
+        } else {
+            Error::Decryption
+        });
+    }
     Ok(batch)
 }
 
@@ -364,10 +404,10 @@ fn valid_host(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Browser;
+    use crate::{Browser, Install, Keyring};
     struct NoKeys;
     impl Keys for NoKeys {
-        fn password(&mut self, _: Browser) -> Result<Zeroizing<Vec<u8>>, Error> {
+        fn passwords(&mut self, _: Keyring) -> Result<Vec<Zeroizing<Vec<u8>>>, Error> {
             panic!("Firefox needs no keyring")
         }
     }
@@ -376,6 +416,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let profile = Profile {
             browser: Browser::Firefox,
+            install: Install::System,
             name: "Fixture".into(),
             database: directory.path().join("cookies.sqlite"),
         };
@@ -414,6 +455,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let profile = Profile {
             browser: Browser::Firefox,
+            install: Install::System,
             name: "Schema fixture".into(),
             database: directory.path().join("cookies.sqlite"),
         };
@@ -446,10 +488,13 @@ mod tests {
         }
         for unknown in [-1, 0, 18] {
             source.pragma_update(None, "user_version", unknown).unwrap();
-            assert_eq!(scan(&profile, &cancel).err(), Some(Error::Unsupported));
+            assert_eq!(
+                scan(&profile, &cancel).err(),
+                Some(Error::UnsupportedSchema)
+            );
             assert_eq!(
                 extract(&profile, &selected, &mut NoKeys, &cancel, now).err(),
-                Some(Error::Unsupported)
+                Some(Error::UnsupportedSchema)
             );
         }
     }
@@ -462,6 +507,7 @@ mod tests {
         for browser in [Browser::Chrome, Browser::Firefox] {
             let profile = Profile {
                 browser,
+                install: Install::System,
                 name: "Security fixture".into(),
                 database: directory.path().join(browser.label()),
             };
@@ -486,6 +532,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let profile = Profile {
             browser: Browser::Firefox,
+            install: Install::System,
             name: "Untrusted schema".into(),
             database: directory.path().join("cookies.sqlite"),
         };
@@ -498,7 +545,10 @@ mod tests {
             "CREATE VIRTUAL TABLE moz_cookies USING fts5(host);",
         ] {
             source.execute_batch(schema).unwrap();
-            assert_eq!(scan(&profile, &cancel).err(), Some(Error::Unsupported));
+            assert_eq!(
+                scan(&profile, &cancel).err(),
+                Some(Error::UnsupportedSchema)
+            );
             assert_eq!(
                 extract(
                     &profile,
@@ -508,7 +558,7 @@ mod tests {
                     1_700_000_000
                 )
                 .err(),
-                Some(Error::Unsupported)
+                Some(Error::UnsupportedSchema)
             );
             source
                 .execute_batch(if schema.starts_with("CREATE VIEW") {
@@ -540,6 +590,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let profile = Profile {
             browser: Browser::Firefox,
+            install: Install::System,
             name: "Metadata fixture".into(),
             database: directory.path().join("cookies.sqlite"),
         };
@@ -573,26 +624,33 @@ mod tests {
         assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 
+    /// A running Firefox keeps `cookies.sqlite` in WAL mode under an
+    /// exclusive lock. Its committed cookies, including those only in the
+    /// log, are still read; an open transaction's are not.
     #[test]
-    fn a_locked_database_is_a_retryable_error_and_cancel_never_opens_it() {
+    fn a_running_browsers_locked_database_is_read_and_cancel_never_opens_it() {
         let directory = tempfile::tempdir().unwrap();
         let profile = Profile {
             browser: Browser::Firefox,
+            install: Install::System,
             name: "Locked".into(),
             database: directory.path().join("cookies.sqlite"),
         };
         let source = Connection::open(&profile.database).unwrap();
-        source.execute_batch("PRAGMA user_version=15; CREATE TABLE moz_cookies(host TEXT); BEGIN EXCLUSIVE; INSERT INTO moz_cookies VALUES('example.test');").unwrap();
+        source.execute_batch("PRAGMA user_version=17; PRAGMA journal_mode=WAL; PRAGMA locking_mode=EXCLUSIVE; CREATE TABLE moz_cookies(host TEXT); INSERT INTO moz_cookies VALUES('committed.test'); BEGIN EXCLUSIVE; INSERT INTO moz_cookies VALUES('pending.test');").unwrap();
         assert_eq!(
-            scan(&profile, &AtomicBool::new(false)).err(),
-            Some(Error::Busy)
+            scan(&profile, &AtomicBool::new(false)).unwrap(),
+            [Site {
+                host: "committed.test".into(),
+                cookies: 1
+            }]
         );
         assert_eq!(
             scan(&profile, &AtomicBool::new(true)).err(),
             Some(Error::Cancelled)
         );
-        source.execute_batch("ROLLBACK").unwrap();
-        assert!(scan(&profile, &AtomicBool::new(false)).unwrap().is_empty());
+        source.execute_batch("COMMIT").unwrap();
+        assert_eq!(scan(&profile, &AtomicBool::new(false)).unwrap().len(), 2);
     }
 
     #[test]
@@ -600,6 +658,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let profile = Profile {
             browser: Browser::Chrome,
+            install: Install::System,
             name: "Chromium partition fixture".into(),
             database: directory.path().join("Cookies"),
         };
@@ -622,13 +681,14 @@ mod tests {
     fn selected_chromium_profiles_report_keyring_denial_without_exposing_values() {
         struct Denied;
         impl Keys for Denied {
-            fn password(&mut self, _: Browser) -> Result<Zeroizing<Vec<u8>>, Error> {
+            fn passwords(&mut self, _: Keyring) -> Result<Vec<Zeroizing<Vec<u8>>>, Error> {
                 Err(Error::KeyringDenied)
             }
         }
         let directory = tempfile::tempdir().unwrap();
         let profile = Profile {
             browser: Browser::Chrome,
+            install: Install::System,
             name: "Fixture".into(),
             database: directory.path().join("Cookies"),
         };
@@ -653,5 +713,71 @@ mod tests {
         .unwrap();
         assert_eq!(error, Error::KeyringDenied);
         assert!(!error.to_string().contains("session"));
+    }
+
+    /// Helium stores its key under Chromium's name. A value written under
+    /// an older key is skipped and counted; the rest of the profile imports.
+    #[test]
+    fn chromium_forks_use_their_keyring_name_and_skip_stale_values() {
+        struct Keyrings(Vec<Keyring>);
+        impl Keys for Keyrings {
+            fn passwords(&mut self, keyring: Keyring) -> Result<Vec<Zeroizing<Vec<u8>>>, Error> {
+                self.0.push(keyring);
+                Ok(vec![Zeroizing::new(b"fixture-password".to_vec())])
+            }
+        }
+        let encrypt = crate::chromium::tests::encrypt;
+        let directory = tempfile::tempdir().unwrap();
+        let profile = Profile {
+            browser: Browser::Helium,
+            install: Install::System,
+            name: "Primary".into(),
+            database: directory.path().join("Cookies"),
+        };
+        let source = Connection::open(&profile.database).unwrap();
+        source.execute_batch("CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES('version','24'); CREATE TABLE cookies(host_key TEXT,path TEXT,name TEXT,value TEXT,encrypted_value BLOB,is_secure INTEGER,is_httponly INTEGER,samesite INTEGER,expires_utc INTEGER,top_frame_site_key TEXT);").unwrap();
+        for (name, value) in [
+            (
+                "current",
+                encrypt(b"v11", b"fixture-password", "example.test", 24),
+            ),
+            (
+                "stale",
+                encrypt(b"v11", b"replaced-password", "example.test", 24),
+            ),
+            ("portal", b"v12unsupported".to_vec()),
+        ] {
+            source
+                .execute(
+                    "INSERT INTO cookies VALUES('example.test','/',?1,'',?2,1,1,0,0,'')",
+                    rusqlite::params![name, value],
+                )
+                .unwrap();
+        }
+        let selected = BTreeSet::from(["example.test".into()]);
+        let cancel = AtomicBool::new(false);
+        let mut keys = Keyrings(Vec::new());
+        let batch = extract(&profile, &selected, &mut keys, &cancel, 0).unwrap();
+        assert_eq!(keys.0, [Keyring::Chromium]);
+        assert_eq!(batch.cookies.len(), 1);
+        assert_eq!(batch.cookies[0].name, "current");
+        assert_eq!(batch.cookies[0].value.as_str(), "fixture-cookie-value");
+        assert_eq!(batch.undecryptable, 2);
+        // When nothing decrypts, the profile reports why instead of an
+        // empty import.
+        source
+            .execute("DELETE FROM cookies WHERE name = 'current'", [])
+            .unwrap();
+        assert_eq!(
+            extract(&profile, &selected, &mut keys, &cancel, 0).err(),
+            Some(Error::Decryption)
+        );
+        source
+            .execute("DELETE FROM cookies WHERE name = 'stale'", [])
+            .unwrap();
+        assert_eq!(
+            extract(&profile, &selected, &mut keys, &cancel, 0).err(),
+            Some(Error::UnsupportedEncryption)
+        );
     }
 }
