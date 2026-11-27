@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    device_stats::{DeviceStats, SAMPLE_INTERVAL, Sampler, Shown},
+    device_stats::{DeviceStats, SAMPLE_INTERVAL, Sampler},
     model::HostSessionProof,
     terminal_ipc::ServerMessage,
 };
@@ -35,7 +35,8 @@ struct Inner {
     watchers: BTreeMap<ClientId, Watcher>,
     sampling: bool,
     revision: u64,
-    latest: Option<(DeviceStats, Shown)>,
+    /// The last reading sent, which is what every watcher shows.
+    latest: Option<DeviceStats>,
 }
 
 struct Watcher {
@@ -70,7 +71,10 @@ impl Watch {
                 }
                 next
             })
-            .map_err(|error| format!("The device's load could not be read: {error}"))?;
+            .map_err(|error| {
+                inner.watchers.remove(&client);
+                format!("The device's load could not be read: {error}")
+            })?;
             inner.sampling = true;
         }
         Ok(answer)
@@ -87,7 +91,7 @@ impl Watch {
             // A reading from an earlier watch is stale by now.
             inner.latest = None;
         }
-        (inner.revision, inner.latest.map(|(stats, _)| stats))
+        (inner.revision, inner.latest)
     }
 
     pub(super) fn unwatch(&self, client: ClientId) {
@@ -103,13 +107,15 @@ impl Watch {
         // Read outside the lock: a home directory on a stalled network file
         // system may hold up `statvfs`, and that must not hold up a watch.
         let stats = sampler.sample();
-        let shown = stats.shown();
         let mut inner = self.inner();
-        if inner.latest.is_some_and(|(_, previous)| previous == shown) {
+        if inner
+            .latest
+            .is_some_and(|latest| !latest.superseded_by(&stats))
+        {
             return Next::Continue;
         }
         inner.revision += 1;
-        inner.latest = Some((stats, shown));
+        inner.latest = Some(stats);
         let revision = inner.revision;
         inner.watchers.retain(|_, watcher| {
             let Some(delivery) = watcher.delivery.upgrade() else {

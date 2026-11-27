@@ -771,7 +771,15 @@ impl Cagents {
                     self.device_ui.switching = None;
                 }
                 match result {
-                    Ok(()) if replace => return self.exit_after_language_servers(),
+                    Ok(()) if replace => {
+                        let exit = self.exit_after_language_servers();
+                        // A window that may not close yet stays on this
+                        // device, and says so.
+                        if self.exit.is_none() {
+                            self.device_ui.switching = None;
+                        }
+                        return exit;
+                    }
                     Ok(()) => {}
                     Err(OpenFailure::Needs { need, blocked }) => {
                         return self.update_device_update(device_update_ui::Action::Offer {
@@ -1334,11 +1342,10 @@ impl Cagents {
                     } else {
                         format!("Switch this window to {label}")
                     })
-                    // The open device is already this window's: pressing it
-                    // has nothing to do, so it is not offered.
-                    .on_press_maybe(
-                        (enabled && !current).then_some(Message::Device(Action::Device(index))),
-                    );
+                    // Pressing the open device changes nothing, but the row
+                    // stays live, so the device this window works on never
+                    // looks unavailable.
+                    .on_press_maybe(enabled.then_some(Message::Device(Action::Device(index))));
                 if current {
                     row = row.trailing(
                         widget::icon(Icon::Check.handle())

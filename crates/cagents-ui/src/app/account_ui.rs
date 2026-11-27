@@ -1737,8 +1737,9 @@ pub(super) enum ChipTone {
 
 impl ChipTone {
     /// How current figures read, from the provider's own verdict and from
-    /// how full the window the chip leads with is. Healthy accounts stay
-    /// neutral, so only an account in trouble draws the eye along the bar.
+    /// how full the window the chip leads with is. Healthy accounts keep the
+    /// accent every gauge shares, so only an account in trouble stands out
+    /// along the bar.
     fn of_usage(status: UsageStatus, used: f32) -> Self {
         if status == UsageStatus::Limited || used > design::BUDGET_CRITICAL {
             Self::Exhausted
@@ -1749,7 +1750,7 @@ impl ChipTone {
         }
     }
 
-    /// The color the chip's gauge takes, or `None` for the neutral stroke.
+    /// The color the chip's gauge takes, or `None` for the gauges' accent.
     pub(super) fn color(self) -> Option<fn(&cosmic::Theme) -> cosmic::iced::Color> {
         match self {
             Self::Low | Self::Attention => Some(design::warning_color),

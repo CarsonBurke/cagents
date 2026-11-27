@@ -66,38 +66,42 @@ impl Disk {
     }
 }
 
-impl DeviceStats {
-    /// This reading as a window shows it: percentages, gigabytes to a tenth
-    /// and load to a tenth. Two readings that look the same compare equal, so
-    /// the daemon sends nothing for a change no one could see.
-    pub fn shown(&self) -> Shown {
-        const TENTH_GB: u64 = 100_000_000;
-        Shown {
-            cpu: self
-                .cpu
-                .map(|cpu| (cpu.percent, cpu.cores, cpu.load_centi.div_ceil(10))),
-            memory: self.memory.map(|memory| {
-                (
-                    memory.percent(),
-                    memory.used / TENTH_GB,
-                    memory.total / TENTH_GB,
-                    memory.swap_used / TENTH_GB,
-                    memory.swap_total / TENTH_GB,
-                )
-            }),
-            disk: self
-                .disk
-                .map(|disk| (disk.percent(), disk.used / TENTH_GB, disk.total / TENTH_GB)),
-        }
+/// A share at which a figure turns amber, and red.
+pub const WARNING_PERCENT: u8 = 80;
+pub const CRITICAL_PERCENT: u8 = 90;
+
+/// Processor use moves a little with every sample on a busy device; a window
+/// is sent a new figure only once it has moved this far, or crossed into
+/// another band.
+const CPU_STEP: u8 = 2;
+
+fn band(percent: u8) -> u8 {
+    match percent {
+        percent if percent >= CRITICAL_PERCENT => 2,
+        percent if percent >= WARNING_PERCENT => 1,
+        _ => 0,
     }
 }
 
-/// What a window can see of a [`DeviceStats`]; see [`DeviceStats::shown`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Shown {
-    cpu: Option<(u8, u16, u32)>,
-    memory: Option<(Option<u8>, u64, u64, u64, u64)>,
-    disk: Option<(Option<u8>, u64, u64)>,
+impl DeviceStats {
+    /// Whether a window showing `self` should be sent `next`: when one of the
+    /// status bar's percentages moves, or a part appears or disappears. The
+    /// details on hover are as of the last reading sent, which keeps a busy
+    /// device from redrawing every window every sample for figures that
+    /// mostly sit behind a tooltip.
+    pub fn superseded_by(&self, next: &Self) -> bool {
+        let cpu = match (self.cpu, next.cpu) {
+            (Some(shown), Some(next)) => {
+                shown.percent.abs_diff(next.percent) >= CPU_STEP
+                    || band(shown.percent) != band(next.percent)
+                    || shown.cores != next.cores
+            }
+            (shown, next) => shown.is_some() != next.is_some(),
+        };
+        cpu || self.memory.map(|memory| memory.percent())
+            != next.memory.map(|memory| memory.percent())
+            || self.disk.map(|disk| disk.percent()) != next.disk.map(|disk| disk.percent())
+    }
 }
 
 /// How often the daemon reads the device while a window watches.
@@ -161,6 +165,22 @@ impl Sampler {
 
 #[cfg(feature = "host")]
 fn disk(path: &std::ffi::CStr) -> Option<Disk> {
+    let (unit, blocks, free, available) = block_counts(path)?;
+    // As `df` counts: the blocks reserved for the superuser are neither used
+    // nor available to the user, so they leave the total.
+    let used = blocks.saturating_sub(free).saturating_mul(unit);
+    let total = used.saturating_add(available.saturating_mul(unit));
+    (total > 0).then_some(Disk { used, total })
+}
+
+/// The block size and the total, free and user-available blocks of the file
+/// system holding `path`.
+#[cfg(all(feature = "host", not(target_os = "macos")))]
+#[allow(
+    clippy::useless_conversion,
+    reason = "the field widths differ by platform"
+)]
+fn block_counts(path: &std::ffi::CStr) -> Option<(u64, u64, u64, u64)> {
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
     // SAFETY: the path is NUL-terminated and statvfs fills the buffer.
     if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
@@ -168,25 +188,31 @@ fn disk(path: &std::ffi::CStr) -> Option<Disk> {
     }
     // SAFETY: statvfs succeeded, so the buffer is initialized.
     let stat = unsafe { stat.assume_init() };
-    #[allow(
-        clippy::useless_conversion,
-        reason = "the field widths differ by platform"
-    )]
-    let unit = u64::from(stat.f_frsize);
-    #[allow(
-        clippy::useless_conversion,
-        reason = "the field widths differ by platform"
-    )]
-    let (blocks, free, available) = (
+    Some((
+        u64::from(stat.f_frsize),
         u64::from(stat.f_blocks),
         u64::from(stat.f_bfree),
         u64::from(stat.f_bavail),
-    );
-    // As `df` counts: the blocks reserved for the superuser are neither used
-    // nor available to the user, so they leave the total.
-    let used = blocks.saturating_sub(free).saturating_mul(unit);
-    let total = used.saturating_add(available.saturating_mul(unit));
-    (total > 0).then_some(Disk { used, total })
+    ))
+}
+
+/// Darwin's `statvfs` reports 32-bit block counts, which a large volume
+/// overflows; `statfs` counts in 64 bits.
+#[cfg(all(feature = "host", target_os = "macos"))]
+fn block_counts(path: &std::ffi::CStr) -> Option<(u64, u64, u64, u64)> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: the path is NUL-terminated and statfs fills the buffer.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statfs succeeded, so the buffer is initialized.
+    let stat = unsafe { stat.assume_init() };
+    Some((
+        u64::from(stat.f_bsize),
+        stat.f_blocks,
+        stat.f_bfree,
+        stat.f_bavail,
+    ))
 }
 
 #[cfg(all(feature = "host", target_os = "linux"))]
@@ -319,12 +345,17 @@ mod platform {
         reason = "libc's Mach host calls are the dependency-free route"
     )]
     pub fn cpu_times() -> Option<CpuTimes> {
+        // Each `mach_host_self` adds a reference to the host port that is
+        // never released, so the port is asked for once.
+        static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+        // SAFETY: mach_host_self has no preconditions.
+        let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
         let mut info = std::mem::MaybeUninit::<libc::host_cpu_load_info>::zeroed();
         let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
         // SAFETY: the buffer holds `count` integers of the requested flavor.
         let status = unsafe {
             libc::host_statistics(
-                libc::mach_host_self(),
+                host,
                 libc::HOST_CPU_LOAD_INFO,
                 info.as_mut_ptr().cast(),
                 &mut count,
@@ -461,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invisible_change_is_not_a_new_reading() {
+    fn only_a_change_the_bar_shows_is_sent() {
         let reading = DeviceStats {
             cpu: Some(Cpu {
                 percent: 12,
@@ -479,13 +510,27 @@ mod tests {
                 total: 512_000_000_000,
             }),
         };
-        let mut nudged = reading;
-        nudged.memory.as_mut().unwrap().used += 4096;
-        nudged.disk.as_mut().unwrap().used += 1_000_000;
-        assert_eq!(reading.shown(), nudged.shown());
-        let mut moved = reading;
-        moved.cpu.as_mut().unwrap().percent = 13;
-        assert_ne!(reading.shown(), moved.shown());
+        let with = |change: fn(&mut DeviceStats)| {
+            let mut next = reading;
+            change(&mut next);
+            reading.superseded_by(&next)
+        };
+        assert!(!with(|next| next.memory.as_mut().unwrap().used += 4096));
+        assert!(!with(|next| next.disk.as_mut().unwrap().used += 1_000_000));
+        assert!(!with(|next| next.cpu.as_mut().unwrap().load_centi = 250));
+        // A processor figure that only jitters by a point is held.
+        assert!(!with(|next| next.cpu.as_mut().unwrap().percent = 13));
+        assert!(with(|next| next.cpu.as_mut().unwrap().percent = 14));
+        assert!(with(
+            |next| next.memory.as_mut().unwrap().used = 10_000_000_000
+        ));
+        assert!(with(|next| next.disk = None));
+        // Crossing into amber is sent even within the step.
+        let mut warm = reading;
+        warm.cpu.as_mut().unwrap().percent = 79;
+        let mut hot = warm;
+        hot.cpu.as_mut().unwrap().percent = 80;
+        assert!(warm.superseded_by(&hot));
     }
 
     #[cfg(all(feature = "host", target_os = "linux"))]

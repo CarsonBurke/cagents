@@ -4,7 +4,7 @@
 //! The daemon on the device sends a reading only when a figure shown here
 //! moves, so a steady device redraws nothing.
 use super::*;
-use crate::device_stats::DeviceStats;
+use crate::device_stats::{CRITICAL_PERCENT, DeviceStats, WARNING_PERCENT};
 use cosmic::iced::futures::SinkExt;
 
 /// What the window knows of its device's load.
@@ -17,10 +17,6 @@ pub enum DeviceLoad {
     /// The device is not reporting; the reason is shown on hover.
     Unavailable(String),
 }
-
-/// A share at which a figure turns amber, and red.
-const WARNING_PERCENT: u8 = 80;
-const CRITICAL_PERCENT: u8 = 90;
 
 /// One figure as the bar draws it.
 struct Gauge {
@@ -106,7 +102,7 @@ pub(super) fn detail(load: &DeviceLoad, device: &str) -> String {
     let mut lines = Vec::with_capacity(4);
     lines.push(match stats.cpu {
         Some(cpu) => format!(
-            "CPU {}% · {} core{} · load {:.2}",
+            "CPU {}% · {} core{} · load {:.1}",
             cpu.percent,
             cpu.cores,
             if cpu.cores == 1 { "" } else { "s" },
@@ -214,15 +210,23 @@ impl Cagents {
 fn watch_load() -> impl cosmic::iced::futures::Stream<Item = DeviceLoad> {
     cosmic::iced::stream::channel(2, async move |mut output| {
         let (sender, receiver) = async_channel::bounded(1);
-        let hangup = Arc::new(Mutex::new(None));
-        let held = hangup.clone();
+        let link = Arc::new(Mutex::new(Link::default()));
+        let held = link.clone();
         let spawned = std::thread::Builder::new()
             .name("cagents-device-load".into())
             .spawn(move || {
-                while !sender.is_closed() {
+                while !lock(&held).closed {
                     let watched = watch(&sender, &held);
-                    if let Some(hangup) = held.lock().unwrap_or_else(|p| p.into_inner()).take() {
-                        hangup.hang_up();
+                    // A connection given up on must not stay open through the
+                    // retry delay, where the daemon would keep sampling for it.
+                    {
+                        let mut link = lock(&held);
+                        if let Some(hangup) = link.hangup.take() {
+                            hangup.hang_up();
+                        }
+                        if link.closed {
+                            break;
+                        }
                     }
                     if let Err(error) = watched {
                         tracing::debug!(%error, "the device's load is not reporting");
@@ -248,7 +252,7 @@ fn watch_load() -> impl cosmic::iced::futures::Stream<Item = DeviceLoad> {
                 .await;
             return;
         }
-        let _hangup = HangUpOnDrop(hangup);
+        let _closed = CloseOnDrop(link);
         while let Ok(load) = receiver.recv().await {
             if output.send(load).await.is_err() {
                 break;
@@ -257,20 +261,33 @@ fn watch_load() -> impl cosmic::iced::futures::Stream<Item = DeviceLoad> {
     })
 }
 
-fn watch(
-    sender: &async_channel::Sender<DeviceLoad>,
-    hangup: &Mutex<Option<crate::control::Hangup>>,
-) -> Result<(), String> {
+/// What the subscription and its thread share. Closing and publishing the
+/// connection's hangup happen under one lock, so a subscription dropped while
+/// the thread connects can never leave it blocked on a connection nobody
+/// will end.
+#[derive(Default)]
+struct Link {
+    closed: bool,
+    hangup: Option<crate::control::Hangup>,
+}
+
+fn lock(link: &Mutex<Link>) -> std::sync::MutexGuard<'_, Link> {
+    link.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn watch(sender: &async_channel::Sender<DeviceLoad>, link: &Mutex<Link>) -> Result<(), String> {
     // Never start a daemon merely to watch it; the window starts one when it
     // needs one, and this reconnects then.
     let socket =
         crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string())?;
     let mut client =
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-    *hangup.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(client.hangup().map_err(|error| error.to_string())?);
-    if sender.is_closed() {
-        return Ok(());
+    {
+        let mut link = lock(link);
+        if link.closed {
+            return Ok(());
+        }
+        link.hangup = Some(client.hangup().map_err(|error| error.to_string())?);
     }
     let (mut revision, stats) = client
         .watch_device_stats()
@@ -290,11 +307,15 @@ fn watch(
     }
 }
 
-struct HangUpOnDrop(Arc<Mutex<Option<crate::control::Hangup>>>);
+/// Ends the watch when the subscription goes: the window closed or hid its
+/// status bar.
+struct CloseOnDrop(Arc<Mutex<Link>>);
 
-impl Drop for HangUpOnDrop {
+impl Drop for CloseOnDrop {
     fn drop(&mut self) {
-        if let Some(hangup) = self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        let mut link = lock(&self.0);
+        link.closed = true;
+        if let Some(hangup) = link.hangup.take() {
             hangup.hang_up();
         }
     }
@@ -366,7 +387,7 @@ mod tests {
         });
         assert_eq!(
             detail(&DeviceLoad::Live(stats), "This device"),
-            "CPU 12% · 16 cores · load 1.90\nMemory 9.3 GB of 16.0 GB · swap 0.4 GB\n\
+            "CPU 12% · 16 cores · load 1.9\nMemory 9.3 GB of 16.0 GB · swap 0.4 GB\n\
              Home disk 238.0 GB of 512.0 GB\nOn This device"
         );
     }
