@@ -115,8 +115,10 @@ pub enum GitOperation {
     },
     /// Answers whether [`GitOperation::RemoveWorktree`] would remove the
     /// worktree `name`, changing nothing: empty text when it would, its
-    /// refusal otherwise. A window asks before closing the worktree's
-    /// sessions, so a refusal leaves them running.
+    /// refusal as the text otherwise. A refusal is an answer, not an error,
+    /// so the window can tell it from a device it could not ask. A window
+    /// asks before closing the worktree's sessions, so a refusal leaves them
+    /// running.
     CheckWorktreeRemoval {
         name: String,
     },
@@ -636,8 +638,7 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
                 .current_dir
                 .as_ref()
                 .ok_or("repository directory unavailable")?;
-            removable_worktree(root, &name)?;
-            return Ok(String::new());
+            return Ok(removable_worktree(root, &name).err().unwrap_or_default());
         }
         GitOperation::Diff { staged } => {
             let command = command.args(["diff", "--no-ext-diff", "--no-textconv"]);
@@ -712,14 +713,22 @@ fn removable_worktree(root: &std::path::Path, name: &str) -> Result<PathBuf, Str
     // Git refuses a dirty worktree itself, but not one whose detached HEAD is
     // the only thing holding its commits.
     service.refuse_losing_detached_commits(root, record, &cancellation)?;
-    if service
+    // Git refuses a worktree with a checked-out submodule, one whose
+    // directory holds a `.git`; a submodule never checked out there is
+    // removed like any directory. Only a gitlink can hold one: every other
+    // index entry is a file.
+    let index = service
         .index_paths(&destination, &cancellation)
-        .map_err(|error| error.to_string())?
-        .gitlinks
+        .map_err(|error| error.to_string())?;
+    if index.gitlinks
+        && index
+            .paths
+            .iter()
+            .any(|path| destination.join(path.as_os_str()).join(".git").exists())
     {
         return Err(
-            "it contains submodules, which Git removes only with --force. Use git \
-             worktree remove --force in a terminal on the device."
+            "it has checked-out submodules, which Git removes only with --force. Use \
+             git worktree remove --force in a terminal on the device."
                 .into(),
         );
     }
@@ -1462,21 +1471,25 @@ mod tests {
                 .contains(".worktrees")
         );
         std::fs::write(root.join(".worktrees/dev/untracked"), "keep").unwrap();
-        let check = |name: &str| invoke(GitOperation::CheckWorktreeRemoval { name: name.into() });
-        let refusal = check("dev").unwrap_err();
+        let check =
+            |name: &str| match invoke(GitOperation::CheckWorktreeRemoval { name: name.into() }) {
+                Ok(Reply::Text(refusal)) => refusal,
+                other => panic!("{other:?}"),
+            };
+        let refusal = check("dev");
         assert!(refusal.contains("uncommitted or untracked"), "{refusal}");
         // Hiding untracked files from status hides them from Git's own check,
         // which would then delete them; the device still counts them.
         run(&["config", "status.showUntrackedFiles", "no"]);
-        assert!(check("dev").is_err());
+        assert!(!check("dev").is_empty());
         assert!(invoke(GitOperation::RemoveWorktree { name: "dev".into() }).is_err());
         assert!(root.join(".worktrees/dev/untracked").exists());
         run(&["config", "--unset", "status.showUntrackedFiles"]);
         std::fs::remove_file(root.join(".worktrees/dev/untracked")).unwrap();
         // The check changes nothing.
-        assert!(matches!(check("dev"), Ok(Reply::Text(text)) if text.is_empty()));
+        assert_eq!(check("dev"), "");
         assert!(root.join(".worktrees/dev").is_dir());
-        assert!(check("missing").unwrap_err().contains("not registered"));
+        assert!(check("missing").contains("not registered"));
         invoke(GitOperation::RemoveWorktree { name: "dev".into() }).unwrap();
         assert!(!root.join(".worktrees/dev").exists());
         // A detached worktree whose HEAD alone holds a commit is kept; once
@@ -1507,7 +1520,7 @@ mod tests {
         };
         run_in(&["switch", "--detach"]);
         run_in(&["commit", "--allow-empty", "-m", "detached only"]);
-        let refusal = check("detached").unwrap_err();
+        let refusal = check("detached");
         assert!(refusal.contains("1 commit on no branch"), "{refusal}");
         let refusal = invoke(GitOperation::RemoveWorktree {
             name: "detached".into(),
@@ -1521,8 +1534,9 @@ mod tests {
         })
         .unwrap();
         assert!(!detached.exists());
-        // Git removes a worktree with submodules only with --force, so the
-        // device says so before anything closes.
+        // Git removes a worktree with a checked-out submodule only with
+        // --force, so the device says so before anything closes; one never
+        // checked out there is removed as Git would remove it.
         invoke(GitOperation::CreateWorktree {
             name: "modules".into(),
             branch: "feature/modules".into(),
@@ -1539,6 +1553,12 @@ mod tests {
                 &format!("160000,{},vendored", head.trim()),
             ],
         );
+        std::fs::write(
+            modules.join(".gitmodules"),
+            "[submodule \"vendored\"]\n\tpath = vendored\n\turl = ./vendored\n",
+        )
+        .unwrap();
+        git_output(&modules, &["add", ".gitmodules"]);
         git_output(
             &modules,
             &[
@@ -1552,15 +1572,25 @@ mod tests {
                 "gitlink",
             ],
         );
-        let refusal = check("modules").unwrap_err();
-        assert!(refusal.contains("submodules"), "{refusal}");
+        // Checking out a worktree leaves a submodule's directory empty.
+        std::fs::create_dir(modules.join("vendored")).unwrap();
+        assert_eq!(check("modules"), "");
+        git_output(&modules.join("vendored"), &["init", "-q"]);
+        let refusal = check("modules");
+        assert!(refusal.contains("checked-out submodules"), "{refusal}");
         assert!(
             invoke(GitOperation::RemoveWorktree {
                 name: "modules".into()
             })
             .is_err()
         );
-        assert!(modules.is_dir());
+        assert!(modules.join("vendored/.git").is_dir());
+        std::fs::remove_dir_all(modules.join("vendored/.git")).unwrap();
+        invoke(GitOperation::RemoveWorktree {
+            name: "modules".into(),
+        })
+        .unwrap();
+        assert!(!modules.exists());
         // The remote project can itself be an external linked checkout.
         // Remove the prior rule so this exercises its real policy write.
         let linked_directory = crate::repository::retained_managed_fixture_directory();
