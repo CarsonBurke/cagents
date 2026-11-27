@@ -35,7 +35,11 @@ pub mod progress;
 #[cfg(target_os = "macos")]
 mod ready_plan;
 #[cfg(target_os = "macos")]
+pub(crate) use ready_plan::HeldSourceReturn;
+#[cfg(target_os = "macos")]
 pub(crate) use ready_plan::abandon_claimed as abandon_claimed_darwin_update;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use ready_plan::admit_held_source_return;
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) use ready_plan::admit_ready as admit_shared_ready;
 #[cfg(target_os = "macos")]
@@ -1733,6 +1737,12 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
     };
     #[cfg(target_os = "macos")]
     if job.phase == UpdatePhase::Failed {
+        if ready_plan::held_return_in_progress(&state, &job)? {
+            job.phase = UpdatePhase::Installing;
+            job.message = "Reopening the current version".into();
+            job.refusal = None;
+            return Ok(Some(job));
+        }
         let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
         if cutover::pending_selected(&layout, &state, &job)? {
             if let Some(reason) = cutover::selected_start_failure(&state, &job)? {
@@ -2532,6 +2542,11 @@ fn restart_selected_after_worker(
     job: &UpdateJob,
     worker: File,
 ) {
+    match ready_plan::try_held_source_return(state, job, &worker) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => eprintln!("Could not return the saved work to the selected source: {error}"),
+    }
     match cutover::restart_after_worker(installation, state, job) {
         Ok(Some(restart)) => {
             drop(worker);

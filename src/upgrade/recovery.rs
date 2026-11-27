@@ -1809,6 +1809,159 @@ impl ReadyPlanEvidence<'_> {
         Ok(())
     }
 
+    /// A held source return is eligible only after both staged attempts
+    /// positively exited without changing the workspace.
+    pub(crate) fn held_return_predecessor(
+        &self,
+        original: &crate::daemon::holder_registry::Process,
+        daemon: &File,
+    ) -> Result<ReadyStatePredecessor, String> {
+        let authority = &self.authority;
+        if authority.version != 1
+            || !matches!(authority.origin, Origin::AcknowledgedPrepare)
+            || !self.same_boot().map_err(|error| error.to_string())?
+            || !self.names_current_runtime()?
+        {
+            return Err("The owned Ready checkpoint belongs to another update".into());
+        }
+        let (first, fingerprint) = self.first_claim()?;
+        let (retry, _) = self.read_claim("retry-claim")?;
+        let first_proof = first
+            .successor_proof
+            .as_ref()
+            .ok_or("Missing first claimant proof")?;
+        let retry_proof = retry
+            .successor_proof
+            .as_ref()
+            .ok_or("Missing retry claimant proof")?;
+        if original.pid <= 1
+            || original.start == 0
+            || retry.retry_of.as_deref() != Some(fingerprint.as_str())
+            || first.successor == retry.successor
+            || original == &first.successor
+            || original == &retry.successor
+            || first_proof.host_session_id == retry_proof.host_session_id
+            || first_proof.host_session_id == authority.source.host_session_id
+            || retry_proof.host_session_id == authority.source.host_session_id
+            || !first.exited()?
+            || !retry.exited()?
+            || !crate::pinned_process::exited_since(original.pid as u32, original.start)
+                .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "The installed update did not prove both untouched successors exited".into(),
+            );
+        }
+        for stage in [
+            "effects",
+            "retry-effects",
+            "init-start",
+            "init-complete",
+            "restore",
+            "return-claim",
+            "return-effects",
+        ] {
+            if ready_evidence_exists(authority, stage)? {
+                return Err("The installed successor began changing saved work".into());
+            }
+        }
+        validate_lock(daemon, &authority.daemon_path).map_err(|error| error.to_string())?;
+        validate_received_checkpoint(authority, Phase::Ready)?;
+        self.exact_checkpoint()?;
+        if validate_acknowledged_capture(authority)?.as_deref() != Some(&self.capture_digest) {
+            return Err("The original Ready inventory changed".into());
+        }
+        let state = authority
+            .worker_path
+            .parent()
+            .ok_or("Missing held update directory")?;
+        let request = read_checkpoint(&state.join(format!("{}.request", authority.job)))?
+            .ok_or("Missing held update request")?;
+        if digest(&request) != authority.job_request_hash {
+            return Err("The held update request changed".into());
+        }
+        validate_request_origin(authority, &request)?;
+        let (runtime, runtime_pid) = crate::daemon::lease_handoff::recorded_owner(daemon)
+            .map_err(|error| error.to_string())?;
+        select_held_return_predecessor(
+            [
+                (&authority.source, original.pid as u32),
+                (first_proof, first.successor.pid as u32),
+                (retry_proof, retry.successor.pid as u32),
+            ],
+            &runtime,
+            runtime_pid,
+            |proof| {
+                crate::instance::state_claim::last_daemon_pid(&authority.daemon_path, proof)
+                    .map_err(|error| error.to_string())
+            },
+        )
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn accept_held_return(
+        self,
+        original: &crate::daemon::holder_registry::Process,
+        [worker, fence, legacy]: [File; STANDBY_RECEIPT_DESCRIPTORS],
+        daemon: File,
+    ) -> Result<ReadyAdmission, String> {
+        let authority = self.authority.as_ref();
+        for (file, path) in [
+            (&worker, &authority.worker_path),
+            (&fence, &authority.fence_path),
+            (&daemon, &authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|error| error.to_string())?;
+        }
+        validate_lock_mode(&legacy, &authority.legacy_path, "READ")
+            .map_err(|error| error.to_string())?;
+        let saved_predecessor = self.held_return_predecessor(original, &daemon)?;
+        let successor =
+            crate::daemon::new_host_session_proof().map_err(|error| error.to_string())?;
+        let process = crate::daemon::holder_registry::Process::read(std::process::id() as i32)
+            .map_err(|error| error.to_string())?;
+        record_held_return_actor(
+            authority,
+            &self.capture_digest,
+            "return-claim",
+            &successor,
+            process,
+        )?;
+        Ok(ReadyAdmission {
+            authority: self.authority.into_owned(),
+            custody: Inherited {
+                authority: None,
+                worker,
+                fence,
+                legacy,
+                daemon,
+            },
+            successor,
+            saved_predecessor,
+            runtime_claim: None,
+            requires_durable_workspace: true,
+            retry_predecessor: None,
+            return_capture: Some(self.capture_digest),
+        })
+    }
+
+    pub(crate) fn verified_held_return_owner(
+        &self,
+    ) -> Result<Option<(HostSessionProof, crate::daemon::holder_registry::Process)>, String> {
+        if !ready_evidence_exists(&self.authority, "return-ready")? {
+            return Ok(None);
+        }
+        let (claim, claimed) = self.read_claim("return-claim")?;
+        let (_, ready) = self.read_claim("return-ready")?;
+        if claimed != ready || claim.retry_of.is_some() {
+            return Err("A different process recorded the held return result".into());
+        }
+        let proof = claim
+            .successor_proof
+            .ok_or("The held return has no exact successor proof")?;
+        Ok(Some((proof, claim.successor)))
+    }
+
     pub(crate) fn claimed_process_exited(&self) -> Result<bool, String> {
         self.latest_claim()?.exited()
     }
@@ -4768,6 +4921,7 @@ pub(crate) fn accept_standby_authority(
 /// authority never enters the global Prepared adoption slot.
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub struct ReadyAdmission {
+    return_capture: Option<String>,
     authority: Authority,
     custody: Inherited,
     successor: HostSessionProof,
@@ -4816,8 +4970,43 @@ impl ReadyAdmission {
 
     /// The runtime and saved-data leases are installed. Every action on the
     /// store, provider, or matching CLI now belongs to this exact proof.
+    pub fn is_held_return(&self) -> bool {
+        self.return_capture.is_some()
+    }
+
+    pub fn finish_held_return(&self, expected_checkpoint: &str) -> Result<(), String> {
+        let capture = self
+            .return_capture
+            .as_ref()
+            .ok_or("This startup is not a held source return")?;
+        let store =
+            super::handoff::Store::observe_existing()?.ok_or("The held checkpoint is missing")?;
+        let checkpoint = store
+            .checkpoint_status()?
+            .ok_or("The held checkpoint is missing")?;
+        if checkpoint.proof != self.authority.source
+            || checkpoint.phase != Phase::Restoring
+            || checkpoint.digest != expected_checkpoint
+        {
+            return Err("The held return changed its restoring checkpoint".into());
+        }
+        let process = crate::daemon::holder_registry::Process::read(std::process::id() as i32)
+            .map_err(|error| error.to_string())?;
+        record_held_return_actor(
+            &self.authority,
+            capture,
+            "return-ready",
+            &self.successor,
+            process,
+        )?;
+        store.archive_claimed_update(&self.authority.job, &self.authority.source)?;
+        Ok(())
+    }
+
     pub fn begin_workspace_effects(&self) -> io::Result<()> {
-        let stage = if self.retry_predecessor.is_some() {
+        let stage = if self.is_held_return() {
+            "return-effects"
+        } else if self.retry_predecessor.is_some() {
             "retry-effects"
         } else {
             "effects"
@@ -4826,21 +5015,29 @@ impl ReadyAdmission {
     }
 
     pub fn begin_workspace_initialization(&self) -> io::Result<()> {
-        if self.retry_predecessor.is_none() {
+        if self.is_held_return() {
+            self.record_workspace_stage("return-init-start")?;
+        } else if self.retry_predecessor.is_none() {
             self.record_workspace_stage("init-start")?;
         }
         Ok(())
     }
 
     pub fn finish_workspace_initialization(&self) -> io::Result<()> {
-        if self.retry_predecessor.is_none() {
+        if self.is_held_return() {
+            self.record_workspace_stage("return-init-complete")?;
+        } else if self.retry_predecessor.is_none() {
             self.record_workspace_stage("init-complete")?;
         }
         Ok(())
     }
 
     pub fn begin_workspace_restore(&self) -> io::Result<()> {
-        self.record_workspace_stage("restore")
+        self.record_workspace_stage(if self.is_held_return() {
+            "return-restore"
+        } else {
+            "restore"
+        })
     }
 
     pub fn requires_durable_workspace(&self) -> bool {
@@ -4912,6 +5109,20 @@ impl ReadyAdmission {
             &lineage,
         )
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn record_held_return_actor(
+    authority: &Authority,
+    capture: &str,
+    stage: &str,
+    proof: &HostSessionProof,
+    process: crate::daemon::holder_registry::Process,
+) -> Result<(), String> {
+    let path = ready_evidence_path(authority, stage)?;
+    let claim = ready_claim_record(authority, capture, proof, process, None);
+    let bytes = serde_json::to_vec(&claim).map_err(|error| error.to_string())?;
+    crate::update::persist_ready_evidence(&path, &bytes).map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -5086,6 +5297,32 @@ fn select_ready_state_predecessor(
     Err("Another daemon has used the saved work since this update stopped its source".into())
 }
 
+#[cfg(target_os = "macos")]
+fn select_held_return_predecessor(
+    owners: [(&HostSessionProof, u32); 3],
+    runtime: &HostSessionProof,
+    runtime_pid: u32,
+    saved_pid: impl Fn(&HostSessionProof) -> Result<Option<u32>, String>,
+) -> Result<ReadyStatePredecessor, String> {
+    let runtime_index = owners
+        .iter()
+        .position(|(proof, pid)| *proof == runtime && *pid > 1 && *pid == runtime_pid);
+    let mut saved = None;
+    for (index, (proof, expected)) in owners.into_iter().enumerate() {
+        if let Some(pid) = saved_pid(proof)? {
+            if pid <= 1
+                || pid != expected
+                || saved.is_some()
+                || runtime_index.is_none_or(|runtime| index > runtime)
+            {
+                return Err("The saved-data owner does not follow the held return chain".into());
+            }
+            saved = Some((proof.clone(), Some(pid)));
+        }
+    }
+    saved.ok_or_else(|| "The exact saved-data predecessor is unavailable for source return".into())
+}
+
 #[cfg(all(target_os = "macos", feature = "host"))]
 fn claim_ready_activation(
     authority: &Authority,
@@ -5196,6 +5433,7 @@ pub(crate) fn accept_ready_authority(
         successor,
         saved_predecessor,
         runtime_claim: record_runtime.then_some(claim),
+        return_capture: None,
         requires_durable_workspace,
         retry_predecessor,
     })

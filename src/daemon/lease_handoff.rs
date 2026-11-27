@@ -89,6 +89,14 @@ impl HandoffSource {
         self.exited_within(std::time::Duration::ZERO)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn identity(&self) -> holder_registry::Process {
+        holder_registry::Process {
+            pid: self.pid as i32,
+            start: self.process.started_ticks(),
+        }
+    }
+
     pub(crate) fn executable(&self) -> io::Result<std::path::PathBuf> {
         self.process.executable()
     }

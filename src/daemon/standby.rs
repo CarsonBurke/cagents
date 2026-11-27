@@ -53,6 +53,8 @@ enum Activation {
     Checkpoint,
     #[cfg(target_os = "macos")]
     ReadyCheckpoint,
+    #[cfg(target_os = "macos")]
+    HeldSourceReturn,
 }
 
 #[cfg(any(feature = "host", test))]
@@ -76,7 +78,7 @@ impl Activation {
         match self {
             Self::Fresh => 0,
             Self::Lease => 1,
-            Self::Checkpoint | Self::ReadyCheckpoint => DESCRIPTOR_LIMIT,
+            Self::Checkpoint | Self::ReadyCheckpoint | Self::HeldSourceReturn => DESCRIPTOR_LIMIT,
         }
     }
 }
@@ -187,6 +189,8 @@ pub(crate) struct Parked {
 struct ImageAttestation {
     start: u64,
     address: u64,
+    #[serde(default)]
+    held_source_return: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -194,6 +198,7 @@ struct ParkedImage {
     process: crate::pinned_process::PinnedProcess,
     expected: (u64, u64),
     address: u64,
+    held_source_return: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -376,6 +381,7 @@ impl Parked {
             process,
             expected,
             address: attestation.address,
+            held_source_return: attestation.held_source_return,
         };
         image.verify()?;
         self.image = Some(image);
@@ -385,6 +391,54 @@ impl Parked {
     #[cfg(target_os = "macos")]
     pub(crate) fn publication(&self) -> &fs::File {
         &self.publication
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn supports_held_source_return(&self) -> bool {
+        self.image
+            .as_ref()
+            .is_some_and(|image| image.held_source_return)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn activate_held_source_return(
+        &mut self,
+        request: &crate::update::HeldSourceReturn,
+        worker: &fs::File,
+        guard: &UiUpdateGuard,
+        lease: &LeaseHandoff,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        self.check_running()?;
+        if !self.supports_held_source_return() {
+            return Err(io::Error::other(
+                "The selected build cannot receive a held Ready return",
+            ));
+        }
+        let (fence, legacy) = guard.duplicate_for_recovery()?;
+        self.transferred = true;
+        self.channel.write_all(&[0])?;
+        send(
+            &self.channel,
+            &Activation::HeldSourceReturn,
+            &[
+                lease.descriptor(),
+                worker.as_fd(),
+                fence.as_fd(),
+                legacy.as_fd(),
+            ],
+        )?;
+        send_json_with_fds_until(
+            &self.channel,
+            request,
+            &[],
+            Instant::now() + TRANSFER_TIMEOUT,
+            FRAME_LIMIT,
+            0,
+            FrameByteOrder::LittleEndian,
+        )
+        .map_err(io::Error::other)?;
+        self.wait_for_activation(timeout, || {})
     }
 
     pub(crate) fn check_running(&mut self) -> io::Result<()> {
@@ -487,6 +541,10 @@ impl Parked {
             )
             .map_err(io::Error::other)?;
         }
+        self.wait_for_activation(timeout, overdue)
+    }
+
+    fn wait_for_activation(&mut self, timeout: Duration, overdue: impl FnOnce()) -> io::Result<()> {
         let result = wait_for_start(&self.channel, timeout, overdue);
         if let Err(error) = &result
             && error
@@ -649,6 +707,7 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         &ImageAttestation {
             start: crate::pinned_process::started_ticks_of(std::process::id())?,
             address: crate::process::own_code_address(),
+            held_source_return: true,
         },
         &[],
     )?;
@@ -683,6 +742,11 @@ pub unsafe fn await_activation() -> io::Result<Activated> {
         if request == Activation::ReadyCheckpoint && publication.is_none() {
             return Err(io::Error::other(
                 "Ready activation requires an installed selection",
+            ));
+        }
+        if request == Activation::HeldSourceReturn && account_fence.is_none() {
+            return Err(io::Error::other(
+                "A held Ready return requires the account publication fence",
             ));
         }
         install_darwin_activation(&control, request, descriptors)?
@@ -726,7 +790,29 @@ fn install_darwin_activation(
     let lease = descriptors
         .next()
         .ok_or_else(|| io::Error::other("Darwin standby requires a runtime lease transfer"))?;
-    let ready = if matches!(
+    let ready = if request == Activation::HeldSourceReturn {
+        let (returning, _): (crate::update::HeldSourceReturn, _) = receive_json_with_fds_until(
+            control,
+            Instant::now() + TRANSFER_TIMEOUT,
+            FRAME_LIMIT,
+            0,
+            FrameByteOrder::LittleEndian,
+        )
+        .map_err(io::Error::other)?;
+        let files = descriptors
+            .map(File::from)
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| io::Error::other("Source return has incomplete custody"))?;
+        Some(
+            crate::update::admit_held_source_return(
+                returning,
+                files,
+                File::from(lease.try_clone()?),
+            )
+            .map_err(io::Error::other)?,
+        )
+    } else if matches!(
         request,
         Activation::Checkpoint | Activation::ReadyCheckpoint
     ) {
@@ -888,6 +974,7 @@ mod tests {
             process,
             expected: (metadata.dev(), metadata.ino()),
             address: crate::process::own_code_address(),
+            held_source_return: false,
         };
         image.verify().unwrap();
         // SAFETY: dlsym looks up a valid C string. The address belongs to

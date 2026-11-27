@@ -4152,6 +4152,12 @@ impl RestoredUpgrade {
             .map(|finalization| finalization.restoring_digest.as_str())
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn finish_archived_locked(&mut self, state: &mut HostState) {
+        self.finalization.take();
+        state.retained_startup_checkpoint.take();
+    }
+
     pub(super) fn finish(&mut self, host: &SharedHost) -> Result<(), String> {
         self.finish_locked(&mut host.lock().unwrap_or_else(|p| p.into_inner()))
     }

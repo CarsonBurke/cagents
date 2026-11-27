@@ -242,7 +242,7 @@ pub struct DaemonAdmission {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct StartupPublication {
-    publication: crate::update::LocalPublication,
+    publication: Option<crate::update::LocalPublication>,
     _admission: DaemonAdmission,
     #[cfg(target_os = "macos")]
     recovered: Option<InstalledRestoration>,
@@ -273,6 +273,7 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
     #[cfg(target_os = "linux")]
     let result = publication
         .publication
+        .expect("Linux publication requires a prepared selector")
         .publish()
         .map_err(|error| error.to_string());
     #[cfg(target_os = "macos")]
@@ -302,15 +303,29 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
                     return Err("An original conversation has not finished resuming".into());
                 }
                 admission.verify_live_inventory(state.proof(), &terminals, &chats)?;
-                admission.remember_cutover(state.proof(), restored.checkpoint_digest_for_removal())
+                let digest = restored.checkpoint_digest_for_removal();
+                if admission.is_held_return() {
+                    admission.finish_held_return(
+                        digest.ok_or("The held return did not restore the exact checkpoint")?,
+                    )
+                } else {
+                    admission.remember_cutover(state.proof(), digest)
+                }
             }
         }?;
-        publication
-            .publication
-            .publish()
-            .map_err(|error| error.to_string())?;
-        if let InstalledRestoration::Ready { mut restored, .. } = recovered {
-            restored.finish_locked(&mut state)?;
+        if let Some(publication) = publication.publication {
+            publication.publish().map_err(|error| error.to_string())?;
+        }
+        if let InstalledRestoration::Ready {
+            admission,
+            mut restored,
+        } = recovered
+        {
+            if admission.is_held_return() {
+                restored.finish_archived_locked(&mut state);
+            } else {
+                restored.finish_locked(&mut state)?;
+            }
         }
         Ok::<_, String>(())
     })();
@@ -1105,10 +1120,17 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("restore complete; release admission", None);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let mut pending_publication = if let Some(publication) = standby
+    let publication = standby
         .as_mut()
-        .and_then(daemon::standby::Activated::take_local_publication)
-    {
+        .and_then(daemon::standby::Activated::take_local_publication);
+    #[cfg(target_os = "macos")]
+    let returning = installed_restoration.as_ref().is_some_and(|restoration| {
+        matches!(restoration, InstalledRestoration::Ready { admission, .. } if admission.is_held_return())
+    });
+    #[cfg(target_os = "linux")]
+    let returning = false;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut pending_publication = if publication.is_some() || returning {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .publishing_startup = true;
