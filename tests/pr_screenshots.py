@@ -137,8 +137,24 @@ class PrScreenshots(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("shows an email address (s…e@e…e.", result.stderr)
 
+    def test_mentions_sentences_assets_and_forge_remotes_are_not_addresses(self):
+        shown = self.image("after-chat.webp", "Thanks @reviewer. Next step\nMeet @ 3pm. Room 4\n"
+                           "logo@2x.png  icon@1.5x.webp\ngit@github.com:owner/repo.git")
+        result = self.run_tool("scan", shown)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_fixture_address_lends_its_user_name_no_identity(self):
+        self.git(self.work, "config", "user.email", "codex@fixture.invalid")
+        result = self.run_tool("scan", self.image("after-codex.webp", "Codex is ready"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.config / "cagents").mkdir(parents=True)
+        (self.config / "cagents" / "private-identities").write_text("person.name@example.com\n")
+        shown = self.image("after-person.webp", "person.name is signed in")
+        self.assertEqual(self.run_tool("scan", shown).returncode, 1)
+        self.assertEqual(self.run_tool("scan", "--allow", "example.com", shown).returncode, 0)
+
     def test_a_known_address_is_found_by_its_user_name_when_cut_off(self):
-        self.git(self.work, "config", "user.email", "jordan.dev@example.invalid")
+        self.git(self.work, "config", "user.email", "jordan.dev@example.com")
         result = self.run_tool("scan", self.image("after-cut.webp", "Signed in as jordan.dev@exam…"))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("a private identity (j…v, from the Git email, before its @)", result.stderr)
@@ -233,6 +249,7 @@ class PrScreenshots(unittest.TestCase):
         result = self.run_tool("publish", "-R", "owner/repo", clean, shown)
         self.assertEqual(result.returncode, 1)
         self.assertIn("nothing was published", result.stderr)
+        self.assertIn("accept it with --allow", result.stderr)
         self.assertEqual(self.remote_branches(), "")
         # Masked, it goes.
         shown.write_bytes(WEBP + b"s\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88@\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88")

@@ -2531,8 +2531,10 @@ harness, it provides:
   by a later `shot`, `fetch` or `pair` bringing the host's copies back. When a
   new capture arrives for it, the tool says it kept the shot and leaves the
   capture in `raw/`; copy that over the shot to use it. A `shot` whose own
-  name was kept prints the shot's path as usual and exits 4. `raw/` holds the
-  unedited originals, so never publish from it.
+  name was kept prints the shot's path as usual and exits 4, which stops a
+  steps script run under `set -e`; that happens only where shots were edited,
+  never on the host. `raw/` holds the unedited originals, so never publish
+  from it.
 - **Identities at shot time.** Fixture accounts use addresses such as
   `fixture@example.test` that can never be real. Where the host has
   tesseract with English data, `shot` reads the capture's text and warns when
@@ -2794,9 +2796,10 @@ image's text by OCR and refuses:
   `XDG_CONFIG_HOME`), a private list of names, logins and addresses that must
   never appear in a public image. `--identity TEXT` adds one for a single run.
 
-For each of those addresses, the part before the `@` counts on its own when
-it has five or more characters, so an address OCR misread or the UI cut off
-is still found. Matching ignores case and spaces and reads the symbols OCR
+For each of those addresses on a deliverable domain, the part before the `@`
+counts on its own when it has five or more characters, so an address OCR
+misread or the UI cut off is still found. A scaled asset such as
+`logo@2x.png` and a forge's `git@github.com` are not addresses. Matching ignores case and spaces and reads the symbols OCR
 mistakes `@` for, such as `©`, as `@`. The report masks what it found.
 
 OCR needs tesseract with English data. Where this machine lacks it, the

@@ -56,9 +56,14 @@ import sys
 # Top-level domains reserved by RFC 2606 and RFC 6761 that never deliver mail.
 UNDELIVERABLE = frozenset({"test", "invalid", "example", "localhost"})
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
-# What OCR reads @ as, between two characters of an address.
-AT = re.compile(r"(?<=[A-Za-z0-9._%+-])\s*(?:@\s*[®©]|[®©]|\(a\)|@)\s*(?=[A-Za-z0-9])")
-DOT = re.compile(r"(?<=[A-Za-z0-9])\s*\.\s*(?=[A-Za-z0-9])")
+# What OCR reads @ as, between two characters of an address. A plain @ is
+# closed up only with space on both sides, so "Thanks @name" stays a mention.
+AT = re.compile(r"(?<=[A-Za-z0-9._%+-])(?:\s*@?\s*[®©]\s*|\(a\)|\s+@\s+)(?=[A-Za-z0-9])")
+# A dot is closed up only before what could end a domain, so a sentence's
+# capitalized next word stays apart.
+DOT = re.compile(r"(?<=[A-Za-z0-9])\s*\.\s*(?=[a-z0-9-]{2,24}\b)")
+# Not addresses: a scaled asset (logo@2x.png) and a forge's SSH user.
+NOT_ADDRESS = re.compile(r"[^@]+@\d+(?:\.\d+)?x\..+|git@(?:github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)")
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.webp$")
 DEFAULT_OCR_HOST = "fw16"
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
@@ -104,7 +109,7 @@ def account_addresses() -> list[str]:
             if isinstance(account, dict) and isinstance(account.get("name"), str) and "@" in account["name"]]
 
 
-def private_identities(extra: list[str]) -> list[tuple[str, str]]:
+def private_identities(extra: list[str], allow: list[str]) -> list[tuple[str, str]]:
     """(identity, where it came from) for everything that must not show."""
     found = [(text, "--identity") for text in extra]
     found += [(address, "a cagents account") for address in account_addresses()]
@@ -117,9 +122,12 @@ def private_identities(extra: list[str]) -> list[tuple[str, str]]:
             line = line.split("#", 1)[0].strip()
             if line:
                 found.append((line, f"{path} line {number}"))
-    # A misread or cut-off address still shows its user name.
+    # A misread or cut-off address still shows its user name, unless it is a
+    # fixture's or an allowed one, whose user name may be a common word.
+    allow = [normalized(entry).lstrip("@") for entry in allow]
     found += [(text.rsplit("@", 1)[0], f"{source}, before its @") for text, source in found
-              if "@" in text and len(normalized(text.rsplit("@", 1)[0])) >= 5]
+              if EMAIL.fullmatch(text.strip()) and len(normalized(text.rsplit("@", 1)[0])) >= 5
+              and not allowed(normalized(text), allow)]
     unique, seen = [], set()
     for text, source in found:
         if len(normalized(text)) >= 3 and normalized(text) not in seen:
@@ -144,6 +152,8 @@ def addresses(text: str) -> list[str]:
         for match in EMAIL.finditer(variant):
             address = match.group().casefold().rstrip(".")
             top = address.rsplit(".", 1)[-1]
+            if NOT_ADDRESS.fullmatch(address):
+                continue
             if re.fullmatch(r"[a-z0-9]{2,}", top) and re.search(r"[a-z]", top) and address not in found:
                 found.append(address)
     return found
@@ -209,7 +219,7 @@ def read_text(image: Path, data: bytes, route: list[str], seconds: int) -> str:
 
 def check(images: dict[Path, bytes], options, seconds: int) -> dict[Path, list[str]]:
     """What each image shows that it must not; raises Unreadable."""
-    identities = private_identities(options.identity)
+    identities = private_identities(options.identity, options.allow)
     route = ocr_route(options.ocr_host, seconds)
     return {image: findings(read_text(image, data, route, seconds), identities, options.allow)
             for image, data in images.items()}
@@ -359,6 +369,7 @@ def main(arguments: list[str]) -> int:
         if options.command == "publish":
             print("pr-screenshots: nothing was published; use fixture accounts, or mask the identity in shots/ "
                   "and publish again", file=sys.stderr)
+        print("pr-screenshots: if what it found is not an identity, accept it with --allow", file=sys.stderr)
         return 1
     if options.command == "scan":
         if not warn:
