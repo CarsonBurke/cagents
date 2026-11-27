@@ -1110,12 +1110,6 @@ impl Cagents {
             .refused_creations
             .insert(card, reason.to_owned());
         self.fail_terminal_creation(card, reason);
-        // Said where it can be seen from anywhere too, as a failed start is.
-        self.status = Some(
-            TransientNotice::error(super::terminal_failure::creation_title())
-                .with_details(reason.to_owned())
-                .with_key(NoticeKey::TerminalStart(card)),
-        );
     }
 
     /// Asks the registry again for a new terminal it refused. The pane waits

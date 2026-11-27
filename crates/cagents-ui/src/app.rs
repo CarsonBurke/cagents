@@ -7384,11 +7384,6 @@ impl Cagents {
                 // Nothing ran, so there is nothing to restore or reconnect:
                 // the pane says the terminal didn't open, and why (#4400).
                 self.fail_terminal_creation(card, &error);
-                self.status = Some(
-                    TransientNotice::error(terminal_failure::creation_title())
-                        .with_details(error)
-                        .with_key(NoticeKey::TerminalStart(card)),
-                );
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
             Err(error) => {
@@ -10502,16 +10497,16 @@ impl Cagents {
             self.card_state(card).map(|state| &state.kind),
             Some(CardKind::Terminal(session)) if account::login::is_codex_browser(&session.launch)
         ) && account::login::callback_failed(reason);
-        let reason = if login_busy {
-            account::login::PORT_BUSY.to_owned()
-        } else {
-            terminal_failure::creation_reason(reason)
-        };
+        let failure = terminal_failure::creation_failure(reason, login_busy);
         self.sidebar_state.clear_agent_activity(card);
-        self.mark_runtime_failed(card, reason.clone());
-        self.cards.insert(
-            card,
-            CardRuntime::Failed(terminal_failure::Failure::Generic(reason)),
+        self.mark_runtime_failed(card, failure.message().to_owned());
+        self.cards.insert(card, CardRuntime::Failed(failure));
+        self.status = Some(
+            TransientNotice::error(terminal_failure::creation_title(
+                self.notice_pane_name(card).as_deref(),
+            ))
+            .with_details(reason.to_owned())
+            .with_key(NoticeKey::TerminalStart(card)),
         );
     }
 
@@ -10532,10 +10527,13 @@ impl Cagents {
     /// Whether `card`'s pane says its terminal didn't open.
     pub(super) fn terminal_creation_failed(&self, card: CardId) -> bool {
         self.shared_views.refused_creations.contains_key(&card)
-            || (matches!(
-                self.cards.get(&card),
-                Some(CardRuntime::Failed(terminal_failure::Failure::Generic(_)))
-            ) && self.terminal_never_started(card))
+            || match self.cards.get(&card) {
+                Some(CardRuntime::Failed(terminal_failure::Failure::Creation { .. })) => true,
+                Some(CardRuntime::Failed(terminal_failure::Failure::Generic(_))) => {
+                    self.terminal_never_started(card)
+                }
+                _ => false,
+            }
     }
 
     fn fail_runtime(&mut self, card: CardId, message: String) {
@@ -13288,7 +13286,7 @@ impl Cagents {
                             design::title(if self.reopen_failed(id) {
                                 std::borrow::Cow::Borrowed("Couldn't reopen this conversation")
                             } else if self.terminal_creation_failed(id) {
-                                terminal_failure::creation_title()
+                                terminal_failure::creation_title(None)
                             } else {
                                 std::borrow::Cow::Borrowed(labels.unavailable)
                             })
@@ -13334,7 +13332,10 @@ impl Cagents {
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         self.blocked_failure_guidance(id)
                             .or_else(|| self.chat_capacity_guidance(id).map(str::to_owned))
-                            .map(|guidance| design::caption(guidance).into())
+                            .or_else(|| message.creation_guidance().map(str::to_owned))
+                            .map(|guidance| design::caption(guidance)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                                .into())
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
                             let mut controls = if self.chat_retry_blocked(id) {
