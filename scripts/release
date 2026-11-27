@@ -386,7 +386,9 @@ trap 'exit 1' HUP INT TERM
 rm -rf -- build-source
 mkdir -- build-source
 trap 'rm -rf -- build-source' EXIT
-tar -xzf "$1/source.tar.gz" -C build-source
+# Cargo indexes path packages by this stable path. Fresh file times make
+# it recheck them even when this commit predates the last build.
+tar -xmzf "$1/source.tar.gz" -C build-source
 export PATH=$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 export CARGO_TARGET_DIR=$HOME/Library/Caches/cagents-release/target SOURCE_DATE_EPOCH=$2
 # Ghostty runs Zig from its own checkout, where a mise shim cannot see
@@ -438,7 +440,8 @@ macos_cache_dir() {
 }
 
 macos_receipt() {
-    printf '%s\n' "$2"
+    # Require packages built with fresh checkout timestamps.
+    printf '%s\n' "$2" 'source-export-version=2'
     sha256sum < "$1/SHA256SUMS-macos"
 }
 
