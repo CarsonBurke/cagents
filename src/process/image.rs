@@ -28,10 +28,10 @@
 //!   their blocks, so a clone costs no copy; elsewhere the image is copied.
 use std::{io, path::PathBuf};
 
-#[cfg(target_os = "macos")]
-pub(crate) use darwin::mapped_region_identity;
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) use darwin::own_code_address;
+#[cfg(target_os = "macos")]
+pub(crate) use darwin::{mapped_executable_identity, mapped_region_identity};
 
 /// The installed executable this process runs, with every symlink resolved.
 /// See the module documentation for how this differs from [`own_image`].
@@ -184,7 +184,7 @@ mod darwin {
         vnode: libc::vnode_info_path,
     }
 
-    pub(crate) fn mapped_region_identity(pid: u32, address: u64) -> io::Result<(u64, u64)> {
+    fn region_with_path(pid: u32, address: u64) -> io::Result<RegionWithPath> {
         // SAFETY: all-zero is a valid value of this plain C struct.
         let mut info: RegionWithPath = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<RegionWithPath>() as libc::c_int;
@@ -203,19 +203,76 @@ mod darwin {
                 "the kernel did not describe this process's mapped image",
             ));
         }
-        // The kernel answers the region at or after the address.
-        if address
-            .checked_sub(info.region.address)
-            .is_none_or(|offset| offset >= info.region.size)
-            || info.region.protection & libc::PROT_EXEC as u32 == 0
-            || info.vnode.vip_vi.vi_stat.vst_ino == 0
-        {
-            return Err(io::Error::other(
-                "this process's code is not mapped from a file",
-            ));
+        Ok(info)
+    }
+
+    impl RegionWithPath {
+        fn executable_identity(&self) -> Option<(u64, u64)> {
+            let stat = &self.vnode.vip_vi.vi_stat;
+            (self.region.protection & libc::PROT_EXEC as u32 != 0 && stat.vst_ino != 0)
+                .then_some((u64::from(stat.vst_dev), stat.vst_ino))
         }
-        let stat = &info.vnode.vip_vi.vi_stat;
-        Ok((u64::from(stat.vst_dev), stat.vst_ino))
+    }
+
+    pub(crate) fn mapped_region_identity(pid: u32, address: u64) -> io::Result<(u64, u64)> {
+        let info = region_with_path(pid, address)?;
+        // The kernel answers the region at or after the address.
+        let inside = address
+            .checked_sub(info.region.address)
+            .is_some_and(|offset| offset < info.region.size);
+        info.executable_identity()
+            .filter(|_| inside)
+            .ok_or_else(|| io::Error::other("this process's code is not mapped from a file"))
+    }
+
+    /// Find the vnode backing the named executable's code. A serving legacy
+    /// daemon does not report a code address, but libproc describes its
+    /// mapped regions without attaching to the process or modifying it.
+    pub(crate) fn mapped_executable_identity(
+        pid: u32,
+        executable: &std::path::Path,
+    ) -> io::Result<(u64, u64)> {
+        use std::os::unix::ffi::OsStrExt;
+
+        const MAX_REGIONS: usize = 4096;
+        let executable = executable.as_os_str().as_bytes();
+        let mut address = 0;
+        for _ in 0..MAX_REGIONS {
+            let info = region_with_path(pid, address)?;
+            let path = info.vnode.vip_path.as_flattened();
+            if let Some(identity) = info.executable_identity()
+                && path.get(executable.len()) == Some(&0)
+                && path[..executable.len()]
+                    .iter()
+                    .map(|&byte| byte as u8)
+                    .eq(executable.iter().copied())
+            {
+                return Ok(identity);
+            }
+            address = info
+                .region
+                .address
+                .checked_add(info.region.size)
+                .filter(|next| *next > address)
+                .ok_or_else(|| io::Error::other("the kernel returned an invalid mapped region"))?;
+        }
+        Err(io::Error::other(
+            "could not find the executable in the process's mapped regions",
+        ))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn mapped_executable_query_agrees_with_the_kernel_code_address() {
+        let executable = super::current_executable().unwrap();
+        let pid = std::process::id();
+        let code = mapped_executable_query_agrees_with_the_kernel_code_address as *const () as usize
+            as u64;
+        assert_eq!(
+            mapped_executable_identity(pid, &executable).unwrap(),
+            mapped_region_identity(pid, code).unwrap(),
+        );
+        assert!(mapped_executable_identity(pid, std::path::Path::new("/unmapped")).is_err());
     }
 
     #[cfg(all(feature = "host", test))]

@@ -91,6 +91,7 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "ready-retry-claim.json"
             | "ready-runtime-owner.json"
             | "ready-plan.json"
+            | "ready-source.json"
             | "ready-return.json"
             | "release-stage.json"
             | "cancel-nonce"
@@ -190,6 +191,7 @@ mod tests {
             "ready-retry-claim.json",
             "ready-runtime-owner.json",
             "ready-plan.json",
+            "ready-source.json",
             "ready-return.json",
             "cancel-nonce",
             "decisions.lock",
