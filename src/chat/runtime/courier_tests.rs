@@ -110,6 +110,9 @@ impl Adapter for GatedAdapter {
                     ..Step::default()
                 });
             }
+            // As ACP does, a removal empties the queue in the command's own
+            // step, with no provider frame after it.
+            Command::RemoveQueued { .. } => vec![Event::QueueChanged(Vec::new())],
             _ => return Err("unsupported fixture command".into()),
         };
         Ok(Step {
@@ -469,6 +472,26 @@ fn courier_prompt_waits_behind_a_message_the_person_queued_with_the_provider() {
         .unwrap();
     fixture.wait_for_provider_writes(1);
     assert_eq!(fixture.prompt_texts(), ["courier delivery"]);
+    fixture.close();
+}
+
+#[test]
+fn removing_the_persons_last_queued_message_announces_the_idle_conversation() {
+    let mut fixture = RequestRaceFixture::new();
+    fixture.set_persons_queue(true);
+    assert!(fixture.handle.is_idle());
+    assert!(!fixture.handle.takes_courier());
+    let announced = fixture.prompt_available_count();
+    fixture
+        .handle
+        .command(Command::RemoveQueued {
+            id: "person-1".into(),
+        })
+        .unwrap();
+    // The step is applied, and announced, before the command returns.
+    assert_eq!(fixture.prompt_available_count(), announced + 1);
+    assert!(fixture.handle.takes_courier());
+    assert_eq!(fixture.provider_write_count(), 0);
     fixture.close();
 }
 

@@ -976,7 +976,7 @@ impl Courier {
             registry,
             seal,
             state: Mutex::new(WakeState::default()),
-            wait: wait::Wait::new().map_err(|error| error.to_string())?,
+            wait: wait::Wait::new(),
             limits: Mutex::new(BTreeMap::new()),
             yielding: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -1091,7 +1091,7 @@ impl Handle {
                 let remaining = Duration::from_millis(deadline.saturating_sub(super::now()));
                 if let Err(error) = self.0.wait.edge_within(remaining.min(RETRY)) {
                     tracing::error!(%error, "cannot wait for message delivery");
-                    return;
+                    std::thread::sleep(RETRY);
                 }
             }
         }
@@ -1691,7 +1691,7 @@ mod tests {
             registry: registry.clone(),
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
-            wait: wait::Wait::new().unwrap(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -1819,7 +1819,7 @@ mod tests {
             registry: registry.clone(),
             seal: Arc::new(Seal::new([8; 32])),
             state: Mutex::default(),
-            wait: wait::Wait::new().unwrap(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -1889,7 +1889,7 @@ mod tests {
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([9; 32])),
                 state: Mutex::default(),
-                wait: wait::Wait::new().unwrap(),
+                wait: wait::Wait::new(),
                 limits: Mutex::default(),
                 yielding: Mutex::default(),
                 scanned_generation: Mutex::new(None),
@@ -2014,7 +2014,7 @@ mod tests {
             )),
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
-            wait: wait::Wait::new().unwrap(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -2078,18 +2078,34 @@ mod tests {
 
     #[test]
     fn an_edge_after_a_pass_begins_ends_the_next_wait() {
-        let wait = wait::Wait::new().unwrap();
-        wait.wake();
-        wait.begin_pass();
-        // The edge before the pass began was consumed by it.
-        let start = Instant::now();
-        wait.until(super::super::now() + 50).unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(40));
-        wait.begin_pass();
-        wait.wake();
-        let start = Instant::now();
-        wait.until(super::super::now() + 60_000).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(5));
+        // Linux falls back to the condition variable when it cannot create
+        // the descriptors, so both must hold the same contract there.
+        #[cfg(target_os = "linux")]
+        let waits = [wait::Wait::new(), wait::Wait::portable()];
+        #[cfg(not(target_os = "linux"))]
+        let waits = [wait::Wait::new()];
+        for wait in waits {
+            wait.wake();
+            wait.begin_pass();
+            // The edge before the pass began was consumed by it.
+            let start = Instant::now();
+            wait.until(super::super::now() + 50).unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(40));
+            wait.begin_pass();
+            wait.wake();
+            let start = Instant::now();
+            wait.until(super::super::now() + 60_000).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(5));
+            // The fallback wait without a deadline timer ends on an edge too.
+            wait.begin_pass();
+            let start = Instant::now();
+            wait.edge_within(Duration::from_millis(50)).unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(40));
+            wait.wake();
+            let start = Instant::now();
+            wait.edge_within(Duration::from_secs(60)).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
     }
 
     #[test]
@@ -2102,7 +2118,7 @@ mod tests {
             )),
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
-            wait: wait::Wait::new().unwrap(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             update_runtime: None,
@@ -2169,7 +2185,7 @@ mod tests {
             )),
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
-            wait: wait::Wait::new().unwrap(),
+            wait: wait::Wait::new(),
             limits: Mutex::default(),
             yielding: Mutex::default(),
             scanned_generation: Mutex::new(None),
@@ -2283,7 +2299,7 @@ mod tests {
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([7; 32])),
                 state: Mutex::default(),
-                wait: wait::Wait::new().unwrap(),
+                wait: wait::Wait::new(),
                 limits: Mutex::default(),
                 yielding: Mutex::default(),
                 scanned_generation: Mutex::new(None),

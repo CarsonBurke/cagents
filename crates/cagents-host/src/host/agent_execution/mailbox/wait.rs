@@ -4,10 +4,62 @@
 //! [`Wait::until`] at once, so a pass never sleeps through a change it did
 //! not see.
 
-#[cfg(target_os = "linux")]
-pub(super) use linux::Wait;
 #[cfg(not(target_os = "linux"))]
 pub(super) use portable::Wait;
+
+/// The descriptors where the kernel provides them, or a condition variable
+/// when it refuses to create them, so the courier keeps delivering either way.
+#[cfg(target_os = "linux")]
+pub(super) enum Wait {
+    Descriptors(linux::Wait),
+    Portable(portable::Wait),
+}
+
+#[cfg(target_os = "linux")]
+impl Wait {
+    pub(super) fn new() -> Self {
+        match linux::Wait::new() {
+            Ok(wait) => Self::Descriptors(wait),
+            Err(error) => {
+                tracing::warn!(%error, "cannot create the courier's wait descriptors; using a condition variable");
+                Self::Portable(portable::Wait::new())
+            }
+        }
+    }
+
+    pub(super) fn wake(&self) {
+        match self {
+            Self::Descriptors(wait) => wait.wake(),
+            Self::Portable(wait) => wait.wake(),
+        }
+    }
+
+    pub(super) fn begin_pass(&self) {
+        match self {
+            Self::Descriptors(wait) => wait.begin_pass(),
+            Self::Portable(wait) => wait.begin_pass(),
+        }
+    }
+
+    pub(super) fn until(&self, unix_ms: u64) -> std::io::Result<()> {
+        match self {
+            Self::Descriptors(wait) => wait.until(unix_ms),
+            Self::Portable(wait) => wait.until(unix_ms),
+        }
+    }
+
+    pub(super) fn edge_within(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        match self {
+            Self::Descriptors(wait) => wait.edge_within(timeout),
+            Self::Portable(wait) => wait.edge_within(timeout),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn portable() -> Self {
+        Self::Portable(portable::Wait::new())
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -161,7 +213,6 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 mod portable {
     use std::{
         io,
@@ -181,11 +232,11 @@ mod portable {
     }
 
     impl Wait {
-        pub(in super::super) fn new() -> io::Result<Self> {
-            Ok(Self {
+        pub(in super::super) fn new() -> Self {
+            Self {
                 edge: Mutex::new(false),
                 changed: Condvar::new(),
-            })
+            }
         }
 
         pub(in super::super) fn wake(&self) {
@@ -216,13 +267,18 @@ mod portable {
 
         /// Blocks until an edge or `timeout` elapses.
         pub(in super::super) fn edge_within(&self, timeout: Duration) -> io::Result<()> {
-            let edge = self.edge.lock().unwrap_or_else(|p| p.into_inner());
-            if !*edge {
-                drop(
-                    self.changed
-                        .wait_timeout(edge, timeout)
-                        .unwrap_or_else(|p| p.into_inner()),
-                );
+            let deadline = std::time::Instant::now() + timeout;
+            let mut edge = self.edge.lock().unwrap_or_else(|p| p.into_inner());
+            while !*edge {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                edge = self
+                    .changed
+                    .wait_timeout(edge, remaining)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
             }
             Ok(())
         }
