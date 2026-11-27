@@ -318,13 +318,22 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         // draw the window's widgets. Dynamic canvas meshes in the pinned WGPU
         // renderer retained arcs after their panes unmounted; sharing one
         // icon per size also avoids retessellation on every animation frame.
-        // Keep the original phase, sweep and stroke. The track is a second
-        // shared icon that never turns, drawn first so the arc covers it.
+        // Keep the original phase, sweep and stroke.
+        //
+        // The track is a second shared icon that never turns, drawn first so
+        // the arc covers it. It shares the arc's layer, so it is clipped with
+        // it and adds an instance to the arc's draw rather than a draw of its
+        // own. It is set a quarter turn round, which leaves a ring unchanged:
+        // the renderer snaps an upright drawing to the pixel grid but samples
+        // a rotated one at its exact bounds, as it does the turning arc, so
+        // the ring stays under the arc where the spinner sits between
+        // physical pixels.
         renderer.with_layer(clip, |renderer| {
             renderer.draw_svg(
                 Svg::new(self.track.clone())
                     .color(cosmic::iced::Color { a: 1.0, ..track })
-                    .opacity(track.a),
+                    .opacity(track.a)
+                    .rotation(cosmic::iced::Radians(std::f32::consts::FRAC_PI_2)),
                 bounds,
                 clip,
             );
