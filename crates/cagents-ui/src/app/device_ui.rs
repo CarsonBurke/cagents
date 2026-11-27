@@ -2202,22 +2202,34 @@ pub(super) fn diagnose(name: &str, reason: Option<&str>) -> OpenFailure {
     }
 }
 
-/// Runs this computer's CLI with `--json`: whether it succeeded, and what
-/// it printed.
+/// Runs this computer's CLI with `--json`: whether it succeeded, and the
+/// JSON result it printed.
 fn cli_json(arguments: &[&str]) -> std::io::Result<(bool, String)> {
     let executable = crate::companion::Product::Cli.beside_current()?;
-    std::process::Command::new(executable)
+    let output = std::process::Command::new(executable)
         .arg("--json")
         .args(arguments)
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|output| {
-            (
-                output.status.success(),
-                String::from_utf8_lossy(&output.stdout).into_owned(),
-            )
-        })
+        .output()?;
+    let success = output.status.success();
+    Ok((
+        success,
+        json_result(success, &output.stdout, &output.stderr),
+    ))
+}
+
+/// The CLI prints a success to stdout, but a failure's JSON to stderr, last,
+/// after anything it logged on the way.
+fn json_result(success: bool, stdout: &[u8], stderr: &[u8]) -> String {
+    if success {
+        return String::from_utf8_lossy(stdout).into_owned();
+    }
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|line| line.starts_with('{'))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// `reason`, a CLI message, as a sentence that starts with a capital.
@@ -2231,6 +2243,24 @@ fn sentence(reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::Provider;
+
+    #[test]
+    fn a_failed_command_is_read_from_the_json_it_wrote_to_stderr() {
+        let refusal = r#"{"ok":false,"error":{"kind":"device_incompatible","message":"old runs an older cagents","details":{"device":"old","expected":210,"protocol":208}}}"#;
+        let stderr = format!("2026-11-26 WARN reconnecting\n{refusal}\n");
+        let printed = json_result(false, b"", stderr.as_bytes());
+        // A device that is older says so, so the window offers the update.
+        assert_eq!(device_update_ui::mismatch(&printed), Some(208));
+        assert_eq!(
+            device_update_ui::error_message(&printed).as_deref(),
+            Some("old runs an older cagents")
+        );
+        assert_eq!(
+            json_result(true, b"{\"ok\":true}\n", b"noise"),
+            "{\"ok\":true}\n"
+        );
+        assert_eq!(json_result(false, b"", b"ssh: no route\n"), "");
+    }
 
     #[test]
     fn devices_menu_and_keyboard_chat_picker_transfer_keyboard_ownership() {
