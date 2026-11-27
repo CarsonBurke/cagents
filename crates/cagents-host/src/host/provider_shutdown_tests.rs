@@ -1230,6 +1230,26 @@ fn reopenable_codex_agent(
     chat::Session,
     crate::workspace_model::views::Pane,
 ) {
+    reopenable_agent(
+        directory,
+        crate::agent::Provider::Codex,
+        chat::NativeContinuity::ReconnectOnly,
+    )
+}
+
+/// An open `provider` agent whose run an unclean restart interrupted, bound
+/// to a chat the first boot's daemon ran with `continuity`, and shown in its
+/// channel's pane.
+fn reopenable_agent(
+    directory: &Path,
+    provider: crate::agent::Provider,
+    continuity: chat::NativeContinuity,
+) -> (
+    model::Registry,
+    crate::agent_execution::Agent,
+    chat::Session,
+    crate::workspace_model::views::Pane,
+) {
     use crate::{
         agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target},
         model::{CardId, CardKind, ProjectKind},
@@ -1250,7 +1270,7 @@ fn reopenable_codex_agent(
             &Submit {
                 name: None,
                 destination: Destination::New(Spec {
-                    provider: crate::agent::Provider::Codex,
+                    provider,
                     account: None,
                     target: Target {
                         repository: repository.clone(),
@@ -1271,7 +1291,7 @@ fn reopenable_codex_agent(
     let session = chat::Session {
         id: TerminalId::new(),
         launch: chat::Launch {
-            provider: crate::agent::Provider::Codex,
+            provider,
             recipe: LaunchRecipe {
                 program: "/bin/cat".into(),
                 arguments: Vec::new(),
@@ -1282,7 +1302,7 @@ fn reopenable_codex_agent(
             session_id: Some(Uuid::new_v4().to_string()),
             draft_model: None,
         },
-        native_continuity: Default::default(),
+        native_continuity: continuity,
         owned_codex_listener: None,
         proof: Some(boot_proof("first")),
         terminal: None,
@@ -1523,4 +1543,223 @@ fn a_chat_reopened_in_place_after_a_recorded_stop_keeps_its_agent() {
         registry.lock().unwrap().agent(agent.id).unwrap().session,
         Some(HostedSession::Chat(reopened))
     );
+}
+
+/// A provider the daemon ran itself, as Antigravity's is, was connected only
+/// through that daemon. After the daemon is lost uncleanly within one boot,
+/// nothing recorded its stop, yet nothing can give it work either: the chat
+/// reopened in place by the next daemon takes the agent over, and the earlier
+/// process's authority is revoked rather than left to it.
+#[test]
+fn a_chat_reopened_in_place_after_its_daemon_was_lost_keeps_its_agent() {
+    use crate::{agent_execution::HostedSession, model::CardKind};
+    let directory = tempfile::tempdir().unwrap();
+    let (registry, agent, session, pane) = reopenable_agent(
+        directory.path(),
+        crate::agent::Provider::Antigravity,
+        chat::NativeContinuity::ReconnectOnly,
+    );
+    let restarted = HostSessionProof {
+        host_session_id: HostSessionId::new("first-daemon-again"),
+        host_incarnation: HostIncarnation::new("first-incarnation-again"),
+        ..boot_proof("first")
+    };
+    let mut state = HostState::new(restarted.clone());
+    state.install_model(registry);
+    let host = Arc::new(state::HostLock::new(state));
+    let reopened = chat::Session {
+        proof: Some(restarted),
+        ..session.clone()
+    };
+    assert!(agent_execution::adopt_resumed(&host, &reopened).unwrap());
+
+    let registry = agent_execution::registry(&host).unwrap();
+    let registry = registry.lock().unwrap();
+    let adopted = registry.agent(agent.id).unwrap();
+    assert!(!adopted.closed);
+    assert_eq!(adopted.session, Some(HostedSession::Chat(reopened.clone())));
+    assert!(
+        registry.retained_agent_authority(session.id).is_err(),
+        "the lost daemon's provider keeps no authority"
+    );
+    let shown = registry
+        .model()
+        .unwrap()
+        .views
+        .into_iter()
+        .flat_map(|view| view.panes)
+        .find(|candidate| candidate.id == pane.id)
+        .unwrap();
+    assert_eq!(shown.kind, CardKind::Chat(reopened));
+    assert!(pane_opens(&registry, agent.id));
+}
+
+/// A retained provider outlives the daemon that started it, so a chat
+/// reopened beside it in the same boot does not take its agent over, and
+/// nothing records that it stopped.
+#[test]
+fn a_retained_provider_from_an_earlier_daemon_keeps_its_agent() {
+    use crate::agent_execution::HostedSession;
+    let directory = tempfile::tempdir().unwrap();
+    let (registry, agent, session, _) = reopenable_agent(
+        directory.path(),
+        crate::agent::Provider::Claude,
+        chat::NativeContinuity::RetainedClaudeActor { protocol: 1 },
+    );
+    let restarted = HostSessionProof {
+        host_session_id: HostSessionId::new("first-daemon-again"),
+        host_incarnation: HostIncarnation::new("first-incarnation-again"),
+        ..boot_proof("first")
+    };
+    let mut state = HostState::new(restarted.clone());
+    state.install_model(registry);
+    let host = Arc::new(state::HostLock::new(state));
+    let reopened = chat::Session {
+        proof: Some(restarted),
+        native_continuity: chat::NativeContinuity::ReconnectOnly,
+        ..session.clone()
+    };
+    assert!(agent_execution::adopt_resumed(&host, &reopened).is_err());
+
+    let registry = agent_execution::registry(&host).unwrap();
+    let registry = registry.lock().unwrap();
+    assert_eq!(
+        registry.agent(agent.id).unwrap().session,
+        Some(HostedSession::Chat(session))
+    );
+    assert!(!registry.agent_process_ended(agent.id).unwrap());
+}
+
+/// A `provider` agent's chat restarted in place by the next daemon of the
+/// same boot, running beside an agent still bound to the lost daemon's
+/// process, with client 17 attached when `attached`.
+fn restarted_beside_its_agent(
+    directory: &Path,
+    provider: crate::agent::Provider,
+    continuity: chat::NativeContinuity,
+    attached: bool,
+) -> (
+    SharedHost,
+    crate::agent_execution::Agent,
+    chat::Session,
+    chat::Session,
+    Handle,
+) {
+    let (registry, agent, session, _) = reopenable_agent(directory, provider, continuity);
+    let restarted = HostSessionProof {
+        host_session_id: HostSessionId::new("first-daemon-again"),
+        host_incarnation: HostIncarnation::new("first-incarnation-again"),
+        ..boot_proof("first")
+    };
+    let reopened = chat::Session {
+        proof: Some(restarted.clone()),
+        native_continuity: chat::NativeContinuity::ReconnectOnly,
+        ..session.clone()
+    };
+    let mut state = HostState::new(restarted);
+    state.install_model(registry);
+    let handle = quiet_chat(&directory.canonicalize().unwrap());
+    let mut running = record(reopened.clone(), handle.clone());
+    if attached {
+        running.subscribers.insert(17, false);
+    }
+    state.chats.insert(reopened.id, running);
+    (
+        Arc::new(state::HostLock::new(state)),
+        agent,
+        session,
+        reopened,
+        handle,
+    )
+}
+
+fn send_from_window(
+    host: &SharedHost,
+    chat: TerminalId,
+) -> Result<crate::terminal_ipc::ServerResponse, crate::terminal_ipc::ProtocolError> {
+    agent_execution::interactive(
+        host,
+        17,
+        crate::terminal_ipc::ClientRequest::ChatCommand {
+            chat_id: chat,
+            command: chat::Command::Prompt {
+                text: "Carry on".into(),
+                mode: chat::PromptMode::Send,
+                attachments: Vec::new(),
+            },
+        },
+        |_| Ok(crate::terminal_ipc::ServerResponse::Accepted),
+    )
+}
+
+/// A restarted chat whose agent did not follow it when it started, as when
+/// that adoption was refused for the moment, gets the agent at the window's
+/// next send instead of refusing it.
+#[test]
+fn a_send_to_a_restarted_chat_lets_its_agent_follow() {
+    use crate::agent_execution::HostedSession;
+    let directory = tempfile::tempdir().unwrap();
+    let (host, agent, _, reopened, handle) = restarted_beside_its_agent(
+        directory.path(),
+        crate::agent::Provider::Antigravity,
+        chat::NativeContinuity::ReconnectOnly,
+        true,
+    );
+    send_from_window(&host, reopened.id).unwrap();
+    let registry = agent_execution::registry(&host).unwrap();
+    assert_eq!(
+        registry.lock().unwrap().agent(agent.id).unwrap().session,
+        Some(HostedSession::Chat(reopened))
+    );
+    handle.close().unwrap();
+}
+
+/// A window that is not attached to the restarted chat neither moves its
+/// agent nor sends; it is told to reconnect.
+#[test]
+fn a_send_from_a_detached_window_moves_nothing() {
+    use crate::agent_execution::HostedSession;
+    let directory = tempfile::tempdir().unwrap();
+    let (host, agent, session, reopened, handle) = restarted_beside_its_agent(
+        directory.path(),
+        crate::agent::Provider::Antigravity,
+        chat::NativeContinuity::ReconnectOnly,
+        false,
+    );
+    let refused = send_from_window(&host, reopened.id).unwrap_err();
+    assert_eq!(refused.message, chat::failure::delivery::DETACHED_REQUEST);
+    let registry = agent_execution::registry(&host).unwrap();
+    assert_eq!(
+        registry.lock().unwrap().agent(agent.id).unwrap().session,
+        Some(HostedSession::Chat(session))
+    );
+    handle.close().unwrap();
+}
+
+/// When the agent cannot safely follow, because its earlier provider may
+/// outlive the lost daemon, the send is refused in words that say so and
+/// what to do, and the agent stays where it was.
+#[test]
+fn a_send_whose_agent_cannot_follow_the_restart_says_so() {
+    use crate::agent_execution::HostedSession;
+    let directory = tempfile::tempdir().unwrap();
+    let (host, agent, session, reopened, handle) = restarted_beside_its_agent(
+        directory.path(),
+        crate::agent::Provider::Claude,
+        chat::NativeContinuity::RetainedClaudeActor { protocol: 1 },
+        true,
+    );
+    let refused = send_from_window(&host, reopened.id).unwrap_err();
+    assert_eq!(refused.message, chat::failure::delivery::UNFOLLOWED_RESTART);
+    let outcome = chat::failure::DeliveryOutcome::parse(&refused.message).unwrap();
+    assert!(!outcome.unknown && outcome.notice);
+    let registry = agent_execution::registry(&host).unwrap();
+    let registry = registry.lock().unwrap();
+    assert_eq!(
+        registry.agent(agent.id).unwrap().session,
+        Some(HostedSession::Chat(session))
+    );
+    assert!(!registry.agent_process_ended(agent.id).unwrap());
+    drop(registry);
+    handle.close().unwrap();
 }

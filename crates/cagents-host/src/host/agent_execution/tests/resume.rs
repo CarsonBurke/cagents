@@ -908,3 +908,136 @@ fn a_pane_a_window_reopened_first_is_left_to_it() {
         writers[0].subscribers.keys().collect::<Vec<_>>()
     );
 }
+
+fn send(id: crate::model::TerminalId, text: &str) -> ClientRequest {
+    ClientRequest::ChatCommand {
+        chat_id: id,
+        command: Command::Prompt {
+            text: text.into(),
+            mode: PromptMode::Send,
+            attachments: Vec::new(),
+        },
+    }
+}
+
+/// Waits until chat `id` is ready for another prompt.
+fn idle(host: &SharedHost, id: crate::model::TerminalId) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let handle = host.lock().unwrap().chats[&id].handle.clone();
+        if handle
+            .snapshot(None)
+            .is_some_and(|snapshot| snapshot.ready && !snapshot.busy)
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the chat never became idle");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// When a daemon is lost without stopping its providers, the next daemon in
+/// the same boot restarts a pane's conversation in place. Its agent follows
+/// the restarted process, so the window that restarted it can keep working
+/// with the agent rather than being told the agent's session is gone.
+#[test]
+fn a_pane_restarted_after_its_daemon_was_lost_keeps_working_with_its_agent() {
+    if in_child("a_pane_restarted_after_its_daemon_was_lost_keeps_working_with_its_agent") {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    show_in_a_channel(&host, &path, &accepted);
+    let pane = panes(&host).into_iter().next().unwrap();
+    // The daemon ends without recording that its provider stopped.
+    let handle = host.lock().unwrap().chats[&pane.id].handle.clone();
+    handle.close().unwrap();
+    std::mem::forget(host);
+
+    let host = daemon_on(crate::daemon::read_boot_id().unwrap());
+    let mut start = pane.clone();
+    start.proof = Some(host.lock().unwrap().proof().clone());
+    crate::host::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatStart {
+            session: start,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
+    let running = host.lock().unwrap().chats[&pane.id].session.clone();
+    assert!(crate::agent_execution::same_chat_process(
+        &session_of(&host, accepted.agent.id),
+        &running
+    ));
+    idle(&host, pane.id);
+    crate::host::chat::process(&host, 17, send(pane.id, "Carry on")).unwrap();
+}
+
+/// A window the conversation stopped serving, because the daemon reopened it
+/// for the agent's next prompt, is told plainly that it is not connected and
+/// to reconnect, and nothing is sent on its behalf.
+#[test]
+fn a_window_left_behind_by_a_reopen_is_told_to_reconnect() {
+    if in_child("a_window_left_behind_by_a_reopen_is_told_to_reconnect") {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    show_in_a_channel(&host, &path, &accepted);
+    let session = session_of(&host, accepted.agent.id);
+    crate::host::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    idle(&host, session.id);
+    let handle = host.lock().unwrap().chats[&session.id].handle.clone();
+    assert!(
+        handle
+            .try_stop_if_idle(
+                handle.resident_generation(),
+                crate::daemon::owned_children::DetachedWork::Spare,
+            )
+            .unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !host.lock().unwrap().chats[&session.id]
+        .handle
+        .is_completed()
+    {
+        assert!(Instant::now() < deadline, "the chat never stopped");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The agent's next prompt reopens its conversation in place.
+    let next = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(accepted.agent.id),
+            prompt: "Again".into(),
+            idempotency_key: "again".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, next.run.id).state, State::Succeeded);
+    idle(&host, session.id);
+
+    let refused =
+        crate::host::chat::process(&host, 17, send(session.id, "From the window")).unwrap_err();
+    assert_eq!(
+        refused.message,
+        crate::chat::failure::delivery::DETACHED_REQUEST
+    );
+    let outcome = crate::chat::failure::DeliveryOutcome::parse(&refused.message).unwrap();
+    assert!(!outcome.unknown && outcome.notice);
+}

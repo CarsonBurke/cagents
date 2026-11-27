@@ -10625,6 +10625,8 @@ fn a_declined_send_is_a_notice_unless_the_conversation_cannot_go_on() {
         (delivery::HANDOVER_INPUT, false),
         (delivery::DAMAGED_INPUT, false),
         (delivery::UNSETTLEABLE_INPUT, false),
+        (delivery::DETACHED_REQUEST, false),
+        (delivery::UNFOLLOWED_RESTART, false),
         (delivery::UNRESOLVABLE_INPUT, true),
         (delivery::STOPPED_INPUT, true),
         (delivery::CLOSING_INPUT, true),
