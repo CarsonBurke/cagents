@@ -21,6 +21,8 @@ mod unsupported;
 use unsupported as backend;
 
 pub use backend::collect_empty_scopes;
+#[cfg(target_os = "linux")]
+pub(crate) use backend::in_session_scope;
 #[cfg(test)]
 pub(crate) use backend::tests;
 pub(crate) use backend::{

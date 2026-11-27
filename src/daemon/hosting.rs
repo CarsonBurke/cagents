@@ -33,7 +33,7 @@ use super::RuntimePaths;
 use crate::instance;
 
 const DAEMON_EXECUTABLE: &str = "cagentsd";
-const MAX_ANCESTORS: usize = 1024;
+pub(super) const MAX_ANCESTORS: usize = 1024;
 
 /// Newline-separated runtime directories of the daemons hosting the session
 /// that started a development instance; see the module documentation.
@@ -155,15 +155,17 @@ fn host_runtime_directories(proc_root: &Path) -> Result<Vec<PathBuf>, String> {
 /// Holders and actors keep the daemon's executable under another process name.
 /// A process this user can't inspect is not one of their daemons.
 fn runs_daemon_executable(process: &Path) -> bool {
-    fs::read_link(process.join("exe")).is_ok_and(|executable| {
-        executable.file_name().is_some_and(|name| {
-            let name = name.as_bytes();
-            name.strip_suffix(b" (deleted)").unwrap_or(name) == DAEMON_EXECUTABLE.as_bytes()
-        })
+    fs::read_link(process.join("exe")).is_ok_and(|executable| daemon_executable(&executable))
+}
+
+pub(super) fn daemon_executable(executable: &Path) -> bool {
+    executable.file_name().is_some_and(|name| {
+        let name = name.as_bytes();
+        name.strip_suffix(b" (deleted)").unwrap_or(name) == DAEMON_EXECUTABLE.as_bytes()
     })
 }
 
-fn parent_of(process: &Path) -> io::Result<u32> {
+pub(crate) fn parent_of(process: &Path) -> io::Result<u32> {
     let stat = fs::read(process.join("stat"))?;
     // The command name in parentheses may itself contain spaces or parentheses.
     let fields = stat

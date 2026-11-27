@@ -201,6 +201,41 @@ pub struct PinnedProcess {
 }
 
 impl PinnedProcess {
+    /// Pins the socket's kernel peer where the platform provides that pin.
+    /// The caller has already read the peer credentials from this socket.
+    /// Older Linux and Darwin resolve the peer's numeric PID instead.
+    #[cfg(feature = "host")]
+    pub(crate) fn socket_peer(stream: &UnixStream, pid: u32) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut fd: libc::c_int = -1;
+            let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: fd and length describe a live c_int buffer, and a
+            // successful SO_PEERPIDFD returns a fresh descriptor.
+            let result = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERPIDFD,
+                    (&raw mut fd).cast(),
+                    &mut length,
+                )
+            };
+            if result == 0 {
+                // SAFETY: the successful call transferred the descriptor.
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                return Ok(Self::from_pidfd(pid, fd));
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOPROTOOPT) {
+                return Err(error);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let _ = stream;
+        Self::open_unreaped(pid)
+    }
+
     /// Pins the process that holds `pid` now.
     ///
     /// # Errors
@@ -405,9 +440,37 @@ impl PinnedProcess {
         self.while_running(imp::command_line(self.pid))
     }
 
+    #[cfg(all(target_os = "linux", feature = "host"))]
+    pub(crate) fn parent_pid(&self) -> io::Result<u32> {
+        self.while_running(crate::daemon::hosting::parent_of(
+            &std::path::Path::new("/proc").join(self.pid.to_string()),
+        ))
+    }
+
     #[cfg(all(target_os = "macos", feature = "host"))]
     pub(crate) fn parent_pid(&self) -> io::Result<u32> {
         self.while_running(imp::bsd_info(self.pid).map(|info| info.pbi_ppid))
+    }
+
+    /// The kernel's process name, available when executable lookup is denied.
+    #[cfg(feature = "host")]
+    pub(crate) fn command_name(&self) -> io::Result<Vec<u8>> {
+        #[cfg(target_os = "linux")]
+        let name = fs::read(format!("/proc/{}/comm", self.pid)).map(|mut name| {
+            if name.last() == Some(&b'\n') {
+                name.pop();
+            }
+            name
+        });
+        #[cfg(target_os = "macos")]
+        let name = imp::bsd_info(self.pid).map(|info| {
+            info.pbi_comm
+                .into_iter()
+                .map(|byte| byte as u8)
+                .take_while(|byte| *byte != 0)
+                .collect()
+        });
+        self.while_running(name)
     }
 
     /// Foreground group of the expected controlling terminal of this root.

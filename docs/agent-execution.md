@@ -252,7 +252,30 @@ A row shows a session or agent ID by its shortest prefix that is unique in the l
 
 Each entry carries the live session ID, provider, `idle`/`working`/`waiting` state, working directory, checkout (repository or linked worktree), project, and, for delegated agents, the owner and latest run. `relation` places it relative to the caller: `me`, `parent` (a session of the lineage that owns the caller), `child` (an agent the caller may control; one started by a CLI outside cagents is shown as a user agent, because every such caller shares it), or a peer. A plain shell appears only as the caller or as the owner of a listed agent. `whoami` reports the calling session, its relatives, and peers working in the same checkout, which are the sessions most likely to collide with its edits.
 
-The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: the agent commands below remain restricted to an agent's owner. Inside a hosted session the lower-level `cagents terminal` commands are restricted too. That includes a plain shell, since an agent may be running in it. They still list, snapshot and wait on any terminal, but `write` and `close` reach only the terminals the session's lineage controls: its own session, the terminals it started with `cagents terminal spawn`, and the sessions and consoles of the agents it delegated to. Typing, pasting or clicking into a delegated agent's session, into any agent's console, or into a terminal running a provider CLI, its own included, acts as the person at it, who can approve tool requests there, so the daemon refuses that input unless the writing agent runs with nothing asking it, as described under permissions; such an agent uses `cagents agent message` instead, and the console's commands stay with a person or such an agent. A shell it started stays its own to type into. To reach anyone else's, message its owner. The daemon records which lineage started each terminal, from registry schema version 6, so this survives a reconnect and a daemon restart; a terminal relaunched in its card keeps its owner. A spawn from inside a session may start a new terminal but not relaunch an existing one. By the same rule a session moves panes: `cagents channel move --to CHANNEL` moves its own pane into another channel of its project, `--new TITLE` makes that channel first, and naming a pane moves one the lineage controls; no other pane, a pane in another project, nor a channel made without moving a pane into it. Windows show the pane in its new channel as they show a move made in another window, with its conversation, draft and tab intact, and without switching the channel the person is looking at. The check applies to the connection the CLI authenticates with the session's capability, which also refuses everything else outside the terminal surface. Like a CLI outside cagents, a process that reaches the daemon socket without authenticating acts for the user. So does a command run with `CAGENTS_AGENT_AUTHORITY` unset, which a person at a hosted shell can use to act as themselves. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID. Its `lineage`, in `--json`, names the root session it succeeds and stays the same across those relaunches and recoveries; it is left out while the session is its own root.
+A hosted session identifies itself with its daemon-issued capability. The daemon
+checks the caller's process ancestry on the local socket, including ancestry
+through a retained holder, and on Linux also checks membership in a Cagents
+session scope when available. A hosted caller needs its capability for
+operations that act on behalf of a caller. A local CLI outside Cagents can act
+for the person using the app. Run user-scoped commands from an external shell
+or the app.
+
+Hosted sessions can list, snapshot and wait on any terminal. They can close
+only terminals their lineage controls. These include their own terminal,
+terminals they started, and the sessions and consoles of delegated agents.
+Starting a fresh terminal or sending terminal input requires Full permission
+even for a plain shell. A limited agent can use `cagents agent spawn` for a
+task within its mode and `cagents agent message` to reach another session.
+The daemon records terminal ownership across reconnects, restarts and
+relaunches in the same card.
+
+A hosted session can move a pane it controls into another channel in the same
+project with `cagents channel move --to CHANNEL`, or create the channel with
+`--new TITLE`. The move preserves its conversation, draft and tab and leaves
+the current channel focused. Session IDs address the live process. A relaunched
+or recovered conversation has a new ID. Its `lineage` in JSON names the
+original session and stays the same across relaunches and recoveries. JSON
+omits `lineage` while the session is its own root.
 
 ## Reading your channel
 
@@ -336,7 +359,7 @@ A message body is at most 64 KiB, and a lineage holds at most 64 undelivered mes
 
 ## Delegation and bundled skill
 
-Fresh hosted sessions receive a daemon-issued, session-bound capability in `CAGENTS_AGENT_AUTHORITY`. It is transient process context, omitted from public recipes and redacted in diagnostics. Agents use the same CLI commands as people, but can only inspect/control children created under their live, proved session. A plain human CLI invocation without that variable owns a separate root scope. Passing a parent ID never grants authority. Do not copy, print, unset, or fabricate capabilities to bypass that scope.
+Fresh hosted sessions receive a daemon-issued, session-bound capability in `CAGENTS_AGENT_AUTHORITY`. It is transient process context, omitted from public recipes and redacted in diagnostics. Agents use the same CLI commands as people, but can only inspect/control children created under their live, proved session. A CLI outside hosted sessions can act for the person in a separate root scope. Passing a parent ID never grants authority. Do not copy, print, unset, or fabricate capabilities to bypass that scope.
 
 A session's children belong to its lineage, not to its process. A successor joins the lineage and keeps control of the children when the session is relaunched in its card, recovered after a crash, reopened after its native owner's close was proved, recovered under another account, or converted between chat and terminal. It joins only if no other session of that lineage is still running, which account recovery, reopening and conversion prove for the session they replace by stopping it first; otherwise, as with a rival relaunch of a live session, it starts a lineage of its own, and the daemon logs a warning. Each successor joins the lineage of the exact session it replaces, so a rival's own agents pass to its successors in turn; a relaunch that failed to start passes on the lineage of the chain's first session. Resuming a closed conversation from history, branching a conversation, or cloning a pane starts a new lineage, except that a Codex conversation kept by its native server keeps its lineage. The lineage is recorded before the successor starts and never changes afterwards. Every live session of a lineage controls its children; the check above keeps that to one session at a time. A delegated agent's `owner` names its lineage, which is the ID of the session that began it and may no longer be live. Chats replaced before this release cannot be traced to their original lineage. The daemon registry records lineages from schema version 4, and the application state records each relaunched terminal's predecessor from schema version 11; an older cagents refuses to open either.
 

@@ -301,6 +301,11 @@ struct MobileSubscription {
     pending: Cell<bool>,
 }
 
+struct ClientPeer {
+    pid: Option<u32>,
+    requires_session_authority: bool,
+}
+
 pub(crate) struct HostState {
     recover_holders: bool,
     /// Shared, never mutated: a redraw broadcast hands the same proof to every
@@ -409,7 +414,7 @@ pub(crate) struct HostState {
     /// independent subscriptions with independent clients - the CLI reads the
     /// model without subscribing at all.
     model_watchers: BTreeSet<ClientId>,
-    client_pids: BTreeMap<ClientId, u32>,
+    client_peers: BTreeMap<ClientId, ClientPeer>,
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
@@ -591,7 +596,7 @@ impl HostState {
             idle_adoptions: BTreeSet::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
-            client_pids: BTreeMap::new(),
+            client_peers: BTreeMap::new(),
             notifications: None,
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
@@ -660,10 +665,27 @@ impl HostState {
         delivery
     }
 
-    pub(super) fn record_client_pid(&mut self, client: ClientId, pid: u32) {
+    pub(super) fn record_client_peer(
+        &mut self,
+        client: ClientId,
+        pid: Option<u32>,
+        requires_session_authority: bool,
+    ) {
         if self.clients.contains_key(&client) {
-            self.client_pids.insert(client, pid);
+            self.client_peers.insert(
+                client,
+                ClientPeer {
+                    pid,
+                    requires_session_authority,
+                },
+            );
         }
+    }
+
+    pub(super) fn client_requires_session_authority(&self, client: ClientId) -> bool {
+        self.client_peers
+            .get(&client)
+            .is_some_and(|peer| peer.requires_session_authority)
     }
 
     /// Subscribes `client_id` to terminal-inventory edges. Repeating it is
@@ -685,7 +707,7 @@ impl HostState {
             notifications.presence(client_id, None);
         }
         self.clients.remove(&client_id);
-        self.client_pids.remove(&client_id);
+        self.client_peers.remove(&client_id);
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
@@ -1323,7 +1345,7 @@ impl HostState {
         if let Some(delivery) = self.clients.remove(&client_id) {
             delivery.close_after_drain();
         }
-        self.client_pids.remove(&client_id);
+        self.client_peers.remove(&client_id);
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
@@ -2290,9 +2312,10 @@ impl HostState {
             return Err("An account operation is still using its credential directories".into());
         }
         let verified = |id: &ClientId| {
-            self.client_pids
+            self.client_peers
                 .get(id)
-                .is_some_and(|pid| windows.iter().any(|window| window.pid() == *pid))
+                .and_then(|peer| peer.pid)
+                .is_some_and(|pid| windows.iter().any(|window| window.pid() == pid))
         };
         if !verified(&client) || self.model_watchers.iter().any(|id| !verified(id)) {
             return Err("A window has not established directory protection".into());

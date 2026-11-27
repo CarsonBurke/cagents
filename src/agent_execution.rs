@@ -94,8 +94,8 @@ pub fn console_agent(recipe: &crate::model::LaunchRecipe) -> Option<AgentId> {
 }
 
 /// A session capability injected by the daemon, never copied into a public
-/// launch recipe or diagnostic. Absence is the user's CLI scope; that scope
-/// does not grant authority over session-owned children.
+/// launch recipe or diagnostic. The daemon checks the socket peer before
+/// allowing connections without a session credential to act for the user.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Authority(Option<String>);

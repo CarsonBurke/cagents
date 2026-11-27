@@ -6187,6 +6187,7 @@ fn sessions_message_their_parent_peers_and_the_user_and_replies_find_their_asker
 #[test]
 fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     use crate::{
+        agent_execution::Lineage,
         host::client::process_request,
         model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
         terminal_ipc::{ProtocolErrorCode, TerminalSpawnOptions},
@@ -6288,12 +6289,33 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     authenticate(PEER, peer).unwrap();
     denied(authenticate(AGENT, peer));
 
-    // An agent changes its own session and the terminals it started.
+    // A plain shell's limited ceiling applies to its own shell and to new
+    // terminals, even when the connection authenticated and owns the target.
     attach(AGENT, agent);
-    input(AGENT, agent).unwrap();
+    denied(input(AGENT, agent));
+    let refused = TerminalId::new();
+    denied(spawn_as(AGENT, shell(refused)));
+    assert!(!host.lock().unwrap().terminals.contains_key(&refused));
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .lineage_recorded(refused)
+            .unwrap()
+    );
+
+    // An older registry may already record a terminal owned by this lineage.
     let started = TerminalId::new();
-    spawn_as(AGENT, shell(started)).unwrap();
-    input(AGENT, started).unwrap();
+    spawn_as(USER, shell(started)).unwrap();
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .own_terminal(Lineage(started), Lineage(agent))
+        .unwrap();
+    attach(AGENT, started);
+    denied(input(AGENT, started));
     request_as(
         AGENT,
         ClientRequest::Resize {
@@ -6448,7 +6470,10 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         },
     )
     .unwrap();
-    change(CHILD, child_session).unwrap();
+    assert_eq!(
+        change(CHILD, child_session).unwrap_err().code,
+        ProtocolErrorCode::PermissionDenied
+    );
     assert_eq!(
         change(CHILD, agent).unwrap_err().code,
         ProtocolErrorCode::PermissionDenied
@@ -6480,12 +6505,22 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     let trusted = submit(&host, &authority(full), trusted).unwrap();
     assert_eq!(settled(&host, trusted.run.id).state, State::Succeeded);
     change(FULL, session_of(trusted.agent.id)).unwrap();
-    // Nor into a provider CLI it runs or started itself, which reads its
-    // keys as its person's; a shell it started is its own to type into.
+    // Full agents can still start and type into fresh terminals they own.
+    let full_started = TerminalId::new();
+    spawn_as(FULL, shell(full_started)).unwrap();
+    attach(FULL, full_started);
+    input(FULL, full_started).unwrap();
+    // A limited agent cannot type into the provider CLI it already owns.
     let mut provider = shell(TerminalId::new());
     provider.launch.program = root.join("bin/claude").display().to_string();
     let provider_id = provider.id;
-    spawn_as(AGENT, provider).unwrap();
+    spawn_as(USER, provider).unwrap();
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .own_terminal(Lineage(provider_id), Lineage(agent))
+        .unwrap();
     let error = change(AGENT, provider_id).unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
     assert_eq!(
@@ -6494,19 +6529,19 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
             "This agent can't type into Claude Code's terminal {provider_id} because its approvals are limited. A person can type there in cagents."
         )
     );
-    change(AGENT, started).unwrap();
+    denied(input(AGENT, started));
     change(FULL, full).unwrap();
 
     // The user changes every terminal, and an agent's connection forgets
     // whom it acted for once it disconnects.
-    for terminal in [agent, peer, started] {
+    for terminal in [agent, peer, started, full_started, full, provider_id] {
         attach(USER, terminal);
         input(USER, terminal).unwrap();
     }
     host.lock().unwrap().unregister_client(AGENT);
     assert!(!host.lock().unwrap().agent_clients.contains_key(&AGENT));
     close(&host, &authority(agent), child.agent.id).unwrap();
-    for terminal in [agent, peer, started] {
+    for terminal in [agent, peer, started, full_started, full, provider_id] {
         request_as(
             USER,
             ClientRequest::ShutdownTerminal {

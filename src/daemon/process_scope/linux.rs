@@ -580,6 +580,13 @@ fn session_scope(membership: &str) -> Option<&str> {
         .then_some(scope)
 }
 
+pub(crate) fn in_session_scope(pid: u32) -> io::Result<bool> {
+    Ok(fs::read_to_string(format!("/proc/{pid}/cgroup"))?
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .any(|membership| session_scope(membership).is_some()))
+}
+
 /// Holder constructors have no tracing subscriber. Their daemon logs degraded
 /// isolation after startup ACK instead; include the actual root to detect a
 /// manager migration that completed too late for the provider fork.
