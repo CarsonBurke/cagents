@@ -453,7 +453,7 @@ fn threads_quiescent(process: &CloseProcess, deadline: Instant) -> Result<bool, 
     let ids = thread_ids(pid, deadline)?;
     for &tid in &ids {
         check_deadline(deadline)?;
-        let stat = match fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")) {
+        let stat = match fs::read(format!("/proc/{pid}/task/{tid}/stat")) {
             Ok(stat) => stat,
             // A thread can vanish before the open (ENOENT) or after it (ESRCH).
             Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
@@ -511,13 +511,12 @@ fn same_identity(a: &CloseProcess, b: &CloseProcess) -> bool {
 
 #[cfg(target_os = "linux")]
 fn read_process(pid: libc::pid_t) -> io::Result<CloseProcess> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let stat = fs::read(format!("/proc/{pid}/stat"))?;
     parse_process(pid, &stat).ok_or_else(changed)
 }
 #[cfg(target_os = "linux")]
-fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
-    let (_, fields) = stat.rsplit_once(") ")?;
-    let mut fields = fields.split_whitespace();
+fn parse_process(pid: libc::pid_t, stat: &[u8]) -> Option<CloseProcess> {
+    let mut fields = crate::model::agent_recovery::process_stat_fields(stat)?;
     let state = fields.next()?.as_bytes().first().copied()?;
     let parent = fields.next()?.parse().ok()?;
     let group = fields.next()?.parse().ok()?;
@@ -1071,20 +1070,21 @@ mod tests {
     // This fixture exercises the Linux /proc text format.
     #[cfg(target_os = "linux")]
     #[test]
-    fn proc_parser_handles_parentheses_inside_names_and_rejects_partial_identity() {
+    fn proc_parser_handles_arbitrary_name_bytes_and_rejects_partial_identity() {
         let mut fields = vec!["0"; 20];
         fields[0] = "S";
         fields[1] = "1";
         fields[2] = "10";
         fields[3] = "10";
         fields[19] = "998877";
-        let parsed =
-            parse_process(10, &format!("10 (shell ) nested) {}", fields.join(" "))).unwrap();
+        let mut stat = b"10 (shell ) nested \xff) ".to_vec();
+        stat.extend_from_slice(fields.join(" ").as_bytes());
+        let parsed = parse_process(10, &stat).unwrap();
         assert_eq!(
             (parsed.parent, parsed.group, parsed.session, parsed.start),
             (1, 10, 10, 998877)
         );
-        assert!(parse_process(10, "10 (truncated) S 1").is_none());
+        assert!(parse_process(10, b"10 (truncated) S 1").is_none());
     }
 
     struct ChildGuard(std::process::Child);
