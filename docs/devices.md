@@ -70,9 +70,13 @@ It can also list worktrees, create a branch and worktree under `.worktrees/`, an
 remove a clean worktree without forcing deletion. Creation adds a clone-local
 `/.worktrees/` rule to Git's common `info/exclude` when needed, matching local
 creation without editing tracked `.gitignore`.
-**Use directory** selects the working directory for new remote terminals and
-conversations and publishes the project to the remote daemon. Saves compare the
-loaded content and serialize with other cagents saves; a changed file requires a
+**Open repository** (the sidebar's Projects **+**, the empty window or the
+command palette) chooses a folder on the device: pick it, or type its path, and
+choose **Open**. The project is published to the remote daemon and the window
+enters its checkout, as a local open does. In the file browser, the folder
+button beside the path does the same for the folder being browsed.
+
+Saves compare the loaded content and serialize with other cagents saves; a changed file requires a
 reload. If the replacement is published but syncing its directory fails, the
 editor reports that the file was saved with unconfirmed durability. The new
 content becomes the saved baseline; the warning means crash durability could
