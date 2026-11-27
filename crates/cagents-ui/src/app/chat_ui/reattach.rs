@@ -1349,8 +1349,10 @@ mod tests {
         let flapping = live_chat(&mut app, Some("thread"));
         let slow = live_chat(&mut app, Some("thread"));
         let lost_for_good = live_chat(&mut app, Some("thread"));
-        for card in [flapping, slow, lost_for_good] {
-            lose(&mut app, card, Instant::now());
+        // Lost a moment apart, so each attempt comes due in that order.
+        let lost = Instant::now();
+        for (card, later) in [flapping, slow, lost_for_good].into_iter().zip(0..) {
+            lose(&mut app, card, lost + Duration::from_millis(later));
         }
         for card in [flapping, lost_for_good] {
             make_attempt(&mut app, card);
@@ -1380,7 +1382,6 @@ mod tests {
     #[test]
     fn a_dismissed_notice_stays_dismissed_as_the_reader_reconnects_the_rest() {
         fn give_up(app: &mut Cagents, card: CardId) {
-            lose(app, card, Instant::now());
             for _ in DELAYS {
                 make_attempt(app, card);
                 refuse(app, card, chat::Recovery::Unreached);
@@ -1391,10 +1392,16 @@ mod tests {
         let first = live_chat(&mut app, Some("thread"));
         let second = live_chat(&mut app, Some("thread"));
         let third = live_chat(&mut app, Some("thread"));
-        give_up(&mut app, first);
-        give_up(&mut app, second);
+        for card in [first, second] {
+            lose(&mut app, card, Instant::now());
+            give_up(&mut app, card);
+        }
         assert_eq!(notices(&app).len(), 1);
         app.notices.clear();
+        // A third is lost before the reader reconnects the first, so as
+        // many are left to them after as before: one of them is new.
+        let lost = Instant::now();
+        lose(&mut app, third, lost);
         let target = chat_runtime(&app, first).target;
         drop(app.update(Message::ChatUi(Action::Reconnect(target))));
         reconnect(&mut app, first);
