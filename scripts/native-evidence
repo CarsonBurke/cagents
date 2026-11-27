@@ -555,7 +555,9 @@ session_variables=
 session_path=
 fixture_env() {
     local name passed=()
-    for name in LANG LC_ALL LC_CTYPE TERM $session_variables; do
+    # WGPU_BACKEND picks the app's graphics backend, such as `gl` for the
+    # OpenGL fallback a machine without a working Vulkan driver renders with.
+    for name in LANG LC_ALL LC_CTYPE TERM WGPU_BACKEND $session_variables; do
         if [ "${!name+x}" ]; then
             passed+=("$name=${!name}")
         fi

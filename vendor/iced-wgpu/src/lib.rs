@@ -112,6 +112,9 @@ struct Prepared {
     /// The shared text atlas's trim count once this renderer had trimmed.
     /// Another renderer's trim may let glyphs these layers draw be evicted.
     text_atlas_trims: u64,
+    /// The size of the multisampled targets every window shares, which
+    /// meshes were projected onto. Another window may grow them.
+    msaa_size: Option<Size<u32>>,
 }
 
 impl Renderer {
@@ -175,6 +178,7 @@ impl Renderer {
             scale_factor: viewport.scale_factor(),
             revision: self.layers.revision(),
             text_atlas_trims: self.engine.text_pipeline.trims(),
+            msaa_size: self.engine.triangle_pipeline.msaa_size(),
         };
 
         // Layers presented again for the same target keep everything they
@@ -212,9 +216,11 @@ impl Renderer {
         graphics::present::lap(graphics::present::Stage::Trim);
 
         // Merging and trimming leave the revision alone; the trim count is
-        // taken once this renderer's own trim has counted.
+        // taken once this renderer's own trim has counted, and the targets'
+        // size once preparing has grown them for this frame.
         self.prepared = Some(Prepared {
             text_atlas_trims: self.engine.text_pipeline.trims(),
+            msaa_size: self.engine.triangle_pipeline.msaa_size(),
             ..prepared
         });
 

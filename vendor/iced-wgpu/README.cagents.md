@@ -66,7 +66,8 @@ retained layers still draw. Image layers therefore keep their instances
 through a trim, clearing each one when it is next prepared, and clear the
 layers a frame left unused. Another window's trim lets its next prepare evict
 glyphs this window's layers draw, so it makes this window prepare in full on
-its next frame.
+its next frame. Meshes are projected onto the multisampled targets every
+window shares, so a window prepares in full too once another has grown them.
 
 `layer_revision` in `crates/iced-contracts` covers the revision; native
 traces of a window with spinners over long transcripts cover the rest.
@@ -92,3 +93,33 @@ advanced its vertex and uniform offsets past it but not its index offset, so
 every later mesh in that group drew with the indices of the mesh before it.
 Skipping a mesh now advances the index offset as well. The pinned upstream
 renderer has the same omission; drop this when it is fixed there.
+
+# Multisampled meshes on OpenGL
+
+Meshes are drawn into a multisampled attachment, resolved into a texture, and
+that texture is blended onto the frame. wgpu's OpenGL backend resolves with a
+framebuffer blit when the pass ends, and a blit only writes inside the scissor
+the pass last set: that of its last mesh. So on OpenGL, the fallback on a
+machine without a working Vulkan driver, every mesh of a layer but the last
+vanished, and the rest of the resolve texture, which every window shares, kept
+what earlier passes had resolved there. The blend then drew that again over
+the whole window, and budget rings piled up as ghosts across the composer
+footer and status bar. wgpu upstream still blits under the scissor.
+
+A mesh pass now ends with its scissor on the whole layer, so the resolve
+writes every pixel the layer's meshes could have drawn, and the blend is
+scissored to the same layer. That also stops each mesh layer from blending a
+texture the size of the window. The shared targets now only grow, to the
+largest width and height any window needs: replacing them with one window's
+size could make them narrower or shorter than another window.
+
+Two tests render on an OpenGL adapter and are skipped without one:
+
+```sh
+scripts/cargo-gate test --manifest-path vendor/iced-wgpu/Cargo.toml triangle::tests
+```
+
+To see it in the app, start a native-evidence session with `WGPU_BACKEND=gl`.
+The scissor before the pass ends can go once wgpu resolves the whole
+attachment on OpenGL; the scissored blend and the growing targets are worth
+keeping until the pinned renderer does the same.
