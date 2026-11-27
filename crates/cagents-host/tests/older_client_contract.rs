@@ -14,7 +14,7 @@ use cagents::{
     terminal_ipc::{
         CANDIDATE_LINE_PROTOCOL, ClientEnvelope, ClientRequest, PROTOCOL_VERSION,
         ProtocolErrorCode, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
-        ShutdownOperation, read_frame, write_frame,
+        ShutdownOperation, decoding_from, read_frame, write_frame,
     },
 };
 use std::{
@@ -155,9 +155,10 @@ impl RawClient {
 
     fn reply(&mut self, request_id: u64) -> ServerMessage {
         loop {
-            let envelope: ServerEnvelope = read_frame(&mut self.stream)
-                .unwrap()
-                .expect("the daemon closed the connection before replying");
+            let envelope: ServerEnvelope =
+                decoding_from(self.protocol, || read_frame(&mut self.stream))
+                    .unwrap()
+                    .expect("the daemon closed the connection before replying");
             assert_eq!(envelope.version, self.protocol, "{envelope:?}");
             if self.protocol == CANDIDATE_LINE_PROTOCOL {
                 assert!(

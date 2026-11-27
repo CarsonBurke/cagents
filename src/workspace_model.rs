@@ -370,9 +370,20 @@ pub struct WorkspaceModel {
     /// [`PROJECT_ORDER`]: crate::terminal_ipc::PROJECT_ORDER
     #[serde(
         default,
-        skip_serializing_if = "crate::terminal_ipc::before_project_order"
+        skip_serializing_if = "crate::terminal_ipc::before_project_order",
+        deserialize_with = "deserialize_project_order"
     )]
     pub project_order: Vec<PathBuf>,
+}
+
+fn deserialize_project_order<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    if crate::terminal_ipc::decoding_before(crate::terminal_ipc::PROJECT_ORDER) {
+        return Ok(Vec::new());
+    }
+    Vec::deserialize(deserializer)
 }
 
 /// Where a project is listed: its place in the shared order, then, for one the
@@ -1329,7 +1340,7 @@ mod tests {
 
     #[test]
     fn an_older_client_is_sent_the_model_without_the_project_order() {
-        use crate::terminal_ipc::{PROJECT_ORDER, encoding_for};
+        use crate::terminal_ipc::{PROJECT_ORDER, decoding_from, encoding_for};
         let mut model = WorkspaceModel {
             identity: Uuid::new_v4(),
             sequence: 4,
@@ -1343,6 +1354,21 @@ mod tests {
             &unarranged[..unarranged.len() - 1],
             "the older layout ends where the project order would begin"
         );
+        let sentinel = 42u8;
+        let framed = encoding_for(PROJECT_ORDER - 1, || {
+            postcard::to_allocvec(&(&model, sentinel))
+        })
+        .unwrap();
+        let (older, trailing): (WorkspaceModel, u8) =
+            decoding_from(PROJECT_ORDER - 1, || postcard::from_bytes(&framed)).unwrap();
+        assert_eq!(
+            older,
+            WorkspaceModel {
+                project_order: Vec::new(),
+                ..model.clone()
+            }
+        );
+        assert_eq!(trailing, sentinel);
         let bytes = postcard::to_allocvec(&model).unwrap();
         assert_eq!(
             postcard::from_bytes::<WorkspaceModel>(&bytes).unwrap(),
