@@ -378,6 +378,35 @@ pub fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLock> {
     Ok(OwnedLock(Some(lock)))
 }
 
+/// Probe with a separate open file description so a shared observer never
+/// looks like an exclusive owner.
+fn exclusive_lock_is_held(probe: &File) -> io::Result<bool> {
+    match probe.try_lock_shared() {
+        Ok(()) => probe.unlock().map(|()| false),
+        Err(fs::TryLockError::WouldBlock) => Ok(true),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn acquire_window_slot(path: &Path, mut wait: impl FnMut(Duration)) -> io::Result<OwnedLock> {
+    let started = std::time::Instant::now();
+    loop {
+        let lock = open_owned_lock(path)?;
+        match lock.try_lock() {
+            Ok(()) => return Ok(OwnedLock(Some(lock))),
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+        // Window leases are exclusive. Only shared status probes get a retry.
+        let remaining = PEER_PROBE_ALLOWANCE.saturating_sub(started.elapsed());
+        if remaining.is_zero() || exclusive_lock_is_held(&lock)? {
+            return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
+        }
+        drop(lock);
+        wait(PEER_PROBE_POLL.min(remaining));
+    }
+}
+
 /// Expected contention with the installation coordinator, distinct from a
 /// filesystem failure or a window that is already open.
 #[derive(Debug, Error)]
@@ -434,11 +463,7 @@ pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
     if !safe(&opened) || !same(&named, &opened) {
         return Err(io::Error::other("update ownership changed"));
     }
-    let held = match owned_file_lock(file, libc::LOCK_SH | libc::LOCK_NB) {
-        Ok(_probe) => false,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
-        Err(error) => return Err(error),
-    };
+    let held = exclusive_lock_is_held(&file)?;
     let current = fs::symlink_metadata(path)?;
     if !safe(&current) || !same(&opened, &current) {
         return Err(io::Error::other("update ownership changed"));
@@ -583,10 +608,7 @@ impl WindowLease {
                     format!("window-{}", index + 1)
                 }
             });
-            match owned_lock(
-                &runtime.join(slot_lock_name(&slot)),
-                libc::LOCK_EX | libc::LOCK_NB,
-            ) {
+            match acquire_window_slot(&runtime.join(slot_lock_name(&slot)), std::thread::sleep) {
                 Ok(mut lock) => {
                     let state = match claims {
                         Some(claims) => match state_claim::claim_window_state_in(
@@ -1045,10 +1067,8 @@ fn running_window_slots(runtime: &Path) -> io::Result<Vec<String>> {
         if slot == "update" || validate_window_slot(slot).is_err() {
             continue;
         }
-        match owned_lock(&entry.path(), libc::LOCK_EX | libc::LOCK_NB) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => slots.push(slot.to_owned()),
-            Err(error) => return Err(error),
+        if exclusive_lock_is_held(&open_owned_lock(&entry.path())?)? {
+            slots.push(slot.to_owned());
         }
     }
     slots.sort();
@@ -1380,11 +1400,10 @@ fn owns_lease(
 }
 
 /// Darwin's proof names less than Linux's: the process holds the lease's
-/// inode open while some open file description holds a lock on it. It cannot
-/// tell which description holds the lock, nor that the lock is exclusive
-/// rather than shared, so another process of this user holding the lease open
-/// beside its owner passes too. Any failure to list or read the process
-/// refuses the proof.
+/// inode open while some open file description holds an exclusive lock on it.
+/// It cannot tell which description holds the lock, so another process of
+/// this user holding the lease open beside its owner passes too. Any failure
+/// to list or read the process refuses the proof.
 #[cfg(target_os = "macos")]
 fn owns_lease(
     _proc_root: &Path,
@@ -1448,8 +1467,7 @@ pub(crate) fn verified_windows_for_daemon(
 /// milliseconds before it takes its slot.
 const UNLEASED_OWNER_PATIENCE: Duration = Duration::from_secs(2);
 const UNLEASED_OWNER_POLL: Duration = Duration::from_millis(25);
-/// How long a modern holder waits out a peer's exclusive probe of the
-/// application lock, which lasts no longer than one flock call.
+/// How long a launcher waits for a peer's lock probe to finish.
 const PEER_PROBE_ALLOWANCE: Duration = Duration::from_millis(250);
 const PEER_PROBE_POLL: Duration = Duration::from_millis(5);
 const OLDER_WINDOW_RUNNING: &str = "an older cagents window is running; close it and try again";
@@ -1624,9 +1642,9 @@ fn verified_window_lease_owners_in(
     Ok(owners)
 }
 
-/// Whether nobody holds the lease `lock` opened, probed through a separate
+/// Whether nobody holds the exclusive lease `lock` opened, probed through a separate
 /// open of that same inode: a duplicate would share the open file description
-/// and could take a lock already held through it, and the path may since
+/// and could change a lock already held through it, and the path may since
 /// name another file.
 fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
     let probe = crate::descriptor::reopen(lock, libc::O_NONBLOCK)?;
@@ -1634,11 +1652,7 @@ fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
     if probed.dev() != expected.dev() || probed.ino() != expected.ino() {
         return Err(io::Error::other("window lease changed during verification"));
     }
-    match owned_file_lock(probe, libc::LOCK_EX | libc::LOCK_NB) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
-        Err(error) => Err(error),
-    }
+    exclusive_lock_is_held(&probe).map(|held| !held)
 }
 
 /// An open observation of the exact launch fence an update already holds.
@@ -4982,6 +4996,27 @@ mod tests {
     }
 
     #[test]
+    fn window_slot_observers_only_report_exclusive_leases() {
+        let runtime = tempfile::tempdir().unwrap();
+        let path = runtime.path().join(slot_lock_name("second"));
+        let probe = owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).unwrap();
+        let metadata = probe.metadata().unwrap();
+        assert!(running_window_slots(runtime.path()).unwrap().is_empty());
+        assert!(lease_released(&probe, &metadata).unwrap());
+        let mut probe = Some(probe);
+        let lease = acquire_window_slot(&path, |_| drop(probe.take().unwrap())).unwrap();
+        assert!(probe.is_none(), "launch waited for the shared observer");
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), ["second"]);
+        assert!(!lease_released(&lease, &metadata).unwrap());
+        assert_eq!(
+            acquire_window_slot(&path, |_| panic!("an exclusive lease is occupied"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+    }
+
+    #[test]
     fn a_check_for_windows_waits_for_a_window_another_launch_is_starting() {
         let runtime = tempfile::tempdir().unwrap();
         let path = runtime.path().to_path_buf();
@@ -4993,11 +5028,8 @@ mod tests {
             drop(lease._slot);
             shared.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(200));
-            let mut slot_lock = owned_lock(
-                &path.join(slot_lock_name(&slot)),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-            .unwrap();
+            let mut slot_lock =
+                acquire_window_slot(&path.join(slot_lock_name(&slot)), std::thread::sleep).unwrap();
             daemon_admission::publish_capability(slot_lock.file_mut()).unwrap();
             (lease._legacy_fence, slot_lock)
         });

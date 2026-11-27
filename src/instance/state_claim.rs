@@ -746,7 +746,7 @@ enum Listed {
     Unknown,
 }
 
-/// Whether `/proc/locks` lists a flock held on `lock`, which `metadata`
+/// Whether `/proc/locks` lists an exclusive flock held on `lock`, which `metadata`
 /// describes.
 #[cfg(target_os = "linux")]
 fn listed_flock(lock: &File, metadata: &fs::Metadata) -> Listed {
@@ -776,7 +776,7 @@ fn on_tmpfs(file: &File) -> bool {
     kind == TMPFS_MAGIC
 }
 
-/// What `locks`, in the format of `/proc/locks`, says about a flock on the
+/// What `locks`, in the format of `/proc/locks`, says about an exclusive flock on the
 /// file with `device` and `inode`.
 #[cfg(target_os = "linux")]
 fn parse_locks(locks: &str, device: u64, inode: u64) -> Listed {
@@ -790,10 +790,14 @@ fn parse_locks(locks: &str, device: u64, inode: u64) -> Listed {
         // "1: FLOCK  ADVISORY  WRITE 1234 00:1a:5678 0 EOF"; a process waiting
         // for the lock is listed as "1: -> FLOCK ...", and holds nothing.
         let mut fields = line.split_whitespace().skip(1);
-        if fields.next() != Some("FLOCK") {
+        // A shared probe of a window slot does not protect its saved state.
+        if fields.next() != Some("FLOCK")
+            || fields.next() != Some("ADVISORY")
+            || fields.next() != Some("WRITE")
+        {
             continue;
         }
-        let Some((on, number)) = fields.nth(3).and_then(|file| file.rsplit_once(':')) else {
+        let Some((on, number)) = fields.nth(1).and_then(|file| file.rsplit_once(':')) else {
             continue;
         };
         if number == inode {
@@ -1050,6 +1054,9 @@ mod tests {
         assert_eq!(parse_locks(held, 0x1a, 5678), Listed::Held);
         assert_eq!(parse_locks(held, 0x1a, 5679), Listed::Free);
         assert_eq!(parse_locks("", 0x1a, 5678), Listed::Free);
+
+        let probe = "1: FLOCK  ADVISORY  READ 1234 00:1a:5678 0 EOF\n";
+        assert_eq!(parse_locks(probe, 0x1a, 5678), Listed::Free);
 
         let waiting = "1: FLOCK  ADVISORY  WRITE 1234 00:1a:9 0 EOF\n\
                        1: -> FLOCK  ADVISORY  WRITE 4321 00:1a:5678 0 EOF\n";
