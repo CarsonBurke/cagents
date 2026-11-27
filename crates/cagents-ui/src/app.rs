@@ -3820,7 +3820,7 @@ impl SettingsField {
             Self::InspectorWidth => "Inspector width",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
-            Self::ResumeSessionsAfterReboot => "Resume when this computer starts",
+            Self::ResumeSessionsAfterReboot => "Resume sessions when this computer starts",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
             Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",

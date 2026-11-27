@@ -1010,7 +1010,7 @@ fn settings_category_controls<'a>(
                 "What happens when this computer starts again after a shutdown or reboot.",
                 vec![crate::settings_widgets::toggle(
                     "Resume sessions when this computer starts",
-                    "The first time the daemon runs after this computer starts, it reopens every stopped chat pane and agent the earlier boot ran, as `cagents resume --all` would, without waiting for a window. Each waits for its next message. One that cannot resume is reported in notifications. On a computer no one logs in to, also run `cagents daemon boot enable`.",
+                    "After this computer restarts, reopen its stopped chats and agents the first time the daemon starts, such as when you open the app or run a cagents command. They start idle; any that cannot resume are reported in notifications. For another computer, run cagents daemon boot enable --resume-sessions on it, for example over SSH; that also starts its daemon when it starts.",
                     draft.resume_sessions_after_reboot,
                     |enabled| Message::SettingsChanged {
                         field: SettingsField::ResumeSessionsAfterReboot,
