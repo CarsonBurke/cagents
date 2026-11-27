@@ -3962,6 +3962,7 @@ mod tests {
             exits,
             Some(recovery.clone()),
             false,
+            None,
         )
         .unwrap();
         cleanup.holder = Some(PinnedProcess::open(holder_pid(&held)).unwrap());
