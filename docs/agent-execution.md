@@ -123,7 +123,9 @@ kernel boot ran it, or when its provider's retained owner proves it ended, as
 for a retained Claude or Codex conversation. Otherwise, as after a daemon restart
 within one boot, the prompt fails without being sent and names the command that
 resumes it: `cagents resume SESSION`, which reopens the conversation as its
-pane's Resume does in the app. `cagents resume --channel`, `--project` and
+pane's Resume does in the app. A session ID names that session; a lineage
+ID, which is also its first session's ID, names the lineage's latest stopped
+conversation, the one a listing offers. `cagents resume --channel`, `--project` and
 `--all` resume every stopped session in that scope; a session may resume only
 the agents it started. With `--json` it returns `data.sessions`, a row per
 session with its `session`, the `running` session that now carries the
