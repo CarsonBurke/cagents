@@ -369,6 +369,16 @@ impl<'a> Failure<'a> {
                 format!("{name} {} limit reached", limit_name(reached)),
                 limit_action(limit_name(reached)),
             ),
+            // Antigravity's sign-in is in the desktop keyring only where it
+            // is too old to keep it where its agents can read it.
+            FailureKind::Authentication if super::sign_in_needs_update(provider, &signal) => (
+                "Antigravity needs an update to sign in".to_owned(),
+                "Update Antigravity by running agy update, then sign in to it again from cagents.",
+            ),
+            FailureKind::Authentication if provider == Provider::Antigravity => (
+                format!("{name} sign-in needs attention"),
+                "Sign in to Antigravity again from cagents. Agents in cagents read this sign-in from a file, not the desktop keyring.",
+            ),
             FailureKind::Authentication => (
                 format!("{name} sign-in needs attention"),
                 "Check the selected account and sign in again.",
@@ -1368,6 +1378,50 @@ mod tests {
         let failure = Failure::parse(Provider::Claude, type_only).unwrap();
         assert_eq!(failure.kind, FailureKind::AccountLimit);
         assert!(failure.reset.is_none());
+    }
+
+    #[test]
+    fn an_antigravity_sign_in_failure_says_whether_the_keyring_is_to_blame() {
+        let failure = |version| {
+            format!(
+                "{}: {} (Authentication required)",
+                crate::chat::ACP_SIGN_IN_PREFIX,
+                crate::agent::antigravity::chat_sign_in_advice(version)
+            )
+        };
+        // An Antigravity that can keep its sign-in in a file needs one made
+        // from cagents, whatever the keyring holds.
+        let current = failure(Some("1.5.18"));
+        let parsed = Failure::parse(Provider::Antigravity, &current).unwrap();
+        assert_eq!(parsed.kind, FailureKind::Authentication);
+        assert_eq!(parsed.summary, "Antigravity sign-in needs attention");
+        assert!(
+            parsed
+                .action
+                .starts_with("Sign in to Antigravity again from cagents.")
+        );
+        assert!(parsed.action.contains("not the desktop keyring"));
+        // One too old for that reads it from the keyring, which a headless
+        // boot leaves locked: signing in again alone would not last.
+        let outdated = failure(Some("1.5.15"));
+        let parsed = Failure::parse(Provider::Antigravity, &outdated).unwrap();
+        assert_eq!(parsed.kind, FailureKind::Authentication);
+        assert_eq!(parsed.summary, "Antigravity needs an update to sign in");
+        assert!(
+            parsed
+                .action
+                .starts_with("Update Antigravity by running agy update")
+        );
+        // Another ACP agent's sign-in keeps the general advice.
+        let muse = format!(
+            "{}: sign in to Muse, then try again. (Authentication required)",
+            crate::chat::ACP_SIGN_IN_PREFIX
+        );
+        let parsed = Failure::parse(Provider::Muse, &muse).unwrap();
+        assert_eq!(
+            parsed.action,
+            "Check the selected account and sign in again."
+        );
     }
 
     #[test]

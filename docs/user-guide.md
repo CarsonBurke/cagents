@@ -1169,6 +1169,25 @@ directory, or a `CLAUDE_CONFIG_DIR` naming `~/.claude` that an earlier version
 exported, when deciding the system default. A daemon started before this
 protection keeps its environment until it restarts.
 
+#### Antigravity's sign-in
+
+Every Antigravity process that cagents starts keeps its sign-in in a file,
+`~/.gemini/antigravity-cli/antigravity-oauth-token`, rather than in the desktop
+keyring. That covers conversations, resumed and upgraded conversations, account
+checks, sign-ins and every cagents terminal. Agents then keep working after a
+boot with no graphical login, which leaves the keyring locked. Cagents does
+this by setting `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`, which overrides whatever
+a saved conversation, the daemon or your shell sets. It needs Antigravity 1.5.18
+or later. With an older version, the sign-in prompt says to run `agy update`.
+
+A sign-in that `agy` keeps in the keyring, such as one from a terminal outside
+cagents, is not the file sign-in, so sign in once from cagents. An `agy` run
+outside cagents without the variable can move the file sign-in back into an
+unlocked keyring, which signs agents out, so set it wherever you run `agy`
+yourself. See
+[Antigravity's sign-in](account-configuration.md#antigravitys-sign-in) for
+details and the security tradeoff.
+
 The Accounts pane flags a row whose home is not a login of its own: **Login
 changed** when a managed or linked home reports a different login than the one
 it was added with (the recorded login is kept; sign that account in again to

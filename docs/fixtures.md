@@ -1465,6 +1465,7 @@ These variables add failures:
 | `FAKE_ACP_BACKGROUND_SECONDS=N` | how long the `background` turn's build runs |
 | `FAKE_ACP_WORK=PATH` | the Claude Code transcript a `work` prompt replays. The installed `agy` and `muse-upstream` read the fixture's `home/.claude/fixture-frames.jsonl`, which `conversation-work.py` writes |
 | `FAKE_ACP_AUTH_FILE=PATH` | the sign-in record Muse's `login` writes and `logout` removes; only ever a fixture's own file |
+| `FAKE_ACP_VERSION=V` | the version `initialize` reports; the default, `fixture`, stands for a current one |
 
 These files under `FAKE_ACP_STATE` switch states that last across processes:
 
@@ -1473,6 +1474,9 @@ These files under `FAKE_ACP_STATE` switch states that last across processes:
 | `signed-out` | every new or loaded session and every prompt answers that sign-in is required |
 | `no-allowance` | every prompt is refused as a login with no usage allowance, and Muse's `usage --json` reports none |
 | `hang-probe` | a session opened by the account probe (`--app-data-dir`) never answers, as one that times out |
+| `keyring-locked` | Antigravity's sign-in is in a desktop keyring left locked by a boot with no graphical login: every new or loaded session and every prompt answers that sign-in is required, unless `AGY_CLI_FORCE_FILE_TOKEN_STORAGE` is set and the reported version is 1.5.18 or later |
+| `keyring-only` | Antigravity's sign-in is in the desktop keyring alone, as it was before cagents kept it in a file: an `agy` that keeps it in a file (the variable set, 1.5.18 or later) answers that sign-in is required until `agy acp --login` with the variable set removes the marker |
+| `version` | the version Antigravity's `initialize` reports, such as `1.5.15`, in place of `FAKE_ACP_VERSION` |
 | `background-seconds` | in the native-evidence fixture only, how long a `background` prompt's build runs, where `FAKE_ACP_BACKGROUND_SECONDS` cannot reach the app's agent |
 
 Run with `--app-data-dir DIR`, as the Antigravity account probe runs
@@ -1494,6 +1498,18 @@ app's sign-in, `agy acp --login`, removes it:
 ```sh
 evidence env touch '{fixture}/acp/agy/signed-out'
 evidence env touch '{fixture}/acp/muse/no-allowance'
+```
+
+Cagents keeps Antigravity's sign-in in a file, so `acp/agy/keyring-locked`
+changes nothing on its own. It shows a locked keyring only to an older
+Antigravity, or to a revision from before cagents kept the sign-in in a file.
+`acp/agy/keyring-only` shows the first conversation after upgrading to one that
+does, which needs one sign-in from cagents:
+
+```sh
+evidence env touch '{fixture}/acp/agy/keyring-locked'
+evidence env sh -c "echo 1.5.15 > '{fixture}/acp/agy/version'"
+evidence env touch '{fixture}/acp/agy/keyring-only'
 ```
 
 A conversation started outside cagents is one the fake agent saved without

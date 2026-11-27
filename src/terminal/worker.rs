@@ -6794,6 +6794,7 @@ fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     for name in crate::account::launch_credential_overrides(recipe) {
         command.env_remove(name);
     }
+    pin_credential_storage(&mut command);
     command
 }
 
@@ -6814,7 +6815,19 @@ fn command_from_execution(
     }
     scrub_inherited_markers(&mut command);
     terminal_environment(&mut command);
+    pin_credential_storage(&mut command);
     command
+}
+
+/// An agent in any terminal cagents hosts, whether it runs a conversation, a
+/// sign-in or the reader's shell, keeps its login where the agents cagents
+/// starts read it, whatever the recipe, the returned environment or the
+/// shell would set. A sign-in from any of them is then the one every agent
+/// uses. See [`crate::account::credential_storage`].
+fn pin_credential_storage(command: &mut CommandBuilder) {
+    for (name, value) in crate::account::all_credential_storage() {
+        command.env(name, value);
+    }
 }
 
 fn terminal_environment(command: &mut CommandBuilder) {

@@ -2135,18 +2135,9 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
             registered.id() == account.id() && registered.resolved_home() == account.resolved_home()
         })
         .ok_or("account is not registered on this device")?;
-    let arguments = match account.provider {
-        Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
-        Provider::Codex => vec!["login".into(), "--device-auth".into()],
-        Provider::Muse => vec!["login".into()],
-        Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
-        Provider::Antigravity => {
-            return Err(format!(
-                "open {} in a terminal on this device to sign in",
-                account.provider.label()
-            ));
-        }
-    };
+    if account.provider == Provider::Omp {
+        return Err("open an Omp terminal on this device and use /login".into());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2159,33 +2150,11 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
                 account.provider.label()
             )
         })?;
-    let mut environment = std::collections::BTreeMap::new();
-    if let Some(path) = search_path.and_then(|path| path.into_string().ok()) {
-        environment.insert("PATH".into(), path);
-    }
-    let program = program
-        .into_os_string()
-        .into_string()
-        .map_err(|_| "provider executable is not UTF-8")?;
-    let mut recipe = crate::model::LaunchRecipe {
-        // Muse's `muse` may be a wrapper that cannot run `login`.
-        program: account.provider.subcommand_program(
-            &program,
-            std::path::Path::new("/"),
-            environment.get("PATH").map_or("", String::as_str),
-        ),
-        arguments,
-        working_directory: std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or("remote HOME is unavailable")?,
-        environment,
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect(),
-    };
-    account.bind_home(&mut recipe)?;
+    // The sign-in this device's own Accounts pane runs, so one made from
+    // another device, such as Antigravity's on a headless machine, is the
+    // same.
+    let recipe =
+        crate::account::remote::login_recipe_with_path(&account, program, search_path.as_deref())?;
     if account.provider == Provider::Claude
         && let (Some(cache), Some(key)) = (
             crate::account::cache::Cache::installation(),

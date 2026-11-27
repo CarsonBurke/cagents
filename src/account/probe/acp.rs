@@ -37,6 +37,8 @@ pub(super) struct Opened {
     pub catalog: Option<Catalog>,
     /// Antigravity's name for the plan the sign-in is on.
     pub tier: Option<String>,
+    /// The version the agent's `initialize` reply names it by.
+    pub version: Option<String>,
 }
 
 /// Probes the system Antigravity sign-in.
@@ -45,16 +47,65 @@ pub(super) async fn probe_antigravity(
     program: &Path,
     search_path: Option<&OsStr>,
 ) -> Result<Probed, String> {
-    let data = account
+    let home = account
         .resolved_home()
         .filter(|home| home.is_absolute())
-        .ok_or("Antigravity's data directory could not be found")?
-        .join(ANTIGRAVITY_PROBE_DATA);
+        .ok_or("Antigravity's data directory could not be found")?;
+    let data = home.join(ANTIGRAVITY_PROBE_DATA);
     let mut command = super::command_with_path(account, program, search_path);
     command
         .args(["acp", "--disable-telemetry", "--app-data-dir"])
         .arg(ANTIGRAVITY_PROBE_DATA);
-    probe_antigravity_in(data, command).await
+    let probed = probe_antigravity_in(data, command).await;
+    // A probe follows every sign-in, so the sign-in it made is private by
+    // the time anyone is told it worked.
+    let _ = tokio::task::spawn_blocking(move || keep_sign_in_private(&home)).await;
+    probed
+}
+
+/// Keeps the sign-in Antigravity holds in `home`, its `~/.gemini`, for the
+/// agents cagents starts readable by its owner alone, as Claude Code's and
+/// Codex's are, whatever mode `agy` gave it. Only the file's mode changes:
+/// it is never read, and a link or a file someone else owns is left alone.
+fn keep_sign_in_private(home: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let path = super::inputs::antigravity_sign_in(home);
+    if std::fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.mode() & 0o077 != 0)
+    {
+        // Opened without following a link, its owner checked, then its mode
+        // set through that descriptor.
+        let _ = crate::secure_file::open_existing_private_file(&path);
+    }
+}
+
+/// Has the probe's data directory, `data`, read the sign-in the agents
+/// cagents starts read. Antigravity looks for its file sign-in only in the
+/// data directory it runs with, so without this a probe reports signed out
+/// while every conversation is signed in. The sign-in is a link to theirs,
+/// `../antigravity-oauth-token`, never a copy: cagents doesn't read or move
+/// credentials. Anything else in its place, such as a file `agy` saved over
+/// the link when it renewed the sign-in, is replaced by the link again; a
+/// directory there is left alone.
+fn share_sign_in(data: &Path) {
+    let link = data.join(super::inputs::ANTIGRAVITY_SIGN_IN);
+    let target = Path::new("..").join(super::inputs::ANTIGRAVITY_SIGN_IN);
+    match std::fs::symlink_metadata(&link) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(metadata)
+            if metadata.is_symlink()
+                && std::fs::read_link(&link).is_ok_and(|found| found == target) =>
+        {
+            return;
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            if std::fs::remove_file(&link).is_err() {
+                return;
+            }
+        }
+        _ => return,
+    }
+    let _ = std::os::unix::fs::symlink(&target, &link);
 }
 
 /// Probes with `command`, an `agy acp` keeping its data in `data`.
@@ -76,6 +127,7 @@ async fn probe_antigravity_in(data: PathBuf, mut command: Command) -> Result<Pro
             let lock =
                 crate::instance::owned_lock(&data.join(PROBE_LOCK), libc::LOCK_EX | libc::LOCK_NB)?;
             forget(&data);
+            share_sign_in(&data);
             std::fs::create_dir_all(&workspace)?;
             Ok::<_, std::io::Error>(lock)
         })
@@ -174,7 +226,10 @@ fn probed(label: &str, opened: Opened, observed_at: u64) -> Probed {
     if !opened.signed_in {
         return Probed::state(
             UsageStatus::NeedsLogin,
-            &format!("Signed out of {label}"),
+            &format!(
+                "Signed out of {label}. {}",
+                crate::agent::antigravity::sign_in_advice(opened.version.as_deref())
+            ),
             observed_at,
             None,
         );
@@ -217,8 +272,14 @@ async fn open(session: &mut Session, cwd: &Path) -> Result<Observed<Opened>, Str
         }}))
         .await?;
     let initialized = response(session, 1).await?;
-    let capabilities = match initialized.value {
-        Ok(result) => result["agentCapabilities"].clone(),
+    let (capabilities, version) = match initialized.value {
+        Ok(result) => (
+            result["agentCapabilities"].clone(),
+            result["agentInfo"]["version"]
+                .as_str()
+                .filter(|version| version.len() <= 64)
+                .map(str::to_owned),
+        ),
         Err(error) if error["code"].as_i64() == Some(AUTH_REQUIRED) => {
             return Ok(Observed {
                 value: Opened::default(),
@@ -240,6 +301,7 @@ async fn open(session: &mut Session, cwd: &Path) -> Result<Observed<Opened>, Str
         Err(error) if error["code"].as_i64() == Some(AUTH_REQUIRED) => Opened::default(),
         Err(_) => return Err("The agent could not open a session".into()),
     };
+    let opened = Opened { version, ..opened };
     if let Some(id) = &opened.session
         && capabilities["sessionCapabilities"]["close"].is_object()
     {
@@ -373,6 +435,7 @@ fn opened(result: &Value) -> Opened {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(str::to_owned),
+        version: None,
     }
 }
 
@@ -423,10 +486,92 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_s_file_sign_in_is_kept_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        // No sign-in yet: nothing to do, and nothing made.
+        keep_sign_in_private(home.path());
+        let path = super::super::inputs::antigravity_sign_in(home.path());
+        assert!(!path.exists());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        keep_sign_in_private(home.path());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        // A link in its place is not followed.
+        let target = home.path().join("elsewhere");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        keep_sign_in_private(home.path());
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn the_probe_reads_the_sign_in_its_agents_read() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join(ANTIGRAVITY_PROBE_DATA);
+        std::fs::create_dir_all(&data).unwrap();
+        let sign_in = super::super::inputs::antigravity_sign_in(home.path());
+        let shared = data.join(super::super::inputs::ANTIGRAVITY_SIGN_IN);
+        let reads = |expected: &[u8]| {
+            assert!(std::fs::symlink_metadata(&shared).unwrap().is_symlink());
+            assert_eq!(std::fs::read(&shared).unwrap(), expected);
+        };
+        // Before any sign-in, it is linked to where one will be.
+        share_sign_in(&data);
+        assert!(!shared.exists());
+        std::fs::write(&sign_in, b"first").unwrap();
+        reads(b"first");
+        // A sign-in renewed later is the one it reads.
+        std::fs::write(&sign_in, b"renewed").unwrap();
+        share_sign_in(&data);
+        reads(b"renewed");
+        // One the agent saved over the link is replaced by the link again,
+        // and the agents' own sign-in is left as it was.
+        std::fs::remove_file(&shared).unwrap();
+        std::fs::write(&shared, b"saved by the probe").unwrap();
+        share_sign_in(&data);
+        reads(b"renewed");
+        // So is a link that leads elsewhere.
+        std::fs::remove_file(&shared).unwrap();
+        std::os::unix::fs::symlink(home.path().join("elsewhere"), &shared).unwrap();
+        share_sign_in(&data);
+        reads(b"renewed");
+        // A directory in its place is not anyone's sign-in to remove.
+        std::fs::remove_file(&shared).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        share_sign_in(&data);
+        assert!(shared.is_dir());
+    }
+
+    #[test]
     fn a_signed_out_agent_asks_for_sign_in_and_a_signed_in_one_reports_its_plan() {
         let signed_out = probed("Antigravity", Opened::default(), 7);
         assert_eq!(signed_out.snapshot.status, UsageStatus::NeedsLogin);
         assert!(signed_out.identity.is_none());
+        // The sign-in it asks for is the one its agents read, apart from
+        // the desktop keyring, unless the agent is too old to keep it so.
+        let detail = signed_out.snapshot.detail.unwrap();
+        assert!(
+            detail.starts_with("Signed out of Antigravity. "),
+            "{detail}"
+        );
+        assert!(detail.contains("not the desktop keyring"), "{detail}");
+        let outdated = probed(
+            "Antigravity",
+            Opened {
+                version: Some("1.5.15".into()),
+                ..Opened::default()
+            },
+            7,
+        );
+        let detail = outdated.snapshot.detail.unwrap();
+        assert!(detail.contains("agy update"), "{detail}");
         let signed_in = probed(
             "Antigravity",
             Opened {

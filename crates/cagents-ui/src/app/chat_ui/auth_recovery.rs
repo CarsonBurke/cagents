@@ -24,6 +24,11 @@ impl Runtime {
             .chain(self.error.as_deref())
             .find(|error| chat::requires_sign_in(self.session.launch.provider, error))
     }
+    /// Whether this agent must be updated before a sign-in can reach it.
+    fn auth_needs_update(&self) -> bool {
+        self.auth_error()
+            .is_some_and(|error| chat::sign_in_needs_update(self.session.launch.provider, error))
+    }
     pub(super) fn auth_verification_detail(&self) -> Option<&str> {
         self.auth_error()
             .and_then(chat::sign_in_verification_detail)
@@ -40,6 +45,14 @@ impl Runtime {
     /// Whether a draft has a message to send again once signed in.
     fn has_unsent_draft(&self) -> bool {
         !self.composer.text().trim().is_empty() || !self.attachments.is_empty()
+    }
+    /// Whether signing in again can bring this conversation back in this
+    /// pane: it is still running, reconnecting starts it again because its
+    /// daemon connection is gone, or its ended Claude actor resumes in place.
+    /// A stopped conversation the daemon still holds would only attach to the
+    /// same stopped view again (#4482).
+    fn resumes_after_sign_in(&self) -> bool {
+        !self.snapshot.exited || !self.connected() || self.resumes_in_place()
     }
     fn recovery_available(&self) -> bool {
         self.auth_error().is_some()
@@ -116,6 +129,10 @@ impl Cagents {
         self.chat_auth_recovery_enabled(target)
             && matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
                 if !runtime.is_draft()
+                    // The running agent is the one too old to read a new
+                    // sign-in; resuming it would only fail the same way.
+                    && !runtime.auth_needs_update()
+                    && runtime.resumes_after_sign_in()
                     && self.auth_account(runtime).is_some_and(|account| self.account_login_change(&account).is_none()))
     }
     pub(super) fn resume_after_sign_in(&mut self, target: Target) -> Task<Message> {
@@ -167,6 +184,10 @@ pub(super) fn view<'a>(
     let mut login_change = None;
     let mut draft = false;
     let unsent = runtime.has_unsent_draft();
+    // Signing in again can't reach an agent that keeps its sign-in in the
+    // locked keyring; only updating it can.
+    let needs_update = known && runtime.auth_needs_update();
+    let resumes = runtime.resumes_after_sign_in();
     let label = if let Some(recovery) = recovery {
         let enabled = enabled && runtime.recovery_available() && !recovery.signing_in;
         draft = recovery.draft;
@@ -179,8 +200,9 @@ pub(super) fn view<'a>(
                 .into(),
         );
         // A draft's message is back in the composer, whose Send starts the
-        // conversation again; a second control here would do the same.
-        if !draft {
+        // conversation again; a second control here would do the same. An
+        // agent too old to read a new sign-in can't resume either.
+        if !draft && !needs_update && resumes {
             controls.push(
                 crate::ui_controls::button::secondary("Resume chat")
                     .on_press_maybe(
@@ -198,7 +220,9 @@ pub(super) fn view<'a>(
         format!(
             "{} {} · {}",
             runtime.session.launch.provider.label(),
-            if draft {
+            if needs_update {
+                "needs an update to sign in"
+            } else if draft {
                 "sign-in required"
             } else {
                 "sign-in is no longer valid"
@@ -215,7 +239,7 @@ pub(super) fn view<'a>(
     };
     let mut rows = vec![
         design::body(label).into(),
-        design::caption(if draft && unsent { "Sign in, then send your message again. It is still in the composer." } else if draft { "Sign in, then send a message to start this chat." } else if known { "Sign in, then resume this conversation. Your draft is retained." } else { "Open accounts to add or link this session’s account, then return here to sign in and resume. Your draft is retained." }).into(),
+        design::caption(if needs_update && draft { "Run agy update in a terminal, then sign in and send your message. This version keeps its sign-in in the desktop keyring, which agents can't read while it's locked." } else if needs_update { "Run agy update in a terminal, then sign in and start a new chat. This version keeps its sign-in in the desktop keyring, which agents can't read while it's locked." } else if draft && unsent { "Sign in, then send your message again. It is still in the composer." } else if draft { "Sign in, then send a message to start this chat." } else if known && !resumes { "Sign in, then start a new chat. This one stopped and can't start again here." } else if known { "Sign in, then resume this conversation. Your draft is retained." } else { "Open accounts to add or link this session’s account, then return here to sign in and resume. Your draft is retained." }).into(),
         widget::flex_row(controls)
             .spacing(step::GAP_S as u16)
             .into(),

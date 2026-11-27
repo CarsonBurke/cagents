@@ -10,6 +10,13 @@
 # the fake agent's own, and keep the fixture's Muse sign-in record where Muse
 # keeps its own: present while signed in.
 #
+# `acp/agy/keyring-locked` keeps Antigravity's sign-in in a locked desktop
+# keyring, out of reach of an `agy` that does not keep it in a file, and
+# `acp/agy/version` names the version it reports. `acp/agy/keyring-only`
+# keeps it in the keyring alone, as before cagents kept it in a file, so an
+# `agy` that keeps it in a file is signed out until `agy acp --login` signs
+# it in there.
+#
 # `acp/AGENT/no-allowance` refuses every prompt as a login with no usage
 # allowance, and `acp/agy/hang-probe` makes the account probe's session
 # never answer, as one that times out. `acp/AGENT/background-seconds` holds
@@ -51,6 +58,9 @@ if [ "$shape" = agy ]; then
     for argument in "$@"; do
         if [ "$argument" = --login ]; then
             rm -f -- "$FAKE_ACP_STATE/signed-out"
+            if [ -n "${AGY_CLI_FORCE_FILE_TOKEN_STORAGE:-}" ]; then
+                rm -f -- "$FAKE_ACP_STATE/keyring-only"
+            fi
             echo 'Signed in to Antigravity (fixture).'
             exit 0
         fi

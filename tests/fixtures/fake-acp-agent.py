@@ -65,6 +65,8 @@ Environment switches:
                             replays, as tests/fixtures/conversation-work.py
                             writes them
   FAKE_ACP_LOGIN_SECONDS=N  how long `login` waits before signing in
+  FAKE_ACP_VERSION=V        the version `initialize` reports (default
+                            `fixture`, a current one)
   FAKE_ACP_CANCEL_SECONDS=N how long a stopped turn takes to end after
                             `session/cancel`, as an agent that winds down
                             its work first (default 0)
@@ -87,6 +89,14 @@ Files under FAKE_ACP_STATE switch states that last across processes:
   no-allowance    every prompt is refused as a login with no usage allowance,
                   and Muse's `usage --json` reports no allowance
   hang-probe      a session opened by a probe (`--app-data-dir`) never answers
+  keyring-locked  Antigravity's sign-in is in a locked desktop keyring: every
+                  new or loaded session and every prompt is refused as signed
+                  out, unless AGY_CLI_FORCE_FILE_TOKEN_STORAGE keeps it in a
+                  file and the reported version (1.5.18 or later) honours it
+  keyring-only    Antigravity's sign-in is in the desktop keyring alone, as
+                  before cagents kept it in a file: an `agy` that keeps it in
+                  a file is refused as signed out until it signs in again
+  version         Antigravity's `initialize` reports this version
 
 Run with `--app-data-dir DIR`, as cagents' Antigravity probe runs `agy acp`,
 it saves each new session's files under ~/.gemini/DIR the way agy does
@@ -215,8 +225,43 @@ def signed_out(id):
 
 
 def logged_out():
-    """Signed out until `login`: the state's marker, written by `logout`."""
-    return marked("signed-out")
+    """Signed out until `login`: the state's marker, written by `logout`, or,
+    for Antigravity, a sign-in kept in a desktop keyring that is locked."""
+    return marked("signed-out") or keyring_locked() or keyring_only()
+
+
+def version():
+    """The version `initialize` reports: Antigravity's `version` state file,
+    else FAKE_ACP_VERSION, else `fixture`, which stands for a current one."""
+    if SHAPE == "agy" and marked("version"):
+        with open(os.path.join(MARKS, "version")) as recorded:
+            return recorded.read().strip() or "fixture"
+    return os.environ.get("FAKE_ACP_VERSION") or "fixture"
+
+
+def keyring_locked():
+    """While Antigravity's `keyring-locked` state is marked, as after a boot
+    with no graphical login, its sign-in is out of reach unless it keeps it
+    in a file: AGY_CLI_FORCE_FILE_TOKEN_STORAGE is set, and it is 1.5.18 or
+    later, the first version known to honour that."""
+    if SHAPE != "agy" or not marked("keyring-locked"):
+        return False
+    return not keeps_sign_in_in_file()
+
+
+def keeps_sign_in_in_file():
+    """Whether this Antigravity reads its sign-in from a file:
+    AGY_CLI_FORCE_FILE_TOKEN_STORAGE is set and it is 1.5.18 or later."""
+    if not os.environ.get("AGY_CLI_FORCE_FILE_TOKEN_STORAGE"):
+        return False
+    numbers = re.findall(r"\d+", version())[:3]
+    return len(numbers) != 3 or tuple(map(int, numbers)) >= (1, 5, 18)
+
+
+def keyring_only():
+    """While Antigravity's `keyring-only` state is marked, its sign-in is in
+    the keyring alone, so one that reads it from a file has none."""
+    return SHAPE == "agy" and marked("keyring-only") and keeps_sign_in_in_file()
 
 
 def marked(name):
@@ -470,11 +515,11 @@ class Agent:
         }
         if SHAPE == "agy":
             reply(id, {"protocolVersion": 1, "agentCapabilities": capabilities,
-                       "agentInfo": {"name": "Antigravity ACP Server", "version": "fixture"},
+                       "agentInfo": {"name": "Antigravity ACP Server", "version": version()},
                        "authMethods": [{"id": "oauth-personal", "name": "Log in with Google"}]})
         else:
             reply(id, {"protocolVersion": 1, "agentCapabilities": capabilities,
-                       "agentInfo": {"name": "muse", "version": "fixture"},
+                       "agentInfo": {"name": "muse", "version": version()},
                        "authMethods": [{"id": "muse-login", "name": "Log in to Muse"}]})
 
     def on_session_new(self, id, params):

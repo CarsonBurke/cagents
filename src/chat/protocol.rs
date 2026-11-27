@@ -571,15 +571,35 @@ impl QueuedInput {
 }
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    launch.provider.create_chat(launch)
+    launch
+        .provider
+        .create_chat(launch)
+        .map(|created| pinned(launch, created))
 }
 
 pub fn create_for_start(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
         crate::agent::Provider::Codex => codex::create_for_start(launch),
         crate::agent::Provider::Claude => claude::create_for_start(launch),
-        _ => create(launch).map_err(SetupError::Invalid),
+        _ => return create(launch).map_err(SetupError::Invalid),
     }
+    .map(|created| pinned(launch, created))
+}
+
+/// The provider's process keeps its sign-in where the daemon can read it,
+/// whatever the launch recipe it was created from says: a conversation
+/// resumed from a recipe saved before cagents set it is started the same as
+/// a new one. See [`crate::account::credential_storage`].
+fn pinned(
+    launch: &Launch,
+    (mut spec, adapter): (ProcessSpec, Box<dyn Adapter>),
+) -> (ProcessSpec, Box<dyn Adapter>) {
+    crate::account::pin_credential_storage(
+        launch.provider,
+        &mut spec.environment,
+        &mut spec.unset_environment,
+    );
+    (spec, adapter)
 }
 
 /// A bounded diagnostic prefix, with terminal controls escaped. Inspect only

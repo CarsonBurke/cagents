@@ -15,6 +15,8 @@ pub static PROFILE: Profile = Profile {
     modes: crate::agent::ANTIGRAVITY_MODES,
     offers_model: |_| true,
     sign_in_required: super::auth_required,
+    sign_in_advice: Some(crate::agent::antigravity::chat_sign_in_advice),
+    rereads_sign_in: true,
     // As recorded from 1.5.17: a prompt sent mid-turn answers the running
     // one with `end_turn` and goes on with its work, and `session/cancel`
     // fails the background commands the turn started, which run on after
@@ -156,6 +158,35 @@ mod tests {
                 .any(|argument| argument.contains("user_agent")),
             "cagents never disguises itself"
         );
+    }
+
+    #[test]
+    fn every_conversation_keeps_its_sign_in_in_a_file_whatever_its_recipe_says() {
+        let pinned = (
+            crate::agent::antigravity::FILE_TOKEN_STORAGE.to_owned(),
+            crate::agent::antigravity::FILE_TOKEN_STORAGE_ON.to_owned(),
+        );
+        // A new conversation's recipe names nothing; one saved by a daemon
+        // that did not set it, or a reader's own setting, may say otherwise.
+        let mut overridden = launch_of(&[], None);
+        overridden
+            .recipe
+            .environment
+            .insert(pinned.0.clone(), "0".into());
+        let mut removed = launch_of(&[], None);
+        removed.recipe.unset_environment.insert(pinned.0.clone());
+        for launch in [launch_of(&[], None), overridden, removed] {
+            for (spec, _) in [
+                crate::chat::protocol::create(&launch).unwrap(),
+                crate::chat::protocol::create_for_start(&launch).unwrap(),
+            ] {
+                assert_eq!(
+                    spec.environment.get_key_value(&pinned.0),
+                    Some((&pinned.0, &pinned.1))
+                );
+                assert!(!spec.unset_environment.contains(&pinned.0));
+            }
+        }
     }
 
     #[test]
