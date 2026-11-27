@@ -338,6 +338,252 @@ fn a_reopened_codex_thread_nothing_serves_starts_on_its_own_listener() {
     server.join().unwrap();
 }
 
+#[test]
+fn headless_resume_reopens_the_exact_codex_chat_and_its_cli_view() {
+    const NAME: &str = "host::chat::unserved_resume_tests::headless_resume_reopens_the_exact_codex_chat_and_its_cli_view";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    resume_paired_fixture(false);
+}
+
+#[test]
+fn boot_resume_finishes_the_pair_after_slow_provider_startup() {
+    const NAME: &str = "host::chat::unserved_resume_tests::boot_resume_finishes_the_pair_after_slow_provider_startup";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    resume_paired_fixture(true);
+}
+
+fn resume_paired_fixture(boot: bool) {
+    use crate::{
+        agent_execution::{Authority, Operation, Placement, Reply, directory::Scope, resume},
+        host::agent_execution,
+        model::{BootId, CardId, CardKind},
+        workspace_model::{ModelEdit, views::Pane},
+    };
+    let (host, _, path) = fixture();
+    let _lease = daemon_lease(&host);
+    let root = path.parent().unwrap();
+    let program = root.join("bin/codex");
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+    app-server) receipt="$HOME/../codex-server" ;;
+    resume|--remote) receipt="$HOME/../codex-view" ;;
+    *) exit 1 ;;
+esac
+printf '%s\n' "$@" > "$receipt.partial"
+mv "$receipt.partial" "$receipt"
+exec /bin/sleep 60
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    host.lock().unwrap().codex_listeners = CodexListenerRoots::in_runtime_directory(runtime.path());
+    let mut saved = reopened(root);
+    let mut old_proof = host.lock().unwrap().proof().clone();
+    old_proof.boot_id = BootId::new("earlier-boot");
+    saved.proof = Some(old_proof);
+    saved.terminal = Some(Box::new(
+        crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            saved.id,
+            saved.launch.terminal_recipe().unwrap(),
+            None,
+        )
+        .session,
+    ));
+    let store = agent_execution::registry(&host).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::SeedView {
+            scope: Placement::Worktree {
+                repository: root.join("project"),
+                path: root.join("project"),
+            },
+            closed: vec![],
+            panes: vec![Pane {
+                id: CardId::new(),
+                title: "Paired Codex".into(),
+                user_title: None,
+                pending_terminal_start: false,
+                width_fraction: 1.0,
+                kind: CardKind::Chat(saved.clone()),
+                scope: Some(root.join("project")),
+            }],
+        })
+        .unwrap();
+    let request = |operation| agent_execution::process(&host, Authority::default(), operation);
+    let Reply::Stopped(found) =
+        request(Operation::Stopped(resume::Scope::Sessions(Scope::All))).unwrap()
+    else {
+        panic!("expected stopped sessions");
+    };
+    assert_eq!(found.in_app_only, 0);
+    assert_eq!(
+        found
+            .sessions
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [saved.id]
+    );
+
+    host.lock().unwrap().register_client(1);
+    let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+        saved.id,
+        LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: root.join("project"),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+        None,
+    )
+    .session;
+    crate::host::state::spawn_terminal(&host, 1, terminal, Default::default()).unwrap();
+    let existing = host.lock().unwrap().terminals[&saved.id].handle.clone();
+    assert!(request(Operation::Resume(saved.id.to_string())).is_err());
+    assert!(
+        !existing.is_completed(),
+        "the existing terminal was left alone"
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(!root.join("codex-server").exists() && !root.join("codex-view").exists());
+    existing.shutdown().unwrap();
+    drop(host.lock().unwrap().retire_terminal(saved.id));
+
+    let (methods, received) = mpsc::channel();
+    let server_root = root.to_path_buf();
+    let server_host = host.clone();
+    let server = thread::spawn(move || {
+        let arguments = crate::test_timing::wait_for("the resumed Codex server to start", || {
+            std::fs::read_to_string(server_root.join("codex-server")).ok()
+        });
+        let arguments: Vec<_> = arguments.lines().collect();
+        let ["app-server", "--listen", address] = arguments.as_slice() else {
+            panic!("unexpected server arguments {arguments:?}");
+        };
+        let socket = address.strip_prefix("unix://").unwrap();
+        if boot {
+            crate::test_timing::wait_for("the daemon to publish the starting provider", || {
+                (!server_host.lock().unwrap().chats.is_empty()).then_some(())
+            });
+            // Cross the control request's five-second wait. The boot pass
+            // must finish the pair once the same provider becomes ready.
+            thread::sleep(Duration::from_millis(5_500));
+        } else {
+            // The server already launched. Fail the first terminal spawn
+            // before serving readiness, then restore the program for retry.
+            std::fs::rename(
+                server_root.join("bin/codex"),
+                server_root.join("bin/codex.saved"),
+            )
+            .unwrap();
+        }
+        serve(
+            crate::descriptor::bind(socket).unwrap(),
+            server_root.join("home/.codex"),
+            methods,
+        );
+    });
+
+    let running = if boot {
+        let settings = crate::instance::settings_path().unwrap();
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(settings, "resume_sessions_after_reboot = true\n").unwrap();
+        agent_execution::resume_after_boot(Arc::downgrade(&host));
+        *host.lock().unwrap().chats.keys().next().unwrap()
+    } else {
+        let Reply::Resumed(first) = request(Operation::Resume(saved.id.to_string())).unwrap()
+        else {
+            panic!("expected a resumed conversation");
+        };
+        assert!(!first.already_running && !first.starting, "{first:?}");
+        assert!(
+            first
+                .note
+                .as_ref()
+                .is_some_and(|note| note.contains("again to restore the paired terminal")),
+            "{first:?}"
+        );
+        assert!(host.lock().unwrap().terminals.is_empty());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .chat_pane_descriptor(saved.id)
+                .unwrap()
+                .as_ref(),
+            Some(&saved),
+            "a terminal failure must keep the saved pair available",
+        );
+        std::fs::rename(root.join("bin/codex.saved"), program).unwrap();
+
+        let Reply::Resumed(reopened) = request(Operation::Resume(saved.id.to_string())).unwrap()
+        else {
+            panic!("expected a resumed pair");
+        };
+        assert!(
+            reopened.already_running && !reopened.starting,
+            "{reopened:?}"
+        );
+        assert_eq!(reopened.session, first.session, "retry reused the provider");
+        assert_eq!(
+            reopened.note.as_deref(),
+            Some("Reopened its paired terminal.")
+        );
+        reopened.session
+    };
+    resumed(&received);
+    let (current, worker) = {
+        let state = host.lock().unwrap();
+        let record = &state.chats[&running];
+        let worker = &state.terminals[&running].handle;
+        assert!(record.paired_terminal.as_ref().unwrap().same_worker(worker));
+        assert_eq!(state.chats.len(), 1);
+        assert_eq!(state.terminals.len(), 1);
+        (record.current_session(), worker.clone())
+    };
+    assert_eq!(current.launch.session_id.as_deref(), Some(thread_id()));
+    assert!(
+        current.owns_codex_listener(),
+        "the old daemon and server are gone"
+    );
+    let persisted = store
+        .lock()
+        .unwrap()
+        .chat_pane_descriptor(current.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, persisted);
+    let arguments = crate::test_timing::wait_for("the paired CLI to record its arguments", || {
+        std::fs::read_to_string(root.join("codex-view")).ok()
+    });
+    assert_eq!(
+        arguments.lines().collect::<Vec<_>>(),
+        current.launch.terminal_recipe().unwrap().arguments,
+    );
+    let Reply::Resumed(again) = request(Operation::Resume(saved.id.to_string())).unwrap() else {
+        panic!("expected already running");
+    };
+    assert!(again.already_running);
+    assert!(
+        host.lock().unwrap().terminals[&running]
+            .handle
+            .same_worker(&worker)
+    );
+
+    crate::host::finish_chat_shutdown(&host).unwrap();
+    server.join().unwrap();
+}
+
 /// A shared daemon serving the account may own the saved thread, so the
 /// reopened thread joins it and no other server is launched.
 #[test]

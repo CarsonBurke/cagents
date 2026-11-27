@@ -52,7 +52,15 @@ impl Registry {
         let CardKind::Chat(current) = &pane.kind else {
             return Ok(false);
         };
-        if !crate::agent_execution::same_chat_process(current, stopped) {
+        if !crate::agent_execution::same_chat_process(current, stopped)
+            || current.terminal != stopped.terminal
+            || current
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| Some(id) != started.launch.session_id.as_ref())
+            || current == started
+        {
             return Ok(false);
         }
         let actor = crate::agent_execution::HostedSession::Chat(started.clone());
@@ -89,9 +97,9 @@ impl Registry {
 }
 
 /// Whether `started` can stand for `stopped` in its pane: the same provider
-/// conversation, provider and directory, started under a complete proof with
-/// no terminal of its own, either in place or under a new ID. How it runs,
-/// such as the Codex listener it was given, is the start's to decide.
+/// conversation, provider and directory, started under a complete proof.
+/// In-place recovery can keep its proof. A restored terminal must belong
+/// to the new attachment and its daemon.
 pub(super) fn shows_resumed(stopped: &Session, started: &Session) -> bool {
     let conversation = |session: &Session| {
         session
@@ -105,9 +113,11 @@ pub(super) fn shows_resumed(stopped: &Session, started: &Session) -> bool {
         .proof
         .as_ref()
         .is_some_and(crate::model::HostSessionProof::is_complete)
-        && started.proof != stopped.proof
-        && started.terminal.is_none()
-        && stopped.terminal.is_none()
+        && (started.proof != stopped.proof || started.id == stopped.id)
+        && started != stopped
+        && started.terminal.as_ref().is_none_or(|terminal| {
+            terminal.id == started.id && terminal.continuity.live_proof() == started.proof
+        })
         && started.launch.provider == stopped.launch.provider
         && started.launch.recipe.working_directory == stopped.launch.recipe.working_directory
         && conversation(started).is_some()

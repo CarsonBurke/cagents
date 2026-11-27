@@ -171,11 +171,8 @@ pub(super) fn list(
     // Reading confers nothing, so a capability whose session has ended reads
     // as a caller outside cagents rather than failing the whole listing.
     let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
-    let mut live = live_sessions(host);
+    let mut live = hosted_sessions(host, members);
     let mut saved = HashMap::new();
-    if members {
-        live.extend(exited_chats(host));
-    }
     let (model, scopes, delegations, lineages, succession, channel_history) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -540,10 +537,17 @@ pub(in crate::host) fn named(projects: &[ModelProject], name: &Path) -> Result<P
 /// Live provider conversations and terminals; the caller decides which
 /// plain shells matter.
 pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
+    hosted_sessions(host, false)
+}
+
+/// Read running and stopped chats together so an exit during a directory
+/// read cannot list the same conversation twice.
+fn hosted_sessions(host: &SharedHost, include_stopped: bool) -> Vec<Live> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut live = Vec::new();
     for (id, record) in &state.chats {
-        if record.handle.is_completed() {
+        let exited = !record.provider_running();
+        if exited && !include_stopped {
             continue;
         }
         live.push(Live {
@@ -552,9 +556,13 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             provider: Some(record.session.launch.provider),
             // Resident metadata only; a directory read never loads a transcript.
             title: record.handle.title(),
-            state: record.handle.activity(),
+            state: if exited {
+                ActivityState::Idle
+            } else {
+                record.handle.activity()
+            },
             directory: record.session.launch.recipe.working_directory.clone(),
-            exited: false,
+            exited,
             failure: record.handle.failure(),
             chat: Some(record.handle.clone()),
         });
@@ -582,28 +590,6 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
         });
     }
     live
-}
-
-/// Chats whose provider exited but whose pane remains, so their
-/// conversation can still be read.
-fn exited_chats(host: &SharedHost) -> Vec<Live> {
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    state
-        .chats
-        .iter()
-        .filter(|(_, record)| record.handle.is_completed())
-        .map(|(id, record)| Live {
-            id: *id,
-            surface: Surface::Chat,
-            provider: Some(record.session.launch.provider),
-            title: record.handle.title(),
-            state: ActivityState::Idle,
-            directory: record.session.launch.recipe.working_directory.clone(),
-            exited: true,
-            failure: record.handle.failure(),
-            chat: Some(record.handle.clone()),
-        })
-        .collect()
 }
 
 /// Chats a pane still shows that this daemon is not hosting, such as one

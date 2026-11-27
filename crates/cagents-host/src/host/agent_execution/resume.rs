@@ -34,6 +34,10 @@ use std::{
 /// this stays short: an update asked for then waits for no more than this.
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// The boot pass can wait longer for a paired provider, outside control
+/// admission, before taking it again to open the terminal.
+const BOOT_PAIR_SETTLE: Duration = Duration::from_secs(25);
+
 /// Who asks for a conversation to reopen, which decides what proves its
 /// earlier process can no longer write it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,18 +403,31 @@ fn resume_as(
         |id| may_resume(&origin, open_agent(&agents, id)),
     )? {
         Resolved::Running(member) => {
+            let repaired = retry_codex_pair(host, &registry, &origin, &agents, member)?;
+            let id = member.session.id;
             return Ok(Resumed {
-                stopped: member.session.id,
-                session: member.session.id,
+                stopped: repaired.as_ref().map_or(id, |(stopped, _)| *stopped),
+                session: id,
                 provider: member
                     .session
                     .provider
                     .ok_or("That session runs no provider")?,
                 title: member.session.title.clone(),
-                agent: open_agent(&agents, member.session.id).map(|agent| agent.id),
+                agent: registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .agent_for_session(id)?
+                    .filter(|agent| !agent.closed)
+                    .map(|agent| agent.id),
                 already_running: true,
-                starting: false,
-                note: None,
+                starting: repaired
+                    .as_ref()
+                    .is_some_and(|(_, reopened)| reopened.starting == Some(true)),
+                note: repaired.and_then(|(_, reopened)| {
+                    reopened.note.or_else(|| {
+                        (basis != Basis::Boot).then(|| "Reopened its paired terminal.".into())
+                    })
+                }),
             });
         }
         Resolved::Stopped(id, title) => (id, title),
@@ -422,8 +439,8 @@ fn resume_as(
             "Session {id} is not yours to resume: a session may resume only the agents it started"
         ));
     }
-    // An agent's own start resumes it too; one at a time. Held only until
-    // the start is made, never while the provider settles.
+    // An agent's own start resumes it too. Serialize the provider start
+    // and any paired terminal before allowing its next prompt to run.
     let gate = agent.as_ref().map(|agent| start_gate(host, agent.id));
     let starting_gate = gate
         .as_ref()
@@ -455,22 +472,25 @@ fn resume_as(
     // This request already holds the shared control admission; taking it
     // again could wait behind a queued exclusive request that waits on it.
     open_for_work(host)?;
-    let started = reopen(host, &source, basis)?;
+    let reopened = reopen(host, &source, basis)?;
     drop(starting_gate);
-    let starting = settle(host, &started)?;
+    let started = reopened.session;
+    let starting = match reopened.starting {
+        Some(starting) => starting,
+        None => settle(host, &started)?,
+    };
     let bound = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent_for_session(started.id)?
         .filter(|agent| !agent.closed);
-    let note = match (&agent, &bound) {
+    let note = reopened.note.or_else(|| match (&agent, &bound) {
         (Some(agent), None) => Some(format!(
-            "Its agent {} did not take the reopened conversation over, so prompts for that agent \
-             still cannot reach it; the conversation itself runs",
+            "Its agent {} did not take the reopened conversation over, so prompts for that agent still cannot reach it",
             agent.id
         )),
         _ => None,
-    };
+    });
     Ok(Resumed {
         stopped: id,
         session: started.id,
@@ -483,15 +503,19 @@ fn resume_as(
     })
 }
 
+pub(super) struct Reopened {
+    pub(super) session: Session,
+    pub(super) note: Option<String>,
+    starting: Option<bool>,
+}
+
 /// Reopens `source`'s conversation as its pane would, and moves the pane
 /// showing it to the process that now runs it. Returns that process.
-pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Result<Session, String> {
-    if source.terminal.is_some() {
-        return Err(
-            "This conversation is paired with its provider's terminal; resume it from its pane in the app, where the terminal reopens with it"
-                .into(),
-        );
-    }
+pub(super) fn reopen(
+    host: &SharedHost,
+    source: &Session,
+    basis: Basis,
+) -> Result<Reopened, String> {
     let registry = registry(host)?;
     // An agent's record keeps the descriptor it launched; the window showing
     // it saves the conversation its provider confirmed into the pane.
@@ -505,7 +529,8 @@ pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Resul
                 && crate::agent_execution::same_chat_process(pane, source)
         });
     let source = learned.as_ref().unwrap_or(source);
-    if basis == Basis::Boot && !super::super::chat::from_earlier_boot(host, source) {
+    let earlier_boot = super::super::chat::from_earlier_boot(host, source);
+    if basis == Basis::Boot && !earlier_boot {
         return Err(
             "This boot already ran this conversation, so it is not resumed by itself".into(),
         );
@@ -517,11 +542,21 @@ pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Resul
     let (proof, ended_here) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let hosted = state.chats.get(&source.id);
-        if hosted.is_some_and(|record| !record.handle.is_completed()) {
+        if hosted.is_some_and(|record| record.provider_running()) {
             return Err("This conversation is already running".into());
         }
-        (state.proof().clone(), hosted.is_some())
+        (
+            state.proof().clone(),
+            hosted.is_some_and(|record| !record.handle.is_read_only_history()),
+        )
     };
+    let codex_pair = will_reopen_codex_terminal(source)?;
+    if codex_pair && basis == Basis::Prompt {
+        return Err(format!(
+            "Run `cagents resume {}` to reopen the conversation and its terminal before sending a prompt",
+            source.id
+        ));
+    }
     // An update that stopped this conversation names the original it resumes.
     let original = crate::upgrade::floor::load()
         .ok()
@@ -531,8 +566,9 @@ pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Resul
     // its conversation.
     let prepare = source.native_continuity.retains_provider()
         || chat::is_unstarted_resume_successor(source)
-        || original.is_some();
-    let start = if prepare {
+        || original.is_some()
+        || codex_pair;
+    let mut start = if prepare {
         let asked = original.unwrap_or_else(|| source.clone());
         let ServerResponse::ChatResumePrepared { session: prepared } =
             request(ClientRequest::ChatPrepareResume {
@@ -549,10 +585,7 @@ pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Resul
                     .into(),
             );
         }
-        if basis == Basis::Prompt
-            && !ended_here
-            && !super::super::chat::from_earlier_boot(host, source)
-        {
+        if basis == Basis::Prompt && !ended_here && !earlier_boot {
             return Err(format!(
                 "The daemon restarted since its provider last ran, so it cannot tell whether that process still writes the conversation. Once it has ended, resume it with `cagents resume {}`",
                 source.id
@@ -562,34 +595,194 @@ pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Resul
         // its proof, as a pane's restore does, and the daemon checks it
         // against any closed record it still holds under this ID.
         let mut session = source.clone();
-        session.proof = Some(proof);
+        session.proof = Some(proof.clone());
         session
+    };
+    if !prepare && let Some(terminal) = &source.terminal {
+        if terminal.id != source.id {
+            return Err(
+                "The saved source terminal has a different allocation from this conversation"
+                    .into(),
+            );
+        }
+        // A legacy conversion's terminal ran the provider itself. Replaying
+        // that recipe alongside the native provider would give it two writers.
+        super::super::chat::require_ended_resume_terminal(host, terminal, &proof, earlier_boot)?;
+        start.terminal = None;
+    }
+    if start.launch.needs_read_only_history() {
+        return Err(format!(
+            "The saved working directory {} is missing. Restore it before resuming the provider",
+            start.launch.recipe.working_directory.display()
+        ));
+    }
+    let response = if codex_pair {
+        // Keep the original pane and agent binding until both views attach
+        // so a temporary terminal failure can reuse this same provider.
+        super::super::chat::start_for_paired_resume(host, EXECUTION_CLIENT, start)
+            .map_err(|error| error.message)?
+    } else {
+        request(ClientRequest::ChatStart {
+            session: start,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        })?
     };
     let ServerResponse::ChatAttached {
         session: started, ..
-    } = request(ClientRequest::ChatStart {
-        session: start,
-        source: None,
-        terminate_source: false,
-        // With no source terminal the daemon starts the provider with its
-        // own native environment, as for a new agent.
-        execution_environment: Default::default(),
-    })?
+    } = response
     else {
         return Err("The daemon answered the start with something else".into());
     };
+    if codex_pair {
+        return finish_codex_pair(host, &registry, source, started);
+    }
+    save_pane(host, &registry, source, &started);
+    Ok(Reopened {
+        session: started,
+        note: None,
+        starting: None,
+    })
+}
+
+fn will_reopen_codex_terminal(source: &Session) -> Result<bool, String> {
+    let Some(terminal) = &source.terminal else {
+        return Ok(false);
+    };
+    if has_managed_console(source) {
+        return Err(
+            "This terminal is a managed agent console. Reopen it through its agent's pane".into(),
+        );
+    }
+    if source.launch.provider != crate::agent::Provider::Codex {
+        return Ok(false);
+    }
+    if terminal.id != source.id || !super::super::chat::can_reopen_codex_terminal(source) {
+        return Err(
+            "The saved Codex terminal cannot be reopened as a view of this exact conversation"
+                .into(),
+        );
+    }
+    Ok(true)
+}
+
+/// A failed terminal start leaves the original paired pane in the registry.
+/// A later explicit resume can finish that pair against the exact successor
+/// that is already serving its thread.
+fn retry_codex_pair(
+    host: &SharedHost,
+    registry: &super::SharedRegistry,
+    origin: &Origin,
+    agents: &[Agent],
+    running: &Member,
+) -> Result<Option<(TerminalId, Reopened)>, String> {
+    if running.session.surface != Surface::Chat
+        || running.session.provider != Some(crate::agent::Provider::Codex)
+    {
+        return Ok(None);
+    }
+    let Some(started) = hosted_provider(host, running.session.id) else {
+        return Ok(None);
+    };
+    let source = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let mut found = None;
+        for id in store.lineage_succession(running.session.lineage)? {
+            if id == started.id || !may_resume(origin, open_agent(agents, id)) {
+                continue;
+            }
+            let Some(source) = store.chat_pane_descriptor(id)? else {
+                continue;
+            };
+            if will_reopen_codex_terminal(&source) == Ok(true)
+                && is_exact_paired_successor(&source, &started)
+            {
+                found = Some(source);
+                break;
+            }
+        }
+        found
+    };
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let gate = open_agent(agents, source.id).map(|agent| start_gate(host, agent.id));
+    let _starting_gate = gate
+        .as_ref()
+        .map(|gate| gate.lock().unwrap_or_else(|p| p.into_inner()));
+    open_for_work(host)?;
+    finish_codex_pair(host, registry, &source, started).map(|reopened| Some((source.id, reopened)))
+}
+
+fn hosted_provider(host: &SharedHost, id: TerminalId) -> Option<Session> {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&id)
+        .filter(|record| record.provider_running())
+        .map(|record| record.current_session())
+}
+
+fn is_exact_paired_successor(source: &Session, started: &Session) -> bool {
+    let mut expected = source.clone();
+    expected.reset_owned_codex_listener();
+    expected.id = started.id;
+    expected.terminal = None;
+    expected.launch == started.launch || expected.resolved_to_owned_codex_listener(started)
+}
+
+fn finish_codex_pair(
+    host: &SharedHost,
+    registry: &super::SharedRegistry,
+    source: &Session,
+    started: Session,
+) -> Result<Reopened, String> {
+    let starting = settle(host, &started)?;
+    let paired = if starting {
+        Err("The provider is still starting".into())
+    } else {
+        super::super::chat::reopen_codex_terminal(host, EXECUTION_CLIENT, &started)
+            .map_err(|error| error.message)
+    };
+    let (session, note) = match paired {
+        Ok(paired) => {
+            super::follow_restart(host, &paired);
+            save_pane(host, registry, source, &paired);
+            (paired, None)
+        }
+        Err(reason) => (
+            started,
+            Some(format!(
+                "{reason}. Run `cagents resume {}` again to restore the paired terminal",
+                source.id
+            )),
+        ),
+    };
+    Ok(Reopened {
+        session,
+        note,
+        starting: Some(starting),
+    })
+}
+
+fn save_pane(
+    host: &SharedHost,
+    registry: &super::SharedRegistry,
+    source: &Session,
+    started: &Session,
+) {
     let moved = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .adopt_resumed_chat_pane(source, &started);
+        .adopt_resumed_chat_pane(source, started);
     match moved {
-        Ok(true) => super::announce(host, &registry),
+        Ok(true) => super::announce(host, registry),
         Ok(false) => {}
         Err(error) => {
             tracing::warn!(chat = %started.id, %error, "the reopened conversation's pane still names its stopped process");
         }
     }
-    Ok(started)
 }
 
 /// What starts after the daemon prepared `asked` as `prepared`: the
@@ -623,34 +816,49 @@ fn open_for_work(host: &SharedHost) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `reopen` can start `session` at all: a conversation with no
-/// paired terminal that recorded its provider conversation, or whose retained
-/// owner knows it.
+/// Whether there is a saved conversation for the daemon to try to reopen.
 fn resumable(session: &Session) -> bool {
-    session.terminal.is_none()
+    !has_managed_console(session)
         && (session.launch.session_id.is_some() || session.native_continuity.retains_provider())
+}
+
+fn has_managed_console(session: &Session) -> bool {
+    session
+        .terminal
+        .as_ref()
+        .is_some_and(|terminal| crate::agent_execution::console_agent(&terminal.launch).is_some())
 }
 
 /// Waits a bounded time for the provider `started` runs to be ready, and
 /// fails with its reason when it stops instead. Returns whether it is still
 /// starting.
 fn settle(host: &SharedHost, started: &Session) -> Result<bool, String> {
-    let deadline = Instant::now() + SETTLE;
+    settle_for(host, started.id, started.launch.provider, SETTLE)
+}
+
+fn settle_for(
+    host: &SharedHost,
+    session: TerminalId,
+    provider: crate::agent::Provider,
+    budget: Duration,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + budget;
     loop {
         let handle = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .chats
-            .get(&started.id)
+            .get(&session)
             .map(|record| record.handle.clone());
         let Some(handle) = handle else {
             return Err("The reopened conversation stopped as soon as it started".into());
         };
+        if handle.is_read_only_history() {
+            return Err("The conversation is only available as saved history. Restore its working directory before resuming the provider".into());
+        }
         if handle.is_completed() {
             return Err(match handle.failure() {
-                Some(failure) => {
-                    chat::failure::summary(started.launch.provider, &failure).into_owned()
-                }
+                Some(failure) => chat::failure::summary(provider, &failure).into_owned(),
                 None => "The reopened conversation stopped as soon as it started".into(),
             });
         }
@@ -673,23 +881,33 @@ fn descriptor(
     id: TerminalId,
     agent: Option<&Agent>,
 ) -> Result<Option<Session>, String> {
-    if let Some(record) = host
+    let reader = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        match state.chats.get(&id) {
+            Some(record) if record.provider_running() => return Ok(None),
+            Some(record) if record.handle.is_read_only_history() => Some(record.current_session()),
+            Some(record) => return Ok(Some(record.current_session())),
+            None => None,
+        }
+    };
+    let pane = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&id)
-    {
-        return Ok(record
-            .handle
-            .is_completed()
-            .then(|| record.current_session()));
-    }
-    if let Some(session) = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chat_pane_descriptor(id)?
-    {
-        return Ok(Some(session));
+        .chat_pane_descriptor(id)?;
+    match (reader, pane) {
+        (Some(reader), Some(pane))
+            if Session {
+                proof: reader.proof.clone(),
+                ..pane.clone()
+            } == reader =>
+        {
+            // The reader's proof describes when its history was loaded.
+            // The pane still records the boot that ran the provider.
+            return Ok(Some(pane));
+        }
+        (Some(reader), _) => return Ok(Some(reader)),
+        (None, Some(pane)) => return Ok(Some(pane)),
+        (None, None) => {}
     }
     match agent.and_then(|agent| agent.session.as_ref()) {
         Some(HostedSession::Chat(session)) if session.id == id => Ok(Some(session.clone())),
@@ -1045,7 +1263,7 @@ fn pass(host: &std::sync::Weak<crate::host::state::HostLock>) -> Pass {
         tracing::info!(%session, %error, "not resumed: nothing saved to reopen");
     }
     for session in &in_app {
-        tracing::info!(session = %session.id, "not resumed: paired with its provider's terminal, it reopens from its pane");
+        tracing::info!(session = %session.id, "not resumed: the saved session requires its app pane");
     }
     let mut pass = Pass {
         left: in_app,
@@ -1087,7 +1305,43 @@ fn pass(host: &std::sync::Weak<crate::host::state::HostLock>) -> Pass {
             break;
         };
         match outcome {
-            Ok(resumed) => {
+            Ok(mut resumed) => {
+                if resumed.starting && will_reopen_codex_terminal(&source) == Ok(true) {
+                    // Provider startup can outlast a control request. Wait
+                    // without holding admission, then finish the same pair.
+                    let deferred = match settle_for(
+                        &host,
+                        resumed.session,
+                        resumed.provider,
+                        BOOT_PAIR_SETTLE,
+                    ) {
+                        Ok(false) => mailbox::with_control(&host, || {
+                            finish_boot_codex_pair(&host, &source, &resumed).map(Some)
+                        }),
+                        Ok(true) => Some(Ok(None)),
+                        Err(reason) => Some(Err(reason)),
+                    };
+                    match deferred {
+                        Some(Ok(Some(finished))) => resumed = finished,
+                        Some(Ok(None)) => {}
+                        None => {
+                            pass.interrupted = true;
+                            break;
+                        }
+                        Some(Err(_)) if open_for_work(&host).is_err() => {
+                            pass.interrupted = true;
+                            break;
+                        }
+                        Some(Err(reason)) => {
+                            announce_failure(&host, &source, &stopped, &reason);
+                            pass.failed.push((stopped, reason));
+                            continue;
+                        }
+                    }
+                }
+                if let Some(note) = &resumed.note {
+                    tracing::warn!(session = %stopped.id, %note, "resume after boot needs attention");
+                }
                 tracing::info!(session = %stopped.id, running = %resumed.session, "resumed now that this computer started");
                 pass.resumed.push(resumed);
             }
@@ -1116,6 +1370,31 @@ fn pass(host: &std::sync::Weak<crate::host::state::HostLock>) -> Pass {
     pass
 }
 
+fn finish_boot_codex_pair(
+    host: &SharedHost,
+    source: &Session,
+    resumed: &Resumed,
+) -> Result<Resumed, String> {
+    open_for_work(host)?;
+    let registry = registry(host)?;
+    let started = hosted_provider(host, resumed.session)
+        .filter(|started| is_exact_paired_successor(source, started))
+        .ok_or("The resumed provider changed before its terminal could be reopened")?;
+    let finished = finish_codex_pair(host, &registry, source, started)?;
+    let agent = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(finished.session.id)?
+        .filter(|agent| !agent.closed)
+        .map(|agent| agent.id);
+    Ok(Resumed {
+        starting: finished.starting == Some(true),
+        note: finished.note,
+        agent,
+        ..resumed.clone()
+    })
+}
+
 /// Whether `session`'s complete saved record says this boot ran it. One
 /// whose record is incomplete may be an earlier boot's.
 fn ran_this_boot(host: &SharedHost, session: &Session) -> bool {
@@ -1126,16 +1405,16 @@ fn ran_this_boot(host: &SharedHost, session: &Session) -> bool {
         && !super::super::chat::from_earlier_boot(host, session)
 }
 
-/// Whether a window is attached to the daemon's record of `id`, as to the
-/// history it shows, or anything is starting it.
+/// Whether a window holds the provider attachment, or a start is pending.
 fn window_holds(host: &SharedHost, id: TerminalId) -> bool {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     state.chat_spawning.contains_key(&id)
         || state.chats.get(&id).is_some_and(|record| {
-            record
-                .subscribers
-                .keys()
-                .any(|client| *client != EXECUTION_CLIENT)
+            !record.handle.is_read_only_history()
+                && record
+                    .subscribers
+                    .keys()
+                    .any(|client| *client != EXECUTION_CLIENT)
         })
 }
 
@@ -1150,7 +1429,7 @@ fn conversation_runs(host: &SharedHost, source: &Session) -> bool {
     state.chats.values().any(|record| {
         record.session.launch.provider == provider
             && record.handle.session_id().as_deref() == Some(conversation)
-            && (record.handle.owns_work() || !record.handle.is_completed())
+            && (record.handle.owns_work() || record.provider_running())
     }) || state.chat_spawning.values().any(|pending| {
         pending.launch.provider == provider
             && pending.launch.session_id.as_deref() == Some(conversation)

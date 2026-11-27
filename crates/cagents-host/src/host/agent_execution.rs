@@ -593,8 +593,9 @@ fn resume(
     // about the conversation is prepared, and says why.
     working_directory::open_for_start(registry, agent)
         .map_err(|error| format!("Cannot reopen the agent's conversation: {error}"))?;
-    let session = resume::reopen(host, source, resume::Basis::Prompt)
+    let reopened = resume::reopen(host, source, resume::Basis::Prompt)
         .map_err(|error| format!("Cannot reopen the agent's conversation: {error}"))?;
+    let session = reopened.session;
     let bound = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())

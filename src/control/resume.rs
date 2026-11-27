@@ -172,12 +172,9 @@ fn listed_human(found: &StoppedSessions, flag: &str, program: &str) -> String {
     }
     match found.in_app_only {
         0 => {}
-        1 => lines.push(
-            "1 more can be resumed only from its pane in the app, such as one paired with its provider's terminal."
-                .to_owned(),
-        ),
+        1 => lines.push("1 more can be resumed only from its pane in the app.".to_owned()),
         count => lines.push(format!(
-            "{count} more can be resumed only from their panes in the app, such as ones paired with their provider's terminal."
+            "{count} more can be resumed only from their panes in the app."
         )),
     }
     if !found.sessions.is_empty() {
