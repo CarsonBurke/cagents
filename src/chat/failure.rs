@@ -422,7 +422,9 @@ impl<'a> Failure<'a> {
                 // Its step reads "failed", as the agent reported it: this
                 // says why, in the same word.
                 "A command failed because the computer ran out of memory".to_owned(),
-                "The agent is still working and knows the command failed.",
+                // Shown for as long as the notice is, so it must stay true
+                // after the agent finishes.
+                "The agent was told the command failed.",
             ),
             FailureKind::Exited => (
                 exit_summary(program, &signal),
@@ -1514,11 +1516,9 @@ mod tests {
             failure.summary,
             "A command failed because the computer ran out of memory"
         );
-        assert!(
-            failure.action.contains("still working"),
-            "{}",
-            failure.action
-        );
+        // The agent carries on, and the notice outlives its work: no
+        // claim that it is still working.
+        assert_eq!(failure.action, "The agent was told the command failed.");
         // An agent kept running across an update reports in the words an
         // earlier build used, which read the same.
         for (legacy, kind) in [
