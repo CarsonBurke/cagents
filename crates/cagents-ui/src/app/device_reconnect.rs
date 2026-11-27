@@ -348,6 +348,7 @@ impl cosmic::Application for Reconnect {
                             "Copy command",
                         )
                     },
+                    design::base,
                 ));
             }
             Phase::Needs {

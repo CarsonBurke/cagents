@@ -49,6 +49,7 @@ pub(super) fn view<'a, M: Clone + 'static>(
     text: &'a str,
     prose: impl Fn(&'a str) -> Element<'a, M>,
     copy: impl Fn(&'a str) -> Element<'a, M>,
+    surface: impl Fn(&cosmic::Theme) -> iced::Color + Copy + 'a,
 ) -> Element<'a, M> {
     let segments = segments(text);
     if !segments
@@ -61,11 +62,14 @@ pub(super) fn view<'a, M: Clone + 'static>(
         match segment {
             Segment::Prose(text) => prose(text),
             Segment::Command(command) => widget::row::with_children(vec![
-                crate::interaction::overflow_fade_x(
+                // A command too long for the line scrolls, its cut end
+                // faded into the surface it sits on; the copy control takes
+                // it whole.
+                crate::interaction::overflow_fade_x_over(
                     widget::scrollable(
                         widget::selectable_text(command)
                             .font(iced::Font::MONOSPACE)
-                            .size(design::TEXT_BODY)
+                            .size(design::TEXT_CAPTION)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None),
                     )
                     .width(Length::Fill)
@@ -74,6 +78,7 @@ pub(super) fn view<'a, M: Clone + 'static>(
                             iced::widget::scrollable::Scrollbar::hidden(),
                         ),
                     ),
+                    surface,
                 ),
                 copy(command),
             ])
