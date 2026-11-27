@@ -272,6 +272,25 @@ fn ready_pre_effects_retry_requires_a_dead_exact_first_attempt_and_one_unused_sl
 
 #[cfg(target_os = "macos")]
 #[test]
+fn ordinary_ready_return_requires_no_successor_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let preparation = preparation(directory.path());
+    let plan = ReadyPlanEvidence {
+        authority: std::borrow::Cow::Borrowed(&preparation.authority),
+        checkpoint: (0, 0),
+        capture_digest: String::new(),
+    };
+    assert!(plan.require_unclaimed_return().is_ok());
+    for marker in ["claim", "retry-claim", "effects"] {
+        let path = ready_evidence_path(&preparation.authority, marker).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        assert!(plan.require_unclaimed_return().is_err(), "{marker}");
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn ready_retry_accepts_only_causal_pairs_of_exact_runtime_and_saved_owners() {
     let directory = tempfile::tempdir().unwrap();
     let preparation = preparation(directory.path());

@@ -170,6 +170,10 @@ impl Reservation<'_> {
                 "The saved return plan belongs to a different update",
             ));
         }
+        self.plan
+            .ready
+            .require_unclaimed_return()
+            .map_err(invalid)?;
         Ok(true)
     }
 
@@ -298,6 +302,9 @@ pub fn admit_saved_state(executable: &Path) -> Result<(), UpdateError> {
                     .names_current_runtime()
                     .map_err(invalid)?
             {
+                if phase == Phase::Returning {
+                    reservation.verify_original_if_recorded(&layout)?;
+                }
                 Ok(())
             } else {
                 Err(UpdateError::Busy)

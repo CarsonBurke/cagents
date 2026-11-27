@@ -1751,6 +1751,13 @@ impl ReadyPlanEvidence<'_> {
         &self.authority.windows
     }
 
+    pub(crate) fn require_unclaimed_return(&self) -> Result<(), String> {
+        if self.claim_exists()? {
+            return Err("A Ready successor already claimed this update".into());
+        }
+        require_no_ready_effects_or_retry(&self.authority)
+    }
+
     /// Keep the original saved work eligible for the selected source when the
     /// candidate disappeared before obtaining permission to touch it.
     pub(crate) fn verify_unclaimed_source(
@@ -1764,7 +1771,6 @@ impl ReadyPlanEvidence<'_> {
             || !matches!(authority.origin, Origin::AcknowledgedPrepare)
             || !self.same_boot().map_err(|error| error.to_string())?
             || !self.names_current_runtime()?
-            || self.claim_exists()?
         {
             return Err("The selected source no longer owns the untouched Ready checkpoint".into());
         }
@@ -1783,7 +1789,7 @@ impl ReadyPlanEvidence<'_> {
         }
         validate_lock_mode(&legacy, &authority.legacy_path, "READ")
             .map_err(|error| error.to_string())?;
-        require_no_ready_effects_or_retry(authority)?;
+        self.require_unclaimed_return()?;
         ready_state_predecessor(authority, &daemon, None)?;
         validate_received_checkpoint(authority, Phase::Ready)?;
         self.exact_checkpoint()?;
