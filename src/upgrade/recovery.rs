@@ -1804,6 +1804,10 @@ impl ReadyPlanEvidence<'_> {
     }
 
     pub(crate) fn claimed_process_exited(&self) -> Result<bool, String> {
+        self.latest_claim()?.exited()
+    }
+
+    fn latest_claim(&self) -> Result<ReadyClaim, String> {
         let (first, first_digest) = self.first_claim()?;
         if ready_evidence_exists(&self.authority, "retry-claim")? {
             let (retry, _) = self.read_claim("retry-claim")?;
@@ -1813,9 +1817,35 @@ impl ReadyPlanEvidence<'_> {
             {
                 return Err("The installed update has no exact retry claimant to settle".into());
             }
-            return retry.exited();
+            return Ok(retry);
         }
-        first.exited()
+        Ok(first)
+    }
+
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn verify_exited_cutover_claim(
+        &self,
+        request: &str,
+        checkpoint: &str,
+        source: &HostSessionProof,
+        windows: &[String],
+        successor: &HostSessionProof,
+        process: &crate::daemon::holder_registry::Process,
+    ) -> Result<(), String> {
+        let claim = self.latest_claim()?;
+        if claim.request_digest != request
+            || claim.checkpoint_digest != checkpoint
+            || &claim.source != source
+            || self.saved_windows() != windows
+            || claim.successor_proof.as_ref() != Some(successor)
+            || &claim.successor != process
+            || !claim.exited()?
+        {
+            return Err(
+                "The installed cutover does not name the exact exited Ready claimant".into(),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn require_pre_effects_retry(&self) -> Result<(), String> {

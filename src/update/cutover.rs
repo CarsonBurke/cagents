@@ -589,6 +589,21 @@ pub(super) fn finish(
     if reentered && (!intent.witness_present(state)? || !intent.original_exited()?) {
         return Ok(None);
     }
+    if reentered
+        && !intent.witness.is_legacy()
+        && let Some(ready) = ready_plan::selected_evidence(layout, state, &job)?
+    {
+        ready
+            .verify_exited_cutover_claim(
+                &intent.request_digest,
+                &intent.checkpoint_digest,
+                &intent.source,
+                &intent.windows,
+                &intent.successor,
+                &intent.process,
+            )
+            .map_err(invalid)?;
+    }
     if !reentered && intent.process.pid != std::process::id() as i32 {
         return Ok(None);
     }
