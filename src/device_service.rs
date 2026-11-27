@@ -89,11 +89,13 @@ pub enum Operation {
     AccountProbeAfterLogin {
         account: crate::account::Account,
     },
-    /// A device window's source control, answered by the device's Git with
-    /// the service a local window uses. Its types keep Serde forms Postcard
-    /// cannot read, so it travels as JSON. The CLI never sends one.
-    #[cfg(any(feature = "ui", feature = "host"))]
-    Repository(#[serde(with = "json_framed")] crate::repository::RepositoryRequest),
+    /// A device window's source control: a
+    /// [`crate::repository::RepositoryRequest`] as JSON text, answered by the
+    /// device's Git with the service a local window uses. Its types keep
+    /// Serde forms Postcard cannot read, so it travels as JSON, and as text
+    /// so that every build, the CLI's too, has this variant and numbers any
+    /// appended after it alike. Appended wire tag.
+    Repository(String),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -194,37 +196,6 @@ pub struct NavigationWorktree {
     pub prunable_reason: Option<String>,
 }
 
-/// [`wire_json`] for a typed value: JSON on the binary wire, the value's own
-/// form for human-readable serializers.
-#[cfg(any(feature = "ui", feature = "host"))]
-mod json_framed {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
-
-    pub fn serialize<T: Serialize, S: Serializer>(
-        value: &T,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        if serializer.is_human_readable() {
-            value.serialize(serializer)
-        } else {
-            serde_json::to_string(value)
-                .map_err(serde::ser::Error::custom)?
-                .serialize(serializer)
-        }
-    }
-
-    pub fn deserialize<'de, T: DeserializeOwned, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<T, D::Error> {
-        if deserializer.is_human_readable() {
-            T::deserialize(deserializer)
-        } else {
-            let encoded = String::deserialize(deserializer)?;
-            serde_json::from_str(&encoded).map_err(serde::de::Error::custom)
-        }
-    }
-}
-
 /// JSON's self-describing value visitor cannot run on Postcard. Keep JSON
 /// schemas at the service boundary, but frame each value as an ordinary string
 /// on the binary IPC wire. Human-readable serializers keep their existing form.
@@ -306,7 +277,10 @@ pub fn execute(operation: Operation) -> Result<Reply, String> {
         Operation::AccountLogin { account } => account_login(account),
         Operation::AccountProbe { account, force } => probe_account(account, force, false),
         Operation::AccountProbeAfterLogin { account } => probe_account(account, true, true),
-        Operation::Repository(request) => repository(request).map(Reply::Repository),
+        Operation::Repository(request) => serde_json::from_str(&request)
+            .map_err(|error| format!("The device could not read this request: {error}"))
+            .and_then(repository)
+            .map(Reply::Repository),
         Operation::Home => {
             let path = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -914,6 +888,17 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Postcard numbers an enum's variants by position, so the CLI, a window
+    /// and a daemon of one protocol version agree on a variant only while
+    /// every build has every variant in the same place.
+    #[test]
+    fn a_repository_request_keeps_its_appended_wire_tag() {
+        assert_eq!(
+            postcard::to_allocvec(&Operation::Repository(String::new())).unwrap(),
+            [20, 0]
+        );
+    }
+
     /// A project chooser shows folders, and a link to one is a folder too.
     #[test]
     fn listing_counts_a_link_to_a_folder_as_a_folder() {
@@ -1497,7 +1482,7 @@ mod tests {
         std::fs::write(root.join("notes.txt"), "one\ntwo\n").unwrap();
         // Each request crosses the wire as a window sends it.
         let answer = |request: RepositoryRequest| -> RepositoryReply {
-            let operation = Operation::Repository(request);
+            let operation = Operation::Repository(serde_json::to_string(&request).unwrap());
             let operation: Operation =
                 postcard::from_bytes(&postcard::to_allocvec(&operation).unwrap()).unwrap();
             let reply = execute(operation).unwrap();
@@ -2084,6 +2069,7 @@ pub fn answer_repository(
             )
             .map_err(|error| error.to_string());
     }
+    let request = serde_json::to_string(&request).map_err(|error| error.to_string())?;
     match request_for_reader(Operation::Repository(request))? {
         Reply::Repository(encoded) => serde_json::from_str(&encoded)
             .map_err(|error| format!("The device's answer could not be read: {error}")),
