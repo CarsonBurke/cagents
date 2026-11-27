@@ -94,6 +94,16 @@ pub(super) struct Record {
 }
 
 impl Record {
+    /// Only the last visible subscriber leaving changes the actor's visibility.
+    pub(super) fn detach(&mut self, client: ClientId) {
+        self.observations.remove(&client);
+        if self.subscribers.remove(&client) == Some(true)
+            && !self.subscribers.values().any(|visible| *visible)
+        {
+            self.handle.set_visible(false);
+        }
+    }
+
     /// The conversation as its actor now holds it: the source it started
     /// from, with the provider conversation ID and continuity the actor has
     /// learned since. A new conversation learns its ID only after it starts,
@@ -587,6 +597,14 @@ fn changed_for_instance(
             }
         }
     }
+    let predecessors = if matches!(update, Update::TurnStarted { .. }) {
+        super::notifications::predecessor_sessions(&host, id).unwrap_or_else(|error| {
+            tracing::debug!(%error, session = %id, "could not resolve attention lineage");
+            Default::default()
+        })
+    } else {
+        Default::default()
+    };
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     // Validate the producer under the same lock that publishes its update.
     // A retired callback must never target a replacement sharing this pane ID.
@@ -598,9 +616,26 @@ fn changed_for_instance(
     }) {
         return;
     }
+    if matches!(update, Update::RecordChanged) {
+        if let Some(work) = &state.work {
+            work.input_changed(id);
+        }
+        return;
+    }
+    if matches!(update, Update::TurnStarted { .. }) {
+        if state.chats.contains_key(&id)
+            && let Some(notifications) = &state.notifications
+        {
+            notifications.session_started_turn(id, predecessors);
+        }
+        return;
+    }
     let proof = state.proof().clone();
     if matches!(update, Update::Activity { .. }) {
         state.tally_updates.notify_one();
+        if let Some(work) = &state.work {
+            work.activity_changed(id);
+        }
     }
     // A conversation that starts or settles may take the messages left for
     // it, and may have hit a usage limit or left one behind. A failure, such
@@ -654,6 +689,9 @@ fn changed_for_instance(
         state.mobile_sessions_changed();
     }
     if matches!(update, Update::ConversationNameChanged) {
+        if let Some(work) = &state.work {
+            work.conversation_identity_changed(id);
+        }
         if let Some(titles) = &state.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
         }
@@ -4527,11 +4565,7 @@ fn process_inner(
                 return Ok(ServerResponse::Detached);
             }
             let record = attached_mut(&mut state, client, chat_id)?;
-            record.subscribers.remove(&client);
-            record.observations.remove(&client);
-            record
-                .handle
-                .set_visible(record.subscribers.values().any(|visible| *visible));
+            record.detach(client);
             let released = state
                 .held_followups
                 .get_mut(&chat_id)

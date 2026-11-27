@@ -857,6 +857,8 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
+    #[cfg(target_os = "macos")]
+    let mut cutover_checkpoint = Some(crate::update::cutover_startup_checkpoint());
     let listener = listener_before_restore(&paths, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);
@@ -887,7 +889,17 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             }
             #[cfg(all(test, target_os = "linux"))]
             observe_fixture_startup("restore ordinary", None);
-            update_recovery::restore_ordinary(&host).map_err(io::Error::other)?;
+            #[cfg(target_os = "macos")]
+            let ordinary = cutover_checkpoint
+                .as_ref()
+                .and_then(|entry| entry.restoring_digest())
+                .map_or_else(
+                    || update_recovery::restore_ordinary(&host),
+                    |digest| update_recovery::restore_observed_adoption(&host, digest),
+                );
+            #[cfg(not(target_os = "macos"))]
+            let ordinary = update_recovery::restore_ordinary(&host);
+            ordinary.map_err(io::Error::other)?;
             Ok(())
         })();
         // After restore has reattached every holder it could, and before
@@ -1038,7 +1050,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut courier = if recovery_only {
         None
     } else {
-        match agent_execution::mailbox::Courier::start(&host) {
+        match agent_execution::mailbox::Courier::start_with_update_fence(&host) {
             Ok(courier) => Some(courier),
             Err(error) => {
                 tracing::warn!(%error, "messages between sessions are unavailable");
@@ -1094,21 +1106,33 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     }
     #[cfg(target_os = "linux")]
     acknowledge_standby(standby.take());
-    #[cfg(target_os = "macos")]
-    let mut settle_startup_update = true;
     loop {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         publish_restored_selection(&host, &mut pending_publication);
         #[cfg(target_os = "macos")]
         if pending_publication.is_none() {
             acknowledge_standby(standby.take());
-            if std::mem::take(&mut settle_startup_update) {
-                crate::update::settle_as_successor(
-                    host.lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .proof()
-                        .clone(),
-                );
+            if let Some(cutover_checkpoint) = cutover_checkpoint.take() {
+                let serving = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone();
+                let host = Arc::clone(&host);
+                crate::update::settle_as_successor(serving, cutover_checkpoint, move || {
+                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut chats = chat::chat_list_inventory(&state);
+                    chats.retain(|session| {
+                        state.chats.get(&session.id).is_some_and(|record| {
+                            record.handle.owns_work() && !record.handle.is_completed()
+                        })
+                    });
+                    crate::update::CutoverLiveInventory {
+                        terminals: state.list(0),
+                        chats,
+                        adopted_sources: state.upgrade_chats.clone(),
+                    }
+                });
             }
         }
         reap_finished(&mut clients);

@@ -912,6 +912,8 @@ struct Claude {
     /// Which result-delimited turn has already published its start. Busy may
     /// stay true between turns while background permission decisions remain.
     started_generation: Option<u64>,
+    confirmed_start_generation: Option<u64>,
+    root_message_starts: VecDeque<[u8; 32]>,
     deferred_attention: HashMap<
         u64,
         (
@@ -1462,6 +1464,29 @@ impl Claude {
             self.stop_marked = false;
             step.events.push(Event::TurnStarted);
         }
+    }
+    fn confirm_turn_start(&mut self, step: &mut Step) {
+        self.start_turn(step);
+        if self.confirmed_start_generation != Some(self.attention_generation) {
+            self.confirmed_start_generation = Some(self.attention_generation);
+            step.events.push(Event::TurnStartConfirmed);
+        }
+    }
+    fn confirm_root_message(&mut self, frame: &Value, id: &str, step: &mut Step) {
+        use sha2::{Digest, Sha256};
+
+        if frame["isReplay"] == true {
+            return;
+        }
+        let id: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+        if self.root_message_starts.contains(&id) {
+            return;
+        }
+        self.root_message_starts.push_back(id);
+        if self.root_message_starts.len() > 2048 {
+            self.root_message_starts.pop_front();
+        }
+        self.confirm_turn_start(step);
     }
     fn status(&mut self, busy: bool, detail: impl Into<String>, step: &mut Step) {
         self.busy = busy;
@@ -2335,8 +2360,7 @@ impl Claude {
             self.refused_calls
                 .retain(|key| key.parent.as_deref() != child);
         }
-        if let Some(parent) = child
-            && fresh_live_carrier
+        let fresh_assistant_output = fresh_live_carrier
             && role == Role::Assistant
             && frame["error"].is_null()
             && frame["isMeta"].as_bool() != Some(true)
@@ -2370,7 +2394,9 @@ impl Claude {
                                 .any(|field| !string(&block["source"], field).trim().is_empty()),
                             _ => false,
                         })
-                    }))
+                    }));
+        if let Some(parent) = child
+            && fresh_assistant_output
         {
             step.events.push(Event::Subagent {
                 id: parent.into(),
@@ -2385,6 +2411,14 @@ impl Claude {
                 waiting: Some(false),
                 detail: Some(String::new()),
             });
+        }
+        if child.is_none()
+            && fresh_assistant_output
+            && frame["isSynthetic"] != true
+            && let Some(id) = frame["message"]["id"].as_str().filter(|id| !id.is_empty())
+        {
+            // A provider may deliver a complete answer without partial events.
+            self.confirm_root_message(frame, id, step);
         }
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
@@ -4711,6 +4745,8 @@ impl Claude {
             }
             "conversation_reset" => {
                 self.started_generation = None;
+                self.confirmed_start_generation = None;
+                self.root_message_starts.clear();
                 self.session_id = None;
                 self.history = None;
                 if let Some(titles) = &mut self.titles {
@@ -5393,7 +5429,7 @@ impl Claude {
                         }
                         if state == "started" && self.submissions.contains_key(id) {
                             self.hand_over = None;
-                            self.start_turn(&mut step);
+                            self.confirm_turn_start(&mut step);
                             self.status(true, "Claude is working", &mut step);
                         }
                         self.queued.retain(|message| message.id != id);
@@ -6070,7 +6106,7 @@ fn injected(content: &Value) -> Injected<'_> {
 
 /// Whether `text` is wholly one of the notes Claude Code writes for the
 /// model alone; see [`Injected::ModelOnly`].
-fn model_only_note(text: &str) -> bool {
+pub(crate) fn model_only_note(text: &str) -> bool {
     let text = text.trim();
     let wrapped = |tag: &str| {
         let mut rest = text;
@@ -7893,7 +7929,7 @@ impl Claude {
                     .is_none_or(|stream| stream.message != id)
                 {
                     let stream = Stream {
-                        message: id,
+                        message: id.clone(),
                         truncated: false,
                     };
                     // A message interrupted before its `message_stop` is
@@ -7903,7 +7939,7 @@ impl Claude {
                     }
                 }
                 if parent.is_empty() {
-                    self.start_turn(step);
+                    self.confirm_root_message(frame, &id, step);
                     self.update_usage(&event["message"]["usage"], step);
                     self.observe_request(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
@@ -10286,9 +10322,10 @@ impl Claude {
                     let schema = &request["requested_schema"];
                     let fields = elicitation_fields(schema)?;
                     let mut content = serde_json::Map::new();
+                    let mut answered = HashSet::new();
                     for answer in &answers {
                         if !fields.iter().any(|field| field.id == answer.field)
-                            || content.contains_key(&answer.field)
+                            || !answered.insert(answer.field.as_str())
                         {
                             return Err(
                                 "Claude elicitation answer has an unknown or duplicate field"
@@ -10296,6 +10333,13 @@ impl Claude {
                             );
                         }
                         let field_schema = &schema["properties"][&answer.field];
+                        // A blank scalar is an absent field: an optional one is
+                        // omitted, and a required one is reported missing below.
+                        if string(field_schema, "type") != "array"
+                            && super::blank_form_answer(&answer.values)
+                        {
+                            continue;
+                        }
                         let value = elicitation_value(field_schema, &answer.values)?;
                         content.insert(answer.field.clone(), value);
                     }

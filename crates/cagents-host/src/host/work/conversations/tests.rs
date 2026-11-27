@@ -65,6 +65,7 @@ fn facts(directory: &str) -> Facts {
     Facts {
         directory: PathBuf::from(directory),
         project: Some(ProjectFacts {
+            id: ProjectId::new(),
             snapshot: Some(Arc::new(forge::Snapshot {
                 repository: repo("me"),
                 remotes: vec![repo("me"), repo("upstream")],
@@ -177,16 +178,17 @@ fn a_branch_pushed_outside_the_project_s_remotes_is_not_its_pull_request() {
 fn a_branch_known_to_have_no_pull_request_is_not_asked_about_again_soon() {
     let facts = facts("/w/app");
     let mut branches = BTreeMap::new();
+    let checked = Instant::now();
     branches.insert(
         ((&repo("me")).into(), "lonely".to_owned()),
         BranchLookup {
             number: None,
-            checked: Instant::now(),
+            checked,
         },
     );
     assert!(matches!(
         resolve(&branch(None, "lonely"), &facts, &branches),
-        Resolved::Nothing
+        Resolved::Deferred(due) if due == checked + BRANCH_MISSING_FOR
     ));
     branches.insert(
         ((&repo("me")).into(), "found".to_owned()),
@@ -472,88 +474,193 @@ fn many_mentions_drop_the_oldest_mention_before_any_work() {
 #[test]
 fn failed_lookups_back_off() {
     let mut state = State::default();
-    assert!(state.lookups_due());
+    assert!(state.lookup_retry().is_none());
     let error = GitHubError::NoActiveAccount("github.com".into());
     state.failed(&error);
-    assert!(!state.lookups_due());
+    assert!(state.lookup_retry().is_some());
     assert_eq!(backoff(1), Duration::from_secs(30));
     assert_eq!(backoff(2), Duration::from_secs(60));
     assert_eq!(backoff(40), FINISHED_FOR);
     state.succeeded();
-    assert!(state.lookups_due());
+    assert!(state.lookup_retry().is_none());
     assert!(state.forge_error.is_none());
 }
 
-/// A rate limit pauses lookups until it resets, without growing the backoff
-/// an outage would, its own or a pull request's, so they resume as soon as
-/// GitHub admits them.
 #[test]
-fn rate_limited_lookups_wait_for_the_reset_not_a_backoff() {
-    let limited = |seconds| GitHubError::RateLimited {
-        limit: crate::github::polling::RateLimit::primary(
-            "graphql",
-            crate::github::polling::now() + seconds,
-        ),
+fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
+    use crate::repository::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
     };
-    let outage = GitHubError::NoActiveAccount("github.com".into());
-    let mut state = State::default();
-    // Outages before it are over once GitHub answers with its limit.
-    state.failed(&outage);
-    state.failed(&outage);
-    state.failed(&limited(3600));
-    assert!(!state.lookups_due());
-    assert_eq!(state.failures, 0);
-    assert!(state.forge_error.is_some());
-    let mut pull_request = Observed::default();
-    pull_request.lookup_failed(&limited(3600));
-    assert_eq!(pull_request.failures, 0);
-    // Once it resets: due, though a doubling backoff would wait on.
-    state.paused_until = Some(crate::github::polling::now());
-    assert!(state.lookups_due());
-    // An outage after it backs off as before.
-    state.failed(&outage);
-    pull_request.lookup_failed(&outage);
-    assert!(state.paused_until.is_none());
-    assert!(!state.lookups_due());
-    assert_eq!(state.failures, 1);
-    assert_eq!(pull_request.failures, 1);
-    // A reset about now means the clocks disagree: that backs off too.
-    state.failed(&limited(1));
-    pull_request.lookup_failed(&limited(1));
-    assert!(state.paused_until.is_none());
-    assert_eq!(state.failures, 2);
-    assert_eq!(pull_request.failures, 2);
+
+    #[derive(Default)]
+    struct Forge(Mutex<Vec<String>>);
+    impl ProcessExecutor for Forge {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            self.0.lock().unwrap().push(
+                command
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            Ok(ProcessOutput {
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: b"Could not resolve to a PullRequest".to_vec(),
+            })
+        }
+    }
+
+    let scope = "conversation-lookups-quota-test";
+    let spent = GitHubRepoKey::new("spent-graphql.invalid", None, "owner", "repo").unwrap();
+    let rest_spent = GitHubRepoKey::new("spent-rest.invalid", None, "owner", "repo").unwrap();
+    let open = GitHubRepoKey::new("open-graphql.invalid", None, "owner", "repo").unwrap();
+    let forge = Arc::new(Forge::default());
+    let gh = GitHubService::new("gh", forge.clone());
+    let work = Handle::idle(Weak::new());
+    let view = |repository: &GitHubRepoKey, number| {
+        Lookup::PullRequest(PullRequestKeyOrd {
+            repository: repository.into(),
+            number,
+        })
+    };
+
+    let reset = polling::now() + 600;
+    let next = polling::with_scope(scope, || {
+        for (repository, resource) in [(&spent, "graphql"), (&rest_spent, "core")] {
+            polling::failed(
+                &repository.authority(),
+                &GitHubError::RateLimited {
+                    limit: polling::RateLimit::primary(resource, reset),
+                },
+            );
+        }
+        let lookups = std::iter::once(Lookup::Branch {
+            base: (&spent).into(),
+            head: (&spent).into(),
+            branch: "next".into(),
+        })
+        .chain((1..10).map(|number| view(&spent, number)))
+        .chain([view(&rest_spent, 1), view(&open, 1)]);
+        work.run_lookups(&gh, lookups.map(|lookup| (Relation::Edited, lookup)))
+    });
+    assert_eq!(next.reset, Some(reset + 1));
+    assert_eq!(next.wait_for(), Some(crate::host::work::PAUSED_WAKE));
+
+    let commands = forge.0.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert!(commands[0].contains("spent-rest.invalid"));
+    assert!(commands[1].contains("open-graphql.invalid"));
+    let state = work.conversations();
+    assert_eq!(
+        state.observed.len(),
+        2,
+        "a skipped lookup changes no observation"
+    );
+    assert!(state.branches.is_empty());
+    assert!(
+        state.lookup_retry().is_none(),
+        "rate limits do not start an outage backoff"
+    );
+    assert!(
+        state
+            .forge_error
+            .as_deref()
+            .unwrap()
+            .contains("Retrying at")
+    );
 }
 
-/// A transcript file under `/var/tmp`, removed when dropped.
-struct Transcript(PathBuf);
+#[test]
+fn a_new_rate_limit_ends_an_outage_but_a_near_reset_backs_off() {
+    use crate::repository::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
+    };
+
+    struct Rejected(u64);
+    impl ProcessExecutor for Rejected {
+        fn execute(
+            &self,
+            _: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            Ok(ProcessOutput {
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: format!(
+                    "GraphQL: API rate limit already exceeded\nX-RateLimit-Remaining: 0\nX-RateLimit-Resource: graphql\nX-RateLimit-Reset: {}\n",
+                    self.0,
+                ).into_bytes(),
+            })
+        }
+    }
+
+    for (authority, seconds) in [("normal-reset.invalid", 600), ("near-reset.invalid", 1)] {
+        let reset = polling::now() + seconds;
+        let gh = GitHubService::new("gh", Arc::new(Rejected(reset)));
+        let repository = GitHubRepoKey::new(authority, None, "owner", "repo").unwrap();
+        let key = PullRequestKeyOrd {
+            repository: (&repository).into(),
+            number: 1,
+        };
+        let work = Handle::idle(Weak::new());
+        let outage = GitHubError::NoActiveAccount(authority.into());
+        work.conversations().failed(&outage);
+        work.conversations().failed(&outage);
+
+        let next = polling::with_scope("conversation-rate-limit-reply-test", || {
+            work.run_lookups(&gh, [(Relation::Edited, Lookup::PullRequest(key.clone()))])
+        });
+        let state = work.conversations();
+        if seconds == 1 {
+            assert_eq!(state.failures, 3);
+            assert_eq!(state.observed[&key].failures, 1);
+            assert_eq!(next.deadline, state.lookup_retry());
+            assert_eq!(next.reset, None);
+        } else {
+            assert_eq!(state.failures, 0);
+            assert!(!state.observed.contains_key(&key));
+            assert_eq!(next.deadline, None);
+            assert_eq!(next.reset, Some(reset + 1));
+        }
+    }
+}
+
+/// A transcript file in a directory owned by its test.
+struct Transcript {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
+}
 
 impl Transcript {
     fn new(name: &str) -> Self {
-        let directory = Path::new("/var/tmp").join(format!(
-            "cagents-conversations-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        Self(directory.join("transcript.jsonl"))
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("cagents-conversations-{name}-"))
+            .tempdir()
+            .unwrap();
+        Self {
+            path: directory.path().join("transcript.jsonl"),
+            _directory: directory,
+        }
     }
 
     fn append(&self, text: &str) {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.0)
+            .open(&self.path)
             .unwrap()
             .write_all(text.as_bytes())
             .unwrap();
-    }
-}
-
-impl Drop for Transcript {
-    fn drop(&mut self) {
-        if let Some(directory) = self.0.parent() {
-            let _ = std::fs::remove_dir_all(directory);
-        }
     }
 }
 
@@ -589,7 +696,7 @@ fn located(path: &Path) -> Source {
 fn a_transcript_is_read_as_it_grows_one_whole_line_at_a_time() {
     let file = Transcript::new("grows");
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     read(&mut watched);
     assert!(matches!(
         watched.coverage,
@@ -610,7 +717,7 @@ fn a_transcript_is_read_as_it_grows_one_whole_line_at_a_time() {
     assert_eq!(numbers(&watched), vec![1, 2]);
 
     // A subagent's transcript is found beside it.
-    let subagents = file.0.with_extension("").join("subagents");
+    let subagents = file.path.with_extension("").join("subagents");
     std::fs::create_dir_all(&subagents).unwrap();
     std::fs::write(subagents.join("agent-a.jsonl"), mention(3)).unwrap();
     std::fs::write(subagents.join("notes.txt"), mention(4)).unwrap();
@@ -625,19 +732,19 @@ fn a_replaced_or_truncated_transcript_is_read_again_from_its_start() {
     file.append(&mention(1));
     file.append(&mention(2));
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     read(&mut watched);
     assert_eq!(numbers(&watched), vec![1, 2]);
 
     // Rewritten shorter in place.
-    std::fs::write(&file.0, mention(5)).unwrap();
+    std::fs::write(&file.path, mention(5)).unwrap();
     read(&mut watched);
     assert_eq!(numbers(&watched), vec![1, 2, 5]);
 
     // Replaced by a new file of the same length.
-    let replacement = file.0.with_extension("new");
+    let replacement = file.path.with_extension("new");
     std::fs::write(&replacement, mention(6)).unwrap();
-    std::fs::rename(&replacement, &file.0).unwrap();
+    std::fs::rename(&replacement, &file.path).unwrap();
     read(&mut watched);
     assert_eq!(numbers(&watched), vec![1, 2, 5, 6]);
 }
@@ -654,7 +761,7 @@ fn a_long_transcript_is_read_from_its_newest_part_and_says_so() {
     file.append(&padding);
     file.append(&mention(7));
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     // The backlog is read a pass at a time.
     for _ in 0..(FIRST_READ / READ_PER_PASS + 2) {
         read(&mut watched);
@@ -678,7 +785,7 @@ fn an_over_long_line_is_skipped_without_making_the_list_partial() {
     }
     file.append(&mention(8));
     let mut watched = Watched::new();
-    watched.source = located(&file.0);
+    watched.source = located(&file.path);
     for _ in 0..4 {
         read(&mut watched);
     }
@@ -1247,8 +1354,27 @@ fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_
 /// Hosts an Antigravity chat whose record holds `items`, the way the daemon
 /// installs one, and tells the Work tracker.
 fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> TerminalId {
+    let recipe = crate::model::LaunchRecipe {
+        program: "unused-history-reader".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    host_chat(host, Provider::Antigravity, recipe, None, items)
+}
+
+/// Hosts a `provider` chat launched from `recipe`, whose record holds
+/// `items`, and tells the Work tracker.
+fn host_chat(
+    host: &SharedHost,
+    provider: Provider,
+    recipe: crate::model::LaunchRecipe,
+    session_id: Option<String>,
+    items: Vec<crate::chat::Item>,
+) -> TerminalId {
     use crate::chat::{
-        self, Command, Event,
+        self, Command, Event, Item, ItemContent, Phase, Role,
         protocol::{Adapter, ProcessSpec, Step, TransportSpec},
     };
     struct Idle;
@@ -1256,21 +1382,29 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step::default())
         }
-        fn command(&mut self, _: Command) -> Result<Step, String> {
-            Ok(Step::default())
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            let Command::SetModel { model: text, .. } = command else {
+                return Ok(Step::default());
+            };
+            Ok(Step {
+                events: vec![Event::Item(Item {
+                    id: "extra".into(),
+                    role: Role::Assistant,
+                    content: ItemContent::Text {
+                        text,
+                        thinking: false,
+                        phase: Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })],
+                ..Step::default()
+            })
         }
         fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
             Ok(Step::default())
         }
     }
-    let directory = std::env::temp_dir();
-    let recipe = crate::model::LaunchRecipe {
-        program: "unused-history-reader".into(),
-        arguments: Vec::new(),
-        working_directory: directory.clone(),
-        environment: Default::default(),
-        unset_environment: Default::default(),
-    };
     let spec = ProcessSpec {
         transport: TransportSpec::History,
         followed: true,
@@ -1281,16 +1415,21 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
         ..Step::default()
     };
     let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
-    let handle =
-        chat::runtime::Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
     let id = TerminalId::new();
+    let execution_instance = uuid::Uuid::new_v4();
+    let owner = Arc::downgrade(host);
+    let handle =
+        chat::runtime::Handle::start(spec, Box::new(Idle), initial, store, None, move |update| {
+            crate::host::chat::changed_owned(&owner, id, execution_instance, update);
+        })
+        .unwrap();
     let mut state = host.lock().unwrap();
     let session = chat::Session {
         id,
         launch: chat::Launch {
-            provider: Provider::Antigravity,
+            provider,
             recipe,
-            session_id: None,
+            session_id,
             draft_model: None,
         },
         proof: Some(state.proof().clone()),
@@ -1301,7 +1440,7 @@ fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> Termi
     state.chats.insert(
         id,
         crate::host::chat::Record {
-            execution_instance: uuid::Uuid::new_v4(),
+            execution_instance,
             console_recipe: None,
             paired_terminal: None,
             session,
@@ -1332,9 +1471,13 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     host.lock().unwrap().work = Some(work.clone());
     let signal = &work.0.conversations.signal;
 
-    // Nothing to read: the loop would wait for its idle interval.
+    let mut files = files::Watches::new(|_| {});
+    // Nothing to read: the loop would wait for input.
     let observed = signal.observe().unwrap();
-    assert!(!work.conversation_pass(&host));
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
 
     let id = host_recorded_chat(
         &host,
@@ -1360,15 +1503,157 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     assert_ne!(signal.observe(), Some(observed));
 
     // Followed with no watcher, and read from its start.
-    assert!(work.conversation_pass(&host));
-    let state = work.conversations();
-    let watched = &state.watched[&id];
-    assert!(watched.watchers.is_empty());
-    assert_eq!(numbers(watched), [1]);
-    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
-    drop(state);
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
+    {
+        let mut state = work.conversations();
+        let watched = state.watched.get_mut(&id).unwrap();
+        assert!(watched.watchers.is_empty());
+        assert_eq!(numbers(watched), [1]);
+        assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+        watched.input.read = Some(Instant::now() - TICK);
+    }
+
+    // A daemon-origin command writes a record without provider output or
+    // visible presentation. The next record read is triggered by that write.
+    let observed = signal.observe().unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    handle
+        .command(crate::chat::Command::SetModel {
+            model: "https://github.com/me/repo/pull/2".into(),
+            reasoning: None,
+        })
+        .unwrap();
+    assert_ne!(signal.observe(), Some(observed));
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
+    assert_eq!(numbers(&work.conversations().watched[&id]), [1, 2]);
+
     let record = host.lock().unwrap().chats.remove(&id).unwrap();
     let _ = record.handle.close();
+}
+
+#[test]
+fn an_inspected_claude_chat_finds_its_first_transcript_when_a_turn_starts() {
+    use crate::model::{HostIncarnation, HostSessionId, HostSessionProof};
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(
+        crate::host::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        }),
+    ));
+    let work = Handle::idle(Arc::downgrade(&host));
+    host.lock().unwrap().work = Some(work.clone());
+    let signal = &work.0.conversations.signal;
+    let home = tempfile::Builder::new()
+        .prefix("cagents-conversations-claude-")
+        .tempdir()
+        .unwrap();
+    let home = home.path().canonicalize().map(|path| (path, home)).unwrap();
+    let project = home.0.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    let recipe = crate::model::LaunchRecipe {
+        program: "claude".into(),
+        arguments: Vec::new(),
+        working_directory: project.clone(),
+        environment: [("HOME".into(), home.0.to_string_lossy().into_owned())].into(),
+        unset_environment: Default::default(),
+    };
+    let id = host_chat(
+        &host,
+        Provider::Claude,
+        recipe,
+        Some(session.clone()),
+        Vec::new(),
+    );
+    let queue = Arc::new(crate::host::delivery::DeliveryQueue::new(1, 16));
+    work.watch_conversation(&host, 1, id, Arc::downgrade(&queue))
+        .unwrap();
+    let mut files = files::Watches::new(|_| {});
+
+    // Opened before its first prompt: Claude has written no transcript.
+    // The inspector has been waiting long enough to back off far.
+    work.input_changed(id);
+    work.conversation_pass(&host, &mut files);
+    let missed = |work: &Handle| {
+        let state = work.conversations();
+        let watched = &state.watched[&id];
+        (watched.source == Source::Pending, watched.searches_missed)
+    };
+    assert_eq!(missed(&work), (true, 1));
+    let waited = |work: &Handle| {
+        let mut state = work.conversations();
+        let watched = state.watched.get_mut(&id).unwrap();
+        watched.input.read = Some(Instant::now() - TICK);
+        watched.searches_missed = 5;
+        watched.search_after = Some(Instant::now() + Duration::from_secs(120));
+    };
+    waited(&work);
+
+    // The prompt starts a turn, which is input, before Claude has written
+    // the transcript: the search misses again, but backs off from its start.
+    let observed = signal.observe().unwrap();
+    work.activity_changed(id);
+    assert_ne!(signal.observe(), Some(observed));
+    work.conversation_pass(&host, &mut files);
+    assert_eq!(missed(&work), (true, 1));
+    let soon = work.conversations().watched[&id].search_after.unwrap();
+    assert!(soon <= Instant::now() + search_backoff(1));
+
+    // Claude writes it, which no watch reports; the short backoff ends.
+    let key: String = project
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let directory = home.0.join(".claude/projects").join(key);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(format!("{session}.jsonl")), "").unwrap();
+    work.conversations()
+        .watched
+        .get_mut(&id)
+        .unwrap()
+        .search_after = Some(Instant::now());
+    work.conversation_pass(&host, &mut files);
+    assert_eq!(missed(&work), (false, 0));
+
+    // Once found, activity is not input: its file watch is.
+    let observed = signal.observe().unwrap();
+    work.activity_changed(id);
+    assert_eq!(signal.observe(), Some(observed));
+
+    let record = host.lock().unwrap().chats.remove(&id).unwrap();
+    let _ = record.handle.close();
+}
+
+#[test]
+fn checkout_facts_change_with_what_a_left_behind_branch_reads() {
+    let local = |ahead: u32| {
+        let mut local = super::super::scan::Local::default();
+        local.worktrees = vec![worktree("/w/app/.worktrees/feat", "feat")];
+        local.worktrees[0].comparison = Some(crate::work::Comparison {
+            base: "main".into(),
+            ahead,
+            behind: 0,
+        });
+        local
+    };
+    assert!(!checkout_facts_changed(Some(&local(0)), &local(0)));
+    // A fetch moved the base, so its commits are now its own.
+    assert!(checkout_facts_changed(Some(&local(0)), &local(1)));
+    // A scan measured whether a merged head contains its commit.
+    let mut measured = local(0);
+    measured
+        .ancestry
+        .insert(("local".into(), "merged".into()), true);
+    assert!(checkout_facts_changed(Some(&local(0)), &measured));
 }
 
 #[test]

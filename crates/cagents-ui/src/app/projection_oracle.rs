@@ -415,6 +415,29 @@ impl Cagents {
                     )
                     | Message::Frame(_)
                     | Message::Viewport { .. }
+                    | Message::Lsp(_)
+                    | Message::ContextSectionsMeasured(_)
+                    | Message::ContextInspector(inspector::InspectorAction::Resize { .. })
+                    | Message::Palette(palette_ui::Action::Query(_))
+                    | Message::ResumeConversation(
+                        resume_ui::Action::Query(_)
+                            | resume_ui::Action::Reach(_)
+                            | resume_ui::Action::Point(..)
+                            | resume_ui::Action::More
+                    )
+                    | Message::Repository(
+                        RepositoryAction::EditorAction { .. }
+                            | RepositoryAction::DiffViewport { .. }
+                            | RepositoryAction::PreviewViewport { .. }
+                            | RepositoryAction::Language {
+                                action: repository_widget::EditorLspAction::Hover(_)
+                                    | repository_widget::EditorLspAction::CompleteAt { .. }
+                                    | repository_widget::EditorLspAction::Complete
+                                    | repository_widget::EditorLspAction::Next(_)
+                                    | repository_widget::EditorLspAction::Dismiss,
+                                ..
+                            }
+                    )
             )
     }
 

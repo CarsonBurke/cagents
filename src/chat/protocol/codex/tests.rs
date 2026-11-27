@@ -673,6 +673,42 @@ fn absent_or_failed_predictions_and_observed_child_turns_never_produce_prompts()
 }
 
 #[test]
+fn a_duplicate_provider_start_does_not_reopen_the_same_turn() {
+    let notification = json!({"method":"turn/started","params":{
+        "threadId":"thread-exact",
+        "turn":{"id":"same-turn","status":"inProgress","items":[]},
+    }});
+    for notification_first in [false, true] {
+        let mut current = adapter();
+        let prompted = current
+            .command(Command::Prompt {
+                text: "Begin".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert!(!prompted.events.contains(&Event::TurnStartConfirmed));
+        let start_request = prompted
+            .writes
+            .iter()
+            .find(|request| request["method"] == "turn/start")
+            .unwrap();
+        let reply = json!({"id":start_request["id"],"result":{"turn":{"id":"same-turn","status":"inProgress"}}});
+        let [first, duplicate] = if notification_first {
+            [notification.clone(), reply]
+        } else {
+            [reply, notification.clone()]
+        };
+        let started = current.receive(first).unwrap();
+        assert!(started.events.contains(&Event::TurnStarted));
+        assert!(started.events.contains(&Event::TurnStartConfirmed));
+        let repeated = current.receive(duplicate).unwrap();
+        assert!(!repeated.events.contains(&Event::TurnStarted));
+        assert!(!repeated.events.contains(&Event::TurnStartConfirmed));
+    }
+}
+
+#[test]
 fn next_prompt_prediction_is_correlated_and_legacy_errors_are_quiet() {
     let mut current = adapter();
     let completion = |id: &str| json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":id,"status":"completed","items":[]}}});
@@ -2225,6 +2261,7 @@ fn adapter() -> Codex {
         turn: None,
         held_stop: HeldStop::None,
         notification_turn: None,
+        observed_turn_start: None,
         notification_revision: 0,
         busy: false,
         lifecycle_revision: 0,
@@ -7173,6 +7210,64 @@ fn question_and_elicitation_kinds_preserve_their_exact_reply_contracts() {
             .unwrap();
         assert_eq!(response.writes[0]["result"], json!({"action":action}));
     }
+}
+
+#[test]
+fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
+    let mut adapter = adapter();
+    let request = |id: &str| json!({"id":id,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-exact","turnId":"turn","mode":"form","message":"Search","requestedSchema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}});
+    let accept = |id: &str, answers: Vec<(&str, Vec<String>)>| Command::Answer {
+        request_id: rpc_id(&json!(id)).unwrap(),
+        action: "accept".into(),
+        answers: answers
+            .into_iter()
+            .map(|(field, values)| Answer {
+                field: field.into(),
+                values,
+            })
+            .collect(),
+    };
+    let search = || ("query", vec!["search".to_owned()]);
+    adapter.receive(request("e1")).unwrap();
+    // A blank required field is missing, and the request stays pending.
+    for blank in [vec![], vec![String::new()]] {
+        let error = adapter
+            .command(accept("e1", vec![("query", blank), ("limit", vec![])]))
+            .unwrap_err();
+        assert_eq!(error, "Missing answer for query");
+    }
+    // Skipping a blank answer must not hide a duplicate or unknown field.
+    for (field, expected) in [
+        ("limit", "Duplicate answer for limit"),
+        ("unknown", "Unknown form field"),
+    ] {
+        let error = adapter
+            .command(accept(
+                "e1",
+                vec![search(), ("limit", vec![]), (field, vec![])],
+            ))
+            .unwrap_err();
+        assert_eq!(error, expected);
+    }
+    // An untouched optional field arrives with no value; a cleared one may
+    // arrive as one empty string. Either way it is left out of the reply.
+    for (id, blank) in [("e2", vec![]), ("e3", vec![String::new()])] {
+        adapter.receive(request(id)).unwrap();
+        let step = adapter
+            .command(accept(id, vec![search(), ("limit", blank)]))
+            .unwrap();
+        assert_eq!(
+            step.writes[0]["result"],
+            json!({"action":"accept","content":{"query":"search"}})
+        );
+    }
+    let step = adapter
+        .command(accept("e1", vec![search(), ("limit", vec!["5".into()])]))
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["result"],
+        json!({"action":"accept","content":{"query":"search","limit":5}})
+    );
 }
 
 #[test]

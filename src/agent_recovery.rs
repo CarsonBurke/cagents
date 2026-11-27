@@ -26,6 +26,59 @@ pub struct AgentProcess {
     pub launch: LaunchRecipe,
     pub recovery: LaunchRecipe,
 }
+/// The kernel identity of an observed provider within the current boot.
+#[cfg(feature = "host")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentProcessIdentity {
+    pub pid: i32,
+    pub start: u64,
+}
+
+#[cfg(feature = "host")]
+impl AgentProcess {
+    pub fn identity(&self) -> AgentProcessIdentity {
+        AgentProcessIdentity {
+            pid: self.pid,
+            start: self.start,
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+impl AgentProcessIdentity {
+    /// Foreground departure alone says nothing about this provider's life.
+    /// Only a kernel-confirmed exit or PID reuse can settle its request.
+    pub(crate) fn has_exited(self) -> bool {
+        let Ok(pid) = u32::try_from(self.pid) else {
+            return false;
+        };
+        if pid <= 1 {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use crate::{daemon::holder_registry::Process, pinned_process::PinnedProcess};
+            let pin = match PinnedProcess::open_unreaped(pid) {
+                Ok(pin) => pin,
+                Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+            };
+            match Process::read(self.pid) {
+                Ok(current) => current.start != self.start || pin.exited().unwrap_or(false),
+                // The proc mount may hide a live PID. Only the kernel
+                // descriptor can distinguish that from a process that exited.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    pin.exited().unwrap_or(false)
+                }
+                Err(_) => false,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::pinned_process::exited_since(pid, self.start).unwrap_or(false)
+        }
+    }
+}
+
 /// A hint version: the exact conversation, ready to resume.
 const EXACT: u8 = 1;
 /// A hint version: the agent was recognized, but nothing confirmed which
@@ -1956,6 +2009,39 @@ fn recovery_observation(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "host")]
+    #[test]
+    fn terminal_wait_process_requires_the_observed_start_and_kernel_exit() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let watched = crate::daemon::holder_registry::Process::read(pid).map(|process| {
+            super::AgentProcessIdentity {
+                pid,
+                start: process.start,
+            }
+        });
+        // The child is blocked on stdin until the test closes its pipe.
+        let was_live = watched.as_ref().is_ok_and(|process| !process.has_exited());
+        let recognized_prior_start = watched.as_ref().is_ok_and(|process| {
+            super::AgentProcessIdentity {
+                start: process.start - 1,
+                ..*process
+            }
+            .has_exited()
+        });
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(was_live);
+        assert!(recognized_prior_start);
+        assert!(watched.unwrap().has_exited());
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

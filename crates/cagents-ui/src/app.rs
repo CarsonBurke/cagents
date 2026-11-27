@@ -1221,6 +1221,14 @@ enum Projection {
     Full,
 }
 
+/// A dragged inspector width as the inspector takes it: whole pixels, as
+/// Settings shows and steps them, within the inspector's bounds.
+fn inspector_width(width: f32) -> f32 {
+    width
+        .round()
+        .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+}
+
 impl Projection {
     /// The variant's name, which the UI thread trace reports.
     fn name(&self) -> &'static str {
@@ -3028,11 +3036,12 @@ fn is_save_press(event: &keyboard::Event) -> bool {
     matches!(
         event,
         keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
+            key,
+            physical_key,
             modifiers,
             repeat: false,
             ..
-        } if key.eq_ignore_ascii_case("s")
+        } if crate::interaction::latin_key(key, *physical_key) == Some('s')
             && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && !modifiers.shift()
     )
@@ -3055,10 +3064,7 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
         return None;
     }
     if settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
-        return match key
-            .to_latin(*physical_key)
-            .map(|key| key.to_ascii_lowercase())
-        {
+        return match crate::interaction::latin_key(key, *physical_key) {
             Some('l') => Some(Message::FocusBrowserAddress(card)),
             Some('r') => Some(Message::BrowserReload(card)),
             _ => None,
@@ -5994,6 +6000,10 @@ pub struct Cagents {
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
+    /// The closed cards showing each terminal session, from the same
+    /// workspace as `card_indices`, so a lookup by session needs no walk of
+    /// the workspace's whole card history.
+    closed_cards_by_terminal: HashMap<TerminalId, Vec<CardId>>,
     /// The workspace `card_indices` was built from. Holding it weakly pins
     /// its allocation, so a changed workspace always has a different address.
     card_indices_source: std::sync::Weak<WorkspaceState>,
@@ -9664,14 +9674,37 @@ impl Cagents {
         terminal_output_tests::record_card_index();
         self.card_indices_source = Arc::downgrade(&self.durable);
         self.card_indices.clear();
-        self.card_indices.extend(
-            self.durable
-                .cards
-                .iter()
-                .enumerate()
-                .map(|(index, card)| (card.id, index)),
-        );
+        self.closed_cards_by_terminal.clear();
+        for (index, card) in self.durable.cards.iter().enumerate() {
+            self.card_indices.insert(card.id, index);
+            if !card.existence.is_open()
+                && let CardKind::Terminal(session) = &card.kind
+            {
+                self.closed_cards_by_terminal
+                    .entry(session.id)
+                    .or_default()
+                    .push(card.id);
+            }
+        }
         self.prune_presence();
+    }
+
+    /// Whether a closed card other than `card` shows `terminal`. The index
+    /// answers while it is current; a pass that changed the workspace since
+    /// asks the cards themselves, rather than rebuilding every index once
+    /// per pane it restores.
+    fn closed_terminal_elsewhere(&self, card: CardId, terminal: TerminalId) -> bool {
+        if self.card_indices_source.as_ptr() == Arc::as_ptr(&self.durable) {
+            return self
+                .closed_cards_by_terminal
+                .get(&terminal)
+                .is_some_and(|cards| cards.iter().any(|closed| *closed != card));
+        }
+        self.durable.cards.iter().any(|source| {
+            source.id != card
+                && !source.existence.is_open()
+                && matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal)
+        })
     }
 
     /// Rebuilds everything the workspace derives for the sidebar, the panes'
@@ -10890,13 +10923,17 @@ impl Cagents {
         // A held chord copies once, so its repeats must not cancel the
         // copy its first press started.
         if let keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
+            key,
+            physical_key,
             modifiers,
             repeat: false,
             ..
         } = &event
             && modifiers.command()
-            && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
+            && matches!(
+                crate::interaction::latin_key(key, *physical_key),
+                Some('c' | 'x')
+            )
         {
             chat_ui::invalidate_copy_intent();
         }
@@ -10956,13 +10993,14 @@ impl Cagents {
             )
             .is_none()
             && let keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(key),
+                key,
+                physical_key,
                 modifiers,
                 ..
             } = &event
             && settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo())
             && modifiers.shift()
-            && key.eq_ignore_ascii_case("s")
+            && crate::interaction::latin_key(key, *physical_key) == Some('s')
             && let Some(card) = self.workspace.focused()
             && !self.pane_content_inputs_blocked(card)
             && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
@@ -15295,10 +15333,7 @@ impl Cagents {
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Resize { width } => {
-                // Whole pixels, as Settings shows and steps them.
-                self.settings.inspector_width = width
-                    .round()
-                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                self.settings.inspector_width = inspector_width(width);
                 Task::none()
             }
             InspectorAction::ResizeFinished => {
@@ -16816,6 +16851,7 @@ impl Application for Cagents {
             terminal_paste: None,
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            closed_cards_by_terminal: HashMap::new(),
             card_indices_source: std::sync::Weak::new(),
             terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
@@ -18317,7 +18353,16 @@ impl Cagents {
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
             Message::Phone(action) => self.update_phone(action),
-            Message::Palette(action) => self.update_palette(action),
+            Message::Palette(action) => {
+                // Typing a query narrows the palette's own list, which only
+                // its view reads.
+                if matches!(action, palette_ui::Action::Query(_))
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                self.update_palette(action)
+            }
             Message::RunCommand(command) => {
                 self.run_workspace_command(command, keyboard::Modifiers::empty())
             }
@@ -18634,7 +18679,30 @@ impl Cagents {
                 self.open_document_link(Some(card), &uri)
             }
             Message::Repository(RepositoryAction::Language { card, action }) => {
-                self.update_editor_lsp(card, action)
+                use repository_widget::EditorLspAction as Action;
+                // A hover request, and the end of one, is the editor's and
+                // the language server's alone. Completion requests, sent as
+                // trigger characters are typed, and moving through or
+                // dismissing the popup stay in the pane too, unless they
+                // change what the projection reads of it.
+                let pane = matches!(
+                    action,
+                    Action::CompleteAt { .. } | Action::Complete | Action::Next(_) | Action::Dismiss
+                )
+                .then(|| repository_ui::EditorProjectionInputs::capture(self, card))
+                .flatten();
+                let hover = matches!(action, Action::Hover(_));
+                let task = self.update_editor_lsp(card, action);
+                if (hover
+                    || pane.is_some_and(|before| {
+                        repository_ui::EditorProjectionInputs::capture(self, card)
+                            .is_some_and(|after| after == before)
+                    }))
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                task
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let target = match self.cards.get(&card) {
@@ -18756,7 +18824,23 @@ impl Cagents {
                 }
                 Task::batch(tasks)
             }
-            Message::Repository(action) => handled!(self.update_repository(action)),
+            Message::Repository(action) => {
+                // Typing, caret moves and scrolling confine themselves to
+                // the pane, and arrive once per key or wheel notch.
+                let pane = repository_ui::EditorProjectionInputs::pane(&action)
+                    .and_then(|card| {
+                        Some((card, repository_ui::EditorProjectionInputs::capture(self, card)?))
+                    });
+                let flow = self.update_repository(action);
+                if let Some((card, before)) = pane
+                    && repository_ui::EditorProjectionInputs::capture(self, card)
+                        .is_some_and(|after| after == before)
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                handled!(flow)
+            }
             Message::Sidebar(action) => handled!(self.update_sidebar(action)),
             Message::FoldInProgress { refocus } => {
                 if self.sidebar_state.fold_in_progress() && refocus {
@@ -20183,11 +20267,25 @@ impl Cagents {
             // Reported on the first layout and whenever the size changes,
             // including the width while the inspector slides open.
             Message::ContextSectionsMeasured(height) => {
+                // Only the inspector's view reads the height.
+                if !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
                 self.context_sections_height = Some(height);
                 Task::none()
             }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
-            Message::ContextInspector(action) => self.handle_context_inspector_action(action),
+            Message::ContextInspector(action) => {
+                // A splitter drag reports every pointer move, most of which
+                // round to the width the inspector already has.
+                if matches!(action, InspectorAction::Resize { width }
+                    if inspector_width(width) == self.settings.inspector_width)
+                    && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                self.handle_context_inspector_action(action)
+            }
             Message::SelectSettingsCategory(category) => {
                 self.palette.clear_pressed_key_filter();
                 self.settings_search.clear();
@@ -20271,7 +20369,22 @@ impl Cagents {
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
-            Message::ResumeConversation(action) => self.update_resume(action),
+            Message::ResumeConversation(action) => {
+                // The picker's search, its scope, the row under the pointer
+                // and how many rows it lists are its own: the pointer
+                // crossing rows must not rebuild every card's chrome.
+                if matches!(
+                    action,
+                    resume_ui::Action::Query(_)
+                        | resume_ui::Action::Reach(_)
+                        | resume_ui::Action::Point(..)
+                        | resume_ui::Action::More
+                ) && !self.update_tail_may_close_or_commit()
+                {
+                    projection = Projection::Unchanged;
+                }
+                self.update_resume(action)
+            }
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::WorktreesUi(action) => self.update_worktrees_ui(action),
@@ -20357,6 +20470,13 @@ impl Cagents {
                     }
                     return self
                         .reveal_context_section(card, context_sections::Section::Locations);
+                }
+                // Diagnostics, progress, status and answers land in the
+                // editor and its inspector section, which their views read;
+                // no projection does. Progress arrives as fast as the UI
+                // drains it while a server indexes.
+                if !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
                 }
                 Task::none()
             }

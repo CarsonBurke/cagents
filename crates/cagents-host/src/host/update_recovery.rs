@@ -33,7 +33,14 @@ pub(super) fn restore_settled_from(
 /// Ordinary startup restores only current, authenticated holders and the
 /// current Ready checkpoint. Archived update evidence cannot recreate panes.
 pub(super) fn restore_ordinary(host: &SharedHost) -> Result<(), String> {
-    restore_ordinary_with(host, std::path::Path::new("/proc"), None).map(|_| ())
+    restore_ordinary_with(
+        host,
+        std::path::Path::new("/proc"),
+        Admission::Ordinary {
+            observed_digest: None,
+        },
+    )
+    .map(|_| ())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -41,7 +48,14 @@ pub(super) fn restore_ordinary_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,
 ) -> Result<(), String> {
-    restore_ordinary_with(host, processes, None).map(|_| ())
+    restore_ordinary_with(
+        host,
+        processes,
+        Admission::Ordinary {
+            observed_digest: None,
+        },
+    )
+    .map(|_| ())
 }
 
 #[cfg(target_os = "macos")]
@@ -52,14 +66,34 @@ pub(super) fn restore_installed_ready(
     restore_ordinary_with(
         host,
         std::path::Path::new("/proc"),
-        Some(admission.checkpoint_digest()),
+        Admission::InstalledReady(admission.checkpoint_digest()),
     )
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn restore_observed_adoption(host: &SharedHost, digest: &str) -> Result<(), String> {
+    restore_ordinary_with(
+        host,
+        std::path::Path::new("/proc"),
+        Admission::Ordinary {
+            observed_digest: Some(digest),
+        },
+    )
+    .map(|_| ())
+}
+
+enum Admission<'a> {
+    Ordinary {
+        observed_digest: Option<&'a str>,
+    },
+    #[cfg(target_os = "macos")]
+    InstalledReady(&'a str),
 }
 
 fn restore_ordinary_with(
     host: &SharedHost,
     processes: &std::path::Path,
-    expected_ready: Option<&str>,
+    admission: Admission<'_>,
 ) -> Result<state::RestoredUpgrade, String> {
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: previous boot history", None);
@@ -70,12 +104,19 @@ fn restore_ordinary_with(
     let captured_digest = ready_capture
         .as_ref()
         .map(ready::ReadyCapture::checkpoint_digest);
-    if expected_ready.is_some() && captured_digest != expected_ready {
-        return Err("Installed startup lost its acknowledged Ready capture".into());
-    }
+    let observed_digest = match admission {
+        Admission::Ordinary { observed_digest } => observed_digest.or(captured_digest),
+        #[cfg(target_os = "macos")]
+        Admission::InstalledReady(expected) => {
+            if captured_digest != Some(expected) {
+                return Err("Installed startup lost its acknowledged Ready capture".into());
+            }
+            captured_digest
+        }
+    };
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
-    let mut restored = state::restore_upgrade_with_digest(host, processes, captured_digest)?;
+    let mut restored = state::restore_upgrade_with_digest(host, processes, observed_digest)?;
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;
@@ -127,7 +168,7 @@ fn restore_ordinary_with(
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: publish Ready proof", None);
     ready::publish(ready_capture, &proof, &executable, &terminals, &chats)?;
-    if expected_ready.is_none() {
+    if matches!(admission, Admission::Ordinary { .. }) {
         restored.finish(host)?;
     }
     #[cfg(all(test, target_os = "linux"))]

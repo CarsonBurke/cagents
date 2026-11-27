@@ -7893,3 +7893,150 @@ fn a_skipped_edge_applies_a_held_channel_name_and_projects_its_chrome() {
     assert_eq!(complete_reconciliations(), before, "the echo skips");
     assert_eq!(channel_title(&app, channel), Some("Parser cache"));
 }
+
+/// A channel named in window A, emptied by a move, and then given back its
+/// automatic name in window B retires when A leaves it (#3403). A's rename
+/// protects the name only until the registry echoes it: before the echo, a
+/// model from before the rename must not make A forget it; after it, a
+/// clear from B is the registry's word, as it would be had A cleared it.
+#[test]
+fn a_name_cleared_in_another_window_lets_the_emptied_channel_retire() {
+    use super::super::chrome_ui::Action as Chrome;
+    use crate::model::ChannelTitleSource;
+    use crate::workspace_model::views::View;
+
+    let (mut a, project, repository) = app_with_project();
+    let (mut b, _, _) = app_with_project();
+    let channel = ChannelId::new();
+    for window in [&mut a, &mut b] {
+        let mut source = local(channel, project, "", 1);
+        source.shared = true;
+        Arc::make_mut(&mut window.durable).channels.push(source);
+        window.channel_ui.sweep = super::super::channel_ui::Sweep::Done;
+    }
+    let mut model = registry(vec![shared(channel, &repository, "", 1)]);
+    let a_requests = intercept_publishes(&mut a);
+    let b_requests = intercept_publishes(&mut b);
+    // Hands each edit a window published to the registry, then the
+    // registry's model to `window`, with the channel's last pane moved out.
+    let deliver = |model: &WorkspaceModel, window: &mut Cagents| {
+        window.workspace_model = model.clone();
+        window.workspace_model.views.push(View::empty(channel));
+        drop(window.absorb_channel_title(channel).unwrap());
+    };
+    let publish = |model: &mut WorkspaceModel, requests: &TestModelRequests| {
+        for edit in drain(requests) {
+            model.sequence += 1;
+            let sequence = model.sequence;
+            model.fold(sequence, &edit);
+        }
+    };
+
+    // A names the channel.
+    drop(a.update_chrome(Chrome::RenameChannel(channel)));
+    drop(a.update_chrome(Chrome::RenameChanged("Named here".into())));
+    drop(a.update_chrome(Chrome::RenameSubmit));
+    assert!(a.channel_is_named(channel));
+    // A model the registry sent before the rename arrives first.
+    deliver(&model.clone(), &mut a);
+    assert!(
+        a.channel_is_named(channel),
+        "a model from before the rename does not undo it"
+    );
+    // The registry applies the rename, refusing any automatic name the
+    // stale model had A offer, and echoes it.
+    publish(&mut model, &a_requests);
+    assert_eq!(model.channels[0].title, "Named here");
+    assert_eq!(model.channels[0].title_source, ChannelTitleSource::Manual);
+    deliver(&model, &mut a);
+    deliver(&model, &mut b);
+    assert!(a.channel_is_named(channel), "the echo keeps the name");
+    assert!(b.channel_is_named(channel));
+
+    // B gives the channel back its automatic name from its sidebar.
+    drop(b.update_chrome(Chrome::RenameChannel(channel)));
+    drop(b.update_chrome(Chrome::RenameChanged(String::new())));
+    drop(b.update_chrome(Chrome::RenameSubmit));
+    publish(&mut model, &b_requests);
+    assert!(model.channels[0].title.is_empty());
+    deliver(&model, &mut a);
+    assert!(a.durable.channels[0].title.is_empty());
+    assert!(!a.channel_is_named(channel), "A takes B's clear");
+
+    drain(&a_requests);
+    a.retire_left_channel(Some(channel));
+    assert!(
+        drain(&a_requests).iter().any(|edit| matches!(
+            edit,
+            ModelEdit::RetireEmptyChannel { home, .. } if home.channel == channel
+        )),
+        "leaving the emptied, unnamed channel retires it"
+    );
+}
+
+/// When another window clears the name before this window sees its own
+/// rename in a model, the rename's receipt ends the wait instead (#3403):
+/// the channel is left unnamed, and the older receipt does not bring the
+/// name back.
+#[test]
+fn a_rename_cleared_before_its_echo_ends_its_wait_at_the_receipt() {
+    use super::super::chrome_ui::Action as Chrome;
+    use crate::workspace_model::views::View;
+
+    let (mut a, project, repository) = app_with_project();
+    let channel = ChannelId::new();
+    let mut source = local(channel, project, "", 1);
+    source.shared = true;
+    Arc::make_mut(&mut a.durable).channels.push(source);
+    a.channel_ui.sweep = super::super::channel_ui::Sweep::Done;
+    let mut model = registry(vec![shared(channel, &repository, "", 1)]);
+    let requests = intercept_publishes(&mut a);
+
+    drop(a.update_chrome(Chrome::RenameChannel(channel)));
+    drop(a.update_chrome(Chrome::RenameChanged("Named here".into())));
+    drop(a.update_chrome(Chrome::RenameSubmit));
+    let rename = drain(&requests)
+        .into_iter()
+        .find(|edit| matches!(edit, ModelEdit::RetitleChannel { .. }))
+        .expect("the rename is published");
+    model.sequence += 1;
+    let renamed = model.sequence;
+    model.fold(renamed, &rename);
+    let held = model.clone();
+    // Another window clears the name before the registry sends a model.
+    let clear = ModelEdit::RetitleChannel {
+        id: channel,
+        title: String::new(),
+    };
+    model.sequence += 1;
+    let cleared = model.sequence;
+    model.fold(cleared, &clear);
+
+    a.workspace_model = model.clone();
+    a.workspace_model.views.push(View::empty(channel));
+    a.shared_views.snapshot_sequence = cleared;
+    drop(a.absorb_channel_title(channel).unwrap());
+    assert!(a.durable.channels[0].title.is_empty());
+    assert!(
+        a.channel_is_named(channel),
+        "a model without the rename may predate it"
+    );
+
+    drop(a.apply_workspace_model_update(ModelUpdate::Committed {
+        receipt: EditReceipt {
+            identity: held.identity,
+            sequence: renamed,
+            effects: EditEffects {
+                channels: held.channels.clone(),
+                ..Default::default()
+            },
+        },
+        edit: rename,
+        views: Default::default(),
+    }));
+    assert!(!a.channel_is_named(channel), "the receipt ends the wait");
+    assert!(
+        a.durable.channels[0].title.is_empty(),
+        "the older receipt does not restore the cleared name"
+    );
+}

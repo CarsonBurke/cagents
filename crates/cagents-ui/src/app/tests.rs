@@ -3638,6 +3638,72 @@ async fn reviewed_update_prepare_flushes_folder_editor_selection_before_handoff(
     assert!(!app.update_prepared);
 }
 
+/// Typing, caret moves and scrolling in an editor arrive once per key,
+/// wheel notch or dragged pointer move. While they leave everything the
+/// projection reads of the pane as it was they project nothing, rather than
+/// walking every card for each one; the projection oracle checks each such
+/// update. An action that changes what the pane shows still projects.
+#[test]
+fn editor_input_projects_only_when_it_changes_what_the_projection_reads() {
+    use cosmic::widget::text_editor::{Action as Editor, Edit, Motion};
+    let (mut app, card) = editing_repository_app();
+    let projections = super::terminal_output_tests::projections;
+    let edit = |action| Message::Repository(RepositoryAction::EditorAction { card, action });
+
+    // The pane's card does not yet name the file its editor shows, so the
+    // first action records it and projects.
+    let before = projections();
+    drop(app.update(edit(Editor::Move(Motion::Right))));
+    assert_eq!(projections(), before + 1, "the card took the shown file");
+
+    let before = projections();
+    for message in [
+        edit(Editor::Move(Motion::Right)),
+        edit(Editor::Select(Motion::Down)),
+        edit(Editor::Scroll { lines: 3 }),
+        edit(Editor::Edit(Edit::Insert('a'))),
+        edit(Editor::Edit(Edit::Insert('b'))),
+        Message::Repository(RepositoryAction::DiffViewport {
+            card,
+            offset: 40.0,
+            height: 400.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }),
+        Message::Repository(RepositoryAction::PreviewViewport { card, offset: 40.0 }),
+        Message::Repository(RepositoryAction::Language {
+            card,
+            action: repository_widget::EditorLspAction::Hover(None),
+        }),
+        Message::ContextSectionsMeasured(240.0),
+        Message::Palette(palette_ui::Action::Query("note".into())),
+        Message::ContextInspector(InspectorAction::Resize {
+            width: app.settings.inspector_width + 0.2,
+        }),
+    ] {
+        drop(app.update(message));
+    }
+    assert_eq!(projections(), before, "pane-local input projects nothing");
+    assert_eq!(app.context_sections_height, Some(240.0));
+
+    // A clean file's first edit makes it block navigation. The capture
+    // treats that as projected state, though no stage reads it yet, so the
+    // edit projects; a further edit does not.
+    let (clean, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "saved\n");
+    app.cards
+        .insert(card, CardRuntime::Repository(Box::new(clean)));
+    drop(app.update(edit(Editor::Move(Motion::Right))));
+    let dirty = |app: &Cagents| matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.is_dirty());
+    assert!(!dirty(&app));
+    let before = projections();
+    drop(app.update(edit(Editor::Edit(Edit::Insert('c')))));
+    assert!(dirty(&app));
+    assert_eq!(projections(), before + 1, "the first edit dirties the file");
+    let before = projections();
+    drop(app.update(edit(Editor::Edit(Edit::Insert('d')))));
+    assert_eq!(projections(), before, "a further edit projects nothing");
+}
+
 #[test]
 fn window_snapshots_capture_editor_selection_without_changing_shared_recipe() {
     let (mut app, card) = editing_repository_app();
@@ -12206,6 +12272,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
             .unwrap_or_default(),
         card_chrome: HashMap::new(),
         card_indices: HashMap::new(),
+        closed_cards_by_terminal: HashMap::new(),
         card_indices_source: std::sync::Weak::new(),
         terminal_ordinals_source: std::sync::Weak::new(),
         navigation_cache: sidebar::NavigationCache::default(),
@@ -14910,6 +14977,36 @@ fn control_tab_uses_history_and_respects_blocking_surfaces() {
     app.settings_reset_confirm = true;
     drop(app.update(next()));
     assert_eq!(app.workspace.focused(), Some(ids[2]));
+}
+
+#[test]
+fn staging_shortcut_works_on_a_non_latin_layout() {
+    let mut app = context_inspector_test_app(true);
+    app.sidebar_model = sidebar::test_support::panel_model();
+    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    let worktree = app.sidebar_state.active_worktree().unwrap().clone();
+    let card = app.workspace.focused().unwrap();
+    let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    runtime.descriptor.worktree = worktree.canonical_path.clone();
+    app.cards
+        .insert(card, CardRuntime::Repository(Box::new(runtime)));
+    // Ctrl+Shift+S on a Russian layout, where the S key types "ы".
+    drop(app.update(Message::KeyEvent {
+        event: keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("ы".into()),
+            modified_key: keyboard::Key::Character("Ы".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            text: None,
+            repeat: false,
+        },
+        captured: false,
+    }));
+    assert_eq!(
+        app.source_control_mutations[&worktree.canonical_path].kind,
+        MutationKind::Stage
+    );
 }
 
 #[test]

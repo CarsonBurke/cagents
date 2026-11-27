@@ -77,7 +77,9 @@ unknown rather than guessed from a missing exit record.
 Raw debug output remains local and explicit. Use
 `scripts/run-development --browserless --debug --log-file /var/tmp/cagents-ui.log`
 or explicitly set `CAGENTS_LOCAL_DEBUG=1` when invoking a binary. This enables
-foreground standard-error tracing and the ordinary raw panic hook; `RUST_LOG`
+foreground standard-error tracing and raw panic reports, each with a
+backtrace, recovered panics included; set `RUST_BACKTRACE` to choose
+otherwise, for example `RUST_BACKTRACE=0`. `RUST_LOG`
 only chooses its filter and does not enable raw capture on its own. Raw debug
 output can contain application data: its caller-selected file has caller-managed
 retention and is never returned by `cagents diagnostics`. No support upload or
