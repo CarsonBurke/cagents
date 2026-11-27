@@ -8885,6 +8885,8 @@ impl Cagents {
                 .pending_terminal_creations
                 .retain(|id| open.contains(id));
         }
+        self.shared_views
+            .forget_sent_creations(&self.durable.pending_terminal_creations);
         #[cfg(test)]
         terminal_output_tests::record_persist();
         let mut phase = WorkspaceProjectionTiming::new(true);

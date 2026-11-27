@@ -804,7 +804,7 @@ impl Cagents {
             .filter(|(scope, panes)| {
                 counters.initialized.contains(*scope)
                     && counters.baseline.get(*scope) == Some(panes)
-                    && !panes.iter().any(|pane| self.unpublished_chat(pane.id))
+                    && !panes.iter().any(|pane| self.unpublished_pane(pane.id))
             })
             .map(|(scope, _)| scope.clone())
             .collect::<HashSet<_>>();
@@ -1707,7 +1707,7 @@ mod tests {
                     let complete = app.local_views();
                     for scope in &scopes {
                         let mut panes = complete.panes.get(scope).cloned().unwrap_or_default();
-                        panes.retain(|pane| !app.unpublished_chat(pane.id));
+                        panes.retain(|pane| !app.unpublished_pane(pane.id));
                         app.shared_views.baseline.insert(scope.clone(), panes);
                     }
                     app.publish_projected_view_changes(complete, ViewProjection::All);

@@ -98,7 +98,8 @@ fn a_terminal_opened_while_its_channel_seeds_survives_the_seed() {
     let card = new_terminal(&mut window);
     drop(window.app.reconcile_shared_views());
     assert_open(&window, card);
-    drain(&window.rx);
+    // Nothing is inserted into a view still being seeded.
+    assert_eq!(inserts(&window.rx, card), 0);
 
     seed_applied(&mut window, Vec::new());
     assert_open(&window, card);
@@ -126,29 +127,62 @@ fn a_terminal_opened_while_connecting_survives_joining_the_registry() {
             .apply_workspace_model_update(ModelUpdate::Connected(model)),
     );
     assert_open(&window, card);
-    let seeded = std::iter::from_fn(|| window.rx.try_recv().ok()).find_map(|edit| match edit {
-        ModelEdit::SeedView { scope, panes, .. } if scope == window.scope => Some(panes),
-        _ => None,
-    });
-    let in_seed = seeded
-        .as_ref()
-        .is_some_and(|panes| panes.iter().any(|pane| pane.id == card));
-    seed_applied(&mut window, seeded.unwrap_or_default());
+    let mut early_inserts = 0;
+    let seeded = std::iter::from_fn(|| window.rx.try_recv().ok())
+        .find_map(|edit| match edit {
+            ModelEdit::SeedView { scope, panes, .. } if scope == window.scope => Some(panes),
+            ModelEdit::ChangeView {
+                change: Change::Insert { pane, .. },
+                ..
+            } if pane.id == card => {
+                early_inserts += 1;
+                None
+            }
+            _ => None,
+        })
+        .expect("joining seeds the channel");
+    assert_eq!(early_inserts, 0);
+    // A creation still awaiting acceptance never migrates with the seed; it
+    // is shared by its own Insert once the seed is in.
+    assert!(seeded.iter().all(|pane| pane.id != card));
+    seed_applied(&mut window, seeded);
     assert_open(&window, card);
-    // Shared exactly once, by the seed or by its own Insert after it.
-    assert_eq!(usize::from(in_seed) + inserts(&window.rx, card), 1);
+    assert_eq!(inserts(&window.rx, card), 1);
 }
 
 #[test]
 fn a_terminal_opened_in_a_blocked_channel_survives_the_block() {
     let mut window = window();
+    // A terminal here whose canonical pane is listed by a view this window
+    // cannot project holds the channel back until that view goes. The
+    // previous pass already found it held back.
     window.app.shared_views.blocked.insert(window.scope.clone());
+    let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+    drop(window.app.insert_terminal_card(session, None));
+    let alias = window.app.workspace.focused().unwrap();
+    let mut canonical = Pane::from_card(window.app.card_state(alias).unwrap(), None).unwrap();
+    canonical.id = CardId::new();
+    let mut elsewhere = View::empty(ChannelId::new());
+    elsewhere.panes.push(canonical);
+    window.app.workspace_model.views.push(elsewhere);
     drop(window.app.reconcile_shared_views());
+    assert!(window.app.shared_views.blocked.contains(&window.scope));
     drain(&window.rx);
+
     let card = new_terminal(&mut window);
+    assert_ne!(card, alias);
     drop(window.app.reconcile_shared_views());
+    assert!(window.app.shared_views.blocked.contains(&window.scope));
     assert_open(&window, card);
-    window.app.shared_views.blocked.remove(&window.scope);
+    assert_eq!(inserts(&window.rx, card), 0);
+
+    window
+        .app
+        .workspace_model
+        .views
+        .retain(|view| view.scope == window.scope);
     drop(window.app.reconcile_shared_views());
+    assert!(!window.app.shared_views.blocked.contains(&window.scope));
     assert_open(&window, card);
+    assert_eq!(inserts(&window.rx, card), 1);
 }
