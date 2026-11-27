@@ -132,6 +132,12 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    /// The registry answered, or refused, one of this window's project moves.
+    /// It arrives after the receipt, or before the model read that restores the
+    /// registry's order after a refusal.
+    ProjectMoveAnswered {
+        refused: bool,
+    },
     /// The registry's answer to this window's request to retire an emptied
     /// channel: the model after it decided, either way. A channel still in it
     /// was kept.
@@ -615,7 +621,13 @@ fn publish_with_mirror(
         let seed_attempt = request.seed_attempt;
         let request = request.edit;
         match send_with_mirror(client, request.clone(), seed_attempt, updates, mirror) {
-            Ok(()) => *pending = None,
+            Ok(()) => {
+                *pending = None;
+                if matches!(&request, ModelEdit::ReorderProjects { .. }) {
+                    let _ =
+                        updates.send_blocking(ModelUpdate::ProjectMoveAnswered { refused: false });
+                }
+            }
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
                 // resending it to a fresh connection would be refused
@@ -640,6 +652,8 @@ fn publish_with_mirror(
                     if matches!(&request, ModelEdit::ReorderProjects { .. }) {
                         // The window moved the project before asking, and no
                         // receipt will settle it: show the registry's order.
+                        let _ = updates
+                            .send_blocking(ModelUpdate::ProjectMoveAnswered { refused: true });
                         let model = client
                             .read_workspace_model()
                             .map_err(|error| error.to_string())?;
@@ -1047,8 +1061,10 @@ impl Cagents {
             self.shared_views.view_sequences.clear();
             self.shared_views.scope_absences.clear();
             self.shared_views.closed.clear();
-            // A different registry has not heard this window's order.
+            // A different registry has not heard this window's order, and
+            // its order is the one to show.
             self.shared_views.project_order_offered = false;
+            self.shared_views.project_moves_in_flight = 0;
         } else if model.sequence < self.shared_views.snapshot_sequence {
             return false;
         } else if model.sequence < self.workspace_model.sequence
@@ -1172,6 +1188,11 @@ impl Cagents {
                 }
             }
             model.sequence = model.sequence.max(self.workspace_model.sequence);
+        }
+        if self.shared_views.project_moves_in_flight > 0 {
+            // A read taken before the registry answered this window's move
+            // would put the project back until the answer arrives.
+            model.project_order = self.workspace_model.project_order.clone();
         }
         // `model.sequence` may retain a newer receipt's high watermark; the
         // caller's original read sequence is the complete baseline's floor.
@@ -1972,6 +1993,19 @@ impl Cagents {
                     return projected;
                 }
                 self.reconcile_shared_views()
+            }
+            ModelUpdate::ProjectMoveAnswered { refused } => {
+                let moves = &mut self.shared_views.project_moves_in_flight;
+                *moves = moves.saturating_sub(1);
+                if refused {
+                    // The registry's order, which the read that follows
+                    // brings, is the one to show; an unarranged one lists the
+                    // projects by path, as every other window does.
+                    Arc::make_mut(&mut self.durable).project_order.clear();
+                    self.sidebar_model.apply_project_order(&[]);
+                    self.persist();
+                }
+                Task::none()
             }
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(
@@ -3482,8 +3516,9 @@ impl Cagents {
     /// anyone arranged them, or else in the order this window arranged before
     /// the order was shared. A device window has only the shared order: until
     /// someone arranges the device's projects, it lists them by path as the
-    /// device's own windows do. The window keeps the shared order as its own too,
-    /// so it opens in that order before the daemon answers. Whether the
+    /// device's own windows do. The window keeps the shared order's projects
+    /// as its own order too, so it opens in that order before the daemon
+    /// answers, and lists the rest by path as the registry does. Whether the
     /// sidebar changed.
     pub(super) fn order_sidebar_projects(&mut self) -> bool {
         if self.workspace_model.project_order.is_empty() && !crate::device::is_remote() {
@@ -3491,12 +3526,22 @@ impl Cagents {
                 .apply_project_order(&self.durable.project_order);
             return false;
         }
-        let moved = self
+        let order = &self.workspace_model.project_order;
+        let moved = self.sidebar_model.apply_shared_project_order(order);
+        let arranged = self
             .sidebar_model
-            .apply_shared_project_order(&self.workspace_model.project_order);
-        let shown = self.sidebar_model.projects.iter().map(|project| project.id);
-        if !self.durable.project_order.iter().copied().eq(shown.clone()) {
-            Arc::make_mut(&mut self.durable).project_order = shown.collect();
+            .projects
+            .iter()
+            .filter(|project| order.contains(&project.repository))
+            .map(|project| project.id);
+        if !self
+            .durable
+            .project_order
+            .iter()
+            .copied()
+            .eq(arranged.clone())
+        {
+            Arc::make_mut(&mut self.durable).project_order = arranged.collect();
         }
         moved
     }
@@ -3516,16 +3561,31 @@ impl Cagents {
         {
             return;
         }
-        self.shared_views.project_order_offered = true;
-        let order: Vec<PathBuf> = self
+        let arranged: Vec<_> = self
             .durable
             .project_order
             .iter()
             .filter_map(|id| self.sidebar_model.project(*id))
+            .collect();
+        // The registry leaves out a project it doesn't hold, so wait for every
+        // arranged project this window will open there, still loading or only
+        // now introduced, rather than lose its place.
+        if arranged.iter().any(|project| {
+            project.unreachable.is_none()
+                && !self.project_ui.closed.contains(&project.repository)
+                && !self
+                    .workspace_model
+                    .closed_projects
+                    .contains(&project.repository)
+                && self.workspace_model.project(&project.repository).is_none()
+        }) {
+            return;
+        }
+        let order: Vec<PathBuf> = arranged
+            .into_iter()
             .map(|project| project.repository.clone())
             .collect();
-        // Projects this reconciliation is only now opening in the registry are
-        // queued ahead of the seed; the registry leaves out any it didn't open.
+        self.shared_views.project_order_offered = true;
         if !order.is_empty() {
             self.publish_model_edit(ModelEdit::SeedProjectOrder { order });
         }
@@ -3579,12 +3639,15 @@ impl Cagents {
             // The shared order moves with it, so a reconciliation before the
             // registry answers keeps the project where the user put it.
             let model = &self.workspace_model;
-            if let Some(order) = project_order_after(&model.project_order, &edit, |repository| {
+            let order = project_order_after(&model.project_order, &edit, |repository| {
                 model.project(repository).is_some()
-            }) {
-                self.workspace_model.project_order = order;
+            });
+            if self.publish_model_edit(edit) {
+                self.shared_views.project_moves_in_flight += 1;
+                if let Some(order) = order {
+                    self.workspace_model.project_order = order;
+                }
             }
-            self.publish_model_edit(edit);
         }
         Task::none()
     }
@@ -3928,7 +3991,8 @@ impl Cagents {
     /// A redraw must never wait on the daemon, so this only queues: the
     /// publisher thread owns the connection and the retry, and the window learns
     /// the outcome as an update like any other.
-    pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) {
+    /// Whether the edit was queued.
+    pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) -> bool {
         #[cfg(test)]
         super::reconcile_oracle::published();
         self.capture_view_update_source(&edit);
@@ -3971,9 +4035,12 @@ impl Cagents {
             if let Some((id, _)) = retitle {
                 self.note_channel_retitle_unqueued(id);
             }
-        } else if let Some((id, gives_name)) = retitle {
+            return false;
+        }
+        if let Some((id, gives_name)) = retitle {
             self.note_channel_retitle_queued(id, gives_name);
         }
+        true
     }
 }
 

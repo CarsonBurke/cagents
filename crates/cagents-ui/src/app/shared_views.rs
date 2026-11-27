@@ -420,6 +420,10 @@ pub(super) struct State {
     /// This window offered the registry the project order it arranged
     /// before that order was shared.
     pub(super) project_order_offered: bool,
+    /// Project moves this window sent that the registry has not answered.
+    /// Until it does, the window shows its own order rather than a read
+    /// taken before the move.
+    pub(super) project_moves_in_flight: usize,
     baseline: settlement::ScopeMap<Vec<Pane>>,
     initialized: settlement::ScopeSet,
     seeding: HashSet<Scope>,
@@ -633,6 +637,7 @@ impl State {
             registry_unavailable,
             unintroduced_projects,
             project_order_offered,
+            project_moves_in_flight,
             baseline,
             initialized,
             seeding,
@@ -673,6 +678,7 @@ impl State {
             registry_unavailable: *registry_unavailable,
             unintroduced_projects: *unintroduced_projects,
             project_order_offered: *project_order_offered,
+            project_moves_in_flight: *project_moves_in_flight,
             baseline: baseline.clone(),
             initialized: initialized.clone(),
             seeding: seeding.clone(),

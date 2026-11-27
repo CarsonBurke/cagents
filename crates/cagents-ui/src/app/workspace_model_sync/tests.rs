@@ -8377,8 +8377,10 @@ fn every_window_lists_projects_in_the_order_the_registry_shares() {
     );
     let shown: Vec<_> = app.sidebar_model.projects.iter().map(|p| p.id).collect();
     assert_eq!(
-        app.durable.project_order, shown,
-        "the window opens in the shared order before the daemon answers"
+        app.durable.project_order,
+        shown[..3],
+        "the window opens in the shared order before the daemon answers, and keeps \
+         listing the rest by path"
     );
     assert_eq!(shown.len(), ids.len());
 }
@@ -8505,15 +8507,81 @@ fn a_moved_project_stays_put_until_the_registry_answers_and_a_refusal_restores_i
         before: Some(ids[0]),
     })));
     assert_eq!(drain(&published).len(), 1);
-    // An unrelated update reconciles the window before the answer arrives.
+    // An unrelated update reconciles the window before the answer arrives, and
+    // a read taken before the registry applied the move doesn't undo it.
     drop(app.reconcile_workspace_model());
+    assert_eq!(sidebar_names(&app), ["gamma", "alpha", "beta"]);
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
     assert_eq!(sidebar_names(&app), ["gamma", "alpha", "beta"]);
 
     // The registry refused the move: the window reports it and returns to the
     // registry's order instead of keeping a move nobody else has.
     drop(app.apply_workspace_model_update(ModelUpdate::NavigationFailed("refused".into())));
+    drop(app.apply_workspace_model_update(ModelUpdate::ProjectMoveAnswered { refused: true }));
     drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
     assert_eq!(sidebar_names(&app), ["alpha", "beta", "gamma"]);
     let shown: Vec<_> = app.sidebar_model.projects.iter().map(|p| p.id).collect();
     assert_eq!(app.durable.project_order, shown);
+}
+
+/// Review of #4450: once the registry answers a move, its order is the one to
+/// show again, and a refused move in a registry nobody arranged lists the
+/// projects by path, as every other window does, rather than keeping a local
+/// arrangement that would be carried over later.
+#[test]
+fn an_answered_move_hands_the_order_back_to_the_registry() {
+    let (mut app, ids, model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    assert!(app.install_workspace_model_snapshot(model.clone()));
+    drop(app.reconcile_workspace_model());
+    let published = intercept_publishes(&mut app);
+    drop(app.update(Message::Sidebar(SidebarAction::ReorderProject {
+        project: ids[2],
+        before: Some(ids[0]),
+    })));
+    assert_eq!(drain(&published).len(), 1);
+    drop(app.apply_workspace_model_update(ModelUpdate::ProjectMoveAnswered { refused: false }));
+    let mut arranged = model.clone();
+    arranged.project_order = order_of(&["beta", "gamma", "alpha"]);
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(arranged)));
+    assert_eq!(sidebar_names(&app), ["beta", "gamma", "alpha"]);
+
+    let (mut app, ids, model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    assert!(app.install_workspace_model_snapshot(model.clone()));
+    drop(app.reconcile_workspace_model());
+    let published = intercept_publishes(&mut app);
+    drop(app.update(Message::Sidebar(SidebarAction::ReorderProject {
+        project: ids[2],
+        before: Some(ids[0]),
+    })));
+    assert_eq!(drain(&published).len(), 1);
+    drop(app.apply_workspace_model_update(ModelUpdate::ProjectMoveAnswered { refused: true }));
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+    assert_eq!(sidebar_names(&app), ["alpha", "beta", "gamma"]);
+    assert!(app.durable.project_order.is_empty());
+}
+
+/// Review of #4450: the carry-over waits for an arranged project the registry
+/// doesn't hold yet, rather than leave it out of the order for good.
+#[test]
+fn the_carried_over_order_waits_for_every_arranged_project() {
+    let (mut app, ids, mut model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    Arc::make_mut(&mut app.durable).project_order = vec![ids[2], ids[0]];
+    let held = model.projects.clone();
+    model.projects.retain(|project| project.name != "gamma");
+    let published = intercept_publishes(&mut app);
+    assert!(app.install_workspace_model_snapshot(model.clone()));
+    drop(app.reconcile_workspace_model());
+    assert!(
+        !drain(&published)
+            .iter()
+            .any(|edit| matches!(edit, ModelEdit::SeedProjectOrder { .. })),
+        "gamma is not in the registry yet"
+    );
+    model.projects = held;
+    model.sequence += 1;
+    assert!(app.install_workspace_model_snapshot(model));
+    drop(app.reconcile_workspace_model());
+    assert!(drain(&published).contains(&ModelEdit::SeedProjectOrder {
+        order: order_of(&["gamma", "alpha"]),
+    }));
 }
