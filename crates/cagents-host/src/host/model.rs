@@ -36,7 +36,7 @@ mod automations;
 #[cfg(test)]
 mod channel_replay_tests;
 mod channel_retirement;
-pub(super) use automations::Claimed;
+pub(super) use automations::{Claimed, SlotRetry, awaits_agent_slot};
 pub(super) mod console_relaunch;
 mod execution;
 mod execution_deltas;

@@ -147,23 +147,43 @@ impl Registry {
         read_firing(&self.db, id)
     }
 
-    pub(crate) fn cancel_automation_precheck(
+    /// Cancels a firing that has no run yet. One in its precheck is only
+    /// marked: its worker's receipt settles it. One waiting for an agent slot
+    /// owns nothing else, so it ends here and frees its automation.
+    pub(crate) fn cancel_unstarted_automation_firing(
         &mut self,
         automation_id: Uuid,
         firing_id: Uuid,
+        now_ms: u64,
     ) -> Result<Firing, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        let automation = read_automation(&tx, automation_id)?;
+        let mut automation = read_automation(&tx, automation_id)?;
         let mut firing = read_firing(&tx, firing_id)?;
-        if automation.active_firing != Some(firing_id)
-            || firing.automation != automation_id
-            || firing.state != FiringState::Prechecking
-            || firing.run.is_some()
-        {
-            return Err("The precheck changed before cancellation; inspect its current run".into());
+        if automation.active_firing != Some(firing_id) || firing.automation != automation_id {
+            return Err("The run changed before cancellation; inspect its current state".into());
+        }
+        if awaits_agent_slot(&firing) {
+            firing.state = FiringState::Cancelled;
+            firing.finished_ms = Some(now_ms);
+            firing.diagnostic = Some("Cancelled while waiting for an agent slot".into());
+            automation.active_firing = None;
+            automation.updated_ms = now_ms;
+            write_firing(&tx, &firing)?;
+            write_automation(&tx, &automation)?;
+            history::prune(
+                &tx,
+                Some(automation.id),
+                now_ms,
+                crate::automations::HISTORY_RETAINED_ROWS,
+            )?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(firing);
+        }
+        if firing.state != FiringState::Prechecking || firing.run.is_some() {
+            return Err("The run changed before cancellation; inspect its current state".into());
         }
         firing.cancel_requested = true;
         write_firing(&tx, &firing)?;
@@ -407,8 +427,10 @@ impl Registry {
     pub(crate) fn automation_update_blockers(&self) -> Result<Vec<String>, String> {
         let limit = crate::automations::MAX_CONCURRENT_PRECHECKS;
         let mut query = self.db.prepare(
-            "SELECT f.record FROM automations a JOIN automation_firings f ON f.id = a.active_firing
-             WHERE f.run_id IS NULL ORDER BY f.created_ms, f.id LIMIT ?1",
+            &format!(
+                "SELECT f.record FROM automations a JOIN automation_firings f ON f.id = a.active_firing
+                 WHERE {HOLDS_PRECHECK} ORDER BY f.created_ms, f.id LIMIT ?1"
+            ),
         ).map_err(|error| error.to_string())?;
         let records = query
             .query_map([limit as u64 + 1], |row| row.get::<_, String>(0))
@@ -845,7 +867,12 @@ impl Registry {
         firing.release_pending = !state.is_active();
         firing.started_ms = run.started_ms;
         firing.finished_ms = run.finished_ms;
-        firing.diagnostic = run.result.diagnostic;
+        // A run that ends with nothing to say keeps the note that it waited.
+        let waited = firing.diagnostic.as_deref() == Some(SLOT_WAITED);
+        firing.diagnostic = run
+            .result
+            .diagnostic
+            .or_else(|| waited.then(|| SLOT_WAITED.to_owned()));
         if state == FiringState::Interrupted {
             automation.blocked = Some("The run's outcome or ownership is uncertain. Inspect and close it before scheduling more work.".into());
             automation.enabled = false;
@@ -1443,7 +1470,7 @@ impl Registry {
             .map_err(|e| e.to_string())?;
         let mut capacity_full = false;
         if automation.active_firing.is_none() && automation.definition.precheck.is_some() {
-            let count: usize = tx.query_row("SELECT count(*) FROM automations a JOIN automation_firings f ON f.id=a.active_firing WHERE f.run_id IS NULL", [], |row| row.get(0)).map_err(|error| error.to_string())?;
+            let count: usize = tx.query_row(&format!("SELECT count(*) FROM automations a JOIN automation_firings f ON f.id=a.active_firing WHERE {HOLDS_PRECHECK}"), [], |row| row.get(0)).map_err(|error| error.to_string())?;
             if count >= crate::automations::MAX_CONCURRENT_PRECHECKS {
                 if matches!(trigger, Trigger::Manual { .. }) {
                     return Err("All precheck slots are occupied; wait for running checks or resolve interrupted owners".into());
@@ -1593,9 +1620,7 @@ impl Registry {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         }
-        let current = automation.execution_revision == firing.revision
-            && (matches!(firing.trigger, crate::automations::Trigger::Manual { .. })
-                || automation.enabled);
+        let current = still_current(&automation, &firing);
         let accepted = if let Outcome::Stopped {
             state,
             skip,
@@ -1663,6 +1688,142 @@ impl Registry {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
+
+    /// Whether asking again for a waiting firing's agent slot would change
+    /// it: a slot is free for its automation, or the firing no longer waits
+    /// or is no longer its automation's to start. It reads only, so the
+    /// scheduler can ask on every wake. A slot counts as taken here even when
+    /// the run would queue behind its reused agent's current one, and the
+    /// counts in the firing's details are not refreshed; asking again on the
+    /// scheduler's timer covers both.
+    pub(crate) fn automation_slot_retry_due(&self, firing_id: Uuid) -> Result<bool, String> {
+        let firing = read_firing(&self.db, firing_id)?;
+        if !awaits_agent_slot(&firing) {
+            return Ok(true);
+        }
+        let automation = read_automation(&self.db, firing.automation)?;
+        if !still_current(&automation, &firing) {
+            return Ok(true);
+        }
+        let origin = crate::agent_execution::Origin::Automation { id: automation.id };
+        Ok(!super::execution::limit_reached(
+            &self.db,
+            &origin,
+            self.concurrency(),
+        )?)
+    }
+
+    /// Asks again for the agent slot a waiting firing was refused. The firing
+    /// starts if one is free and keeps waiting if none is. One whose
+    /// automation was paused or resumed, or whose project was closed, while
+    /// it waited is skipped instead, as one still in its precheck is.
+    pub(crate) fn retry_automation_slot(
+        &mut self,
+        firing_id: Uuid,
+        now_ms: u64,
+    ) -> Result<SlotRetry, String> {
+        let limits = self.concurrency();
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut firing = read_firing(&tx, firing_id)?;
+        if !awaits_agent_slot(&firing) {
+            return Ok(SlotRetry::Settled);
+        }
+        let mut automation = read_automation(&tx, firing.automation)?;
+        if automation.active_firing != Some(firing_id) {
+            return Err("A run waiting for an agent slot no longer owns its automation".into());
+        }
+        let waiting = firing.diagnostic.clone();
+        let accepted = if still_current(&automation, &firing) {
+            let definition = read_definition(&tx, firing.automation, firing.revision)?;
+            let key = occurrence_key(firing.revision, &firing.trigger);
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                now_ms,
+                limits,
+            )?
+        } else {
+            firing.state = FiringState::Skipped;
+            firing.skip = Some(crate::automations::SkipReason::DefinitionChanged);
+            firing.diagnostic = Some(
+                "The automation was paused or resumed, or its project was closed, while this run waited for an agent slot".into(),
+            );
+            None
+        };
+        if awaits_agent_slot(&firing) && firing.diagnostic == waiting {
+            // Refused as before: leave the saved rows as they are.
+            return Ok(SlotRetry::Waiting);
+        }
+        if !firing.state.is_active() {
+            firing.finished_ms = Some(now_ms);
+            automation.active_firing = None;
+        }
+        automation.updated_ms = now_ms;
+        write_firing(&tx, &firing)?;
+        write_automation(&tx, &automation)?;
+        history::prune(
+            &tx,
+            Some(automation.id),
+            now_ms,
+            crate::automations::HISTORY_RETAINED_ROWS,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(match accepted {
+            Some(accepted) => SlotRetry::Started(Box::new(accepted)),
+            None if awaits_agent_slot(&firing) => SlotRetry::Waiting,
+            None => SlotRetry::Settled,
+        })
+    }
+}
+
+/// What asking again for an agent slot came to.
+pub(crate) enum SlotRetry {
+    /// A slot was free: the run was accepted and is the caller's to dispatch.
+    Started(Box<crate::agent_execution::Accepted>),
+    /// Still refused for the limit.
+    Waiting,
+    /// The firing ended without a run, or no longer waits.
+    Settled,
+}
+
+/// What a firing that waited for an agent slot keeps once it starts, unless
+/// its run ends with a diagnostic of its own.
+const SLOT_WAITED: &str = "Waited for an agent slot before starting.";
+
+/// An active firing with no run that holds a precheck slot: in its precheck
+/// or awaiting that precheck's cleanup, not waiting for an agent slot.
+const HOLDS_PRECHECK: &str = "f.run_id IS NULL AND f.state<>'\"accepted\"'";
+
+/// A firing refused for the agent concurrency limit keeps its automation and
+/// waits, queued with no run, until the scheduler's retry finds a slot.
+pub(crate) fn awaits_agent_slot(firing: &Firing) -> bool {
+    firing.state == FiringState::Accepted && firing.run.is_none()
+}
+
+/// Whether a firing claimed earlier may still start: its definition is the
+/// one it was claimed under, and a scheduled one's automation is enabled.
+fn still_current(automation: &Automation, firing: &Firing) -> bool {
+    automation.execution_revision == firing.revision
+        && (matches!(firing.trigger, crate::automations::Trigger::Manual { .. })
+            || automation.enabled)
+}
+
+fn slot_wait_diagnostic(refusal: &crate::agent_execution::concurrency::LimitReached) -> String {
+    use crate::agent_execution::concurrency::Scope;
+    let allowed = match refusal.scope {
+        Scope::Caller => "agent runs this automation may have at once",
+        Scope::Global => "agent runs allowed at once",
+    };
+    format!(
+        "Waiting for an agent slot: {} of the {} {allowed} are active or unconfirmed. This run starts once one finishes or its agent is closed; an interrupted run keeps its slot until its agent is closed.",
+        refusal.running, refusal.limit
+    )
 }
 
 fn accept_firing(
@@ -1678,6 +1839,7 @@ fn accept_firing(
         agent_execution::{Destination, Origin, Submit},
         automations::SessionMode,
     };
+    let waited = awaits_agent_slot(firing);
     // Someone may close the automation's agent between firings, and closing
     // a channel's last conversation removes the channel. A closed agent never
     // runs again and a removed channel cannot hold one, so this firing starts
@@ -1755,6 +1917,9 @@ fn accept_firing(
             firing.agent = Some(accepted.agent.id);
             firing.run = Some(accepted.run.id);
             firing.state = FiringState::Accepted;
+            if waited {
+                firing.diagnostic = Some(SLOT_WAITED.into());
+            }
             if creates_agent {
                 automation.channel = accepted.agent.channel();
             }
@@ -1766,20 +1931,21 @@ fn accept_firing(
         Err(error) => {
             tx.execute_batch("ROLLBACK TO automation_accept; RELEASE automation_accept")
                 .map_err(|error| error.to_string())?;
-            firing.state = FiringState::Failed;
-            firing.finished_ms = Some(now_ms);
-            // The automation's own runs are listed with its firings, so the
-            // diagnostic keeps the counts rather than every holder's IDs.
             let mut diagnostic = match error {
+                // Nothing was started, and the same request is accepted once
+                // a slot frees: the firing keeps its automation and waits for
+                // the scheduler to ask again. The automation's own runs are
+                // listed with its firings, so it keeps the counts rather than
+                // every holder's IDs.
                 crate::agent_execution::AcceptanceError::LimitReached(refusal) => {
-                    crate::agent_execution::concurrency::LimitReached {
-                        holders: Vec::new(),
-                        ..refusal
-                    }
-                    .to_string()
+                    firing.state = FiringState::Accepted;
+                    firing.diagnostic = Some(slot_wait_diagnostic(&refusal));
+                    return Ok(None);
                 }
                 error => error.to_string(),
             };
+            firing.state = FiringState::Failed;
+            firing.finished_ms = Some(now_ms);
             crate::agent_execution::truncate(
                 &mut diagnostic,
                 crate::agent_execution::MAX_DIAGNOSTIC_BYTES,
@@ -2052,7 +2218,7 @@ mod tests {
             )
             .unwrap();
         registry
-            .cancel_automation_precheck(automation.id, claim.firing.id)
+            .cancel_unstarted_automation_firing(automation.id, claim.firing.id, 210)
             .unwrap();
         // The child already finished, but its receipt had not yet authorized
         // provider acceptance. Cancellation wins that transaction boundary.
@@ -4777,4 +4943,5 @@ mod tests {
     }
 
     include!("automations/history_tests.rs");
+    include!("automations/slot_wait_tests.rs");
 }

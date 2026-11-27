@@ -3081,11 +3081,11 @@ pub(super) fn agent_is_interactive_in(db: &Connection, id: AgentId) -> Result<bo
 /// interrupted and its agent is still open; runs queued behind a head wait
 /// for it and hold nothing.
 fn concurrency_refusal(
-    tx: &Transaction<'_>,
+    db: &Connection,
     origin_json: &str,
     limits: Limits,
 ) -> Result<Option<LimitReached>, String> {
-    let mut query = tx
+    let mut query = db
         .prepare_cached(
             "SELECT r.agent, r.id, r.state, r.origin = ?1
              FROM agent_runs r JOIN agents a ON a.id = r.agent
@@ -3134,6 +3134,16 @@ fn concurrency_refusal(
         yours,
         holders,
     }))
+}
+
+/// Whether a new agent's run submitted by `origin` would be refused for a
+/// limit now. Reads only, for a caller deciding whether to submit again.
+pub(super) fn limit_reached(
+    db: &Connection,
+    origin: &Origin,
+    limits: Limits,
+) -> Result<bool, String> {
+    Ok(concurrency_refusal(db, &encode(origin)?, limits)?.is_some())
 }
 
 /// How a follow-up is refused when its agent's queue is full.

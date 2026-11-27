@@ -157,6 +157,8 @@ With `--json`, `error.details` has `scope` (`caller` or `global`), `running`, `l
 
 `cagents agent close --interrupted` closes every open agent of yours with an interrupted run, which `agent list` shows as its state, and so frees their slots.
 
+An automation's run refused for either limit waits instead of failing. Its firing stays queued without a run and gives the counts in its details. It remains the automation's active firing, so later occurrences are skipped as overlapping and only the automation's name can be edited while it waits. The scheduler starts the run when another run's end frees a slot. It also asks after 2 seconds, doubling the delay up to a minute, which covers a slot freed another way, such as a raised limit. `cagents automation cancel` ends the wait. Pausing or resuming the automation, or closing its project, skips the firing.
+
 `cagents agent limits` shows the limits. A person changes them with `cagents agent limits --per-caller 16 --total 64`; each is 1 to 256, and the per-caller limit cannot exceed the total. The command refuses a change from a session's agents; that guards against an agent raising its own limit by accident, not against one that writes the file. The limits are kept in `agent-concurrency.toml` in the configuration directory, and the daemon reads the file again at its next submission after it changes. If the file is invalid or cannot be read, the defaults apply and the daemon logs a warning; giving both options replaces it. As with the other configuration files, the daemon does not follow a symbolic link in its path.
 
 ## Reading context and account budgets

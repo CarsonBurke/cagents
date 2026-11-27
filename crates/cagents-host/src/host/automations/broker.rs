@@ -20,7 +20,7 @@ use crate::{
     automations::{Firing, FiringState, SessionMode, Trigger},
     host::{
         agent_execution,
-        model::Claimed,
+        model::{Claimed, SlotRetry, awaits_agent_slot},
         state::{HostLock, SharedHost},
     },
 };
@@ -79,6 +79,40 @@ struct Inner {
     attention: Mutex<AttentionTransfer>,
     // The independent no-run lifecycle transfer owns its original receipt.
     notifications: Mutex<notifications::Transfer>,
+    // When each firing waiting for an agent slot next asks for it on the
+    // timer. The firing is the durable part: a daemon that restarts finds it
+    // and starts afresh.
+    slots: Mutex<BTreeMap<Uuid, SlotBackoff>>,
+}
+
+/// When a firing refused for the agent concurrency limit asks again without
+/// being told a slot is free. A run that ends wakes the scheduler, which
+/// then starts the firing at once; this timer is for what frees a slot
+/// without a wake, such as a raised limit. Its delay doubles with each
+/// refusal, so a long wait costs few transactions.
+#[derive(Clone, Copy)]
+struct SlotBackoff {
+    refusals: u32,
+    retry: Instant,
+}
+
+impl SlotBackoff {
+    const FIRST: Duration = Duration::from_secs(2);
+    const LONGEST: Duration = Duration::from_secs(60);
+
+    fn refused(previous: Option<Self>, now: Instant) -> Self {
+        let refusals = previous.map_or(0, |backoff| backoff.refusals) + 1;
+        Self {
+            refusals,
+            retry: now + Self::delay(refusals),
+        }
+    }
+
+    fn delay(refusals: u32) -> Duration {
+        Self::FIRST
+            .saturating_mul(1 << refusals.saturating_sub(1).min(16))
+            .min(Self::LONGEST)
+    }
 }
 
 #[derive(Clone)]
@@ -107,6 +141,15 @@ pub(in crate::host) struct Broker {
 /// How often the scheduler rechecks while it holds an active firing or a
 /// precheck worker, whose retries no other event announces.
 const OWNED_WORK_RECHECK: Duration = Duration::from_secs(60);
+
+fn warn_slot_retry(firing: Uuid, error: &str) {
+    let diagnostic: String = error
+        .chars()
+        .flat_map(char::escape_default)
+        .take(512)
+        .collect();
+    tracing::warn!(%firing, error = %diagnostic, "cannot ask again for an automation firing's agent slot");
+}
 
 fn warn_history_maintenance(error: &str) {
     let diagnostic: String = error
@@ -141,6 +184,7 @@ impl Broker {
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -199,7 +243,7 @@ impl Handle {
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .cancel_automation_precheck(id, firing)
+                .cancel_unstarted_automation_firing(id, firing, service::now()?)
                 .map(|_| ())
         };
         self.wake();
@@ -618,6 +662,9 @@ impl Handle {
                 checking |= self.observe_precheck(host, &firing, now)?;
             }
         }
+        // Before this wake's claims, so a freed slot goes to the firing that
+        // has waited for it rather than to a later occurrence.
+        let mut slot_delay = self.retry_slots(host, now)?;
         // Four jobs per wake keeps a burst of slow filesystem validation from
         // starving completion/cleanup handling. Remaining due rows wake again.
         let due = self
@@ -667,6 +714,13 @@ impl Handle {
                 checking |= claim.created
                     && claim.firing.state == FiringState::Prechecking
                     && claim.definition.precheck.is_some();
+                if claim.created && awaits_agent_slot(&claim.firing) {
+                    // Refused just now: the next wake starts its timer.
+                    slot_delay = Some(
+                        slot_delay
+                            .map_or(SlotBackoff::FIRST, |delay| delay.min(SlotBackoff::FIRST)),
+                    );
+                }
                 self.launch(host, claim)?;
             } else {
                 self.0
@@ -720,7 +774,7 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .is_empty();
         let owned_delay = owns_work.then_some(OWNED_WORK_RECHECK);
-        let delay = [automation_delay, history_delay, owned_delay]
+        let delay = [automation_delay, history_delay, owned_delay, slot_delay]
             .into_iter()
             .flatten()
             .min();
@@ -736,6 +790,111 @@ impl Handle {
         // it before sleeping, outside the execution-admission guard as well.
         let attention_delay = self.transfer_attention(host);
         Ok([attention_delay, delay].into_iter().flatten().min())
+    }
+
+    /// Starts the firings waiting for an agent slot that can now have one,
+    /// oldest first, and ends those that are no longer their automation's to
+    /// start. Every wake asks whether a slot is free, which only reads; a
+    /// firing asks for its slot regardless when its timer comes due. Returns
+    /// how long until the next timer.
+    fn retry_slots(&self, host: &SharedHost, now: u64) -> Result<Option<Duration>, String> {
+        let waiting: Vec<_> = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_automation_firings()?
+            .into_iter()
+            .filter(awaits_agent_slot)
+            .collect();
+        // Only this thread schedules retries, so its map is not held over
+        // the registry or a launch.
+        let previous = std::mem::take(&mut *self.0.slots.lock().unwrap_or_else(|p| p.into_inner()));
+        let instant = Instant::now();
+        let mut slots = BTreeMap::new();
+        for firing in waiting {
+            let backoff = previous.get(&firing.id).copied();
+            let timed = backoff.is_none_or(|backoff| backoff.retry <= instant);
+            // One firing's failure must not keep the others from their slots.
+            // It stays active and asks again on its timer.
+            let still_waiting =
+                self.retry_slot(host, &firing, timed, now)
+                    .unwrap_or_else(|error| {
+                        warn_slot_retry(firing.id, &error);
+                        true
+                    });
+            if still_waiting {
+                let backoff = match backoff {
+                    Some(backoff) if !timed => backoff,
+                    // The first delay follows the refusal that left the
+                    // firing waiting: at its claim, after its precheck, or
+                    // before a restart.
+                    previous => SlotBackoff::refused(previous, instant),
+                };
+                slots.insert(firing.id, backoff);
+            }
+        }
+        let next = slots
+            .values()
+            .map(|backoff| backoff.retry.saturating_duration_since(instant))
+            .min();
+        *self.0.slots.lock().unwrap_or_else(|p| p.into_inner()) = slots;
+        Ok(next)
+    }
+
+    /// Whether the firing still waits. It asks for its slot when one is free
+    /// or it has nothing to wait for any more, and whenever `timed` says its
+    /// timer came due.
+    fn retry_slot(
+        &self,
+        host: &SharedHost,
+        firing: &Firing,
+        timed: bool,
+        now: u64,
+    ) -> Result<bool, String> {
+        let retry = {
+            let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+            if !timed && !registry.automation_slot_retry_due(firing.id)? {
+                return Ok(true);
+            }
+            registry.retry_automation_slot(firing.id, now)?
+        };
+        match retry {
+            SlotRetry::Started(accepted) => {
+                self.dispatch(host, firing, *accepted, now)?;
+                Ok(false)
+            }
+            SlotRetry::Waiting => Ok(true),
+            SlotRetry::Settled => Ok(false),
+        }
+    }
+
+    /// Launches a run accepted some time after its firing was claimed, once
+    /// its target is confirmed to be the one that was saved.
+    fn dispatch(
+        &self,
+        host: &SharedHost,
+        firing: &Firing,
+        accepted: crate::agent_execution::Accepted,
+        now: u64,
+    ) -> Result<(), String> {
+        let automation = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .automation(firing.automation)?;
+        match service::validate_target(host, &automation.definition, &automation.target_identity) {
+            Ok(directory) => {
+                agent_execution::dispatch_accepted_in_directory(host, accepted, directory)
+            }
+            Err(error) => self
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .fail_automation_start(firing.id, error, now, true),
+        }
     }
 
     fn release_run(&self, host: &SharedHost, firing: &Firing, now: u64) -> Result<bool, String> {
@@ -849,11 +1008,7 @@ impl Handle {
             Ok(Status::Complete(outcome)) => {
                 let accepted = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).finish_automation_precheck(firing.id, outcome, now)?;
                 if let Some(accepted) = accepted {
-                    let automation = self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).automation(firing.automation)?;
-                    match service::validate_target(host, &automation.definition, &automation.target_identity) {
-                        Ok(directory) => agent_execution::dispatch_accepted_in_directory(host, accepted, directory)?,
-                        Err(error) => self.0.registry.lock().unwrap_or_else(|p| p.into_inner()).fail_automation_start(firing.id, error, now, true)?,
-                    }
+                    self.dispatch(host, firing, accepted, now)?;
                 }
             }
             Ok(Status::CleanupUnconfirmed) | Err(_) if firing.state == FiringState::Interrupted => {}
@@ -1194,6 +1349,9 @@ impl AttentionTransfer {
 mod attention_tests;
 
 #[cfg(test)]
+mod slot_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::state::HostState;
@@ -1242,6 +1400,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         (directory, host, handle, automation)
     }
@@ -1529,6 +1688,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         host.lock().unwrap().automations = Some(handle.clone());
         let control = host.lock().unwrap().control_gate.clone();
@@ -1772,6 +1932,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         // Exercise both retire-on-idle and retain-for-reuse policies. Each uses
         // a real offline native actor held busy beyond the cleanup grace.
@@ -2011,6 +2172,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -2049,6 +2211,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         let wake = handle.clone();
         let (reported, received) = std::sync::mpsc::channel();
@@ -2098,6 +2261,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         assert_eq!(handle.tick(&host).unwrap(), None);
     }
@@ -2165,6 +2329,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.exclusive();
@@ -2389,6 +2554,7 @@ mod tests {
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
+            slots: Mutex::default(),
         }));
         let control = host.lock().unwrap().control_gate.clone();
         let exclusive = control.exclusive();
