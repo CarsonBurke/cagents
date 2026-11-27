@@ -658,6 +658,41 @@ mod tests {
     }
 
     #[test]
+    fn an_open_pull_request_ahead_of_its_worktree_holds_the_local_head() {
+        let contains = |fixture: &Fixture| {
+            fixture
+                .board()
+                .items
+                .iter()
+                .find(|item| item.branch.as_deref() == Some("feature"))
+                .and_then(|item| item.pull_request.as_ref())
+                .unwrap()
+                .contains_local_head
+        };
+        let mut fixture = fixture();
+        assert!(
+            contains(&fixture),
+            "the worktree is at the pull request's head"
+        );
+        fixture.snapshot.pull_requests[0].head_ref_oid = "suggestion-oid".into();
+        assert!(
+            !contains(&fixture),
+            "a head the scan did not find containing the worktree's"
+        );
+        let key = ("feature-oid".to_owned(), "suggestion-oid".to_owned());
+        fixture.local.ancestry.insert(key.clone(), true);
+        assert!(
+            contains(&fixture),
+            "the worktree is behind its pull request"
+        );
+        fixture.local.ancestry.insert(key, false);
+        assert!(
+            !contains(&fixture),
+            "the worktree is ahead of its pull request"
+        );
+    }
+
+    #[test]
     fn sessions_attach_to_their_innermost_worktree_and_make_it_active() {
         let mut fixture = fixture();
         fixture.sessions.push(LiveSession {
