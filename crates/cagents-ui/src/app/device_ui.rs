@@ -2175,8 +2175,9 @@ fn diagnose_with(
     };
     // SSH could not connect at all: the checks below would each wait out
     // the same connection, only to say nothing more.
+    // It starts with the device's name, kept as the person wrote it.
     if let Some(reason) = reason.filter(|reason| crate::device::reads_as_unreachable(reason)) {
-        return OpenFailure::Other(sentence(reason));
+        return OpenFailure::Other(reason.to_owned());
     }
     // The update's own inspection tells what the device lacks, a missing
     // install included, and what it would refuse.
@@ -2259,7 +2260,7 @@ mod tests {
 
     #[test]
     fn a_device_ssh_cannot_reach_is_reported_without_asking_it_more() {
-        let reason = "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that it is on and that `ssh build-host` connects, then try again.";
+        let reason = "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that `ssh build-host` connects, then try again.";
         // Each question would wait out another SSH connection timeout.
         let failure = diagnose_with("build-host", Some(reason), |arguments| {
             panic!("asked the device again: {arguments:?}")

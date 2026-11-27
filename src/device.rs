@@ -180,7 +180,7 @@ impl std::fmt::Display for Unreachable {
         } = self;
         write!(
             f,
-            "{device}{UNREACHABLE_INFIX}{reason}. Check that it is on and that `ssh {host}` connects, then try again."
+            "{device}{UNREACHABLE_INFIX}{reason}. Check that `ssh {host}` connects, then try again."
         )
     }
 }
@@ -196,22 +196,21 @@ pub fn reads_as_unreachable(message: &str) -> bool {
 }
 /// SSH's own complaint in what it wrote to stderr: its last line, without
 /// the `ssh: ` it starts with. Warnings it printed first are not the cause.
-fn ssh_reason(stderr: &str) -> String {
+fn ssh_reason(stderr: &str) -> Option<String> {
     let line = stderr
         .lines()
         .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .unwrap_or_default();
+        .rfind(|line| !line.is_empty())?;
     let reason = line.strip_prefix("ssh: ").unwrap_or(line);
     let reason = reason.trim_end_matches('.');
     if reason.is_empty() {
-        return "SSH exited without saying why".into();
+        return None;
     }
     let mut end = reason.len().min(300);
     while !reason.is_char_boundary(end) {
         end -= 1;
     }
-    reason[..end].to_owned()
+    Some(reason[..end].to_owned())
 }
 /// Whether the selected device's no-start bridge found no daemon running.
 pub(crate) fn existing_daemon_missing() -> bool {
@@ -563,6 +562,10 @@ fn ssh(control: Option<&str>) -> Command {
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=15",
+        // One try: a device that does not answer is reported, not waited on
+        // again under a setting of the person's SSH configuration.
+        "-o",
+        "ConnectionAttempts=1",
         "-o",
         "ServerAliveInterval=15",
         "-o",
@@ -934,6 +937,10 @@ impl Forwarding {
             transport
                 .daemon_missing
                 .store(false, std::sync::atomic::Ordering::Release);
+            *transport
+                .unreachable
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
         }
         let stop = match Cancellation::new() {
             Ok(stop) => Arc::new(stop),
@@ -1060,13 +1067,19 @@ impl Forwarding {
                 std::sync::atomic::Ordering::Release,
             );
             // SSH exits 255 for its own errors: no answer, no such host, a
-            // refused login.
+            // refused login. It does too when the command it ran died or the
+            // connection dropped later, but by then the device had answered,
+            // or SSH said nothing.
             *transport
                 .unreachable
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = (status.code() == Some(255)
-                && !detail.daemon_absent)
-                .then(|| ssh_reason(&detail.text));
+                && !detail.daemon_absent
+                && !self
+                    .received_output
+                    .load(std::sync::atomic::Ordering::Acquire))
+            .then(|| ssh_reason(&detail.text))
+            .flatten();
             *transport
                 .last_error
                 .lock()
@@ -1468,42 +1481,45 @@ pub fn prepare() -> io::Result<()> {
                 actual,
             },
         )),
-        Err(crate::device_service::Failure::Failed(_)) if selected_unreachable().is_some() => {
-            let device = selected().unwrap();
-            Err(io::Error::new(
-                io::ErrorKind::HostUnreachable,
-                Unreachable {
-                    device: device.name.clone(),
-                    host: device.host.clone(),
-                    reason: selected_unreachable().unwrap_or_default(),
-                },
-            ))
-        }
-        Err(crate::device_service::Failure::Failed(error)) => Err(io::Error::other(
-            format!(
-                "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start`",
-                selected().unwrap().name,
-                selected().unwrap().host,
-                selected().unwrap().host
-            ) + &SELECTED
-                .get()
-                .unwrap()
-                .bridges
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
-            .as_ref()
-            .and_then(|bridge| {
-                bridge
-                    .transport
-                    .last_error
+        Err(crate::device_service::Failure::Failed(error)) => Err(match selected_unreachable() {
+            Some(reason) => unreachable_error(selected().unwrap(), reason),
+            None => io::Error::other(
+                format!(
+                    "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start`",
+                    selected().unwrap().name,
+                    selected().unwrap().host,
+                    selected().unwrap().host
+                ) + &SELECTED
+                    .get()
+                    .unwrap()
+                    .bridges
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone()
-            })
-            .map(|error| format!("; {error}"))
-            .unwrap_or_default(),
-        )),
+                    .unwrap_or_else(|p| p.into_inner())[usize::from(bridge_no_start())]
+                .as_ref()
+                .and_then(|bridge| {
+                    bridge
+                        .transport
+                        .last_error
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone()
+                })
+                .map(|error| format!("; {error}"))
+                .unwrap_or_default(),
+            ),
+        }),
     }
+}
+/// The error for `device`, which SSH could not reach, saying `reason`.
+fn unreachable_error(device: &Device, reason: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::HostUnreachable,
+        Unreachable {
+            device: device.name.clone(),
+            host: device.host.clone(),
+            reason,
+        },
+    )
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -2018,31 +2034,84 @@ mod tests {
     }
 
     #[test]
+    fn only_a_device_that_never_answered_reads_as_unreachable() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(
+            Device {
+                name: "fixture".into(),
+                host: "unused-fixture".into(),
+                executable: "cagents".into(),
+            },
+            directory.path().to_path_buf(),
+        );
+        let forward = |script: &str| {
+            let child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let forwarding = Forwarding::start(child, server, Some(transport.clone())).unwrap();
+            let device = transport.device.clone();
+            let worker = thread::spawn(move || forwarding.finish(&device));
+            let _ = client.read_to_end(&mut Vec::new());
+            let _ = worker.join().unwrap();
+            transport.unreachable.lock().unwrap().clone()
+        };
+        let refused =
+            "printf 'ssh: connect to host fixture port 22: Connection refused\\n' >&2; exit 255";
+        assert_eq!(
+            forward(refused).as_deref(),
+            Some("connect to host fixture port 22: Connection refused")
+        );
+        // The next stream starts afresh, so an old failure is not this one's.
+        assert_eq!(forward("exit 0"), None);
+        // A device that answered and then dropped the connection was reached.
+        assert_eq!(
+            forward(
+                "printf answer; printf 'Connection to fixture closed by remote host.\\n' >&2; exit 255"
+            ),
+            None
+        );
+        // SSH saying nothing is the command it ran dying, not SSH failing.
+        assert_eq!(forward("exit 255"), None);
+    }
+
+    #[test]
     fn a_device_ssh_cannot_reach_is_named_with_what_ssh_said() {
         assert_eq!(
             ssh_reason(
                 "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
                  ssh: connect to host build-host port 22: Connection timed out\n"
-            ),
-            "connect to host build-host port 22: Connection timed out"
+            )
+            .as_deref(),
+            Some("connect to host build-host port 22: Connection timed out")
         );
         assert_eq!(
-            ssh_reason("user@build-host: Permission denied (publickey)."),
-            "user@build-host: Permission denied (publickey)"
+            ssh_reason("user@build-host: Permission denied (publickey).").as_deref(),
+            Some("user@build-host: Permission denied (publickey)")
         );
-        assert_eq!(ssh_reason(""), "SSH exited without saying why");
-        let error = io::Error::new(
-            io::ErrorKind::HostUnreachable,
-            Unreachable {
-                device: "build-host".into(),
+        // A command that died on the device leaves SSH nothing to say.
+        assert_eq!(ssh_reason("\n"), None);
+        let error = unreachable_error(
+            &Device {
+                name: "build-host".into(),
                 host: "me@build-host".into(),
-                reason: "connect to host build-host port 22: Connection timed out".into(),
+                executable: "cagents".into(),
             },
+            "connect to host build-host port 22: Connection timed out".into(),
         );
         let message = error.to_string();
         assert_eq!(
             message,
-            "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that it is on and that `ssh me@build-host` connects, then try again."
+            "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that `ssh me@build-host` connects, then try again."
         );
         assert!(unreachable(&error).is_some());
         // A window passes its failure on as text, still recognizable.

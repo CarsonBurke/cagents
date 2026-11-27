@@ -353,7 +353,14 @@ fn on_device<T>(
     request: impl FnOnce(&mut ControlClient) -> Result<T, ControlError>,
 ) -> Result<(), AppError> {
     crate::device::select(Some(name)).map_err(|error| AppError::new("device", error))?;
-    crate::device::prepare().map_err(|error| AppError::new("device", error))?;
+    crate::device::prepare().map_err(|error| {
+        let kind = if crate::device::unreachable(&error).is_some() {
+            "device_unreachable"
+        } else {
+            "device"
+        };
+        AppError::new(kind, error)
+    })?;
     let mut remote = control_daemon_client()?;
     request(&mut remote).map_err(protocol_error)?;
     Ok(())
