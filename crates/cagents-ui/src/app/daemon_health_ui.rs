@@ -283,9 +283,26 @@ impl Cagents {
         Some(Task::none())
     }
     pub(super) fn daemon_health_banner(&self) -> Element<'_, Message> {
-        let Some(detail) = health_detail(&self.daemon_health_ui.health) else {
-            return iced::widget::Space::new().height(Length::Shrink).into();
+        let device = self.device_update_banner();
+        // A device window whose daemon speaks another protocol says which
+        // side to update, and offers to, in place of the protocol numbers.
+        // A device this window failed to open is offered beside its health.
+        let health = if self.device_update_replaces_health() {
+            None
+        } else {
+            self.own_daemon_health_banner()
         };
+        match (device, health) {
+            (Some(device), Some(health)) => widget::column::with_children(vec![device, health])
+                .spacing(space::XS)
+                .into(),
+            (Some(banner), None) | (None, Some(banner)) => banner,
+            (None, None) => iced::widget::Space::new().height(Length::Shrink).into(),
+        }
+    }
+
+    fn own_daemon_health_banner(&self) -> Option<Element<'_, Message>> {
+        let detail = health_detail(&self.daemon_health_ui.health)?;
         let mut row =
             widget::row::with_children(vec![design::body(detail).width(Length::Fill).into()])
                 .spacing(space::M)
@@ -300,11 +317,13 @@ impl Cagents {
                     ),
             );
         }
-        widget::container(row)
-            .padding(space::M)
-            .width(Length::Fill)
-            .class(cosmic::theme::Container::Dialog(false))
-            .into()
+        Some(
+            widget::container(row)
+                .padding(space::M)
+                .width(Length::Fill)
+                .class(cosmic::theme::Container::Dialog(false))
+                .into(),
+        )
     }
 
     pub(super) fn daemon_health_dialog(&self) -> Option<Element<'_, Message>> {

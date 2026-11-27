@@ -390,6 +390,9 @@ pub enum TopCommand {
         /// Copy initial navigation from this same-device client window.
         #[arg(long, value_parser = parse_window_slot, requires = "new_window")]
         source: Option<String>,
+        /// The calling window shows a startup failure itself.
+        #[arg(long, hide = true)]
+        caller_reports_startup_failure: bool,
     },
     /// Manage the persistent cagents daemon.
     Daemon {
@@ -4398,14 +4401,29 @@ where
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
         }
+        // A mismatch names both protocols, so a caller can tell which side
+        // to update without reading the sentence.
+        let details = crate::device::incompatible(&error).map(|mismatch| {
+            json!({
+                "device": mismatch.device,
+                "protocol": mismatch.actual,
+                "expected": crate::terminal_ipc::PROTOCOL_VERSION,
+            })
+        });
         let kind = if error.kind() == io::ErrorKind::PermissionDenied {
             "permission_denied"
-        } else if crate::device::incompatible(&error).is_some() {
+        } else if details.is_some() {
             "device_incompatible"
         } else {
             "device"
         };
-        emit_error(cli.global.json, &AppError::new(kind, error));
+        emit_error(
+            cli.global.json,
+            &AppError {
+                details,
+                ..AppError::new(kind, error)
+            },
+        );
         return ExitCode::FAILURE;
     }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
@@ -4659,7 +4677,13 @@ fn execute_with_model_context(
             new_window,
             window,
             source,
-        } => launch_ui(new_window, window.as_deref(), source.as_deref()),
+            caller_reports_startup_failure,
+        } => launch_ui(
+            new_window,
+            window.as_deref(),
+            source.as_deref(),
+            caller_reports_startup_failure,
+        ),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => match project_channel_context {
             Some(context) => execute_terminal_as(command, &context),
@@ -4697,6 +4721,7 @@ fn launch_ui(
     new_window: bool,
     slot: Option<&str>,
     source: Option<&str>,
+    caller_reports_startup_failure: bool,
 ) -> Result<CommandOutput, AppError> {
     let unique_slot = uuid::Uuid::new_v4().to_string();
     let remote_new_window = new_window && crate::device::is_remote();
@@ -4730,6 +4755,9 @@ fn launch_ui(
         }
         if let Some(source) = source {
             command.args(["--from-window", source]);
+        }
+        if caller_reports_startup_failure {
+            command.arg(instance::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT);
         }
 
         if let Some(slot) = slot {

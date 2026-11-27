@@ -6,8 +6,8 @@ runs on your desktop. Terminals, native conversations, account probes, and the
 saved windows; opening another device does not move or stop the existing jobs.
 
 Both computers run the same cagents version. Install cagents on your desktop;
-`cagents device update` installs that version on the device (see
-[Updating a device](#updating-a-device)). The remote machine does not need a
+connecting to a device that lacks that version offers to install or update it
+there (see [Updating a device](#updating-a-device)). The remote machine does not need a
 display. Set up ordinary SSH access first:
 
 ```console
@@ -22,7 +22,9 @@ provider credential files to your desktop.
 
 Use the current-device control at the bottom right of the status bar. Its menu
 lists **This device** and your saved devices. Choose **Connect to a device…** to
-enter an SSH host alias and remote executable, then **Save and switch device**.
+enter an SSH host alias and remote executable (by default
+`~/.local/bin/cagents`, where the installer links it), then **Save and switch
+device**.
 The profiles are stored in `devices.json` beside `settings.toml` in the desktop's cagents configuration
 directory (`~/.config/cagents/devices.json` on Linux; the development instance uses
 its own configuration directory):
@@ -33,14 +35,15 @@ its own configuration directory):
     {
       "name": "build-host",
       "host": "build-host",
-      "executable": "/home/user/.local/bin/cagents"
+      "executable": "~/.local/bin/cagents"
     }
   ]
 }
 ```
 
 `executable` defaults to `cagents` and names the remote CLI, not a shell script
-body. It is quoted as one executable name. Device names contain 1–16 letters,
+body. It is quoted as one executable name; a leading `~/` is the device user's
+home, read by the device's shell. Device names contain 1–16 letters,
 digits, hyphens, or underscores. `local` is reserved for this computer. A saved
 name keeps its connection: saving the same name with another host or executable
 is refused. The file holds at most 64 devices and 64 KiB, and a save that would
@@ -118,9 +121,14 @@ connects separately under your own configuration, as before.
 Closing the window detaches its SSH streams; daemon-hosted jobs continue. SSH
 keepalives detect lost connections, and the normal terminal/chat reconnect paths
 establish new streams. Startup failures identify the selected device and include
-SSH diagnostics. When the device runs another cagents version, the failure says
-which side is older; an older device can be brought up to date with
-`cagents device update`.
+SSH diagnostics. When the device runs another cagents version or none, the
+window says which side is older and offers **Update NAME** (or **Install on
+NAME**), which runs `cagents device update NAME --yes` with its progress shown
+and reconnects when it finishes. A device window shows this in place of its
+connection banner; a switch or new window that failed shows it in the window you
+started from, one device at a time. When this computer cannot update the
+device, such as one whose cagents was not installed with `install.sh`, the
+banner says why instead of offering to.
 
 ## Updating a device
 
@@ -140,7 +148,8 @@ terminals keep their processes, and work that cannot be carried waits or is
 listed for your decision. Run it from a terminal to answer those prompts; pass
 `--yes` to accept the handover without prompting, and `--interrupt` to also stop
 work that would otherwise block it. A device that is already compatible is left
-alone.
+alone. `--check` reports what an update would do without changing anything,
+including a device executable SSH commands would not find.
 
 It needs only SSH: the device downloads nothing, and no credentials are copied.
 It refuses, without changing the device, when:
@@ -155,7 +164,7 @@ It refuses, without changing the device, when:
 
 On a device without cagents, it installs into `~/.local/share/cagents-install`
 with links in `~/.local/bin`; set the device's `executable` to
-`~/.local/bin/cagents` by its absolute path if that directory is not on the
+`~/.local/bin/cagents` if it is `cagents` and that directory is not on the
 non-interactive SSH `PATH`.
 
 The first device-window implementation uses Device files for remote filesystem
