@@ -194,13 +194,18 @@ pub struct Site {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unreadable,
+    /// The file is not a readable SQLite database, or is corrupt.
+    Damaged,
     Busy,
     /// A cookie database layout this importer has not been checked against,
     /// usually from a newer browser version.
     UnsupportedSchema,
     /// A cookie encryption scheme this importer cannot decrypt.
     UnsupportedEncryption,
+    /// The whole profile is beyond the import limits.
     TooLarge,
+    /// The selected sites hold more cookie data than one import takes.
+    TooManySelected,
     KeyringDenied,
     /// The keyring has no entry under the browser's name.
     KeyMissing,
@@ -213,14 +218,16 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Unreadable => "Couldn't read this profile's cookies. Check that its folder is readable, then retry.",
+            Self::Unreadable => "Couldn't read this profile's cookies. Check that its folder is readable and the browser isn't mid-update, then retry.",
             Self::Busy => "The browser kept changing its cookies while they were read. Wait a moment or close the browser, then retry.",
             Self::UnsupportedSchema => "This profile stores cookies in a format this app doesn't recognize yet, possibly from a newer browser version. No cookies were imported from it.",
             Self::UnsupportedEncryption => "This browser encrypts its cookies in a way this app can't read yet. No cookies were imported from it.",
-            Self::TooLarge => "This profile has more cookies than this app can import. Import a smaller profile, or select fewer sites if that applies.",
+            Self::Damaged => "This profile's cookie file is damaged or isn't a cookie database. Open the browser once so it can repair it, then retry.",
+            Self::TooLarge => "This profile is too large to import.",
+            Self::TooManySelected => "Too many cookies are selected from this profile. Select fewer sites, then retry.",
             Self::KeyringDenied => "Your desktop keyring didn't allow access to this browser's cookie key. Unlock the keyring and allow access when asked, then retry.",
-            Self::KeyMissing => "Your desktop keyring has no cookie key for this browser. Open the browser once so it can save its key, then retry.",
-            Self::Decryption => "This profile's cookies were saved with a key your desktop keyring no longer has, so none were imported.",
+            Self::KeyMissing => "Couldn't find this browser's cookie key. Check that your desktop keyring is running and unlocked, and that the browser has been opened at least once, then retry.",
+            Self::Decryption => "This profile's cookies were saved with a key your desktop keyring no longer has, so none were imported. Sign in again in that browser to save new cookies, then retry.",
             Self::Cancelled => "The import was cancelled.",
         })
     }
@@ -378,10 +385,12 @@ mod tests {
         use super::Error::*;
         for error in [
             Unreadable,
+            Damaged,
             Busy,
             UnsupportedSchema,
             UnsupportedEncryption,
             TooLarge,
+            TooManySelected,
             KeyringDenied,
             KeyMissing,
             Decryption,

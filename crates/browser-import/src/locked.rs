@@ -71,7 +71,7 @@ pub(crate) fn image(
 /// Bytes 18 and 19 are 2 for a WAL database. The copy has no log, so mark
 /// it as a rollback-journal database for SQLite to open it from memory.
 fn without_log(image: &mut [u8]) -> Result<(), Error> {
-    let versions = image.get_mut(18..20).ok_or(Error::Unreadable)?;
+    let versions = image.get_mut(18..20).ok_or(Error::Damaged)?;
     for byte in versions {
         if *byte == 2 {
             *byte = 1;
@@ -185,7 +185,7 @@ fn replay(image: &mut Zeroizing<Vec<u8>>, wal: &[u8], limit: u64) -> Result<(), 
             size => usize::from(size),
         };
         if stored != page_size {
-            return Err(Error::Unreadable);
+            return Err(Error::Damaged);
         }
     }
     // First find the committed frames and the final size, so the image is

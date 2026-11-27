@@ -19,6 +19,9 @@ fn sql(error: rusqlite::Error) -> Error {
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
             Error::Busy
         }
+        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => {
+            Error::Damaged
+        }
         _ => Error::Unreadable,
     }
 }
@@ -358,7 +361,7 @@ pub(super) fn extract(
         }
         imported_bytes = imported_bytes.saturating_add(value.len() + name.len() + path.len());
         if imported_bytes > 16 * 1024 * 1024 || batch.cookies.len() >= 20_000 {
-            return Err(Error::TooLarge);
+            return Err(Error::TooManySelected);
         }
         let same_site = match site {
             0 => SameSite::None,
