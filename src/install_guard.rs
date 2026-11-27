@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd},
         unix::{
             fs::{FileTypeExt, MetadataExt},
             process::CommandExt,
@@ -1281,6 +1281,7 @@ pub(crate) fn wait_daemon_start_with_progress(
             error,
             spawned: false,
         })?;
+    let mut exit_notification = crate::process::identity::child_identity(&child).ok();
     let budget_error = || {
         io::Error::new(
             io::ErrorKind::TimedOut,
@@ -1307,6 +1308,18 @@ pub(crate) fn wait_daemon_start_with_progress(
                 };
             }
             Ok(None) if Instant::now() < deadline => {
+                if let Some(exit) = exit_notification.take()
+                    && crate::descriptor::wait_for_activity(
+                        exit.as_fd(),
+                        libc::POLLIN,
+                        Some(deadline),
+                    )
+                    .is_ok()
+                {
+                    continue;
+                }
+                // Preserve the same wait and deadline when the kernel cannot
+                // provide this process with an exit notification.
                 thread::sleep(Duration::from_millis(25));
                 continue;
             }
