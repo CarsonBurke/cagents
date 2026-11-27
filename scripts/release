@@ -406,6 +406,8 @@ case $(command -v zig || :) in
         export PATH="${zig%/*}:$PATH"
         ;;
 esac
+# Rehearsal keys are compiled into private test builds only.
+unset CAGENTS_UPDATE_REHEARSAL_KEYS
 # rustup and Cargo find the checkout's toolchain and config from cwd.
 (cd build-source && scripts/package-macos --output "$1/dist" </dev/null 9>&-)
 BUILD

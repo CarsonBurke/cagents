@@ -609,6 +609,18 @@ fn installer_updates_only(version: Option<&str>) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Private rehearsal builds can exercise the real signed update worker from
+/// their local feed before installed Darwin builds offer it to users.
+fn requires_installer(rehearsal_key: bool, file_feed: bool) -> bool {
+    cfg!(target_os = "macos") && !(rehearsal_key && file_feed)
+}
+
+fn signed_update_requires_installer() -> bool {
+    let rehearsal_key = cfg!(target_os = "macos") && signature::rehearsal_build();
+    let file_feed = rehearsal_key && feed::Feed::configured().is_ok_and(|feed| feed.is_local());
+    requires_installer(rehearsal_key, file_feed)
+}
+
 fn unsupported_install() -> UpdateError {
     UpdateError::UnsupportedInstallation
 }
@@ -669,7 +681,10 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
         result => result?,
     };
     Ok(match release {
-        Some(release) => offered(release, cfg!(target_os = "macos")),
+        Some(release) => offered(
+            release,
+            requires_installer(signature::rehearsal_build(), feed.is_local()),
+        ),
         None => UpdateState::Current {
             version: installation.version,
         },
@@ -738,7 +753,9 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
             "a native evidence session never installs a release",
         ));
     }
-    installer_updates_only(Some(&release.version))?;
+    if signed_update_requires_installer() {
+        return Err(invalid(installer_updates(Some(&release.version))));
+    }
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
@@ -886,7 +903,7 @@ pub fn upgrade_release(
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
-    if cfg!(target_os = "macos") {
+    if signed_update_requires_installer() {
         // Offer the installer command for the release, once it is verified.
         let selected = selected_upgrade(&Installation::detect()?, version)?;
         return Err(invalid(installer_updates(Some(&selected.version))));
@@ -2608,6 +2625,11 @@ fn perform_update(
     };
     let cancellation = CancellationToken::for_job(state, &job.id)?;
     let feed = feed::Feed::configured().map_err(invalid)?;
+    if requires_installer(signature::rehearsal_build(), feed.is_local()) {
+        return Err(invalid(
+            "this macOS build must be updated with the installer",
+        ));
+    }
     let release = feed.release(&selected.version, &cancellation)?;
     if release != selected || !is_newer(&release.version, &installation.version)? {
         return Err(invalid(
@@ -4361,6 +4383,13 @@ mod tests {
             installer_updates_only(None).is_err(),
             cfg!(target_os = "macos")
         );
+        for (key, file_feed) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                requires_installer(key, file_feed),
+                cfg!(target_os = "macos")
+            );
+        }
+        assert!(!requires_installer(true, true));
         // Each command ends the text, so copying it takes nothing else.
         assert!(installer_updates(Some("0.2.5")).ends_with(
             "\n\ncurl -fsSL https://github.com/CarsonBurke/cagents/releases/download/v0.2.5/install-macos.sh | sh -s -- --version 0.2.5"

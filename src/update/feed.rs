@@ -118,6 +118,10 @@ impl Feed {
         Ok(Self { base, local, keys })
     }
 
+    pub(super) fn is_local(&self) -> bool {
+        self.local
+    }
+
     /// The newest published release, verified, when `newer` says it is an
     /// update. Its version is read before anything else, so a routine check
     /// that finds nothing new makes one small request, and a release from
