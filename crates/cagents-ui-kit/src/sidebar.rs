@@ -1776,6 +1776,8 @@ pub enum MutationKind {
     Abort,
     /// Resuming a rebase, cherry-pick or revert sequence.
     Continue,
+    /// Dropping a cherry-pick, revert or rebase step with nothing to commit.
+    Skip,
 }
 
 impl MutationKind {
@@ -1788,6 +1790,7 @@ impl MutationKind {
             Self::Push => "Pushing…",
             Self::Abort => "Aborting…",
             Self::Continue => "Continuing…",
+            Self::Skip => "Skipping…",
         }
     }
 }
@@ -2834,20 +2837,48 @@ impl SourceControlModel {
     }
 
     /// Whether a commit would record anything Git accepts: staged changes,
-    /// or a merge, cherry-pick or revert whose conflicts are all resolved.
-    /// Resolving every conflict in favour of ours leaves nothing staged, and
-    /// the commit that concludes the merge is still required; Git creates it.
-    /// Git refuses any commit while a path is still conflicted.
+    /// or a merge whose conflicts are all resolved. Resolving every conflict
+    /// in favour of ours leaves nothing staged, and the commit that
+    /// concludes the merge is still required; Git creates it. Git refuses
+    /// any commit while a path is still conflicted.
     pub fn has_commit_content(&self) -> bool {
         self.conflict_count() == 0 && (self.staged_count > 0 || self.concludes_operation())
     }
 
-    /// Whether a commit now concludes the operation's current step.
+    /// Whether a commit with nothing staged concludes the operation's
+    /// current step, which only a merge allows: Git calls such a cherry-pick
+    /// or revert empty and refuses it, and [`Self::can_skip`] offers to drop
+    /// it instead.
     pub fn concludes_operation(&self) -> bool {
+        self.operation.as_ref().is_some_and(|operation| {
+            operation.pending_commit && operation.kind == OperationKind::Merge
+        }) && self.conflict_count() == 0
+    }
+
+    /// Whether the stopped cherry-pick, revert or rebase step has left
+    /// nothing to commit, so the way on is to skip it: every conflict is
+    /// resolved, nothing is staged, and a single pick is still pending or a
+    /// rebase is between steps.
+    pub fn can_skip(&self) -> bool {
         self.operation
             .as_ref()
-            .is_some_and(|operation| operation.pending_commit)
+            .is_some_and(|operation| match operation.kind {
+                OperationKind::Merge => false,
+                OperationKind::Rebase => true,
+                OperationKind::CherryPick | OperationKind::Revert => operation.pending_commit,
+            })
             && self.conflict_count() == 0
+            && self.staged_count == 0
+    }
+
+    /// Whether the commit box commits through `--continue` rather than
+    /// `git commit`. A rebase step is committed by the rebase, which keeps
+    /// the replayed commit's author, and then goes on to the next step; so
+    /// the box offers that, and there is one control for the step.
+    pub fn commits_by_continuing(&self) -> bool {
+        self.operation
+            .as_ref()
+            .is_some_and(|operation| operation.kind == OperationKind::Rebase)
     }
 
     /// How many paths are still conflicted.
@@ -4917,6 +4948,9 @@ impl SidebarState {
         self.changes_tab_chosen = false;
         self.publish = None;
         self.discard = None;
+        // A confirmation names the worktree it was raised for, so it never
+        // carries to another one, where it would act on what is not shown.
+        self.git_confirmation = None;
         self.panel_selection = None;
         true
     }
@@ -5157,6 +5191,12 @@ impl SidebarState {
                 selection,
                 paths,
             } => {
+                // Raised after a task finishes, which may be after the panel
+                // moved to another worktree; there it would ask about one
+                // the user is not looking at.
+                if self.active_worktree.as_ref() != Some(key) {
+                    return;
+                }
                 self.git_confirmation = Some(GitConfirmation::StageConflictMarkers {
                     key: key.clone(),
                     selection: selection.clone(),
@@ -5164,6 +5204,9 @@ impl SidebarState {
                 });
             }
             SidebarAction::RequestAbortOperation { key, kind } => {
+                if self.active_worktree.as_ref() != Some(key) {
+                    return;
+                }
                 self.git_confirmation = Some(GitConfirmation::AbortOperation {
                     key: key.clone(),
                     kind: *kind,
@@ -5222,6 +5265,7 @@ impl SidebarState {
             | SidebarAction::OpenWork
             | SidebarAction::Stage { .. }
             | SidebarAction::ContinueOperation { .. }
+            | SidebarAction::SkipOperation { .. }
             | SidebarAction::ChangeGroup { .. }
             | SidebarAction::Unstage { .. }
             | SidebarAction::Commit { .. }
@@ -5546,8 +5590,15 @@ pub enum SidebarAction {
     },
     /// Dismisses whichever [`GitConfirmation`] is showing.
     CancelGitConfirmation,
-    /// Resumes the rebase, cherry-pick or revert sequence in progress.
+    /// Resumes the rebase, cherry-pick or revert sequence in progress. A
+    /// rebase step commits with the panel's commit draft as its message.
     ContinueOperation {
+        key: ActiveWorktreeKey,
+        kind: OperationKind,
+    },
+    /// Drops the cherry-pick, revert or rebase step that left nothing to
+    /// commit, and goes on with the rest.
+    SkipOperation {
         key: ActiveWorktreeKey,
         kind: OperationKind,
     },
@@ -11515,14 +11566,18 @@ fn operation_banner<'a>(
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let key = &source.key;
-    let subject = operation.subject.as_deref();
+    // A rebase of a detached HEAD has no branch to name.
+    let subject = operation
+        .subject
+        .as_deref()
+        .filter(|subject| *subject != "detached HEAD");
     let mut title = match (operation.kind, subject) {
         (OperationKind::Merge, _) => "Merge in progress".to_owned(),
         (OperationKind::Rebase, Some(subject)) => format!("Rebasing {subject}"),
         (OperationKind::Rebase, None) => "Rebase in progress".to_owned(),
-        (OperationKind::CherryPick, Some(subject)) => format!("Cherry-picking {subject}"),
+        (OperationKind::CherryPick, Some(subject)) => format!("Cherry-picking “{subject}”"),
         (OperationKind::CherryPick, None) => "Cherry-pick in progress".to_owned(),
-        (OperationKind::Revert, Some(subject)) => format!("Reverting {subject}"),
+        (OperationKind::Revert, Some(subject)) => format!("Reverting “{subject}”"),
         (OperationKind::Revert, None) => "Revert in progress".to_owned(),
     };
     if let Some((step, steps)) = operation.progress {
@@ -11530,19 +11585,26 @@ fn operation_banner<'a>(
     }
     let conflicts = source.conflict_count();
     let noun = operation.kind.noun();
-    let continues = !operation.pending_commit;
+    let skips = source.can_skip();
+    // The commit box concludes a pending merge or pick and commits a rebase
+    // step; only a sequence between two steps needs a Continue of its own.
+    let continues = !operation.pending_commit && operation.kind != OperationKind::Rebase;
     let status = if conflicts > 0 {
         format!(
             "Resolve {conflicts} conflicted {}, then mark {} resolved.",
             if conflicts == 1 { "file" } else { "files" },
             if conflicts == 1 { "it" } else { "each" },
         )
+    } else if skips && operation.kind == OperationKind::Rebase {
+        "Nothing is staged for this step. Continue if it needs no commit, or skip it.".to_owned()
+    } else if skips {
+        "Its changes are already here, so there is nothing to commit. Skip it to go on.".to_owned()
     } else if operation.pending_commit && operation.sequence {
-        "Commit this step, then continue with the next.".to_owned()
+        "Commit this step, then continue with the rest.".to_owned()
     } else if operation.pending_commit {
         format!("Commit to conclude the {noun}.")
     } else if operation.kind == OperationKind::Rebase {
-        "Continue to commit this step and replay the rest.".to_owned()
+        "Continue the rebase below to commit this step and replay the rest.".to_owned()
     } else {
         format!("Continue to apply the rest of the {noun}.")
     };
@@ -11556,11 +11618,23 @@ fn operation_banner<'a>(
             },
             gate,
         ));
-    let mut actions = widget::row::with_capacity(3)
+    let mut actions = widget::row::with_capacity(4)
         .spacing(space::S)
         .align_y(Alignment::Center)
         .push(widget::Space::new().width(Length::Fill))
         .push(abort);
+    if skips {
+        let skip = crate::ui_controls::button::secondary("Skip")
+            .name(format!("Skip this {noun} step"))
+            .on_press_maybe(gated(
+                SidebarAction::SkipOperation {
+                    key: key.clone(),
+                    kind: operation.kind,
+                },
+                gate,
+            ));
+        actions = actions.push(skip);
+    }
     if continues {
         actions = actions.push(
             crate::ui_controls::button::primary("Continue")
@@ -11624,7 +11698,11 @@ fn changes_section<'a>(
         })));
     if source.groups().iter().all(ChangeGroup::is_empty) {
         column = column.push(design::caption(
-            if state.section_expanded(PanelSection::Untracked) {
+            // Under a banner that asks for a commit, "clean" would read as
+            // nothing left to do.
+            if source.operation.is_some() {
+                "No changes in the working tree."
+            } else if state.section_expanded(PanelSection::Untracked) {
                 "Working tree clean."
             } else {
                 "No tracked changes."
@@ -11636,7 +11714,11 @@ fn changes_section<'a>(
         // upstream so that a plain push could no longer send it.
         let pushed = source.upstream.is_some()
             && matches!(source.tracking, TrackingState::Compared { ahead: 0, .. });
-        if source.head_oid.is_some() && !pushed && !offers_commit(state, source) {
+        if source.head_oid.is_some()
+            && source.operation.is_none()
+            && !pushed
+            && !offers_commit(state, source)
+        {
             column = column.push(
                 crate::ui_controls::button::secondary("Amend last commit")
                     .icon(Icon::Commit.handle())
@@ -12356,7 +12438,8 @@ fn commit_description_style(
 fn offers_commit(state: &SidebarState, source: &SourceControlModel) -> bool {
     source.has_uncommitted_changes()
         || source.concludes_operation()
-        || state.commit_draft.amend
+        || source.commits_by_continuing()
+        || (state.commit_draft.amend && source.operation.is_none())
         || !state.commit_message().trim().is_empty()
 }
 
@@ -12444,18 +12527,31 @@ fn changes_footer<'a>(
     let chrome = &source.chrome;
     let message = state.commit_message();
     let input_key = key.clone();
+    // Git refuses to amend in the middle of a merge, cherry-pick or rebase,
+    // so a ticked Amend waits until the operation is over.
+    let amending = state.commit_draft.amend && source.operation.is_none();
+    let continuing = source.commits_by_continuing();
     let can_commit = !modal_open
         && !source.busy()
         && !state.commit_draft.subject.trim().is_empty()
-        && (if state.commit_draft.amend {
+        && (if continuing {
+            source.conflict_count() == 0
+        } else if amending {
             source.head_oid.is_some() && source.conflict_count() == 0
         } else {
             source.has_commit_content()
         });
-    let commit_action = SidebarAction::Commit {
-        key: key.clone(),
-        message: message.to_owned(),
-        amend: state.commit_draft.amend,
+    let commit_action = if continuing {
+        SidebarAction::ContinueOperation {
+            key: key.clone(),
+            kind: OperationKind::Rebase,
+        }
+    } else {
+        SidebarAction::Commit {
+            key: key.clone(),
+            message: message.to_owned(),
+            amend: amending,
+        }
     };
     let submit = commit_action.clone();
     let subject_submit = commit_action.clone();
@@ -12557,46 +12653,68 @@ fn changes_footer<'a>(
             });
     }
 
-    let commit_label = if state.commit_draft.amend {
+    let commit_label = if continuing {
+        "Continue rebase"
+    } else if amending {
         "Amend commit"
     } else {
         "Commit"
     };
+    let kind = source.operation.as_ref().map(|operation| operation.kind);
     let commit_hint = if !has_subject {
         "Enter a commit summary"
     } else if source.busy() {
         "Git operation in progress"
+    } else if continuing && source.conflict_count() > 0 {
+        "Resolve conflicts to continue the rebase"
+    } else if continuing {
+        "Commit this step and replay the rest"
     } else if source.conflict_count() > 0 {
         "Resolve conflicts to commit"
-    } else if !source.has_commit_content() && !state.commit_draft.amend {
+    } else if !amending && source.can_skip() {
+        match kind {
+            Some(OperationKind::Revert) => "Nothing to commit; skip this revert",
+            _ => "Nothing to commit; skip this cherry-pick",
+        }
+    } else if !source.has_commit_content() && !amending {
         "Stage changes to commit"
-    } else if !state.commit_draft.amend && source.concludes_operation() {
-        match source.operation.as_ref().map(|operation| operation.kind) {
+    } else if !amending
+        && source
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.pending_commit)
+    {
+        match kind {
             Some(OperationKind::CherryPick) => "Commit to conclude the cherry-pick",
             Some(OperationKind::Revert) => "Commit to conclude the revert",
             _ => "Commit to conclude the merge",
         }
-    } else if !can_commit && state.commit_draft.amend && source.head_oid.is_none() {
+    } else if !can_commit && amending && source.head_oid.is_none() {
         "No commit to amend"
     } else {
         commit_label
     };
     let commit = crate::interaction::tooltip(
-        // Ticking Amend relabels Commit in place.
-        crate::ui_controls::button::primary("Commit")
-            .instead("Amend commit", state.commit_draft.amend)
-            .icon(Icon::Commit)
-            .name(format!("{commit_label} (Ctrl+Enter)"))
-            .id(chrome.commit_id.clone())
-            .on_press_maybe(can_commit.then_some(commit_action)),
+        // Ticking Amend relabels Commit in place, as a rebase does.
+        crate::ui_controls::button::primary(if continuing {
+            "Continue rebase"
+        } else {
+            "Commit"
+        })
+        .instead("Amend commit", amending)
+        .icon(Icon::Commit)
+        .name(format!("{commit_label} (Ctrl+Enter)"))
+        .id(chrome.commit_id.clone())
+        .on_press_maybe(can_commit.then_some(commit_action)),
         format!("{commit_hint} (Ctrl+Enter)"),
     );
 
     if has_subject {
         column = column.push(commit_input);
     }
-    // Amending needs a commit; an unborn branch has none to offer.
-    let amend = source.head_oid.is_some().then(|| {
+    // Amending needs a commit; an unborn branch has none to offer, and Git
+    // will not amend while an operation is stopped.
+    let amend = (source.head_oid.is_some() && source.operation.is_none()).then(|| {
         crate::ui_controls::field::checkbox(state.commit_draft.amend)
             .label("Amend")
             .size(14)
@@ -13019,6 +13137,12 @@ pub fn git_confirmation_dialog(
     pending: &GitConfirmation,
     surface_id: Id,
 ) -> Element<'_, SidebarAction> {
+    // The worktree is named because the dialog acts on it, and the panel is
+    // not the only place showing one.
+    let worktree = pending.key().canonical_path.file_name().map_or_else(
+        || pending.key().canonical_path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     let (title, body, consequence, confirm): (String, String, &str, &str) = match pending {
         GitConfirmation::StageConflictMarkers { paths, .. } => {
             let named = match paths.as_slice() {
@@ -13028,7 +13152,9 @@ pub fn git_confirmation_dialog(
             (
                 format!("Mark {named} resolved?"),
                 if paths.len() == 1 {
-                    format!("{named} still contains conflict markers (<<<<<<< and >>>>>>>).")
+                    format!(
+                        "{named} in {worktree} still contains conflict markers (<<<<<<< and >>>>>>>)."
+                    )
                 } else {
                     let list = paths
                         .iter()
@@ -13042,21 +13168,27 @@ pub fn git_confirmation_dialog(
                     } else {
                         String::new()
                     };
-                    format!("{list}{more} still contain conflict markers (<<<<<<< and >>>>>>>).")
+                    format!(
+                        "{list}{more} in {worktree} still contain conflict markers (<<<<<<< and >>>>>>>)."
+                    )
                 },
-                "Marking them resolved stages the markers, and the next commit records them.",
+                if paths.len() == 1 {
+                    "Marking it resolved stages the markers, and the next commit records them."
+                } else {
+                    "Marking them resolved stages the markers, and the next commit records them."
+                },
                 "Mark resolved",
             )
         }
         GitConfirmation::AbortOperation { kind, .. } => {
             let noun = kind.noun();
             (
-                format!("Abort the {noun}?"),
+                format!("Abort the {noun} in {worktree}?"),
                 format!(
-                    "The worktree returns to where it was before the {noun} began. \
+                    "{worktree} returns to where it was before the {noun} began. \
                      Conflicts you resolved and changes you staged for it are lost."
                 ),
-                "This can't be undone from Git.",
+                "There is no undo for this.",
                 "Abort",
             )
         }

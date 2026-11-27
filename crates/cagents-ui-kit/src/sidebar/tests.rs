@@ -13731,9 +13731,10 @@ fn committing_and_continuing_wait_for_every_conflict() {
         sequence: false,
         subject: Some("side".into()),
         progress: Some((2, 5)),
-        message: None,
+        message: Some("theirs".into()),
     });
-    let (model, state) = operation_panel(&snapshot);
+    let (model, mut state) = operation_panel(&snapshot);
+    state.adopt_operation_message(model.source_control.as_ref().unwrap());
     let renderer = headless_renderer();
     let continues = |model: &SidebarModel, state: &SidebarState| {
         frame_enter_presses(&renderer, git_panel(model, state, 380.0, false))
@@ -13753,7 +13754,8 @@ fn committing_and_continuing_wait_for_every_conflict() {
         .status
         .entries
         .retain(|entry| entry.area != ChangeArea::Conflict);
-    let (model, state) = operation_panel(&snapshot);
+    let (model, mut state) = operation_panel(&snapshot);
+    state.adopt_operation_message(model.source_control.as_ref().unwrap());
     assert!(continues(&model, &state));
 }
 
@@ -13810,7 +13812,7 @@ fn a_conflicted_row_offers_to_mark_it_resolved() {
 /// takes it down.
 #[test]
 fn a_git_confirmation_runs_what_it_describes() {
-    let mut state = SidebarState::default();
+    let mut state = panel_state(&panel_model());
     let selection = vec![PathSelection::new(repo_path("f.txt"))];
     state.apply(&SidebarAction::RequestStageConflictMarkers {
         key: main_key(),
@@ -13835,4 +13837,173 @@ fn a_git_confirmation_runs_what_it_describes() {
     let confirm = state.pending_git_confirmation().unwrap().confirm_action();
     state.apply(&confirm);
     assert!(state.pending_git_confirmation().is_none());
+}
+
+/// A confirmation belongs to the worktree it was raised for: one raised for
+/// a worktree the panel does not show is not raised, and moving to another
+/// worktree takes a raised one down rather than letting it act there.
+#[test]
+fn a_git_confirmation_stays_with_its_worktree() {
+    let model = panel_model();
+    let mut state = panel_state(&model);
+    state.apply(&SidebarAction::RequestAbortOperation {
+        key: fix_key(),
+        kind: OperationKind::Merge,
+    });
+    assert!(
+        state.pending_git_confirmation().is_none(),
+        "fix-sidebar is not the bound worktree"
+    );
+
+    state.apply(&SidebarAction::RequestStageConflictMarkers {
+        key: main_key(),
+        selection: vec![PathSelection::new(repo_path("f.txt"))],
+        paths: vec![repo_path("f.txt")],
+    });
+    assert!(state.pending_git_confirmation().is_some());
+    assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+    assert!(state.pending_git_confirmation().is_none());
+    assert!(state.sync_active_worktree(&model, &focus_on(&main_key())));
+    assert!(
+        state.pending_git_confirmation().is_none(),
+        "returning does not revive it"
+    );
+}
+
+fn picking(kind: OperationKind) -> crate::repository::InProgressOperation {
+    crate::repository::InProgressOperation {
+        kind,
+        pending_commit: true,
+        sequence: false,
+        subject: Some("theirs".into()),
+        progress: None,
+        message: Some("theirs".into()),
+    }
+}
+
+fn panel_texts(model: &SidebarModel, state: &SidebarState) -> Vec<String> {
+    laid_out_texts(
+        git_panel(model, state, 380.0, false),
+        Size::new(380.0, 4000.0),
+    )
+    .into_iter()
+    .map(|(text, _)| text)
+    .collect()
+}
+
+/// A cherry-pick or revert whose changes are already present has nothing to
+/// commit, and Git refuses to commit it empty, so the panel offers Skip and
+/// keeps Commit disabled; only a merge concludes with nothing staged.
+#[test]
+fn an_empty_pick_offers_skip_rather_than_commit() {
+    for kind in [OperationKind::CherryPick, OperationKind::Revert] {
+        let mut snapshot = snapshot();
+        snapshot.status.entries.clear();
+        snapshot.operation = Some(picking(kind));
+        let (model, mut state) = operation_panel(&snapshot);
+        let source = model.source_control.as_ref().unwrap();
+        assert!(!source.concludes_operation());
+        assert!(source.can_skip());
+        assert!(!source.can_commit("theirs"));
+
+        state.adopt_operation_message(source);
+        let actions = frame_enter_presses(
+            &headless_renderer(),
+            git_panel(&model, &state, 380.0, false),
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                SidebarAction::SkipOperation { kind: skipped, .. } if *skipped == kind
+            )),
+            "{kind:?}: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                SidebarAction::Commit { .. } | SidebarAction::ContinueOperation { .. }
+            )),
+            "{kind:?}: {actions:?}"
+        );
+        let texts = panel_texts(&model, &state);
+        assert!(
+            texts.iter().any(|text| text.contains("“theirs”")),
+            "the banner names the commit by its subject: {texts:?}"
+        );
+    }
+
+    // With the pick's changes staged, Commit concludes it and Skip is gone.
+    let mut snapshot = snapshot();
+    snapshot
+        .status
+        .entries
+        .retain(|entry| entry.area != ChangeArea::Conflict);
+    snapshot.status.dirty.conflicted = 0;
+    snapshot.operation = Some(picking(OperationKind::CherryPick));
+    let source = SourceControlModel::ready(main_key(), &snapshot);
+    assert!(source.staged_count > 0);
+    assert!(!source.can_skip());
+    assert!(source.can_commit("theirs"));
+}
+
+/// A rebase step is committed through the commit box, whose button
+/// continues the rebase with the message in the box, so the step has one
+/// commit control; amending is not offered while an operation is stopped.
+#[test]
+fn a_rebase_step_is_committed_by_continuing_from_the_commit_box() {
+    let mut snapshot = snapshot();
+    snapshot
+        .status
+        .entries
+        .retain(|entry| entry.area != ChangeArea::Conflict);
+    snapshot.status.dirty.conflicted = 0;
+    snapshot.operation = Some(crate::repository::InProgressOperation {
+        kind: OperationKind::Rebase,
+        pending_commit: false,
+        sequence: false,
+        subject: Some("side".into()),
+        progress: Some((2, 5)),
+        message: Some("theirs\n\nThe body.".into()),
+    });
+    let (model, mut state) = operation_panel(&snapshot);
+    let source = model.source_control.as_ref().unwrap();
+    assert!(source.commits_by_continuing());
+    state.adopt_operation_message(source);
+    assert_eq!(state.commit_message(), "theirs\n\nThe body.");
+
+    let actions = frame_enter_presses(
+        &headless_renderer(),
+        git_panel(&model, &state, 380.0, false),
+    );
+    let continues = actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action,
+                SidebarAction::ContinueOperation {
+                    kind: OperationKind::Rebase,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(continues, 1, "one control commits the step: {actions:?}");
+    assert!(
+        !actions.iter().any(|action| matches!(
+            action,
+            SidebarAction::Commit { .. } | SidebarAction::AmendChanged { .. }
+        )),
+        "{actions:?}"
+    );
+    let texts = panel_texts(&model, &state);
+    assert!(
+        texts.iter().any(|text| text == "Continue rebase"),
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text == "Amend" || text == "Amend last commit"),
+        "{texts:?}"
+    );
 }

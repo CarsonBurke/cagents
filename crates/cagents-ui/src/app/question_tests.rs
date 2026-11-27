@@ -415,9 +415,31 @@ fn open(question: Question) -> Opened {
             )
         }
         Question::ConfirmGitCommand => {
+            // A Git confirmation is raised only for the worktree the panel
+            // is bound to.
             let mut app = tests::context_inspector_test_app(false);
+            let worktree = std::path::PathBuf::from("/repo/main");
+            app.sidebar_model
+                .projects
+                .push(sidebar::SidebarProject::new(
+                    crate::model::ProjectId::default(),
+                    crate::repository::RepositoryId::new(),
+                    "repo".into(),
+                    "/repo".into(),
+                    vec![sidebar::SidebarWorktree::from_durable(
+                        crate::model::WorktreeId::new(),
+                        worktree.clone(),
+                        Some("main".into()),
+                    )],
+                    Vec::new(),
+                ));
+            assert!(app.sidebar_state.sync_active_worktree(
+                &app.sidebar_model,
+                &sidebar::SidebarFocus::Repository { worktree },
+            ));
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
             let opening = app.update(Message::Sidebar(SidebarAction::RequestAbortOperation {
-                key: tests::discard_key(),
+                key,
                 kind: crate::repository::OperationKind::Merge,
             }));
             opened(

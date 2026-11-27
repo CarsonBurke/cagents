@@ -4,10 +4,10 @@ use cagents::{
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     process::ProcessExecutor,
     repository::{
-        CancellationToken, CommitOutcome, CommitRequest, DiffBasis, MutationFailure, MutationOutcome,
-        PathSelection, RepositoryError,
-        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryService, RepositorySnapshot,
-        StageRequest, UnstageRequest,
+        CancellationToken, CommitOutcome, CommitRequest, DiffBasis, MutationFailure,
+        MutationOutcome, OperationKind, PathSelection, PushOutcome, PushRequest, RepoPath,
+        RepositoryError, RepositoryId, RepositoryService, RepositorySnapshot, StageRequest,
+        UnstageRequest,
     },
     settings::{self, AppSettings, AppTheme},
     splitter::{self, Splitter},
@@ -3098,12 +3098,11 @@ impl Editor {
             return Task::none();
         };
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                run(&RepositoryService::system("git"), &root)
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
+            let result =
+                tokio::task::spawn_blocking(move || run(&RepositoryService::system("git"), &root))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
             Message::Mutation(id, result)
         })
     }
@@ -4137,6 +4136,7 @@ impl Application for Editor {
                         | SidebarAction::RequestAbortOperation { key, .. }
                         | SidebarAction::ConfirmAbortOperation { key, .. }
                         | SidebarAction::ContinueOperation { key, .. }
+                        | SidebarAction::SkipOperation { key, .. }
                         | SidebarAction::CommitMessageChanged { key, .. }
                         | SidebarAction::Commit { key, .. }
                         | SidebarAction::Push { key, .. }
@@ -4215,12 +4215,25 @@ impl Application for Editor {
                             })
                         }
                         SidebarAction::ContinueOperation { kind, .. } => {
+                            // A rebase step commits with the commit box's message.
+                            let message = (kind == OperationKind::Rebase)
+                                .then(|| {
+                                    self.tab(id)
+                                        .map(|tab| tab.navigation.commit_message().to_owned())
+                                })
+                                .flatten();
                             self.git_command(id, MutationKind::Continue, move |service, root| {
                                 service.continue_operation(
                                     root,
                                     kind,
+                                    message.as_deref(),
                                     &CancellationToken::default(),
                                 )
+                            })
+                        }
+                        SidebarAction::SkipOperation { kind, .. } => {
+                            self.git_command(id, MutationKind::Skip, move |service, root| {
+                                service.skip_operation(root, kind, &CancellationToken::default())
                             })
                         }
                         SidebarAction::ConfirmDiscard { request, .. } => {
@@ -4460,6 +4473,12 @@ impl Application for Editor {
                     Task::batch(tasks)
                 }
                 Message::StageNeedsConfirmation(id, selection, paths) => {
+                    // Asked only where it can be answered; otherwise the
+                    // refusal is reported instead of vanishing unseen.
+                    if self.modal_open() || self.active != Some(id) {
+                        let refusal = MutationFailure::ConflictMarkers { paths }.to_string();
+                        return self.finish_mutation(id, Some(refusal));
+                    }
                     let finished = self.finish_mutation(id, None);
                     let Some(key) = self
                         .tab(id)
@@ -5395,7 +5414,7 @@ impl Application for Editor {
             return Some(dialog_overlay(
                 sidebar::git_confirmation_dialog(
                     pending,
-                    widget::Id::new("dialog.question.ConfirmGitCommand"),
+                    cagents_ui_kit::question::Question::ConfirmGitCommand.surface_id(),
                 )
                 .map(Message::Sidebar),
                 Message::Sidebar(SidebarAction::CancelGitConfirmation),
@@ -9107,8 +9126,9 @@ mod tests {
             .map(|(focus, opened)| (focus, opened.unwrap()))
             .collect();
 
-        // One root lookup per file and six snapshot calls per worktree.
-        assert_eq!(executor.0.load(Ordering::Relaxed), 4 + 2 * 6);
+        // One root lookup per file and seven snapshot calls per worktree, the
+        // last locating any stopped merge, rebase or pick.
+        assert_eq!(executor.0.load(Ordering::Relaxed), 4 + 2 * 7);
         let snapshot = opened[0].1.snapshot.as_ref().unwrap();
         for (focus, opened) in &opened[..3] {
             assert_eq!(opened.root, root);

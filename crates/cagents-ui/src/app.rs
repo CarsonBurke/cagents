@@ -20611,18 +20611,35 @@ impl Cagents {
                 selection,
                 paths,
             } => {
-                // A stale answer, for a mutation the panel has moved on
-                // from, asks nothing.
-                let settled =
-                    handled!(self.source_control_mutated(key.clone(), operation, None, false));
-                let ask = self.dispatch(Message::Sidebar(
-                    SidebarAction::RequestStageConflictMarkers {
-                        key,
-                        selection,
-                        paths,
-                    },
-                ));
-                Task::batch([settled, ask])
+                // The question is asked only where it can be answered: in
+                // the worktree the panel still shows, with no other dialog
+                // over it. Otherwise the refusal is reported like any other,
+                // rather than vanishing with the question nobody saw. A stale
+                // answer, for a mutation the panel has moved on from, is
+                // neither.
+                let askable = !self.modal_is_open()
+                    && self.source_control_is_bound(&key)
+                    && self.sidebar_state.active_worktree() == Some(&key);
+                if askable {
+                    let settled =
+                        handled!(self.source_control_mutated(key.clone(), operation, None, false));
+                    let ask = self.dispatch(Message::Sidebar(
+                        SidebarAction::RequestStageConflictMarkers {
+                            key,
+                            selection,
+                            paths,
+                        },
+                    ));
+                    Task::batch([settled, ask])
+                } else {
+                    let report = mutation_report(
+                        "Stage",
+                        Ok(MutationOutcome::NotApplied {
+                            failure: crate::repository::MutationFailure::ConflictMarkers { paths },
+                        }),
+                    );
+                    handled!(self.source_control_mutated(key, operation, report, false))
+                }
             }
         };
         self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });

@@ -509,12 +509,33 @@ impl Cagents {
                     return ControlFlow::Break(Task::none());
                 };
                 let worktree = key.canonical_path.clone();
+                // A rebase step commits with the message in the commit box,
+                // which starts as the stopped commit's own.
+                let message = (kind == cagents::repository::OperationKind::Rebase)
+                    .then(|| self.sidebar_state.commit_message().to_owned());
                 Self::mutation_task(key, operation, move |service, cancel| {
                     (
                         mutation_report(
                             "Continue",
-                            service.continue_operation(&worktree, kind, cancel),
+                            service.continue_operation(
+                                &worktree,
+                                kind,
+                                message.as_deref(),
+                                cancel,
+                            ),
                         ),
+                        false,
+                    )
+                })
+            }
+            SidebarAction::SkipOperation { key, kind } => {
+                let Some(operation) = self.begin_mutation(&key, MutationKind::Skip, None) else {
+                    return ControlFlow::Break(Task::none());
+                };
+                let worktree = key.canonical_path.clone();
+                Self::mutation_task(key, operation, move |service, cancel| {
+                    (
+                        mutation_report("Skip", service.skip_operation(&worktree, kind, cancel)),
                         false,
                     )
                 })

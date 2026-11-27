@@ -1074,23 +1074,25 @@ impl OperationKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InProgressOperation {
     pub kind: OperationKind,
-    /// True when `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `REVERT_HEAD` exists, so
-    /// a commit concludes this step even with an index equal to `HEAD`'s
-    /// tree. See [`RepositoryService::has_pending_commit_state`]. Always
-    /// false for a rebase, whose steps `--continue` commits.
+    /// True when `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `REVERT_HEAD` names the
+    /// commit being brought in, so a commit concludes this step. Only a merge
+    /// may be concluded with an index equal to `HEAD`'s tree; Git refuses
+    /// an empty cherry-pick or revert commit, which `--skip` drops instead.
+    /// Always false for a rebase, whose steps `--continue` commits.
     pub pending_commit: bool,
     /// True when a cherry-pick or revert sequence has further commits to
     /// apply after this one, so concluding it takes `--continue` rather than
     /// only a commit.
     pub sequence: bool,
-    /// What the operation is bringing in, as Git recorded it: the branch a
-    /// rebase is replaying, or the commit a cherry-pick or revert applies.
+    /// What the operation is bringing in: the branch a rebase is replaying,
+    /// or the subject line of the commit a cherry-pick or revert applies.
     pub subject: Option<String>,
     /// The rebase step this stopped at and the number of steps, when Git
     /// recorded both.
     pub progress: Option<(u32, u32)>,
-    /// The commit message Git prepared in `MERGE_MSG`, with comment lines
-    /// removed, for the commit that concludes a merge, cherry-pick or revert.
+    /// The commit message Git prepared for the commit that concludes this
+    /// step: `MERGE_MSG` without its comment lines for a merge, cherry-pick
+    /// or revert, and the stopped commit's message for a rebase.
     pub message: Option<String>,
 }
 
@@ -1099,40 +1101,66 @@ pub struct InProgressOperation {
 /// typed and is left for the user to write.
 const MERGE_MESSAGE_LIMIT: u64 = 64 * 1024;
 
+/// A prepared commit message no longer than [`MERGE_MESSAGE_LIMIT`], or
+/// `None` when it is missing, unreadable or longer.
+fn read_bounded_message(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MERGE_MESSAGE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MERGE_MESSAGE_LIMIT)
+        .then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// The state files and directories [`RepositoryService::in_progress_operation`]
 /// reads, in the order it asks Git to locate them.
-const OPERATION_STATE_PATHS: [&str; 7] = [
+///
+/// `CHERRY_PICK_HEAD` and `REVERT_HEAD` are not among them: the reftable
+/// backend keeps those pseudo-refs in the ref store rather than as files, so
+/// Git resolves them. Git still writes `MERGE_HEAD` and `MERGE_MSG` as files
+/// under every backend.
+const OPERATION_STATE_PATHS: [&str; 5] = [
     "MERGE_HEAD",
-    "CHERRY_PICK_HEAD",
-    "REVERT_HEAD",
     "rebase-merge",
     "rebase-apply",
     "sequencer",
     "MERGE_MSG",
 ];
 
+/// The marker width Git uses when no `conflict-marker-size` attribute
+/// overrides it.
+pub const DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
+
+/// The widest `conflict-marker-size` honoured; a larger attribute value is
+/// read as this.
+const MAX_CONFLICT_MARKER_SIZE: usize = 256;
+
 /// Whether `reader` holds a line that opens or closes a conflict block:
-/// exactly seven `<` or `>` at the start of a line, followed by a space or
+/// exactly `width` `<` or `>` at the start of a line, followed by a space or
 /// the line's end. Git writes both around every conflict, in the merge and
 /// diff3 styles alike; the `=======` separator alone is not counted, because
 /// it is also a Markdown and reStructuredText heading underline.
 ///
-/// The scan reads in bounded chunks and keeps only a line's first eight
+/// The scan reads in bounded chunks and keeps only a line's first `width + 1`
 /// bytes, so a very large or single-line file costs no more memory than a
-/// small one.
+/// small one. A NUL byte ends it with no markers found: Git does not write
+/// text conflict markers into a file it merged as binary.
 pub fn scan_conflict_markers(
     reader: &mut impl Read,
+    width: usize,
     cancellation: &CancellationToken,
 ) -> io::Result<bool> {
-    const WIDTH: usize = 7;
+    let width = width.clamp(1, MAX_CONFLICT_MARKER_SIZE);
     let mut chunk = [0_u8; 64 * 1024];
-    // The first `WIDTH + 1` bytes of the current line.
-    let mut prefix = [0_u8; WIDTH + 1];
+    // The first `width + 1` bytes of the current line.
+    let mut prefix = vec![0_u8; width + 1];
     let mut used = 0;
     let marker = |prefix: &[u8], used: usize| {
-        used >= WIDTH
-            && (prefix[..WIDTH] == [b'<'; WIDTH] || prefix[..WIDTH] == [b'>'; WIDTH])
-            && (used == WIDTH || matches!(prefix[WIDTH], b' ' | b'\t' | b'\r'))
+        used >= width
+            && (prefix[..width].iter().all(|byte| *byte == b'<')
+                || prefix[..width].iter().all(|byte| *byte == b'>'))
+            && (used == width || matches!(prefix[width], b' ' | b'\t' | b'\r'))
     };
     loop {
         if cancellation.is_cancelled() {
@@ -1150,17 +1178,22 @@ pub fn scan_conflict_markers(
             return Ok(marker(&prefix, used));
         }
         for byte in &chunk[..length] {
-            if *byte == b'\n' {
-                if marker(&prefix, used) {
-                    return Ok(true);
+            match *byte {
+                0 => return Ok(false),
+                b'\n' => {
+                    if marker(&prefix, used) {
+                        return Ok(true);
+                    }
+                    used = 0;
                 }
-                used = 0;
-            } else if used < prefix.len() {
-                prefix[used] = *byte;
-                used += 1;
-                if used == prefix.len() && marker(&prefix, used) {
-                    return Ok(true);
+                byte if used < prefix.len() => {
+                    prefix[used] = byte;
+                    used += 1;
+                    if used == prefix.len() && marker(&prefix, used) {
+                        return Ok(true);
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -4350,7 +4383,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let parsed = parse_refs(&output.stdout);
         let refs = invalid_output(parsed, output)?;
 
-        let operation = self.in_progress_operation(worktree, cancellation)?;
+        // The panel is still worth showing without it: a failure to read
+        // the operation only costs its banner.
+        let operation = match self.in_progress_operation(worktree, cancellation) {
+            Ok(operation) => operation,
+            Err(error) if cancellation.is_cancelled() => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "could not read the operation in progress");
+                None
+            }
+        };
 
         Ok(RepositorySnapshot {
             status,
@@ -5844,57 +5886,55 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
-    /// The sequencer state files whose presence means Git will accept a commit
-    /// with an index identical to HEAD's tree.
+    /// True when Git has a merge waiting to be concluded by a commit.
     ///
-    /// These are per-worktree pseudo-refs, so their location comes from Git
-    /// rather than from an assumed `.git/` layout: a linked worktree keeps them
-    /// in its own administrative directory.
-    const PENDING_COMMIT_STATES: [&'static str; 3] =
-        ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"];
-
-    /// True when Git has a merge, cherry-pick or revert waiting to be
-    /// concluded by a commit.
+    /// This is how `git commit` itself decides whether an index identical to
+    /// HEAD's tree may still be committed: a merge conflict resolved in
+    /// favour of ours leaves nothing staged, and `git status` reports nothing
+    /// changed, yet the merge commit is still required and plain `git commit`
+    /// still creates it. A cherry-pick or revert gets no such allowance; Git
+    /// calls that commit empty and refuses it.
     ///
-    /// This is how `git commit` itself decides, and it is what makes the
-    /// "nothing staged" refusal correct rather than merely usual: a conflict
-    /// resolved in favour of ours leaves the index equal to HEAD's tree, and
-    /// `git status` reports nothing changed, yet the merge commit is still
-    /// required and plain `git commit` still creates it.
-    pub fn has_pending_commit_state(
+    /// `MERGE_HEAD` is per-worktree, so its location comes from Git rather
+    /// than from an assumed `.git/` layout: a linked worktree keeps it in its
+    /// own administrative directory, and every ref backend writes it as a
+    /// file.
+    pub fn has_pending_merge(
         &self,
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<bool, RepositoryError> {
-        let mut arguments = vec![OsString::from("rev-parse")];
-        for state in Self::PENDING_COMMIT_STATES {
-            arguments.push(OsString::from("--git-path"));
-            arguments.push(OsString::from(state));
-        }
-        let command = self.git_read(worktree, arguments);
+        let command = self.git_read(worktree, ["rev-parse", "--git-path", "MERGE_HEAD"]);
         let output = self.run_checked(&command, cancellation)?;
-        Ok(output
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(bytes_to_path)
-            // `--git-path` answers relative to the working directory it ran
-            // in, which is the worktree.
-            .any(|path| worktree.join(path).exists()))
+        let path = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+        // `--git-path` answers relative to the working directory it ran in,
+        // which is the worktree.
+        Ok(!path.is_empty() && worktree.join(bytes_to_path(path)).exists())
     }
 
     /// The merge, rebase, cherry-pick or revert this worktree stopped in, or
     /// `None` when it is in none of them.
     ///
-    /// One `rev-parse --git-path` locates every state file, since a linked
+    /// One `rev-parse --git-path` locates the state files, since a linked
     /// worktree keeps them in its own administrative directory, and the rest
-    /// is reading those few small files. A rebase is reported ahead of the
-    /// merge or pick it is replaying, because `--continue` and `--abort`
-    /// belong to the rebase. `git am`, which shares `rebase-apply`, is not
-    /// one of these operations and is reported as none.
+    /// is reading those few small files; Git is asked again only while a
+    /// cherry-pick or revert may be stopped, to resolve its pseudo-ref. A
+    /// rebase is reported ahead of the merge or pick it is replaying, because
+    /// `--continue` and `--abort` belong to the rebase. `git am`, which
+    /// shares `rebase-apply`, is not one of these operations and is reported
+    /// as none.
     pub fn in_progress_operation(
         &self,
         worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<InProgressOperation>, RepositoryError> {
+        self.operation_state(worktree, true, cancellation)
+    }
+
+    fn operation_state(
+        &self,
+        worktree: &Path,
+        read_message: bool,
         cancellation: &CancellationToken,
     ) -> Result<Option<InProgressOperation>, RepositoryError> {
         let mut arguments = vec![OsString::from("rev-parse")];
@@ -5910,15 +5950,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .filter(|line| !line.is_empty())
             .map(|line| worktree.join(bytes_to_path(line)))
             .collect();
-        let [
-            merge_head,
-            cherry_pick_head,
-            revert_head,
-            rebase_merge,
-            rebase_apply,
-            sequencer,
-            merge_msg,
-        ] = located.as_slice()
+        let [merge_head, rebase_merge, rebase_apply, sequencer, merge_msg] = located.as_slice()
         else {
             return Err(RepositoryError::InvalidOutput {
                 field: "git-path",
@@ -5936,12 +5968,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             })
         };
         let read_number = |path: &Path| read_line(path).and_then(|line| line.parse::<u32>().ok());
-        let short = |line: String| match line.get(..12) {
-            Some(prefix) if is_hex_oid(&line) => prefix.to_owned(),
-            _ => line,
-        };
-        let pending_commit =
-            merge_head.exists() || cherry_pick_head.exists() || revert_head.exists();
 
         let rebase = if rebase_merge.is_dir() {
             Some((
@@ -5958,55 +5984,68 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         } else {
             None
         };
-        let (kind, subject, progress) = if let Some((step, steps, directory)) = rebase {
-            let subject = read_line(&directory.join("head-name")).map(|name| {
-                name.strip_prefix("refs/heads/")
-                    .map_or_else(|| name.clone(), str::to_owned)
-            });
-            let progress = read_number(&step).zip(read_number(&steps));
-            (OperationKind::Rebase, subject, progress)
-        } else if merge_head.exists() {
-            (OperationKind::Merge, None, None)
-        } else if cherry_pick_head.exists() {
-            (
-                OperationKind::CherryPick,
-                read_line(cherry_pick_head).map(short),
-                None,
-            )
-        } else if revert_head.exists() {
-            (
-                OperationKind::Revert,
-                read_line(revert_head).map(short),
-                None,
-            )
-        } else if sequencer.is_dir() {
-            // Between two steps of a sequence: the last pick was committed
-            // and `--continue` applies the next. The to-do list says which
-            // command the sequence runs.
-            let next = fs::read(sequencer.join("todo")).unwrap_or_default();
-            let next = String::from_utf8_lossy(&next);
-            let Some(command) = next
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('#'))
-            else {
-                return Ok(None);
-            };
-            let kind = match command.split_whitespace().next() {
-                Some("revert" | "r") => OperationKind::Revert,
-                _ => OperationKind::CherryPick,
-            };
-            (kind, None, None)
-        } else {
-            return Ok(None);
-        };
-
-        let pending_commit = pending_commit && kind != OperationKind::Rebase;
-        let message = if pending_commit {
-            self.merge_message(worktree, merge_msg, cancellation)?
+        let merging = merge_head.exists();
+        // A stopped cherry-pick or revert always leaves the message it
+        // prepared, so without one there is no pseudo-ref to resolve.
+        let picking = if rebase.is_none() && !merging && merge_msg.exists() {
+            self.pending_pick(worktree, cancellation)?
         } else {
             None
         };
+        let (kind, pending_commit, subject, progress) =
+            if let Some((step, steps, directory)) = rebase {
+                let subject = read_line(&directory.join("head-name")).map(|name| {
+                    name.strip_prefix("refs/heads/")
+                        .map_or_else(|| name.clone(), str::to_owned)
+                });
+                let progress = read_number(&step).zip(read_number(&steps));
+                (OperationKind::Rebase, false, subject, progress)
+            } else if merging {
+                (OperationKind::Merge, true, None, None)
+            } else if let Some(kind) = picking {
+                (kind, true, None, None)
+            } else if sequencer.is_dir() {
+                // Between two steps of a sequence: the last pick was committed
+                // and `--continue` applies the next. The to-do list says which
+                // command the sequence runs; the sequencer spells `revert`
+                // out, and its abbreviations are those of `pick`.
+                let next = fs::read(sequencer.join("todo")).unwrap_or_default();
+                let next = String::from_utf8_lossy(&next);
+                let Some(command) = next
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with('#'))
+                else {
+                    return Ok(None);
+                };
+                let kind = match command.split_whitespace().next() {
+                    Some("revert") => OperationKind::Revert,
+                    _ => OperationKind::CherryPick,
+                };
+                (kind, false, None, None)
+            } else {
+                return Ok(None);
+            };
+
+        let message = match (read_message, kind) {
+            (false, _) => None,
+            // The stopped commit's message, with the conflict list Git
+            // appends to it as comments.
+            (true, OperationKind::Rebase) => {
+                self.prepared_message(worktree, &rebase_merge.join("message"), cancellation)?
+            }
+            (true, _) if pending_commit => {
+                self.prepared_message(worktree, merge_msg, cancellation)?
+            }
+            (true, _) => None,
+        };
+        // A cherry-pick or revert is named by the commit it applies, whose
+        // subject opens the message Git prepared from it.
+        let subject = subject.or_else(|| {
+            matches!(kind, OperationKind::CherryPick | OperationKind::Revert)
+                .then(|| message.as_deref()?.lines().next().map(str::to_owned))
+                .flatten()
+        });
         Ok(Some(InProgressOperation {
             kind,
             pending_commit,
@@ -6018,30 +6057,46 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }))
     }
 
-    /// `MERGE_MSG` as the commit it prepares would record it: Git's own
-    /// `stripspace` removes the conflict list and every other comment line,
-    /// honouring the repository's `core.commentChar`.
-    fn merge_message(
+    /// The cherry-pick or revert whose pseudo-ref Git holds, resolved
+    /// through Git so the reftable backend, which keeps no file for it, is
+    /// read too.
+    fn pending_pick(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<OperationKind>, RepositoryError> {
+        let command = self
+            .git_read(worktree, ["cat-file", "--batch-check=%(objecttype)"])
+            .stdin(b"CHERRY_PICK_HEAD\nREVERT_HEAD\n".to_vec());
+        let output = self.run_checked(&command, cancellation)?;
+        let mut answers = output.stdout.split(|byte| *byte == b'\n');
+        // Each line is the object's type, or `<name> missing`.
+        let resolved = |answer: Option<&[u8]>| answer == Some(b"commit".as_slice());
+        Ok(if resolved(answers.next()) {
+            Some(OperationKind::CherryPick)
+        } else if resolved(answers.next()) {
+            Some(OperationKind::Revert)
+        } else {
+            None
+        })
+    }
+
+    /// A message Git prepared, `MERGE_MSG` or a stopped rebase step's, as
+    /// the commit it prepares would record it: Git's own `stripspace`
+    /// removes the conflict list and every other comment line, honouring the
+    /// repository's `core.commentChar`.
+    fn prepared_message(
         &self,
         worktree: &Path,
         path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, RepositoryError> {
-        let Ok(file) = fs::File::open(path) else {
+        let Some(message) = read_bounded_message(path) else {
             return Ok(None);
         };
-        let mut bytes = Vec::new();
-        if file
-            .take(MERGE_MESSAGE_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-            || bytes.len() as u64 > MERGE_MESSAGE_LIMIT
-        {
-            return Ok(None);
-        }
         let command = self
             .git_read(worktree, ["stripspace", "--strip-comments"])
-            .stdin(bytes);
+            .stdin(message.into_bytes());
         let output = self.run_checked(&command, cancellation)?;
         let message = String::from_utf8_lossy(&output.stdout)
             .trim_end()
@@ -6054,7 +6109,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ///
     /// Only an unmerged path is scanned. A resolved or ordinary file may
     /// legitimately contain marker-like lines, such as a test fixture or this
-    /// very documentation, and staging it is not resolving a conflict.
+    /// very documentation, and staging it is not resolving a conflict. Each
+    /// is scanned for markers of the width its `conflict-marker-size`
+    /// attribute gives, which is the width Git wrote.
     pub fn conflict_marker_paths(
         &self,
         worktree: &Path,
@@ -6073,15 +6130,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .split(|byte| *byte == 0)
             .filter_map(|record| record.splitn(2, |byte| *byte == b'\t').nth(1))
             .collect();
-        let root = fs_safety::Root::open(worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let mut marked = Vec::new();
+        let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         for entry in selection {
             let path = &entry.path;
-            if !unmerged.contains(path.as_bytes()) || !seen.insert(path) {
-                continue;
+            if unmerged.contains(path.as_bytes()) && seen.insert(path) {
+                candidates.push(path);
             }
+        }
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let widths = self.conflict_marker_sizes(worktree, &candidates, cancellation)?;
+        let root = fs_safety::Root::open(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let mut marked = Vec::new();
+        for path in candidates {
             // A conflict that deleted the file on one side may leave no
             // file at all, and a symlink or directory holds no text.
             let Ok(metadata) = fs_safety::metadata_beneath(&root, path.as_path()) else {
@@ -6090,15 +6154,50 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if !metadata.is_file() {
                 continue;
             }
+            let width = widths
+                .get(path.as_bytes())
+                .copied()
+                .unwrap_or(DEFAULT_CONFLICT_MARKER_SIZE);
             let mut file = fs_safety::open_beneath(&root, path.as_path())
                 .map_err(|error| ValidationError::Io(format!("{path}: {error}")))?;
-            if scan_conflict_markers(&mut file, cancellation)
+            if scan_conflict_markers(&mut file, width, cancellation)
                 .map_err(|error| ValidationError::Io(format!("{path}: {error}")))?
             {
                 marked.push(path.clone());
             }
         }
         Ok(marked)
+    }
+
+    /// Each path's `conflict-marker-size` attribute, where one is set to a
+    /// number. The paths go on standard input, so their count is unbounded.
+    fn conflict_marker_sizes(
+        &self,
+        worktree: &Path,
+        paths: &[&RepoPath],
+        cancellation: &CancellationToken,
+    ) -> Result<HashMap<Vec<u8>, usize>, RepositoryError> {
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        let command = self
+            .git_literal_read(
+                worktree,
+                ["check-attr", "-z", "--stdin", "conflict-marker-size"],
+            )
+            .stdin(input);
+        let output = self.run_checked(&command, cancellation)?;
+        // Records are `<path> NUL <attribute> NUL <value> NUL`.
+        let fields: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+        Ok(fields
+            .chunks_exact(3)
+            .filter_map(|record| {
+                let width = std::str::from_utf8(record[2]).ok()?.parse::<usize>().ok()?;
+                (width > 0).then(|| (record[0].to_vec(), width))
+            })
+            .collect())
     }
 
     /// Abandons the operation the worktree stopped in, restoring what it
@@ -6130,16 +6229,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Resumes the operation the worktree stopped in, once its conflicts are
     /// resolved and staged: `git <operation> --continue`, which commits the
-    /// staged step with the message Git prepared and applies the rest.
+    /// staged step and applies the rest.
     ///
-    /// Git would otherwise open an editor on that message, and there is no
-    /// terminal to show it in, so the editor is one that accepts the message
-    /// unchanged. A message the user wrote is committed with
-    /// [`Self::commit`] instead, which a later `--continue` then follows.
+    /// Git asks an editor for the message of the step it commits, and there
+    /// is no terminal to show one in. The editor given instead writes
+    /// `message` once, when there is one, so the first commit records what
+    /// the user wrote and any later step, such as a `reword`, keeps the
+    /// message Git prepared for it.
+    ///
+    /// A step that commits and then stops at the next conflict exits
+    /// non-zero, yet HEAD has moved on: that is progress, and is reported as
+    /// applied rather than as a failure.
     pub fn continue_operation(
         &self,
         worktree: &Path,
         expected: OperationKind,
+        message: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
         let _protection = crate::worktree_cleanup::protect(worktree)
@@ -6147,16 +6252,88 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if let Some(refusal) = self.operation_refusal(worktree, expected, cancellation)? {
             return Ok(refusal);
         }
-        let command = self
+        let message = message
+            .map(str::trim_end)
+            .filter(|message| !message.is_empty());
+        let staging = message
+            .map(|message| -> Result<_, RepositoryError> {
+                let directory =
+                    tempfile::tempdir().map_err(|error| ValidationError::Io(error.to_string()))?;
+                let path = directory.path().join("message");
+                fs::write(&path, format!("{message}\n"))
+                    .map_err(|error| ValidationError::Io(error.to_string()))?;
+                Ok((directory, path))
+            })
+            .transpose()?;
+        let mut command = self
             .git_mutation(worktree, [expected.command(), "--continue"])
+            .env("GIT_SEQUENCE_EDITOR", "true");
+        command = match &staging {
+            // Git runs an editor containing shell syntax as `sh -c '<editor>
+            // "$@"'`, so `$1` is the file it asks to have edited.
+            Some((_, path)) => command
+                .env(
+                    "GIT_EDITOR",
+                    r#"m=$CAGENTS_CONTINUE_MESSAGE; if test -f "$m"; then mv -f "$m" "$1"; fi; :"#,
+                )
+                .env("CAGENTS_CONTINUE_MESSAGE", path.as_os_str()),
+            None => command.env("GIT_EDITOR", "true"),
+        };
+        self.run_step(worktree, &command, cancellation)
+    }
+
+    /// Drops the step a cherry-pick, revert or rebase stopped at and goes on
+    /// with the rest: `git <operation> --skip`. This is how a pick whose
+    /// changes are already present, so that nothing is left to commit, is
+    /// concluded; Git refuses to commit it empty.
+    pub fn skip_operation(
+        &self,
+        worktree: &Path,
+        expected: OperationKind,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if expected == OperationKind::Merge {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected {
+                    reason: "a merge has no step to skip".into(),
+                },
+            });
+        }
+        if let Some(refusal) = self.operation_refusal(worktree, expected, cancellation)? {
+            return Ok(refusal);
+        }
+        let command = self
+            .git_mutation(worktree, [expected.command(), "--skip"])
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true");
-        Ok(self.run_mutation(
-            &command,
+        self.run_step(worktree, &command, cancellation)
+    }
+
+    /// Runs a command that advances a stopped operation. One that exits
+    /// non-zero after moving HEAD stopped at a later step's conflict, which
+    /// the next snapshot shows; only one that left HEAD where it was failed.
+    fn run_step(
+        &self,
+        worktree: &Path,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        let before = self.resolve_head(worktree, cancellation)?;
+        let outcome = self.run_mutation(
+            command,
             Vec::new(),
             MutationScope::AllOrNothing,
             cancellation,
-        ))
+        );
+        if matches!(outcome, MutationOutcome::Applied { .. }) {
+            return Ok(outcome);
+        }
+        match self.resolve_head(worktree, cancellation) {
+            Ok(after) if after != before => Ok(MutationOutcome::Applied { paths: Vec::new() }),
+            _ => Ok(outcome),
+        }
     }
 
     /// A refusal when the worktree is not in the `expected` operation.
@@ -6166,7 +6343,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         expected: OperationKind,
         cancellation: &CancellationToken,
     ) -> Result<Option<MutationOutcome>, RepositoryError> {
-        let current = self.in_progress_operation(worktree, cancellation)?;
+        let current = self.operation_state(worktree, false, cancellation)?;
         if current
             .as_ref()
             .is_some_and(|current| current.kind == expected)
@@ -6210,7 +6387,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         if !amend
             && !self.has_staged_changes(&request.worktree, cancellation)?
-            && !self.has_pending_commit_state(&request.worktree, cancellation)?
+            && !self.has_pending_merge(&request.worktree, cancellation)?
         {
             return Ok(CommitOutcome::NotCreated {
                 failure: MutationFailure::Rejected {
@@ -8057,7 +8234,12 @@ mod tests {
     #[test]
     fn conflict_marker_scan_finds_block_edges_only() {
         let scan = |bytes: &[u8]| {
-            scan_conflict_markers(&mut io::Cursor::new(bytes), &CancellationToken::new()).unwrap()
+            scan_conflict_markers(
+                &mut io::Cursor::new(bytes),
+                DEFAULT_CONFLICT_MARKER_SIZE,
+                &CancellationToken::new(),
+            )
+            .unwrap()
         };
         assert!(scan(
             b"a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> side\n"
@@ -8071,6 +8253,15 @@ mod tests {
         assert!(!scan(b"  <<<<<<< indented\n"));
         assert!(!scan(b"<<<<<<"));
         assert!(!scan(b""));
+        // Git merges a file holding NUL as binary and writes no markers.
+        assert!(!scan(b"\0\n<<<<<<< HEAD\n"));
+        // A `conflict-marker-size` attribute widens the markers Git writes.
+        let wide = |bytes: &[u8]| {
+            scan_conflict_markers(&mut io::Cursor::new(bytes), 10, &CancellationToken::new())
+                .unwrap()
+        };
+        assert!(wide(b"<<<<<<<<<< HEAD\n"));
+        assert!(!wide(b"<<<<<<< HEAD\n"));
 
         // A reader that hands back one byte at a time splits every line.
         struct Trickle<'a>(&'a [u8]);
@@ -8086,10 +8277,24 @@ mod tests {
         }
         let mut long = vec![b'x'; 100_000];
         long.extend_from_slice(b"\n>>>>>>> side\n");
-        assert!(scan_conflict_markers(&mut Trickle(&long), &CancellationToken::new()).unwrap());
+        assert!(
+            scan_conflict_markers(
+                &mut Trickle(&long),
+                DEFAULT_CONFLICT_MARKER_SIZE,
+                &CancellationToken::new()
+            )
+            .unwrap()
+        );
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        assert!(scan_conflict_markers(&mut Trickle(&long), &cancelled).is_err());
+        assert!(
+            scan_conflict_markers(
+                &mut Trickle(&long),
+                DEFAULT_CONFLICT_MARKER_SIZE,
+                &cancelled
+            )
+            .is_err()
+        );
     }
 
     #[derive(Default)]
