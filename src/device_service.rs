@@ -2188,8 +2188,9 @@ fn mutation_lock(path: PathBuf) -> std::sync::Arc<std::sync::Mutex<()>> {
     lock
 }
 
-#[cfg(feature = "host")]
-fn worktree_name(name: &str) -> Result<(), String> {
+/// Checks a worktree name the device creates or removes under `.worktrees`.
+/// A device window applies it before asking, so it builds without `host`.
+pub fn worktree_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.len() > 80
         || name == "."

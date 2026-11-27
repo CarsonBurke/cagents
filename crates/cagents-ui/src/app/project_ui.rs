@@ -2049,7 +2049,9 @@ impl Cagents {
         let dirty = self
             .deletion_target_row(target)
             .and_then(|worktree| worktree.dirty.as_ref())
-            .is_some_and(crate::repository::DirtyState::is_dirty);
+            .is_some_and(crate::repository::DirtyState::is_dirty)
+            // A device keeps a dirty worktree instead, as its note says.
+            && !crate::device::is_remote();
         let unsaved = self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
                 if runtime.descriptor.worktree.starts_with(&target.path) && runtime.is_dirty())
@@ -2886,22 +2888,27 @@ pub(super) fn worktree_deletion_note(several: bool) -> String {
     }
 }
 
-const DEVICE_WORKTREE_OUTSIDE: &str = "A device window can only delete worktrees in the \
-     project's .worktrees folder. Use git worktree remove in a terminal on the device.";
+const DEVICE_WORKTREE_OUTSIDE: &str = "A device window can only delete a worktree directly in \
+     the project's .worktrees folder, named with letters, digits, dots, hyphens or underscores. \
+     Use git worktree remove in a terminal on the device.";
 
 /// The name a device knows a removable worktree by: its folder directly in
-/// the main checkout's `.worktrees`, the only place a device removes one.
+/// the main checkout's `.worktrees`, the only place a device removes one,
+/// named as the device accepts.
 pub(super) fn device_worktree_name(main: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(main.join(".worktrees"))
         .ok()
         .filter(|name| name.components().count() == 1)
         .and_then(|name| name.to_str())
+        .filter(|name| crate::device_service::worktree_name(name).is_ok())
         .map(str::to_owned)
 }
 
 /// Deletes a device's worktree as [`delete_worktree`] does a local one, with
 /// the device's Git. The device removes only a clean worktree, so that is
-/// checked before any session closes: a refusal leaves everything running.
+/// checked before any session closes. Its other refusals, such as commits
+/// only a detached HEAD holds, come when it removes the worktree, after the
+/// sessions closed (#4496).
 fn delete_device_worktree(target: &Target, main: &Path) -> Result<(), String> {
     use crate::device_service::{GitOperation, Operation, Reply, request};
     let name = device_worktree_name(main, &target.path).ok_or(DEVICE_WORKTREE_OUTSIDE)?;
@@ -2918,7 +2925,7 @@ fn delete_device_worktree(target: &Target, main: &Path) -> Result<(), String> {
     };
     if device_status_has_changes(&status) {
         return Err(
-            "It has uncommitted or untracked changes. Commit or remove them on the \
+            "it has uncommitted or untracked changes. Commit or remove them on the \
              device first, or use git worktree remove --force in a terminal there."
                 .into(),
         );
@@ -2975,6 +2982,10 @@ pub(in crate::app) mod tests {
             main.join(".worktrees"),
             main.join(".worktrees/nested/deeper"),
             PathBuf::from("/srv/device-only/elsewhere"),
+            // Names the device refuses are refused before any session closes.
+            main.join(".worktrees/my wt"),
+            main.join(".worktrees/-flag"),
+            main.join(format!(".worktrees/{}", "a".repeat(81))),
         ] {
             assert_eq!(device_worktree_name(main, &outside), None, "{outside:?}");
         }

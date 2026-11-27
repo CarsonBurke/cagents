@@ -3155,6 +3155,25 @@ mod tests {
         assert_eq!(app.device_ui.path, "/srv/device-only/other");
         settle(&mut app);
 
+        // Confirming a worktree's deletion reaches the deletion rather than
+        // being refused as local work. Without session storage here, the
+        // deletion itself declines, in the dialog.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: Some(linked_id),
+            command: sidebar::ProjectCommand::Delete,
+        })));
+        assert!(app.project_ui.modal_open());
+        app.status = None;
+        drop(app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete)));
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(
+            format!("{:?}", app.project_ui).contains("Session storage is unavailable"),
+            "{:?}",
+            app.project_ui
+        );
+        dismiss(&mut app);
+
         // Remove project asks first, as locally, and says the files stay
         // on the device; nothing opens the device tools.
         app.status = None;
