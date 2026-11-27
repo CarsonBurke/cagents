@@ -1828,7 +1828,6 @@ impl ReadyPlanEvidence<'_> {
         Ok(first)
     }
 
-    #[cfg(any(feature = "host", test))]
     pub(crate) fn verify_exited_cutover_claim(
         &self,
         request: &str,

@@ -1699,9 +1699,14 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
     if job.phase == UpdatePhase::Failed {
         let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
         if cutover::pending_selected(&layout, &state, &job)? {
-            job.phase = UpdatePhase::Installing;
-            job.message = "Finishing the update".into();
-            job.refusal = None;
+            if let Some(reason) = cutover::selected_start_failure(&state, &job)? {
+                job.message.push('\n');
+                job.message.push_str(&reason);
+            } else {
+                job.phase = UpdatePhase::Installing;
+                job.message = "Finishing the update".into();
+                job.refusal = None;
+            }
             return Ok(Some(job));
         }
     }
@@ -2448,6 +2453,8 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
             job.refusal = error.refusal();
             if let Err(write_error) = write_job(&state, &job) {
                 eprintln!("Could not record the interrupted update's result: {write_error}");
+            } else {
+                restart_selected_after_worker(&installation, &state, &job, _lock);
             }
         }
         return recovered;
@@ -2468,7 +2475,33 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         &mut handoff,
         &mut survivors,
     );
-    finish_worker(&state, &mut job, result, &mut survivors)
+    let outcome = finish_worker(&state, &mut job, result, &mut survivors);
+    #[cfg(target_os = "macos")]
+    if outcome.is_err() {
+        drop(survivors);
+        drop(handoff);
+        restart_selected_after_worker(&installation, &state, &job, _lock);
+    }
+    outcome
+}
+
+#[cfg(target_os = "macos")]
+fn restart_selected_after_worker(
+    installation: &Installation,
+    state: &Path,
+    job: &UpdateJob,
+    worker: File,
+) {
+    match cutover::restart_after_worker(installation, state, job) {
+        Ok(Some(restart)) => {
+            drop(worker);
+            if let Err(error) = restart.launch(state) {
+                eprintln!("{error}");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("Could not verify the selected daemon restart: {error}"),
+    }
 }
 
 fn finish_worker(

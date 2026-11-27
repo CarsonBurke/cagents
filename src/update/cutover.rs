@@ -129,7 +129,6 @@ struct Witness {
 
 const INVENTORY_LIMIT: u64 = crate::upgrade::recovery::STANDBY_RECEIPT_LIMIT as u64;
 
-#[cfg(any(feature = "host", target_os = "macos", test))]
 pub(super) fn persist(
     state: &Path,
     target: &Path,
@@ -253,7 +252,6 @@ impl Intent {
         Ok(())
     }
 
-    #[cfg(feature = "host")]
     fn verify_request(&self, state: &Path) -> Result<(), UpdateError> {
         let request = read_private(
             &state.join(format!("{}.request", self.job)),
@@ -318,7 +316,6 @@ impl Intent {
         }
     }
 
-    #[cfg(feature = "host")]
     fn original_exited(&self) -> Result<bool, UpdateError> {
         Ok(crate::pinned_process::exited_since(
             self.process.pid as u32,
@@ -326,7 +323,6 @@ impl Intent {
         )?)
     }
 
-    #[cfg(feature = "host")]
     fn verify_selected_ready_claim(
         &self,
         layout: &InstallLayout,
@@ -559,6 +555,138 @@ pub(super) fn recorded_selection(
     Ok(Some(intent.stage))
 }
 
+/// Both launchers and the selected daemon recheck the exact committed Ready
+/// attempt after the previous claimant has exited.
+fn restart_intent(
+    layout: &InstallLayout,
+    state: &Path,
+    job: &UpdateJob,
+) -> Result<Option<(Intent, OriginalInventory)>, UpdateError> {
+    if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
+        || layout.version != job.version
+    {
+        return Ok(None);
+    }
+    let Some(intent) = read(state, &job.id)? else {
+        return Ok(None);
+    };
+    if intent.stage != Stage::Pending
+        || !intent.names_selected(layout)?
+        || !intent.original_exited()?
+        || !intent.witness_present(state)?
+        || !intent.verify_selected_ready_claim(layout, state, job)?
+    {
+        return Ok(None);
+    }
+    intent.verify_request(state)?;
+    let original = intent.read_witness(state)?;
+    Ok(Some((intent, original)))
+}
+
+pub(super) struct SelectedRestart {
+    cli: PathBuf,
+    intent: Intent,
+}
+
+pub(super) fn restart_after_worker(
+    installation: &Installation,
+    state: &Path,
+    job: &UpdateJob,
+) -> Result<Option<SelectedRestart>, UpdateError> {
+    if job.phase != UpdatePhase::Failed {
+        return Ok(None);
+    }
+    let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
+    let Some((intent, _)) = restart_intent(&layout, state, job)? else {
+        return Ok(None);
+    };
+    // This entry point is for a completed restore followed by process loss.
+    // Keep any existing canonical checkpoint under its own recovery rules.
+    let Some(store) = crate::upgrade::handoff::Store::observe_existing().map_err(invalid)? else {
+        return Ok(None);
+    };
+    if store.checkpoint_status().map_err(invalid)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(SelectedRestart {
+        cli: layout.version_root.join("bin/cagents"),
+        intent,
+    }))
+}
+
+fn restart_failure_path(state: &Path, job: &str) -> PathBuf {
+    state.join(format!("{job}.cutover-start-failed.json"))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartFailure {
+    intent_digest: String,
+    message: String,
+}
+
+/// A launch failure is a status verdict, not a change to the selected
+/// update's authority. A later ordinary launch can still settle the job.
+pub(super) fn selected_start_failure(
+    state: &Path,
+    job: &UpdateJob,
+) -> Result<Option<String>, UpdateError> {
+    let bytes = match read_private(&restart_failure_path(state, &job.id), SMALL_ASSET_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(intent) = read(state, &job.id)? else {
+        return Ok(None);
+    };
+    let failed: RestartFailure = serde_json::from_slice(&bytes)?;
+    Ok((failed.intent_digest == intent.pending_digest()?).then_some(failed.message))
+}
+
+impl SelectedRestart {
+    /// The caller has closed the worker and handoff descriptions before this
+    /// ordinary launch can obtain its own runtime and saved-data leases.
+    pub(super) fn launch(self, state: &Path) -> Result<(), UpdateError> {
+        let mut command = Command::new(self.cli);
+        command
+            .args(["--json", "daemon", "start"])
+            .stdin(Stdio::null());
+        crate::install_guard::sanitize_child_environment(&mut command);
+        // SAFETY: the hook seals inherited descriptors before exec.
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        let failure = match command.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => format!("Selected daemon restart command reported {status}"),
+            Err(error) => format!("Could not start the selected daemon: {error}"),
+        };
+        // A manual launch could have won recovery during the attempt. Keep
+        // any verdict that has already moved the exact job past this stage.
+        let _worker = crate::instance::owned_file_lock(open_worker_lock(state)?, libc::LOCK_EX)?;
+        if let Some(job) = read_job(state)?
+            && job.id == self.intent.job
+            && job.phase == UpdatePhase::Failed
+            && let Some(current) = read(state, &job.id)?
+            && current.stage == Stage::Pending
+            && current.pending_digest()? == self.intent.pending_digest()?
+        {
+            let receipt = RestartFailure {
+                intent_digest: self.intent.pending_digest()?,
+                message: failure.clone(),
+            };
+            persist(
+                state,
+                &restart_failure_path(state, &job.id),
+                &serde_json::to_vec(&receipt)?,
+                false,
+            )?;
+            // Wake existing readers of status.json. The verdict and message
+            // travel together in the receipt they read on the next snapshot.
+            write_job(state, &job)?;
+        }
+        Err(invalid(failure))
+    }
+}
+
 /// Recover only previously confirmed Codex threads for the exact selected
 /// Ready update. Called under runtime and saved-data leases after ordinary
 /// holder discovery and interrupted run settlement.
@@ -574,28 +702,16 @@ pub fn selected_reconnectable_codex() -> Result<Vec<crate::upgrade::handoff::Cha
     let Some(job) = read_job(&state)? else {
         return Ok(Vec::new());
     };
-    if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
-        || layout.version != job.version
-    {
-        return Ok(Vec::new());
-    }
-    let Some(intent) = read(&state, &job.id)? else {
+    let Some((intent, original)) = restart_intent(&layout, &state, &job)? else {
         return Ok(Vec::new());
     };
-    if intent.stage != Stage::Pending
-        || !intent.names_selected(&layout)?
-        || crate::process::mapped_region_identity(
-            std::process::id(),
-            crate::process::own_code_address(),
-        )? != intent.target_image
-        || !intent.original_exited()?
-        || !intent.witness_present(&state)?
-        || !intent.verify_selected_ready_claim(&layout, &state, &job)?
+    if crate::process::mapped_region_identity(
+        std::process::id(),
+        crate::process::own_code_address(),
+    )? != intent.target_image
     {
         return Ok(Vec::new());
     }
-    intent.verify_request(&state)?;
-    let original = intent.read_witness(&state)?;
     let store = crate::upgrade::handoff::Store::observe_existing()
         .map_err(invalid)?
         .ok_or_else(|| invalid("Selected Ready recovery is missing its saved work directory"))?;
@@ -774,6 +890,45 @@ mod tests {
             stage: Stage::Pending,
             witness: WitnessLocation::Legacy,
         }
+    }
+
+    #[test]
+    fn selected_launch_failure_marks_only_its_exact_attempt() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let mut selected = intent();
+        let job = UpdateJob {
+            id: selected.job.clone(),
+            version: "0.2.4".into(),
+            phase: UpdatePhase::Failed,
+            message: String::new(),
+            log_path: state.join("update.log"),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: None,
+        };
+        selected.persist(state).unwrap();
+        assert_eq!(selected_start_failure(state, &job).unwrap(), None);
+        let receipt = RestartFailure {
+            intent_digest: selected.pending_digest().unwrap(),
+            message: "Selected daemon launch failed".into(),
+        };
+        persist(
+            state,
+            &restart_failure_path(state, &job.id),
+            &serde_json::to_vec(&receipt).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selected_start_failure(state, &job).unwrap(),
+            Some(receipt.message)
+        );
+
+        selected.process.start += 1;
+        selected.persist(state).unwrap();
+        assert_eq!(selected_start_failure(state, &job).unwrap(), None);
     }
 
     #[test]
