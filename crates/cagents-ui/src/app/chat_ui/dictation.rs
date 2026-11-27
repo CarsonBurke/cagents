@@ -635,8 +635,11 @@ fn mid_sentence_capitals(text: &str) -> impl Iterator<Item = &str> {
     text.lines().flat_map(|line| {
         let mut sentence_start = true;
         content(line).split_whitespace().filter_map(move |word| {
-            // A bare list number can occur mid-line without ending a sentence.
-            let ends = !is_marker(word) && ends_sentence(without_closing_punctuation(word));
+            // Inline markers leave the boundary set by the surrounding prose.
+            if is_marker(word) {
+                return None;
+            }
+            let ends = ends_sentence(without_closing_punctuation(word));
             let starts = std::mem::replace(&mut sentence_start, ends);
             let core = bare(word);
             (!starts && !is_i(core) && core.chars().next().is_some_and(char::is_uppercase))
@@ -1773,7 +1776,10 @@ mod tests {
     fn names_after_mid_line_markers_are_learned() {
         for marker in ["-", ">", "*", "#", "2."] {
             let mut names = HashSet::new();
-            remember_names(&mut names, &format!("the fix {marker} Carson said"));
+            remember_names(
+                &mut names,
+                &format!("the fix {marker} Carson said. {marker} Then we left"),
+            );
             assert_eq!(names, HashSet::from(["Carson".to_owned()]), "{marker}");
         }
     }
