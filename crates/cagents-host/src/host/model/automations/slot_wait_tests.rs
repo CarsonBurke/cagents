@@ -116,7 +116,7 @@ fn a_firing_refused_for_the_agent_limit_waits_and_starts_once_a_slot_frees() {
     }
 
     // Asking again while the slot is held changes nothing.
-    assert!(!registry.automation_slot_retry_due(waiting.id).unwrap());
+    assert!(!registry.automation_slot_retry_due(waiting.id, true).unwrap());
     assert!(matches!(
         registry.retry_automation_slot(waiting.id, 300).unwrap(),
         SlotRetry::Waiting
@@ -125,7 +125,7 @@ fn a_firing_refused_for_the_agent_limit_waits_and_starts_once_a_slot_frees() {
     assert_eq!(registry.automation(automation.id).unwrap(), owner);
 
     slot_wait_release(&mut registry, &holder);
-    assert!(registry.automation_slot_retry_due(waiting.id).unwrap());
+    assert!(registry.automation_slot_retry_due(waiting.id, true).unwrap());
     let SlotRetry::Started(accepted) = registry.retry_automation_slot(waiting.id, 400).unwrap()
     else {
         panic!("the freed slot starts the waiting firing");
@@ -142,7 +142,7 @@ fn a_firing_refused_for_the_agent_limit_waits_and_starts_once_a_slot_frees() {
     );
     // One firing records the whole of it, and it no longer asks for a slot.
     assert_eq!(slot_wait_rows(&registry, "automation_firings"), 1);
-    assert!(registry.automation_slot_retry_due(waiting.id).unwrap());
+    assert!(registry.automation_slot_retry_due(waiting.id, true).unwrap());
     assert!(matches!(
         registry.retry_automation_slot(waiting.id, 410).unwrap(),
         SlotRetry::Settled
@@ -311,7 +311,7 @@ fn disabling_an_automation_skips_its_firing_waiting_for_a_slot() {
         .unwrap();
 
     // The scheduler need not wait for a slot to end it.
-    assert!(registry.automation_slot_retry_due(waiting.id).unwrap());
+    assert!(registry.automation_slot_retry_due(waiting.id, true).unwrap());
 
     // Even with a slot free, the paused automation's firing does not start.
     slot_wait_release(&mut registry, &holder);
