@@ -9935,7 +9935,7 @@ fn a_worktree_strip_lists_its_cards_in_workspace_order_without_walking_history()
                     .channels
                     .iter()
                     .any(|channel| channel.cards.contains(&card.id))
-                && local_worktrees.get(card.id) == Some(&path)
+                && local_worktrees.paths.get(&card.id) == Some(&path)
         })
         .map(|card| card.id)
         .collect::<Vec<_>>();

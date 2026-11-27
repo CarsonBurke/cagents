@@ -155,11 +155,6 @@ struct CardWorktrees {
 }
 
 impl CardWorktrees {
-    #[cfg(test)]
-    fn get(&self, card: CardId) -> Option<&PathBuf> {
-        self.paths.get(&card)
-    }
-
     fn holds(&self, path: &Path) -> bool {
         self.cards.contains_key(path)
     }
