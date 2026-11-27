@@ -919,6 +919,60 @@ impl Plan<'_> {
     }
 }
 
+/// The old version still resolves through the selector. Finish only the
+/// approved target whose restored inventory was verified before process loss.
+pub(super) fn select_completed_restore(
+    layout: &InstallLayout,
+    state: &Path,
+    job: &UpdateJob,
+    guard: &crate::instance::UiUpdateGuard,
+    runtime: &crate::daemon::lease_handoff::LeaseHandoff,
+    standby: &crate::daemon::standby::Parked,
+) -> Result<bool, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(false);
+    };
+    if reservation.job != job.id
+        || reservation.prefix != layout.prefix
+        || reservation.plan.target != layout.version_root
+        || reservation.phase()? != Phase::Claimed
+        || guard.has_running_windows()?
+        || !reservation
+            .plan
+            .ready
+            .names_current_runtime()
+            .map_err(invalid)?
+    {
+        return Ok(false);
+    }
+    crate::install_guard::verify_darwin_publication(standby.publication())?;
+    if !reservation.plan.selection_is_untouched(layout)?
+        || !cutover::verify_completed_preselection(
+            layout,
+            state,
+            job,
+            &reservation.plan.ready,
+            runtime,
+            standby.pid(),
+        )?
+    {
+        return Ok(false);
+    }
+    let Some(original) = reservation.original_image()? else {
+        return Ok(false);
+    };
+    let source = locate(&served_version_root(layout)?.join("bin/cagents"))?;
+    original.verify_selected(&source, reservation.plan.ready.source())?;
+    reservation.plan.verify_binaries(state, job)?;
+    let switch = reservation
+        .plan
+        .selection
+        .prepare(layout)?
+        .ok_or_else(|| invalid("The verified update selector was already exchanged"))?;
+    installed::complete_selection(Some(switch), layout)?;
+    Ok(true)
+}
+
 pub(super) fn recover_worker(
     installation: &Installation,
     state: &Path,

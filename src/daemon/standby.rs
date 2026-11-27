@@ -382,6 +382,11 @@ impl Parked {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn publication(&self) -> &fs::File {
+        &self.publication
+    }
+
     pub(crate) fn check_running(&mut self) -> io::Result<()> {
         if let Some(status) = self.child.as_mut().unwrap().try_wait()? {
             return Err(io::Error::other(format!(

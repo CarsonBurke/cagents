@@ -543,6 +543,15 @@ pub(super) fn perform(
             return Err(result.unwrap_err());
         }
     }
+    #[cfg(target_os = "macos")]
+    if result.is_err()
+        && let Some(runtime) = handoff.as_ref()
+        && let Some(standby) = standby.as_ref()
+        && let Err(error) =
+            ready_plan::select_completed_restore(&layout, state, job, &guard, runtime, standby)
+    {
+        eprintln!("Could not finish the verified selection: {error}");
+    }
     // No parked process should retain a launch-fence copy while closing an
     // unsuccessful transaction and reopening the old application.
     #[cfg(any(target_os = "linux", target_os = "macos"))]

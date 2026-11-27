@@ -267,8 +267,17 @@ impl Intent {
     }
 
     fn names_selected(&self, layout: &InstallLayout) -> Result<bool, UpdateError> {
+        if self.target != layout.version_root.join("bin/cagentsd")
+            || served_version_root(layout)? != layout.version_root
+        {
+            return Ok(false);
+        }
+        self.names_target(layout)
+    }
+
+    fn names_target(&self, layout: &InstallLayout) -> Result<bool, UpdateError> {
         let daemon = layout.version_root.join("bin/cagentsd");
-        if self.target != daemon || served_version_root(layout)? != layout.version_root {
+        if self.target != daemon {
             return Ok(false);
         }
         let named = fs::symlink_metadata(daemon)?;
@@ -681,6 +690,60 @@ pub fn retire_completed_checkpoint() -> Result<(), UpdateError> {
         store.remove().map_err(invalid)?;
     }
     Ok(())
+}
+
+/// Continue selection only when the same claimant durably verified the
+/// restored inventory before exiting. The caller holds updater, account,
+/// launch, and runtime custody and rechecks the original selector.
+pub(super) fn verify_completed_preselection(
+    layout: &InstallLayout,
+    state: &Path,
+    job: &UpdateJob,
+    ready: &crate::upgrade::recovery::ReadyPlanEvidence<'_>,
+    runtime: &crate::daemon::lease_handoff::LeaseHandoff,
+    standby_pid: u32,
+) -> Result<bool, UpdateError> {
+    let Some(intent) = read(state, &job.id)? else {
+        return Ok(false);
+    };
+    if intent.stage != Stage::Pending
+        || intent.witness.is_legacy()
+        || intent.process.pid as u32 != standby_pid
+        || !intent.names_target(layout)?
+        || !intent.original_exited()?
+    {
+        return Ok(false);
+    }
+    let Some(store) = Store::observe_existing().map_err(invalid)? else {
+        return Ok(false);
+    };
+    let Some(checkpoint) = store.checkpoint_status().map_err(invalid)? else {
+        return Ok(false);
+    };
+    if !checkpoint_retirement_matches(state, &intent, &checkpoint)? {
+        return Ok(false);
+    }
+    intent.verify_request(state)?;
+    let inventory = intent.read_witness(state)?;
+    if !ready.matches_cutover_inventory(&inventory.terminals, &inventory.chats) {
+        return Err(invalid(
+            "The completed cutover inventory differs from the acknowledged census",
+        ));
+    }
+    ready
+        .verify_exited_cutover_claim(
+            &intent.request_digest,
+            &intent.checkpoint_digest,
+            &intent.source,
+            &intent.windows,
+            &intent.successor,
+            &intent.process,
+        )
+        .map_err(invalid)?;
+    ready
+        .verify_completed_runtime_owner(runtime, &intent.successor, &intent.process)
+        .map_err(invalid)?;
+    Ok(true)
 }
 
 pub(super) struct SelectedRestart {
