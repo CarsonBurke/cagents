@@ -1467,6 +1467,7 @@ fn worktree(id: u128, branch: &str, dirty: bool) -> SidebarWorktree {
                     submodule: false,
                     added_lines: None,
                     removed_lines: None,
+                    index_oid: None,
                 }]
             } else {
                 Vec::new()

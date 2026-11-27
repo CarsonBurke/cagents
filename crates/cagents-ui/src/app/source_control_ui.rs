@@ -300,6 +300,7 @@ mod tests {
             submodule: false,
             added_lines: None,
             removed_lines: None,
+            index_oid: None,
         }
     }
 

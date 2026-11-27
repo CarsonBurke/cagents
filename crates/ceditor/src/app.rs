@@ -892,6 +892,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
+            | RepositoryAction::DiffBasisRefreshed { .. }
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
@@ -10321,6 +10322,7 @@ mod tests {
             submodule: false,
             added_lines: Some(1),
             removed_lines: Some(0),
+            index_oid: None,
         }
     }
 
