@@ -424,6 +424,9 @@ pub(super) struct State {
     /// Until it does, the window shows its own order rather than a read
     /// taken before the move.
     pub(super) project_moves_in_flight: usize,
+    /// The order a read held back while a move was in flight brought, and
+    /// that read's sequence.
+    pub(super) deferred_project_order: Option<(u64, Vec<std::path::PathBuf>)>,
     baseline: settlement::ScopeMap<Vec<Pane>>,
     initialized: settlement::ScopeSet,
     seeding: HashSet<Scope>,
@@ -638,6 +641,7 @@ impl State {
             unintroduced_projects,
             project_order_offered,
             project_moves_in_flight,
+            deferred_project_order,
             baseline,
             initialized,
             seeding,
@@ -679,6 +683,7 @@ impl State {
             unintroduced_projects: *unintroduced_projects,
             project_order_offered: *project_order_offered,
             project_moves_in_flight: *project_moves_in_flight,
+            deferred_project_order: deferred_project_order.clone(),
             baseline: baseline.clone(),
             initialized: initialized.clone(),
             seeding: seeding.clone(),

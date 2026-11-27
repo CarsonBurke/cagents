@@ -8585,3 +8585,29 @@ fn the_carried_over_order_waits_for_every_arranged_project() {
         order: order_of(&["gamma", "alpha"]),
     }));
 }
+
+/// Review of #4450: a read held back while this window's move was in flight
+/// can carry another window's later move; once the move is answered, the
+/// window shows it rather than its own order.
+#[test]
+fn a_later_move_read_during_a_move_in_flight_is_shown_once_it_is_answered() {
+    let (mut app, ids, mut model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    model.project_order = order_of(&["alpha", "beta", "gamma"]);
+    assert!(app.install_workspace_model_snapshot(model.clone()));
+    drop(app.reconcile_workspace_model());
+    let published = intercept_publishes(&mut app);
+    drop(app.update(Message::Sidebar(SidebarAction::ReorderProject {
+        project: ids[2],
+        before: Some(ids[0]),
+    })));
+    assert_eq!(drain(&published).len(), 1);
+    // The registry applied this move at 11 and another window's at 12; the
+    // read arrives before the answer to this window's move.
+    let mut later = model.clone();
+    later.sequence = 12;
+    later.project_order = order_of(&["beta", "gamma", "alpha"]);
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(later)));
+    assert_eq!(sidebar_names(&app), ["gamma", "alpha", "beta"]);
+    drop(app.apply_workspace_model_update(ModelUpdate::ProjectMoveAnswered { refused: false }));
+    assert_eq!(sidebar_names(&app), ["beta", "gamma", "alpha"]);
+}

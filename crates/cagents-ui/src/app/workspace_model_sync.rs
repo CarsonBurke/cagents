@@ -1065,6 +1065,7 @@ impl Cagents {
             // its order is the one to show.
             self.shared_views.project_order_offered = false;
             self.shared_views.project_moves_in_flight = 0;
+            self.shared_views.deferred_project_order = None;
         } else if model.sequence < self.shared_views.snapshot_sequence {
             return false;
         } else if model.sequence < self.workspace_model.sequence
@@ -1191,8 +1192,14 @@ impl Cagents {
         }
         if self.shared_views.project_moves_in_flight > 0 {
             // A read taken before the registry answered this window's move
-            // would put the project back until the answer arrives.
-            model.project_order = self.workspace_model.project_order.clone();
+            // would put the project back until the answer arrives. It may
+            // also hold a later move from another window, so it is kept for
+            // when the answer arrives.
+            let read = std::mem::replace(
+                &mut model.project_order,
+                self.workspace_model.project_order.clone(),
+            );
+            self.shared_views.deferred_project_order = Some((snapshot_sequence, read));
         }
         // `model.sequence` may retain a newer receipt's high watermark; the
         // caller's original read sequence is the complete baseline's floor.
@@ -1997,6 +2004,19 @@ impl Cagents {
             ModelUpdate::ProjectMoveAnswered { refused } => {
                 let moves = &mut self.shared_views.project_moves_in_flight;
                 *moves = moves.saturating_sub(1);
+                if *moves == 0
+                    && let Some((sequence, order)) = self.shared_views.deferred_project_order.take()
+                    && self
+                        .shared_views
+                        .metadata_revisions
+                        .get(&MetadataKey::ProjectOrder)
+                        .is_none_or(|held| *held <= sequence)
+                {
+                    // A read held back while the move was in flight is newer
+                    // than every answer since: its order is the registry's.
+                    self.workspace_model.project_order = order;
+                    self.order_sidebar_projects();
+                }
                 if refused {
                     // The registry's order, which the read that follows
                     // brings, is the one to show; an unarranged one lists the
