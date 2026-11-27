@@ -8,6 +8,8 @@ mod confirmation;
 #[cfg(target_os = "macos")]
 mod cutover;
 #[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use cutover::persist_ready_activation_claim;
+#[cfg(all(target_os = "macos", feature = "host"))]
 #[doc(hidden)]
 pub use cutover::{
     LiveInventory as CutoverLiveInventory, StartupCheckpoint as CutoverStartupCheckpoint,
