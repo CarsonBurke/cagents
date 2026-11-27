@@ -39,6 +39,7 @@ impl Fixture {
         let mut command = Command::new(program);
         command
             .env_clear()
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .env("HOME", root.join("home"))
             .env("XDG_RUNTIME_DIR", root.join("run"))
             .env("XDG_DATA_HOME", root.join("data"))

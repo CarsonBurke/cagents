@@ -48,6 +48,7 @@ fn hosted_bell_storm_preserves_attention_input_and_completion() {
     let log = directory.path().join("daemon.log");
     let mut daemon = PrivateDaemon(
         Command::new(env!("CARGO_BIN_EXE_cagentsd"))
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .env("HOME", &home)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_STATE_HOME", directory.path().join("state"))
@@ -188,6 +189,7 @@ fn cli_inventory_reads_real_pty_titles_without_exporting_launch_environment() {
     // clears an agent authority and never launches a provider.
     let mut daemon = PrivateDaemon(
         Command::new(env!("CARGO_BIN_EXE_cagentsd"))
+            .env(cagents::account::probe::login_path::ADOPTED_ENV, "1")
             .env("HOME", &home)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_STATE_HOME", root.join("state"))

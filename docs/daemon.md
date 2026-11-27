@@ -22,9 +22,9 @@ terminals or agent work asks for a counted confirmation first.
 
 On Linux the daemon reads your login shell's `PATH` once when it starts,
 whatever started it, so the terminals, provider CLIs and agents it launches
-find what your login startup files add, such as `~/.local/bin`. A window, the
-autostart entry or systemd can hand the daemon a much shorter `PATH`; see
-[Devices](devices.md) for the order the two are combined in.
+find what your login startup files add, such as `~/.local/bin`, even when the
+window or autostart entry that started it carries a much shorter `PATH`; see
+[Devices](devices.md) for how the two are combined.
 
 Full and browserless production builds share one daemon socket
 (`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes
