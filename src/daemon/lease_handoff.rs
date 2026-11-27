@@ -25,6 +25,31 @@ pub(crate) struct LeaseHandoff {
     lock: File,
 }
 
+/// Read the last owner without disturbing the cursor shared with the standby.
+#[cfg(target_os = "macos")]
+pub(crate) fn recorded_owner(lock: &File) -> io::Result<(HostSessionProof, u32)> {
+    use std::os::unix::fs::FileExt;
+
+    #[derive(serde::Deserialize)]
+    struct Owner {
+        proof: HostSessionProof,
+        pid: u32,
+    }
+
+    const LIMIT: u64 = 16 * 1024;
+    let len = lock.metadata()?.len();
+    if len > LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Runtime owner record is too large",
+        ));
+    }
+    let mut bytes = vec![0; len as usize];
+    lock.read_exact_at(&mut bytes, 0)?;
+    let owner: Owner = serde_json::from_slice(&bytes)?;
+    Ok((owner.proof, owner.pid))
+}
+
 pub(crate) struct HandoffSource {
     pub(crate) pid: u32,
     pub(crate) proof: HostSessionProof,
@@ -75,28 +100,6 @@ impl LeaseHandoff {
     pub(super) fn descriptor(&self) -> BorrowedFd<'_> {
         use std::os::fd::AsFd;
         self.lock.as_fd()
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn recorded_source_is(&self, proof: &HostSessionProof) -> io::Result<bool> {
-        use std::os::unix::fs::FileExt;
-
-        #[derive(serde::Deserialize)]
-        struct Owner {
-            proof: HostSessionProof,
-        }
-
-        // Positional reads keep the transferred OFD's cursor unchanged. The
-        // stopped lease must still name the last source, not a later restart.
-        const LIMIT: u64 = 16 * 1024;
-        let len = self.lock.metadata()?.len();
-        if len > LIMIT {
-            return Ok(false);
-        }
-        let mut bytes = vec![0; len as usize];
-        self.lock.read_exact_at(&mut bytes, 0)?;
-        let owner: Owner = serde_json::from_slice(&bytes)?;
-        Ok(&owner.proof == proof)
     }
 
     pub(crate) fn duplicate_for_recovery(&self) -> io::Result<File> {

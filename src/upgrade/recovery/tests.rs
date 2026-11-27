@@ -151,13 +151,19 @@ fn ready_activation_claim_prevents_a_recipe_retry_before_checkpoint_mutation() {
         authority: preparation.authority,
     };
     assert!(receipt.ready_before_restore().unwrap());
-    let claim = ready_claim_path(&receipt.authority).unwrap();
+    let claim = ready_evidence_path(&receipt.authority, "claim").unwrap();
     let capture_digest = digest(b"test capture");
     let successor = crate::daemon::new_host_session_proof().unwrap();
-    claim_ready_activation(&receipt.authority, &capture_digest, &successor).unwrap();
+    claim_ready_activation(&receipt.authority, &capture_digest, &successor, None).unwrap();
     let original = fs::read(&claim).unwrap();
     assert!(
-        claim_ready_activation(&receipt.authority, &digest(b"other capture"), &successor).is_err()
+        claim_ready_activation(
+            &receipt.authority,
+            &digest(b"other capture"),
+            &successor,
+            None
+        )
+        .is_err()
     );
     assert_eq!(fs::read(&claim).unwrap(), original);
     let saved: serde_json::Value = serde_json::from_slice(&original).unwrap();
@@ -173,6 +179,139 @@ fn ready_activation_claim_prevents_a_recipe_retry_before_checkpoint_mutation() {
     assert_eq!(saved_proof, successor);
     assert_eq!(fs::read(canonical).unwrap(), bytes);
     assert!(!receipt.ready_before_restore().unwrap());
+
+    let retry_of = digest(&original);
+    claim_ready_activation(
+        &receipt.authority,
+        &capture_digest,
+        &successor,
+        Some(retry_of),
+    )
+    .unwrap();
+    let retry_path = ready_evidence_path(&receipt.authority, "retry-claim").unwrap();
+    let retry = fs::read(&retry_path).unwrap();
+    assert!(
+        claim_ready_activation(
+            &receipt.authority,
+            &capture_digest,
+            &successor,
+            Some(digest(b"another first attempt")),
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read(claim).unwrap(), original);
+    assert_eq!(fs::read(retry_path).unwrap(), retry);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ready_pre_effects_retry_requires_a_dead_exact_first_attempt_and_one_unused_slot() {
+    use crate::daemon::holder_registry::Process;
+    use std::process::Stdio;
+
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let mut preparation = preparation(directory.path());
+    preparation.authority.source.boot_id = crate::daemon::read_boot_id().unwrap();
+    let successor = |name| HostSessionProof {
+        host_session_id: HostSessionId::new(name),
+        host_incarnation: HostIncarnation::new(name),
+        boot_id: preparation.authority.source.boot_id.clone(),
+    };
+    let capture_digest = digest(b"original inventory capture");
+    let plan = ReadyPlanEvidence {
+        authority: std::borrow::Cow::Borrowed(&preparation.authority),
+        checkpoint: (0, 0),
+        capture_digest: capture_digest.clone(),
+    };
+    let first_path = ready_evidence_path(&preparation.authority, "claim").unwrap();
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let first = ready_claim_record(
+        &preparation.authority,
+        &capture_digest,
+        &successor("first-successor"),
+        Process::read(child.id() as i32).unwrap(),
+        None,
+    );
+    let first_bytes = serde_json::to_vec(&first).unwrap();
+    save(&first_path, &first_bytes);
+    let while_live = plan.require_pre_effects_retry();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(while_live.is_err());
+    let (_, fingerprint) = plan.retry_predecessor().unwrap();
+    assert_eq!(fingerprint, digest(&first_bytes));
+
+    let mut legacy = first;
+    legacy.successor_proof = None;
+    save(&first_path, &serde_json::to_vec(&legacy).unwrap());
+    assert!(plan.require_pre_effects_retry().is_err());
+    save(&first_path, &first_bytes);
+
+    let effects = ready_evidence_path(&preparation.authority, "effects").unwrap();
+    std::os::unix::fs::symlink("missing", &effects).unwrap();
+    assert!(plan.require_pre_effects_retry().is_err());
+    fs::remove_file(effects).unwrap();
+
+    let retry = ready_claim_record(
+        &preparation.authority,
+        &capture_digest,
+        &successor("retry-successor"),
+        Process::read(std::process::id() as i32).unwrap(),
+        Some(fingerprint),
+    );
+    let retry_path = ready_evidence_path(&preparation.authority, "retry-claim").unwrap();
+    save(&retry_path, &serde_json::to_vec(&retry).unwrap());
+    assert!(plan.require_pre_effects_retry().is_err());
+    assert!(!plan.claimed_process_exited().unwrap());
+    assert_eq!(fs::read(first_path).unwrap(), first_bytes);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ready_retry_accepts_only_causal_pairs_of_exact_runtime_and_saved_owners() {
+    let directory = tempfile::tempdir().unwrap();
+    let preparation = preparation(directory.path());
+    let source = &preparation.authority.source;
+    let successor = HostSessionProof {
+        host_session_id: HostSessionId::new("successor"),
+        host_incarnation: HostIncarnation::new("new-incarnation"),
+        boot_id: source.boot_id.clone(),
+    };
+    let first = ready_claim_record(
+        &preparation.authority,
+        "capture",
+        &successor,
+        crate::daemon::holder_registry::Process { pid: 20, start: 1 },
+        None,
+    );
+    let observe = |runtime: &HostSessionProof, runtime_pid, saved: &HostSessionProof, saved_pid| {
+        select_ready_state_predecessor(
+            source,
+            runtime.clone(),
+            runtime_pid,
+            Some(&first),
+            |proof| Ok((proof == saved).then_some(saved_pid)),
+        )
+    };
+    for (runtime, runtime_pid, saved, saved_pid) in [
+        (source, 10, source, 10),
+        (&successor, 20, source, 10),
+        (&successor, 20, &successor, 20),
+    ] {
+        let accepted = observe(runtime, runtime_pid, saved, saved_pid).unwrap();
+        assert_eq!((&accepted.0, accepted.1), (saved, Some(saved_pid)));
+    }
+    assert!(observe(source, 10, &successor, 20).is_err());
+    assert!(observe(&successor, 21, source, 10).is_err());
+    assert!(observe(&successor, 20, &successor, 21).is_err());
+    let mut intervening = successor.clone();
+    intervening.host_session_id = HostSessionId::new("intervening");
+    assert!(observe(&successor, 20, &intervening, 20).is_err());
+    assert!(observe(&intervening, 20, source, 10).is_err());
 }
 
 fn checkpoint(preparation: &Preparation, phase: &str) -> Vec<u8> {

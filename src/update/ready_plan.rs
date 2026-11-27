@@ -207,13 +207,22 @@ pub fn admit_saved_state(executable: &Path) -> Result<(), UpdateError> {
 #[cfg(feature = "host")]
 pub(crate) fn admit_ready(
     authority: &crate::upgrade::recovery::Authority,
-) -> Result<(), UpdateError> {
-    if let Some(reservation) = shared_reservation()?
-        && (reservation.returning()? || !reservation.plan.ready.same_authority(authority))
-    {
+) -> Result<Option<ReadyPlanEvidence<'static>>, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(None);
+    };
+    if !reservation.plan.ready.same_authority(authority) {
         return Err(invalid("The saved work is reserved for a different update"));
     }
-    Ok(())
+    if !matches!(
+        reservation.phase()?,
+        Phase::AwaitingAdmission | Phase::Claimed
+    ) {
+        return Err(invalid(
+            "The approved update no longer owns the saved-work reservation",
+        ));
+    }
+    Ok(Some(reservation.plan.ready))
 }
 
 fn refreshed_reservation(
@@ -324,9 +333,11 @@ pub(crate) fn resume_selected(
                 reservation.finish_return(&source)?;
                 return Ok(None);
             }
-            Phase::Claimed => {
-                return Err(invalid("The update already took custody of the saved work"));
-            }
+            Phase::Claimed => reservation
+                .plan
+                .ready
+                .require_pre_effects_retry()
+                .map_err(invalid)?,
             Phase::AwaitingAdmission => (),
         }
         let Some(job) = cutover::read_job(&state)? else {
@@ -657,7 +668,7 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, UpdateError> {
     Ok(Some(bytes))
 }
 
-fn load(state: &Path, job: &UpdateJob) -> Result<Option<Plan<'static>>, UpdateError> {
+fn load(state: &Path, job: &UpdateJob) -> Result<Option<(Plan<'static>, bool)>, UpdateError> {
     if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed) {
         return Ok(None);
     }
@@ -668,7 +679,7 @@ fn load(state: &Path, job: &UpdateJob) -> Result<Option<Plan<'static>>, UpdateEr
                     "This update is already reopening the selected build",
                 ));
             }
-            return Ok(Some(reservation.plan));
+            return Ok(Some((reservation.plan, true)));
         }
         if reservation.phase()? != Phase::Released {
             return Err(UpdateError::Busy);
@@ -681,7 +692,7 @@ fn load(state: &Path, job: &UpdateJob) -> Result<Option<Plan<'static>>, UpdateEr
     if plan.version != 1 {
         return Err(invalid("Unsupported Ready activation plan"));
     }
-    Ok(Some(plan))
+    Ok(Some((plan, false)))
 }
 
 impl Plan<'_> {
@@ -749,7 +760,7 @@ pub(super) fn recover_worker(
     job: &mut UpdateJob,
     worker: &File,
 ) -> Result<(), UpdateError> {
-    let plan =
+    let (plan, reserved) =
         load(state, job)?.ok_or_else(|| invalid("This update has no Ready activation plan"))?;
     let target = plan.target_layout(&installation.prefix, job)?;
     if target.version != installation.version {
@@ -784,7 +795,7 @@ pub(super) fn recover_worker(
     let handoff = acquire_unserved_runtime()?;
     let receipt = plan
         .ready
-        .reopen(&daemon, worker, &guard, &handoff)
+        .reopen(&daemon, worker, &guard, &handoff, reserved)
         .map_err(invalid)?;
     let mut standby = crate::daemon::standby::Parked::launch_with_custody(
         &daemon,

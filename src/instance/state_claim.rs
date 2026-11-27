@@ -219,32 +219,39 @@ pub fn claims_directory() -> io::Result<PathBuf> {
 /// process held the old runtime's lock. Its last claimant must still be the
 /// acknowledged source; the caller holds the Darwin publication fence.
 #[cfg(target_os = "macos")]
-pub(crate) fn last_daemon_was(
+pub(crate) fn last_daemon_pid(
     lock: &Path,
     proof: &crate::model::HostSessionProof,
-) -> io::Result<bool> {
+) -> io::Result<Option<u32>> {
     let claim = claims_directory()?.join(DAEMON_CLAIM);
     let guard = canonical_guard(lock);
     Ok(read_path(&claim)?
-        .as_ref()
-        .is_some_and(|record| names_source(record, &guard, proof)))
+        .filter(|record| names_source(record, &guard, proof, None))
+        .map(|record| record.pid))
 }
 
 #[cfg(target_os = "macos")]
-fn names_source(record: &Record, guard: &Path, proof: &crate::model::HostSessionProof) -> bool {
+fn names_source(
+    record: &Record,
+    guard: &Path,
+    proof: &crate::model::HostSessionProof,
+    pid: Option<u32>,
+) -> bool {
     record.guard == guard
         && record.host_session.as_deref() == Some(proof.host_session_id.as_str())
         && record.boot.as_deref() == Some(proof.boot_id.as_str())
+        && pid.is_none_or(|pid| record.pid == pid)
 }
 
 /// The acknowledged Ready successor may replace only its original source's
 /// saved-data claim. Compare under the exclusive lock before recording a
 /// successor so an intervening writer cannot race the coordinator's snapshot.
-#[cfg(target_os = "macos")]
-pub fn claim_daemon_state_from(
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn claim_daemon_state_from(
     lock: &Path,
     host_session: &str,
     source: &crate::model::HostSessionProof,
+    source_pid: Option<u32>,
 ) -> io::Result<StateClaim> {
     let claims = claims_directory()?;
     prepare_claim_directory(&claims, Claimant::Daemon)?;
@@ -255,7 +262,9 @@ pub fn claim_daemon_state_from(
         ours,
         Claimant::Daemon,
         DAEMON_PATIENCE,
-        |previous| previous.is_some_and(|previous| names_source(previous, &guard, source)),
+        |previous| {
+            previous.is_some_and(|previous| names_source(previous, &guard, source, source_pid))
+        },
     )
 }
 

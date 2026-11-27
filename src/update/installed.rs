@@ -447,11 +447,11 @@ pub(super) fn perform(
             let started = match started {
                 Err(error)
                     if standby.exited_during_start(&error)
-                        && receipt
-                            .is_some_and(|receipt| receipt.ready_before_restore() == Ok(true))
                         && ready_plan.as_ref().is_some_and(|plan| {
                             plan.unchanged().is_ok_and(|unchanged| unchanged)
                         })
+                        && receipt
+                            .is_some_and(|receipt| receipt.can_retry_standby() == Ok(true))
                         && Selection::capture(&layout)
                             .is_ok_and(|current| current == selection)
                         && stamp(root).is_ok_and(|current| current == before) =>
