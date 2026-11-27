@@ -332,6 +332,49 @@ class CodexToolRowsFixture(unittest.TestCase):
             self.assertEqual(resumed["result"]["thread"]["id"], original.thread)
             self.assertEqual(replacement.thread, original.thread)
 
+    def test_a_server_that_resumes_a_thread_in_its_home_replays_the_last_finished_turn(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            home = Path(directory, "home")
+            home.mkdir()
+            Path(home, "fixture-rollouts").touch()
+            earlier = PEER["Scenario"]()
+            earlier.request({"id": 1, "method": "thread/start", "params": {"cwd": directory}},
+                            str(home))
+            resume = {"id": 3, "method": "thread/resume", "params": {"threadId": earlier.thread}}
+            # A thread that finished nothing comes back with nothing.
+            [empty] = PEER["Scenario"]().request(resume, str(home))
+            self.assertEqual(empty["result"]["initialTurnsPage"]["data"], [])
+
+            replies = earlier.request({"id": 2, "method": "turn/start", "params": {
+                "threadId": earlier.thread}}, str(home))
+            pause = next(index for index, reply in enumerate(replies) if "_sleep" in reply)
+            for reply in replies[:pause]:
+                earlier.observe(reply)
+            # The turn still under way when its server died was not kept.
+            [working] = PEER["Scenario"]().request(resume, str(home))
+            self.assertEqual(working["result"]["initialTurnsPage"]["data"], [])
+            for reply in replies[pause:]:
+                if "_sleep" not in reply:
+                    earlier.observe(reply)
+            self.assertEqual(earlier.latest["status"], "completed")
+
+            later = PEER["Scenario"]()
+            [resumed] = later.request(resume, str(home))
+            self.assertEqual(resumed["result"]["thread"]["id"], earlier.thread)
+            [turn] = resumed["result"]["initialTurnsPage"]["data"]
+            self.assertEqual(turn["id"], earlier.latest["id"])
+            self.assertEqual(turn["status"], "completed")
+            self.assertEqual(turn["items"], earlier.latest["items"])
+            self.assertEqual(later.child, earlier.child, "its rows name the same subagent")
+            # Whatever was still running did not survive the server.
+            for latest in (later.child_latest, later.second_latest):
+                self.assertNotEqual((latest or {}).get("status"), "inProgress")
+            self.assertEqual(resumed["result"]["thread"]["status"], {"type": "idle"})
+            kept = [path.name for path in home.glob("sessions/*/*/*/*")]
+            self.assertEqual(sorted(kept), sorted(
+                [f"turn-{earlier.thread}.json",
+                 next(name for name in kept if name.startswith("rollout-"))]))
+
     def test_model_catalog_and_resolved_selection_come_from_the_fixture_home(self):
         import json
         import tempfile
