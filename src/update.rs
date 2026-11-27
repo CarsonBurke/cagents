@@ -1079,7 +1079,13 @@ impl TerminalReview for NativeTerminalReview {
         let state = running_installation()?.state_dir()?;
         match acquire_lock(&state) {
             Ok(_lease) => Ok(false),
-            Err(UpdateError::Busy) => Ok(true),
+            Err(UpdateError::Busy) => {
+                // Its release is the next change worth waking for.
+                if let Some(progress) = &self.progress {
+                    progress.follow_lease();
+                }
+                Ok(true)
+            }
             Err(error) => Err(error),
         }
     }
