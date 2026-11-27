@@ -175,6 +175,15 @@ impl<'de> Deserialize<'de> for UsageReset {
 }
 
 impl UsageReset {
+    /// Whether both rows describe the same grant and remaining credit.
+    pub fn same_grant(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.kind == other.kind
+            && self.available_count == other.available_count
+            && self.expires_at == other.expires_at
+            && ordered_scopes(&self.scopes) == ordered_scopes(&other.scopes)
+    }
+
     pub fn label(&self) -> String {
         scope_label(&self.scopes)
     }
@@ -348,32 +357,51 @@ pub fn inventory_lines(resets: &[UsageReset], now_secs: i64) -> Vec<String> {
 
 impl UsageSnapshot {
     /// Integrate a complete inventory into newer usage figures.
-    pub fn merge_reset_inventory(&mut self, full: &Self, now: u64) {
+    pub fn merge_reset_inventory(
+        &mut self,
+        full: &Self,
+        now: u64,
+        retain_window: impl Fn(&UsageWindow) -> bool,
+    ) {
         let mut resets = full.resets.clone();
-        self.retain_newer_reset_releases(&mut resets, full.observed_at, now, |_| true);
+        self.retain_newer_reset_releases(&mut resets, full.observed_at, now, retain_window);
         self.resets = resets;
     }
 
     /// A scoped frame does not move the account-wide clock. Keep the scoped
     /// figure that released a hold if a complete probe observed it earlier.
-    pub fn retain_newer_scoped_reset_usage(&mut self, previous: &Self, now: u64) {
+    pub fn retain_newer_scoped_reset_usage(
+        &mut self,
+        previous: &Self,
+        now: u64,
+        retain_window: impl Fn(&UsageWindow) -> bool,
+    ) -> bool {
+        let mut retained = false;
+        let windows = &mut self.windows;
         previous.retain_newer_reset_releases(&mut self.resets, self.observed_at, now, |window| {
-            if window.kind != WindowKind::Scoped {
+            if window.kind != WindowKind::Scoped || !retain_window(window) {
                 return false;
             }
             let key = super::claude::stable_window_key(&window.key);
-            if let Some(probed) = self
-                .windows
+            if let Some(probed) = windows
                 .iter_mut()
                 .find(|probed| super::claude::stable_window_key(&probed.key) == key)
             {
                 probed.used = window.used;
                 probed.resets_at = window.resets_at.or(probed.resets_at);
             } else {
-                self.windows.push(window.clone());
+                windows.push(window.clone());
             }
+            retained = true;
             true
         });
+        if retained
+            && self.status == super::UsageStatus::Ok
+            && super::status_for(&self.windows, false, false) == super::UsageStatus::Warning
+        {
+            self.status = super::UsageStatus::Warning;
+        }
+        retained
     }
 
     fn retain_newer_reset_releases(
@@ -403,12 +431,8 @@ impl UsageSnapshot {
                 continue;
             };
             if let Some(reset) = resets.iter_mut().find(|reset| {
-                reset.unused_limit_hold == Some(UnusedLimitHold::Held)
-                    && reset.id == previous.id
-                    && reset.kind == previous.kind
-                    && reset.available_count == previous.available_count
-                    && reset.expires_at == previous.expires_at
-                    && ordered_scopes(&reset.scopes) == ordered_scopes(&previous.scopes)
+                (reset.usable || reset.unused_limit_hold == Some(UnusedLimitHold::Held))
+                    && reset.same_grant(previous)
             }) && retain_window(window)
             {
                 reset.usable = true;

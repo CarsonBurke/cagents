@@ -55,6 +55,7 @@ struct Attempt {
     key: String,
     total_count: u64,
     identity: Option<Identity>,
+    usage_generation: Option<u64>,
 }
 
 impl State {
@@ -152,7 +153,8 @@ impl State {
         let confirmation = self.confirmation.take()?;
         // A refresh may learn the plan between question and answer; only
         // another login changes whose reset the question was about.
-        if &confirmation.reset != current
+        if !confirmation.reset.same_grant(current)
+            || confirmation.reset.usable != current.usable
             || confirmation.total_count != total_count
             || (confirmation.identity.as_ref() != identity
                 && !may_act_for(identity, confirmation.identity.as_ref()))
@@ -168,6 +170,7 @@ impl State {
             key: confirmation.key,
             total_count: confirmation.total_count,
             identity: confirmation.identity,
+            usage_generation: None,
         };
         self.pending = Some(attempt.clone());
         self.feedback = None;
@@ -1013,6 +1016,7 @@ impl Cagents {
             return Task::none();
         };
         attempt.incidents = incidents;
+        attempt.usage_generation = Some(state.usage_generation);
         state.reset.pending = Some(attempt.clone());
         let owner = state.owner;
         // A pre-consume probe must not overwrite the refreshed result.
@@ -1031,9 +1035,11 @@ impl Cagents {
             return Task::none();
         }
         let state = self.account_ui.account_mut(&id).expect("account checked");
-        let Some(attempt) = state.reset.recover(&reset_id, state.identity.as_ref()) else {
+        let Some(mut attempt) = state.reset.recover(&reset_id, state.identity.as_ref()) else {
             return Task::none();
         };
+        attempt.usage_generation = Some(state.usage_generation);
+        state.reset.pending = Some(attempt.clone());
         state.pending_probe = None;
         state.schedule.abandon();
         submit_attempt(id, state.owner, attempt)
@@ -1077,44 +1083,56 @@ impl Cagents {
         if !state.reset.finish(&key, status, message) {
             return Task::none();
         }
-        if let Some(snapshot) = snapshot {
+        if let Some(mut snapshot) = snapshot {
+            let now = now_ms();
+            let same_generation = state.usage_generation;
+            let compatible_attempt = submitted.as_ref().filter(|attempt| {
+                attempt.usage_generation == Some(same_generation)
+                    && may_act_for(state.identity.as_ref(), attempt.identity.as_ref())
+            });
+            let retain_window = |window: &UsageWindow| {
+                compatible_attempt.is_some_and(|attempt| !attempt.reset.clears(window))
+            };
             let mut merged_inventory = false;
             if status == ConsumeStatus::Reset
-                && let Some(attempt) = submitted
+                && let Some(attempt) = &submitted
             {
                 state.reset.confirmed.insert(
                     attempt.reset.id.clone(),
                     ConfirmedReset {
-                        reset: attempt.reset,
-                        identity: attempt.identity,
+                        reset: attempt.reset.clone(),
+                        identity: attempt.identity.clone(),
                         observed_at: snapshot.observed_at,
-                        incidents: attempt.incidents,
+                        incidents: attempt.incidents.clone(),
                     },
                 );
             }
             state.schedule.observe(snapshot.observed_at);
-            if state.inventory_observed_at.is_none_or(|known| {
-                snapshot.observed_at >= known
-                    || known > now_ms().saturating_add(schedule::CLOCK_SLACK)
-            }) {
+            let inventory_current = state.inventory_observed_at.is_none_or(|known| {
+                snapshot.observed_at >= known || known > now.saturating_add(schedule::CLOCK_SLACK)
+            });
+            if inventory_current {
                 state.inventory_observed_at = Some(snapshot.observed_at);
                 if let Some(current) = state.snapshot.as_mut()
                     && current.observed_at > snapshot.observed_at
                 {
-                    merge_complete_inventory(current, &snapshot);
+                    merge_complete_inventory(current, &snapshot, now, retain_window);
                     merged_inventory = true;
                 }
             }
-            if state
-                .snapshot
-                .as_ref()
-                .is_none_or(|current| current.observed_at <= snapshot.observed_at)
-            {
-                state.snapshot = Some(snapshot);
+            match state.snapshot.as_ref() {
+                Some(current) if current.observed_at > snapshot.observed_at => {}
+                current => {
+                    if inventory_current && let Some(current) = current {
+                        merged_inventory =
+                            snapshot.retain_newer_scoped_reset_usage(current, now, retain_window);
+                    }
+                    state.snapshot = Some(snapshot);
+                }
             }
             state.failure = None;
             let provider = state.account.provider;
-            self.account_ui.now_ms = now_ms();
+            self.account_ui.now_ms = now;
             let publish = if merged_inventory {
                 self.save_live(id)
             } else {
@@ -1958,6 +1976,22 @@ pub(in crate::app) mod tests {
     }
 
     #[test]
+    fn a_new_live_observation_does_not_change_the_confirmed_grant() {
+        use account::resets::UnusedLimitHold;
+
+        let mut grant = reset(ResetScope::Model("Fable".into()));
+        let observed = |observed_at| UnusedLimitHold::Released {
+            window_key: "weekly_scoped:Fable".into(),
+            observed_at,
+        };
+        grant.unused_limit_hold = Some(observed(1_000));
+        let mut state = State::default();
+        state.prepare(grant.clone(), 2, None, "accounts".into());
+        grant.unused_limit_hold = Some(observed(2_000));
+        assert!(state.submit(&grant, 2, None).is_some());
+    }
+
+    #[test]
     fn an_older_attempt_cannot_complete_the_current_attempt() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
@@ -1997,6 +2031,70 @@ pub(in crate::app) mod tests {
         assert_eq!(state.snapshot.as_ref(), Some(&before));
         assert!(state.reset.in_flight());
     }
+
+    #[test]
+    fn reset_completion_keeps_later_scoped_usage_for_an_unaffected_grant() {
+        use account::resets::UnusedLimitHold;
+
+        for (scope, same_generation, expected) in [
+            (ResetScope::AccountWeekly, true, true),
+            (ResetScope::AccountWeekly, false, false),
+            (ResetScope::Model("Fable".into()), true, false),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let id = Account::system(Provider::Claude).id();
+            let now = now_ms();
+            let key = "weekly_scoped:Fable";
+            let mut fable = reset(ResetScope::Model("Fable".into()));
+            fable.id = "fable".into();
+            fable.usable = false;
+            fable.unused_limit_hold = Some(UnusedLimitHold::Held);
+            let mut complete = UsageSnapshot::state(UsageStatus::Ok, "", now - 2_000);
+            complete.windows = vec![window(account::WindowKind::Scoped, key, 0.0)];
+            complete.resets = vec![fable];
+            let mut current = complete.clone();
+            current.observed_at = now - 3_000;
+            let live = account::claude::parse_rate_limit_event(&serde_json::json!({
+                "rateLimitType":"seven_day_overage_included",
+                "utilization":0.98
+            }))
+            .unwrap();
+            assert!(LiveReport::Claude(live).apply(&mut current, now - 1_000, now));
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.identity = Some(reset_identity());
+            state.snapshot = Some(current);
+            let grant = reset(scope);
+            state
+                .reset
+                .prepare(grant.clone(), 2, Some(reset_identity()), "accounts".into());
+            let mut attempt = state
+                .reset
+                .submit(&grant, 2, Some(&reset_identity()))
+                .unwrap();
+            attempt.usage_generation = Some(state.usage_generation);
+            state.reset.pending = Some(attempt.clone());
+            if !same_generation {
+                state.invalidate_usage();
+            }
+            let owner = state.owner;
+            drop(app.finish_usage_reset(
+                id.clone(),
+                owner,
+                attempt.key,
+                Ok(ConsumeOutcome {
+                    status: ConsumeStatus::Reset,
+                    message: None,
+                    snapshot: Some(complete),
+                }),
+            ));
+            let state = app.account_ui.account(&id).unwrap();
+            let snapshot = state.snapshot.as_ref().unwrap();
+            assert_eq!(snapshot.observed_at, now - 2_000);
+            assert_eq!(snapshot.windows[0].used, if expected { 0.98 } else { 0.0 });
+            assert_eq!(snapshot.resets[0].is_available(unix_seconds(now)), expected);
+        }
+    }
+
     #[test]
     fn multiple_credits_render_one_scope_count_and_choose_earliest_expiry() {
         use iced::advanced::{

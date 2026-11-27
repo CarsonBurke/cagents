@@ -1998,7 +1998,7 @@ mod reset_tests {
         let mut spent = delayed.clone();
         spent.resets[0].available_count = 0;
         let mut with_spent_inventory = usage.clone();
-        with_spent_inventory.merge_reset_inventory(&spent, now + 3);
+        with_spent_inventory.merge_reset_inventory(&spent, now + 3, |_| true);
         assert_eq!(with_spent_inventory.resets, spent.resets);
 
         let mut fable_reset = usage.clone();
@@ -2007,13 +2007,13 @@ mod reset_tests {
             now + 4,
             now + 4
         ));
-        fable_reset.merge_reset_inventory(&delayed, now + 4);
+        fable_reset.merge_reset_inventory(&delayed, now + 4, |_| true);
         assert!(!fable_reset.resets[0].is_available(1));
 
         // Newer weekly usage cannot stand in for a Fable observation after this read.
         delayed.observed_at = now + 4;
         assert!(update("seven_day", 1.0).apply(&mut usage, now + 5, now + 5));
-        usage.merge_reset_inventory(&delayed, now + 5);
+        usage.merge_reset_inventory(&delayed, now + 5, |_| true);
         assert!(!usage.resets[0].is_available(1));
     }
 
