@@ -6,7 +6,8 @@
 # Prepare a new task once: start/stop a side, run this as prepare while it is
 # stopped, then save-seed, so both sides' startup probes see the same
 # catalogs. It captures a new chat's picker, a search across providers, and
-# the picker of a conversation already under way. Every catalog is invented
+# the picker of a conversation already under way, with its fast mode
+# switched on. Every catalog is invented
 # or recorded, and no provider is contacted.
 set -euo pipefail
 scene=${1:?usage: model-picker-scene.sh picker|prepare}
@@ -69,6 +70,8 @@ picker() {
 
 # A step that fails leaves a picture of what was on screen.
 trap '"$ne" shot failed-step >/dev/null 2>&1 || true' ERR
+# Claude conversations started from here on offer fast mode.
+"$ne" env sh -c 'touch "$HOME/.claude/fixture-fast-mode"'
 dismiss_inspector
 "$ne" cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project" >/dev/null
 "$ne" drive wait project --timeout 30
@@ -87,6 +90,11 @@ picker
 sleep 2
 picker
 shot started-picker
+at=$(locate 'Fast mode')
+[ -n "$at" ] || { echo 'Could not locate the fast mode switch.' >&2; false; }
+"$ne" drive click "$at" >/dev/null
+sleep 2
+shot fast-mode-on
 "$ne" drive key Escape
 "$ne" drive wait 'models' --gone --timeout 20
 
