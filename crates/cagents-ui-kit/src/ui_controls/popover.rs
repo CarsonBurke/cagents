@@ -127,10 +127,11 @@ fn framed<'a, Message: Clone + 'static>(
 /// A full-width menu action with a stable icon column and a secondary description.
 pub fn popover_item<'a, Message: Clone + 'a>(
     icon: impl Into<widget::icon::Handle>,
-    title: &'a str,
+    title: impl Into<Cow<'a, str>>,
     description: impl Into<Cow<'a, str>> + 'a,
     on_press: Message,
 ) -> widget::button::Button<'a, Message> {
+    let title = title.into();
     widget::button::custom(
         widget::row::with_children(vec![
             widget::container(widget::icon(icon.into()).size(design::STATUS_ICON_SIZE))
@@ -139,7 +140,7 @@ pub fn popover_item<'a, Message: Clone + 'a>(
                 .center_y(design::ROW_HEIGHT + space::XS)
                 .into(),
             widget::column::with_children(vec![
-                design::body(title).into(),
+                design::body(title.clone()).into(),
                 design::caption(description).into(),
             ])
             .spacing(space::XXS)

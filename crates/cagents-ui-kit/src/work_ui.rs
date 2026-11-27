@@ -30,6 +30,9 @@ const COLUMN_MIN_WIDTH: f32 = 248.0;
 const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
+/// The most agents a card's menu lists to focus, most in need first, so a
+/// busy card's menu still fits the window.
+const MENU_AGENTS: usize = 4;
 
 /// A board card's height before it has been measured: branch, title, facts
 /// and footer at the compact sizes.
@@ -1019,12 +1022,12 @@ impl State {
         let urgent = urgent_sessions(item);
         let first = urgent.first()?;
         let mut members = crate::sidebar::ChannelMembers::default();
-        for session in &item.sessions {
+        for (index, session) in urgent.iter().enumerate() {
+            let state = crate::sidebar::ChannelMemberState::of(session.state, false);
             match session.provider {
-                Some(provider) => members.add_agent(
-                    provider,
-                    crate::sidebar::ChannelMemberState::of(session.state, false),
-                ),
+                // The mark shows the agent pressing it focuses.
+                Some(provider) if index == 0 => members.add_lead(provider, state),
+                Some(provider) => members.add_agent(provider, state),
                 None => members.add_terminal(),
             }
         }
@@ -1033,29 +1036,30 @@ impl State {
             crate::sidebar::MembersGround::Row,
             crate::sidebar::RowInk::Full,
         )?;
-        let tip = urgent
-            .iter()
-            .map(|session| {
-                format!(
-                    "{}: {}",
-                    session_label(session),
-                    session_state(session.state)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let each = |separator: &str| {
+            urgent
+                .iter()
+                .map(|session| {
+                    format!(
+                        "{}{separator}{}",
+                        session_label(session),
+                        session_state(session.state)
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let named = each(", ");
+        let name = match named.len() {
+            1 => format!("Focus {}", named[0]),
+            count => format!("Focus {}; {count} agents: {}", named[0], named.join("; ")),
+        };
         Some(crate::interaction::tooltip(
             widget::button::custom(mark)
-                .name(format!(
-                    "Focus {}, {}; {}",
-                    session_label(first),
-                    session_state(first.state),
-                    members.description()
-                ))
+                .name(name)
                 .class(crate::ui_controls::control_style(false, None))
                 .padding([space::XXS, space::XS])
                 .on_press(Action::FocusSession(first.id)),
-            tip,
+            each(": ").join("\n"),
         ))
     }
 
@@ -1103,19 +1107,28 @@ impl State {
                     .into(),
                 );
             }
-            for session in urgent_sessions(item) {
+            let urgent = urgent_sessions(item);
+            for session in urgent.iter().take(MENU_AGENTS) {
                 let icon = session.provider.map_or_else(
                     || Icon::Terminal.handle(),
                     crate::ui_controls::provider_icon,
                 );
+                let label = format!("Focus {}", session_label(session));
+                let state = session_state(session.state);
                 items.push(
-                    popover_item(
-                        icon,
-                        session_label(session),
-                        session_state(session.state),
-                        Action::FocusSession(session.id),
-                    )
-                    .name(format!("Focus {}", session_label(session)))
+                    popover_item(icon, label.clone(), state, Action::FocusSession(session.id))
+                        .name(format!("{label}, {state}"))
+                        .into(),
+                );
+            }
+            // The rest are a hover away on the agent mark, and in the sidebar.
+            if let Some(more) = urgent.len().checked_sub(MENU_AGENTS).filter(|more| *more > 0) {
+                items.push(
+                    widget::container(design::caption(format!(
+                        "{more} more {} in the sidebar",
+                        if more == 1 { "agent" } else { "agents" }
+                    )))
+                    .padding([space::XXS, space::S])
                     .into(),
                 );
             }
@@ -1323,9 +1336,10 @@ impl<'a> Leading<'a> {
 }
 
 /// What a card is called: its pull request's title, else its branch, else
-/// the folder of a checkout whose HEAD is detached, which says more about
-/// what it is for than that it is detached; the glyph's tooltip and the
-/// card's accessible name say that.
+/// the folder of a linked checkout whose HEAD is detached, which says more
+/// about what it is for than that it is detached; the glyph's tooltip and the
+/// card's accessible name say that. The primary checkout's folder is the
+/// project's own name, so a detached one there is said to be detached.
 fn title(item: &Item) -> &str {
     if let Some(pull_request) = &item.pull_request {
         return &pull_request.title;
@@ -1335,6 +1349,7 @@ fn title(item: &Item) -> &str {
     }
     item.worktree
         .as_ref()
+        .filter(|worktree| !worktree.primary)
         .and_then(|worktree| worktree.path.file_name())
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("Detached HEAD")
@@ -2188,6 +2203,10 @@ mod tests {
         assert_eq!(state.visible().count(), 1);
         state.update(Action::Query("207".into()));
         assert_eq!(state.visible().count(), 1);
+        // The primary checkout's folder is the project's name, which would
+        // read as the project rather than a detached checkout.
+        card.worktree.as_mut().unwrap().primary = true;
+        assert_eq!(title(&card), "Detached HEAD");
     }
 
     /// A card leads with its pull request's title, as its list row does, and
@@ -2261,8 +2280,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(focus.len(), 1, "{names:?}");
         assert!(
-            focus[0].starts_with("Focus Run the tests, Waiting for your permission; "),
+            focus[0].starts_with("Focus Run the tests, Waiting for your permission; 4 agents: "),
             "{focus:?}"
+        );
+        // A second provider working does not take the mark from the agent
+        // pressing it focuses.
+        card.sessions[0].provider = Some(Provider::Codex);
+        connected(&mut state, 2, board(vec![card.clone()]));
+        let (_, names) = card_words(&state, &card);
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("Focus Run the tests, Waiting for your permission; ")),
+            "{names:?}"
         );
     }
 
