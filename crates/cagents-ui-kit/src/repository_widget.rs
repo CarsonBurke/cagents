@@ -2854,6 +2854,9 @@ pub struct RepositoryRuntime {
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
+    /// A Git mutation of this worktree has been admitted and its refresh has
+    /// not begun, so the comparison on screen may already be out of date.
+    index_mutation_in_flight: bool,
     /// Last comparison stays readable while Git refreshes this file, or
     /// while it is rebuilt in a new presentation.
     stale_diff: Option<RetainedDiff>,
@@ -3088,6 +3091,7 @@ impl RepositoryRuntime {
             file_list_refresh_queued: false,
             background_file_refresh: false,
             mutation_refresh_pending: false,
+            index_mutation_in_flight: false,
             stale_diff: None,
             disk_comparison: None,
             diff_presentation: 0,
@@ -4091,6 +4095,7 @@ impl RepositoryRuntime {
     /// Refreshes Git's status and mutable comparisons without replacing the
     /// open buffer or changing the identity of its loads and saves.
     pub fn refresh_after_mutation(&mut self, card: CardId) -> Task<RepositoryAction> {
+        self.index_mutation_in_flight = false;
         self.mutation_refresh_pending = true;
         if let Some(path) = self.selected.as_ref().map(|file| file.path.clone())
             && let Some(index) = self.diffs.iter().position(|(basis, state)| {
@@ -5641,8 +5646,18 @@ impl RepositoryRuntime {
     /// Whether the comparison on screen describes the buffer as it is now.
     /// A live comparison lags typing by its debounce; a hunk taken from a
     /// superseded one would name lines that have since moved.
+    /// Records that a Git mutation of this worktree was admitted. Hunk
+    /// actions stand down until [`Self::refresh_after_mutation`] re-reads
+    /// what it left behind: reverting a hunk the mutation is staging would
+    /// otherwise leave the index and the file disagreeing.
+    pub fn index_mutation_started(&mut self) {
+        self.index_mutation_in_flight = true;
+    }
+
     fn hunks_current(&self) -> bool {
-        self.current_diff_model().is_some()
+        !self.index_mutation_in_flight
+            && !self.mutation_refresh_pending
+            && self.current_diff_model().is_some()
             && (!self.editable_working_diff() || self.working_annotations_current())
     }
 
@@ -5651,10 +5666,7 @@ impl RepositoryRuntime {
     }
 
     fn can_stage_hunks(&self) -> bool {
-        self.hunk_offers().stage.is_some()
-            && self.hunks_current()
-            && !self.mutation_refresh_pending
-            && !self.blocks_navigation()
+        self.hunk_offers().stage.is_some() && self.hunks_current() && !self.blocks_navigation()
     }
 
     /// What staging (`stage`) or unstaging `hunk` of the comparison on
@@ -5675,16 +5687,19 @@ impl RepositoryRuntime {
                 .selected_staging_selection(stage)
                 .map(HunkStaging::File);
         }
-        let target = if stage {
-            PatchTarget::Before
+        // Staging patches the index shown as the old side, unstaging the
+        // one shown as the new side; staged lines come from the working file.
+        let (target, index_text) = if stage {
+            (PatchTarget::Before, &model.before)
         } else {
-            PatchTarget::After
+            (PatchTarget::After, &model.after)
         };
         Some(HunkStaging::Patch(IndexPatchRequest {
             worktree: self.descriptor.worktree.clone(),
             path: RepoPath::parse(self.diff_pathspec()?.as_os_str()).ok()?,
+            index: index_text.to_string(),
             hunks: model.hunk_patch(index, target)?,
-            from_worktree: stage,
+            worktree_text: stage.then(|| model.after.to_string()),
         }))
     }
 

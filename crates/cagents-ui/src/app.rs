@@ -14989,6 +14989,14 @@ impl Cagents {
         );
         source.set_error(None);
         source.set_mutation(Some(kind));
+        // Their comparisons are stale until the completion refreshes them.
+        for runtime in self.cards.values_mut() {
+            if let CardRuntime::Repository(runtime) = runtime
+                && runtime.descriptor.worktree == key.canonical_path
+            {
+                runtime.index_mutation_started();
+            }
+        }
         Some(id)
     }
 

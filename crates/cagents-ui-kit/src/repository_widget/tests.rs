@@ -12319,11 +12319,19 @@ fn each_working_hunk_stages_as_its_own_index_patch() {
             request.hunks,
             model.hunk_patch(index, PatchTarget::Before).unwrap()
         );
-        assert!(request.from_worktree);
+        assert_eq!(request.index, *model.before);
+        assert_eq!(request.worktree_text.as_deref(), Some(&*model.after));
         assert_eq!(request.path.as_os_str(), "notes.txt");
         // Staging is not unstaging.
         assert_eq!(runtime.hunk_staging(hunk, false), None);
     }
+    // An admitted Git mutation retires every hunk action until the refresh
+    // after it: reverting a hunk it is staging would split index and file.
+    assert!(runtime.can_revert_hunks());
+    runtime.index_mutation_started();
+    assert_eq!(runtime.hunk_staging(&model.hunks[0], true), None);
+    assert!(!runtime.can_revert_hunks());
+    runtime.index_mutation_in_flight = false;
     runtime.source_surface = SourceSurface::Editor;
     drop(runtime.update(RepositoryAction::EditorAction {
         card,
@@ -12393,7 +12401,8 @@ fn staged_hunks_unstage_and_a_new_file_stages_whole() {
         request.hunks,
         staged.hunk_patch(0, PatchTarget::After).unwrap()
     );
-    assert!(!request.from_worktree);
+    assert_eq!(request.index, *staged.after);
+    assert_eq!(request.worktree_text, None);
 
     staged.absent = [true, false];
     runtime.selected = Some(RepositoryFile {

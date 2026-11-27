@@ -1319,11 +1319,15 @@ pub struct UnstageRequest {
 pub struct IndexPatchRequest {
     pub worktree: PathBuf,
     pub path: RepoPath,
+    /// The index text the hunks were cut from. The patch applies only while
+    /// the index entry still holds exactly these bytes, so it never lands on
+    /// text the user was not shown.
+    pub index: String,
     /// The patch's `@@` sections, with no file header.
     pub hunks: String,
-    /// Whether the lines the hunks add were read from the working tree, as
-    /// staging's are, rather than from the index or HEAD.
-    pub from_worktree: bool,
+    /// When staging, the working-tree text the added lines were read from;
+    /// `None` when they come from the index or HEAD, as unstaging's do.
+    pub worktree_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3060,15 +3064,53 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
     }
 }
 
-/// Reads one comparison side from the worktree.
-///
-/// Every step here is anchored to a descriptor rather than to a name, because a
-/// name resolves to whatever is there at the moment it is resolved. A symlink
-/// is still reported as a link with its target rather than read as though it
-/// were the file itself, but no component of the path is ever followed, the
-/// size comes from the same descriptor the bytes come from, and the read is
-/// bounded — so a classification and the read that acts on it cannot describe
-/// different objects.
+/// Checks that `body` is only `@@` sections whose lines match the counts in
+/// their headers, as [`RepositoryService::apply_index_patch`] needs: nothing
+/// after them may reach `git apply` as a further file's patch.
+fn validate_hunks(body: &str) -> Result<(), &'static str> {
+    fn counts(header: &str) -> Option<(u64, u64)> {
+        let (ranges, _) = header.strip_prefix("@@ -")?.split_once(" @@")?;
+        let (old, new) = ranges.split_once(" +")?;
+        let number = |digits: &str| {
+            digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| digits.parse::<u64>().ok())
+                .flatten()
+        };
+        let count = |range: &str| {
+            let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+            number(start).and(number(count))
+        };
+        Some((count(old)?, count(new)?))
+    }
+    let mut lines = body.split_inclusive('\n').peekable();
+    if lines.peek().is_none() {
+        return Err("the patch has no hunks");
+    }
+    while let Some(header) = lines.next() {
+        let (mut old, mut new) = counts(header).ok_or("the patch has a malformed hunk header")?;
+        if old == 0 && new == 0 {
+            return Err("the patch has an empty hunk");
+        }
+        while old > 0 || new > 0 {
+            let line = lines
+                .next()
+                .filter(|line| line.ends_with('\n'))
+                .ok_or("a hunk is shorter than its header says")?;
+            match line.as_bytes()[0] {
+                b' ' if old > 0 && new > 0 => (old, new) = (old - 1, new - 1),
+                b'-' if old > 0 => old -= 1,
+                b'+' if new > 0 => new -= 1,
+                _ => return Err("a hunk line does not match its header"),
+            }
+            // The line before it has no final newline.
+            lines.next_if(|line| line.starts_with("\\ ") && line.ends_with('\n'));
+        }
+    }
+    Ok(())
+}
+
 /// A patch file name as Git writes one: bare when it is plain printable
 /// ASCII, otherwise C-quoted, which `git apply` reads back exactly.
 fn quote_patch_name(name: &[u8]) -> Vec<u8> {
@@ -3093,6 +3135,15 @@ fn quote_patch_name(name: &[u8]) -> Vec<u8> {
     quoted
 }
 
+/// Reads one comparison side from the worktree.
+///
+/// Every step here is anchored to a descriptor rather than to a name, because a
+/// name resolves to whatever is there at the moment it is resolved. A symlink
+/// is still reported as a link with its target rather than read as though it
+/// were the file itself, but no component of the path is ever followed, the
+/// size comes from the same descriptor the bytes come from, and the read is
+/// bounded — so a classification and the read that acts on it cannot describe
+/// different objects.
 fn read_worktree_side(root: &fs_safety::Root, path: &RepoPath) -> DiffSide {
     let unreadable = |error: &dyn fmt::Display| DiffSide::Unreadable {
         reason: error.to_string(),
@@ -5622,28 +5673,42 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 failure: MutationFailure::Rejected { reason },
             })
         };
-        if !request.hunks.starts_with("@@ ") {
-            return rejected(format!("{path}: the patch has no hunks"));
+        if let Err(problem) = validate_hunks(&request.hunks) {
+            return rejected(format!("{path}: {problem}"));
         }
-        if request.from_worktree {
-            // The new lines are the file's bytes as they are on disk. Where
+        if let Some(text) = &request.worktree_text {
+            // The new lines are the working file's bytes, as shown. Where
             // Git's clean filters would change those bytes on staging, as
             // autocrlf, an eol attribute or LFS do, they are not what
             // staging the file would record.
-            let hash = |filters: bool| {
-                let mut arguments = vec![OsString::from("hash-object")];
-                if !filters {
-                    arguments.push("--no-filters".into());
-                }
-                arguments.extend(["--".into(), path.as_os_str().to_owned()]);
-                self.run_checked(&self.git_literal_read(worktree, arguments), cancellation)
-                    .map(|output| output.stdout)
+            let hash = |filter: OsString| {
+                let arguments = [OsString::from("hash-object"), filter, "--stdin".into()];
+                self.run_checked(
+                    &self
+                        .git_literal_read(worktree, arguments)
+                        .stdin(text.as_bytes()),
+                    cancellation,
+                )
+                .map(|output| output.stdout)
             };
-            if hash(true)? != hash(false)? {
+            let mut filtered = OsString::from("--path=");
+            filtered.push(path.as_os_str());
+            if hash(filtered)? != hash("--no-filters".into())? {
                 return rejected(format!(
                     "{path}: Git converts this file when staging it, so stage the whole file"
                 ));
             }
+        }
+        let mut entry = OsString::from(":0:");
+        entry.push(path.as_os_str());
+        let index = self.run(
+            &self.git_literal_read(worktree, [OsString::from("cat-file"), "blob".into(), entry]),
+            cancellation,
+        )?;
+        if !index.success || index.stdout != request.index.as_bytes() {
+            return rejected(format!(
+                "{path} changed in the index since this diff was read; try again once it refreshes"
+            ));
         }
         let name = |side: &[u8]| {
             let mut name = side.to_vec();

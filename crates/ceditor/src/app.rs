@@ -3023,6 +3023,7 @@ impl Editor {
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = Some(kind);
+                tab.runtime.index_mutation_started();
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(Some(kind));
                 }

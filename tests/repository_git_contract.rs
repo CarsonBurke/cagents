@@ -1535,8 +1535,9 @@ fn an_index_patch_changes_only_its_own_index_entry() {
                 &IndexPatchRequest {
                     worktree: fixture.work(),
                     path: RepoPath::from_bytes(name).expect("path"),
+                    index: "one\ntwo\n".into(),
                     hunks: "@@ -1,2 +1,2 @@\n one\n-two\n+2\n".into(),
-                    from_worktree: false,
+                    worktree_text: None,
                 },
                 &CancellationToken::new(),
             )
@@ -1595,13 +1596,15 @@ fn staging_a_hunk_of_a_converted_file_is_refused() {
     fixture.write("plain.txt", b"one\n2\n");
     let service = fixture.service();
     let stage = |name: &str, hunks: &str| {
+        let shown = fs::read_to_string(fixture.work().join(name)).expect("read");
         service
             .apply_index_patch(
                 &IndexPatchRequest {
                     worktree: fixture.work(),
                     path: path(name),
+                    index: "one\ntwo\n".into(),
                     hunks: hunks.into(),
-                    from_worktree: true,
+                    worktree_text: Some(shown),
                 },
                 &CancellationToken::new(),
             )
@@ -1628,6 +1631,87 @@ fn staging_a_hunk_of_a_converted_file_is_refused() {
             failure: MutationFailure::Rejected { .. }
         }
     ));
+}
+
+/// A hunk applies only to the exact index text it was cut from, and its
+/// body can carry nothing but that file's hunks: a stale comparison or a
+/// second file's section smuggled after the hunks changes no index entry.
+#[test]
+fn an_index_patch_applies_only_to_what_it_was_cut_from() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let shown = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+    fixture.write("numbers.txt", shown.as_bytes());
+    fixture.write("bystander.txt", b"one\ntwo\n");
+    fixture.commit_all("initial");
+    let service = fixture.service();
+    let apply = |name: &str, index: &str, hunks: &str| {
+        let outcome = service
+            .apply_index_patch(
+                &IndexPatchRequest {
+                    worktree: fixture.work(),
+                    path: path(name),
+                    index: index.into(),
+                    hunks: hunks.into(),
+                    worktree_text: None,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("apply");
+        match outcome {
+            MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            } => Some(reason),
+            MutationOutcome::Applied { .. } => None,
+            other => panic!("{other:?}"),
+        }
+    };
+    let second = "@@ -1,3 +1,3 @@\n 1\n-2\n+two\n 3\n";
+    // Line 9 changed in the index after the comparison was read. `git apply`
+    // alone would still place this hunk, since its context is untouched.
+    fixture.write("numbers.txt", b"1\n2\n3\n4\n5\n6\n7\n8\nnine\n");
+    fixture.git_in_work(&["add", "numbers.txt"]);
+    let reason = apply("numbers.txt", shown, second).expect("a stale hunk is refused");
+    assert!(reason.contains("changed in the index"), "{reason}");
+    assert_eq!(
+        fixture.text(&["show", ":numbers.txt"]),
+        "1\n2\n3\n4\n5\n6\n7\n8\nnine"
+    );
+
+    let current = "1\n2\n3\n4\n5\n6\n7\n8\nnine\n";
+    for smuggled in [
+        format!(
+            "{second}diff --git a/bystander.txt b/bystander.txt\n--- a/bystander.txt\n\
+             +++ b/bystander.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+2\n"
+        ),
+        format!("{second}+extra\n"),
+        "@@ -1,3 +1,3 @@\n 1\n-2\n+two\n".into(),
+        "@@ -1,1 +1,1 @@\n-1\n+one".into(),
+        "@@ -1 +1 @@ \n-1\n+one\n\\ No newline\n-2\n".into(),
+        String::new(),
+    ] {
+        assert!(
+            apply("numbers.txt", current, &smuggled).is_some(),
+            "accepted {smuggled:?}"
+        );
+    }
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--", "bystander.txt"]),
+        ""
+    );
+    assert_eq!(fixture.text(&["show", ":numbers.txt"]), current.trim_end());
+
+    // The same hunk against the current index applies, and only there.
+    assert_eq!(apply("numbers.txt", current, second), None);
+    assert_eq!(
+        fixture.text(&["show", ":numbers.txt"]),
+        "1\ntwo\n3\n4\n5\n6\n7\n8\nnine"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.work().join("numbers.txt")).expect("read"),
+        current
+    );
 }
 
 #[test]

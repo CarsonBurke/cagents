@@ -2142,13 +2142,16 @@ mod tests {
         String::from_utf8(git_output(root, &["show", ":f.txt"])).unwrap()
     }
 
-    /// Applies hunk `index` of `model` to the index through the service.
+    /// Applies hunk `index` of `model` to the index through the service,
+    /// as staging (`target` Before, the index) or unstaging (After) does.
     fn apply_hunk(root: &Path, model: &DiffModel, index: usize, target: PatchTarget) {
+        let staging = target == PatchTarget::Before;
         let request = crate::repository::IndexPatchRequest {
             worktree: root.to_path_buf(),
             path: RepoPath::parse("f.txt").unwrap(),
+            index: if staging { &model.before } else { &model.after }.to_string(),
             hunks: model.hunk_patch(index, target).unwrap(),
-            from_worktree: false,
+            worktree_text: staging.then(|| model.after.to_string()),
         };
         let outcome = RepositoryService::system("git")
             .apply_index_patch(&request, &CancellationToken::new())
