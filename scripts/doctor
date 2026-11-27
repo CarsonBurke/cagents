@@ -187,6 +187,20 @@ def check_optional(report):
             report.ok(command, "found")
 
 
+def check_codex_watcher(report, system_directory):
+    if sys.platform != "linux" or shutil.which("codex") is None:
+        return
+    try:
+        system_directory.stat()
+    except FileNotFoundError:
+        report.warn("codex", f"{system_directory} is missing. Idle Codex app-servers can wake "
+                    "on unrelated file opens under /etc. "
+                    "See docs/performance.md#idle-codex-app-servers")
+    except OSError:
+        # An unreadable path may still exist. Leave it to the administrator.
+        return
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--no-build-host", action="store_true",
@@ -200,6 +214,7 @@ def main():
     if not args.no_build_host:
         check_build_host(report)
     check_optional(report)
+    check_codex_watcher(report, Path("/etc/codex"))
     if report.failed:
         print(f"Some prerequisites are missing; see {DEVELOPMENT}.", file=sys.stderr)
         return 1

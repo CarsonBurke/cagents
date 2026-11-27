@@ -2,11 +2,13 @@
 """scripts/doctor names each missing prerequisite and changes nothing."""
 
 import os
+import runpy
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 LIBRARIES = ("dbus-1", "egl", "fontconfig", "freetype2", "gbm", "gl", "libudev",
@@ -165,6 +167,35 @@ class Doctor(unittest.TestCase):
         result = self.doctor("--no-build-host")
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("build host", result.stdout)
+
+
+class CodexWatcher(unittest.TestCase):
+    def test_a_missing_system_directory_warns_only_with_codex_on_linux(self):
+        doctor = runpy.run_path(str(ROOT / "scripts/doctor"))
+        with tempfile.TemporaryDirectory(prefix="cagents-codex-doctor-") as temporary:
+            directory = Path(temporary) / "codex"
+            for platform, executable, exists, warning in (
+                ("linux", "/usr/bin/codex", False, True),
+                ("linux", None, False, False),
+                ("darwin", "/usr/bin/codex", False, False),
+                ("linux", "/usr/bin/codex", True, False),
+            ):
+                with self.subTest(platform=platform, executable=executable, exists=exists):
+                    if exists:
+                        directory.mkdir()
+                    report = mock.Mock()
+                    with mock.patch("sys.platform", platform), mock.patch("shutil.which", return_value=executable):
+                        doctor["check_codex_watcher"](report, directory)
+                    if warning:
+                        report.warn.assert_called_once()
+                        name, detail = report.warn.call_args.args
+                        self.assertEqual(name, "codex")
+                        self.assertIn(str(directory), detail)
+                        self.assertIn("docs/performance.md#idle-codex-app-servers", detail)
+                    else:
+                        report.warn.assert_not_called()
+                    report.fail.assert_not_called()
+                    self.assertEqual(directory.exists(), exists)
 
 
 if __name__ == "__main__":
