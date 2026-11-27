@@ -846,8 +846,8 @@ pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
 /// window it does not mention - another model's weekly allowance, most of
 /// all - keeps its probed figure. Fable's window is the probe's, whatever
 /// version of the name Claude scoped it to. A probe's binding mark survives
-/// while its window still agrees with the relative pressure in the merged
-/// figures. The event's rate-limit type describes which limit it reports.
+/// unless a competing window tightens and outranks it, or the marked window
+/// loosens and falls behind a competitor.
 ///
 /// Returns whether the update renews account-wide evidence, as Codex's
 /// [`super::codex::merge_update`] does. A report about one model's allowance
@@ -864,6 +864,15 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
     snapshot
         .windows
         .retain(|window| window.key != RETIRED_FABLE);
+    let rank = |window: &UsageWindow| {
+        (
+            window.used,
+            std::cmp::Reverse(window.resets_at.unwrap_or(i64::MAX)),
+        )
+    };
+    let has_binding = snapshot.windows.iter().any(|window| window.binding);
+    let previous_ranks = (has_binding && !update.windows.is_empty())
+        .then(|| snapshot.windows.iter().map(rank).collect::<Vec<_>>());
     for window in update.windows {
         let fable = window.key == FABLE;
         match snapshot
@@ -881,9 +890,28 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
             }),
         }
     }
-    let tightest = super::tightest(&snapshot.windows).map(|window| (window.used, window.resets_at));
-    for window in &mut snapshot.windows {
-        window.binding &= tightest == Some((window.used, window.resets_at));
+    if let Some(previous) = previous_ranks {
+        let tightened = super::tightest(
+            snapshot
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(index, window)| {
+                    previous.get(*index).is_none_or(|old| rank(window) > *old)
+                })
+                .map(|(_, window)| window),
+        )
+        .map(rank);
+        let tightest = super::tightest(&snapshot.windows).map(rank);
+        for (index, window) in snapshot.windows.iter_mut().enumerate() {
+            if window.binding {
+                let current = rank(window);
+                let loosened = previous.get(index).is_some_and(|old| current < *old);
+                let displaced = tightened.is_some_and(|rival| rival > current)
+                    || (loosened && tightest.is_some_and(|rival| rival > current));
+                window.binding = !displaced;
+            }
+        }
     }
     if !account_wide {
         // A spent model allowance can warn without changing what the account
@@ -1552,6 +1580,50 @@ mod tests {
                 .unwrap();
         merge_live(&mut usage, update, 30);
         assert_eq!(usage.status, UsageStatus::Warning);
+    }
+
+    #[test]
+    fn only_changed_live_figures_can_displace_a_probe_binding() {
+        let probed = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 90},
+                {"kind": "weekly_all", "percent": 80, "is_active": true},
+                {"kind": "weekly_scoped", "percent": 5,
+                    "scope": {"model": {"display_name": "Fable"}}},
+            ]}}),
+            10,
+        );
+        for (event, expected) in [
+            (
+                json!({"status": "rejected", "rateLimitType": "five_hour"}),
+                WEEKLY,
+            ),
+            (
+                json!({"unifiedWindows": {"five_hour": {"utilization": 0.9}}}),
+                WEEKLY,
+            ),
+            (
+                json!({"unifiedWindows": {"seven_day_overage_included": {"utilization": 0.3}}}),
+                WEEKLY,
+            ),
+            (
+                json!({"unifiedWindows": {"five_hour": {"utilization": 0.85}}}),
+                WEEKLY,
+            ),
+            (
+                json!({"unifiedWindows": {"five_hour": {"utilization": 0.95}}}),
+                SESSION,
+            ),
+            (
+                json!({"unifiedWindows": {"seven_day": {"utilization": 0.7}}}),
+                SESSION,
+            ),
+        ] {
+            let mut usage = probed.clone();
+            merge_live(&mut usage, parse_rate_limit_event(&event).unwrap(), 20);
+            assert_eq!(usage.binding_window().unwrap().key, expected, "{event}");
+            assert_eq!(usage.windows[1].binding, expected == WEEKLY, "{event}");
+        }
     }
 
     /// As Claude Code 2.1.296 reported a Fable 5.2 turn: the weekly window
