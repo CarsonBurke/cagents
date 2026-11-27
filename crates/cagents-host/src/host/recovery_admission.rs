@@ -108,6 +108,10 @@ fn access(request: &ClientRequest) -> Access<'_> {
         // Inspects what holds a lost helper's Close, ending only processes
         // the person chose and the daemon proves are that conversation's.
         | R::ChatLostProcesses { .. }
+        | R::ChatQueueRecipientScope { .. }
+        | R::ChatReadExitedQueuePage { .. }
+        | R::ChatReadExitedQueue { .. }
+        | R::ChatCommitExitedQueue { .. }
         // Device links name no hosted process.
         | R::DeviceTrust { .. }
         | R::PeerChallenge
@@ -131,7 +135,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
             ..
         }
         | R::ChatStartInPane { session, .. } => Access::StartChat(session),
-        R::ChatPrepareResume { source } => Access::PrepareResume(source.id),
+        R::ChatPrepareResume { source } | R::ChatPrepareResumeWithQueue { source } => {
+            Access::PrepareResume(source.id)
+        }
         R::ChatRecoverAccount {
             source,
             replacement,

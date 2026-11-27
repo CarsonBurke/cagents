@@ -89,7 +89,7 @@ fn isolated_completion_wake_case(marker: &str) -> bool {
     true
 }
 
-fn completion_wake_host() -> SharedHost {
+pub(super) fn completion_wake_host() -> SharedHost {
     Arc::new(HostLock::new(HostState::new(HostSessionProof {
         host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
         host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
@@ -97,7 +97,7 @@ fn completion_wake_host() -> SharedHost {
     })))
 }
 
-fn completion_wake_record(
+pub(super) fn completion_wake_record(
     host: &SharedHost,
     id: TerminalId,
     instance: uuid::Uuid,
@@ -131,7 +131,7 @@ fn completion_wake_record(
     session
 }
 
-fn direct_completion_actor(
+pub(super) fn direct_completion_actor(
     script: &str,
     cwd: &std::path::Path,
     notify: impl Fn(Update) + Send + Sync + 'static,
@@ -213,6 +213,159 @@ fn completion_wait_until(mut ready: impl FnMut() -> bool) {
             "completion fixture did not advance"
         );
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn close_archives_an_acp_queue_published_during_teardown_and_retries_storage_failure() {
+    use crate::{chat::PromptMode, terminal_ipc::ProtocolErrorCode};
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    if isolated_completion_wake_case("CAGENTS_CLOSE_LATE_ACP_QUEUE_CASE") {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("agy");
+    fs::write(
+        &provider,
+        r#"#!/bin/sh
+while IFS= read -r frame; do
+    case "$frame" in
+        *'"method":"initialize"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}' ;;
+        *'"method":"session/new"'*)
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ended-acp-conversation"}}' ;;
+        *'"method":"session/prompt"'*)
+            [ ! -f received-prompt ] || exit 10
+            : > received-prompt ;;
+        *'"method":"session/cancel"'*)
+            : > received-close
+            exit 0 ;;
+    esac
+done
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&provider, PermissionsExt::from_mode(0o700)).unwrap();
+
+    let launch = chat::Launch {
+        provider: Provider::Antigravity,
+        session_id: None,
+        recipe: LaunchRecipe {
+            program: provider.to_string_lossy().into_owned(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        },
+        draft_model: None,
+    };
+    let (spec, mut adapter) = chat::protocol::create(&launch).unwrap();
+    let mut initial = adapter.initialize().unwrap();
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    let host = completion_wake_host();
+    let id = TerminalId::new();
+    let execution = uuid::Uuid::new_v4();
+    let original = completion_wake_record(&host, id, execution, handle.clone(), launch);
+    let client = 17;
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&id)
+        .unwrap()
+        .subscribers
+        .insert(client, false);
+    completion_wait_until(|| handle.is_ready());
+
+    handle
+        .command(Command::Prompt {
+            text: "Hold the current turn open until Close".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    completion_wait_until(|| directory.path().join("received-prompt").is_file());
+    let text = "x".repeat(chat::QueuedMessage::PREVIEW_BYTES + 4096);
+    handle
+        .command(Command::Prompt {
+            text: text.clone(),
+            attachments: Vec::new(),
+            mode: PromptMode::Queue,
+        })
+        .unwrap();
+    let queued = handle.snapshot(None).unwrap().queued_messages;
+    assert_eq!(queued.len(), 1);
+    assert!(!queued[0].editable);
+    assert!(!handle.is_completed());
+
+    // Refuse publication of the archive on the first attempt. This is the
+    // isolated child's own runtime directory, never the user's running daemon.
+    let runtime = crate::daemon::RuntimePaths::discover().unwrap().directory;
+    let saved = runtime.with_extension("archive-test-saved");
+    let had_runtime = runtime.exists();
+    if had_runtime {
+        fs::rename(&runtime, &saved).unwrap();
+    }
+    fs::File::create(&runtime).unwrap();
+    let close = || process(&host, client, ClientRequest::ChatClose { chat_id: id });
+    let error = close().unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(error.retryable);
+    assert!(
+        error
+            .message
+            .contains("Could not retain ended provider input")
+    );
+    assert!(directory.path().join("received-close").is_file());
+    assert!(handle.is_completed());
+    assert_eq!(handle.exited_recovery_queue().unwrap()[0].text, text);
+    let current = {
+        let state = host.lock().unwrap();
+        assert!(state.chat_close_reservations.is_empty());
+        state.chats[&id].current_session()
+    };
+    assert_eq!(
+        current.launch.session_id.as_deref(),
+        Some("ended-acp-conversation")
+    );
+
+    fs::remove_file(&runtime).unwrap();
+    if had_runtime {
+        fs::rename(saved, &runtime).unwrap();
+    } else {
+        crate::secure_file::prepare_private_directory(&runtime).unwrap();
+    }
+    assert!(matches!(close().unwrap(),
+        ServerResponse::ChatClosed { chat_id, .. } if chat_id == id));
+    assert!(!host.lock().unwrap().chats.contains_key(&id));
+
+    // A later connection need not have received Close or the original wake.
+    for source in [original, current] {
+        let reply = process(
+            &host,
+            18,
+            ClientRequest::ChatReadExitedQueue {
+                source,
+                execution: Some(execution),
+            },
+        )
+        .unwrap();
+        let ServerResponse::ChatExitedQueue {
+            source,
+            queued: Some(page),
+        } = reply
+        else {
+            panic!("missing exact recovery queue {reply:?}");
+        };
+        assert_eq!(source, id);
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.total as usize, page.bytes.len());
+        let recovered: chat::ExitedQueue = postcard::from_bytes(&page.bytes).unwrap();
+        assert_eq!(recovered.messages.len(), 1);
+        assert_eq!(recovered.messages[0].id, queued[0].id);
+        assert!(recovered.messages[0].editable);
+        assert_eq!(recovered.messages[0].text, text);
     }
 }
 

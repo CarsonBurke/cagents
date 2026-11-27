@@ -1012,6 +1012,71 @@ fn real_helper_epoch_rotation_between_resolve_and_attach_rejects_old_proxy() {
 }
 
 #[test]
+fn queue_recipient_scope_reports_the_live_actors_captured_account() {
+    #[cfg(target_os = "linux")]
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated() else { return };
+    let fixture = Fixture::new(root);
+    fixture
+        .handle()
+        .command(chat::Command::Prompt {
+            text: "Confirm this offline fixture conversation".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait(
+        || fixture.root.join("provider-done").exists(),
+        "offline turn did not finish",
+    );
+    let recipient = fixture.publicly_attached_identity(None, "queue recipient was not confirmed");
+    let captured = fixture.handle().launch_account_scope().cloned().unwrap();
+    let ask = |session| {
+        super::super::client::process_request(
+            &fixture.host,
+            0,
+            ClientRequest::ChatQueueRecipientScope { session },
+        )
+        .map(|(response, _, _)| response)
+    };
+    let expected = ServerResponse::ChatQueueRecipientScope {
+        source: recipient.id,
+        account_scope: Some(captured.queue_fingerprint()),
+    };
+    assert_eq!(ask(recipient.clone()).unwrap(), expected);
+    let mut wrong = recipient.clone();
+    wrong
+        .launch
+        .recipe
+        .arguments
+        .push("--different-source".into());
+    assert_eq!(
+        ask(wrong.clone()).unwrap(),
+        ServerResponse::ChatQueueRecipientScope {
+            source: recipient.id,
+            account_scope: None,
+        }
+    );
+    wrong.proof.as_mut().unwrap().host_incarnation = "another-daemon".into();
+    assert_eq!(
+        ask(wrong).unwrap_err().code,
+        ProtocolErrorCode::ProofMismatch
+    );
+
+    // Same argv, path and provider ID, different directory inode. The
+    // running helper still owns the account it captured before the swap.
+    let moved = fixture.root.join("original-account");
+    fs::rename(&captured.canonical_home, &moved).unwrap();
+    fs::create_dir(&captured.canonical_home).unwrap();
+    assert!(captured.revalidate().is_err());
+    assert_eq!(ask(recipient).unwrap(), expected);
+    fs::remove_dir(&captured.canonical_home).unwrap();
+    fs::rename(moved, &captured.canonical_home).unwrap();
+}
+
+#[test]
 fn real_helper_resolution_learns_only_provider_confirmed_pre_id_identity() {
     #[cfg(target_os = "linux")]
     if crate::retained_fixture::run_isolated() {

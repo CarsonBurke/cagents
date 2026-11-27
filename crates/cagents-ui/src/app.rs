@@ -8940,12 +8940,39 @@ impl Cagents {
         }
         let saved = self.persistent_workspace();
         self.record_shared_chat_identities();
+        // Queue recovery and its exact replay checkpoint belong to the same
+        // snapshot. An immediately following close cannot coalesce it away.
+        let queue_checkpoints: Vec<_> = self
+            .chat_ui
+            .pending_queue_checkpoints
+            .iter()
+            .copied()
+            .filter(|(origin, source)| {
+                saved
+                    .returned_chat_queues
+                    .get(origin)
+                    .and_then(|sources| sources.get(source))
+                    .and_then(|recipient| *recipient)
+                    .is_some_and(|recipient| {
+                        saved.chat_drafts.contains_key(&recipient)
+                            || saved.chat_draft_attachments.contains_key(&recipient)
+                            || saved
+                                .chat_waiting_messages
+                                .get(&recipient)
+                                .is_some_and(|queue| !queue.messages.is_empty())
+                    })
+            })
+            .collect();
         let offer = self.snapshot_offer(saved, ordinary);
         if let Some(writer) = &self.session {
             let result = if self.shared_views.adoptions.is_empty()
                 && self.shared_views.restorations.is_empty()
             {
-                writer.offer_snapshot(offer)
+                if queue_checkpoints.is_empty() {
+                    writer.offer_snapshot(offer)
+                } else {
+                    writer.offer_conversion(offer)
+                }
             } else {
                 writer.offer_terminal_panes(
                     offer,
@@ -8958,6 +8985,11 @@ impl Cagents {
                 self.shared_views.restorations.clear();
             }
             accepted = result.is_ok();
+            if accepted {
+                for checkpoint in queue_checkpoints {
+                    self.chat_ui.pending_queue_checkpoints.remove(&checkpoint);
+                }
+            }
             self.snapshot_offer_answered(accepted);
         } else if self.replica_capture.pending.is_none() {
             // Memory-only windows retain their existing navigation bookkeeping;

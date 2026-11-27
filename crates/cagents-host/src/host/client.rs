@@ -178,6 +178,8 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ChatRead { .. }
             | ClientRequest::ChatAcknowledge { .. }
             | ClientRequest::ChatList
+            | ClientRequest::ChatReadExitedQueuePage { .. }
+            | ClientRequest::ChatReadExitedQueue { .. }
             | ClientRequest::ReadWorkspaceModel
             | ClientRequest::ReadWorkspaceView { .. }
             | ClientRequest::ReadWorkspaceSnapshot
@@ -499,6 +501,9 @@ fn chat_startup_request(request: &ClientRequest) -> bool {
             | ClientRequest::ChatList
             | ClientRequest::ResolveUpgradeChat { .. }
             | ClientRequest::ChatPrepareResume { .. }
+            | ClientRequest::ChatPrepareResumeWithQueue { .. }
+            | ClientRequest::ChatReadExitedQueuePage { .. }
+            | ClientRequest::ChatReadExitedQueue { .. }
     )
 }
 
@@ -1991,6 +1996,11 @@ fn process_admitted_request(
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatStartInPane { .. }
         | ClientRequest::ChatPrepareResume { .. }
+        | ClientRequest::ChatPrepareResumeWithQueue { .. }
+        | ClientRequest::ChatQueueRecipientScope { .. }
+        | ClientRequest::ChatReadExitedQueuePage { .. }
+        | ClientRequest::ChatReadExitedQueue { .. }
+        | ClientRequest::ChatCommitExitedQueue { .. }
         | ClientRequest::ChatRecoverAccount { .. }
         | ClientRequest::ChatPreview { .. }
         | ClientRequest::ChatCandidates { .. }

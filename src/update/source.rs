@@ -896,6 +896,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         207,
         "intermediate #4235 protocol; no released install was qualified as a live-update source",
     ),
+    (
+        209,
+        "intermediate #4310 review monitor protocol; no released install was qualified as a live-update source",
+    ),
 ];
 
 #[cfg(any(test, feature = "test-support"))]

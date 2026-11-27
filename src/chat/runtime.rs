@@ -407,6 +407,7 @@ struct Inner {
     record_observer: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
+    exited_recovery_queue: Arc<Mutex<Option<Arc<[super::QueuedMessage]>>>>,
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -706,6 +707,7 @@ impl LocalHandle {
         let record_observer = spec.followed.then(|| Arc::new(AtomicBool::new(false)));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
+        let exited_recovery_queue = Arc::new(Mutex::new(None));
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
@@ -732,6 +734,7 @@ impl LocalHandle {
             record_observer: record_observer.clone(),
             stop: stop.clone(),
             completed: completed.clone(),
+            exited_recovery_queue: exited_recovery_queue.clone(),
             draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
@@ -918,6 +921,7 @@ impl LocalHandle {
                         actor.publish_current_attention(evidence);
                     }
                 }
+                let had_provider = actor.child.is_some() || actor.native_holder.is_some();
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
                     let code = child
@@ -986,6 +990,15 @@ impl LocalHandle {
                         tracing::warn!(%error, "steps left running could not be marked stopped");
                     }
                     stop_snapshot_steps(&mut actor.state.lock().unwrap_or_else(|p| p.into_inner()));
+                }
+                // Publish the adapter's exact final input before any exit
+                // notification lets a reader fetch it. A detached or
+                // unproved process might still consume its own queue.
+                if had_provider && direct_closed && native_closed && !preserve_holder {
+                    *exited_recovery_queue
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) =
+                        actor.adapter.recovery_queue().map(Arc::from);
                 }
                 actor.apply(Event::Exited { code });
                 let usage = actor
@@ -1719,6 +1732,13 @@ impl LocalHandle {
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
+    }
+    fn exited_recovery_queue(&self) -> Option<Arc<[super::QueuedMessage]>> {
+        self.0
+            .exited_recovery_queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     /// When the latest turn and its delegated work finished, in daemon Unix
     /// milliseconds; absent while a turn runs or before the first one ends.

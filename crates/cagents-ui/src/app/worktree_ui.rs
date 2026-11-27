@@ -646,6 +646,7 @@ fn scope_descriptor(
         chat_draft_models: HashMap::new(),
         chat_waiting_messages: HashMap::new(),
         kept_chat_drafts: HashMap::new(),
+        returned_chat_queues: Default::default(),
         stopping_chats: Vec::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),

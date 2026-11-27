@@ -9870,7 +9870,7 @@ fn a_pane_reopening_in_a_channel_keeps_its_place_until_it_starts() {
 
     // Once it starts, it is published where it is, before the pane after it.
     drop(app.update(Message::ResumeConversation(
-        crate::app::resume_ui::Action::Prepared(held, 0, Ok(Some(Box::new(session)))),
+        crate::app::resume_ui::Action::Prepared(held, 0, Ok(Some(Box::new(session))), None),
     )));
     assert!(!app.reopen_pending(held));
     drop(app.reconcile_shared_views());

@@ -1060,6 +1060,14 @@ pub(in crate::host) fn release(
             "History changed while its reader closed; resident data was preserved",
         ));
     }
+    // Provider history proves the transcript, not the input it never saw.
+    super::archive_completed_queue(
+        host,
+        &source,
+        proof.session.clone(),
+        proof.execution_instance,
+        &handle,
+    )?;
     // The exclusive request gate remains held through exact capability
     // retirement and resident removal. No cached-origin submission may cross
     // this boundary; the reservation also fences actor recovery and attach.

@@ -1943,6 +1943,29 @@ pub struct QueuedMessage {
     pub attachments: Vec<Attachment>,
 }
 
+/// Authenticated final input of one retired provider, with the account
+/// identity the daemon captured when that provider started, if available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitedQueue {
+    pub messages: Vec<QueuedMessage>,
+    pub account_scope: Option<[u8; 32]>,
+    /// The provider's final thread, which may differ from an issued alias.
+    pub confirmed_session: Option<String>,
+}
+
+/// Identity of the exact ordered input in a retired queue. A direct actor can
+/// be replaced at the same session ID, so the session alone is insufficient.
+pub fn exited_queue_fingerprint<'a>(ids: impl IntoIterator<Item = &'a str>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    for id in ids {
+        hash.update((id.len() as u64).to_le_bytes());
+        hash.update(id.as_bytes());
+    }
+    hash.finalize().into()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchPoint {
     pub id: String,

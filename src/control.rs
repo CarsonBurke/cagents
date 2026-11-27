@@ -84,10 +84,10 @@ use crate::{
     terminal::{
         self, TerminalSpawnOptions,
         ipc::{
-            ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolErrorCode,
-            SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse, ShutdownCapability,
-            ShutdownOperation, ShutdownOutcome, ShutdownPreflight, TerminalDescriptor,
-            TerminalSnapshot, TerminalVisibility,
+            ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolError,
+            ProtocolErrorCode, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
+            ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+            TerminalDescriptor, TerminalSnapshot, TerminalVisibility,
             client_session::{HandshakeError, validate_handshake},
             daemon_socket_path, read_frame, write_frame,
         },
@@ -864,6 +864,8 @@ pub enum ControlError {
     SnapshotTimeout,
     #[error("the daemon returned a terminal list page that does not follow the previous one")]
     StalledListPage,
+    #[error("the daemon returned an invalid page for the retired input queue")]
+    InvalidExitedQueuePage,
     #[error("timed out waiting for terminal {terminal_id} to contain {text:?}")]
     WaitTimeout {
         terminal_id: TerminalId,
@@ -995,6 +997,12 @@ pub struct ModelEdge {
     pub edit: ModelEdit,
     pub effects: crate::workspace_model::delta::EditEffects,
 }
+
+/// The old provider's independently verified queue and the successor result.
+pub type PreparedChatResume = (
+    Option<crate::chat::ExitedQueue>,
+    Result<crate::chat::Session, ProtocolError>,
+);
 
 /// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
@@ -2150,6 +2158,101 @@ impl ControlClient {
         }
     }
 
+    /// Prepare an exact successor while preserving the old provider's
+    /// verified final queue, even when later preparation is refused.
+    pub fn prepare_chat_resume_with_queue(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<PreparedChatResume, ControlError> {
+        let expected = source.id;
+        match self.request_strict(ClientRequest::ChatPrepareResumeWithQueue { source })? {
+            ServerResponse::ChatResumePreparedWithQueue {
+                source,
+                queued,
+                prepared,
+            } if source == expected => {
+                let queued = queued
+                    .map(|first| {
+                        crate::terminal_ipc::collect_exited_queue(
+                            source,
+                            first,
+                            |request| self.request_strict(request),
+                            || ControlError::InvalidExitedQueuePage,
+                        )
+                    })
+                    .transpose()?;
+                Ok((queued, prepared))
+            }
+            response => Err(unexpected_response(
+                "a prepared conversation resume with its exact final queue",
+                &response,
+            )),
+        }
+    }
+
+    /// A completed native actor's exact held input, without preparing or
+    /// launching a successor. An unavailable receipt is distinct from empty.
+    pub fn read_exited_chat_queue(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<Option<crate::chat::ExitedQueue>, ControlError> {
+        let expected = source.id;
+        match self.request_strict(ClientRequest::ChatReadExitedQueue {
+            source,
+            execution: None,
+        })? {
+            ServerResponse::ChatExitedQueue { source, queued } if source == expected => queued
+                .map(|first| {
+                    crate::terminal_ipc::collect_exited_queue(
+                        source,
+                        first,
+                        |request| self.request_strict(request),
+                        || ControlError::InvalidExitedQueuePage,
+                    )
+                })
+                .transpose(),
+            response => Err(unexpected_response(
+                "a completed chat's exact queue",
+                &response,
+            )),
+        }
+    }
+
+    /// Release a completed queue after the exact input and its replay
+    /// checkpoint have been saved together.
+    pub fn commit_exited_chat_queue(
+        &mut self,
+        source: crate::chat::Session,
+        queue_ids: Vec<String>,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::ChatCommitExitedQueue { source, queue_ids })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "an exited queue acknowledgement",
+                &response,
+            )),
+        }
+    }
+
+    /// The exact recipient's captured provider account, resolved by the
+    /// daemon hosting it rather than the machine running the window.
+    pub fn chat_queue_recipient_scope(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<Option<[u8; 32]>, ControlError> {
+        let expected = session.id;
+        match self.request_strict(ClientRequest::ChatQueueRecipientScope { session })? {
+            ServerResponse::ChatQueueRecipientScope {
+                source,
+                account_scope,
+            } if source == expected => Ok(account_scope),
+            response => Err(unexpected_response(
+                "a chat's captured queue scope",
+                &response,
+            )),
+        }
+    }
+
     pub fn resolve_upgrade_chat(
         &mut self,
         source: crate::chat::Session,
@@ -3196,6 +3299,8 @@ impl ControlClient {
             | ServerMessage::ChatAgentAddresses { chat_id, .. }
             | ServerMessage::ChatActiveModel { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
+            ServerMessage::ChatQueueEnded { source, .. }
+                if self.attached_chats.contains(&source.id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
             | ServerMessage::TerminalObserved { terminal_id, .. }
@@ -3469,6 +3574,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatChanged { .. }
         | ServerMessage::ChatObserved { .. }
         | ServerMessage::ChatActivity { .. }
+        | ServerMessage::ChatQueueEnded { .. }
         | ServerMessage::TerminalCreated { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
@@ -3507,6 +3613,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::MobileChanged { .. } => "mobile_changed",
+        ServerMessage::ChatQueueEnded { .. } => "chat_queue_ended",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
@@ -3557,6 +3664,10 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::WorkspaceEdit(_) => "workspace_edit",
         ServerResponse::WorkspaceMetadata(_) => "workspace_metadata",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
+        ServerResponse::ChatResumePreparedWithQueue { .. } => "chat_resume_prepared_with_queue",
+        ServerResponse::ChatQueueRecipientScope { .. } => "chat_queue_recipient_scope",
+        ServerResponse::ChatExitedQueuePage { .. } => "chat_exited_queue_page",
+        ServerResponse::ChatExitedQueue { .. } => "chat_exited_queue",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
@@ -10652,6 +10763,15 @@ mod tests {
                 None,
                 activity(closed, ActivityState::Working),
             );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::ChatQueueEnded {
+                    source: session.clone(),
+                    execution: uuid::Uuid::new_v4(),
+                    current: true,
+                },
+            );
             respond(
                 &mut server_stream,
                 attach.request_id,
@@ -10790,6 +10910,12 @@ mod tests {
             })
         ));
         assert!(client.attached_chats.is_empty());
+        let foreign_queue = ServerMessage::ChatQueueEnded {
+            source: session(elsewhere),
+            execution: uuid::Uuid::new_v4(),
+            current: true,
+        };
+        assert_eq!(client.absorb(foreign_queue.clone()), Some(foreign_queue));
         assert!(client.list_chats().unwrap().is_empty());
         assert!(matches!(
             client.list_chats(),

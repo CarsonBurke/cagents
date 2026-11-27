@@ -26,7 +26,7 @@
 //!
 //! Antigravity's subagents are listed apart from the parent, with the steps
 //! of theirs that reach its session; see [`subagents`].
-use super::{Adapter, ProcessSpec, Step};
+use super::{Adapter, ProcessSpec, QueuedInput, Step};
 use crate::chat::{
     self, Capabilities, Choice, Command, Event, Item, ItemContent, Launch, PlanState, PlanStep,
     PromptMode, Request, RequestKind, Role, SkillReach, SlashCommand, ToolStatus,
@@ -288,7 +288,7 @@ const RUN_TURN_REFUSAL: &str = "This turn is answering a message that waits for 
 
 /// A message written during a turn, held for the next one.
 struct Queued {
-    message: chat::QueuedMessage,
+    input: QueuedInput,
     blocks: Vec<Value>,
     /// The message as the transcript shows it once it is sent.
     items: Vec<Item>,
@@ -768,10 +768,14 @@ impl Acp {
             ));
         }
         self.next_queued += 1;
-        let mut message = chat::QueuedMessage::new(self.queued_id(self.next_queued), text);
-        message.attachments = attachments;
+        let input = QueuedInput::new(
+            self.queued_id(self.next_queued),
+            text,
+            attachments,
+            chat::QueueDelivery::NextTurn,
+        );
         self.queued.push(Queued {
-            message,
+            input,
             blocks,
             items,
             bytes,
@@ -799,7 +803,7 @@ impl Acp {
         step.events.push(Event::QueueChanged(
             self.queued
                 .iter()
-                .map(|queued| queued.message.clone())
+                .map(|queued| queued.input.preview.clone())
                 .collect(),
         ));
     }
@@ -1674,6 +1678,15 @@ fn tool_item(id: String, content: ItemContent) -> Item {
 }
 
 impl Adapter for Acp {
+    fn recovery_queue(&self) -> Option<Vec<chat::QueuedMessage>> {
+        Some(
+            self.queued
+                .iter()
+                .map(|queued| queued.input.recovery())
+                .collect(),
+        )
+    }
+
     fn initialize(&mut self) -> Result<Step, String> {
         let (_, frame) = self.request(
             "initialize",
@@ -1998,7 +2011,7 @@ impl Adapter for Acp {
                 let position = self
                     .queued
                     .iter()
-                    .position(|queued| queued.message.id == id);
+                    .position(|queued| queued.input.preview.id == id);
                 if let Some(position) = position {
                     self.queued.remove(position);
                 }
@@ -2044,7 +2057,7 @@ impl Adapter for Acp {
                 let position = self
                     .queued
                     .iter()
-                    .position(|queued| queued.message.id == id)
+                    .position(|queued| queued.input.preview.id == id)
                     .ok_or_else(|| format!("That message is no longer queued with {label}."))?;
                 let between = self.turn.is_none();
                 if between {
