@@ -25946,6 +25946,8 @@ fn a_draft_whose_provider_is_missing_names_one_to_choose_instead() {
             "Codex isn't installed on this computer. Choose a model under Claude in the model menu, or install Codex there."
         )
     );
+    // The composer doesn't say it a second time.
+    assert!(app.draft_provider_note(card).is_none());
 
     // Where Accounts found the CLI, only the PATH agents start with lacks
     // it, which the daemon's own words say.

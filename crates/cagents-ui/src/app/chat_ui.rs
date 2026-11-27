@@ -10068,7 +10068,9 @@ impl Cagents {
             return None;
         };
         let provider = runtime.session.launch.provider;
+        // A failed start's error already says so, above the composer.
         (runtime.is_draft()
+            && runtime.error.is_none()
             && !self.chat_start_pending(card)
             && self.account_ui.cli_missing(provider))
         .then(|| self.missing_provider_note(provider, true, false))
