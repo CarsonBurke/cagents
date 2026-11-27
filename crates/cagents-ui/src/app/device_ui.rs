@@ -89,7 +89,11 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::MarkChannelRead(_)
         | SidebarAction::DeleteChannel { .. }
         | SidebarAction::RetryChannelDeletion { .. }
-        | SidebarAction::DeleteRow(SelectionRow::Channel(_) | SelectionRow::Card(_))
+        // A project leaves the device daemon's registry as it leaves this
+        // computer's: its sessions close and its files stay on the device.
+        | SidebarAction::DeleteRow(
+            SelectionRow::Channel(_) | SelectionRow::Card(_) | SelectionRow::Project(_),
+        )
         // Only a local worktree operation can be dismissed, and dismissing or
         // cancelling a confirmation changes nothing outside this window.
         | SidebarAction::DismissWorktreeOperation(_)
@@ -109,7 +113,8 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
             | ProjectCommand::CopyBranch
             | ProjectCommand::MoveUp
             | ProjectCommand::MoveDown
-            | ProjectCommand::ResetSidebarOrder => return None,
+            | ProjectCommand::ResetSidebarOrder
+            | ProjectCommand::Remove => return None,
             ProjectCommand::Reveal => SidebarRoute::BrowseOnDevice {
                 project_id: *project_id,
                 worktree_id: *worktree_id,
@@ -126,7 +131,6 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
                 "Starting a worktree from an existing branch isn't available in a device window \
                  yet. Use New worktree, or git worktree in a terminal on the device.",
             ),
-            ProjectCommand::Remove => SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE),
             ProjectCommand::PullRequest => SidebarRoute::PullRequest {
                 project_id: *project_id,
                 worktree_id: *worktree_id,
@@ -146,9 +150,6 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
                 project_id: *project_id,
                 remove: Some(*worktree_id),
             }
-        }
-        SidebarAction::DeleteRow(SelectionRow::Project(_)) => {
-            SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE)
         }
         SidebarAction::DeleteSelectedRows => SidebarRoute::DeleteSelectedRows,
         SidebarAction::OpenPullRequest { url, .. } => SidebarRoute::OpenLink(url.clone()),
@@ -210,8 +211,6 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
     })
 }
 
-const REMOVE_PROJECT_UNAVAILABLE: &str = "Removing a project from a device window isn't \
-     available yet. Remove it from a window on that computer instead.";
 const CHECKOUT_NOT_LOADED: &str =
     "That checkout hasn't loaded from the device yet. Try again in a moment.";
 const PULL_REQUESTS_UNAVAILABLE: &str =
@@ -634,15 +633,8 @@ impl Cagents {
                     .iter()
                     .filter(|row| matches!(row, sidebar::SelectionRow::Worktree(..)))
                     .count();
-                if selected
-                    .iter()
-                    .any(|row| matches!(row, sidebar::SelectionRow::Project(_)))
-                {
-                    self.status = Some(TransientNotice::warning(REMOVE_PROJECT_UNAVAILABLE));
-                    return Task::none();
-                }
                 match (worktrees, selected.as_slice()) {
-                    // Channels and panes delete as they do locally.
+                    // Channels, panes and projects delete as they do locally.
                     (0, _) => self.begin_sidebar_group_delete(),
                     (1, [sidebar::SelectionRow::Worktree(project_id, worktree_id)]) => self
                         .route_device_sidebar_action(SidebarRoute::DeviceWorktrees {
@@ -652,7 +644,7 @@ impl Cagents {
                     _ => {
                         self.status = Some(TransientNotice::warning(
                             "A device window deletes one worktree at a time. Select a single \
-                             worktree, or only channels.",
+                             worktree, or only channels and projects.",
                         ));
                         Task::none()
                     }
@@ -2801,6 +2793,8 @@ mod tests {
                 channel_id: channel,
             },
             SidebarAction::DeleteRow(sidebar::SelectionRow::Channel(channel)),
+            SidebarAction::DeleteRow(sidebar::SelectionRow::Project(project_id)),
+            on(None, sidebar::ProjectCommand::Remove),
             command(sidebar::ProjectCommand::NewChannel),
             command(sidebar::ProjectCommand::NewTerminal),
             command(sidebar::ProjectCommand::CopyPath),
@@ -2880,12 +2874,10 @@ mod tests {
             assert_eq!(sidebar_route(&action), None, "{action:?}");
         }
         for action in [
-            command(sidebar::ProjectCommand::Remove),
             command(sidebar::ProjectCommand::RepositoryUrl),
             command(sidebar::ProjectCommand::NewWorktreeFromBranch),
             SidebarAction::RetryWorktreeOperation(crate::model::OperationId::new()),
             command(sidebar::ProjectCommand::OpenEditor("code".into())),
-            SidebarAction::DeleteRow(sidebar::SelectionRow::Project(project_id)),
             SidebarAction::BrowsePullRequests { project_id },
         ] {
             assert!(
@@ -3205,18 +3197,55 @@ mod tests {
         assert_eq!(app.device_ui.path, "/srv/device-only/other");
         settle(&mut app);
 
-        // What a device can't do yet says so instead of opening the tools.
+        // Remove project asks first, as locally, and says the files stay
+        // on the device; nothing opens the device tools.
+        app.status = None;
         drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
             project_id,
             worktree_id: None,
             command: sidebar::ProjectCommand::Remove,
         })));
         assert!(!app.device_ui.open);
-        assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message == REMOVE_PROJECT_UNAVAILABLE)
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(app.project_ui.modal_open());
+        assert_eq!(
+            project_ui::files_stay(),
+            "on sidebar-test",
+            "the confirmation names where the files stay"
         );
+        // Its buttons answer it here rather than being refused as local work.
+        drop(app.update(Message::ProjectUi(project_ui::Action::Dismiss)));
+        assert!(!app.project_ui.modal_open());
+        assert!(app.status.is_none(), "{:?}", app.status);
+        // So does Delete on a selected project row.
+        drop(app.update(Message::Sidebar(SidebarAction::DeleteRow(
+            sidebar::SelectionRow::Project(project_id),
+        ))));
+        assert!(!app.device_ui.open);
+        assert!(app.project_ui.modal_open());
+        drop(app.update(Message::ProjectUi(project_ui::Action::Dismiss)));
+        assert!(!app.project_ui.modal_open());
+
+        // Confirming starts the removal rather than being refused as local
+        // work; the device's answer arrives later.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: None,
+            command: sidebar::ProjectCommand::Remove,
+        })));
+        drop(app.update(Message::ProjectUi(project_ui::Action::ConfirmRemove)));
+        assert!(!app.project_ui.modal_open());
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(app.project_ui.removing.contains_key(&main.join(".git")));
+
+        // Removing it compares the device's paths as the device reported
+        // them, never resolving one on this computer's disk.
+        let resolutions = project_ui::scope_resolutions();
+        assert!(
+            project_ui::device_aware_scope_contains(&[main.clone()], &linked),
+            "device paths compare as the device reported them"
+        );
+        assert_eq!(project_ui::scope_resolutions(), resolutions);
     }
 
     #[test]
