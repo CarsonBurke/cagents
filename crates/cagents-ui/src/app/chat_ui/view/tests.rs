@@ -2303,7 +2303,10 @@ fn conversation_tab_marks_only_the_main_conversations_own_state() {
     Arc::make_mut(&mut runtime.snapshot).detail = "Turn interrupted".into();
     assert_eq!(state(&runtime), None);
     Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
-    assert_eq!(runtime.parent_tab_state(), Some((Icon::Error, "Failed")));
+    assert_eq!(
+        runtime.parent_tab_state(),
+        Some((Icon::Error, "Failed".to_owned()))
+    );
 }
 
 #[test]
