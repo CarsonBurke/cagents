@@ -55,7 +55,7 @@ dismiss_inspector() {
 # control, with its draft in the pane.
 new_channel() {
     "$ne" drive click 174,108
-    "$ne" drive wait 'conversation appears' --timeout 30
+    "$ne" drive wait Message --timeout 30
     dismiss_inspector
 }
 picker() {
@@ -67,6 +67,8 @@ picker() {
     sleep 1
 }
 
+# A step that fails leaves a picture of what was on screen.
+trap '"$ne" shot failed-step >/dev/null 2>&1 || true' ERR
 dismiss_inspector
 "$ne" cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project" >/dev/null
 "$ne" drive wait project --timeout 30
